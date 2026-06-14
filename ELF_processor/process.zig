@@ -1492,8 +1492,20 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(126);
     };
 
-    log.info("exit_code={d}", .{exit_code});
+    if (envFlag("ROSETTE_ELF_VERBOSE")) {
+        log.info("exit_code={d}", .{exit_code});
+    }
     std.process.exit(@as(u8, @truncate(exit_code)));
+}
+
+fn envFlag(name: [:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const value = std.mem.sliceTo(raw, 0);
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return true;
 }
 
 // ─── Tests ───
