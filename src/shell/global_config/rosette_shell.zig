@@ -164,9 +164,13 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
 
     const block = try buildProfileBlock(allocator);
     const zshrc = try std.fs.path.join(allocator, &.{ home, ".zshrc" });
+    const zprofile = try std.fs.path.join(allocator, &.{ home, ".zprofile" });
     const bashrc = try std.fs.path.join(allocator, &.{ home, ".bashrc" });
+    const bash_profile = try std.fs.path.join(allocator, &.{ home, ".bash_profile" });
     try ensureProfileBlock(init.io, allocator, zshrc, block, true);
+    try ensureProfileBlock(init.io, allocator, zprofile, block, fileExists(allocator, zprofile));
     try ensureProfileBlock(init.io, allocator, bashrc, block, fileExists(allocator, bashrc));
+    try ensureProfileBlock(init.io, allocator, bash_profile, block, fileExists(allocator, bash_profile));
 
     if (source_root.len != 0) {
         const config_path = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
@@ -191,9 +195,13 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
 
     const zshrc = try std.fs.path.join(allocator, &.{ home, ".zshrc" });
+    const zprofile = try std.fs.path.join(allocator, &.{ home, ".zprofile" });
     const bashrc = try std.fs.path.join(allocator, &.{ home, ".bashrc" });
+    const bash_profile = try std.fs.path.join(allocator, &.{ home, ".bash_profile" });
     try removeProfileBlock(init.io, allocator, zshrc);
+    try removeProfileBlock(init.io, allocator, zprofile);
     try removeProfileBlock(init.io, allocator, bashrc);
+    try removeProfileBlock(init.io, allocator, bash_profile);
 
     try unlinkIfExists(allocator, shell_path);
     try unlinkIfExists(allocator, source_root);
@@ -222,11 +230,17 @@ fn prepareMake(
 
     const home = try homeDir(allocator);
     const wrapper_dir = try std.fs.path.join(allocator, &.{ home, ".rosette", "wrappers" });
-    const elf_processor_path = try std.fs.path.join(allocator, &.{ home, ".rosette", "bin", "elf_processor" });
-    try makePathRecursive(allocator, wrapper_dir);
+    const elf_processor_path = blk: {
+        if (getenvSlice("ROSETTE_ELF_PROCESSOR")) |env_elf_path| {
+            if (fileExists(allocator, env_elf_path)) {
+                break :blk try allocator.dupe(u8, env_elf_path);
+            }
+        }
+        const default_path = try std.fs.path.join(allocator, &.{ home, ".rosette", "bin", "elf_processor" });
+        break :blk default_path;
+    };
 
     const helper_path = try currentHelperPath(init, allocator);
-    try ensureWrappers(allocator, wrapper_dir, helper_path);
 
     const trace_dir = try std.fs.path.join(allocator, &.{ project_dir, ".rosette" });
     try makePathRecursive(allocator, trace_dir);
@@ -733,7 +747,11 @@ fn buildMakeEnv(
     try appendExport(&out, allocator, "ROSETTE_RECIPE_SHELL", recipe_shell_path);
     if (source_root.len != 0) try appendExport(&out, allocator, "ROSETTE_SOURCE_ROOT", source_root);
     if (assembler_runner) |runner| try appendExport(&out, allocator, "ROSETTE_ASSEMBLER_RUNNER", runner);
-    if (elf_processor_path) |processor| try appendExport(&out, allocator, "ROSETTE_ELF_PROCESSOR", processor);
+    if (elf_processor_path) |processor| {
+        try appendExport(&out, allocator, "ROSETTE_ELF_PROCESSOR", processor);
+        try appendExport(&out, allocator, "RUNNER", processor);
+        try appendExport(&out, allocator, "ELF_PROC", processor);
+    }
     try appendExport(&out, allocator, "PATH", wrapped_path);
     try appendExport(&out, allocator, "ZIG_LOCAL_CACHE_DIR", local_cache);
     try appendExport(&out, allocator, "ZIG_GLOBAL_CACHE_DIR", global_cache);
@@ -744,6 +762,20 @@ fn buildMakeEnv(
 fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld_path: ?[]const u8, elf_processor_path: ?[]const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
+
+    const helper_dir = std.fs.path.dirname(helper_path) orelse "";
+    if (helper_dir.len != 0) {
+        try out.appendSlice(allocator, "export ROSETTE_BIN_DIR=");
+        try appendShellQuoted(&out, allocator, helper_dir);
+        try out.appendSlice(allocator,
+            \\
+            \\case ":$PATH:" in
+            \\  *":$ROSETTE_BIN_DIR:"*) ;;
+            \\  *) export PATH="$ROSETTE_BIN_DIR:$PATH" ;;
+            \\esac
+            \\
+        );
+    }
 
     try out.appendSlice(allocator, "export ROSETTE_SHELL_HELPER=");
     try appendShellQuoted(&out, allocator, helper_path);
@@ -916,6 +948,23 @@ fn ensureWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8, helper_
 
     const recipe_shell_path = try std.fs.path.join(allocator, &.{ wrapper_dir, "rosette-sh" });
     try unlinkIfExists(allocator, recipe_shell_path);
+
+    const elf_processor_wrapper = try std.fs.path.join(allocator, &.{ wrapper_dir, "elf_processor" });
+    const elf_processor_script =
+        \\#!/bin/sh
+        \\unset DYLD_INSERT_LIBRARIES
+        \\if [ -n "${ROSETTE_ELF_PROCESSOR:-}" ] && [ -x "$ROSETTE_ELF_PROCESSOR" ]; then
+        \\  exec "$ROSETTE_ELF_PROCESSOR" "$@"
+        \\fi
+        \\if [ -x "$HOME/.rosette/bin/elf_processor" ]; then
+        \\  exec "$HOME/.rosette/bin/elf_processor" "$@"
+        \\fi
+        \\echo "rosette-shell: elf_processor is not installed; run 'make shell-update' from Rosette." >&2
+        \\exit 127
+        \\
+    ;
+    try writeFilePath(allocator, elf_processor_wrapper, elf_processor_script);
+    try chmodPath(allocator, elf_processor_wrapper, 0o755);
 }
 
 fn removeWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8) !void {
@@ -926,6 +975,8 @@ fn removeWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8) !void {
     }
     const recipe_shell_path = try std.fs.path.join(allocator, &.{ wrapper_dir, "rosette-sh" });
     try unlinkIfExists(allocator, recipe_shell_path);
+    const elf_processor_wrapper = try std.fs.path.join(allocator, &.{ wrapper_dir, "elf_processor" });
+    try unlinkIfExists(allocator, elf_processor_wrapper);
 }
 
 fn copySelf(init: std.process.Init, allocator: std.mem.Allocator, destination: []const u8) !void {
