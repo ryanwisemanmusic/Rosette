@@ -10,6 +10,36 @@ const c = @cImport({
 const block_begin = "# >>> Rosette shell integration >>>";
 const block_end = "# <<< Rosette shell integration <<<";
 const max_text_file = 512 * 1024;
+const default_config_text =
+    \\# Rosette global shell configuration.
+    \\# Values are TOML. The shell helper also accepts the uppercase aliases
+    \\# shown below for people who think in environment-variable names.
+    \\
+    \\[graphics]
+    \\enabled = false
+    \\
+    \\[elf]
+    \\# "auto" enables result summaries for detected class-style YASM/ELF
+    \\# assignment projects when you run `make run`.
+    \\# Use "on" to always request summaries for detected projects, or "off"
+    \\# to leave ELF program output untouched unless the environment asks.
+    \\dump_results = "auto"
+    \\dump_all_results = false
+    \\result_style = "student"
+    \\
+    \\# Optional aliases:
+    \\# GRAPHICS = "OFF"
+    \\# ROSETTE_ELF_DUMP_RESULTS = "AUTO"
+    \\
+;
+
+const ConfigMode = enum { off, on, auto };
+
+const ShellConfig = struct {
+    graphics_enabled: bool = false,
+    elf_dump_results: ConfigMode = .auto,
+    elf_dump_all_results: bool = false,
+};
 
 const Detection = struct {
     detected: bool,
@@ -53,6 +83,18 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "help")) {
+        return usage(args[0]);
+    }
+    if (std.mem.eql(u8, args[1], "config")) {
+        try printConfig(init.io, allocator);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "config-path")) {
+        const path = try configPath(allocator);
+        std.debug.print("{s}\n", .{path});
+        return;
+    }
     if (std.mem.eql(u8, args[1], "install")) {
         const source_root = if (args.len >= 3) args[2] else "";
         try installOrUpdate(init, allocator, source_root);
@@ -115,6 +157,9 @@ fn usage(exe_name: []const u8) void {
         \\Rosette global shell helper
         \\
         \\Usage:
+        \\  {s} help
+        \\  {s} config
+        \\  {s} config-path
         \\  {s} install [source-root]
         \\  {s} update [source-root]
         \\  {s} uninstall
@@ -126,7 +171,14 @@ fn usage(exe_name: []const u8) void {
         \\  {s} recipe-shell [sh-args...]
         \\  {s} is-elf64 <path>
         \\
-    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+        \\Common config at ~/.rosette/config.toml:
+        \\  [elf]
+        \\  dump_results = "auto"  # off | on | auto
+        \\  dump_all_results = false
+        \\  [graphics]
+        \\  enabled = false
+        \\
+    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
@@ -136,13 +188,20 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     const lib_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "lib" });
     const wrapper_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "wrappers" });
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
+    const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
+    const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
 
     try makePathRecursive(allocator, bin_dir);
     try makePathRecursive(allocator, wrapper_dir);
     try makePathRecursive(allocator, lib_dir);
     try copySelf(init, allocator, helper_path);
+    try copySelf(init, allocator, rosette_path);
     try ensureWrappers(allocator, wrapper_dir, helper_path);
+    if (!fileExists(allocator, toml_path)) {
+        try writeFilePath(allocator, toml_path, default_config_text);
+        try chmodPath(allocator, toml_path, 0o644);
+    }
 
     const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
     const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
@@ -190,7 +249,9 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const wrapper_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "wrappers" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
+    const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const source_root = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
+    const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
     const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
     const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
 
@@ -205,10 +266,12 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
 
     try unlinkIfExists(allocator, shell_path);
     try unlinkIfExists(allocator, source_root);
+    try unlinkIfExists(allocator, toml_path);
     try unlinkIfExists(allocator, elf_processor_path);
     try unlinkIfExists(allocator, dyld_lib_path);
     try removeWrappers(allocator, wrapper_dir);
     try unlinkIfExists(allocator, helper_path);
+    try unlinkIfExists(allocator, rosette_path);
     rmdirIfEmpty(allocator, wrapper_dir) catch {};
     rmdirIfEmpty(allocator, bin_dir) catch {};
     rmdirIfEmpty(allocator, lib_dir) catch {};
@@ -241,6 +304,7 @@ fn prepareMake(
     };
 
     const helper_path = try currentHelperPath(init, allocator);
+    const config = try loadShellConfig(init.io, allocator);
 
     const trace_dir = try std.fs.path.join(allocator, &.{ project_dir, ".rosette" });
     try makePathRecursive(allocator, trace_dir);
@@ -260,6 +324,9 @@ fn prepareMake(
         assembler_runner,
         helper_path,
         if (fileExists(allocator, elf_processor_path)) elf_processor_path else null,
+        config,
+        detection,
+        make_args,
     );
     try writeFilePath(allocator, env_path, env_text);
     std.process.exit(0);
@@ -663,6 +730,9 @@ fn scoreAssemblyFiles(
             score.* += 1;
             try addSignal(signals, allocator, "asm:syscall");
         }
+        if (containsIgnoreCase(data, "Ans") or containsIgnoreCase(data, "Rem")) {
+            try addSignal(signals, allocator, "asm:answer-symbols");
+        }
     }
 }
 
@@ -727,6 +797,9 @@ fn buildMakeEnv(
     assembler_runner: ?[]const u8,
     recipe_shell_path: []const u8,
     elf_processor_path: ?[]const u8,
+    config: ShellConfig,
+    detection: Detection,
+    make_args: []const []const u8,
 ) ![]const u8 {
     const current_path = getenvSlice("PATH") orelse "";
     const tmp = getenvSlice("TMPDIR") orelse "/tmp";
@@ -751,6 +824,18 @@ fn buildMakeEnv(
         try appendExport(&out, allocator, "ROSETTE_ELF_PROCESSOR", processor);
         try appendExport(&out, allocator, "RUNNER", processor);
         try appendExport(&out, allocator, "ELF_PROC", processor);
+    }
+    if (getenvSlice("ROSETTE_ELF_DUMP_RESULTS") == null and shouldEnableResultDump(config, detection, make_args)) {
+        try appendExport(&out, allocator, "ROSETTE_ELF_DUMP_RESULTS", "1");
+    }
+    if (getenvSlice("ROSETTE_ELF_DUMP_ALL") == null and config.elf_dump_all_results) {
+        try appendExport(&out, allocator, "ROSETTE_ELF_DUMP_ALL", "1");
+    }
+    if (getenvSlice("ROSETTE_GRAPHICS") == null) {
+        try appendExport(&out, allocator, "ROSETTE_GRAPHICS", if (config.graphics_enabled) "on" else "off");
+    }
+    if (getenvSlice("ROSETTE_GRAPHICS_ENABLED") == null) {
+        try appendExport(&out, allocator, "ROSETTE_GRAPHICS_ENABLED", if (config.graphics_enabled) "1" else "0");
     }
     try appendExport(&out, allocator, "PATH", wrapped_path);
     try appendExport(&out, allocator, "ZIG_LOCAL_CACHE_DIR", local_cache);
@@ -811,13 +896,61 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\      local __rosette_env __rosette_status __rosette_old_path
         \\      local __rosette_old_makefiles __rosette_had_makefiles
         \\      local __rosette_old_dyld __rosette_had_dyld
+        \\      local __rosette_old_dump __rosette_had_dump
+        \\      local __rosette_old_dump_all __rosette_had_dump_all
+        \\      local __rosette_old_graphics __rosette_had_graphics
+        \\      local __rosette_old_graphics_enabled __rosette_had_graphics_enabled
+        \\      local __rosette_old_runner __rosette_had_runner
+        \\      local __rosette_old_elf_proc __rosette_had_elf_proc
+        \\      local __rosette_old_zig_local __rosette_had_zig_local
+        \\      local __rosette_old_zig_global __rosette_had_zig_global
         \\      __rosette_env="${TMPDIR:-/tmp}/rosette-shell-env.$$"
         \\      __rosette_old_path="$PATH"
         \\      __rosette_had_makefiles=0
         \\      __rosette_had_dyld=0
+        \\      __rosette_had_dump=0
+        \\      __rosette_had_dump_all=0
+        \\      __rosette_had_graphics=0
+        \\      __rosette_had_graphics_enabled=0
+        \\      __rosette_had_runner=0
+        \\      __rosette_had_elf_proc=0
+        \\      __rosette_had_zig_local=0
+        \\      __rosette_had_zig_global=0
         \\      if [ "${MAKEFILES+x}" = "x" ]; then
         \\        __rosette_had_makefiles=1
         \\        __rosette_old_makefiles="$MAKEFILES"
+        \\      fi
+        \\      if [ "${ROSETTE_ELF_DUMP_RESULTS+x}" = "x" ]; then
+        \\        __rosette_had_dump=1
+        \\        __rosette_old_dump="$ROSETTE_ELF_DUMP_RESULTS"
+        \\      fi
+        \\      if [ "${ROSETTE_ELF_DUMP_ALL+x}" = "x" ]; then
+        \\        __rosette_had_dump_all=1
+        \\        __rosette_old_dump_all="$ROSETTE_ELF_DUMP_ALL"
+        \\      fi
+        \\      if [ "${ROSETTE_GRAPHICS+x}" = "x" ]; then
+        \\        __rosette_had_graphics=1
+        \\        __rosette_old_graphics="$ROSETTE_GRAPHICS"
+        \\      fi
+        \\      if [ "${ROSETTE_GRAPHICS_ENABLED+x}" = "x" ]; then
+        \\        __rosette_had_graphics_enabled=1
+        \\        __rosette_old_graphics_enabled="$ROSETTE_GRAPHICS_ENABLED"
+        \\      fi
+        \\      if [ "${RUNNER+x}" = "x" ]; then
+        \\        __rosette_had_runner=1
+        \\        __rosette_old_runner="$RUNNER"
+        \\      fi
+        \\      if [ "${ELF_PROC+x}" = "x" ]; then
+        \\        __rosette_had_elf_proc=1
+        \\        __rosette_old_elf_proc="$ELF_PROC"
+        \\      fi
+        \\      if [ "${ZIG_LOCAL_CACHE_DIR+x}" = "x" ]; then
+        \\        __rosette_had_zig_local=1
+        \\        __rosette_old_zig_local="$ZIG_LOCAL_CACHE_DIR"
+        \\      fi
+        \\      if [ "${ZIG_GLOBAL_CACHE_DIR+x}" = "x" ]; then
+        \\        __rosette_had_zig_global=1
+        \\        __rosette_old_zig_global="$ZIG_GLOBAL_CACHE_DIR"
         \\      fi
         \\      if [ "${DYLD_INSERT_LIBRARIES+x}" = "x" ]; then
         \\        __rosette_had_dyld=1
@@ -843,6 +976,46 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\        unset ROSETTE_SHELL_ACTIVE ROSETTE_SHELL_PROJECT_KIND ROSETTE_SHELL_PROJECT_DIR
         \\        unset ROSETTE_SHELL_TRACE ROSETTE_SHELL_WRAPPER_DIR ROSETTE_SHELL_ORIGINAL_PATH
         \\        unset ROSETTE_RECIPE_SHELL
+        \\        if [ "$__rosette_had_dump" = "1" ]; then
+        \\          export ROSETTE_ELF_DUMP_RESULTS="$__rosette_old_dump"
+        \\        else
+        \\          unset ROSETTE_ELF_DUMP_RESULTS
+        \\        fi
+        \\        if [ "$__rosette_had_dump_all" = "1" ]; then
+        \\          export ROSETTE_ELF_DUMP_ALL="$__rosette_old_dump_all"
+        \\        else
+        \\          unset ROSETTE_ELF_DUMP_ALL
+        \\        fi
+        \\        if [ "$__rosette_had_graphics" = "1" ]; then
+        \\          export ROSETTE_GRAPHICS="$__rosette_old_graphics"
+        \\        else
+        \\          unset ROSETTE_GRAPHICS
+        \\        fi
+        \\        if [ "$__rosette_had_graphics_enabled" = "1" ]; then
+        \\          export ROSETTE_GRAPHICS_ENABLED="$__rosette_old_graphics_enabled"
+        \\        else
+        \\          unset ROSETTE_GRAPHICS_ENABLED
+        \\        fi
+        \\        if [ "$__rosette_had_runner" = "1" ]; then
+        \\          export RUNNER="$__rosette_old_runner"
+        \\        else
+        \\          unset RUNNER
+        \\        fi
+        \\        if [ "$__rosette_had_elf_proc" = "1" ]; then
+        \\          export ELF_PROC="$__rosette_old_elf_proc"
+        \\        else
+        \\          unset ELF_PROC
+        \\        fi
+        \\        if [ "$__rosette_had_zig_local" = "1" ]; then
+        \\          export ZIG_LOCAL_CACHE_DIR="$__rosette_old_zig_local"
+        \\        else
+        \\          unset ZIG_LOCAL_CACHE_DIR
+        \\        fi
+        \\        if [ "$__rosette_had_zig_global" = "1" ]; then
+        \\          export ZIG_GLOBAL_CACHE_DIR="$__rosette_old_zig_global"
+        \\        else
+        \\          unset ZIG_GLOBAL_CACHE_DIR
+        \\        fi
         \\        if [ "$__rosette_had_dyld" = "1" ]; then
         \\          export DYLD_INSERT_LIBRARIES="$__rosette_old_dyld"
         \\        else
@@ -852,6 +1025,46 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\      fi
         \\      rm -f "$__rosette_env"
         \\      PATH="$__rosette_old_path"
+        \\      if [ "$__rosette_had_dump" = "1" ]; then
+        \\        export ROSETTE_ELF_DUMP_RESULTS="$__rosette_old_dump"
+        \\      else
+        \\        unset ROSETTE_ELF_DUMP_RESULTS
+        \\      fi
+        \\      if [ "$__rosette_had_dump_all" = "1" ]; then
+        \\        export ROSETTE_ELF_DUMP_ALL="$__rosette_old_dump_all"
+        \\      else
+        \\        unset ROSETTE_ELF_DUMP_ALL
+        \\      fi
+        \\      if [ "$__rosette_had_graphics" = "1" ]; then
+        \\        export ROSETTE_GRAPHICS="$__rosette_old_graphics"
+        \\      else
+        \\        unset ROSETTE_GRAPHICS
+        \\      fi
+        \\      if [ "$__rosette_had_graphics_enabled" = "1" ]; then
+        \\        export ROSETTE_GRAPHICS_ENABLED="$__rosette_old_graphics_enabled"
+        \\      else
+        \\        unset ROSETTE_GRAPHICS_ENABLED
+        \\      fi
+        \\      if [ "$__rosette_had_runner" = "1" ]; then
+        \\        export RUNNER="$__rosette_old_runner"
+        \\      else
+        \\        unset RUNNER
+        \\      fi
+        \\      if [ "$__rosette_had_elf_proc" = "1" ]; then
+        \\        export ELF_PROC="$__rosette_old_elf_proc"
+        \\      else
+        \\        unset ELF_PROC
+        \\      fi
+        \\      if [ "$__rosette_had_zig_local" = "1" ]; then
+        \\        export ZIG_LOCAL_CACHE_DIR="$__rosette_old_zig_local"
+        \\      else
+        \\        unset ZIG_LOCAL_CACHE_DIR
+        \\      fi
+        \\      if [ "$__rosette_had_zig_global" = "1" ]; then
+        \\        export ZIG_GLOBAL_CACHE_DIR="$__rosette_old_zig_global"
+        \\      else
+        \\        unset ZIG_GLOBAL_CACHE_DIR
+        \\      fi
         \\      if [ "$__rosette_had_dyld" = "1" ]; then
         \\        export DYLD_INSERT_LIBRARIES="$__rosette_old_dyld"
         \\      else
@@ -1004,6 +1217,130 @@ fn currentSourceRoot(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     const config_path = try std.fs.path.join(allocator, &.{ home, ".rosette", "source-root" });
     const contents = std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(16 * 1024)) catch return "";
     return try allocator.dupe(u8, std.mem.trim(u8, contents, " \t\r\n"));
+}
+
+fn configPath(allocator: std.mem.Allocator) ![]const u8 {
+    const home = try homeDir(allocator);
+    return try std.fs.path.join(allocator, &.{ home, ".rosette", "config.toml" });
+}
+
+fn printConfig(io: std.Io, allocator: std.mem.Allocator) !void {
+    const path = try configPath(allocator);
+    const config = try loadShellConfig(io, allocator);
+    std.debug.print("Rosette config: {s}\n", .{path});
+    std.debug.print("  [elf] dump_results = \"{s}\"\n", .{configModeName(config.elf_dump_results)});
+    std.debug.print("  [elf] dump_all_results = {s}\n", .{if (config.elf_dump_all_results) "true" else "false"});
+    std.debug.print("  [graphics] enabled = {s}\n", .{if (config.graphics_enabled) "true" else "false"});
+    std.debug.print("\nUseful commands:\n", .{});
+    std.debug.print("  rosette config-path\n", .{});
+    std.debug.print("  rosette clean-state\n", .{});
+    std.debug.print("  make run    # auto-dumps changed answer/remainder symbols when configured\n", .{});
+}
+
+fn loadShellConfig(io: std.Io, allocator: std.mem.Allocator) !ShellConfig {
+    const path = try configPath(allocator);
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024)) catch return .{};
+    return parseShellConfig(contents);
+}
+
+fn parseShellConfig(contents: []const u8) ShellConfig {
+    var config = ShellConfig{};
+    var section: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |pos| raw_line[0..pos] else raw_line;
+        const line = std.mem.trim(u8, no_comment, " \t\r\n");
+        if (line.len == 0) continue;
+
+        if (line[0] == '[' and line[line.len - 1] == ']') {
+            section = std.mem.trim(u8, line[1 .. line.len - 1], " \t\r\n");
+            continue;
+        }
+
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t\r\n");
+        const value = trimTomlValue(std.mem.trim(u8, line[eq + 1 ..], " \t\r\n"));
+
+        if ((std.ascii.eqlIgnoreCase(section, "elf") and std.ascii.eqlIgnoreCase(key, "dump_results")) or
+            std.ascii.eqlIgnoreCase(key, "ROSETTE_ELF_DUMP_RESULTS"))
+        {
+            config.elf_dump_results = parseConfigMode(value) orelse config.elf_dump_results;
+        } else if ((std.ascii.eqlIgnoreCase(section, "elf") and std.ascii.eqlIgnoreCase(key, "dump_all_results")) or
+            std.ascii.eqlIgnoreCase(key, "ROSETTE_ELF_DUMP_ALL") or
+            std.ascii.eqlIgnoreCase(key, "ROSETTE_ELF_DUMP_ALL_RESULTS"))
+        {
+            config.elf_dump_all_results = parseConfigBool(value) orelse config.elf_dump_all_results;
+        } else if ((std.ascii.eqlIgnoreCase(section, "graphics") and std.ascii.eqlIgnoreCase(key, "enabled")) or
+            std.ascii.eqlIgnoreCase(key, "GRAPHICS"))
+        {
+            config.graphics_enabled = parseConfigBool(value) orelse config.graphics_enabled;
+        }
+    }
+    return config;
+}
+
+fn trimTomlValue(value: []const u8) []const u8 {
+    if (value.len >= 2) {
+        const first = value[0];
+        const last = value[value.len - 1];
+        if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+            return value[1 .. value.len - 1];
+        }
+    }
+    return value;
+}
+
+fn parseConfigMode(value: []const u8) ?ConfigMode {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (parseConfigBool(value)) |enabled| return if (enabled) .on else .off;
+    if (std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "enabled")) return .on;
+    if (std.ascii.eqlIgnoreCase(value, "off") or std.ascii.eqlIgnoreCase(value, "disabled")) return .off;
+    return null;
+}
+
+fn parseConfigBool(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on") or
+        std.ascii.eqlIgnoreCase(value, "enabled"))
+    {
+        return true;
+    }
+    if (std.mem.eql(u8, value, "0") or
+        std.ascii.eqlIgnoreCase(value, "false") or
+        std.ascii.eqlIgnoreCase(value, "no") or
+        std.ascii.eqlIgnoreCase(value, "off") or
+        std.ascii.eqlIgnoreCase(value, "disabled"))
+    {
+        return false;
+    }
+    return null;
+}
+
+fn configModeName(mode: ConfigMode) []const u8 {
+    return switch (mode) {
+        .off => "off",
+        .on => "on",
+        .auto => "auto",
+    };
+}
+
+fn shouldEnableResultDump(config: ShellConfig, detection: Detection, make_args: []const []const u8) bool {
+    return switch (config.elf_dump_results) {
+        .off => false,
+        .on => true,
+        .auto => makeArgsRequestRun(make_args) and
+            containsIgnoreCase(detection.kind, "yasm-linux-elf64") and
+            containsIgnoreCase(detection.signals, "asm:answer-symbols"),
+    };
+}
+
+fn makeArgsRequestRun(make_args: []const []const u8) bool {
+    for (make_args) |arg| {
+        if (std.mem.eql(u8, arg, "run")) return true;
+    }
+    return false;
 }
 
 fn resolveAssemblerRunner(allocator: std.mem.Allocator, helper_path: []const u8, source_root: []const u8) !?[]const u8 {
@@ -1757,6 +2094,38 @@ test "Makefile detector accepts reordered YASM ELF64 flags" {
         \\    $(ASM) main.asm -l main.lst
     ;
     try std.testing.expect(hasYasmElf64Makefile(makefile));
+}
+
+test "shell config parser accepts TOML and uppercase aliases" {
+    const toml =
+        \\[graphics]
+        \\enabled = false
+        \\
+        \\[elf]
+        \\dump_results = "auto"
+        \\dump_all_results = false
+        \\
+        \\GRAPHICS = "ON"
+        \\ROSETTE_ELF_DUMP_RESULTS = "ON"
+    ;
+    const config = parseShellConfig(toml);
+    try std.testing.expect(config.graphics_enabled);
+    try std.testing.expectEqual(ConfigMode.on, config.elf_dump_results);
+    try std.testing.expect(!config.elf_dump_all_results);
+}
+
+test "auto result dump only triggers for run targets with answer symbols" {
+    const config = ShellConfig{ .elf_dump_results = .auto };
+    const detected = Detection{
+        .detected = true,
+        .score = 8,
+        .kind = "yasm-linux-elf64",
+        .signals = "makefile:yasm-elf64,asm:answer-symbols",
+    };
+    const run_args = [_][]const u8{"run"};
+    const build_args = [_][]const u8{};
+    try std.testing.expect(shouldEnableResultDump(config, detected, &run_args));
+    try std.testing.expect(!shouldEnableResultDump(config, detected, &build_args));
 }
 
 test "assembly global parser handles lists and bracket directives" {
