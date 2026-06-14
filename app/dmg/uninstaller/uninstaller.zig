@@ -30,7 +30,8 @@ fn usage(exe_name: []const u8) void {
 }
 
 fn removeApp(io: std.Io, allocator: std.mem.Allocator, app_path: []const u8) !void {
-    std.debug.print("Removing Rosette shell integration...\n", .{});
+    std.debug.print("Removing Rosette global shell integration...\n", .{});
+    std.debug.print("  removing ~/.rosette/bin/rosette, elf_processor, shell hooks, and config\n", .{});
     removeShell(io, allocator, app_path) catch |err| {
         std.debug.print("Shell integration cleanup skipped: {s}\n", .{@errorName(err)});
     };

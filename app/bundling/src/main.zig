@@ -481,7 +481,9 @@ fn runInstaller(init: std.process.Init, allocator: std.mem.Allocator, destinatio
 
     try runCmd(init.io, &[_][]const u8{ "rm", "-rf", installed_path });
     try runCmd(init.io, &[_][]const u8{ "cp", "-R", bundle_path, destination_dir });
-    try registerApp(init.io, installed_path);
+    registerApp(init.io, installed_path) catch |err| {
+        std.debug.print("Finder registration skipped: {s}\n", .{@errorName(err)});
+    };
     try installShellForApp(init, allocator, installed_path);
 
     std.debug.print("Rosette installed successfully.\n", .{});
@@ -505,14 +507,17 @@ fn installShellForApp(init: std.process.Init, allocator: std.mem.Allocator, app_
         return;
     }
     const runtime_root = try std.fs.path.join(allocator, &.{ app_path, "Contents", "Resources", "rosette-runtime" });
-    std.debug.print("Installing Rosette shell integration...\n", .{});
+    std.debug.print("Installing Rosette global shell integration...\n", .{});
+    std.debug.print("  command: rosette\n", .{});
+    std.debug.print("  helpers: rosette-shell, elf_processor, rosette_assembler_runner\n", .{});
+    std.debug.print("  config: ~/.rosette/config.toml with dump_results=\"auto\"\n", .{});
     try runCmd(init.io, &[_][]const u8{ helper, "install", runtime_root });
 }
 
 fn uninstallShellForApp(init: std.process.Init, allocator: std.mem.Allocator, app_path: []const u8) !void {
     const helper = try shellHelperPath(allocator, app_path);
     if (pathExists(allocator, helper)) {
-        std.debug.print("Removing Rosette shell integration...\n", .{});
+        std.debug.print("Removing Rosette global shell integration...\n", .{});
         try runCmd(init.io, &[_][]const u8{ helper, "uninstall" });
         return;
     }
@@ -520,7 +525,7 @@ fn uninstallShellForApp(init: std.process.Init, allocator: std.mem.Allocator, ap
     const home = std.c.getenv("HOME") orelse return;
     const fallback = try std.fs.path.join(allocator, &.{ std.mem.sliceTo(home, 0), ".rosette", "bin", "rosette-shell" });
     if (pathExists(allocator, fallback)) {
-        std.debug.print("Removing Rosette shell integration via installed helper...\n", .{});
+        std.debug.print("Removing Rosette global shell integration via installed helper...\n", .{});
         try runCmd(init.io, &[_][]const u8{ fallback, "uninstall" });
     }
 }

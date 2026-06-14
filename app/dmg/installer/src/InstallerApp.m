@@ -168,7 +168,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     [self.titleLabel setStringValue:@"Installation Summary"];
     [self.subtitleLabel setStringValue:@"Rosette is ready to install."];
     [self.summaryText setStringValue:[NSString stringWithFormat:
-        @"Rosette will be installed at:\n%@\n\nSpace required: %@\nAvailable space: %@\n\n%@",
+        @"Rosette will be installed at:\n%@\n\nSpace required: %@\nAvailable space: %@\n\n%@\n\nThe installer will also enable Rosette's global shell integration: the rosette command, make-time x86-64 ELF handling, and automatic assignment result summaries.",
         target,
         [self formatBytes:required],
         available == 0 ? @"Unknown" : [self formatBytes:available],
@@ -191,8 +191,8 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
 - (void)showInstallingStep {
     self.step = InstallerStepInstalling;
     [self.titleLabel setStringValue:@"Installing Rosette"];
-    [self.subtitleLabel setStringValue:@"Please wait while Rosette is copied and registered."];
-    [self.statusText setStringValue:@"Preparing installation..."];
+    [self.subtitleLabel setStringValue:@"Please wait while Rosette.app and the global shell are installed."];
+    [self.statusText setStringValue:@"Preparing Rosette.app, shell helpers, and assignment result support..."];
     [self.statusText setHidden:NO];
     [self.summaryText setHidden:YES];
     [self.destinationLabel setHidden:YES];
@@ -388,7 +388,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
             [timer invalidate];
             [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
             [self.progress setDoubleValue:5.0];
-            [self.statusText setStringValue:@"Authorization accepted. Installing Rosette.app..."];
+            [self.statusText setStringValue:@"Authorization accepted. Copying Rosette.app and preparing global shell integration..."];
             [self startProgressTimer];
         }
     }];
@@ -409,6 +409,30 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     double value = [self.progress doubleValue];
     if (value < self.progressTarget) {
         [self.progress setDoubleValue:value + 1.0];
+        [self updateInstallingStatusForProgress:value + 1.0];
+    }
+}
+
+- (void)updateInstallingStatusForProgress:(double)value {
+    if (self.step != InstallerStepInstalling) {
+        return;
+    }
+    NSString *message = nil;
+    if (value < 18.0) {
+        message = @"Verifying Rosette.app payload helpers...";
+    } else if (value < 34.0) {
+        message = @"Copying Rosette.app to the selected destination...";
+    } else if (value < 50.0) {
+        message = @"Registering Finder Open With support for Rosette...";
+    } else if (value < 66.0) {
+        message = @"Installing global shell command: rosette and rosette-shell...";
+    } else if (value < 80.0) {
+        message = @"Installing elf_processor and assembler helpers for make run...";
+    } else {
+        message = @"Writing ~/.rosette/config.toml with automatic assignment result summaries...";
+    }
+    if (![[self.statusText stringValue] isEqualToString:message]) {
+        [self.statusText setStringValue:message];
     }
 }
 
@@ -456,7 +480,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
 
 - (NSString *)doneMessageForDestination:(NSString *)destination output:(NSString *)output {
     NSString *target = [destination stringByAppendingPathComponent:@"Rosette.app"];
-    NSString *base = [NSString stringWithFormat:@"Rosette was installed at:\n%@\n\nFinder can use Rosette through Open With for supported .exe and .com files.", target];
+    NSString *base = [NSString stringWithFormat:@"Rosette was installed at:\n%@\n\nFinder can use Rosette through Open With for supported .exe and .com files.\n\nThe global shell is installed too. In supported x86-64 assembly assignment folders, run make run to see Rosette's normalized result summary.", target];
     if (output.length == 0) {
         return base;
     }
