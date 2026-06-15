@@ -34,6 +34,9 @@ pub const Op = enum(u8) {
     mov_mem16_imm16,
     mov_mem32_imm32,
     mov_mem64_imm32,
+    mov_reg8_reg8,
+    mov_reg16_reg16,
+    mov_reg32_reg32,
     mov_reg64_reg64,
     // add (reg, r/m) d=1
     add_reg8_mem8,
@@ -60,6 +63,9 @@ pub const Op = enum(u8) {
     sub_reg16_reg16,
     sub_reg32_reg32,
     sub_reg64_reg64,
+    // sub r/m, imm8 (80 /5)
+    sub_mem8_imm8,
+    sub_reg8_imm8,
     // cmp r/m, r
     cmp_mem8_reg8,
     cmp_mem16_reg16,
