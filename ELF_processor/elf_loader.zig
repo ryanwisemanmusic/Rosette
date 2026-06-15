@@ -76,7 +76,7 @@ pub const Symbol = struct {
 
 pub fn loadExecutableSegments(mem_base: u64, mem: []u8, elf_bytes: []const u8) !u64 {
     const ehdr = try header(elf_bytes);
-    try validateHeader(ehdr);
+    try validateHeader(&ehdr);
 
     const phoff = ehdr.e_phoff;
     const phentsize = ehdr.e_phentsize;
@@ -89,7 +89,7 @@ pub fn loadExecutableSegments(mem_base: u64, mem: []u8, elf_bytes: []const u8) !
     while (i < phnum) : (i += 1) {
         const phdr_off = phoff + i * phentsize;
         if (phdr_off + @sizeOf(Elf64_Phdr) > elf_bytes.len) return error.TruncatedProgramHeaders;
-        const phdr = @as(*const Elf64_Phdr, @ptrCast(@alignCast(elf_bytes[phdr_off..][0..@sizeOf(Elf64_Phdr)])));
+        const phdr = std.mem.bytesToValue(Elf64_Phdr, elf_bytes[phdr_off..][0..@sizeOf(Elf64_Phdr)]);
 
         if (phdr.p_type != PT_LOAD) continue;
         if (phdr.p_memsz == 0) continue;
@@ -117,21 +117,21 @@ pub fn collectSymbols(allocator: std.mem.Allocator, elf_bytes: []const u8) !std.
 
     var section_index: u16 = 0;
     while (section_index < ehdr.e_shnum) : (section_index += 1) {
-        const shdr = readSectionHeader(elf_bytes, ehdr, section_index) orelse return error.TruncatedSectionHeaders;
+        const shdr = readSectionHeader(elf_bytes, &ehdr, section_index) orelse return error.TruncatedSectionHeaders;
         if (shdr.sh_type != SHT_SYMTAB) continue;
         if (shdr.sh_entsize < @sizeOf(Elf64_Sym) or shdr.sh_entsize == 0) continue;
         if (shdr.sh_link >= ehdr.e_shnum) continue;
 
-        const strtab_shdr = readSectionHeader(elf_bytes, ehdr, @intCast(shdr.sh_link)) orelse continue;
-        const strtab = sectionBytes(elf_bytes, strtab_shdr) orelse continue;
-        const symtab = sectionBytes(elf_bytes, shdr) orelse continue;
+        const strtab_shdr = readSectionHeader(elf_bytes, &ehdr, @intCast(shdr.sh_link)) orelse continue;
+        const strtab = sectionBytes(elf_bytes, &strtab_shdr) orelse continue;
+        const symtab = sectionBytes(elf_bytes, &shdr) orelse continue;
         const sym_count = shdr.sh_size / shdr.sh_entsize;
 
         var sym_index: u64 = 0;
         while (sym_index < sym_count) : (sym_index += 1) {
             const sym_offset = sym_index * shdr.sh_entsize;
             if (sym_offset + @sizeOf(Elf64_Sym) > symtab.len) break;
-            const sym = @as(*const Elf64_Sym, @ptrCast(@alignCast(symtab[sym_offset..][0..@sizeOf(Elf64_Sym)])));
+            const sym = std.mem.bytesToValue(Elf64_Sym, symtab[sym_offset..][0..@sizeOf(Elf64_Sym)]);
             if (sym.st_shndx == SHN_UNDEF or sym.st_value == 0) continue;
 
             const name = elfString(strtab, sym.st_name) orelse continue;
@@ -147,9 +147,9 @@ pub fn collectSymbols(allocator: std.mem.Allocator, elf_bytes: []const u8) !std.
     return symbols;
 }
 
-fn header(elf_bytes: []const u8) !*const Elf64_Ehdr {
+fn header(elf_bytes: []const u8) !Elf64_Ehdr {
     if (elf_bytes.len < @sizeOf(Elf64_Ehdr)) return error.InvalidElf;
-    return @as(*const Elf64_Ehdr, @ptrCast(@alignCast(elf_bytes[0..@sizeOf(Elf64_Ehdr)])));
+    return std.mem.bytesToValue(Elf64_Ehdr, elf_bytes[0..@sizeOf(Elf64_Ehdr)]);
 }
 
 fn validateHeader(ehdr: *const Elf64_Ehdr) !void {
@@ -163,10 +163,10 @@ fn validateHeader(ehdr: *const Elf64_Ehdr) !void {
     if (ehdr.e_type != ET_EXEC) return error.NotExecutable;
 }
 
-fn readSectionHeader(elf_bytes: []const u8, ehdr: *const Elf64_Ehdr, index: u16) ?*const Elf64_Shdr {
+fn readSectionHeader(elf_bytes: []const u8, ehdr: *const Elf64_Ehdr, index: u16) ?Elf64_Shdr {
     const offset = ehdr.e_shoff + @as(u64, index) * ehdr.e_shentsize;
     if (offset + @sizeOf(Elf64_Shdr) > elf_bytes.len) return null;
-    return @as(*const Elf64_Shdr, @ptrCast(@alignCast(elf_bytes[offset..][0..@sizeOf(Elf64_Shdr)])));
+    return std.mem.bytesToValue(Elf64_Shdr, elf_bytes[offset..][0..@sizeOf(Elf64_Shdr)]);
 }
 
 fn sectionBytes(elf_bytes: []const u8, shdr: *const Elf64_Shdr) ?[]const u8 {
