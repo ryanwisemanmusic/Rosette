@@ -66,6 +66,9 @@ pub const Op = enum(u8) {
     // sub r/m, imm8 (80 /5)
     sub_mem8_imm8,
     sub_reg8_imm8,
+    sub_reg16_imm8,
+    sub_reg32_imm8,
+    sub_reg64_imm8,
     // cmp r/m, r
     cmp_mem8_reg8,
     cmp_mem16_reg16,
@@ -150,6 +153,14 @@ pub const Op = enum(u8) {
     imul_reg64_reg64_imm8,
     imul_reg32_mem32_imm8,
     imul_reg32_reg32_imm8,
+    // stack / calls
+    call_rel32,
+    ret,
+    push_reg,
+    push_mem64,
+    push_imm,
+    pop_reg,
+    pop_mem64,
     // sign extend
     cbw,
     cwde,

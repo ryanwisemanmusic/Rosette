@@ -2,7 +2,7 @@ const flags = @import("flags.zig");
 
 pub const OperandSize = flags.OperandSize;
 
-pub const RegId = enum(u3) {
+pub const RegId = enum(u4) {
     al_ax_eax_rax = 0,
     cl_cx_ecx_rcx = 1,
     dl_dx_edx_rdx = 2,
@@ -11,9 +11,18 @@ pub const RegId = enum(u3) {
     ch_bp_ebp_rbp = 5,
     dh_si_esi_rsi = 6,
     bh_di_edi_rdi = 7,
+    r8b_r8w_r8d_r8 = 8,
+    r9b_r9w_r9d_r9 = 9,
+    r10b_r10w_r10d_r10 = 10,
+    r11b_r11w_r11d_r11 = 11,
+    r12b_r12w_r12d_r12 = 12,
+    r13b_r13w_r13d_r13 = 13,
+    r14b_r14w_r14d_r14 = 14,
+    r15b_r15w_r15d_r15 = 15,
 
     pub fn highByte(self: RegId) bool {
-        return @intFromEnum(self) >= 4;
+        _ = self;
+        return false;
     }
 };
 
@@ -55,6 +64,14 @@ pub fn regVal(regs: *const Regs, id: RegId, size: OperandSize) u64 {
         5 => regs.rbp,
         6 => regs.rsi,
         7 => regs.rdi,
+        8 => regs.r8,
+        9 => regs.r9,
+        10 => regs.r10,
+        11 => regs.r11,
+        12 => regs.r12,
+        13 => regs.r13,
+        14 => regs.r14,
+        15 => regs.r15,
         else => unreachable,
     };
     return switch (size) {
@@ -76,6 +93,14 @@ pub fn setReg(regs: *Regs, id: RegId, size: OperandSize, val: u64) void {
         5 => regs.rbp,
         6 => regs.rsi,
         7 => regs.rdi,
+        8 => regs.r8,
+        9 => regs.r9,
+        10 => regs.r10,
+        11 => regs.r11,
+        12 => regs.r12,
+        13 => regs.r13,
+        14 => regs.r14,
+        15 => regs.r15,
         else => unreachable,
     };
     const new = switch (size) {
@@ -93,6 +118,14 @@ pub fn setReg(regs: *Regs, id: RegId, size: OperandSize, val: u64) void {
         5 => regs.rbp = new,
         6 => regs.rsi = new,
         7 => regs.rdi = new,
+        8 => regs.r8 = new,
+        9 => regs.r9 = new,
+        10 => regs.r10 = new,
+        11 => regs.r11 = new,
+        12 => regs.r12 = new,
+        13 => regs.r13 = new,
+        14 => regs.r14 = new,
+        15 => regs.r15 = new,
         else => unreachable,
     }
 }
@@ -101,4 +134,12 @@ test "32-bit register writes zero-extend into 64-bit parent" {
     var regs = Regs{ .rax = 0xffff_ffff_ffff_ffff };
     setReg(&regs, .al_ax_eax_rax, .bits32, 0x1234);
     try @import("std").testing.expectEqual(@as(u64, 0x1234), regs.rax);
+}
+
+test "extended registers preserve independent storage" {
+    var regs = Regs{};
+    setReg(&regs, .r12b_r12w_r12d_r12, .bits64, 0x1122_3344_5566_7788);
+    setReg(&regs, .r15b_r15w_r15d_r15, .bits32, 0xaabb_ccdd);
+    try @import("std").testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), regVal(&regs, .r12b_r12w_r12d_r12, .bits64));
+    try @import("std").testing.expectEqual(@as(u64, 0xaabb_ccdd), regs.r15);
 }
