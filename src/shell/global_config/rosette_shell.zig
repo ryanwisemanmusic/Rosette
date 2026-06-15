@@ -853,9 +853,6 @@ fn scoreAssemblyFiles(
             score.* += 1;
             try addSignal(signals, allocator, "asm:syscall");
         }
-        if (containsIgnoreCase(data, "Ans") or containsIgnoreCase(data, "Rem")) {
-            try addSignal(signals, allocator, "asm:answer-symbols");
-        }
     }
 }
 
@@ -1687,8 +1684,8 @@ fn shouldEnableResultDump(config: ShellConfig, detection: Detection, make_args: 
         .off => false,
         .on => true,
         .auto => makeArgsRequestRun(make_args) and
-            containsIgnoreCase(detection.kind, "yasm-linux-elf64") and
-            containsIgnoreCase(detection.signals, "asm:answer-symbols"),
+            detection.detected and
+            containsIgnoreCase(detection.kind, "yasm-linux-elf64"),
     };
 }
 
@@ -1697,8 +1694,7 @@ fn shouldEnableDirectResultDump(config: ShellConfig, detection: Detection) bool 
         .off => false,
         .on => true,
         .auto => detection.detected and
-            containsIgnoreCase(detection.kind, "yasm-linux-elf64") and
-            containsIgnoreCase(detection.signals, "asm:answer-symbols"),
+            containsIgnoreCase(detection.kind, "yasm-linux-elf64"),
     };
 }
 
@@ -2495,13 +2491,13 @@ test "shell config parser accepts TOML and uppercase aliases" {
     try std.testing.expect(!config.elf_dump_all_results);
 }
 
-test "auto result dump only triggers for run targets with answer symbols" {
+test "auto result dump triggers for detected yasm elf64 run targets" {
     const config = ShellConfig{ .elf_dump_results = .auto };
     const detected = Detection{
         .detected = true,
         .score = 8,
         .kind = "yasm-linux-elf64",
-        .signals = "makefile:yasm-elf64,asm:answer-symbols",
+        .signals = "makefile:yasm-elf64,asm:text-section,asm:globals",
     };
     const run_args = [_][]const u8{"run"};
     const build_args = [_][]const u8{};
@@ -2509,13 +2505,13 @@ test "auto result dump only triggers for run targets with answer symbols" {
     try std.testing.expect(!shouldEnableResultDump(config, detected, &build_args));
 }
 
-test "direct ELF result dump triggers for detected answer projects" {
+test "direct ELF result dump triggers for detected yasm elf64 projects" {
     const config = ShellConfig{ .elf_dump_results = .auto };
     const detected = Detection{
         .detected = true,
         .score = 8,
         .kind = "yasm-linux-elf64",
-        .signals = "makefile:yasm-elf64,asm:answer-symbols",
+        .signals = "makefile:yasm-elf64,asm:text-section,asm:globals",
     };
     const generic = Detection{
         .detected = false,
