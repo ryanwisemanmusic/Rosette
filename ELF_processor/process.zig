@@ -477,6 +477,27 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, .bits8, r);
                 self.setFlagsSub(a, d.imm, r, .bits8);
             },
+            .sub_reg16_imm8 => {
+                const a = self.regVal(d.dst_reg, .bits16);
+                const imm = signExtendImm8(d.imm);
+                const r = a -% imm;
+                self.setReg(d.dst_reg, .bits16, r);
+                self.setFlagsSub(a, imm, r, .bits16);
+            },
+            .sub_reg32_imm8 => {
+                const a = self.regVal(d.dst_reg, .bits32);
+                const imm = signExtendImm8(d.imm);
+                const r = a -% imm;
+                self.setReg(d.dst_reg, .bits32, r);
+                self.setFlagsSub(a, imm, r, .bits32);
+            },
+            .sub_reg64_imm8 => {
+                const a = self.regVal(d.dst_reg, .bits64);
+                const imm = signExtendImm8(d.imm);
+                const r = a -% imm;
+                self.setReg(d.dst_reg, .bits64, r);
+                self.setFlagsSub(a, imm, r, .bits64);
+            },
             .sub_mem8_imm8 => {
                 const a = self.readMemVal(d.addr, .bits8);
                 const r = a -% d.imm;
@@ -1140,6 +1161,36 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, .bits32, @as(u32, @bitCast(r)));
             },
 
+            // ── Stack and calls ──
+            .call_rel32 => {
+                const next_rip = self.regs.rip + d.len;
+                const rel = @as(i64, @bitCast(d.imm));
+                const target = @as(i64, @bitCast(self.regs.rip)) + @as(i64, d.len) + rel;
+                self.push(next_rip);
+                self.regs.rip = @as(u64, @bitCast(target));
+                return;
+            },
+            .ret => {
+                self.regs.rip = self.pop();
+                return;
+            },
+            .push_reg => {
+                self.push(self.regVal(d.src_reg, .bits64));
+            },
+            .push_mem64 => {
+                self.push(self.readMemVal(d.addr, .bits64));
+            },
+            .push_imm => {
+                self.push(d.imm);
+            },
+            .pop_reg => {
+                self.setReg(d.dst_reg, .bits64, self.pop());
+            },
+            .pop_mem64 => {
+                const val = self.pop();
+                self.writeMemVal(d.addr, .bits64, val);
+            },
+
             // ── Jump short rel8 ──
             .jmp_rel8 => {
                 const target = @as(i64, @bitCast(self.regs.rip)) + d.len + @as(i64, @bitCast(d.imm));
@@ -1243,7 +1294,64 @@ fn rexB(rex: u8) bool {
     return rex & 0x01 != 0;
 }
 
-fn parseSib(bytes: []const u8, pos: *usize, mod: u3) ?struct { addr: u64, sib_has_index: bool, sib_index_reg: RegId, sib_scale: u2, sib_has_base: bool, sib_base_reg: RegId } {
+fn regId(code: u8, extended: bool) RegId {
+    const value: u4 = @as(u4, @truncate(code)) | if (extended) @as(u4, 8) else @as(u4, 0);
+    return @enumFromInt(value);
+}
+
+fn modRmReg(code: u8, rex: u8) RegId {
+    return regId(code, rexR(rex));
+}
+
+fn modRmRm(code: u8, rex: u8) RegId {
+    return regId(code, rexB(rex));
+}
+
+fn signExtendImm8(imm: u64) u64 {
+    const signed: i8 = @bitCast(@as(u8, @truncate(imm)));
+    return @as(u64, @bitCast(@as(i64, signed)));
+}
+
+const MemRef = struct {
+    addr: u64,
+    sib_has_index: bool,
+    sib_index_reg: RegId,
+    sib_scale: u2,
+    sib_has_base: bool,
+    sib_base_reg: RegId,
+};
+
+fn parseModRmMemory(bytes: []const u8, pos: *usize, mod: u3, rm: u8, rex: u8) ?MemRef {
+    if (rm == 4) return parseSib(bytes, pos, mod, rex);
+
+    var addr: u64 = 0;
+    var has_base = true;
+    if (mod == 0 and rm == 5) {
+        if (pos.* + 4 > bytes.len) return null;
+        addr = std.mem.readInt(u32, bytes[pos.*..][0..4], .little);
+        pos.* += 4;
+        has_base = false;
+    } else if (mod == 1) {
+        if (pos.* + 1 > bytes.len) return null;
+        addr = @as(u64, @bitCast(@as(i64, std.mem.readInt(i8, bytes[pos.*..][0..1], .little))));
+        pos.* += 1;
+    } else if (mod == 2) {
+        if (pos.* + 4 > bytes.len) return null;
+        addr = std.mem.readInt(u32, bytes[pos.*..][0..4], .little);
+        pos.* += 4;
+    }
+
+    return .{
+        .addr = addr,
+        .sib_has_index = false,
+        .sib_index_reg = .al_ax_eax_rax,
+        .sib_scale = 0,
+        .sib_has_base = has_base,
+        .sib_base_reg = modRmRm(rm, rex),
+    };
+}
+
+fn parseSib(bytes: []const u8, pos: *usize, mod: u3, rex: u8) ?MemRef {
     if (pos.* >= bytes.len) return null;
     const sib_byte = bytes[pos.*];
     pos.* += 1;
@@ -1286,10 +1394,10 @@ fn parseSib(bytes: []const u8, pos: *usize, mod: u3) ?struct { addr: u64, sib_ha
     return .{
         .addr = addr,
         .sib_has_index = (index != 4),
-        .sib_index_reg = @enumFromInt(@as(u3, @truncate(index))),
+        .sib_index_reg = regId(index, rexX(rex)),
         .sib_scale = scale,
         .sib_has_base = !(mod == 0 and base == 5),
-        .sib_base_reg = @enumFromInt(@as(u3, @truncate(base))),
+        .sib_base_reg = modRmRm(base, rex),
     };
 }
 
@@ -1324,7 +1432,6 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
     pos += 1;
 
     const rex_w = rexW(rex);
-    const rex_b = rexB(rex);
 
     switch (opcode) {
         0x00...0x03 => {
@@ -1340,40 +1447,30 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
 
             const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
 
-            if (mod == 0 and rm == 4) {
-                if (pos >= bytes.len) return .{};
-                const sib_byte = bytes[pos];
-                pos += 1;
-                const sib_index = (sib_byte >> 3) & 7;
-                const sib_base = sib_byte & 7;
-                if (sib_base == 5 and sib_index == 4 and mod == 0) {
-                    if (pos + 4 > bytes.len) return .{};
-                    const addr = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                    pos += 4;
-                    if (d == 1) {
-                        const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
-                        return switch (size) {
-                            .bits8 => DecodedInsn{ .op = .add_reg8_mem8, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
-                            .bits16 => DecodedInsn{ .op = .add_reg16_mem16, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
-                            .bits32 => DecodedInsn{ .op = .add_reg32_mem32, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
-                            .bits64 => DecodedInsn{ .op = .add_reg64_mem64, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
-                        };
-                    } else {
-                        const src_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
-                        return switch (size) {
-                            .bits8 => DecodedInsn{ .op = .add_mem8_reg8, .size = size, .src_reg = src_reg, .addr = addr, .len = @intCast(pos) },
-                            .bits16 => DecodedInsn{ .op = .add_mem16_reg16, .size = size, .src_reg = src_reg, .addr = addr, .len = @intCast(pos) },
-                            .bits32 => DecodedInsn{ .op = .add_mem32_reg32, .size = size, .src_reg = src_reg, .addr = addr, .len = @intCast(pos) },
-                            .bits64 => DecodedInsn{ .op = .add_mem64_reg64, .size = size, .src_reg = src_reg, .addr = addr, .len = @intCast(pos) },
-                        };
-                    }
+            if (mod != 3 and rm == 4) {
+                const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod)), rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                if (d == 1) {
+                    const dst_reg = modRmReg(reg, rex);
+                    return switch (size) {
+                        .bits8 => DecodedInsn{ .op = .add_reg8_mem8, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .add_reg16_mem16, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .add_reg32_mem32, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .add_reg64_mem64, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                    };
+                } else {
+                    const src_reg = modRmReg(reg, rex);
+                    return switch (size) {
+                        .bits8 => DecodedInsn{ .op = .add_mem8_reg8, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .add_mem16_reg16, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .add_mem32_reg32, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .add_mem64_reg64, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
+                    };
                 }
-                return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
             }
 
             if (mod == 3) {
-                const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(if (d == 1) reg else rm)));
-                const src_reg: RegId = @enumFromInt(@as(u3, @truncate(if (d == 1) rm else reg)));
+                const dst_reg = if (d == 1) modRmReg(reg, rex) else modRmRm(rm, rex);
+                const src_reg = if (d == 1) modRmRm(rm, rex) else modRmReg(reg, rex);
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .add_reg8_reg8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .add_reg16_reg16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
@@ -1407,7 +1504,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     if (pos + 4 > bytes.len) return .{};
                     const addr = std.mem.readInt(u32, bytes[pos..][0..4], .little);
                     pos += 4;
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(if (rex_b) reg | 8 else reg)));
+                    const dst_reg = modRmReg(reg, rex);
                     return switch (size) {
                         .bits8 => DecodedInsn{ .op = .sub_reg8_mem8, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
                         .bits16 => DecodedInsn{ .op = .sub_reg16_mem16, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
@@ -1418,8 +1515,8 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             }
 
             if (mod == 3) {
-                const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(if (d == 1) reg else rm)));
-                const src_reg: RegId = @enumFromInt(@as(u3, @truncate(if (d == 1) rm else reg)));
+                const dst_reg = if (d == 1) modRmReg(reg, rex) else modRmRm(rm, rex);
+                const src_reg = if (d == 1) modRmRm(rm, rex) else modRmReg(reg, rex);
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .sub_reg8_reg8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .sub_reg16_reg16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
@@ -1444,8 +1541,8 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
 
             if (mod_v == 3) {
-                const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(if (d == 1) reg else rm)));
-                const src_reg: RegId = @enumFromInt(@as(u3, @truncate(if (d == 1) rm else reg)));
+                const dst_reg = if (d == 1) modRmReg(reg, rex) else modRmRm(rm, rex);
+                const src_reg = if (d == 1) modRmRm(rm, rex) else modRmReg(reg, rex);
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .cmp_reg8_reg8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .cmp_reg16_reg16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
@@ -1455,10 +1552,10 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             }
 
             if (rm == 4) {
-                const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v)), rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                 if (d == 0) {
                     // cmp r/m, r: source is reg, dst is [addr]
-                    const src_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+                    const src_reg = modRmReg(reg, rex);
                     return switch (size) {
                         .bits8 => DecodedInsn{ .op = .cmp_mem8_reg8, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
                         .bits16 => DecodedInsn{ .op = .cmp_mem16_reg16, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
@@ -1467,7 +1564,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     };
                 } else {
                     // cmp reg, r/m: dst is reg, source is [addr]
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+                    const dst_reg = modRmReg(reg, rex);
                     return switch (size) {
                         .bits8 => DecodedInsn{ .op = .cmp_reg8_mem8, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
                         .bits16 => DecodedInsn{ .op = .cmp_reg16_mem16, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
@@ -1492,12 +1589,45 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             if (mod_v == 3) {
                 return DecodedInsn{
                     .op = .movsxd_reg64_reg32,
-                    .dst_reg = @enumFromInt(@as(u3, @truncate(reg))),
-                    .src_reg = @enumFromInt(@as(u3, @truncate(if (rex_b) rm | 8 else rm))),
+                    .dst_reg = modRmReg(reg, rex),
+                    .src_reg = modRmRm(rm, rex),
                     .len = @intCast(pos),
                 };
             }
             return .{};
+        },
+
+        0x50...0x57 => {
+            // PUSH r64
+            return DecodedInsn{
+                .op = .push_reg,
+                .size = .bits64,
+                .src_reg = regId(opcode - 0x50, rexB(rex)),
+                .len = @intCast(pos),
+            };
+        },
+
+        0x58...0x5F => {
+            // POP r64
+            return DecodedInsn{
+                .op = .pop_reg,
+                .size = .bits64,
+                .dst_reg = regId(opcode - 0x58, rexB(rex)),
+                .len = @intCast(pos),
+            };
+        },
+
+        0x68 => {
+            // PUSH imm32, sign-extended to stack width.
+            if (pos + 4 > bytes.len) return .{};
+            const imm = std.mem.readInt(i32, bytes[pos..][0..4], .little);
+            pos += 4;
+            return DecodedInsn{
+                .op = .push_imm,
+                .size = .bits64,
+                .imm = @as(u64, @bitCast(@as(i64, imm))),
+                .len = @intCast(pos),
+            };
         },
 
         0x6B => {
@@ -1508,7 +1638,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const mod_v = modrm >> 6;
             const reg = (modrm >> 3) & 7;
             const rm = modrm & 7;
-            const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+            const dst_reg = modRmReg(reg, rex);
             if (pos >= bytes.len) return .{};
             const imm = bytes[pos];
             pos += 1;
@@ -1530,7 +1660,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     };
                 }
             } else if (mod_v == 3) {
-                const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                const src_reg = modRmRm(rm, rex);
                 return switch (size) {
                     .bits32 => DecodedInsn{ .op = .imul_reg32_reg32_imm8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .imm = imm, .len = @intCast(pos) },
                     .bits64 => DecodedInsn{ .op = .imul_reg64_reg64_imm8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .imm = imm, .len = @intCast(pos) },
@@ -1538,6 +1668,19 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
             return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+        },
+
+        0x6A => {
+            // PUSH imm8, sign-extended to stack width.
+            if (pos >= bytes.len) return .{};
+            const imm = std.mem.readInt(i8, bytes[pos..][0..1], .little);
+            pos += 1;
+            return DecodedInsn{
+                .op = .push_imm,
+                .size = .bits64,
+                .imm = @as(u64, @bitCast(@as(i64, imm))),
+                .len = @intCast(pos),
+            };
         },
 
         0x70...0x7F => {
@@ -1570,7 +1713,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 if (pos >= bytes.len) return .{};
                 const imm = bytes[pos];
                 pos += 1;
-                const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                const dst_reg = modRmRm(rm, rex);
                 return switch (reg_field) {
                     5 => DecodedInsn{ .op = .sub_reg8_imm8, .size = .bits8, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
                     7 => DecodedInsn{ .op = .cmp_reg8_imm8, .size = .bits8, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
@@ -1578,8 +1721,8 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
 
-            if (rm == 4) {
-                const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            if (mod_v != 3) {
+                const sib_info = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                 if (pos >= bytes.len) return .{};
                 const imm = bytes[pos];
                 pos += 1;
@@ -1590,21 +1733,12 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
 
-            // Non-SIB memory addressing: use sib_has_base to let decodeAt resolve the register
-            if (pos >= bytes.len) return .{};
-            const imm = bytes[pos];
-            pos += 1;
-            const base_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
-            return switch (reg_field) {
-                5 => DecodedInsn{ .op = .sub_mem8_imm8, .size = .bits8, .imm = imm, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                7 => DecodedInsn{ .op = .cmp_mem8_imm8, .size = .bits8, .imm = imm, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
-            };
+            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
         },
 
         0x83 => {
             // Group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP with imm8 sign-extended
-            // We only handle /7 (CMP) for now
+            // /5 = SUB, /7 = CMP
             if (pos >= bytes.len) return .{};
             const modrm = bytes[pos];
             pos += 1;
@@ -1613,14 +1747,19 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const rm = modrm & 7;
             const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else .bits32;
 
-            if (reg_field != 7) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            if (reg_field != 5 and reg_field != 7) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
 
             if (mod_v == 3) {
                 if (pos >= bytes.len) return .{};
                 const imm = bytes[pos];
                 pos += 1;
-                const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
-                return switch (size) {
+                const dst_reg = modRmRm(rm, rex);
+                return if (reg_field == 5) switch (size) {
+                    .bits8 => DecodedInsn{ .op = .sub_reg8_imm8, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                    .bits16 => DecodedInsn{ .op = .sub_reg16_imm8, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                    .bits32 => DecodedInsn{ .op = .sub_reg32_imm8, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                    .bits64 => DecodedInsn{ .op = .sub_reg64_imm8, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                } else switch (size) {
                     .bits8 => DecodedInsn{ .op = .cmp_reg8_imm8, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .cmp_reg16_imm8, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
                     .bits32 => DecodedInsn{ .op = .cmp_reg32_imm8, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
@@ -1628,11 +1767,12 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
 
-            if (rm == 4) {
-                const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            if (mod_v != 3) {
+                const sib_info = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                 if (pos >= bytes.len) return .{};
                 const imm = bytes[pos];
                 pos += 1;
+                if (reg_field == 5) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .cmp_mem8_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .cmp_mem16_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
@@ -1641,17 +1781,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
 
-            // Non-SIB memory addressing
-            if (pos >= bytes.len) return .{};
-            const imm = bytes[pos];
-            pos += 1;
-            const base_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
-            return switch (size) {
-                .bits8 => DecodedInsn{ .op = .cmp_mem8_imm8, .size = size, .imm = imm, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                .bits16 => DecodedInsn{ .op = .cmp_mem16_imm8, .size = size, .imm = imm, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                .bits32 => DecodedInsn{ .op = .cmp_mem32_imm8, .size = size, .imm = imm, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                .bits64 => DecodedInsn{ .op = .cmp_mem64_imm8, .size = size, .imm = imm, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-            };
+            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
         },
 
         0x88, 0x89 => {
@@ -1665,10 +1795,10 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const w = opcode & 1;
 
             const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
-            const src_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+            const src_reg = modRmReg(reg, rex);
 
             if (mod_v == 3) {
-                const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                const dst_reg = modRmRm(rm, rex);
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .mov_reg8_reg8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .mov_reg16_reg16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
@@ -1677,8 +1807,8 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
 
-            if (rm == 4) {
-                const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            if (mod_v != 3) {
+                const sib_info = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .mov_mem8_reg8, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .mov_mem16_reg16, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
@@ -1701,10 +1831,10 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const w = opcode & 1;
 
             const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
-            const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+            const dst_reg = modRmReg(reg, rex);
 
             if (mod_v == 3) {
-                const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                const src_reg = modRmRm(rm, rex);
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .mov_reg8_mem8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .mov_reg16_mem16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
@@ -1713,8 +1843,8 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
 
-            if (rm == 4) {
-                const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            if (mod_v != 3) {
+                const sib_info = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                 return switch (size) {
                     .bits8 => DecodedInsn{ .op = .mov_reg8_mem8, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
                     .bits16 => DecodedInsn{ .op = .mov_reg16_mem16, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) },
@@ -1723,14 +1853,31 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 };
             }
 
-            // Non-SIB memory addressing
-            const base_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
-            return switch (size) {
-                .bits8 => DecodedInsn{ .op = .mov_reg8_mem8, .size = size, .dst_reg = dst_reg, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                .bits16 => DecodedInsn{ .op = .mov_reg16_mem16, .size = size, .dst_reg = dst_reg, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                .bits32 => DecodedInsn{ .op = .mov_reg32_mem32, .size = size, .dst_reg = dst_reg, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-                .bits64 => DecodedInsn{ .op = .mov_reg64_mem64, .size = size, .dst_reg = dst_reg, .sib_has_base = true, .sib_base_reg = base_reg, .len = @intCast(pos) },
-            };
+            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+        },
+
+        0x8F => {
+            // POP r/m64 (Group 1, /0)
+            if (pos >= bytes.len) return .{};
+            const modrm = bytes[pos];
+            pos += 1;
+            const mod_v = modrm >> 6;
+            const reg_field = (modrm >> 3) & 7;
+            const rm = modrm & 7;
+
+            if (reg_field != 0) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+
+            if (mod_v == 3) {
+                return DecodedInsn{
+                    .op = .pop_reg,
+                    .size = .bits64,
+                    .dst_reg = modRmRm(rm, rex),
+                    .len = @intCast(pos),
+                };
+            }
+
+            const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            return DecodedInsn{ .op = .pop_mem64, .size = .bits64, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) };
         },
 
         0x98 => {
@@ -1763,17 +1910,17 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
 
         0xB0...0xB7 => {
             // MOV r8, imm8
-            const reg: RegId = @enumFromInt(@as(u3, @truncate(opcode - 0xB0)));
+            const reg = regId(opcode - 0xB0, rexB(rex));
             if (pos >= bytes.len) return .{};
             const imm = bytes[pos];
             pos += 1;
             return DecodedInsn{ .op = .mov_reg_imm, .size = .bits8, .dst_reg = reg, .imm = imm, .len = @intCast(pos) };
         },
 
-        0xB8, 0xB9, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF => {
+        0xB8...0xBF => {
             // MOV r, imm32 (with REX.W: imm32 sign-extended)
             const reg_bits = opcode - 0xB8;
-            const reg: RegId = @enumFromInt(@as(u3, @truncate(reg_bits)));
+            const reg = regId(reg_bits, rexB(rex));
             if (has_66) {
                 if (pos + 2 > bytes.len) return .{};
                 const imm = std.mem.readInt(u16, bytes[pos..][0..2], .little);
@@ -1789,24 +1936,6 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 const imm = std.mem.readInt(u32, bytes[pos..][0..4], .little);
                 pos += 4;
                 return DecodedInsn{ .op = .mov_reg_imm, .size = .bits32, .dst_reg = reg, .imm = imm, .len = @intCast(pos) };
-            }
-        },
-
-        0xBA => {
-            // MOV DX/EDX/RDX, imm
-            if (pos + 4 > bytes.len) return .{};
-            if (has_66) {
-                const imm = std.mem.readInt(u16, bytes[pos..][0..2], .little);
-                pos += 2;
-                return DecodedInsn{ .op = .mov_reg_imm, .size = .bits16, .dst_reg = .dl_dx_edx_rdx, .imm = imm, .len = @intCast(pos) };
-            } else if (rex_w) {
-                const imm = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                pos += 4;
-                return DecodedInsn{ .op = .mov_reg_imm, .size = .bits64, .dst_reg = .dl_dx_edx_rdx, .imm = imm, .len = @intCast(pos) };
-            } else {
-                const imm = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                pos += 4;
-                return DecodedInsn{ .op = .mov_reg_imm, .size = .bits32, .dst_reg = .dl_dx_edx_rdx, .imm = imm, .len = @intCast(pos) };
             }
         },
 
@@ -1831,40 +1960,36 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 return DecodedInsn{
                     .op = .mov_reg_imm,
                     .size = size,
-                    .dst_reg = @enumFromInt(@as(u3, @truncate(rm))),
+                    .dst_reg = modRmRm(rm, rex),
                     .imm = if (size == .bits64) @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(imm))))) else imm,
                     .len = @intCast(pos),
                 };
             }
 
             // Memory form
-            if (mod_v == 0 and rm == 4) {
-                if (pos >= bytes.len) return .{};
-                const sib = bytes[pos];
-                pos += 1;
-                const base = sib & 7;
-                const sib_index = (sib >> 3) & 7;
-                if (base == 5 and sib_index == 4) {
-                    if (pos + 4 > bytes.len) return .{};
-                    const addr = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                    pos += 4;
-                    const imm_len: usize = if (size == .bits16) 2 else 4;
-                    if (pos + imm_len > bytes.len) return .{};
-                    const imm = if (size == .bits16)
-                        @as(u64, std.mem.readInt(u16, bytes[pos..][0..2], .little))
-                    else
-                        @as(u64, std.mem.readInt(u32, bytes[pos..][0..4], .little));
-                    pos += imm_len;
-                    return switch (size) {
-                        .bits16 => DecodedInsn{ .op = .mov_mem16_imm16, .size = size, .addr = addr, .imm = imm, .len = @intCast(pos) },
-                        .bits32 => DecodedInsn{ .op = .mov_mem32_imm32, .size = size, .addr = addr, .imm = imm, .len = @intCast(pos) },
-                        .bits64 => DecodedInsn{ .op = .mov_mem64_imm32, .size = size, .addr = addr, .imm = imm, .len = @intCast(pos) },
-                        else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
-                    };
-                }
+            if (mod_v != 3) {
+                const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                const imm_len: usize = if (size == .bits16) 2 else 4;
+                if (pos + imm_len > bytes.len) return .{};
+                const imm = if (size == .bits16)
+                    @as(u64, std.mem.readInt(u16, bytes[pos..][0..2], .little))
+                else
+                    @as(u64, std.mem.readInt(u32, bytes[pos..][0..4], .little));
+                pos += imm_len;
+                return switch (size) {
+                    .bits16 => DecodedInsn{ .op = .mov_mem16_imm16, .size = size, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits32 => DecodedInsn{ .op = .mov_mem32_imm32, .size = size, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits64 => DecodedInsn{ .op = .mov_mem64_imm32, .size = size, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
+                };
             }
 
             return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+        },
+
+        0xC3 => {
+            // RET near
+            return DecodedInsn{ .op = .ret, .len = @intCast(pos) };
         },
 
         0xE8 => {
@@ -1872,9 +1997,23 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             if (pos + 4 > bytes.len) return .{};
             const rel = std.mem.readInt(i32, bytes[pos..][0..4], .little);
             pos += 4;
-            _ = rel;
-            // Not supported yet
-            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            return DecodedInsn{
+                .op = .call_rel32,
+                .imm = @as(u64, @bitCast(@as(i64, rel))),
+                .len = @intCast(pos),
+            };
+        },
+
+        0xE9 => {
+            // JMP rel32
+            if (pos + 4 > bytes.len) return .{};
+            const rel = std.mem.readInt(i32, bytes[pos..][0..4], .little);
+            pos += 4;
+            return DecodedInsn{
+                .op = .jmp_rel8,
+                .imm = @as(u64, @bitCast(@as(i64, rel))),
+                .len = @intCast(pos),
+            };
         },
 
         0xEB => {
@@ -1902,7 +2041,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             if (reg_field == 0 or reg_field == 1) {
                 const is_inc = reg_field == 0;
                 if (mod_v == 3) {
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                    const dst_reg = modRmRm(rm, rex);
                     return if (is_inc) switch (size) {
                         .bits8 => DecodedInsn{ .op = .inc_reg8, .size = size, .dst_reg = dst_reg, .len = @intCast(pos) },
                         .bits16 => DecodedInsn{ .op = .inc_reg16, .size = size, .dst_reg = dst_reg, .len = @intCast(pos) },
@@ -1914,29 +2053,32 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                         .bits32 => DecodedInsn{ .op = .dec_reg32, .size = size, .dst_reg = dst_reg, .len = @intCast(pos) },
                         .bits64 => DecodedInsn{ .op = .dec_reg64, .size = size, .dst_reg = dst_reg, .len = @intCast(pos) },
                     };
-                } else if (mod_v == 0 and rm == 4) {
-                    if (pos >= bytes.len) return .{};
-                    const sib = bytes[pos];
-                    pos += 1;
-                    const base = sib & 7;
-                    const sib_idx = (sib >> 3) & 7;
-                    if (base == 5 and sib_idx == 4) {
-                        if (pos + 4 > bytes.len) return .{};
-                        const addr = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                        pos += 4;
-                        return if (is_inc) switch (size) {
-                            .bits8 => DecodedInsn{ .op = .inc_mem8, .size = size, .addr = addr, .len = @intCast(pos) },
-                            .bits16 => DecodedInsn{ .op = .inc_mem16, .size = size, .addr = addr, .len = @intCast(pos) },
-                            .bits32 => DecodedInsn{ .op = .inc_mem32, .size = size, .addr = addr, .len = @intCast(pos) },
-                            .bits64 => DecodedInsn{ .op = .inc_mem64, .size = size, .addr = addr, .len = @intCast(pos) },
-                        } else switch (size) {
-                            .bits8 => DecodedInsn{ .op = .dec_mem8, .size = size, .addr = addr, .len = @intCast(pos) },
-                            .bits16 => DecodedInsn{ .op = .dec_mem16, .size = size, .addr = addr, .len = @intCast(pos) },
-                            .bits32 => DecodedInsn{ .op = .dec_mem32, .size = size, .addr = addr, .len = @intCast(pos) },
-                            .bits64 => DecodedInsn{ .op = .dec_mem64, .size = size, .addr = addr, .len = @intCast(pos) },
-                        };
-                    }
                 }
+                const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                return if (is_inc) switch (size) {
+                    .bits8 => DecodedInsn{ .op = .inc_mem8, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits16 => DecodedInsn{ .op = .inc_mem16, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits32 => DecodedInsn{ .op = .inc_mem32, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits64 => DecodedInsn{ .op = .inc_mem64, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                } else switch (size) {
+                    .bits8 => DecodedInsn{ .op = .dec_mem8, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits16 => DecodedInsn{ .op = .dec_mem16, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits32 => DecodedInsn{ .op = .dec_mem32, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    .bits64 => DecodedInsn{ .op = .dec_mem64, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                };
+            }
+
+            if (reg_field == 6) {
+                if (mod_v == 3) {
+                    return DecodedInsn{
+                        .op = .push_reg,
+                        .size = .bits64,
+                        .src_reg = modRmRm(rm, rex),
+                        .len = @intCast(pos),
+                    };
+                }
+                const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                return DecodedInsn{ .op = .push_mem64, .size = .bits64, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) };
             }
 
             return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
@@ -1953,52 +2095,38 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const w = opcode & 1;
             const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
 
-            if (mod_v == 0) {
-                if (rm == 4) {
-                    // SIB follows: expected 04 25 [addr] pattern
-                    if (pos >= bytes.len) return .{};
-                    const sib_byte = bytes[pos];
-                    pos += 1;
-                    const base = sib_byte & 7;
-                    const index = (sib_byte >> 3) & 7;
-                    if (base == 5 and index == 4) {
-                        // [abs32] addressing
-                        if (pos + 4 > bytes.len) return .{};
-                        const addr = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                        pos += 4;
-
-                        return switch (reg_field) {
-                            4 => switch (size) {
-                                .bits8 => DecodedInsn{ .op = .mul_mem8, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits16 => DecodedInsn{ .op = .mul_mem16, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits32 => DecodedInsn{ .op = .mul_mem32, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits64 => DecodedInsn{ .op = .mul_mem64, .size = size, .addr = addr, .len = @intCast(pos) },
-                            },
-                            5 => switch (size) {
-                                .bits8 => DecodedInsn{ .op = .imul_mem8, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits16 => DecodedInsn{ .op = .imul_mem16, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits32 => DecodedInsn{ .op = .imul_mem32, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits64 => DecodedInsn{ .op = .imul_mem64, .size = size, .addr = addr, .len = @intCast(pos) },
-                            },
-                            6 => switch (size) {
-                                .bits8 => DecodedInsn{ .op = .div_mem8, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits16 => DecodedInsn{ .op = .div_mem16, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits32 => DecodedInsn{ .op = .div_mem32, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits64 => DecodedInsn{ .op = .div_mem64, .size = size, .addr = addr, .len = @intCast(pos) },
-                            },
-                            7 => switch (size) {
-                                .bits8 => DecodedInsn{ .op = .idiv_mem8, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits16 => DecodedInsn{ .op = .idiv_mem16, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits32 => DecodedInsn{ .op = .idiv_mem32, .size = size, .addr = addr, .len = @intCast(pos) },
-                                .bits64 => DecodedInsn{ .op = .idiv_mem64, .size = size, .addr = addr, .len = @intCast(pos) },
-                            },
-                            else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
-                        };
-                    }
-                }
-            } else if (mod_v == 3) {
+            if (mod_v != 3) {
+                const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                return switch (reg_field) {
+                    4 => switch (size) {
+                        .bits8 => DecodedInsn{ .op = .mul_mem8, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .mul_mem16, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .mul_mem32, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .mul_mem64, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    },
+                    5 => switch (size) {
+                        .bits8 => DecodedInsn{ .op = .imul_mem8, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .imul_mem16, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .imul_mem32, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .imul_mem64, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    },
+                    6 => switch (size) {
+                        .bits8 => DecodedInsn{ .op = .div_mem8, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .div_mem16, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .div_mem32, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .div_mem64, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    },
+                    7 => switch (size) {
+                        .bits8 => DecodedInsn{ .op = .idiv_mem8, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .idiv_mem16, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .idiv_mem32, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .idiv_mem64, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                    },
+                    else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
+                };
+            } else {
                 // Register form: Group 3 with register operand
-                const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                const src_reg = modRmRm(rm, rex);
                 return switch (reg_field) {
                     4 => switch (size) {
                         .bits8 => DecodedInsn{ .op = .mul_reg8, .size = size, .src_reg = src_reg, .len = @intCast(pos) },
@@ -2027,8 +2155,6 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
                 };
             }
-
-            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
         },
 
         0x0F => {
@@ -2048,34 +2174,24 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     const mod_v = modrm >> 6;
                     const reg = (modrm >> 3) & 7;
                     const rm = modrm & 7;
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+                    const dst_reg = modRmReg(reg, rex);
                     const size: Size = if (rex_w) .bits64 else .bits32;
 
-                    if (mod_v == 0 and rm == 4) {
-                        if (pos >= bytes.len) return .{};
-                        const sib = bytes[pos];
-                        pos += 1;
-                        const base = sib & 7;
-                        const sib_idx = (sib >> 3) & 7;
-                        if (base == 5 and sib_idx == 4) {
-                            if (pos + 4 > bytes.len) return .{};
-                            const addr = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                            pos += 4;
-                            return switch (size) {
-                                .bits32 => DecodedInsn{ .op = .imul_reg32_mem32, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
-                                .bits64 => DecodedInsn{ .op = .imul_reg64_mem64, .size = size, .dst_reg = dst_reg, .addr = addr, .len = @intCast(pos) },
-                                else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
-                            };
-                        }
-                    } else if (mod_v == 3) {
-                        const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                    if (mod_v == 3) {
+                        const src_reg = modRmRm(rm, rex);
                         return switch (size) {
                             .bits32 => DecodedInsn{ .op = .imul_reg32_reg32, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
                             .bits64 => DecodedInsn{ .op = .imul_reg64_reg64, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
                             else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
                         };
                     }
-                    return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+
+                    const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return switch (size) {
+                        .bits32 => DecodedInsn{ .op = .imul_reg32_mem32, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .imul_reg64_mem64, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) },
+                        else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
+                    };
                 },
                 0xB6 => {
                     // MOVZX r32, r/m8
@@ -2085,17 +2201,14 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     const mod_v = modrm >> 6;
                     const reg = (modrm >> 3) & 7;
                     const rm = modrm & 7;
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+                    const dst_reg = modRmReg(reg, rex);
                     const size: Size = if (rex_w) .bits64 else .bits32;
                     if (mod_v == 3) {
-                        const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                        const src_reg = modRmRm(rm, rex);
                         return DecodedInsn{ .op = .movzx_reg32_mem8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .is_reg_form = true, .len = @intCast(pos) };
                     }
-                    if (rm == 4) {
-                        const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-                        return DecodedInsn{ .op = .movzx_reg32_mem8, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) };
-                    }
-                    return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return DecodedInsn{ .op = .movzx_reg32_mem8, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) };
                 },
                 0xB7 => {
                     // MOVZX r32, r/m16
@@ -2105,17 +2218,14 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     const mod_v = modrm >> 6;
                     const reg = (modrm >> 3) & 7;
                     const rm = modrm & 7;
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+                    const dst_reg = modRmReg(reg, rex);
                     const size: Size = if (rex_w) .bits64 else .bits32;
                     if (mod_v == 3) {
-                        const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                        const src_reg = modRmRm(rm, rex);
                         return DecodedInsn{ .op = .movzx_reg32_mem16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .is_reg_form = true, .len = @intCast(pos) };
                     }
-                    if (rm == 4) {
-                        const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-                        return DecodedInsn{ .op = .movzx_reg32_mem16, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) };
-                    }
-                    return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return DecodedInsn{ .op = .movzx_reg32_mem16, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) };
                 },
                 0xBE => {
                     // MOVSX r32, r/m8
@@ -2125,17 +2235,14 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     const mod_v = modrm >> 6;
                     const reg = (modrm >> 3) & 7;
                     const rm = modrm & 7;
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+                    const dst_reg = modRmReg(reg, rex);
                     const size: Size = if (rex_w) .bits64 else .bits32;
                     if (mod_v == 3) {
-                        const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                        const src_reg = modRmRm(rm, rex);
                         return DecodedInsn{ .op = .movsx_reg32_mem8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .is_reg_form = true, .len = @intCast(pos) };
                     }
-                    if (rm == 4) {
-                        const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-                        return DecodedInsn{ .op = .movsx_reg32_mem8, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) };
-                    }
-                    return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return DecodedInsn{ .op = .movsx_reg32_mem8, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) };
                 },
                 0xBF => {
                     // MOVSX r32, r/m16
@@ -2145,17 +2252,14 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     const mod_v = modrm >> 6;
                     const reg = (modrm >> 3) & 7;
                     const rm = modrm & 7;
-                    const dst_reg: RegId = @enumFromInt(@as(u3, @truncate(reg)));
+                    const dst_reg = modRmReg(reg, rex);
                     const size: Size = if (rex_w) .bits64 else .bits32;
                     if (mod_v == 3) {
-                        const src_reg: RegId = @enumFromInt(@as(u3, @truncate(rm)));
+                        const src_reg = modRmRm(rm, rex);
                         return DecodedInsn{ .op = .movsx_reg32_mem16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .is_reg_form = true, .len = @intCast(pos) };
                     }
-                    if (rm == 4) {
-                        const sib_info = parseSib(bytes, &pos, @as(u3, @truncate(mod_v))) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-                        return DecodedInsn{ .op = .movsx_reg32_mem16, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .len = @intCast(pos) };
-                    }
-                    return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return DecodedInsn{ .op = .movsx_reg32_mem16, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .len = @intCast(pos) };
                 },
                 else => return DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
             }
@@ -2381,6 +2485,48 @@ test "decode 0x0F 0x05 (syscall)" {
     var bytes: [2]u8 = [_]u8{ 0x0F, 0x05 };
     const d = decodeInsn(&bytes);
     try testing.expectEqual(Op.syscall, d.op);
+}
+
+test "decode call ret and extended stack forms" {
+    var call_bytes: [5]u8 = [_]u8{ 0xE8, 0x64, 0x01, 0x00, 0x00 };
+    var d = decodeInsn(&call_bytes);
+    try testing.expectEqual(Op.call_rel32, d.op);
+    try testing.expectEqual(@as(u8, 5), d.len);
+    try testing.expectEqual(@as(u64, 0x164), d.imm);
+
+    d = decodeInsn(&[_]u8{0xC3});
+    try testing.expectEqual(Op.ret, d.op);
+
+    d = decodeInsn(&[_]u8{ 0x41, 0x54 });
+    try testing.expectEqual(Op.push_reg, d.op);
+    try testing.expectEqual(RegId.r12b_r12w_r12d_r12, d.src_reg);
+
+    d = decodeInsn(&[_]u8{ 0x41, 0x5F });
+    try testing.expectEqual(Op.pop_reg, d.op);
+    try testing.expectEqual(RegId.r15b_r15w_r15d_r15, d.dst_reg);
+}
+
+test "decode REX-aware arithmetic and move-extension registers" {
+    var d = decodeInsn(&[_]u8{ 0x45, 0x6B, 0xFF, 0x04 });
+    try testing.expectEqual(Op.imul_reg32_reg32_imm8, d.op);
+    try testing.expectEqual(RegId.r15b_r15w_r15d_r15, d.dst_reg);
+    try testing.expectEqual(RegId.r15b_r15w_r15d_r15, d.src_reg);
+
+    d = decodeInsn(&[_]u8{ 0x41, 0xF7, 0xFD });
+    try testing.expectEqual(Op.idiv_reg32, d.op);
+    try testing.expectEqual(RegId.r13b_r13w_r13d_r13, d.src_reg);
+
+    d = decodeInsn(&[_]u8{ 0x49, 0x0F, 0xAF, 0xC5 });
+    try testing.expectEqual(Op.imul_reg64_reg64, d.op);
+    try testing.expectEqual(RegId.al_ax_eax_rax, d.dst_reg);
+    try testing.expectEqual(RegId.r13b_r13w_r13d_r13, d.src_reg);
+
+    d = decodeInsn(&[_]u8{ 0x4C, 0x0F, 0xB6, 0xEE });
+    try testing.expectEqual(Op.movzx_reg32_mem8, d.op);
+    try testing.expectEqual(Size.bits64, d.size);
+    try testing.expectEqual(RegId.r13b_r13w_r13d_r13, d.dst_reg);
+    try testing.expectEqual(RegId.dh_si_esi_rsi, d.src_reg);
+    try testing.expect(d.is_reg_form);
 }
 
 test "decode 0x48 0x63 0xDB (movsxd rbx, ebx)" {
