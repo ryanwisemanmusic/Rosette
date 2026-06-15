@@ -917,18 +917,44 @@ pub fn build(b: *std.Build) void {
 
     // ELF processor (x86-64 ELF binary loader/emulator)
     {
-        const elf_processor_mod = b.createModule(.{
-            .root_source_file = b.path("../ELF_processor/process.zig"),
+        const x64_decoder_mod = b.createModule(.{
+            .root_source_file = b.path("../src/x64-ASM/decoder.zig"),
             .target = target,
             .optimize = optimize,
         });
+        const x64_interpreter_mod = b.createModule(.{
+            .root_source_file = b.path("../src/x64-ASM/interpreter.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const x64_syscalls_mod = b.createModule(.{
+            .root_source_file = b.path("../src/x64-ASM/syscalls.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const elf_processor_mod = b.createModule(.{
+            .root_source_file = b.path("../ELF_processor/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        elf_processor_mod.addImport("x64_decoder", x64_decoder_mod);
+        elf_processor_mod.addImport("x64_interpreter", x64_interpreter_mod);
+        elf_processor_mod.addImport("x64_syscalls", x64_syscalls_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
         });
         b.installArtifact(elf_processor);
 
-        const elf_processor_test = b.addTest(.{ .root_module = elf_processor_mod });
+        const elf_processor_test_mod = b.createModule(.{
+            .root_source_file = b.path("../ELF_processor/process.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        elf_processor_test_mod.addImport("x64_decoder", x64_decoder_mod);
+        elf_processor_test_mod.addImport("x64_interpreter", x64_interpreter_mod);
+        elf_processor_test_mod.addImport("x64_syscalls", x64_syscalls_mod);
+        const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&elf_processor_test.step);
     }
 
