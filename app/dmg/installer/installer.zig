@@ -56,12 +56,12 @@ fn installApp(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8,
 
     std.debug.print("Installing Rosette global shell integration...\n", .{});
     std.debug.print("  installing ~/.rosette/bin/rosette and rosette-shell\n", .{});
-    std.debug.print("  installing ~/.rosette/bin/elf_processor for x86-64 ELF assignments\n", .{});
+    std.debug.print("  installing ~/.rosette/bin/elf_processor for make run and ./program\n", .{});
     std.debug.print("  installing default ~/.rosette/config.toml with dump_results=\"auto\"\n", .{});
     try installShell(io, allocator, target_app);
 
     std.debug.print("Installation complete: {s}\n", .{target_app});
-    std.debug.print("Try from an assignment folder: make run\n", .{});
+    std.debug.print("Try from an assignment folder: make run or ./program\n", .{});
 }
 
 fn installShell(io: std.Io, allocator: std.mem.Allocator, app_path: []const u8) !void {
