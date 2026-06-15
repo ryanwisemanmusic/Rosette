@@ -132,6 +132,10 @@ const convert_cdqe = @import("CONVERT/CDQE.zig");
 const convert_cwd = @import("CONVERT/CWD.zig");
 const convert_cdq = @import("CONVERT/CDQ.zig");
 const convert_cqo = @import("CONVERT/CQO.zig");
+const loop_loop = @import("LOOP/LOOP.zig");
+const loop_loope = @import("LOOP/LOOPE.zig");
+const loop_loopne = @import("LOOP/LOOPNE.zig");
+const loop_pause = @import("LOOP/PAUSE.zig");
 const mov_mov = @import("MOV/MOV.zig");
 const mov_movapd = @import("MOV/MOVAPD.zig");
 const mov_movaps = @import("MOV/MOVAPS.zig");
@@ -481,6 +485,9 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "CQO",
     "CWDE",
     "CWD",
+    "LOOP",
+    "LOOPE",
+    "LOOPNE",
     "MOV",
     "MOVAPD",
     "MOVAPS",
@@ -527,6 +534,7 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "MULSD",
     "MULSS",
     "MULX",
+    "PAUSE",
     "OR",
     "ORPD",
     "ORPS",
@@ -891,6 +899,10 @@ pub const tables = [_]InstructionTable{
     entry(convert_cwd.family, convert_cwd.path, convert_cwd.source),
     entry(convert_cdq.family, convert_cdq.path, convert_cdq.source),
     entry(convert_cqo.family, convert_cqo.path, convert_cqo.source),
+    entry(loop_loop.family, loop_loop.path, loop_loop.source),
+    entry(loop_loope.family, loop_loope.path, loop_loope.source),
+    entry(loop_loopne.family, loop_loopne.path, loop_loopne.source),
+    entry(loop_pause.family, loop_pause.path, loop_pause.source),
     entry(mov_mov.family, mov_mov.path, mov_mov.source),
     entry(mov_movapd.family, mov_movapd.path, mov_movapd.source),
     entry(mov_movaps.family, mov_movaps.path, mov_movaps.source),
@@ -1262,7 +1274,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 348), tableCount());
+    try std.testing.expectEqual(@as(usize, 352), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
