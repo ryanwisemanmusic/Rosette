@@ -293,6 +293,8 @@ pub const Op = enum(u8) {
     imul_reg32_reg32_imm8,
     // sign extend
     cbw,
+    cwde,
+    cdqe,
     cwd,
     cdq,
     cqo,
@@ -599,31 +601,44 @@ pub const ElfState = struct {
         }
     }
 
-    fn setFlagsSub(self: *ElfState, a: u64, b: u64, result: u64, size: Size) void {
-        const mask: u64 = switch (size) {
+    fn maskForSize(size: Size) u64 {
+        return switch (size) {
             .bits8 => 0xFF,
             .bits16 => 0xFFFF,
             .bits32 => 0xFFFFFFFF,
             .bits64 => 0xFFFF_FFFF_FFFF_FFFF,
         };
+    }
+
+    fn signBitForSize(size: Size) u64 {
+        return switch (size) {
+            .bits8 => 0x80,
+            .bits16 => 0x8000,
+            .bits32 => 0x80000000,
+            .bits64 => 0x8000000000000000,
+        };
+    }
+
+    fn setFlagsSub(self: *ElfState, a: u64, b: u64, result: u64, size: Size) void {
+        const mask = maskForSize(size);
+        const sign = signBitForSize(size);
+        const a_masked = a & mask;
+        const b_masked = b & mask;
         const r = result & mask;
-        const a_s = @as(i64, @bitCast(a & mask));
-        const b_s = @as(i64, @bitCast(b & mask));
-        const r_s = @as(i64, @bitCast(r));
         // CF: borrow from MSB (unsigned)
-        if ((a & mask) < (b & mask)) {
+        if (a_masked < b_masked) {
             self.regs.rflags |= RFL_CF;
         } else {
             self.regs.rflags &= ~RFL_CF;
         }
         // OF: signed overflow
-        if ((a_s < 0 and b_s > 0 and r_s >= 0) or (a_s >= 0 and b_s < 0 and r_s < 0)) {
+        if (((a_masked ^ b_masked) & (a_masked ^ r) & sign) != 0) {
             self.regs.rflags |= RFL_OF;
         } else {
             self.regs.rflags &= ~RFL_OF;
         }
         // SF: sign bit
-        if (r_s < 0) {
+        if ((r & sign) != 0) {
             self.regs.rflags |= RFL_SF;
         } else {
             self.regs.rflags &= ~RFL_SF;
@@ -637,30 +652,25 @@ pub const ElfState = struct {
     }
 
     fn setFlagsAdd(self: *ElfState, a: u64, b: u64, result: u64, size: Size) void {
-        const mask: u64 = switch (size) {
-            .bits8 => 0xFF,
-            .bits16 => 0xFFFF,
-            .bits32 => 0xFFFFFFFF,
-            .bits64 => 0xFFFF_FFFF_FFFF_FFFF,
-        };
+        const mask = maskForSize(size);
+        const sign = signBitForSize(size);
+        const a_masked = a & mask;
+        const b_masked = b & mask;
         const r = result & mask;
-        const a_s = @as(i64, @bitCast(a & mask));
-        const b_s = @as(i64, @bitCast(b & mask));
-        const r_s = @as(i64, @bitCast(r));
         // CF: carry out of MSB
-        if (result > mask) {
+        if (@as(u128, a_masked) + @as(u128, b_masked) > @as(u128, mask)) {
             self.regs.rflags |= RFL_CF;
         } else {
             self.regs.rflags &= ~RFL_CF;
         }
         // OF: signed overflow
-        if ((a_s >= 0 and b_s >= 0 and r_s < 0) or (a_s < 0 and b_s < 0 and r_s >= 0)) {
+        if (((~(a_masked ^ b_masked)) & (a_masked ^ r) & sign) != 0) {
             self.regs.rflags |= RFL_OF;
         } else {
             self.regs.rflags &= ~RFL_OF;
         }
         // SF
-        if (r_s < 0) {
+        if ((r & sign) != 0) {
             self.regs.rflags |= RFL_SF;
         } else {
             self.regs.rflags &= ~RFL_SF;
@@ -674,28 +684,23 @@ pub const ElfState = struct {
     }
 
     fn setFlagsIncDec(self: *ElfState, input: u64, result: u64, size: Size, is_inc: bool) void {
-        const mask: u64 = switch (size) {
-            .bits8 => 0xFF,
-            .bits16 => 0xFFFF,
-            .bits32 => 0xFFFFFFFF,
-            .bits64 => 0xFFFF_FFFF_FFFF_FFFF,
-        };
+        const mask = maskForSize(size);
+        const sign = signBitForSize(size);
+        const input_masked = input & mask;
         const r = result & mask;
-        const input_s = @as(i64, @bitCast(input & mask));
-        const r_s = @as(i64, @bitCast(r));
         // CF not affected
         // OF: overflow for signed (sign change at boundary)
         const overflow = if (is_inc)
-            input_s == std.math.maxInt(i64) & @as(i64, @bitCast(mask))
+            input_masked == sign - 1
         else
-            input_s == std.math.minInt(i64) & @as(i64, @bitCast(mask));
+            input_masked == sign;
         if (overflow) {
             self.regs.rflags |= RFL_OF;
         } else {
             self.regs.rflags &= ~RFL_OF;
         }
         // SF
-        if (r_s < 0) {
+        if ((r & sign) != 0) {
             self.regs.rflags |= RFL_SF;
         } else {
             self.regs.rflags &= ~RFL_SF;
@@ -1484,6 +1489,16 @@ pub const ElfState = struct {
                 const extended = @as(i16, @as(i8, @bitCast(@as(u8, @truncate(al)))));
                 self.setReg(.al_ax_eax_rax, .bits16, @as(u16, @bitCast(extended)));
             },
+            .cwde => {
+                const ax = self.regVal(.al_ax_eax_rax, .bits16);
+                const extended = @as(i32, @as(i16, @bitCast(@as(u16, @truncate(ax)))));
+                self.setReg(.al_ax_eax_rax, .bits32, @as(u32, @bitCast(extended)));
+            },
+            .cdqe => {
+                const eax = self.regVal(.al_ax_eax_rax, .bits32);
+                const extended = @as(i64, @as(i32, @bitCast(@as(u32, @truncate(eax)))));
+                self.setReg(.al_ax_eax_rax, .bits64, @as(u64, @bitCast(extended)));
+            },
             .cwd => {
                 // cwd: AX → DX:AX. With 0x66: EAX → EDX:EAX (cdq). With REX.W: RAX → RDX:RAX (cqo)
                 const ax = self.regVal(.al_ax_eax_rax, .bits16);
@@ -2134,13 +2149,13 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             // CBW/CWDE/CDQE
             if (rex_w) {
                 // CDQE (RAX = sign-extend EAX)
-                return DecodedInsn{ .op = .cqo, .len = @intCast(pos) };
+                return DecodedInsn{ .op = .cdqe, .len = @intCast(pos) };
             } else if (has_66) {
                 // CBW (AX = sign-extend AL)
                 return DecodedInsn{ .op = .cbw, .len = @intCast(pos) };
             } else {
                 // CWDE (EAX = sign-extend AX)
-                return DecodedInsn{ .op = .cwd, .len = @intCast(pos) };
+                return DecodedInsn{ .op = .cwde, .len = @intCast(pos) };
             }
         },
 
@@ -2572,9 +2587,9 @@ fn loadRunElf(allocator: std.mem.Allocator, elf_bytes: []const u8, options: ElfR
     try state.loadElf(elf_bytes);
 
     var result_symbols: std.ArrayList(DumpSymbol) = .empty;
-    defer result_symbols.deinit(allocator);
+    defer deinitDumpSymbols(allocator, &result_symbols);
     if (options.dump_results) {
-        result_symbols = collectResultSymbols(allocator, &state, elf_bytes) catch |err| blk: {
+        result_symbols = collectResultSymbols(allocator, &state, elf_bytes, options.source_text) catch |err| blk: {
             log.warn("result symbols unavailable: {s}", .{@errorName(err)});
             break :blk .empty;
         };
@@ -2656,7 +2671,9 @@ const DumpSymbol = struct {
     name: []const u8,
     addr: u64,
     size: usize,
-    initial: [32]u8 = [_]u8{0} ** 32,
+    element_size: usize = 0,
+    element_count: usize = 1,
+    initial: []u8,
 };
 
 const ResultExpression = struct {
@@ -2664,7 +2681,29 @@ const ResultExpression = struct {
     text: []const u8,
 };
 
-fn collectResultSymbols(allocator: std.mem.Allocator, state: *const ElfState, elf_bytes: []const u8) !std.ArrayList(DumpSymbol) {
+const AsmSection = enum { other, data, bss };
+
+const AsmSymbolDecl = struct {
+    name: []const u8,
+    section: AsmSection,
+    element_size: usize,
+    element_count: usize,
+    zero_initialized: bool,
+
+    fn totalSize(self: AsmSymbolDecl) usize {
+        return self.element_size * self.element_count;
+    }
+};
+
+const DumpShape = struct {
+    size: usize,
+    element_size: usize,
+    element_count: usize,
+};
+
+const max_result_dump_bytes: usize = 8192;
+
+fn collectResultSymbols(allocator: std.mem.Allocator, state: *const ElfState, elf_bytes: []const u8, source_text: ?[]const u8) !std.ArrayList(DumpSymbol) {
     if (elf_bytes.len < @sizeOf(Elf64_Ehdr)) return error.InvalidElf;
     const ehdr = @as(*const Elf64_Ehdr, @ptrCast(@alignCast(elf_bytes[0..@sizeOf(Elf64_Ehdr)])));
     if (ehdr.e_shoff == 0 or ehdr.e_shnum == 0) return .empty;
@@ -2672,8 +2711,14 @@ fn collectResultSymbols(allocator: std.mem.Allocator, state: *const ElfState, el
     const section_table_size = @as(u64, ehdr.e_shentsize) * @as(u64, ehdr.e_shnum);
     if (ehdr.e_shoff > elf_bytes.len or section_table_size > elf_bytes.len - ehdr.e_shoff) return error.TruncatedSectionHeaders;
 
+    var declarations: std.ArrayList(AsmSymbolDecl) = .empty;
+    defer declarations.deinit(allocator);
+    if (source_text) |text| {
+        declarations = try collectAsmSymbolDeclarations(allocator, text);
+    }
+
     var symbols: std.ArrayList(DumpSymbol) = .empty;
-    errdefer symbols.deinit(allocator);
+    errdefer deinitDumpSymbols(allocator, &symbols);
 
     var section_index: u16 = 0;
     while (section_index < ehdr.e_shnum) : (section_index += 1) {
@@ -2695,19 +2740,21 @@ fn collectResultSymbols(allocator: std.mem.Allocator, state: *const ElfState, el
             if (sym.st_shndx == SHN_UNDEF or sym.st_value == 0) continue;
 
             const name = elfString(strtab, sym.st_name) orelse continue;
-            if (!isResultSymbolName(name)) continue;
-
-            const size = inferResultSymbolSize(name, sym.st_size);
-            if (size == 0) continue;
+            const declaration = findAsmSymbolDeclaration(declarations.items, name);
+            const shape = resultDumpShape(name, sym.st_size, declaration, source_text != null) orelse continue;
+            const size = shape.size;
             const mem_offset = state.addrToOffset(sym.st_value) orelse continue;
             if (mem_offset + size > state.mem.len) continue;
 
-            var dump_symbol = DumpSymbol{
+            const dump_symbol = DumpSymbol{
                 .name = name,
                 .addr = sym.st_value,
                 .size = size,
+                .element_size = shape.element_size,
+                .element_count = shape.element_count,
+                .initial = try allocator.alloc(u8, size),
             };
-            copySymbolBytes(state, sym.st_value, size, &dump_symbol.initial);
+            copySymbolBytes(state, sym.st_value, dump_symbol.initial);
             try appendDumpSymbolSorted(allocator, &symbols, dump_symbol);
         }
     }
@@ -2717,7 +2764,7 @@ fn collectResultSymbols(allocator: std.mem.Allocator, state: *const ElfState, el
 
 fn dumpResultSymbols(allocator: std.mem.Allocator, state: *const ElfState, symbols: []const DumpSymbol, options: ElfRunOptions) !void {
     if (symbols.len == 0) {
-        dumpPrint("Rosette ELF results: no answer/remainder symbols found\n", .{});
+        dumpPrint("Rosette ELF results: no result symbols found\n", .{});
         return;
     }
 
@@ -2734,7 +2781,7 @@ fn dumpResultSymbols(allocator: std.mem.Allocator, state: *const ElfState, symbo
     }
 
     if (printed == 0) {
-        dumpPrint("Rosette ELF results: no answer/remainder values changed\n", .{});
+        dumpPrint("Rosette ELF results: no result values changed\n", .{});
         dumpPrint("  Set ROSETTE_ELF_DUMP_ALL=1 to include unchanged placeholders.\n", .{});
         return;
     }
@@ -2770,8 +2817,202 @@ fn elfString(strtab: []const u8, offset: u32) ?[]const u8 {
     return rest[0..len];
 }
 
+fn deinitDumpSymbols(allocator: std.mem.Allocator, symbols: *std.ArrayList(DumpSymbol)) void {
+    for (symbols.items) |symbol| {
+        allocator.free(symbol.initial);
+    }
+    symbols.deinit(allocator);
+}
+
+fn collectAsmSymbolDeclarations(allocator: std.mem.Allocator, source_text: []const u8) !std.ArrayList(AsmSymbolDecl) {
+    var declarations: std.ArrayList(AsmSymbolDecl) = .empty;
+    errdefer declarations.deinit(allocator);
+
+    var section: AsmSection = .other;
+    var lines = std.mem.splitScalar(u8, source_text, '\n');
+    while (lines.next()) |raw_line| {
+        const line_without_comment = raw_line[0 .. std.mem.indexOfScalar(u8, raw_line, ';') orelse raw_line.len];
+        const line = std.mem.trim(u8, line_without_comment, " \t\r\n");
+        if (line.len == 0) continue;
+
+        var pos: usize = 0;
+        const first_raw = nextAsmToken(line, &pos) orelse continue;
+        if (std.ascii.eqlIgnoreCase(first_raw, "section")) {
+            const section_name = nextAsmToken(line, &pos) orelse "";
+            section = parseAsmSection(section_name);
+            continue;
+        }
+        if (section == .other) continue;
+
+        const name = stripTrailingColon(first_raw);
+        if (name.len == 0) continue;
+        if (parseAsmDataDirective(name) != null) continue;
+
+        const directive_token = nextAsmToken(line, &pos) orelse continue;
+        const directive = parseAsmDataDirective(directive_token) orelse continue;
+        const rest = std.mem.trim(u8, line[pos..], " \t\r\n");
+        const element_count = if (directive.reserved)
+            parseAsmCount(rest)
+        else
+            countAsmInitializers(rest);
+
+        try declarations.append(allocator, .{
+            .name = name,
+            .section = section,
+            .element_size = directive.element_size,
+            .element_count = element_count,
+            .zero_initialized = directive.reserved or asmInitializersAllZero(rest),
+        });
+    }
+
+    return declarations;
+}
+
+fn findAsmSymbolDeclaration(declarations: []const AsmSymbolDecl, name: []const u8) ?AsmSymbolDecl {
+    for (declarations) |declaration| {
+        if (std.mem.eql(u8, declaration.name, name)) return declaration;
+    }
+    return null;
+}
+
+const AsmDataDirective = struct {
+    element_size: usize,
+    reserved: bool,
+};
+
+fn parseAsmDataDirective(token: []const u8) ?AsmDataDirective {
+    if (std.ascii.eqlIgnoreCase(token, "db")) return .{ .element_size = 1, .reserved = false };
+    if (std.ascii.eqlIgnoreCase(token, "dw")) return .{ .element_size = 2, .reserved = false };
+    if (std.ascii.eqlIgnoreCase(token, "dd")) return .{ .element_size = 4, .reserved = false };
+    if (std.ascii.eqlIgnoreCase(token, "dq")) return .{ .element_size = 8, .reserved = false };
+    if (std.ascii.eqlIgnoreCase(token, "ddq")) return .{ .element_size = 16, .reserved = false };
+    if (std.ascii.eqlIgnoreCase(token, "resb")) return .{ .element_size = 1, .reserved = true };
+    if (std.ascii.eqlIgnoreCase(token, "resw")) return .{ .element_size = 2, .reserved = true };
+    if (std.ascii.eqlIgnoreCase(token, "resd")) return .{ .element_size = 4, .reserved = true };
+    if (std.ascii.eqlIgnoreCase(token, "resq")) return .{ .element_size = 8, .reserved = true };
+    if (std.ascii.eqlIgnoreCase(token, "resdq")) return .{ .element_size = 16, .reserved = true };
+    return null;
+}
+
+fn parseAsmSection(token: []const u8) AsmSection {
+    if (std.ascii.eqlIgnoreCase(token, ".data") or std.ascii.eqlIgnoreCase(token, "data")) return .data;
+    if (std.ascii.eqlIgnoreCase(token, ".bss") or std.ascii.eqlIgnoreCase(token, "bss")) return .bss;
+    return .other;
+}
+
+fn nextAsmToken(line: []const u8, pos: *usize) ?[]const u8 {
+    while (pos.* < line.len and std.ascii.isWhitespace(line[pos.*])) : (pos.* += 1) {}
+    if (pos.* >= line.len) return null;
+    const start = pos.*;
+    while (pos.* < line.len and !std.ascii.isWhitespace(line[pos.*])) : (pos.* += 1) {}
+    return line[start..pos.*];
+}
+
+fn stripTrailingColon(token: []const u8) []const u8 {
+    if (token.len > 0 and token[token.len - 1] == ':') return token[0 .. token.len - 1];
+    return token;
+}
+
+fn parseAsmCount(rest: []const u8) usize {
+    const trimmed = std.mem.trim(u8, rest, " \t\r\n");
+    if (trimmed.len == 0) return 1;
+    var end: usize = 0;
+    while (end < trimmed.len and std.ascii.isDigit(trimmed[end])) : (end += 1) {}
+    if (end == 0) return 1;
+    return std.fmt.parseInt(usize, trimmed[0..end], 10) catch 1;
+}
+
+fn countAsmInitializers(rest: []const u8) usize {
+    if (std.mem.trim(u8, rest, " \t\r\n").len == 0) return 1;
+    var count: usize = 0;
+    var values = std.mem.splitScalar(u8, rest, ',');
+    while (values.next()) |value| {
+        if (std.mem.trim(u8, value, " \t\r\n").len != 0) count += 1;
+    }
+    return @max(count, @as(usize, 1));
+}
+
+fn asmInitializersAllZero(rest: []const u8) bool {
+    var saw_value = false;
+    var values = std.mem.splitScalar(u8, rest, ',');
+    while (values.next()) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        saw_value = true;
+        if (!asmInitializerIsZero(trimmed)) return false;
+    }
+    return saw_value;
+}
+
+fn asmInitializerIsZero(value: []const u8) bool {
+    var token_end: usize = 0;
+    while (token_end < value.len and !std.ascii.isWhitespace(value[token_end])) : (token_end += 1) {}
+    var token = value[0..token_end];
+    if (token.len > 0 and token[0] == '+') token = token[1..];
+    if (token.len == 0) return false;
+    if (std.mem.eql(u8, token, "0")) return true;
+    if (std.mem.startsWith(u8, token, "0x") or std.mem.startsWith(u8, token, "0X")) {
+        for (token[2..]) |ch| {
+            if (ch != '0') return false;
+        }
+        return token.len > 2;
+    }
+    for (token) |ch| {
+        if (ch != '0') return false;
+    }
+    return true;
+}
+
 fn isResultSymbolName(name: []const u8) bool {
     return containsAsciiIgnoreCase(name, "ans") or containsAsciiIgnoreCase(name, "rem");
+}
+
+fn resultDumpShape(name: []const u8, reported_size: u64, declaration: ?AsmSymbolDecl, source_available: bool) ?DumpShape {
+    if (declaration) |decl| {
+        if (!isResultDeclaration(name, decl)) return null;
+        const declared_size = decl.totalSize();
+        if (declared_size == 0 or declared_size > max_result_dump_bytes) return null;
+        const reported: usize = if (reported_size > 0 and reported_size <= max_result_dump_bytes) @intCast(reported_size) else 0;
+        const size = if (reported != 0 and reported < declared_size) reported else declared_size;
+        return .{
+            .size = size,
+            .element_size = decl.element_size,
+            .element_count = @max(@as(usize, 1), size / decl.element_size),
+        };
+    }
+
+    if (source_available and !isResultSymbolName(name)) return null;
+    const size = inferResultSymbolSize(name, reported_size);
+    if (size == 0 or size > max_result_dump_bytes) return null;
+    return .{
+        .size = size,
+        .element_size = size,
+        .element_count = 1,
+    };
+}
+
+fn isResultDeclaration(name: []const u8, declaration: AsmSymbolDecl) bool {
+    if (isResultSymbolName(name)) return true;
+    if (declaration.section == .bss) return declaration.totalSize() <= max_result_dump_bytes;
+    if (declaration.section != .data) return false;
+    if (!declaration.zero_initialized) return false;
+    if (declaration.element_count > 1 and declaration.totalSize() > max_result_dump_bytes) return false;
+    return !looksLikeInputOrConstantName(name);
+}
+
+fn looksLikeInputOrConstantName(name: []const u8) bool {
+    if (name.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(name, "null")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "false")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "len")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "length")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "two")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "five")) return true;
+    if (containsAsciiIgnoreCase(name, "num")) return true;
+    if (containsAsciiIgnoreCase(name, "limit")) return true;
+    if (containsAsciiIgnoreCase(name, "message")) return true;
+    return false;
 }
 
 fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -2790,7 +3031,7 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn inferResultSymbolSize(name: []const u8, reported_size: u64) usize {
-    if (reported_size > 0 and reported_size <= 32) return @intCast(reported_size);
+    if (reported_size > 0 and reported_size <= max_result_dump_bytes) return @intCast(reported_size);
     if (name.len >= 2 and std.ascii.toLower(name[0]) == 'd' and std.ascii.toLower(name[1]) == 'q') return 16;
     if (name.len == 0) return 0;
     return switch (std.ascii.toLower(name[0])) {
@@ -2802,16 +3043,16 @@ fn inferResultSymbolSize(name: []const u8, reported_size: u64) usize {
     };
 }
 
-fn copySymbolBytes(state: *const ElfState, addr: u64, size: usize, out: *[32]u8) void {
+fn copySymbolBytes(state: *const ElfState, addr: u64, out: []u8) void {
     const start = state.addrToOffset(addr) orelse return;
-    if (start + size > state.mem.len or size > out.len) return;
-    @memcpy(out[0..size], state.mem[start..][0..size]);
+    if (start + out.len > state.mem.len) return;
+    @memcpy(out, state.mem[start..][0..out.len]);
 }
 
 fn symbolChanged(state: *const ElfState, symbol: DumpSymbol) bool {
     const start = state.addrToOffset(symbol.addr) orelse return false;
-    if (start + symbol.size > state.mem.len or symbol.size > symbol.initial.len) return false;
-    return !std.mem.eql(u8, state.mem[start..][0..symbol.size], symbol.initial[0..symbol.size]);
+    if (start + symbol.size > state.mem.len or symbol.size != symbol.initial.len) return false;
+    return !std.mem.eql(u8, state.mem[start..][0..symbol.size], symbol.initial);
 }
 
 fn appendDumpSymbolSorted(allocator: std.mem.Allocator, symbols: *std.ArrayList(DumpSymbol), symbol: DumpSymbol) !void {
@@ -2827,6 +3068,11 @@ fn appendDumpSymbolSorted(allocator: std.mem.Allocator, symbols: *std.ArrayList(
 }
 
 fn printDumpSymbol(state: *const ElfState, symbol: DumpSymbol, expression: ?[]const u8) void {
+    if (symbol.element_count > 1 and symbol.element_size > 0 and symbol.size == symbol.element_size * symbol.element_count) {
+        printDumpArray(state, symbol, expression);
+        return;
+    }
+
     if (expression) |text| {
         dumpPrint("  {s} -> ", .{text});
     } else {
@@ -2865,6 +3111,68 @@ fn printDumpSymbol(state: *const ElfState, symbol: DumpSymbol, expression: ?[]co
         },
     }
     dumpPrint("\n", .{});
+}
+
+fn printDumpArray(state: *const ElfState, symbol: DumpSymbol, expression: ?[]const u8) void {
+    if (expression) |text| {
+        dumpPrint("  {s}[{d}] ({s}) ->", .{ text, symbol.element_count, elementTypeName(symbol.element_size) });
+    } else {
+        dumpPrint("  {s}[{d}] ({s}) ->", .{ symbol.name, symbol.element_count, elementTypeName(symbol.element_size) });
+    }
+
+    var i: usize = 0;
+    while (i < symbol.element_count) : (i += 1) {
+        if (i % 8 == 0) {
+            dumpPrint("\n    [{d}] ", .{i});
+        } else {
+            dumpPrint(", ", .{});
+        }
+        printArrayElement(state, symbol.addr + @as(u64, @intCast(i * symbol.element_size)), symbol.element_size);
+    }
+    dumpPrint("\n", .{});
+}
+
+fn printArrayElement(state: *const ElfState, addr: u64, element_size: usize) void {
+    switch (element_size) {
+        1 => {
+            const value = state.read8(addr);
+            const signed: i8 = @bitCast(value);
+            dumpPrint("{d}", .{signed});
+        },
+        2 => {
+            const value = state.read16(addr);
+            const signed: i16 = @bitCast(value);
+            dumpPrint("{d}", .{signed});
+        },
+        4 => {
+            const value = state.read32(addr);
+            const signed: i32 = @bitCast(value);
+            dumpPrint("{d}", .{signed});
+        },
+        8 => {
+            const value = state.read64(addr);
+            const signed: i64 = @bitCast(value);
+            dumpPrint("{d}", .{signed});
+        },
+        16 => {
+            const lo = state.read64(addr);
+            const hi = state.read64(addr + 8);
+            const combined = (@as(u128, hi) << 64) | lo;
+            dumpPrint("0x{x}", .{combined});
+        },
+        else => printHexBytes(state, addr, element_size),
+    }
+}
+
+fn elementTypeName(element_size: usize) []const u8 {
+    return switch (element_size) {
+        1 => "byte",
+        2 => "word",
+        4 => "dword",
+        8 => "qword",
+        16 => "dqword",
+        else => "bytes",
+    };
 }
 
 fn collectResultExpressions(allocator: std.mem.Allocator, source_text: []const u8) !std.ArrayList(ResultExpression) {
@@ -3012,6 +3320,12 @@ test "decode 0x48 0x99 (cqo)" {
     try testing.expectEqual(Op.cqo, d.op);
 }
 
+test "decode 0x98 sign-extension variants" {
+    try testing.expectEqual(Op.cwde, decodeInsn(&[_]u8{0x98}).op);
+    try testing.expectEqual(Op.cbw, decodeInsn(&[_]u8{ 0x66, 0x98 }).op);
+    try testing.expectEqual(Op.cdqe, decodeInsn(&[_]u8{ 0x48, 0x98 }).op);
+}
+
 test "decode 0x0F 0xB7 (movzx eax, word [abs])" {
     var bytes: [8]u8 = [_]u8{ 0x0F, 0xB7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00 };
     const d = decodeInsn(&bytes);
@@ -3074,6 +3388,63 @@ test "mul byte [mem] and check result" {
     state.execute(decoded);
     // 34 * 19 = 646 = 0x286
     try testing.expectEqual(@as(u64, 0x286), state.regs.rax & 0xFFFF);
+}
+
+test "cmp reg32 imm8 treats negative 32-bit values as signed negative" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+
+    state.setReg(.al_ax_eax_rax, .bits32, @as(u32, @bitCast(@as(i32, -2588))));
+    state.execute(.{
+        .op = .cmp_reg32_imm8,
+        .dst_reg = .al_ax_eax_rax,
+        .imm = 0,
+        .len = 3,
+    });
+
+    try testing.expect((state.regs.rflags & RFL_SF) != 0);
+    try testing.expect((state.regs.rflags & RFL_OF) == 0);
+    try testing.expect(ElfState.evalCond(state.regs.rflags, .l));
+    try testing.expect(!ElfState.evalCond(state.regs.rflags, .ge));
+}
+
+test "asm result declarations include Ast02 outputs without inputs" {
+    const source =
+        \\section .data
+        \\    min dw 0
+        \\    max dw 0
+        \\    sum dw 0
+        \\    averageFive dw 0
+        \\    two dw 2
+        \\    five dw 5
+        \\    len db 75
+        \\    lst dw -1, 2, 3
+        \\    sides dw -4, 5, 6
+        \\section .bss
+        \\    cubeAreas resq 75
+        \\    cubeVolumes resq 75
+        \\    BUFFER resb 500000
+    ;
+
+    var declarations = try collectAsmSymbolDeclarations(testing.allocator, source);
+    defer declarations.deinit(testing.allocator);
+
+    const min_decl = findAsmSymbolDeclaration(declarations.items, "min").?;
+    try testing.expect(isResultDeclaration("min", min_decl));
+    const average_five_decl = findAsmSymbolDeclaration(declarations.items, "averageFive").?;
+    try testing.expect(isResultDeclaration("averageFive", average_five_decl));
+
+    const cube_areas_decl = findAsmSymbolDeclaration(declarations.items, "cubeAreas").?;
+    try testing.expect(isResultDeclaration("cubeAreas", cube_areas_decl));
+    try testing.expectEqual(@as(usize, 8), cube_areas_decl.element_size);
+    try testing.expectEqual(@as(usize, 75), cube_areas_decl.element_count);
+
+    try testing.expect(!isResultDeclaration("two", findAsmSymbolDeclaration(declarations.items, "two").?));
+    try testing.expect(!isResultDeclaration("five", findAsmSymbolDeclaration(declarations.items, "five").?));
+    try testing.expect(!isResultDeclaration("len", findAsmSymbolDeclaration(declarations.items, "len").?));
+    try testing.expect(!isResultDeclaration("lst", findAsmSymbolDeclaration(declarations.items, "lst").?));
+    try testing.expect(!isResultDeclaration("sides", findAsmSymbolDeclaration(declarations.items, "sides").?));
+    try testing.expect(!isResultDeclaration("BUFFER", findAsmSymbolDeclaration(declarations.items, "BUFFER").?));
 }
 
 // Full-binary integration test (manual): zig run ELF_processor/process.zig -- test/Internal_Assembly/x86-64-Ast02-main/ast02
