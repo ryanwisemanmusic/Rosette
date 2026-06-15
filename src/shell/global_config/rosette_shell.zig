@@ -994,11 +994,48 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         try appendShellQuoted(&out, allocator, dyld);
         try out.appendSlice(allocator,
             \\
-            \\if [ "${ROSETTE_ENABLE_DYLD_INTERPOSE:-1}" = "1" ]; then
+            \\__rosette_strip_dyld_interposer() {
+            \\  if [ -z "${ROSETTE_DYLD_INTERPOSER:-}" ] || [ -z "${DYLD_INSERT_LIBRARIES:-}" ]; then
+            \\    return 0
+            \\  fi
+            \\  local __rosette_dyld_old __rosette_dyld_new __rosette_dyld_part
+            \\  __rosette_dyld_old="$DYLD_INSERT_LIBRARIES"
+            \\  __rosette_dyld_new=
+            \\  while [ -n "$__rosette_dyld_old" ]; do
+            \\    case "$__rosette_dyld_old" in
+            \\      *:*)
+            \\        __rosette_dyld_part="${__rosette_dyld_old%%:*}"
+            \\        __rosette_dyld_old="${__rosette_dyld_old#*:}"
+            \\        ;;
+            \\      *)
+            \\        __rosette_dyld_part="$__rosette_dyld_old"
+            \\        __rosette_dyld_old=
+            \\        ;;
+            \\    esac
+            \\    [ "$__rosette_dyld_part" = "$ROSETTE_DYLD_INTERPOSER" ] && continue
+            \\    if [ -z "$__rosette_dyld_new" ]; then
+            \\      __rosette_dyld_new="$__rosette_dyld_part"
+            \\    else
+            \\      __rosette_dyld_new="$__rosette_dyld_new:$__rosette_dyld_part"
+            \\    fi
+            \\  done
+            \\  if [ -n "$__rosette_dyld_new" ]; then
+            \\    export DYLD_INSERT_LIBRARIES="$__rosette_dyld_new"
+            \\  else
+            \\    unset DYLD_INSERT_LIBRARIES
+            \\  fi
+            \\}
+            \\
+            \\# Global DYLD interposition is intentionally opt-in. Injecting a
+            \\# library into every child process can break unrelated developer
+            \\# tools; Rosette's make/direct-ELF paths do not require it.
+            \\if [ "${ROSETTE_ENABLE_DYLD_INTERPOSE:-0}" = "1" ]; then
             \\  case ":${DYLD_INSERT_LIBRARIES:-}:" in
             \\    *":$ROSETTE_DYLD_INTERPOSER:"*) ;;
             \\    *) export DYLD_INSERT_LIBRARIES="$ROSETTE_DYLD_INTERPOSER${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
             \\  esac
+            \\else
+            \\  __rosette_strip_dyld_interposer
             \\fi
             \\
         );
@@ -2496,13 +2533,15 @@ test "shell snippet includes zsh direct ELF launcher" {
     const snippet = try buildShellSnippet(
         arena.allocator(),
         "/tmp/rosette/bin/rosette-shell",
-        null,
+        "/tmp/rosette/lib/rosette-exec.dylib",
         "/tmp/rosette/bin/elf_processor",
     );
     try std.testing.expect(containsIgnoreCase(snippet, "run-elf"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_refresh_elf_commands"));
     try std.testing.expect(containsIgnoreCase(snippet, "detect \"$PWD\""));
     try std.testing.expect(containsIgnoreCase(snippet, "functions[$__rosette_cmd]"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_ENABLE_DYLD_INTERPOSE:-0"));
+    try std.testing.expect(containsIgnoreCase(snippet, "__rosette_strip_dyld_interposer"));
 }
 
 test "assembly global parser handles lists and bracket directives" {
