@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const c = @cImport({
     @cInclude("stdio.h");
+    @cInclude("stdlib.h");
     @cInclude("sys/stat.h");
     @cInclude("unistd.h");
 });
@@ -20,7 +21,7 @@ const default_config_text =
     \\
     \\[elf]
     \\# "auto" enables result summaries for detected class-style YASM/ELF
-    \\# assignment projects when you run `make run`.
+    \\# assignment projects when you run `make run` or launch `./program`.
     \\# Use "on" to always request summaries for detected projects, or "off"
     \\# to leave ELF program output untouched unless the environment asks.
     \\dump_results = "auto"
@@ -62,6 +63,11 @@ const CompileInvocation = struct {
     compile_only: bool = false,
     source_path: ?[]const u8 = null,
     artifact_path: ?[]const u8 = null,
+};
+
+const ProfileTarget = struct {
+    path: []const u8,
+    create: bool,
 };
 
 const ElfSection = struct {
@@ -120,6 +126,12 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("not detected: score={d} signals={s}\n", .{ detection.score, detection.signals });
         std.process.exit(1);
     }
+    if (std.mem.eql(u8, args[1], "diagnose")) {
+        const project_dir = if (args.len >= 3) args[2] else ".";
+        const target = if (args.len >= 4) args[3] else null;
+        try diagnoseShell(init, allocator, project_dir, target);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "prepare-make")) {
         if (args.len < 4) return usage(args[0]);
         try prepareMake(init, allocator, args[2], args[3], args[4..]);
@@ -132,6 +144,11 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, args[1], "clean-state")) {
         try cleanState(init.io, allocator);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "run-elf")) {
+        if (args.len < 3) return usage(args[0]);
+        try runElfTarget(init, allocator, args[2], args[3..]);
         return;
     }
     if (std.mem.eql(u8, args[1], "tool")) {
@@ -164,9 +181,11 @@ fn usage(exe_name: []const u8) void {
         \\  {s} update [source-root]
         \\  {s} uninstall
         \\  {s} detect [project-directory]
+        \\  {s} diagnose [project-directory] [program]
         \\  {s} prepare-make <project-directory> <env-file> [make-args...]
         \\  {s} finish-make <project-directory> <status> [make-args...]
         \\  {s} clean-state
+        \\  {s} run-elf <x86-64-elf-path> [args...]
         \\  {s} tool <tool-name> [tool-args...]
         \\  {s} recipe-shell [sh-args...]
         \\  {s} is-elf64 <path>
@@ -178,7 +197,7 @@ fn usage(exe_name: []const u8) void {
         \\  [graphics]
         \\  enabled = false
         \\
-    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
@@ -222,14 +241,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     try chmodPath(allocator, shell_path, 0o644);
 
     const block = try buildProfileBlock(allocator);
-    const zshrc = try std.fs.path.join(allocator, &.{ home, ".zshrc" });
-    const zprofile = try std.fs.path.join(allocator, &.{ home, ".zprofile" });
-    const bashrc = try std.fs.path.join(allocator, &.{ home, ".bashrc" });
-    const bash_profile = try std.fs.path.join(allocator, &.{ home, ".bash_profile" });
-    try ensureProfileBlock(init.io, allocator, zshrc, block, true);
-    try ensureProfileBlock(init.io, allocator, zprofile, block, fileExists(allocator, zprofile));
-    try ensureProfileBlock(init.io, allocator, bashrc, block, fileExists(allocator, bashrc));
-    try ensureProfileBlock(init.io, allocator, bash_profile, block, fileExists(allocator, bash_profile));
+    try installProfileBlocks(init.io, allocator, home, block);
 
     if (source_root.len != 0) {
         const config_path = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
@@ -239,6 +251,14 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
 
     std.debug.print("Rosette shell integration installed.\n", .{});
     std.debug.print("source: {s}\n", .{shell_path});
+    std.debug.print("command: {s}\n", .{rosette_path});
+    if (fileExists(allocator, elf_processor_path)) {
+        std.debug.print("elf_processor: {s}\n", .{elf_processor_path});
+    } else {
+        std.debug.print("elf_processor: missing; build/install did not copy an ELF processor\n", .{});
+    }
+    std.debug.print("current terminal reload: source ~/.rosette/rosette-shell.sh\n", .{});
+    std.debug.print("diagnose from a project: rosette-diagnose-shell ./program\n", .{});
 }
 
 fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
@@ -255,14 +275,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
     const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
 
-    const zshrc = try std.fs.path.join(allocator, &.{ home, ".zshrc" });
-    const zprofile = try std.fs.path.join(allocator, &.{ home, ".zprofile" });
-    const bashrc = try std.fs.path.join(allocator, &.{ home, ".bashrc" });
-    const bash_profile = try std.fs.path.join(allocator, &.{ home, ".bash_profile" });
-    try removeProfileBlock(init.io, allocator, zshrc);
-    try removeProfileBlock(init.io, allocator, zprofile);
-    try removeProfileBlock(init.io, allocator, bashrc);
-    try removeProfileBlock(init.io, allocator, bash_profile);
+    try removeProfileBlocks(init.io, allocator, home);
 
     try unlinkIfExists(allocator, shell_path);
     try unlinkIfExists(allocator, source_root);
@@ -293,15 +306,7 @@ fn prepareMake(
 
     const home = try homeDir(allocator);
     const wrapper_dir = try std.fs.path.join(allocator, &.{ home, ".rosette", "wrappers" });
-    const elf_processor_path = blk: {
-        if (getenvSlice("ROSETTE_ELF_PROCESSOR")) |env_elf_path| {
-            if (fileExists(allocator, env_elf_path)) {
-                break :blk try allocator.dupe(u8, env_elf_path);
-            }
-        }
-        const default_path = try std.fs.path.join(allocator, &.{ home, ".rosette", "bin", "elf_processor" });
-        break :blk default_path;
-    };
+    const elf_processor_path = try resolveElfProcessorPath(allocator);
 
     const helper_path = try currentHelperPath(init, allocator);
     const config = try loadShellConfig(init.io, allocator);
@@ -436,6 +441,124 @@ fn cleanState(io: std.Io, allocator: std.mem.Allocator) !void {
     if (killed == 0) {
         std.debug.print("rosette-shell: clean-state found no matching live helpers\n", .{});
     }
+}
+
+fn diagnoseShell(init: std.process.Init, allocator: std.mem.Allocator, project_dir_raw: []const u8, target_raw: ?[]const u8) !void {
+    const home = try homeDir(allocator);
+    const project_dir = try absolutePath(allocator, project_dir_raw);
+    const helper = try currentHelperPath(init, allocator);
+    const processor = try resolveElfProcessorPath(allocator);
+    const config_path = try configPath(allocator);
+    const config = try loadShellConfig(init.io, allocator);
+    const source_root = try currentSourceRoot(init.io, allocator);
+    const detection = detectProject(init.io, allocator, project_dir) catch Detection{
+        .detected = false,
+        .score = 0,
+        .kind = "unknown",
+        .signals = "detection-error",
+    };
+
+    std.debug.print("Rosette shell diagnosis\n", .{});
+    std.debug.print("  home: {s}\n", .{home});
+    std.debug.print("  project: {s}\n", .{project_dir});
+    std.debug.print("  helper: {s} ({s})\n", .{ helper, if (canExecute(allocator, helper)) "executable" else "missing/not executable" });
+    std.debug.print("  elf_processor: {s} ({s})\n", .{ processor, if (canExecute(allocator, processor)) "executable" else "missing/not executable" });
+    std.debug.print("  config: {s}\n", .{config_path});
+    std.debug.print("  source_root: {s}\n", .{if (source_root.len == 0) "(unset)" else source_root});
+    std.debug.print("  dump_results: {s}\n", .{configModeName(config.elf_dump_results)});
+    std.debug.print("  dump_all_results: {s}\n", .{if (config.elf_dump_all_results) "true" else "false"});
+    std.debug.print("  project_detected: {s} kind={s} score={d} signals={s}\n", .{
+        if (detection.detected) "yes" else "no",
+        detection.kind,
+        detection.score,
+        detection.signals,
+    });
+    std.debug.print("  direct_launch_eligible: {s}\n", .{
+        if (detection.detected and canExecute(allocator, processor)) "yes" else "no",
+    });
+
+    if (target_raw) |raw| {
+        const target = resolveAgainstProject(allocator, project_dir, raw) catch try absolutePath(allocator, raw);
+        const is_elf = isX86_64Elf(init.io, allocator, target) catch false;
+        const hook_name = try std.fmt.allocPrint(allocator, "./{s}", .{std.fs.path.basename(target)});
+        std.debug.print("  target: {s}\n", .{target});
+        std.debug.print("  target_exists: {s}\n", .{if (fileExists(allocator, target)) "yes" else "no"});
+        std.debug.print("  target_executable: {s}\n", .{if (canExecute(allocator, target)) "yes" else "no"});
+        std.debug.print("  target_x86_64_elf: {s}\n", .{if (is_elf) "yes" else "no"});
+        std.debug.print("  expected_zsh_hook: {s}\n", .{hook_name});
+    } else {
+        try diagnoseProjectExecutables(init.io, allocator, project_dir);
+    }
+
+    std.debug.print("  note: if direct ./program still says exec format error in an already-open terminal, run:\n", .{});
+    std.debug.print("        source ~/.rosette/rosette-shell.sh\n", .{});
+}
+
+fn diagnoseProjectExecutables(io: std.Io, allocator: std.mem.Allocator, project_dir: []const u8) !void {
+    var dir = std.Io.Dir.openDirAbsolute(io, project_dir, .{ .iterate = true }) catch |err| {
+        std.debug.print("  executables: cannot scan project directory ({s})\n", .{@errorName(err)});
+        return;
+    };
+    defer dir.close(io);
+
+    var found: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const path = try std.fs.path.join(allocator, &.{ project_dir, entry.name });
+        if (!canExecute(allocator, path)) continue;
+        if (!(try isX86_64Elf(io, allocator, path))) continue;
+        found += 1;
+        std.debug.print("  executable[{d}]: ./{s} (x86-64 ELF)\n", .{ found, entry.name });
+        if (found >= 12) break;
+    }
+    if (found == 0) {
+        std.debug.print("  executables: no executable x86-64 ELF files found in project root\n", .{});
+    }
+}
+
+fn runElfTarget(init: std.process.Init, allocator: std.mem.Allocator, raw_target: []const u8, target_args: []const []const u8) !void {
+    const target = try absolutePath(allocator, raw_target);
+    if (!(try isX86_64Elf(init.io, allocator, target))) {
+        std.debug.print("rosette-shell: not an x86-64 ELF executable: {s}\n", .{raw_target});
+        std.process.exit(126);
+    }
+
+    const processor = try resolveElfProcessorPath(allocator);
+    if (!canExecute(allocator, processor)) {
+        std.debug.print("rosette-shell: elf_processor is not installed; run 'make shell-update' from Rosette or reinstall Rosette.\n", .{});
+        std.process.exit(127);
+    }
+
+    const config = try loadShellConfig(init.io, allocator);
+    const project_dir = std.fs.path.dirname(target) orelse ".";
+    const detection = detectProject(init.io, allocator, project_dir) catch Detection{
+        .detected = false,
+        .score = 0,
+        .kind = "unknown",
+        .signals = "none",
+    };
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, processor);
+    if (getenvSlice("ROSETTE_ELF_DUMP_RESULTS") == null and
+        getenvSlice("ROSETTE_ELF_DUMP_ALL") == null and
+        getenvSlice("ROSETTE_ELF_DUMP_ALL_RESULTS") == null)
+    {
+        if (config.elf_dump_all_results) {
+            try argv.append(allocator, "--dump-all-results");
+        } else if (shouldEnableDirectResultDump(config, detection)) {
+            try argv.append(allocator, "--dump-results");
+        }
+    }
+    try argv.append(allocator, target);
+    for (target_args) |arg| try argv.append(allocator, arg);
+
+    std.debug.print("Running via {s}...\n", .{processor});
+    _ = c.unsetenv("DYLD_INSERT_LIBRARIES");
+    const code = try runArgvResult(init.io, argv.items);
+    std.process.exit(code);
 }
 
 fn rewriteRecipeCommand(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !?[]const u8 {
@@ -871,7 +994,7 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         try appendShellQuoted(&out, allocator, dyld);
         try out.appendSlice(allocator,
             \\
-            \\if [ "${ROSETTE_ENABLE_DYLD_INTERPOSE:-0}" = "1" ]; then
+            \\if [ "${ROSETTE_ENABLE_DYLD_INTERPOSE:-1}" = "1" ]; then
             \\  case ":${DYLD_INSERT_LIBRARIES:-}:" in
             \\    *":$ROSETTE_DYLD_INTERPOSER:"*) ;;
             \\    *) export DYLD_INSERT_LIBRARIES="$ROSETTE_DYLD_INTERPOSER${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}" ;;
@@ -882,12 +1005,130 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
     }
 
     if (elf_processor_path) |proc_path| {
-        try out.appendSlice(allocator, "export ROSETTE_ELF_PROCESSOR=");
-        try appendShellQuoted(&out, allocator, proc_path);
-        try out.appendSlice(allocator, "\n");
+        _ = proc_path;
+        try out.appendSlice(allocator,
+            \\export ROSETTE_ELF_PROCESSOR="$HOME/.rosette/bin/elf_processor"
+            \\
+        );
     }
 
     try out.appendSlice(allocator,
+        \\__rosette_reload_shell_integration() {
+        \\  if [ -f "$HOME/.rosette/rosette-shell.sh" ]; then
+        \\    . "$HOME/.rosette/rosette-shell.sh"
+        \\  fi
+        \\  if command -v __rosette_refresh_elf_commands >/dev/null 2>&1; then
+        \\    __rosette_refresh_elf_commands >/dev/null 2>&1 || true
+        \\  fi
+        \\}
+        \\
+        \\__rosette_after_make() {
+        \\  local __rosette_after_status="$1"
+        \\  shift
+        \\  local __rosette_after_arg
+        \\  for __rosette_after_arg in "$@"; do
+        \\    case "$__rosette_after_arg" in
+        \\      shell|shell-update|install-shell)
+        \\        __rosette_reload_shell_integration
+        \\        return "$__rosette_after_status"
+        \\        ;;
+        \\    esac
+        \\  done
+        \\  if command -v __rosette_refresh_elf_commands >/dev/null 2>&1; then
+        \\    __rosette_refresh_elf_commands >/dev/null 2>&1 || true
+        \\  fi
+        \\  return "$__rosette_after_status"
+        \\}
+        \\
+        \\rosette-refresh() {
+        \\  __rosette_reload_shell_integration
+        \\}
+        \\
+        \\rosette-diagnose() {
+        \\  if [ "$#" -gt 0 ]; then
+        \\    "$ROSETTE_SHELL_HELPER" diagnose "$PWD" "$@"
+        \\  else
+        \\    "$ROSETTE_SHELL_HELPER" diagnose "$PWD"
+        \\  fi
+        \\}
+        \\
+        \\# zsh direct-launch support. This lets class-style x86-64 ELF
+        \\# binaries run as ./program even though macOS cannot exec ELF.
+        \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ] && [ -n "${ZSH_VERSION:-}" ]; then
+        \\  eval '
+        \\typeset -ga __rosette_elf_commands
+        \\__rosette_exec_elf() {
+        \\  emulate -L zsh
+        \\  local __rosette_target="$1"
+        \\  local __rosette_status __rosette_old_dyld __rosette_had_dyld=0
+        \\  shift
+        \\  if [ "${DYLD_INSERT_LIBRARIES+x}" = "x" ]; then
+        \\    __rosette_had_dyld=1
+        \\    __rosette_old_dyld="$DYLD_INSERT_LIBRARIES"
+        \\    unset DYLD_INSERT_LIBRARIES
+        \\  fi
+        \\  "$ROSETTE_SHELL_HELPER" run-elf "$__rosette_target" "$@"
+        \\  __rosette_status=$?
+        \\  if [ "$__rosette_had_dyld" = "1" ]; then
+        \\    export DYLD_INSERT_LIBRARIES="$__rosette_old_dyld"
+        \\  fi
+        \\  return "$__rosette_status"
+        \\}
+        \\__rosette_refresh_elf_commands() {
+        \\  emulate -L zsh
+        \\  local __rosette_cmd __rosette_path __rosette_proc __rosette_count=0
+        \\  for __rosette_cmd in "${__rosette_elf_commands[@]}"; do
+        \\    unfunction "$__rosette_cmd" 2>/dev/null || true
+        \\  done
+        \\  __rosette_elf_commands=()
+        \\  if [ ! -x "$ROSETTE_SHELL_HELPER" ]; then
+        \\    [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: helper missing/not executable: $ROSETTE_SHELL_HELPER" >&2
+        \\    return 0
+        \\  fi
+        \\  __rosette_proc="${ROSETTE_ELF_PROCESSOR:-$HOME/.rosette/bin/elf_processor}"
+        \\  if [ ! -x "$__rosette_proc" ]; then
+        \\    [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: elf_processor missing/not executable: $__rosette_proc" >&2
+        \\    return 0
+        \\  fi
+        \\  if ! "$ROSETTE_SHELL_HELPER" detect "$PWD" >/dev/null 2>&1; then
+        \\    [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: direct ELF launch disabled; project was not detected in $PWD" >&2
+        \\    return 0
+        \\  fi
+        \\  for __rosette_path in ./*(N); do
+        \\    [ -f "$__rosette_path" ] || continue
+        \\    [ -x "$__rosette_path" ] || continue
+        \\    if ! "$ROSETTE_SHELL_HELPER" is-elf64 "$__rosette_path" >/dev/null 2>&1; then
+        \\      [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: not x86-64 ELF: $__rosette_path" >&2
+        \\      continue
+        \\    fi
+        \\    __rosette_cmd="./${__rosette_path:t}"
+        \\    functions[$__rosette_cmd]="__rosette_exec_elf \"\$0\" \"\$@\""
+        \\    __rosette_elf_commands+=("$__rosette_cmd")
+        \\    __rosette_count=$((__rosette_count + 1))
+        \\  done
+        \\  [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: registered $__rosette_count direct ELF launcher(s) in $PWD" >&2
+        \\}
+        \\rosette-diagnose-shell() {
+        \\  emulate -L zsh
+        \\  local __rosette_target="${1:-./ast01}"
+        \\  "$ROSETTE_SHELL_HELPER" diagnose "$PWD" "$__rosette_target"
+        \\  __rosette_refresh_elf_commands
+        \\  if (( $+functions[$__rosette_target] )); then
+        \\    print -r -- "  zsh_hook: $__rosette_target registered"
+        \\  else
+        \\    print -r -- "  zsh_hook: $__rosette_target NOT registered"
+        \\    print -r -- "  repair: source ~/.rosette/rosette-shell.sh && rosette-refresh"
+        \\  fi
+        \\}
+        \\autoload -Uz add-zsh-hook 2>/dev/null || true
+        \\if (( $+functions[add-zsh-hook] )); then
+        \\  add-zsh-hook chpwd __rosette_refresh_elf_commands 2>/dev/null || true
+        \\  add-zsh-hook precmd __rosette_refresh_elf_commands 2>/dev/null || true
+        \\fi
+        \\__rosette_refresh_elf_commands 2>/dev/null || true
+        \\'
+        \\fi
+        \\
         \\# Rosette shell integration. This does not replace make; it only
         \\# checks the current directory before delegating to command make.
         \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ]; then
@@ -1021,7 +1262,8 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\        else
         \\          unset DYLD_INSERT_LIBRARIES
         \\        fi
-        \\        return "$__rosette_status"
+        \\        __rosette_after_make "$__rosette_status" "$@"
+        \\        return "$?"
         \\      fi
         \\      rm -f "$__rosette_env"
         \\      PATH="$__rosette_old_path"
@@ -1071,6 +1313,9 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\        unset DYLD_INSERT_LIBRARIES
         \\      fi
         \\      command make "$@"
+        \\      __rosette_status=$?
+        \\      __rosette_after_make "$__rosette_status" "$@"
+        \\      return "$?"
         \\    }
         \\  fi
         \\fi
@@ -1086,6 +1331,80 @@ fn buildProfileBlock(allocator: std.mem.Allocator) ![]const u8 {
         \\{s}
         \\
     , .{ block_begin, block_end });
+}
+
+fn installProfileBlocks(io: std.Io, allocator: std.mem.Allocator, home: []const u8, block: []const u8) !void {
+    var targets: std.ArrayList(ProfileTarget) = .empty;
+    defer targets.deinit(allocator);
+    try collectProfileTargets(allocator, home, true, &targets);
+
+    for (targets.items) |target| {
+        try ensureProfileBlock(io, allocator, target.path, block, target.create);
+        if (target.create or fileExists(allocator, target.path)) {
+            std.debug.print("profile: {s}\n", .{target.path});
+        }
+    }
+}
+
+fn removeProfileBlocks(io: std.Io, allocator: std.mem.Allocator, home: []const u8) !void {
+    var targets: std.ArrayList(ProfileTarget) = .empty;
+    defer targets.deinit(allocator);
+    try collectProfileTargets(allocator, home, false, &targets);
+
+    for (targets.items) |target| {
+        try removeProfileBlock(io, allocator, target.path);
+    }
+}
+
+fn collectProfileTargets(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    for_install: bool,
+    targets: *std.ArrayList(ProfileTarget),
+) !void {
+    const shell_path = getenvSlice("SHELL") orelse "";
+    const shell_name = std.fs.path.basename(shell_path);
+    const shell_known = shell_name.len != 0;
+    const shell_is_zsh = std.mem.eql(u8, shell_name, "zsh");
+    const shell_is_bash = std.mem.eql(u8, shell_name, "bash");
+    const prefer_zsh = shell_is_zsh or (!shell_known and comptime builtin.target.os.tag == .macos);
+
+    const zdot = try zshDotDir(allocator, home);
+    const zshrc = try std.fs.path.join(allocator, &.{ zdot, ".zshrc" });
+    const zprofile = try std.fs.path.join(allocator, &.{ zdot, ".zprofile" });
+    try addProfileTarget(targets, allocator, zshrc, for_install and prefer_zsh);
+    try addProfileTarget(targets, allocator, zprofile, false);
+
+    const home_zshrc = try std.fs.path.join(allocator, &.{ home, ".zshrc" });
+    const home_zprofile = try std.fs.path.join(allocator, &.{ home, ".zprofile" });
+    try addProfileTarget(targets, allocator, home_zshrc, for_install and prefer_zsh and std.mem.eql(u8, zdot, home));
+    try addProfileTarget(targets, allocator, home_zprofile, false);
+
+    const bashrc = try std.fs.path.join(allocator, &.{ home, ".bashrc" });
+    const bash_profile = try std.fs.path.join(allocator, &.{ home, ".bash_profile" });
+    try addProfileTarget(targets, allocator, bashrc, for_install and shell_is_bash);
+    try addProfileTarget(targets, allocator, bash_profile, for_install and shell_is_bash);
+
+    if (for_install and !shell_is_zsh and !shell_is_bash and shell_known) {
+        std.debug.print("rosette-shell: warning: shell '{s}' is not directly managed; install added compatible zsh/bash profile hooks where present\n", .{shell_name});
+    }
+}
+
+fn addProfileTarget(targets: *std.ArrayList(ProfileTarget), allocator: std.mem.Allocator, path: []const u8, create: bool) !void {
+    for (targets.items) |*target| {
+        if (std.mem.eql(u8, target.path, path)) {
+            target.create = target.create or create;
+            return;
+        }
+    }
+    try targets.append(allocator, .{ .path = path, .create = create });
+}
+
+fn zshDotDir(allocator: std.mem.Allocator, home: []const u8) ![]const u8 {
+    const raw = getenvSlice("ZDOTDIR") orelse return home;
+    if (raw.len == 0) return home;
+    if (std.fs.path.isAbsolute(raw)) return try allocator.dupe(u8, raw);
+    return try std.fs.path.resolve(allocator, &.{ home, raw });
 }
 
 fn ensureProfileBlock(io: std.Io, allocator: std.mem.Allocator, path: []const u8, block: []const u8, create_if_missing: bool) !void {
@@ -1234,7 +1553,7 @@ fn printConfig(io: std.Io, allocator: std.mem.Allocator) !void {
     std.debug.print("\nUseful commands:\n", .{});
     std.debug.print("  rosette config-path\n", .{});
     std.debug.print("  rosette clean-state\n", .{});
-    std.debug.print("  make run    # auto-dumps changed answer/remainder symbols when configured\n", .{});
+    std.debug.print("  make run or ./program    # auto-dumps assignment results when configured\n", .{});
 }
 
 fn loadShellConfig(io: std.Io, allocator: std.mem.Allocator) !ShellConfig {
@@ -1336,11 +1655,31 @@ fn shouldEnableResultDump(config: ShellConfig, detection: Detection, make_args: 
     };
 }
 
+fn shouldEnableDirectResultDump(config: ShellConfig, detection: Detection) bool {
+    return switch (config.elf_dump_results) {
+        .off => false,
+        .on => true,
+        .auto => detection.detected and
+            containsIgnoreCase(detection.kind, "yasm-linux-elf64") and
+            containsIgnoreCase(detection.signals, "asm:answer-symbols"),
+    };
+}
+
 fn makeArgsRequestRun(make_args: []const []const u8) bool {
     for (make_args) |arg| {
         if (std.mem.eql(u8, arg, "run")) return true;
     }
     return false;
+}
+
+fn resolveElfProcessorPath(allocator: std.mem.Allocator) ![]const u8 {
+    if (getenvSlice("ROSETTE_ELF_PROCESSOR")) |env_elf_path| {
+        if (canExecute(allocator, env_elf_path) or fileExists(allocator, env_elf_path)) {
+            return try allocator.dupe(u8, env_elf_path);
+        }
+    }
+    const home = try homeDir(allocator);
+    return try std.fs.path.join(allocator, &.{ home, ".rosette", "bin", "elf_processor" });
 }
 
 fn resolveAssemblerRunner(allocator: std.mem.Allocator, helper_path: []const u8, source_root: []const u8) !?[]const u8 {
@@ -1891,6 +2230,11 @@ fn absolutePath(allocator: std.mem.Allocator, raw_path: []const u8) ![]const u8 
     return try std.fs.path.resolve(allocator, &.{ std.mem.sliceTo(cwd, 0), resolved });
 }
 
+fn resolveAgainstProject(allocator: std.mem.Allocator, project_dir: []const u8, raw_path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(raw_path)) return try std.fs.path.resolve(allocator, &.{raw_path});
+    return try std.fs.path.resolve(allocator, &.{ project_dir, raw_path });
+}
+
 fn makePathRecursive(allocator: std.mem.Allocator, raw_path: []const u8) !void {
     if (raw_path.len == 0) return;
     var current: std.ArrayList(u8) = .empty;
@@ -2126,6 +2470,39 @@ test "auto result dump only triggers for run targets with answer symbols" {
     const build_args = [_][]const u8{};
     try std.testing.expect(shouldEnableResultDump(config, detected, &run_args));
     try std.testing.expect(!shouldEnableResultDump(config, detected, &build_args));
+}
+
+test "direct ELF result dump triggers for detected answer projects" {
+    const config = ShellConfig{ .elf_dump_results = .auto };
+    const detected = Detection{
+        .detected = true,
+        .score = 8,
+        .kind = "yasm-linux-elf64",
+        .signals = "makefile:yasm-elf64,asm:answer-symbols",
+    };
+    const generic = Detection{
+        .detected = false,
+        .score = 2,
+        .kind = "unknown",
+        .signals = "none",
+    };
+    try std.testing.expect(shouldEnableDirectResultDump(config, detected));
+    try std.testing.expect(!shouldEnableDirectResultDump(config, generic));
+}
+
+test "shell snippet includes zsh direct ELF launcher" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippet = try buildShellSnippet(
+        arena.allocator(),
+        "/tmp/rosette/bin/rosette-shell",
+        null,
+        "/tmp/rosette/bin/elf_processor",
+    );
+    try std.testing.expect(containsIgnoreCase(snippet, "run-elf"));
+    try std.testing.expect(containsIgnoreCase(snippet, "__rosette_refresh_elf_commands"));
+    try std.testing.expect(containsIgnoreCase(snippet, "detect \"$PWD\""));
+    try std.testing.expect(containsIgnoreCase(snippet, "functions[$__rosette_cmd]"));
 }
 
 test "assembly global parser handles lists and bracket directives" {
