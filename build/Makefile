@@ -14,6 +14,7 @@ ASSEMBLER_RUNNER_BIN := zig-out/bin/rosette_assembler_runner
 APP_EXE_BUILDER_SRC := rosette_app_exe.zig
 APP_EXE_BUILDER_BIN := zig-out/bin/rosette_app_exe
 ELF_PROCESSOR_BIN := zig-out/bin/elf_processor
+ELF_PROCESSOR_SRC := ELF_processor/main.zig
 DYLD_DYLIB := zig-out/lib/rosette-exec.dylib
 SHELL_HELPER_SRC := src/shell/global_config/rosette_shell.zig
 SHELL_HELPER_BIN := zig-out/bin/rosette-shell
@@ -150,7 +151,7 @@ clean: exe-runner-cleanup
 
 elf-processor-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe ELF_processor/process.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe --dep x64_decoder --dep x64_interpreter --dep x64_syscalls -Mroot="$(ELF_PROCESSOR_SRC)" -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
 elf-processor-dylib:
 	@mkdir -p zig-out/lib
