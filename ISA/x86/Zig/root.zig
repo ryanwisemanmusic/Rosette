@@ -132,6 +132,7 @@ const convert_cdqe = @import("CONVERT/CDQE.zig");
 const convert_cwd = @import("CONVERT/CWD.zig");
 const convert_cdq = @import("CONVERT/CDQ.zig");
 const convert_cqo = @import("CONVERT/CQO.zig");
+const halt_hlt = @import("HALT/HLT.zig");
 const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
@@ -485,6 +486,7 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "CQO",
     "CWDE",
     "CWD",
+    "HLT",
     "LOOP",
     "LOOPE",
     "LOOPNE",
@@ -899,6 +901,7 @@ pub const tables = [_]InstructionTable{
     entry(convert_cwd.family, convert_cwd.path, convert_cwd.source),
     entry(convert_cdq.family, convert_cdq.path, convert_cdq.source),
     entry(convert_cqo.family, convert_cqo.path, convert_cqo.source),
+    entry(halt_hlt.family, halt_hlt.path, halt_hlt.source),
     entry(loop_loop.family, loop_loop.path, loop_loop.source),
     entry(loop_loope.family, loop_loope.path, loop_loope.source),
     entry(loop_loopne.family, loop_loopne.path, loop_loopne.source),
@@ -1274,7 +1277,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 352), tableCount());
+    try std.testing.expectEqual(@as(usize, 353), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
