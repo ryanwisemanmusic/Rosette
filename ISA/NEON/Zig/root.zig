@@ -445,6 +445,8 @@ const count_vplzcntq = @import("COUNT/VPLZCNTQ.zig");
 const exchange_fxch = @import("EXCHANGE/FXCH.zig");
 const exchange_xadd = @import("EXCHANGE/XADD.zig");
 const exchange_xchg = @import("EXCHANGE/XCHG.zig");
+const nop_fnop = @import("NOP/FNOP.zig");
+const nop_nop = @import("NOP/NOP.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -964,6 +966,8 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(exchange_fxch.family, exchange_fxch.path, exchange_fxch.source),
     mirror(exchange_xadd.family, exchange_xadd.path, exchange_xadd.source),
     mirror(exchange_xchg.family, exchange_xchg.path, exchange_xchg.source),
+    mirror(nop_fnop.family, nop_fnop.path, nop_fnop.source),
+    mirror(nop_nop.family, nop_nop.path, nop_nop.source),
 };
 
 pub fn tableCount() usize {
