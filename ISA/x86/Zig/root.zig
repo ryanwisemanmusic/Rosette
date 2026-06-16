@@ -444,6 +444,8 @@ const count_vplzcntq = @import("COUNT/VPLZCNTQ.zig");
 const exchange_fxch = @import("EXCHANGE/FXCH.zig");
 const exchange_xadd = @import("EXCHANGE/XADD.zig");
 const exchange_xchg = @import("EXCHANGE/XCHG.zig");
+const nop_fnop = @import("NOP/FNOP.zig");
+const nop_nop = @import("NOP/NOP.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -890,6 +892,8 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "FXCH",
     "XADD",
     "XCHG",
+    "FNOP",
+    "NOP",
 };
 
 pub const TableMetadata = struct {
@@ -1397,6 +1401,8 @@ pub const tables = [_]InstructionTable{
     entry(exchange_fxch.family, exchange_fxch.path, exchange_fxch.source),
     entry(exchange_xadd.family, exchange_xadd.path, exchange_xadd.source),
     entry(exchange_xchg.family, exchange_xchg.path, exchange_xchg.source),
+    entry(nop_fnop.family, nop_fnop.path, nop_fnop.source),
+    entry(nop_nop.family, nop_nop.path, nop_nop.source),
 };
 
 pub fn tableCount() usize {
@@ -1553,7 +1559,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 445), tableCount());
+    try std.testing.expectEqual(@as(usize, 447), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
