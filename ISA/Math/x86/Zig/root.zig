@@ -240,6 +240,8 @@ const sub_subsd = @import("SUB/SUBSD.zig");
 const sub_subss = @import("SUB/SUBSS.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
+const verify_verr = @import("VERIFY/VERR.zig");
+const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
 const xor_xorpd = @import("XOR/XORPD.zig");
 const xor_xorps = @import("XOR/XORPS.zig");
@@ -596,6 +598,8 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(sub_subss.meta),
     spec(test_test.meta),
     spec(test_testui.meta),
+    spec(verify_verr.meta),
+    spec(verify_verw.meta),
     spec(xor_xor.meta),
     spec(xor_xorpd.meta),
     spec(xor_xorps.meta),
@@ -953,6 +957,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     sub_subss.proof_report,
     test_test.proof_report,
     test_testui.proof_report,
+    verify_verr.proof_report,
+    verify_verw.proof_report,
     xor_xor.proof_report,
     xor_xorpd.proof_report,
     xor_xorps.proof_report,
@@ -1127,7 +1133,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 355), tableCount());
+    try std.testing.expectEqual(@as(usize, 357), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();

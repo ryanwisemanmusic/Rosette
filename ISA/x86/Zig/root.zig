@@ -238,6 +238,8 @@ const sub_subsd = @import("SUB/SUBSD.zig");
 const sub_subss = @import("SUB/SUBSS.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
+const verify_verr = @import("VERIFY/VERR.zig");
+const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
 const xor_xorpd = @import("XOR/XORPD.zig");
 const xor_xorps = @import("XOR/XORPS.zig");
@@ -478,6 +480,8 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VBROADCASTI64X2",
     "VBROADCASTI32X8",
     "VBROADCASTI64X4",
+    "VERR",
+    "VERW",
     "VPEXPANDD",
     "VPEXPANDQ",
     "XABORT",
@@ -895,6 +899,8 @@ pub const tables = [_]InstructionTable{
     entry(load_vbroadcasti64x2.family, load_vbroadcasti64x2.path, load_vbroadcasti64x2.source),
     entry(load_vbroadcasti32x8.family, load_vbroadcasti32x8.path, load_vbroadcasti32x8.source),
     entry(load_vbroadcasti64x4.family, load_vbroadcasti64x4.path, load_vbroadcasti64x4.source),
+    entry(verify_verr.family, verify_verr.path, verify_verr.source),
+    entry(verify_verw.family, verify_verw.path, verify_verw.source),
     entry(load_vpexpandd.family, load_vpexpandd.path, load_vpexpandd.source),
     entry(load_vpexpandq.family, load_vpexpandq.path, load_vpexpandq.source),
     entry(load_xresldtrk.family, load_xresldtrk.path, load_xresldtrk.source),
@@ -1283,7 +1289,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 355), tableCount());
+    try std.testing.expectEqual(@as(usize, 357), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
