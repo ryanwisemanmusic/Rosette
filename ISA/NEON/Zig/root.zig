@@ -447,6 +447,19 @@ const exchange_xadd = @import("EXCHANGE/XADD.zig");
 const exchange_xchg = @import("EXCHANGE/XCHG.zig");
 const nop_fnop = @import("NOP/FNOP.zig");
 const nop_nop = @import("NOP/NOP.zig");
+const not_not = @import("NOT/NOT.zig");
+const not_knotw = @import("NOT/KNOTW.zig");
+const not_knotb = @import("NOT/KNOTB.zig");
+const not_knotq = @import("NOT/KNOTQ.zig");
+const not_knotd = @import("NOT/KNOTD.zig");
+const andnot_pandn = @import("ANDNOT/PANDN.zig");
+const andnot_vpandn = @import("ANDNOT/VPANDN.zig");
+const andnot_vpandnd = @import("ANDNOT/VPANDND.zig");
+const andnot_vpandnq = @import("ANDNOT/VPANDNQ.zig");
+const andnot_kandnw = @import("ANDNOT/KANDNW.zig");
+const andnot_kandnb = @import("ANDNOT/KANDNB.zig");
+const andnot_kandnq = @import("ANDNOT/KANDNQ.zig");
+const andnot_kandnd = @import("ANDNOT/KANDND.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -968,6 +981,19 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(exchange_xchg.family, exchange_xchg.path, exchange_xchg.source),
     mirror(nop_fnop.family, nop_fnop.path, nop_fnop.source),
     mirror(nop_nop.family, nop_nop.path, nop_nop.source),
+    mirror(not_not.family, not_not.path, not_not.source),
+    mirror(not_knotw.family, not_knotw.path, not_knotw.source),
+    mirror(not_knotb.family, not_knotb.path, not_knotb.source),
+    mirror(not_knotq.family, not_knotq.path, not_knotq.source),
+    mirror(not_knotd.family, not_knotd.path, not_knotd.source),
+    mirror(andnot_pandn.family, andnot_pandn.path, andnot_pandn.source),
+    mirror(andnot_vpandn.family, andnot_vpandn.path, andnot_vpandn.source),
+    mirror(andnot_vpandnd.family, andnot_vpandnd.path, andnot_vpandnd.source),
+    mirror(andnot_vpandnq.family, andnot_vpandnq.path, andnot_vpandnq.source),
+    mirror(andnot_kandnw.family, andnot_kandnw.path, andnot_kandnw.source),
+    mirror(andnot_kandnb.family, andnot_kandnb.path, andnot_kandnb.source),
+    mirror(andnot_kandnq.family, andnot_kandnq.path, andnot_kandnq.source),
+    mirror(andnot_kandnd.family, andnot_kandnd.path, andnot_kandnd.source),
 };
 
 pub fn tableCount() usize {

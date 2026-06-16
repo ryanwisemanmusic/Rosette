@@ -449,6 +449,19 @@ const exchange_xadd = @import("EXCHANGE/XADD.zig");
 const exchange_xchg = @import("EXCHANGE/XCHG.zig");
 const nop_fnop = @import("NOP/FNOP.zig");
 const nop_nop = @import("NOP/NOP.zig");
+const not_not = @import("NOT/NOT.zig");
+const not_knotw = @import("NOT/KNOTW.zig");
+const not_knotb = @import("NOT/KNOTB.zig");
+const not_knotq = @import("NOT/KNOTQ.zig");
+const not_knotd = @import("NOT/KNOTD.zig");
+const andnot_pandn = @import("ANDNOT/PANDN.zig");
+const andnot_vpandn = @import("ANDNOT/VPANDN.zig");
+const andnot_vpandnd = @import("ANDNOT/VPANDND.zig");
+const andnot_vpandnq = @import("ANDNOT/VPANDNQ.zig");
+const andnot_kandnw = @import("ANDNOT/KANDNW.zig");
+const andnot_kandnb = @import("ANDNOT/KANDNB.zig");
+const andnot_kandnq = @import("ANDNOT/KANDNQ.zig");
+const andnot_kandnd = @import("ANDNOT/KANDND.zig");
 
 pub const specs = [_]core.InstructionMathSpec{
     spec(add_adc.meta),
@@ -897,6 +910,19 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(exchange_xchg.meta),
     spec(nop_fnop.meta),
     spec(nop_nop.meta),
+    spec(not_not.meta),
+    spec(not_knotw.meta),
+    spec(not_knotb.meta),
+    spec(not_knotq.meta),
+    spec(not_knotd.meta),
+    spec(andnot_pandn.meta),
+    spec(andnot_vpandn.meta),
+    spec(andnot_vpandnd.meta),
+    spec(andnot_vpandnq.meta),
+    spec(andnot_kandnw.meta),
+    spec(andnot_kandnb.meta),
+    spec(andnot_kandnq.meta),
+    spec(andnot_kandnd.meta),
 };
 
 pub const proof_reports = [_]proofs.ProofReport{
@@ -1346,6 +1372,19 @@ pub const proof_reports = [_]proofs.ProofReport{
     exchange_xchg.proof_report,
     nop_fnop.proof_report,
     nop_nop.proof_report,
+    not_not.proof_report,
+    not_knotw.proof_report,
+    not_knotb.proof_report,
+    not_knotq.proof_report,
+    not_knotd.proof_report,
+    andnot_pandn.proof_report,
+    andnot_vpandn.proof_report,
+    andnot_vpandnd.proof_report,
+    andnot_vpandnq.proof_report,
+    andnot_kandnw.proof_report,
+    andnot_kandnb.proof_report,
+    andnot_kandnq.proof_report,
+    andnot_kandnd.proof_report,
 };
 
 pub fn tableCount() usize {
