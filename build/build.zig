@@ -927,11 +927,17 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        const x64_linux_runtime_mod = b.createModule(.{
+            .root_source_file = b.path("../src/x64-ASM/linux_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         const x64_syscalls_mod = b.createModule(.{
             .root_source_file = b.path("../src/x64-ASM/syscalls.zig"),
             .target = target,
             .optimize = optimize,
         });
+        x64_linux_runtime_mod.addImport("x64_syscalls", x64_syscalls_mod);
         const elf_processor_mod = b.createModule(.{
             .root_source_file = b.path("../ELF_processor/main.zig"),
             .target = target,
@@ -939,6 +945,7 @@ pub fn build(b: *std.Build) void {
         });
         elf_processor_mod.addImport("x64_decoder", x64_decoder_mod);
         elf_processor_mod.addImport("x64_interpreter", x64_interpreter_mod);
+        elf_processor_mod.addImport("x64_linux_runtime", x64_linux_runtime_mod);
         elf_processor_mod.addImport("x64_syscalls", x64_syscalls_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
@@ -953,6 +960,7 @@ pub fn build(b: *std.Build) void {
         });
         elf_processor_test_mod.addImport("x64_decoder", x64_decoder_mod);
         elf_processor_test_mod.addImport("x64_interpreter", x64_interpreter_mod);
+        elf_processor_test_mod.addImport("x64_linux_runtime", x64_linux_runtime_mod);
         elf_processor_test_mod.addImport("x64_syscalls", x64_syscalls_mod);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&elf_processor_test.step);
