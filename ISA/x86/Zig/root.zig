@@ -127,6 +127,7 @@ const load_vpexpandq = @import("LOAD/VPEXPANDQ.zig");
 const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
+const begin_xbegin = @import("BEGIN/XBEGIN.zig");
 const convert_cbw = @import("CONVERT/CBW.zig");
 const convert_cwde = @import("CONVERT/CWDE.zig");
 const convert_cdqe = @import("CONVERT/CDQE.zig");
@@ -480,6 +481,7 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VPEXPANDD",
     "VPEXPANDQ",
     "XABORT",
+    "XBEGIN",
     "XRESLDTRK",
     "XSUSLDTRK",
     "CBW",
@@ -898,6 +900,7 @@ pub const tables = [_]InstructionTable{
     entry(load_xresldtrk.family, load_xresldtrk.path, load_xresldtrk.source),
     entry(load_xsusldtrk.family, load_xsusldtrk.path, load_xsusldtrk.source),
     entry(abort_xabort.family, abort_xabort.path, abort_xabort.source),
+    entry(begin_xbegin.family, begin_xbegin.path, begin_xbegin.source),
     entry(convert_cbw.family, convert_cbw.path, convert_cbw.source),
     entry(convert_cwde.family, convert_cwde.path, convert_cwde.source),
     entry(convert_cdqe.family, convert_cdqe.path, convert_cdqe.source),
@@ -1280,7 +1283,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 354), tableCount());
+    try std.testing.expectEqual(@as(usize, 355), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
