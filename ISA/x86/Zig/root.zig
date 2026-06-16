@@ -128,6 +128,48 @@ const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
+const conditional_cmova = @import("CONDITIONAL/CMOVA.zig");
+const conditional_cmovae = @import("CONDITIONAL/CMOVAE.zig");
+const conditional_cmovb = @import("CONDITIONAL/CMOVB.zig");
+const conditional_cmovbe = @import("CONDITIONAL/CMOVBE.zig");
+const conditional_cmovc = @import("CONDITIONAL/CMOVC.zig");
+const conditional_cmove = @import("CONDITIONAL/CMOVE.zig");
+const conditional_cmovg = @import("CONDITIONAL/CMOVG.zig");
+const conditional_cmovge = @import("CONDITIONAL/CMOVGE.zig");
+const conditional_cmovl = @import("CONDITIONAL/CMOVL.zig");
+const conditional_cmovle = @import("CONDITIONAL/CMOVLE.zig");
+const conditional_cmovna = @import("CONDITIONAL/CMOVNA.zig");
+const conditional_cmovnae = @import("CONDITIONAL/CMOVNAE.zig");
+const conditional_cmovnb = @import("CONDITIONAL/CMOVNB.zig");
+const conditional_cmovnbe = @import("CONDITIONAL/CMOVNBE.zig");
+const conditional_cmovnc = @import("CONDITIONAL/CMOVNC.zig");
+const conditional_cmovne = @import("CONDITIONAL/CMOVNE.zig");
+const conditional_cmovng = @import("CONDITIONAL/CMOVNG.zig");
+const conditional_cmovnge = @import("CONDITIONAL/CMOVNGE.zig");
+const conditional_cmovnl = @import("CONDITIONAL/CMOVNL.zig");
+const conditional_cmovnle = @import("CONDITIONAL/CMOVNLE.zig");
+const conditional_cmovno = @import("CONDITIONAL/CMOVNO.zig");
+const conditional_cmovnp = @import("CONDITIONAL/CMOVNP.zig");
+const conditional_cmovns = @import("CONDITIONAL/CMOVNS.zig");
+const conditional_cmovnz = @import("CONDITIONAL/CMOVNZ.zig");
+const conditional_cmovo = @import("CONDITIONAL/CMOVO.zig");
+const conditional_cmovp = @import("CONDITIONAL/CMOVP.zig");
+const conditional_cmovpe = @import("CONDITIONAL/CMOVPE.zig");
+const conditional_cmovpo = @import("CONDITIONAL/CMOVPO.zig");
+const conditional_cmovs = @import("CONDITIONAL/CMOVS.zig");
+const conditional_cmovz = @import("CONDITIONAL/CMOVZ.zig");
+const conditional_fcmovb = @import("CONDITIONAL/FCMOVB.zig");
+const conditional_fcmove = @import("CONDITIONAL/FCMOVE.zig");
+const conditional_fcmovbe = @import("CONDITIONAL/FCMOVBE.zig");
+const conditional_fcmovu = @import("CONDITIONAL/FCMOVU.zig");
+const conditional_fcmovnb = @import("CONDITIONAL/FCMOVNB.zig");
+const conditional_fcmovne = @import("CONDITIONAL/FCMOVNE.zig");
+const conditional_fcmovnbe = @import("CONDITIONAL/FCMOVNBE.zig");
+const conditional_fcmovnu = @import("CONDITIONAL/FCMOVNU.zig");
+const conditional_vmaskmovps = @import("CONDITIONAL/VMASKMOVPS.zig");
+const conditional_vmaskmovpd = @import("CONDITIONAL/VMASKMOVPD.zig");
+const conditional_vpmaskmovd = @import("CONDITIONAL/VPMASKMOVD.zig");
+const conditional_vpmaskmovq = @import("CONDITIONAL/VPMASKMOVQ.zig");
 const convert_cbw = @import("CONVERT/CBW.zig");
 const convert_cwde = @import("CONVERT/CWDE.zig");
 const convert_cdqe = @import("CONVERT/CDQE.zig");
@@ -483,6 +525,10 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VBROADCASTI64X4",
     "VERR",
     "VERW",
+    "VMASKMOVPD",
+    "VMASKMOVPS",
+    "VPMASKMOVD",
+    "VPMASKMOVQ",
     "VPEXPANDD",
     "VPEXPANDQ",
     "XABORT",
@@ -492,9 +538,47 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "CBW",
     "CDQ",
     "CDQE",
+    "CMOVA",
+    "CMOVAE",
+    "CMOVB",
+    "CMOVBE",
+    "CMOVC",
+    "CMOVE",
+    "CMOVG",
+    "CMOVGE",
+    "CMOVL",
+    "CMOVLE",
+    "CMOVNA",
+    "CMOVNAE",
+    "CMOVNB",
+    "CMOVNBE",
+    "CMOVNC",
+    "CMOVNE",
+    "CMOVNG",
+    "CMOVNGE",
+    "CMOVNL",
+    "CMOVNLE",
+    "CMOVNO",
+    "CMOVNP",
+    "CMOVNS",
+    "CMOVNZ",
+    "CMOVO",
+    "CMOVP",
+    "CMOVPE",
+    "CMOVPO",
+    "CMOVS",
+    "CMOVZ",
     "CQO",
     "CWDE",
     "CWD",
+    "FCMOVB",
+    "FCMOVBE",
+    "FCMOVE",
+    "FCMOVNB",
+    "FCMOVNBE",
+    "FCMOVNE",
+    "FCMOVNU",
+    "FCMOVU",
     "HLT",
     "LOOP",
     "LOOPE",
@@ -909,6 +993,48 @@ pub const tables = [_]InstructionTable{
     entry(load_xsusldtrk.family, load_xsusldtrk.path, load_xsusldtrk.source),
     entry(abort_xabort.family, abort_xabort.path, abort_xabort.source),
     entry(begin_xbegin.family, begin_xbegin.path, begin_xbegin.source),
+    entry(conditional_cmova.family, conditional_cmova.path, conditional_cmova.source),
+    entry(conditional_cmovae.family, conditional_cmovae.path, conditional_cmovae.source),
+    entry(conditional_cmovb.family, conditional_cmovb.path, conditional_cmovb.source),
+    entry(conditional_cmovbe.family, conditional_cmovbe.path, conditional_cmovbe.source),
+    entry(conditional_cmovc.family, conditional_cmovc.path, conditional_cmovc.source),
+    entry(conditional_cmove.family, conditional_cmove.path, conditional_cmove.source),
+    entry(conditional_cmovg.family, conditional_cmovg.path, conditional_cmovg.source),
+    entry(conditional_cmovge.family, conditional_cmovge.path, conditional_cmovge.source),
+    entry(conditional_cmovl.family, conditional_cmovl.path, conditional_cmovl.source),
+    entry(conditional_cmovle.family, conditional_cmovle.path, conditional_cmovle.source),
+    entry(conditional_cmovna.family, conditional_cmovna.path, conditional_cmovna.source),
+    entry(conditional_cmovnae.family, conditional_cmovnae.path, conditional_cmovnae.source),
+    entry(conditional_cmovnb.family, conditional_cmovnb.path, conditional_cmovnb.source),
+    entry(conditional_cmovnbe.family, conditional_cmovnbe.path, conditional_cmovnbe.source),
+    entry(conditional_cmovnc.family, conditional_cmovnc.path, conditional_cmovnc.source),
+    entry(conditional_cmovne.family, conditional_cmovne.path, conditional_cmovne.source),
+    entry(conditional_cmovng.family, conditional_cmovng.path, conditional_cmovng.source),
+    entry(conditional_cmovnge.family, conditional_cmovnge.path, conditional_cmovnge.source),
+    entry(conditional_cmovnl.family, conditional_cmovnl.path, conditional_cmovnl.source),
+    entry(conditional_cmovnle.family, conditional_cmovnle.path, conditional_cmovnle.source),
+    entry(conditional_cmovno.family, conditional_cmovno.path, conditional_cmovno.source),
+    entry(conditional_cmovnp.family, conditional_cmovnp.path, conditional_cmovnp.source),
+    entry(conditional_cmovns.family, conditional_cmovns.path, conditional_cmovns.source),
+    entry(conditional_cmovnz.family, conditional_cmovnz.path, conditional_cmovnz.source),
+    entry(conditional_cmovo.family, conditional_cmovo.path, conditional_cmovo.source),
+    entry(conditional_cmovp.family, conditional_cmovp.path, conditional_cmovp.source),
+    entry(conditional_cmovpe.family, conditional_cmovpe.path, conditional_cmovpe.source),
+    entry(conditional_cmovpo.family, conditional_cmovpo.path, conditional_cmovpo.source),
+    entry(conditional_cmovs.family, conditional_cmovs.path, conditional_cmovs.source),
+    entry(conditional_cmovz.family, conditional_cmovz.path, conditional_cmovz.source),
+    entry(conditional_fcmovb.family, conditional_fcmovb.path, conditional_fcmovb.source),
+    entry(conditional_fcmove.family, conditional_fcmove.path, conditional_fcmove.source),
+    entry(conditional_fcmovbe.family, conditional_fcmovbe.path, conditional_fcmovbe.source),
+    entry(conditional_fcmovu.family, conditional_fcmovu.path, conditional_fcmovu.source),
+    entry(conditional_fcmovnb.family, conditional_fcmovnb.path, conditional_fcmovnb.source),
+    entry(conditional_fcmovne.family, conditional_fcmovne.path, conditional_fcmovne.source),
+    entry(conditional_fcmovnbe.family, conditional_fcmovnbe.path, conditional_fcmovnbe.source),
+    entry(conditional_fcmovnu.family, conditional_fcmovnu.path, conditional_fcmovnu.source),
+    entry(conditional_vmaskmovps.family, conditional_vmaskmovps.path, conditional_vmaskmovps.source),
+    entry(conditional_vmaskmovpd.family, conditional_vmaskmovpd.path, conditional_vmaskmovpd.source),
+    entry(conditional_vpmaskmovd.family, conditional_vpmaskmovd.path, conditional_vpmaskmovd.source),
+    entry(conditional_vpmaskmovq.family, conditional_vpmaskmovq.path, conditional_vpmaskmovq.source),
     entry(convert_cbw.family, convert_cbw.path, convert_cbw.source),
     entry(convert_cwde.family, convert_cwde.path, convert_cwde.source),
     entry(convert_cdqe.family, convert_cdqe.path, convert_cdqe.source),
@@ -1292,7 +1418,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 358), tableCount());
+    try std.testing.expectEqual(@as(usize, 400), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
