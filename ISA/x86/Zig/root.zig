@@ -437,6 +437,10 @@ const set_setpe = @import("SET/SETPE.zig");
 const set_setpo = @import("SET/SETPO.zig");
 const set_sets = @import("SET/SETS.zig");
 const set_setz = @import("SET/SETZ.zig");
+const count_lzcnt = @import("COUNT/LZCNT.zig");
+const count_tzcnt = @import("COUNT/TZCNT.zig");
+const count_vplzcntd = @import("COUNT/VPLZCNTD.zig");
+const count_vplzcntq = @import("COUNT/VPLZCNTQ.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -876,6 +880,10 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "SETPO",
     "SETS",
     "SETZ",
+    "LZCNT",
+    "TZCNT",
+    "VPLZCNTD",
+    "VPLZCNTQ",
 };
 
 pub const TableMetadata = struct {
@@ -1376,6 +1384,10 @@ pub const tables = [_]InstructionTable{
     entry(set_setpo.family, set_setpo.path, set_setpo.source),
     entry(set_sets.family, set_sets.path, set_sets.source),
     entry(set_setz.family, set_setz.path, set_setz.source),
+    entry(count_lzcnt.family, count_lzcnt.path, count_lzcnt.source),
+    entry(count_tzcnt.family, count_tzcnt.path, count_tzcnt.source),
+    entry(count_vplzcntd.family, count_vplzcntd.path, count_vplzcntd.source),
+    entry(count_vplzcntq.family, count_vplzcntq.path, count_vplzcntq.source),
 };
 
 pub fn tableCount() usize {
@@ -1532,7 +1544,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 438), tableCount());
+    try std.testing.expectEqual(@as(usize, 442), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
