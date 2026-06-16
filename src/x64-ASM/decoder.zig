@@ -14,6 +14,7 @@ pub const RFL_OF = flags.RFL_OF;
 pub const applySub = flags.applySub;
 pub const applyAdd = flags.applyAdd;
 pub const applyIncDec = flags.applyIncDec;
+pub const applyLogic = flags.applyLogic;
 pub const evalCond = flags.evalCond;
 pub const regVal = cpu_state.regVal;
 pub const setReg = cpu_state.setReg;
@@ -31,6 +32,7 @@ pub const Op = enum(u8) {
     mov_reg32_mem32,
     mov_reg64_mem64,
     mov_reg_imm,
+    mov_mem8_imm8,
     mov_mem16_imm16,
     mov_mem32_imm32,
     mov_mem64_imm32,
@@ -53,6 +55,10 @@ pub const Op = enum(u8) {
     add_reg16_reg16,
     add_reg32_reg32,
     add_reg64_reg64,
+    add_reg8_imm8,
+    add_reg16_imm8,
+    add_reg32_imm8,
+    add_reg64_imm8,
     // sub (reg, r/m) d=1
     sub_reg8_mem8,
     sub_reg16_mem16,
@@ -69,6 +75,29 @@ pub const Op = enum(u8) {
     sub_reg16_imm8,
     sub_reg32_imm8,
     sub_reg64_imm8,
+    sub_reg16_imm32,
+    sub_reg32_imm32,
+    sub_reg64_imm32,
+    // logical and/xor
+    and_reg8_reg8,
+    and_reg16_reg16,
+    and_reg32_reg32,
+    and_reg64_reg64,
+    and_reg8_imm8,
+    and_reg16_imm8,
+    and_reg32_imm8,
+    and_reg64_imm8,
+    xor_reg8_reg8,
+    xor_reg16_reg16,
+    xor_reg32_reg32,
+    xor_reg64_reg64,
+    xor_reg8_imm8,
+    // test
+    test_reg8_reg8,
+    test_reg16_reg16,
+    test_reg32_reg32,
+    test_reg64_reg64,
+    test_reg8_imm8,
     // cmp r/m, r
     cmp_mem8_reg8,
     cmp_mem16_reg16,
@@ -174,11 +203,18 @@ pub const Op = enum(u8) {
     movsx_reg32_mem8,
     movsx_reg32_mem16,
     movsxd_reg64_reg32,
+    lea_reg_mem,
+    setcc_reg8,
     // conditional / unconditional jumps
     jmp_rel8,
     jcc_rel8,
+    jmp_mem64,
+    jmp_reg64,
     // syscall
     syscall,
+    call_mem64,
+    call_reg64,
+    hlt,
 };
 
 pub const DecodedInsn = struct {
@@ -194,6 +230,7 @@ pub const DecodedInsn = struct {
     sib_scale: u2 = 0,
     sib_has_base: bool = false,
     sib_base_reg: RegId = .al_ax_eax_rax,
+    rip_relative: bool = false,
     has_0x67: bool = false,
     is_reg_form: bool = false,
     cond: Condition = .e,
