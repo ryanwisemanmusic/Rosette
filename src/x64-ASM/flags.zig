@@ -92,6 +92,17 @@ pub fn applyIncDec(rflags: *u32, input: u64, result: u64, size: OperandSize, is_
     setOrClear(rflags, RFL_ZF, r == 0);
 }
 
+pub fn applyLogic(rflags: *u32, result: u64, size: OperandSize) void {
+    const mask = maskForSize(size);
+    const sign = signBitForSize(size);
+    const r = result & mask;
+
+    setOrClear(rflags, RFL_CF, false);
+    setOrClear(rflags, RFL_OF, false);
+    setOrClear(rflags, RFL_SF, (r & sign) != 0);
+    setOrClear(rflags, RFL_ZF, r == 0);
+}
+
 pub fn evalCond(rflags: u32, cond: Condition) bool {
     const sf = (rflags & RFL_SF) != 0;
     const zf = (rflags & RFL_ZF) != 0;
