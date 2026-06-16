@@ -131,6 +131,48 @@ const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
+const conditional_cmova = @import("CONDITIONAL/CMOVA.zig");
+const conditional_cmovae = @import("CONDITIONAL/CMOVAE.zig");
+const conditional_cmovb = @import("CONDITIONAL/CMOVB.zig");
+const conditional_cmovbe = @import("CONDITIONAL/CMOVBE.zig");
+const conditional_cmovc = @import("CONDITIONAL/CMOVC.zig");
+const conditional_cmove = @import("CONDITIONAL/CMOVE.zig");
+const conditional_cmovg = @import("CONDITIONAL/CMOVG.zig");
+const conditional_cmovge = @import("CONDITIONAL/CMOVGE.zig");
+const conditional_cmovl = @import("CONDITIONAL/CMOVL.zig");
+const conditional_cmovle = @import("CONDITIONAL/CMOVLE.zig");
+const conditional_cmovna = @import("CONDITIONAL/CMOVNA.zig");
+const conditional_cmovnae = @import("CONDITIONAL/CMOVNAE.zig");
+const conditional_cmovnb = @import("CONDITIONAL/CMOVNB.zig");
+const conditional_cmovnbe = @import("CONDITIONAL/CMOVNBE.zig");
+const conditional_cmovnc = @import("CONDITIONAL/CMOVNC.zig");
+const conditional_cmovne = @import("CONDITIONAL/CMOVNE.zig");
+const conditional_cmovng = @import("CONDITIONAL/CMOVNG.zig");
+const conditional_cmovnge = @import("CONDITIONAL/CMOVNGE.zig");
+const conditional_cmovnl = @import("CONDITIONAL/CMOVNL.zig");
+const conditional_cmovnle = @import("CONDITIONAL/CMOVNLE.zig");
+const conditional_cmovno = @import("CONDITIONAL/CMOVNO.zig");
+const conditional_cmovnp = @import("CONDITIONAL/CMOVNP.zig");
+const conditional_cmovns = @import("CONDITIONAL/CMOVNS.zig");
+const conditional_cmovnz = @import("CONDITIONAL/CMOVNZ.zig");
+const conditional_cmovo = @import("CONDITIONAL/CMOVO.zig");
+const conditional_cmovp = @import("CONDITIONAL/CMOVP.zig");
+const conditional_cmovpe = @import("CONDITIONAL/CMOVPE.zig");
+const conditional_cmovpo = @import("CONDITIONAL/CMOVPO.zig");
+const conditional_cmovs = @import("CONDITIONAL/CMOVS.zig");
+const conditional_cmovz = @import("CONDITIONAL/CMOVZ.zig");
+const conditional_fcmovb = @import("CONDITIONAL/FCMOVB.zig");
+const conditional_fcmove = @import("CONDITIONAL/FCMOVE.zig");
+const conditional_fcmovbe = @import("CONDITIONAL/FCMOVBE.zig");
+const conditional_fcmovu = @import("CONDITIONAL/FCMOVU.zig");
+const conditional_fcmovnb = @import("CONDITIONAL/FCMOVNB.zig");
+const conditional_fcmovne = @import("CONDITIONAL/FCMOVNE.zig");
+const conditional_fcmovnbe = @import("CONDITIONAL/FCMOVNBE.zig");
+const conditional_fcmovnu = @import("CONDITIONAL/FCMOVNU.zig");
+const conditional_vmaskmovps = @import("CONDITIONAL/VMASKMOVPS.zig");
+const conditional_vmaskmovpd = @import("CONDITIONAL/VMASKMOVPD.zig");
+const conditional_vpmaskmovd = @import("CONDITIONAL/VPMASKMOVD.zig");
+const conditional_vpmaskmovq = @import("CONDITIONAL/VPMASKMOVQ.zig");
 const convert_cbw = @import("CONVERT/CBW.zig");
 const convert_cwde = @import("CONVERT/CWDE.zig");
 const convert_cdqe = @import("CONVERT/CDQE.zig");
@@ -490,6 +532,48 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(load_xsusldtrk.meta),
     spec(abort_xabort.meta),
     spec(begin_xbegin.meta),
+    spec(conditional_cmova.meta),
+    spec(conditional_cmovae.meta),
+    spec(conditional_cmovb.meta),
+    spec(conditional_cmovbe.meta),
+    spec(conditional_cmovc.meta),
+    spec(conditional_cmove.meta),
+    spec(conditional_cmovg.meta),
+    spec(conditional_cmovge.meta),
+    spec(conditional_cmovl.meta),
+    spec(conditional_cmovle.meta),
+    spec(conditional_cmovna.meta),
+    spec(conditional_cmovnae.meta),
+    spec(conditional_cmovnb.meta),
+    spec(conditional_cmovnbe.meta),
+    spec(conditional_cmovnc.meta),
+    spec(conditional_cmovne.meta),
+    spec(conditional_cmovng.meta),
+    spec(conditional_cmovnge.meta),
+    spec(conditional_cmovnl.meta),
+    spec(conditional_cmovnle.meta),
+    spec(conditional_cmovno.meta),
+    spec(conditional_cmovnp.meta),
+    spec(conditional_cmovns.meta),
+    spec(conditional_cmovnz.meta),
+    spec(conditional_cmovo.meta),
+    spec(conditional_cmovp.meta),
+    spec(conditional_cmovpe.meta),
+    spec(conditional_cmovpo.meta),
+    spec(conditional_cmovs.meta),
+    spec(conditional_cmovz.meta),
+    spec(conditional_fcmovb.meta),
+    spec(conditional_fcmove.meta),
+    spec(conditional_fcmovbe.meta),
+    spec(conditional_fcmovu.meta),
+    spec(conditional_fcmovnb.meta),
+    spec(conditional_fcmovne.meta),
+    spec(conditional_fcmovnbe.meta),
+    spec(conditional_fcmovnu.meta),
+    spec(conditional_vmaskmovps.meta),
+    spec(conditional_vmaskmovpd.meta),
+    spec(conditional_vpmaskmovd.meta),
+    spec(conditional_vpmaskmovq.meta),
     spec(convert_cbw.meta),
     spec(convert_cwde.meta),
     spec(convert_cdqe.meta),
@@ -850,6 +934,48 @@ pub const proof_reports = [_]proofs.ProofReport{
     load_xsusldtrk.proof_report,
     abort_xabort.proof_report,
     begin_xbegin.proof_report,
+    conditional_cmova.proof_report,
+    conditional_cmovae.proof_report,
+    conditional_cmovb.proof_report,
+    conditional_cmovbe.proof_report,
+    conditional_cmovc.proof_report,
+    conditional_cmove.proof_report,
+    conditional_cmovg.proof_report,
+    conditional_cmovge.proof_report,
+    conditional_cmovl.proof_report,
+    conditional_cmovle.proof_report,
+    conditional_cmovna.proof_report,
+    conditional_cmovnae.proof_report,
+    conditional_cmovnb.proof_report,
+    conditional_cmovnbe.proof_report,
+    conditional_cmovnc.proof_report,
+    conditional_cmovne.proof_report,
+    conditional_cmovng.proof_report,
+    conditional_cmovnge.proof_report,
+    conditional_cmovnl.proof_report,
+    conditional_cmovnle.proof_report,
+    conditional_cmovno.proof_report,
+    conditional_cmovnp.proof_report,
+    conditional_cmovns.proof_report,
+    conditional_cmovnz.proof_report,
+    conditional_cmovo.proof_report,
+    conditional_cmovp.proof_report,
+    conditional_cmovpe.proof_report,
+    conditional_cmovpo.proof_report,
+    conditional_cmovs.proof_report,
+    conditional_cmovz.proof_report,
+    conditional_fcmovb.proof_report,
+    conditional_fcmove.proof_report,
+    conditional_fcmovbe.proof_report,
+    conditional_fcmovu.proof_report,
+    conditional_fcmovnb.proof_report,
+    conditional_fcmovne.proof_report,
+    conditional_fcmovnbe.proof_report,
+    conditional_fcmovnu.proof_report,
+    conditional_vmaskmovps.proof_report,
+    conditional_vmaskmovpd.proof_report,
+    conditional_vpmaskmovd.proof_report,
+    conditional_vpmaskmovq.proof_report,
     convert_cbw.proof_report,
     convert_cwde.proof_report,
     convert_cdqe.proof_report,
