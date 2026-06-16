@@ -33,3 +33,11 @@ rosette_exe_runner
 app/bundling/app_image/install_rosette_app_icon.icns
 app/bundling/app_image/rosette_app_icon.icns
 /app_testing/Text-Wrangler
+/zig-cache
+/test/Internal_Assembly/x86-64-Ast05-main
+/test/Internal_Assembly/x86-64-Ast01-main
+/.zig-cache-codex
+/.zig-global-cache-codex
+/test/Internal_Assembly/x86-64-Ast02-main
+/test/Internal_Assembly/x86-64-Ast03-main
+/test/Internal_Assembly/x86-64-Ast04
