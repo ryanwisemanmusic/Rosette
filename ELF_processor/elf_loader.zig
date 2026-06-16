@@ -15,6 +15,9 @@ const ET_EXEC: u16 = 2;
 const PT_LOAD: u32 = 1;
 
 const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
+const SHT_DYNSYM: u32 = 11;
 pub const SHN_UNDEF: u16 = 0;
 
 pub const Elf64_Ehdr = extern struct {
@@ -67,11 +70,23 @@ pub const Elf64_Sym = extern struct {
     st_size: u64,
 };
 
+pub const Elf64_Rela = extern struct {
+    r_offset: u64,
+    r_info: u64,
+    r_addend: i64,
+};
+
 pub const Symbol = struct {
     name: []const u8,
     value: u64,
     size: u64,
     section_index: u16,
+};
+
+pub const DynamicRelocation = struct {
+    name: []const u8,
+    offset: u64,
+    rel_type: u32,
 };
 
 pub fn loadExecutableSegments(mem_base: u64, mem: []u8, elf_bytes: []const u8) !u64 {
@@ -147,6 +162,63 @@ pub fn collectSymbols(allocator: std.mem.Allocator, elf_bytes: []const u8) !std.
     return symbols;
 }
 
+pub fn collectDynamicRelocations(allocator: std.mem.Allocator, elf_bytes: []const u8) !std.ArrayList(DynamicRelocation) {
+    const ehdr = try header(elf_bytes);
+    if (ehdr.e_shoff == 0 or ehdr.e_shnum == 0) return .empty;
+    if (ehdr.e_shentsize < @sizeOf(Elf64_Shdr)) return error.InvalidSectionHeaderSize;
+
+    var dynsym_shdr: ?Elf64_Shdr = null;
+    var dynstr_shdr: ?Elf64_Shdr = null;
+    var relocs: std.ArrayList(DynamicRelocation) = .empty;
+    errdefer relocs.deinit(allocator);
+
+    var section_index: u16 = 0;
+    while (section_index < ehdr.e_shnum) : (section_index += 1) {
+        const shdr = readSectionHeader(elf_bytes, &ehdr, section_index) orelse return error.TruncatedSectionHeaders;
+        if (shdr.sh_type == SHT_DYNSYM) dynsym_shdr = shdr;
+        if (shdr.sh_type == SHT_STRTAB) {
+            if (sectionName(elf_bytes, &ehdr, section_index)) |name| {
+                if (std.mem.eql(u8, name, ".dynstr")) dynstr_shdr = shdr;
+            }
+        }
+    }
+
+    const dynsym_header = dynsym_shdr orelse return relocs;
+    const dynstr_header = dynstr_shdr orelse return relocs;
+    const dynsym = sectionBytes(elf_bytes, &dynsym_header) orelse return relocs;
+    const dynstr = sectionBytes(elf_bytes, &dynstr_header) orelse return relocs;
+
+    section_index = 0;
+    while (section_index < ehdr.e_shnum) : (section_index += 1) {
+        const shdr = readSectionHeader(elf_bytes, &ehdr, section_index) orelse return error.TruncatedSectionHeaders;
+        if (shdr.sh_type != SHT_RELA) continue;
+        if (shdr.sh_entsize < @sizeOf(Elf64_Rela) or shdr.sh_entsize == 0) continue;
+        const rela_bytes = sectionBytes(elf_bytes, &shdr) orelse continue;
+        const rela_count = shdr.sh_size / shdr.sh_entsize;
+
+        var rela_index: u64 = 0;
+        while (rela_index < rela_count) : (rela_index += 1) {
+            const rela_offset = rela_index * shdr.sh_entsize;
+            if (rela_offset + @sizeOf(Elf64_Rela) > rela_bytes.len) break;
+            const rela = std.mem.bytesToValue(Elf64_Rela, rela_bytes[rela_offset..][0..@sizeOf(Elf64_Rela)]);
+            const sym_index = rela.r_info >> 32;
+            const rel_type: u32 = @truncate(rela.r_info);
+            const sym_offset = sym_index * @sizeOf(Elf64_Sym);
+            if (sym_offset + @sizeOf(Elf64_Sym) > dynsym.len) continue;
+            const sym = std.mem.bytesToValue(Elf64_Sym, dynsym[sym_offset..][0..@sizeOf(Elf64_Sym)]);
+            const name = elfString(dynstr, sym.st_name) orelse continue;
+            if (name.len == 0) continue;
+            try relocs.append(allocator, .{
+                .name = name,
+                .offset = rela.r_offset,
+                .rel_type = rel_type,
+            });
+        }
+    }
+
+    return relocs;
+}
+
 fn header(elf_bytes: []const u8) !Elf64_Ehdr {
     if (elf_bytes.len < @sizeOf(Elf64_Ehdr)) return error.InvalidElf;
     return std.mem.bytesToValue(Elf64_Ehdr, elf_bytes[0..@sizeOf(Elf64_Ehdr)]);
@@ -173,6 +245,14 @@ fn sectionBytes(elf_bytes: []const u8, shdr: *const Elf64_Shdr) ?[]const u8 {
     if (shdr.sh_offset > elf_bytes.len) return null;
     if (shdr.sh_size > elf_bytes.len - shdr.sh_offset) return null;
     return elf_bytes[shdr.sh_offset..][0..@intCast(shdr.sh_size)];
+}
+
+fn sectionName(elf_bytes: []const u8, ehdr: *const Elf64_Ehdr, index: u16) ?[]const u8 {
+    if (ehdr.e_shstrndx == SHN_UNDEF or ehdr.e_shstrndx >= ehdr.e_shnum) return null;
+    const shdr = readSectionHeader(elf_bytes, ehdr, index) orelse return null;
+    const shstr = readSectionHeader(elf_bytes, ehdr, ehdr.e_shstrndx) orelse return null;
+    const names = sectionBytes(elf_bytes, &shstr) orelse return null;
+    return elfString(names, shdr.sh_name);
 }
 
 fn elfString(strtab: []const u8, offset: u32) ?[]const u8 {
