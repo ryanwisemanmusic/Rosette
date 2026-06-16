@@ -135,6 +135,7 @@ const convert_cdqe = @import("CONVERT/CDQE.zig");
 const convert_cwd = @import("CONVERT/CWD.zig");
 const convert_cdq = @import("CONVERT/CDQ.zig");
 const convert_cqo = @import("CONVERT/CQO.zig");
+const halt_hlt = @import("HALT/HLT.zig");
 const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
@@ -488,6 +489,7 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(convert_cwd.meta),
     spec(convert_cdq.meta),
     spec(convert_cqo.meta),
+    spec(halt_hlt.meta),
     spec(loop_loop.meta),
     spec(loop_loope.meta),
     spec(loop_loopne.meta),
@@ -842,6 +844,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     convert_cwd.proof_report,
     convert_cdq.proof_report,
     convert_cqo.proof_report,
+    halt_hlt.proof_report,
     loop_loop.proof_report,
     loop_loope.proof_report,
     loop_loopne.proof_report,

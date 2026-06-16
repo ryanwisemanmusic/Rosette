@@ -133,6 +133,7 @@ const convert_cdqe = @import("CONVERT/CDQE.zig");
 const convert_cwd = @import("CONVERT/CWD.zig");
 const convert_cdq = @import("CONVERT/CDQ.zig");
 const convert_cqo = @import("CONVERT/CQO.zig");
+const halt_hlt = @import("HALT/HLT.zig");
 const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
@@ -559,6 +560,7 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(convert_cwd.family, convert_cwd.path, convert_cwd.source),
     mirror(convert_cdq.family, convert_cdq.path, convert_cdq.source),
     mirror(convert_cqo.family, convert_cqo.path, convert_cqo.source),
+    mirror(halt_hlt.family, halt_hlt.path, halt_hlt.source),
     mirror(loop_loop.family, loop_loop.path, loop_loop.source),
     mirror(loop_loope.family, loop_loope.path, loop_loope.source),
     mirror(loop_loopne.family, loop_loopne.path, loop_loopne.source),
