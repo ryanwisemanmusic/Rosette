@@ -127,6 +127,7 @@ const load_vpexpandd = @import("LOAD/VPEXPANDD.zig");
 const load_vpexpandq = @import("LOAD/VPEXPANDQ.zig");
 const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
+const abort_xabort = @import("ABORT/XABORT.zig");
 const convert_cbw = @import("CONVERT/CBW.zig");
 const convert_cwde = @import("CONVERT/CWDE.zig");
 const convert_cdqe = @import("CONVERT/CDQE.zig");
@@ -554,6 +555,7 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(load_vpexpandq.family, load_vpexpandq.path, load_vpexpandq.source),
     mirror(load_xresldtrk.family, load_xresldtrk.path, load_xresldtrk.source),
     mirror(load_xsusldtrk.family, load_xsusldtrk.path, load_xsusldtrk.source),
+    mirror(abort_xabort.family, abort_xabort.path, abort_xabort.source),
     mirror(convert_cbw.family, convert_cbw.path, convert_cbw.source),
     mirror(convert_cwde.family, convert_cwde.path, convert_cwde.source),
     mirror(convert_cdqe.family, convert_cdqe.path, convert_cdqe.source),
