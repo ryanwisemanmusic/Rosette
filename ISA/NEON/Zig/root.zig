@@ -400,6 +400,44 @@ const min_max_pminub = @import("MIN-MAX/PMINUB.zig");
 const min_max_pminuw = @import("MIN-MAX/PMINUW.zig");
 const min_max_pminud = @import("MIN-MAX/PMINUD.zig");
 const min_max_pminuq = @import("MIN-MAX/PMINUQ.zig");
+const set_monitor = @import("SET/MONITOR.zig");
+const set_umonitor = @import("SET/UMONITOR.zig");
+const set_stac = @import("SET/STAC.zig");
+const set_stc = @import("SET/STC.zig");
+const set_std = @import("SET/STD.zig");
+const set_sti = @import("SET/STI.zig");
+const set_stui = @import("SET/STUI.zig");
+const set_xsetbv = @import("SET/XSETBV.zig");
+const set_seta = @import("SET/SETA.zig");
+const set_setae = @import("SET/SETAE.zig");
+const set_setb = @import("SET/SETB.zig");
+const set_setbe = @import("SET/SETBE.zig");
+const set_setc = @import("SET/SETC.zig");
+const set_sete = @import("SET/SETE.zig");
+const set_setg = @import("SET/SETG.zig");
+const set_setge = @import("SET/SETGE.zig");
+const set_setl = @import("SET/SETL.zig");
+const set_setle = @import("SET/SETLE.zig");
+const set_setna = @import("SET/SETNA.zig");
+const set_setnae = @import("SET/SETNAE.zig");
+const set_setnb = @import("SET/SETNB.zig");
+const set_setnbe = @import("SET/SETNBE.zig");
+const set_setnc = @import("SET/SETNC.zig");
+const set_setne = @import("SET/SETNE.zig");
+const set_setng = @import("SET/SETNG.zig");
+const set_setnge = @import("SET/SETNGE.zig");
+const set_setnl = @import("SET/SETNL.zig");
+const set_setnle = @import("SET/SETNLE.zig");
+const set_setno = @import("SET/SETNO.zig");
+const set_setnp = @import("SET/SETNP.zig");
+const set_setns = @import("SET/SETNS.zig");
+const set_setnz = @import("SET/SETNZ.zig");
+const set_seto = @import("SET/SETO.zig");
+const set_setp = @import("SET/SETP.zig");
+const set_setpe = @import("SET/SETPE.zig");
+const set_setpo = @import("SET/SETPO.zig");
+const set_sets = @import("SET/SETS.zig");
+const set_setz = @import("SET/SETZ.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -874,6 +912,44 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(min_max_pminuw.family, min_max_pminuw.path, min_max_pminuw.source),
     mirror(min_max_pminud.family, min_max_pminud.path, min_max_pminud.source),
     mirror(min_max_pminuq.family, min_max_pminuq.path, min_max_pminuq.source),
+    mirror(set_monitor.family, set_monitor.path, set_monitor.source),
+    mirror(set_umonitor.family, set_umonitor.path, set_umonitor.source),
+    mirror(set_stac.family, set_stac.path, set_stac.source),
+    mirror(set_stc.family, set_stc.path, set_stc.source),
+    mirror(set_std.family, set_std.path, set_std.source),
+    mirror(set_sti.family, set_sti.path, set_sti.source),
+    mirror(set_stui.family, set_stui.path, set_stui.source),
+    mirror(set_xsetbv.family, set_xsetbv.path, set_xsetbv.source),
+    mirror(set_seta.family, set_seta.path, set_seta.source),
+    mirror(set_setae.family, set_setae.path, set_setae.source),
+    mirror(set_setb.family, set_setb.path, set_setb.source),
+    mirror(set_setbe.family, set_setbe.path, set_setbe.source),
+    mirror(set_setc.family, set_setc.path, set_setc.source),
+    mirror(set_sete.family, set_sete.path, set_sete.source),
+    mirror(set_setg.family, set_setg.path, set_setg.source),
+    mirror(set_setge.family, set_setge.path, set_setge.source),
+    mirror(set_setl.family, set_setl.path, set_setl.source),
+    mirror(set_setle.family, set_setle.path, set_setle.source),
+    mirror(set_setna.family, set_setna.path, set_setna.source),
+    mirror(set_setnae.family, set_setnae.path, set_setnae.source),
+    mirror(set_setnb.family, set_setnb.path, set_setnb.source),
+    mirror(set_setnbe.family, set_setnbe.path, set_setnbe.source),
+    mirror(set_setnc.family, set_setnc.path, set_setnc.source),
+    mirror(set_setne.family, set_setne.path, set_setne.source),
+    mirror(set_setng.family, set_setng.path, set_setng.source),
+    mirror(set_setnge.family, set_setnge.path, set_setnge.source),
+    mirror(set_setnl.family, set_setnl.path, set_setnl.source),
+    mirror(set_setnle.family, set_setnle.path, set_setnle.source),
+    mirror(set_setno.family, set_setno.path, set_setno.source),
+    mirror(set_setnp.family, set_setnp.path, set_setnp.source),
+    mirror(set_setns.family, set_setns.path, set_setns.source),
+    mirror(set_setnz.family, set_setnz.path, set_setnz.source),
+    mirror(set_seto.family, set_seto.path, set_seto.source),
+    mirror(set_setp.family, set_setp.path, set_setp.source),
+    mirror(set_setpe.family, set_setpe.path, set_setpe.source),
+    mirror(set_setpo.family, set_setpo.path, set_setpo.source),
+    mirror(set_sets.family, set_sets.path, set_sets.source),
+    mirror(set_setz.family, set_setz.path, set_setz.source),
 };
 
 pub fn tableCount() usize {
