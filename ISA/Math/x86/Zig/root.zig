@@ -128,6 +128,7 @@ const load_vpexpandd = @import("LOAD/VPEXPANDD.zig");
 const load_vpexpandq = @import("LOAD/VPEXPANDQ.zig");
 const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
+const abort_xabort = @import("ABORT/XABORT.zig");
 const convert_cbw = @import("CONVERT/CBW.zig");
 const convert_cwde = @import("CONVERT/CWDE.zig");
 const convert_cdqe = @import("CONVERT/CDQE.zig");
@@ -482,6 +483,7 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(load_vpexpandq.meta),
     spec(load_xresldtrk.meta),
     spec(load_xsusldtrk.meta),
+    spec(abort_xabort.meta),
     spec(convert_cbw.meta),
     spec(convert_cwde.meta),
     spec(convert_cdqe.meta),
@@ -837,6 +839,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     load_vpexpandq.proof_report,
     load_xresldtrk.proof_report,
     load_xsusldtrk.proof_report,
+    abort_xabort.proof_report,
     convert_cbw.proof_report,
     convert_cwde.proof_report,
     convert_cdqe.proof_report,
@@ -1121,7 +1124,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 353), tableCount());
+    try std.testing.expectEqual(@as(usize, 354), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
