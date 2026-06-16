@@ -399,6 +399,44 @@ const min_max_pminub = @import("MIN-MAX/PMINUB.zig");
 const min_max_pminuw = @import("MIN-MAX/PMINUW.zig");
 const min_max_pminud = @import("MIN-MAX/PMINUD.zig");
 const min_max_pminuq = @import("MIN-MAX/PMINUQ.zig");
+const set_monitor = @import("SET/MONITOR.zig");
+const set_umonitor = @import("SET/UMONITOR.zig");
+const set_stac = @import("SET/STAC.zig");
+const set_stc = @import("SET/STC.zig");
+const set_std = @import("SET/STD.zig");
+const set_sti = @import("SET/STI.zig");
+const set_stui = @import("SET/STUI.zig");
+const set_xsetbv = @import("SET/XSETBV.zig");
+const set_seta = @import("SET/SETA.zig");
+const set_setae = @import("SET/SETAE.zig");
+const set_setb = @import("SET/SETB.zig");
+const set_setbe = @import("SET/SETBE.zig");
+const set_setc = @import("SET/SETC.zig");
+const set_sete = @import("SET/SETE.zig");
+const set_setg = @import("SET/SETG.zig");
+const set_setge = @import("SET/SETGE.zig");
+const set_setl = @import("SET/SETL.zig");
+const set_setle = @import("SET/SETLE.zig");
+const set_setna = @import("SET/SETNA.zig");
+const set_setnae = @import("SET/SETNAE.zig");
+const set_setnb = @import("SET/SETNB.zig");
+const set_setnbe = @import("SET/SETNBE.zig");
+const set_setnc = @import("SET/SETNC.zig");
+const set_setne = @import("SET/SETNE.zig");
+const set_setng = @import("SET/SETNG.zig");
+const set_setnge = @import("SET/SETNGE.zig");
+const set_setnl = @import("SET/SETNL.zig");
+const set_setnle = @import("SET/SETNLE.zig");
+const set_setno = @import("SET/SETNO.zig");
+const set_setnp = @import("SET/SETNP.zig");
+const set_setns = @import("SET/SETNS.zig");
+const set_setnz = @import("SET/SETNZ.zig");
+const set_seto = @import("SET/SETO.zig");
+const set_setp = @import("SET/SETP.zig");
+const set_setpe = @import("SET/SETPE.zig");
+const set_setpo = @import("SET/SETPO.zig");
+const set_sets = @import("SET/SETS.zig");
+const set_setz = @import("SET/SETZ.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -800,6 +838,44 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "PMINUW",
     "PMINUD",
     "PMINUQ",
+    "MONITOR",
+    "UMONITOR",
+    "STAC",
+    "STC",
+    "STD",
+    "STI",
+    "STUI",
+    "XSETBV",
+    "SETA",
+    "SETAE",
+    "SETB",
+    "SETBE",
+    "SETC",
+    "SETE",
+    "SETG",
+    "SETGE",
+    "SETL",
+    "SETLE",
+    "SETNA",
+    "SETNAE",
+    "SETNB",
+    "SETNBE",
+    "SETNC",
+    "SETNE",
+    "SETNG",
+    "SETNGE",
+    "SETNL",
+    "SETNLE",
+    "SETNO",
+    "SETNP",
+    "SETNS",
+    "SETNZ",
+    "SETO",
+    "SETP",
+    "SETPE",
+    "SETPO",
+    "SETS",
+    "SETZ",
 };
 
 pub const TableMetadata = struct {
@@ -1262,6 +1338,44 @@ pub const tables = [_]InstructionTable{
     entry(min_max_pminuw.family, min_max_pminuw.path, min_max_pminuw.source),
     entry(min_max_pminud.family, min_max_pminud.path, min_max_pminud.source),
     entry(min_max_pminuq.family, min_max_pminuq.path, min_max_pminuq.source),
+    entry(set_monitor.family, set_monitor.path, set_monitor.source),
+    entry(set_umonitor.family, set_umonitor.path, set_umonitor.source),
+    entry(set_stac.family, set_stac.path, set_stac.source),
+    entry(set_stc.family, set_stc.path, set_stc.source),
+    entry(set_std.family, set_std.path, set_std.source),
+    entry(set_sti.family, set_sti.path, set_sti.source),
+    entry(set_stui.family, set_stui.path, set_stui.source),
+    entry(set_xsetbv.family, set_xsetbv.path, set_xsetbv.source),
+    entry(set_seta.family, set_seta.path, set_seta.source),
+    entry(set_setae.family, set_setae.path, set_setae.source),
+    entry(set_setb.family, set_setb.path, set_setb.source),
+    entry(set_setbe.family, set_setbe.path, set_setbe.source),
+    entry(set_setc.family, set_setc.path, set_setc.source),
+    entry(set_sete.family, set_sete.path, set_sete.source),
+    entry(set_setg.family, set_setg.path, set_setg.source),
+    entry(set_setge.family, set_setge.path, set_setge.source),
+    entry(set_setl.family, set_setl.path, set_setl.source),
+    entry(set_setle.family, set_setle.path, set_setle.source),
+    entry(set_setna.family, set_setna.path, set_setna.source),
+    entry(set_setnae.family, set_setnae.path, set_setnae.source),
+    entry(set_setnb.family, set_setnb.path, set_setnb.source),
+    entry(set_setnbe.family, set_setnbe.path, set_setnbe.source),
+    entry(set_setnc.family, set_setnc.path, set_setnc.source),
+    entry(set_setne.family, set_setne.path, set_setne.source),
+    entry(set_setng.family, set_setng.path, set_setng.source),
+    entry(set_setnge.family, set_setnge.path, set_setnge.source),
+    entry(set_setnl.family, set_setnl.path, set_setnl.source),
+    entry(set_setnle.family, set_setnle.path, set_setnle.source),
+    entry(set_setno.family, set_setno.path, set_setno.source),
+    entry(set_setnp.family, set_setnp.path, set_setnp.source),
+    entry(set_setns.family, set_setns.path, set_setns.source),
+    entry(set_setnz.family, set_setnz.path, set_setnz.source),
+    entry(set_seto.family, set_seto.path, set_seto.source),
+    entry(set_setp.family, set_setp.path, set_setp.source),
+    entry(set_setpe.family, set_setpe.path, set_setpe.source),
+    entry(set_setpo.family, set_setpo.path, set_setpo.source),
+    entry(set_sets.family, set_sets.path, set_sets.source),
+    entry(set_setz.family, set_setz.path, set_setz.source),
 };
 
 pub fn tableCount() usize {
@@ -1418,7 +1532,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 400), tableCount());
+    try std.testing.expectEqual(@as(usize, 438), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

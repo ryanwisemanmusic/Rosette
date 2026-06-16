@@ -401,6 +401,44 @@ const min_max_pminub = @import("MIN-MAX/PMINUB.zig");
 const min_max_pminuw = @import("MIN-MAX/PMINUW.zig");
 const min_max_pminud = @import("MIN-MAX/PMINUD.zig");
 const min_max_pminuq = @import("MIN-MAX/PMINUQ.zig");
+const set_monitor = @import("SET/MONITOR.zig");
+const set_umonitor = @import("SET/UMONITOR.zig");
+const set_stac = @import("SET/STAC.zig");
+const set_stc = @import("SET/STC.zig");
+const set_std = @import("SET/STD.zig");
+const set_sti = @import("SET/STI.zig");
+const set_stui = @import("SET/STUI.zig");
+const set_xsetbv = @import("SET/XSETBV.zig");
+const set_seta = @import("SET/SETA.zig");
+const set_setae = @import("SET/SETAE.zig");
+const set_setb = @import("SET/SETB.zig");
+const set_setbe = @import("SET/SETBE.zig");
+const set_setc = @import("SET/SETC.zig");
+const set_sete = @import("SET/SETE.zig");
+const set_setg = @import("SET/SETG.zig");
+const set_setge = @import("SET/SETGE.zig");
+const set_setl = @import("SET/SETL.zig");
+const set_setle = @import("SET/SETLE.zig");
+const set_setna = @import("SET/SETNA.zig");
+const set_setnae = @import("SET/SETNAE.zig");
+const set_setnb = @import("SET/SETNB.zig");
+const set_setnbe = @import("SET/SETNBE.zig");
+const set_setnc = @import("SET/SETNC.zig");
+const set_setne = @import("SET/SETNE.zig");
+const set_setng = @import("SET/SETNG.zig");
+const set_setnge = @import("SET/SETNGE.zig");
+const set_setnl = @import("SET/SETNL.zig");
+const set_setnle = @import("SET/SETNLE.zig");
+const set_setno = @import("SET/SETNO.zig");
+const set_setnp = @import("SET/SETNP.zig");
+const set_setns = @import("SET/SETNS.zig");
+const set_setnz = @import("SET/SETNZ.zig");
+const set_seto = @import("SET/SETO.zig");
+const set_setp = @import("SET/SETP.zig");
+const set_setpe = @import("SET/SETPE.zig");
+const set_setpo = @import("SET/SETPO.zig");
+const set_sets = @import("SET/SETS.zig");
+const set_setz = @import("SET/SETZ.zig");
 
 pub const specs = [_]core.InstructionMathSpec{
     spec(add_adc.meta),
@@ -802,6 +840,44 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(min_max_pminuw.meta),
     spec(min_max_pminud.meta),
     spec(min_max_pminuq.meta),
+    spec(set_monitor.meta),
+    spec(set_umonitor.meta),
+    spec(set_stac.meta),
+    spec(set_stc.meta),
+    spec(set_std.meta),
+    spec(set_sti.meta),
+    spec(set_stui.meta),
+    spec(set_xsetbv.meta),
+    spec(set_seta.meta),
+    spec(set_setae.meta),
+    spec(set_setb.meta),
+    spec(set_setbe.meta),
+    spec(set_setc.meta),
+    spec(set_sete.meta),
+    spec(set_setg.meta),
+    spec(set_setge.meta),
+    spec(set_setl.meta),
+    spec(set_setle.meta),
+    spec(set_setna.meta),
+    spec(set_setnae.meta),
+    spec(set_setnb.meta),
+    spec(set_setnbe.meta),
+    spec(set_setnc.meta),
+    spec(set_setne.meta),
+    spec(set_setng.meta),
+    spec(set_setnge.meta),
+    spec(set_setnl.meta),
+    spec(set_setnle.meta),
+    spec(set_setno.meta),
+    spec(set_setnp.meta),
+    spec(set_setns.meta),
+    spec(set_setnz.meta),
+    spec(set_seto.meta),
+    spec(set_setp.meta),
+    spec(set_setpe.meta),
+    spec(set_setpo.meta),
+    spec(set_sets.meta),
+    spec(set_setz.meta),
 };
 
 pub const proof_reports = [_]proofs.ProofReport{
@@ -1204,6 +1280,44 @@ pub const proof_reports = [_]proofs.ProofReport{
     min_max_pminuw.proof_report,
     min_max_pminud.proof_report,
     min_max_pminuq.proof_report,
+    set_monitor.proof_report,
+    set_umonitor.proof_report,
+    set_stac.proof_report,
+    set_stc.proof_report,
+    set_std.proof_report,
+    set_sti.proof_report,
+    set_stui.proof_report,
+    set_xsetbv.proof_report,
+    set_seta.proof_report,
+    set_setae.proof_report,
+    set_setb.proof_report,
+    set_setbe.proof_report,
+    set_setc.proof_report,
+    set_sete.proof_report,
+    set_setg.proof_report,
+    set_setge.proof_report,
+    set_setl.proof_report,
+    set_setle.proof_report,
+    set_setna.proof_report,
+    set_setnae.proof_report,
+    set_setnb.proof_report,
+    set_setnbe.proof_report,
+    set_setnc.proof_report,
+    set_setne.proof_report,
+    set_setng.proof_report,
+    set_setnge.proof_report,
+    set_setnl.proof_report,
+    set_setnle.proof_report,
+    set_setno.proof_report,
+    set_setnp.proof_report,
+    set_setns.proof_report,
+    set_setnz.proof_report,
+    set_seto.proof_report,
+    set_setp.proof_report,
+    set_setpe.proof_report,
+    set_setpo.proof_report,
+    set_sets.proof_report,
+    set_setz.proof_report,
 };
 
 pub fn tableCount() usize {
@@ -1262,7 +1376,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 400), tableCount());
+    try std.testing.expectEqual(@as(usize, 438), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
