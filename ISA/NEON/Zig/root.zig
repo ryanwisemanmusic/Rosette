@@ -438,6 +438,10 @@ const set_setpe = @import("SET/SETPE.zig");
 const set_setpo = @import("SET/SETPO.zig");
 const set_sets = @import("SET/SETS.zig");
 const set_setz = @import("SET/SETZ.zig");
+const count_lzcnt = @import("COUNT/LZCNT.zig");
+const count_tzcnt = @import("COUNT/TZCNT.zig");
+const count_vplzcntd = @import("COUNT/VPLZCNTD.zig");
+const count_vplzcntq = @import("COUNT/VPLZCNTQ.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -950,6 +954,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(set_setpo.family, set_setpo.path, set_setpo.source),
     mirror(set_sets.family, set_sets.path, set_sets.source),
     mirror(set_setz.family, set_setz.path, set_setz.source),
+    mirror(count_lzcnt.family, count_lzcnt.path, count_lzcnt.source),
+    mirror(count_tzcnt.family, count_tzcnt.path, count_tzcnt.source),
+    mirror(count_vplzcntd.family, count_vplzcntd.path, count_vplzcntd.source),
+    mirror(count_vplzcntq.family, count_vplzcntq.path, count_vplzcntq.source),
 };
 
 pub fn tableCount() usize {
