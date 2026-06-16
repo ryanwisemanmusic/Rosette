@@ -442,6 +442,9 @@ const count_lzcnt = @import("COUNT/LZCNT.zig");
 const count_tzcnt = @import("COUNT/TZCNT.zig");
 const count_vplzcntd = @import("COUNT/VPLZCNTD.zig");
 const count_vplzcntq = @import("COUNT/VPLZCNTQ.zig");
+const exchange_fxch = @import("EXCHANGE/FXCH.zig");
+const exchange_xadd = @import("EXCHANGE/XADD.zig");
+const exchange_xchg = @import("EXCHANGE/XCHG.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -958,6 +961,9 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(count_tzcnt.family, count_tzcnt.path, count_tzcnt.source),
     mirror(count_vplzcntd.family, count_vplzcntd.path, count_vplzcntd.source),
     mirror(count_vplzcntq.family, count_vplzcntq.path, count_vplzcntq.source),
+    mirror(exchange_fxch.family, exchange_fxch.path, exchange_fxch.source),
+    mirror(exchange_xadd.family, exchange_xadd.path, exchange_xadd.source),
+    mirror(exchange_xchg.family, exchange_xchg.path, exchange_xchg.source),
 };
 
 pub fn tableCount() usize {
