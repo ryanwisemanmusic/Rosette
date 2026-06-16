@@ -234,6 +234,7 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const swap_swapgs = @import("SWAP/SWAPGS.zig");
 const sub_sub = @import("SUB/SUB.zig");
 const sub_subpd = @import("SUB/SUBPD.zig");
 const sub_subps = @import("SUB/SUBPS.zig");
@@ -592,6 +593,7 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(rotate_rcr.meta),
     spec(rotate_rol.meta),
     spec(rotate_ror.meta),
+    spec(swap_swapgs.meta),
     spec(sub_sub.meta),
     spec(sub_subpd.meta),
     spec(sub_subps.meta),
@@ -951,6 +953,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     rotate_rcr.proof_report,
     rotate_rol.proof_report,
     rotate_ror.proof_report,
+    swap_swapgs.proof_report,
     sub_sub.proof_report,
     sub_subpd.proof_report,
     sub_subps.proof_report,
