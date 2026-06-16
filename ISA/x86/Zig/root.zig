@@ -441,6 +441,9 @@ const count_lzcnt = @import("COUNT/LZCNT.zig");
 const count_tzcnt = @import("COUNT/TZCNT.zig");
 const count_vplzcntd = @import("COUNT/VPLZCNTD.zig");
 const count_vplzcntq = @import("COUNT/VPLZCNTQ.zig");
+const exchange_fxch = @import("EXCHANGE/FXCH.zig");
+const exchange_xadd = @import("EXCHANGE/XADD.zig");
+const exchange_xchg = @import("EXCHANGE/XCHG.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -884,6 +887,9 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "TZCNT",
     "VPLZCNTD",
     "VPLZCNTQ",
+    "FXCH",
+    "XADD",
+    "XCHG",
 };
 
 pub const TableMetadata = struct {
@@ -1388,6 +1394,9 @@ pub const tables = [_]InstructionTable{
     entry(count_tzcnt.family, count_tzcnt.path, count_tzcnt.source),
     entry(count_vplzcntd.family, count_vplzcntd.path, count_vplzcntd.source),
     entry(count_vplzcntq.family, count_vplzcntq.path, count_vplzcntq.source),
+    entry(exchange_fxch.family, exchange_fxch.path, exchange_fxch.source),
+    entry(exchange_xadd.family, exchange_xadd.path, exchange_xadd.source),
+    entry(exchange_xchg.family, exchange_xchg.path, exchange_xchg.source),
 };
 
 pub fn tableCount() usize {
@@ -1544,7 +1553,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 442), tableCount());
+    try std.testing.expectEqual(@as(usize, 445), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

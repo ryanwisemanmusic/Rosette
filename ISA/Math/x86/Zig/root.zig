@@ -443,6 +443,9 @@ const count_lzcnt = @import("COUNT/LZCNT.zig");
 const count_tzcnt = @import("COUNT/TZCNT.zig");
 const count_vplzcntd = @import("COUNT/VPLZCNTD.zig");
 const count_vplzcntq = @import("COUNT/VPLZCNTQ.zig");
+const exchange_fxch = @import("EXCHANGE/FXCH.zig");
+const exchange_xadd = @import("EXCHANGE/XADD.zig");
+const exchange_xchg = @import("EXCHANGE/XCHG.zig");
 
 pub const specs = [_]core.InstructionMathSpec{
     spec(add_adc.meta),
@@ -886,6 +889,9 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(count_tzcnt.meta),
     spec(count_vplzcntd.meta),
     spec(count_vplzcntq.meta),
+    spec(exchange_fxch.meta),
+    spec(exchange_xadd.meta),
+    spec(exchange_xchg.meta),
 };
 
 pub const proof_reports = [_]proofs.ProofReport{
@@ -1330,6 +1336,9 @@ pub const proof_reports = [_]proofs.ProofReport{
     count_tzcnt.proof_report,
     count_vplzcntd.proof_report,
     count_vplzcntq.proof_report,
+    exchange_fxch.proof_report,
+    exchange_xadd.proof_report,
+    exchange_xchg.proof_report,
 };
 
 pub fn tableCount() usize {
@@ -1388,7 +1397,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 442), tableCount());
+    try std.testing.expectEqual(@as(usize, 445), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
