@@ -231,6 +231,7 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const swap_swapgs = @import("SWAP/SWAPGS.zig");
 const sub_sub = @import("SUB/SUB.zig");
 const sub_subpd = @import("SUB/SUBPD.zig");
 const sub_subps = @import("SUB/SUBPS.zig");
@@ -565,6 +566,7 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "SUBPS",
     "SUBSD",
     "SUBSS",
+    "SWAPGS",
     "TEST",
     "TESTUI",
     "VMOVAPD",
@@ -1010,6 +1012,7 @@ pub const tables = [_]InstructionTable{
     entry(rotate_rcr.family, rotate_rcr.path, rotate_rcr.source),
     entry(rotate_rol.family, rotate_rol.path, rotate_rol.source),
     entry(rotate_ror.family, rotate_ror.path, rotate_ror.source),
+    entry(swap_swapgs.family, swap_swapgs.path, swap_swapgs.source),
     entry(sub_sub.family, sub_sub.path, sub_sub.source),
     entry(sub_subpd.family, sub_subpd.path, sub_subpd.source),
     entry(sub_subps.family, sub_subps.path, sub_subps.source),
@@ -1289,7 +1292,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 357), tableCount());
+    try std.testing.expectEqual(@as(usize, 358), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
