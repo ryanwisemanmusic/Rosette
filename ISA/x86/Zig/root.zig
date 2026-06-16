@@ -446,6 +446,19 @@ const exchange_xadd = @import("EXCHANGE/XADD.zig");
 const exchange_xchg = @import("EXCHANGE/XCHG.zig");
 const nop_fnop = @import("NOP/FNOP.zig");
 const nop_nop = @import("NOP/NOP.zig");
+const not_not = @import("NOT/NOT.zig");
+const not_knotw = @import("NOT/KNOTW.zig");
+const not_knotb = @import("NOT/KNOTB.zig");
+const not_knotq = @import("NOT/KNOTQ.zig");
+const not_knotd = @import("NOT/KNOTD.zig");
+const andnot_pandn = @import("ANDNOT/PANDN.zig");
+const andnot_vpandn = @import("ANDNOT/VPANDN.zig");
+const andnot_vpandnd = @import("ANDNOT/VPANDND.zig");
+const andnot_vpandnq = @import("ANDNOT/VPANDNQ.zig");
+const andnot_kandnw = @import("ANDNOT/KANDNW.zig");
+const andnot_kandnb = @import("ANDNOT/KANDNB.zig");
+const andnot_kandnq = @import("ANDNOT/KANDNQ.zig");
+const andnot_kandnd = @import("ANDNOT/KANDND.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -894,6 +907,19 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "XCHG",
     "FNOP",
     "NOP",
+    "NOT",
+    "KNOTW",
+    "KNOTB",
+    "KNOTQ",
+    "KNOTD",
+    "PANDN",
+    "VPANDN",
+    "VPANDND",
+    "VPANDNQ",
+    "KANDNW",
+    "KANDNB",
+    "KANDNQ",
+    "KANDND",
 };
 
 pub const TableMetadata = struct {
@@ -1403,6 +1429,19 @@ pub const tables = [_]InstructionTable{
     entry(exchange_xchg.family, exchange_xchg.path, exchange_xchg.source),
     entry(nop_fnop.family, nop_fnop.path, nop_fnop.source),
     entry(nop_nop.family, nop_nop.path, nop_nop.source),
+    entry(not_not.family, not_not.path, not_not.source),
+    entry(not_knotw.family, not_knotw.path, not_knotw.source),
+    entry(not_knotb.family, not_knotb.path, not_knotb.source),
+    entry(not_knotq.family, not_knotq.path, not_knotq.source),
+    entry(not_knotd.family, not_knotd.path, not_knotd.source),
+    entry(andnot_pandn.family, andnot_pandn.path, andnot_pandn.source),
+    entry(andnot_vpandn.family, andnot_vpandn.path, andnot_vpandn.source),
+    entry(andnot_vpandnd.family, andnot_vpandnd.path, andnot_vpandnd.source),
+    entry(andnot_vpandnq.family, andnot_vpandnq.path, andnot_vpandnq.source),
+    entry(andnot_kandnw.family, andnot_kandnw.path, andnot_kandnw.source),
+    entry(andnot_kandnb.family, andnot_kandnb.path, andnot_kandnb.source),
+    entry(andnot_kandnq.family, andnot_kandnq.path, andnot_kandnq.source),
+    entry(andnot_kandnd.family, andnot_kandnd.path, andnot_kandnd.source),
 };
 
 pub fn tableCount() usize {
@@ -1559,7 +1598,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 447), tableCount());
+    try std.testing.expectEqual(@as(usize, 460), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
