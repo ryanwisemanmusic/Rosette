@@ -467,6 +467,21 @@ const decimal_das = @import("DECIMAL/DAS.zig");
 const empty_emms = @import("EMPTY/EMMS.zig");
 const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
+const expand_vpexpandb = @import("EXPAND/VPEXPANDB.zig");
+const expand_vpexpandw = @import("EXPAND/VPEXPANDW.zig");
+const pause_tpause = @import("PAUSE/TPAUSE.zig");
+const prefetch_prefetchw = @import("PREFETCH/PREFETCHW.zig");
+const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
+const prefetch_prefetcht1 = @import("PREFETCH/PREFETCHT1.zig");
+const prefetch_prefetcht2 = @import("PREFETCH/PREFETCHT2.zig");
+const prefetch_prefetchnta = @import("PREFETCH/PREFETCHNTA.zig");
+const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
+const reset_hreset = @import("RESET/HRESET.zig");
+const resume_rsm = @import("RESUME/RSM.zig");
+const rpl_arpl = @import("RPL/ARPL.zig");
+const select_vpmultishiftqb = @import("SELECT/VPMULTISHIFTQB.zig");
+const send_senduipi = @import("SEND/SENDUIPI.zig");
+const serialize_serialize = @import("SERIALIZE/SERIALIZE.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -936,6 +951,21 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "EMMS",
     "XEND",
     "FXAM",
+    "VPEXPANDB",
+    "VPEXPANDW",
+    "TPAUSE",
+    "PREFETCHW",
+    "PREFETCHT0",
+    "PREFETCHT1",
+    "PREFETCHT2",
+    "PREFETCHNTA",
+    "TILERELEASE",
+    "HRESET",
+    "RSM",
+    "ARPL",
+    "VPMULTISHIFTQB",
+    "SENDUIPI",
+    "SERIALIZE",
 };
 
 pub const TableMetadata = struct {
@@ -1466,6 +1496,21 @@ pub const tables = [_]InstructionTable{
     entry(empty_emms.family, empty_emms.path, empty_emms.source),
     entry(end_xend.family, end_xend.path, end_xend.source),
     entry(examine_fxam.family, examine_fxam.path, examine_fxam.source),
+    entry(expand_vpexpandb.family, expand_vpexpandb.path, expand_vpexpandb.source),
+    entry(expand_vpexpandw.family, expand_vpexpandw.path, expand_vpexpandw.source),
+    entry(pause_tpause.family, pause_tpause.path, pause_tpause.source),
+    entry(prefetch_prefetchw.family, prefetch_prefetchw.path, prefetch_prefetchw.source),
+    entry(prefetch_prefetcht0.family, prefetch_prefetcht0.path, prefetch_prefetcht0.source),
+    entry(prefetch_prefetcht1.family, prefetch_prefetcht1.path, prefetch_prefetcht1.source),
+    entry(prefetch_prefetcht2.family, prefetch_prefetcht2.path, prefetch_prefetcht2.source),
+    entry(prefetch_prefetchnta.family, prefetch_prefetchnta.path, prefetch_prefetchnta.source),
+    entry(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
+    entry(reset_hreset.family, reset_hreset.path, reset_hreset.source),
+    entry(resume_rsm.family, resume_rsm.path, resume_rsm.source),
+    entry(rpl_arpl.family, rpl_arpl.path, rpl_arpl.source),
+    entry(select_vpmultishiftqb.family, select_vpmultishiftqb.path, select_vpmultishiftqb.source),
+    entry(send_senduipi.family, send_senduipi.path, send_senduipi.source),
+    entry(serialize_serialize.family, serialize_serialize.path, serialize_serialize.source),
 };
 
 pub fn tableCount() usize {
@@ -1622,7 +1667,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 468), tableCount());
+    try std.testing.expectEqual(@as(usize, 483), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
