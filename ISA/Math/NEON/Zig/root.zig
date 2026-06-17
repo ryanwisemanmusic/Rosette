@@ -470,6 +470,21 @@ const decimal_das = @import("DECIMAL/DAS.zig");
 const empty_emms = @import("EMPTY/EMMS.zig");
 const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
+const expand_vpexpandb = @import("EXPAND/vpexpandb.zig");
+const expand_vpexpandw = @import("EXPAND/vpexpandw.zig");
+const pause_tpause = @import("PAUSE/tpause.zig");
+const prefetch_prefetchw = @import("PREFETCH/prefetchw.zig");
+const prefetch_prefetcht0 = @import("PREFETCH/prefetcht0.zig");
+const prefetch_prefetcht1 = @import("PREFETCH/prefetcht1.zig");
+const prefetch_prefetcht2 = @import("PREFETCH/prefetcht2.zig");
+const prefetch_prefetchnta = @import("PREFETCH/prefetchnta.zig");
+const release_tilerelease = @import("RELEASE/tilerelease.zig");
+const reset_hreset = @import("RESET/hreset.zig");
+const resume_rsm = @import("RESUME/rsm.zig");
+const rpl_arpl = @import("RPL/arpl.zig");
+const select_vpmultishiftqb = @import("SELECT/vpmultishiftqb.zig");
+const send_senduipi = @import("SEND/senduipi.zig");
+const serialize_serialize = @import("SERIALIZE/serialize.zig");
 
 pub const specs = [_]core.InstructionMathSpec{
     spec(add_adc.meta),
@@ -939,6 +954,21 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(empty_emms.meta),
     spec(end_xend.meta),
     spec(examine_fxam.meta),
+    spec(expand_vpexpandb.meta),
+    spec(expand_vpexpandw.meta),
+    spec(pause_tpause.meta),
+    spec(prefetch_prefetchw.meta),
+    spec(prefetch_prefetcht0.meta),
+    spec(prefetch_prefetcht1.meta),
+    spec(prefetch_prefetcht2.meta),
+    spec(prefetch_prefetchnta.meta),
+    spec(release_tilerelease.meta),
+    spec(reset_hreset.meta),
+    spec(resume_rsm.meta),
+    spec(rpl_arpl.meta),
+    spec(select_vpmultishiftqb.meta),
+    spec(send_senduipi.meta),
+    spec(serialize_serialize.meta),
 };
 
 pub const proof_reports = [_]proofs.ProofReport{
@@ -1409,6 +1439,21 @@ pub const proof_reports = [_]proofs.ProofReport{
     empty_emms.proof_report,
     end_xend.proof_report,
     examine_fxam.proof_report,
+    expand_vpexpandb.proof_report,
+    expand_vpexpandw.proof_report,
+    pause_tpause.proof_report,
+    prefetch_prefetchw.proof_report,
+    prefetch_prefetcht0.proof_report,
+    prefetch_prefetcht1.proof_report,
+    prefetch_prefetcht2.proof_report,
+    prefetch_prefetchnta.proof_report,
+    release_tilerelease.proof_report,
+    reset_hreset.proof_report,
+    resume_rsm.proof_report,
+    rpl_arpl.proof_report,
+    select_vpmultishiftqb.proof_report,
+    send_senduipi.proof_report,
+    serialize_serialize.proof_report,
 };
 
 pub fn tableCount() usize {

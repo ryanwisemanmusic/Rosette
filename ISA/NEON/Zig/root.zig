@@ -468,6 +468,21 @@ const decimal_das = @import("DECIMAL/DAS.zig");
 const empty_emms = @import("EMPTY/EMMS.zig");
 const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
+const expand_vpexpandb = @import("EXPAND/VPEXPANDB.zig");
+const expand_vpexpandw = @import("EXPAND/VPEXPANDW.zig");
+const pause_tpause = @import("PAUSE/TPAUSE.zig");
+const prefetch_prefetchw = @import("PREFETCH/PREFETCHW.zig");
+const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
+const prefetch_prefetcht1 = @import("PREFETCH/PREFETCHT1.zig");
+const prefetch_prefetcht2 = @import("PREFETCH/PREFETCHT2.zig");
+const prefetch_prefetchnta = @import("PREFETCH/PREFETCHNTA.zig");
+const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
+const reset_hreset = @import("RESET/HRESET.zig");
+const resume_rsm = @import("RESUME/RSM.zig");
+const rpl_arpl = @import("RPL/ARPL.zig");
+const select_vpmultishiftqb = @import("SELECT/VPMULTISHIFTQB.zig");
+const send_senduipi = @import("SEND/SENDUIPI.zig");
+const serialize_serialize = @import("SERIALIZE/SERIALIZE.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
