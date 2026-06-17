@@ -459,6 +459,14 @@ const andnot_kandnw = @import("ANDNOT/KANDNW.zig");
 const andnot_kandnb = @import("ANDNOT/KANDNB.zig");
 const andnot_kandnq = @import("ANDNOT/KANDNQ.zig");
 const andnot_kandnd = @import("ANDNOT/KANDND.zig");
+const bitposition_bzhi = @import("BITPOSITION/BZHI.zig");
+const change_fchs = @import("CHANGE/FCHS.zig");
+const complement_cmc = @import("COMPLEMENT/CMC.zig");
+const decimal_daa = @import("DECIMAL/DAA.zig");
+const decimal_das = @import("DECIMAL/DAS.zig");
+const empty_emms = @import("EMPTY/EMMS.zig");
+const end_xend = @import("END/XEND.zig");
+const examine_fxam = @import("EXAMINE/FXAM.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -920,6 +928,14 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "KANDNB",
     "KANDNQ",
     "KANDND",
+    "BZHI",
+    "FCHS",
+    "CMC",
+    "DAA",
+    "DAS",
+    "EMMS",
+    "XEND",
+    "FXAM",
 };
 
 pub const TableMetadata = struct {
@@ -1442,6 +1458,14 @@ pub const tables = [_]InstructionTable{
     entry(andnot_kandnb.family, andnot_kandnb.path, andnot_kandnb.source),
     entry(andnot_kandnq.family, andnot_kandnq.path, andnot_kandnq.source),
     entry(andnot_kandnd.family, andnot_kandnd.path, andnot_kandnd.source),
+    entry(bitposition_bzhi.family, bitposition_bzhi.path, bitposition_bzhi.source),
+    entry(change_fchs.family, change_fchs.path, change_fchs.source),
+    entry(complement_cmc.family, complement_cmc.path, complement_cmc.source),
+    entry(decimal_daa.family, decimal_daa.path, decimal_daa.source),
+    entry(decimal_das.family, decimal_das.path, decimal_das.source),
+    entry(empty_emms.family, empty_emms.path, empty_emms.source),
+    entry(end_xend.family, end_xend.path, end_xend.source),
+    entry(examine_fxam.family, examine_fxam.path, examine_fxam.source),
 };
 
 pub fn tableCount() usize {
@@ -1598,7 +1622,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 460), tableCount());
+    try std.testing.expectEqual(@as(usize, 468), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

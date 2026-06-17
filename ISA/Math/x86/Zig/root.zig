@@ -461,6 +461,14 @@ const andnot_kandnw = @import("ANDNOT/KANDNW.zig");
 const andnot_kandnb = @import("ANDNOT/KANDNB.zig");
 const andnot_kandnq = @import("ANDNOT/KANDNQ.zig");
 const andnot_kandnd = @import("ANDNOT/KANDND.zig");
+const bitposition_bzhi = @import("BITPOSITION/BZHI.zig");
+const change_fchs = @import("CHANGE/FCHS.zig");
+const complement_cmc = @import("COMPLEMENT/CMC.zig");
+const decimal_daa = @import("DECIMAL/DAA.zig");
+const decimal_das = @import("DECIMAL/DAS.zig");
+const empty_emms = @import("EMPTY/EMMS.zig");
+const end_xend = @import("END/XEND.zig");
+const examine_fxam = @import("EXAMINE/FXAM.zig");
 
 pub const specs = [_]core.InstructionMathSpec{
     spec(add_adc.meta),
@@ -922,6 +930,14 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(andnot_kandnb.meta),
     spec(andnot_kandnq.meta),
     spec(andnot_kandnd.meta),
+    spec(bitposition_bzhi.meta),
+    spec(change_fchs.meta),
+    spec(complement_cmc.meta),
+    spec(decimal_daa.meta),
+    spec(decimal_das.meta),
+    spec(empty_emms.meta),
+    spec(end_xend.meta),
+    spec(examine_fxam.meta),
 };
 
 pub const proof_reports = [_]proofs.ProofReport{
@@ -1384,6 +1400,14 @@ pub const proof_reports = [_]proofs.ProofReport{
     andnot_kandnb.proof_report,
     andnot_kandnq.proof_report,
     andnot_kandnd.proof_report,
+    bitposition_bzhi.proof_report,
+    change_fchs.proof_report,
+    complement_cmc.proof_report,
+    decimal_daa.proof_report,
+    decimal_das.proof_report,
+    empty_emms.proof_report,
+    end_xend.proof_report,
+    examine_fxam.proof_report,
 };
 
 pub fn tableCount() usize {
@@ -1442,7 +1466,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 460), tableCount());
+    try std.testing.expectEqual(@as(usize, 468), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
