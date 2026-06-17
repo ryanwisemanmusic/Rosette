@@ -460,6 +460,14 @@ const andnot_kandnw = @import("ANDNOT/KANDNW.zig");
 const andnot_kandnb = @import("ANDNOT/KANDNB.zig");
 const andnot_kandnq = @import("ANDNOT/KANDNQ.zig");
 const andnot_kandnd = @import("ANDNOT/KANDND.zig");
+const bitposition_bzhi = @import("BITPOSITION/BZHI.zig");
+const change_fchs = @import("CHANGE/FCHS.zig");
+const complement_cmc = @import("COMPLEMENT/CMC.zig");
+const decimal_daa = @import("DECIMAL/DAA.zig");
+const decimal_das = @import("DECIMAL/DAS.zig");
+const empty_emms = @import("EMPTY/EMMS.zig");
+const end_xend = @import("END/XEND.zig");
+const examine_fxam = @import("EXAMINE/FXAM.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -994,6 +1002,14 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(andnot_kandnb.family, andnot_kandnb.path, andnot_kandnb.source),
     mirror(andnot_kandnq.family, andnot_kandnq.path, andnot_kandnq.source),
     mirror(andnot_kandnd.family, andnot_kandnd.path, andnot_kandnd.source),
+    mirror(bitposition_bzhi.family, bitposition_bzhi.path, bitposition_bzhi.source),
+    mirror(change_fchs.family, change_fchs.path, change_fchs.source),
+    mirror(complement_cmc.family, complement_cmc.path, complement_cmc.source),
+    mirror(decimal_daa.family, decimal_daa.path, decimal_daa.source),
+    mirror(decimal_das.family, decimal_das.path, decimal_das.source),
+    mirror(empty_emms.family, empty_emms.path, empty_emms.source),
+    mirror(end_xend.family, end_xend.path, end_xend.source),
+    mirror(examine_fxam.family, examine_fxam.path, examine_fxam.source),
 };
 
 pub fn tableCount() usize {
