@@ -30,6 +30,10 @@ const div_divss = @import("DIV/DIVSS.zig");
 const div_idiv = @import("DIV/IDIV.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
+const interrupt_int = @import("INTERRUPT/INT.zig");
+const interrupt_int1 = @import("INTERRUPT/INT1.zig");
+const interrupt_int3 = @import("INTERRUPT/INT3.zig");
+const interrupt_into = @import("INTERRUPT/INTO.zig");
 const jmp_ja = @import("JMP/JA.zig");
 const jmp_jae = @import("JMP/JAE.zig");
 const jmp_jb = @import("JMP/JB.zig");
@@ -513,6 +517,10 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "IDIV",
     "IMUL",
     "INC",
+    "INT",
+    "INT1",
+    "INT3",
+    "INTO",
     "JA",
     "JAE",
     "JB",
@@ -1059,6 +1067,10 @@ pub const tables = [_]InstructionTable{
     entry(div_idiv.family, div_idiv.path, div_idiv.source),
     entry(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     entry(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
+    entry(interrupt_int.family, interrupt_int.path, interrupt_int.source),
+    entry(interrupt_int1.family, interrupt_int1.path, interrupt_int1.source),
+    entry(interrupt_int3.family, interrupt_int3.path, interrupt_int3.source),
+    entry(interrupt_into.family, interrupt_into.path, interrupt_into.source),
     entry(jmp_ja.family, jmp_ja.path, jmp_ja.source),
     entry(jmp_jae.family, jmp_jae.path, jmp_jae.source),
     entry(jmp_jb.family, jmp_jb.path, jmp_jb.source),
@@ -1667,7 +1679,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 483), tableCount());
+    try std.testing.expectEqual(@as(usize, 487), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
