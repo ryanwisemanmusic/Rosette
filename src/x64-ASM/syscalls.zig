@@ -4,10 +4,14 @@ pub const SYS_read: u64 = 0;
 pub const SYS_write: u64 = 1;
 pub const SYS_open: u64 = 2;
 pub const SYS_close: u64 = 3;
+pub const SYS_creat: u64 = 85;
 pub const SYS_exit: u64 = 60;
+pub const SYS_gettid: u64 = 186;
 
 pub const Errno = enum(i64) {
+    no_entry = -2,
     bad_file_descriptor = -9,
+    permission_denied = -13,
     bad_address = -14,
     io = -5,
 };
