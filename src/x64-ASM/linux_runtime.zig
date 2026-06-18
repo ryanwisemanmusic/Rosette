@@ -1,5 +1,6 @@
 const std = @import("std");
 const x64_syscalls = @import("x64_syscalls");
+const x64_interactive_bridge = @import("interactive_bridge.zig");
 
 pub fn setupInitialStack(state: anytype, argv: []const []const u8) !void {
     const default_argv = [_][]const u8{"program"};
@@ -79,6 +80,7 @@ pub fn tryDynamicFunctionShim(state: anytype, got_addr: u64, direct_return_rip: 
 
 pub fn tryLocalFunctionShim(state: anytype, target: u64, direct_return_rip: u64) bool {
     const name = state.localSymbolNameAt(target) orelse return false;
+    if (x64_interactive_bridge.tryLocalFunctionBridge(state, name, direct_return_rip)) return true;
     if (symbolNameEql(name, "_ZNKSt3__16locale9use_facetERNS0_2idE")) {
         const facet = resolveLocaleFacet(state) orelse return false;
         state.regs.rax = facet;
