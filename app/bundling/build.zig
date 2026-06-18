@@ -302,6 +302,7 @@ pub fn build(b: *std.Build) void {
         .{ .source = "../../Assemblers", .destination = "Assemblers" },
         .{ .source = "../../ELF_processor", .destination = "ELF_processor" },
         .{ .source = "../../ISA", .destination = "ISA" },
+        .{ .source = "../../app_testing", .destination = "app_testing" },
         .{ .source = "../../assets", .destination = "assets" },
         .{ .source = "../../bat_processor", .destination = "bat_processor" },
         .{ .source = "../../include", .destination = "include" },
@@ -357,6 +358,7 @@ pub fn build(b: *std.Build) void {
         \\  Assemblers
         \\  ELF_processor
         \\  ISA
+        \\  app_testing
         \\  assets
         \\  bat_processor
         \\  include
@@ -378,7 +380,6 @@ pub fn build(b: *std.Build) void {
         \\  rosette_exe_runner.zig
         \\permanent blacklist:
         \\  .rosette
-        \\  app_testing
         \\  docs
         \\
     );
