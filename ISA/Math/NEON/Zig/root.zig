@@ -33,6 +33,10 @@ const div_divss = @import("DIV/DIVSS.zig");
 const div_idiv = @import("DIV/IDIV.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
+const interrupt_int = @import("INTERRUPT/INT.zig");
+const interrupt_int1 = @import("INTERRUPT/INT1.zig");
+const interrupt_int3 = @import("INTERRUPT/INT3.zig");
+const interrupt_into = @import("INTERRUPT/INTO.zig");
 const jmp_ja = @import("JMP/JA.zig");
 const jmp_jae = @import("JMP/JAE.zig");
 const jmp_jb = @import("JMP/JB.zig");
@@ -517,6 +521,10 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(div_idiv.meta),
     spec(inc_dec_dec.meta),
     spec(inc_dec_inc.meta),
+    spec(interrupt_int.meta),
+    spec(interrupt_int1.meta),
+    spec(interrupt_int3.meta),
+    spec(interrupt_into.meta),
     spec(jmp_ja.meta),
     spec(jmp_jae.meta),
     spec(jmp_jb.meta),
@@ -1002,6 +1010,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     div_idiv.proof_report,
     inc_dec_dec.proof_report,
     inc_dec_inc.proof_report,
+    interrupt_int.proof_report,
+    interrupt_int1.proof_report,
+    interrupt_int3.proof_report,
+    interrupt_into.proof_report,
     jmp_ja.proof_report,
     jmp_jae.proof_report,
     jmp_jb.proof_report,
