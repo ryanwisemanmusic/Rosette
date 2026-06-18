@@ -32,6 +32,14 @@ const default_config_text =
     \\# GRAPHICS = "OFF"
     \\# ROSETTE_ELF_DUMP_RESULTS = "AUTO"
     \\
+    \\[compat]
+    \\# Compatibility routing is intentionally explicit. Use:
+    \\#   rosette route run --prefer-intel /path/to/Xenia.app
+    \\# Apple Rosetta 2 remains a traced fallback while Rosette's Mach-O
+    \\# x86_64 backend is being brought up.
+    \\allow_rosetta2_fallback = true
+    \\trace = true
+    \\
 ;
 
 const ConfigMode = enum { off, on, auto };
@@ -146,6 +154,10 @@ pub fn main(init: std.process.Init) !void {
         try cleanState(init.io, allocator);
         return;
     }
+    if (std.mem.eql(u8, args[1], "route") or std.mem.eql(u8, args[1], "compat")) {
+        try runCompatRouter(init, allocator, args[2..]);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "run-elf")) {
         if (args.len < 3) return usage(args[0]);
         try runElfTarget(init, allocator, args[2], args[3..]);
@@ -185,6 +197,7 @@ fn usage(exe_name: []const u8) void {
         \\  {s} prepare-make <project-directory> <env-file> [make-args...]
         \\  {s} finish-make <project-directory> <status> [make-args...]
         \\  {s} clean-state
+        \\  {s} route run [options] <target|Application.app> [-- target-args...]
         \\  {s} run-elf <x86-64-elf-path> [args...]
         \\  {s} tool <tool-name> [tool-args...]
         \\  {s} recipe-shell [sh-args...]
@@ -197,7 +210,7 @@ fn usage(exe_name: []const u8) void {
         \\  [graphics]
         \\  enabled = false
         \\
-    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
@@ -210,6 +223,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
+    const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
 
     try makePathRecursive(allocator, bin_dir);
     try makePathRecursive(allocator, wrapper_dir);
@@ -228,6 +242,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
 
     if (source_root.len != 0) {
         try copyElfProcessor(init, allocator, source_root, elf_processor_path);
+        try copyCompatRouter(init, allocator, source_root, compat_router_path);
         if (is_macos) try installDylib(init, allocator, source_root, dyld_lib_path);
     }
 
@@ -257,6 +272,11 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     } else {
         std.debug.print("elf_processor: missing; build/install did not copy an ELF processor\n", .{});
     }
+    if (fileExists(allocator, compat_router_path)) {
+        std.debug.print("compat_router: {s}\n", .{compat_router_path});
+    } else {
+        std.debug.print("compat_router: missing; build/install did not copy rosette-router\n", .{});
+    }
     std.debug.print("current terminal reload: source ~/.rosette/rosette-shell.sh\n", .{});
     std.debug.print("diagnose from a project: rosette-diagnose-shell ./program\n", .{});
 }
@@ -270,6 +290,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
+    const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
     const source_root = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
     const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
@@ -281,6 +302,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     try unlinkIfExists(allocator, source_root);
     try unlinkIfExists(allocator, toml_path);
     try unlinkIfExists(allocator, elf_processor_path);
+    try unlinkIfExists(allocator, compat_router_path);
     try unlinkIfExists(allocator, dyld_lib_path);
     try removeWrappers(allocator, wrapper_dir);
     try unlinkIfExists(allocator, helper_path);
@@ -380,6 +402,27 @@ fn runTool(init: std.process.Init, allocator: std.mem.Allocator, tool_name: []co
     }
 }
 
+fn runCompatRouter(init: std.process.Init, allocator: std.mem.Allocator, route_args: []const []const u8) !void {
+    const router_path = try resolveCompatRouterPath(init, allocator);
+    if (!canExecute(allocator, router_path)) {
+        std.debug.print("rosette-shell: rosette-router is not installed; run 'make shell-update' from Rosette or reinstall Rosette.\n", .{});
+        std.debug.print("  expected: {s}\n", .{router_path});
+        std.process.exit(127);
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, router_path);
+    if (route_args.len == 0) {
+        try argv.append(allocator, "help");
+    } else {
+        for (route_args) |arg| try argv.append(allocator, arg);
+    }
+
+    const code = try runArgvResult(init.io, argv.items);
+    std.process.exit(code);
+}
+
 fn runRecipeShell(init: std.process.Init, allocator: std.mem.Allocator, shell_args: []const []const u8) !void {
     const rewritten = if (shell_args.len >= 2 and std.mem.eql(u8, shell_args[0], "-c"))
         try rewriteRecipeCommand(init.io, allocator, shell_args[1])
@@ -419,6 +462,7 @@ fn cleanState(io: std.Io, allocator: std.mem.Allocator) !void {
         "rosette-shell -c",
         "rosette-shell -ec",
         "rosette-shell tool",
+        "rosette-router",
         "elf_processor",
         "rosette_assembler_runner",
         "/usr/local/bin/rose",
@@ -1045,6 +1089,11 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
             \\
         );
     }
+
+    try out.appendSlice(allocator,
+        \\export ROSETTE_ROUTER="$HOME/.rosette/bin/rosette-router"
+        \\
+    );
 
     try out.appendSlice(allocator,
         \\__rosette_reload_shell_integration() {
@@ -1713,6 +1762,42 @@ fn resolveElfProcessorPath(allocator: std.mem.Allocator) ![]const u8 {
     }
     const home = try homeDir(allocator);
     return try std.fs.path.join(allocator, &.{ home, ".rosette", "bin", "elf_processor" });
+}
+
+fn resolveCompatRouterPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (getenvSlice("ROSETTE_ROUTER")) |router_path| {
+        if (canExecute(allocator, router_path) or fileExists(allocator, router_path)) {
+            return try allocator.dupe(u8, router_path);
+        }
+    }
+
+    const self_path = std.process.executablePathAlloc(init.io, allocator) catch "";
+    if (self_path.len != 0) {
+        if (std.fs.path.dirname(self_path)) |self_dir| {
+            const sibling = try std.fs.path.join(allocator, &.{ self_dir, "rosette-router" });
+            if (canExecute(allocator, sibling) or fileExists(allocator, sibling)) return sibling;
+        }
+    }
+
+    const source_root = currentSourceRoot(init.io, allocator) catch "";
+    if (source_root.len != 0) {
+        const from_source = try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "rosette-router" });
+        if (canExecute(allocator, from_source) or fileExists(allocator, from_source)) return from_source;
+    }
+
+    const cwd_candidate = try std.fs.path.join(allocator, &.{ "zig-out", "bin", "rosette-router" });
+    if (canExecute(allocator, cwd_candidate) or fileExists(allocator, cwd_candidate)) return cwd_candidate;
+
+    const helper_path = currentHelperPath(init, allocator) catch "";
+    if (helper_path.len != 0) {
+        if (std.fs.path.dirname(helper_path)) |helper_dir| {
+            const sibling = try std.fs.path.join(allocator, &.{ helper_dir, "rosette-router" });
+            if (canExecute(allocator, sibling) or fileExists(allocator, sibling)) return sibling;
+        }
+    }
+
+    const home = try homeDir(allocator);
+    return try std.fs.path.join(allocator, &.{ home, ".rosette", "bin", "rosette-router" });
 }
 
 fn resolveAssemblerRunner(allocator: std.mem.Allocator, helper_path: []const u8, source_root: []const u8) !?[]const u8 {
@@ -2410,6 +2495,23 @@ fn copyElfProcessor(init: std.process.Init, allocator: std.mem.Allocator, source
         }
     }
     std.debug.print("rosette-shell: warning: elf_processor binary not found; build with 'zig build' first\n", .{});
+}
+
+fn copyCompatRouter(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8, dest_path: []const u8) !void {
+    const candidates = [_][]const u8{
+        try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "rosette-router" }),
+        try std.fs.path.join(allocator, &.{ source_root, "..", "..", "MacOS", "rosette-router" }),
+        try std.fs.path.join(allocator, &.{ source_root, "rosette-router" }),
+    };
+
+    for (candidates) |candidate| {
+        if (fileExists(allocator, candidate) and canExecute(allocator, candidate)) {
+            try copyFile(init, allocator, candidate, dest_path, "rosette-router");
+            _ = chmodPath(allocator, dest_path, 0o755) catch {};
+            return;
+        }
+    }
+    std.debug.print("rosette-shell: warning: rosette-router binary not found; build with 'make compat-router-build' first\n", .{});
 }
 
 fn copyFile(init: std.process.Init, allocator: std.mem.Allocator, source_path: []const u8, dest_path: []const u8, label: []const u8) !void {
