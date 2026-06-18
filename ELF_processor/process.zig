@@ -26,6 +26,8 @@ const RFL_OF = x64_decoder.RFL_OF;
 const STACK_SIZE: u64 = 1024 * 1024; // 1 MB stack
 const MEM_SIZE: u64 = 64 * 1024 * 1024; // 64 MB total address space
 const MEM_BASE: u64 = 0x1000000;
+const SYNTHETIC_INIT_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF00;
+const SYNTHETIC_MAIN_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF08;
 
 // ─── Shared x64 execution types ───
 
@@ -50,6 +52,12 @@ pub const ElfState = struct {
     faulted: bool = false,
     libc_start_main_trampolined: bool = false,
     dynamic_relocations: []const elf_loader.DynamicRelocation = &.{},
+    local_symbols: []const elf_loader.Symbol = &.{},
+    init_functions: []const u64 = &.{},
+    init_index: usize = 0,
+    pending_main_addr: u64 = 0,
+    pending_argc: u64 = 0,
+    pending_argv: u64 = 0,
     heap_next: u64 = MEM_BASE + (MEM_SIZE / 2),
 
     pub fn init(allocator: std.mem.Allocator) ElfState {
@@ -129,7 +137,81 @@ pub const ElfState = struct {
     }
 
     pub fn loadElf(self: *ElfState, elf_bytes: []const u8) !void {
+        const plan = try elf_loader.planExecutableLoad(self.mem.len, elf_bytes, STACK_SIZE);
+        self.mem_base = plan.mem_base;
+        self.heap_next = plan.heap_start;
         self.regs.rip = try elf_loader.loadExecutableSegments(self.mem_base, self.mem, elf_bytes);
+        log.info("load plan: guest_base=0x{x} image=[0x{x}, 0x{x}) heap=0x{x} entry=0x{x}", .{
+            plan.mem_base,
+            plan.image_low,
+            plan.image_high,
+            plan.heap_start,
+            plan.entry,
+        });
+    }
+
+    pub fn startLibcMain(self: *ElfState, main_addr: u64, argc: u64, argv: u64) void {
+        self.pending_main_addr = main_addr;
+        self.pending_argc = argc;
+        self.pending_argv = argv;
+        self.init_index = 0;
+        self.libc_start_main_trampolined = true;
+        self.scheduleNextInitOrMain();
+    }
+
+    fn scheduleNextInitOrMain(self: *ElfState) void {
+        while (self.init_index < self.init_functions.len) {
+            const target = self.init_functions[self.init_index];
+            self.init_index += 1;
+            if (target == 0 or self.addrToOffset(target) == null) continue;
+            self.regs.rdi = self.pending_argc;
+            self.regs.rsi = self.pending_argv;
+            self.regs.rdx = 0;
+            self.push(SYNTHETIC_INIT_RETURN);
+            self.regs.rip = target;
+            log.info("running ELF init function {d}/{d} at 0x{x}", .{
+                self.init_index,
+                self.init_functions.len,
+                target,
+            });
+            return;
+        }
+        self.startMainAfterInit();
+    }
+
+    fn startMainAfterInit(self: *ElfState) void {
+        self.regs.rdi = self.pending_argc;
+        self.regs.rsi = self.pending_argv;
+        self.regs.rdx = 0;
+        self.push(SYNTHETIC_MAIN_RETURN);
+        self.regs.rip = self.pending_main_addr;
+    }
+
+    fn handleSyntheticRip(self: *ElfState) bool {
+        if (self.regs.rip == SYNTHETIC_INIT_RETURN) {
+            self.scheduleNextInitOrMain();
+            return true;
+        }
+        if (self.regs.rip == SYNTHETIC_MAIN_RETURN) {
+            self.exit_code = self.regs.rax;
+            self.terminated = true;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn localSymbolAddress(self: *const ElfState, name: []const u8) ?u64 {
+        for (self.local_symbols) |symbol| {
+            if (std.mem.eql(u8, symbol.name, name)) return symbol.value;
+        }
+        return null;
+    }
+
+    pub fn localSymbolNameAt(self: *const ElfState, address: u64) ?[]const u8 {
+        for (self.local_symbols) |symbol| {
+            if (symbol.value == address) return symbol.name;
+        }
+        return null;
     }
 
     pub fn guestAlloc(self: *ElfState, requested_size: u64, requested_alignment: u64) ?u64 {
@@ -198,6 +280,7 @@ pub const ElfState = struct {
     }
 
     fn step(self: *ElfState) bool {
+        if (self.handleSyntheticRip()) return !self.terminated;
         const decoded = self.decodeAt() orelse {
             self.terminated = true;
             return false;
@@ -274,7 +357,7 @@ pub const ElfState = struct {
         });
     }
 
-    fn regVal(self: *ElfState, id: RegId, size: Size) u64 {
+    fn regVal(self: *const ElfState, id: RegId, size: Size) u64 {
         return x64_decoder.regVal(&self.regs, id, size);
     }
 
@@ -727,6 +810,15 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, .bits64, r);
                 self.setFlagsSub(a, b, r, .bits64);
             },
+            .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => {
+                const a = self.regVal(d.dst_reg, d.size);
+                const b = self.regVal(d.src_reg, d.size);
+                const carry: u64 = if ((self.regs.rflags & RFL_CF) != 0) 1 else 0;
+                const subtrahend = (b +% carry) & maskForSize(d.size);
+                const r = a -% subtrahend;
+                self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsSub(a, subtrahend, r, d.size);
+            },
 
             // ── sub r/m8, imm8 (0x80 /5) ──
             .sub_reg8_imm8 => {
@@ -803,6 +895,20 @@ pub const ElfState = struct {
                 const b = self.readMemVal(d.addr, d.size);
                 const r = a | b;
                 self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsLogic(r, d.size);
+            },
+            .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8 => {
+                const a = self.readMemVal(d.addr, d.size);
+                const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
+                const r = a | imm;
+                self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsLogic(r, d.size);
+            },
+            .or_mem16_imm32, .or_mem32_imm32, .or_mem64_imm32 => {
+                const a = self.readMemVal(d.addr, d.size);
+                const imm = testImmForSize(d.imm, d.size);
+                const r = a | imm;
+                self.writeMemVal(d.addr, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
             .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
@@ -1640,8 +1746,12 @@ pub const ElfState = struct {
                 const next_rip = self.regs.rip + d.len;
                 const rel = @as(i64, @bitCast(d.imm));
                 const target = @as(i64, @bitCast(self.regs.rip)) + @as(i64, d.len) + rel;
+                const target_rip = @as(u64, @bitCast(target));
+                if (x64_linux_runtime.tryLocalFunctionShim(self, target_rip, next_rip)) {
+                    return;
+                }
                 self.push(next_rip);
-                self.regs.rip = @as(u64, @bitCast(target));
+                self.regs.rip = target_rip;
                 return;
             },
             .call_mem64, .call_reg64 => {
@@ -1728,41 +1838,64 @@ pub const ElfState = struct {
 
             // ── Syscall ──
             .syscall => {
-                switch (self.regs.rax) {
-                    SYS_exit => {
-                        self.exit_code = self.regs.rdi;
-                        self.terminated = true;
-                    },
-                    SYS_read => {
-                        self.handleReadSyscall();
-                    },
-                    SYS_write => {
-                        self.handleWriteSyscall();
-                    },
-                    SYS_open => {
-                        self.handleOpenSyscall();
-                    },
-                    SYS_close => {
-                        self.handleCloseSyscall();
-                    },
-                    SYS_creat => {
-                        self.handleCreatSyscall();
-                    },
-                    SYS_gettid => {
-                        self.regs.rax = 1;
-                    },
-                    else => {
-                        log.warn("unimplemented syscall {d}", .{self.regs.rax});
-                        self.faulted = true;
-                        self.exit_code = 127;
-                        self.terminated = true;
-                    },
-                }
+                self.invokeLinuxSyscall(
+                    self.regs.rax,
+                    self.regs.rdi,
+                    self.regs.rsi,
+                    self.regs.rdx,
+                    self.regs.r10,
+                    self.regs.r8,
+                    self.regs.r9,
+                );
             },
         }
 
         if (!self.terminated) {
             self.regs.rip += d.len;
+        }
+    }
+
+    pub fn invokeLinuxSyscall(self: *ElfState, number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) void {
+        self.regs.rax = number;
+        self.regs.rdi = arg1;
+        self.regs.rsi = arg2;
+        self.regs.rdx = arg3;
+        self.regs.r10 = arg4;
+        self.regs.r8 = arg5;
+        self.regs.r9 = arg6;
+        self.dispatchLinuxSyscall();
+    }
+
+    fn dispatchLinuxSyscall(self: *ElfState) void {
+        switch (self.regs.rax) {
+            SYS_exit => {
+                self.exit_code = self.regs.rdi;
+                self.terminated = true;
+            },
+            SYS_read => {
+                self.handleReadSyscall();
+            },
+            SYS_write => {
+                self.handleWriteSyscall();
+            },
+            SYS_open => {
+                self.handleOpenSyscall();
+            },
+            SYS_close => {
+                self.handleCloseSyscall();
+            },
+            SYS_creat => {
+                self.handleCreatSyscall();
+            },
+            SYS_gettid => {
+                self.regs.rax = 1;
+            },
+            else => {
+                log.warn("unimplemented syscall {d}", .{self.regs.rax});
+                self.faulted = true;
+                self.exit_code = 127;
+                self.terminated = true;
+            },
         }
     }
 
@@ -1804,7 +1937,13 @@ pub const ElfState = struct {
         flags.ACCMODE = .WRONLY;
         flags.CREAT = true;
         flags.TRUNC = true;
-        const fd = std.c.open(path_z.ptr, flags, @as(std.c.mode_t, @intCast(self.regs.rsi & 0o7777)));
+        const mode_raw = if (self.regs.rdx != 0) self.regs.rdx else self.regs.rsi;
+        const mode: std.c.mode_t = @intCast(mode_raw & 0o7777);
+        var fd = std.c.open(path_z.ptr, flags, mode);
+        if (fd < 0) {
+            _ = std.c.unlink(path_z.ptr);
+            fd = std.c.open(path_z.ptr, flags, mode);
+        }
         self.regs.rax = if (fd < 0) x64_syscalls.errnoValue(.io) else @as(u64, @intCast(fd));
     }
 
@@ -2253,6 +2392,29 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             };
         },
 
+        0x18...0x1B => {
+            // SBB r/m, r or SBB r, r/m. Register forms are enough for libc carry-mask idioms.
+            if (pos >= bytes.len) return .{};
+            const modrm = bytes[pos];
+            pos += 1;
+            const mod_v = modrm >> 6;
+            const reg = (modrm >> 3) & 7;
+            const rm = modrm & 7;
+            const w = opcode & 1;
+            const d = (opcode >> 1) & 1;
+            const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
+            if (mod_v != 3) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+
+            const dst_reg = if (d == 1) modRmReg(reg, rex) else modRmRm(rm, rex);
+            const src_reg = if (d == 1) modRmRm(rm, rex) else modRmReg(reg, rex);
+            return switch (size) {
+                .bits8 => DecodedInsn{ .op = .sbb_reg8_reg8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
+                .bits16 => DecodedInsn{ .op = .sbb_reg16_reg16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
+                .bits32 => DecodedInsn{ .op = .sbb_reg32_reg32, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
+                .bits64 => DecodedInsn{ .op = .sbb_reg64_reg64, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
+            };
+        },
+
         0x20...0x23, 0x30...0x33 => {
             // AND/XOR r/m, r or r, r/m.
             if (pos >= bytes.len) return .{};
@@ -2567,8 +2729,39 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const reg_field = (modrm >> 3) & 7;
             const rm = modrm & 7;
             const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else .bits32;
-            if ((reg_field != 0 and reg_field != 5) or mod_v != 3) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            if (reg_field != 0 and reg_field != 1 and reg_field != 5) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
             const imm_len: usize = if (size == .bits16) 2 else 4;
+
+            if (mod_v == 3) {
+                if (pos + imm_len > bytes.len) return .{};
+                const imm = if (size == .bits16)
+                    @as(u64, std.mem.readInt(u16, bytes[pos..][0..2], .little))
+                else blk: {
+                    const raw = std.mem.readInt(i32, bytes[pos..][0..4], .little);
+                    break :blk if (size == .bits64) @as(u64, @bitCast(@as(i64, raw))) else @as(u64, @as(u32, @bitCast(raw)));
+                };
+                pos += imm_len;
+                const dst_reg = modRmRm(rm, rex);
+                if (reg_field == 0) {
+                    return switch (size) {
+                        .bits16 => DecodedInsn{ .op = .add_reg16_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .add_reg32_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .add_reg64_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                        .bits8 => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
+                    };
+                }
+                if (reg_field == 5) {
+                    return switch (size) {
+                        .bits16 => DecodedInsn{ .op = .sub_reg16_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .sub_reg32_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .sub_reg64_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                        else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
+                    };
+                }
+                return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+            }
+
+            const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
             if (pos + imm_len > bytes.len) return .{};
             const imm = if (size == .bits16)
                 @as(u64, std.mem.readInt(u16, bytes[pos..][0..2], .little))
@@ -2577,19 +2770,13 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 break :blk if (size == .bits64) @as(u64, @bitCast(@as(i64, raw))) else @as(u64, @as(u32, @bitCast(raw)));
             };
             pos += imm_len;
-            const dst_reg = modRmRm(rm, rex);
-            if (reg_field == 0) {
-                return switch (size) {
-                    .bits16 => DecodedInsn{ .op = .add_reg16_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
-                    .bits32 => DecodedInsn{ .op = .add_reg32_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
-                    .bits64 => DecodedInsn{ .op = .add_reg64_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+            return switch (reg_field) {
+                1 => switch (size) {
+                    .bits16 => DecodedInsn{ .op = .or_mem16_imm32, .size = size, .imm = imm, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
+                    .bits32 => DecodedInsn{ .op = .or_mem32_imm32, .size = size, .imm = imm, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
+                    .bits64 => DecodedInsn{ .op = .or_mem64_imm32, .size = size, .imm = imm, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
                     .bits8 => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
-                };
-            }
-            return switch (size) {
-                .bits16 => DecodedInsn{ .op = .sub_reg16_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
-                .bits32 => DecodedInsn{ .op = .sub_reg32_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
-                .bits64 => DecodedInsn{ .op = .sub_reg64_imm32, .size = size, .dst_reg = dst_reg, .imm = imm, .len = @intCast(pos) },
+                },
                 else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
             };
         },
@@ -2664,6 +2851,12 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                         .bits16 => DecodedInsn{ .op = .add_mem16_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
                         .bits32 => DecodedInsn{ .op = .add_mem32_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
                         .bits64 => DecodedInsn{ .op = .add_mem64_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
+                    },
+                    1 => switch (size) {
+                        .bits8 => DecodedInsn{ .op = .or_mem8_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .or_mem16_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
+                        .bits32 => DecodedInsn{ .op = .or_mem32_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
+                        .bits64 => DecodedInsn{ .op = .or_mem64_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
                     },
                     7 => switch (size) {
                         .bits8 => DecodedInsn{ .op = .cmp_mem8_imm8, .size = size, .imm = imm, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
@@ -3574,6 +3767,14 @@ fn loadRunElf(allocator: std.mem.Allocator, elf_bytes: []const u8, options: ElfR
 
     try state.loadElf(elf_bytes);
 
+    var local_symbols = elf_loader.collectSymbols(allocator, elf_bytes) catch |err| blk: {
+        log.warn("local symbols unavailable: {s}", .{@errorName(err)});
+        const empty_symbols: std.ArrayList(elf_loader.Symbol) = .empty;
+        break :blk empty_symbols;
+    };
+    defer local_symbols.deinit(allocator);
+    state.local_symbols = local_symbols.items;
+
     var dynamic_relocations = elf_loader.collectDynamicRelocations(allocator, elf_bytes) catch |err| blk: {
         log.warn("dynamic relocations unavailable: {s}", .{@errorName(err)});
         const empty_relocations: std.ArrayList(elf_loader.DynamicRelocation) = .empty;
@@ -3581,6 +3782,14 @@ fn loadRunElf(allocator: std.mem.Allocator, elf_bytes: []const u8, options: ElfR
     };
     defer dynamic_relocations.deinit(allocator);
     state.dynamic_relocations = dynamic_relocations.items;
+
+    var init_functions = elf_loader.collectInitArray(allocator, elf_bytes) catch |err| blk: {
+        log.warn("ELF init array unavailable: {s}", .{@errorName(err)});
+        const empty_init: std.ArrayList(u64) = .empty;
+        break :blk empty_init;
+    };
+    defer init_functions.deinit(allocator);
+    state.init_functions = init_functions.items;
 
     var result_symbols: std.ArrayList(result_dump.DumpSymbol) = .empty;
     defer result_dump.deinitSymbols(allocator, &result_symbols);
@@ -3953,6 +4162,59 @@ test "decode lock add byte rip-relative immediate" {
     try testing.expect(d.rip_relative);
     try testing.expectEqual(@as(u64, 0x171428), d.addr);
     try testing.expectEqual(@as(u64, 1), d.imm);
+}
+
+test "decode and execute addb immediate to dl" {
+    const d = decodeInsn(&[_]u8{ 0x80, 0xC2, 0x0A });
+    try testing.expectEqual(Op.add_reg8_imm8, d.op);
+    try testing.expectEqual(Size.bits8, d.size);
+    try testing.expectEqual(RegId.dl_dx_edx_rdx, d.dst_reg);
+    try testing.expectEqual(@as(u64, 10), d.imm);
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.regs.rdx = 0x1234_5605;
+    state.execute(d);
+
+    try testing.expectEqual(@as(u64, 0x1234_560f), state.regs.rdx);
+}
+
+test "decode and execute orl immediate SIB memory" {
+    const d = decodeInsn(&[_]u8{ 0x81, 0x4C, 0x31, 0x08, 0x00, 0x20, 0x00, 0x00 });
+    try testing.expectEqual(Op.or_mem32_imm32, d.op);
+    try testing.expectEqual(Size.bits32, d.size);
+    try testing.expect(d.sib_has_base);
+    try testing.expect(d.sib_has_index);
+    try testing.expectEqual(RegId.cl_cx_ecx_rcx, d.sib_base_reg);
+    try testing.expectEqual(RegId.dh_si_esi_rsi, d.sib_index_reg);
+    try testing.expectEqual(@as(u64, 8), d.addr);
+    try testing.expectEqual(@as(u64, 0x2000), d.imm);
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.regs.rcx = 8;
+    state.regs.rsi = MEM_BASE;
+    var resolved = d;
+    state.sibAddr(&resolved);
+    state.write32(resolved.addr, 0x40);
+    state.execute(resolved);
+
+    try testing.expectEqual(@as(u32, 0x2040), state.read32(resolved.addr));
+}
+
+test "decode and execute sbb eax eax carry mask" {
+    const d = decodeInsn(&[_]u8{ 0x19, 0xC0 });
+    try testing.expectEqual(Op.sbb_reg32_reg32, d.op);
+    try testing.expectEqual(Size.bits32, d.size);
+    try testing.expectEqual(RegId.al_ax_eax_rax, d.dst_reg);
+    try testing.expectEqual(RegId.al_ax_eax_rax, d.src_reg);
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.regs.rax = 0;
+    state.regs.rflags |= RFL_CF;
+    state.execute(d);
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), state.regs.rax);
 }
 
 test "decode lock cmpxchg memory and setne memory" {
