@@ -61,7 +61,22 @@ pub fn tryLibcStartMainTrampoline(state: anytype, d: anytype, return_rip: u64) b
 }
 
 pub fn tryDynamicFunctionShim(state: anytype, got_addr: u64, direct_return_rip: ?u64) bool {
-    const name = dynamicRelocationName(state, got_addr) orelse return false;
+    const name = dynamicRelocationName(state, got_addr) orelse {
+        if (direct_return_rip != null) return false;
+        const resolver_name = dynamicPltResolverRelocationName(state) orelse return false;
+        const old_rsp = state.regs.rsp;
+        state.regs.rsp +%= 16;
+        if (tryNamedFunctionShim(state, resolver_name, null)) return true;
+        state.regs.rsp = old_rsp;
+        std.log.scoped(.x64_linux_runtime).warn("unsupported lazy PLT symbol {s}", .{resolver_name});
+        return false;
+    };
+    if (tryNamedFunctionShim(state, name, direct_return_rip)) return true;
+    std.log.scoped(.x64_linux_runtime).warn("unsupported PLT symbol {s}", .{name});
+    return false;
+}
+
+fn tryNamedFunctionShim(state: anytype, name: []const u8, direct_return_rip: ?u64) bool {
     if (symbolNameEql(name, "remove")) {
         const path = guestCString(state, state.regs.rdi) orelse "";
         if (path.len != 0) {
@@ -93,12 +108,133 @@ pub fn tryDynamicFunctionShim(state: anytype, got_addr: u64, direct_return_rip: 
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
+    if (symbolNameEql(name, "aligned_alloc")) {
+        const alignment = state.regs.rdi;
+        const size = state.regs.rsi;
+        state.regs.rax = state.guestAlloc(size, alignment) orelse 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "malloc") or
+        symbolNameEql(name, "_Znwm") or
+        symbolNameEql(name, "_Znam"))
+    {
+        state.regs.rax = state.guestAlloc(state.regs.rdi, 16) orelse 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "calloc")) {
+        const count = state.regs.rdi;
+        const elem_size = state.regs.rsi;
+        const total = std.math.mul(u64, count, elem_size) catch {
+            state.regs.rax = 0;
+            finishExternalReturn(state, direct_return_rip);
+            return true;
+        };
+        state.regs.rax = state.guestAlloc(total, 16) orelse 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "free") or
+        symbolNameEql(name, "_ZdlPv") or
+        symbolNameEql(name, "_ZdaPv") or
+        symbolNameEql(name, "_ZdlPvm") or
+        symbolNameEql(name, "_ZdaPvm"))
+    {
+        state.regs.rax = 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "dlsym") or
+        symbolNameEql(name, "dlopen") or
+        symbolNameEql(name, "dlerror") or
+        symbolNameEql(name, "dl_iterate_phdr"))
+    {
+        state.regs.rax = 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "dlclose")) {
+        state.regs.rax = 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "pthread_mutex_lock") or
+        symbolNameEql(name, "pthread_mutex_unlock") or
+        symbolNameEql(name, "pthread_mutex_trylock") or
+        symbolNameEql(name, "pthread_cond_broadcast") or
+        symbolNameEql(name, "pthread_cond_signal") or
+        symbolNameEql(name, "pthread_rwlock_rdlock") or
+        symbolNameEql(name, "pthread_rwlock_wrlock") or
+        symbolNameEql(name, "pthread_rwlock_unlock"))
+    {
+        state.regs.rax = 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "isatty")) {
+        const fd = state.regs.rdi;
+        state.regs.rax = if (fd <= 2) 1 else 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "write")) {
+        handleWriteShim(state);
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "fwrite") or symbolNameEql(name, "fwrite_unlocked")) {
+        const size = state.regs.rsi;
+        const count = state.regs.rdx;
+        state.regs.rax = if (size == 0) 0 else count;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "fputc") or
+        symbolNameEql(name, "putc") or
+        symbolNameEql(name, "putchar"))
+    {
+        state.regs.rax = state.regs.rdi & 0xFF;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "fputs") or symbolNameEql(name, "puts")) {
+        state.regs.rax = 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "fflush")) {
+        state.regs.rax = 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
+    if (symbolNameEql(name, "printf") or
+        symbolNameEql(name, "fprintf") or
+        symbolNameEql(name, "vfprintf") or
+        symbolNameEql(name, "snprintf") or
+        symbolNameEql(name, "vsnprintf"))
+    {
+        state.regs.rax = 0;
+        finishExternalReturn(state, direct_return_rip);
+        return true;
+    }
     if (symbolNameEql(name, "writev") or symbolNameEql(name, "pwritev64")) {
         handleWritevShim(state);
         finishExternalReturn(state, direct_return_rip);
         return true;
     }
     return false;
+}
+
+fn dynamicPltResolverRelocationName(state: anytype) ?[]const u8 {
+    const relocation_index = state.read64(state.regs.rsp + 8);
+    var jump_slot_index: u64 = 0;
+    for (state.dynamic_relocations) |reloc| {
+        if (reloc.rel_type != 7) continue; // R_X86_64_JUMP_SLOT
+        if (jump_slot_index == relocation_index) return reloc.name;
+        jump_slot_index += 1;
+    }
+    return null;
 }
 
 fn dynamicRelocationName(state: anytype, got_addr: u64) ?[]const u8 {
@@ -122,6 +258,42 @@ fn finishExternalReturn(state: anytype, direct_return_rip: ?u64) void {
     } else {
         state.regs.rip = state.pop();
     }
+}
+
+fn handleWriteShim(state: anytype) void {
+    const fd = state.regs.rdi;
+    const buf = state.regs.rsi;
+    const len = state.regs.rdx;
+    const off = state.addrToOffset(buf) orelse {
+        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        return;
+    };
+    if (len > std.math.maxInt(usize)) {
+        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        return;
+    }
+    const off_usize: usize = @intCast(off);
+    const len_usize: usize = @intCast(len);
+    if (off_usize > state.mem.len or len_usize > state.mem.len - off_usize) {
+        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        return;
+    }
+    const data = state.mem[off_usize .. off_usize + len_usize];
+    if (fd == 1) {
+        x64_syscalls.writeHostAll(std.posix.STDOUT_FILENO, data) catch {
+            state.regs.rax = x64_syscalls.errnoValue(.io);
+            return;
+        };
+    } else if (fd == 2) {
+        x64_syscalls.writeHostAll(std.posix.STDERR_FILENO, data) catch {
+            state.regs.rax = x64_syscalls.errnoValue(.io);
+            return;
+        };
+    } else {
+        state.regs.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
+        return;
+    }
+    state.regs.rax = len;
 }
 
 fn handleWritevShim(state: anytype) void {
