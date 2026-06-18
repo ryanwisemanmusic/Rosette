@@ -509,8 +509,9 @@ fn installShellForApp(init: std.process.Init, allocator: std.mem.Allocator, app_
     const runtime_root = try std.fs.path.join(allocator, &.{ app_path, "Contents", "Resources", "rosette-runtime" });
     std.debug.print("Installing Rosette global shell integration...\n", .{});
     std.debug.print("  command: rosette\n", .{});
-    std.debug.print("  helpers: rosette-shell, elf_processor, rosette_assembler_runner\n", .{});
+    std.debug.print("  helpers: rosette-shell, elf_processor, rosette-router, rosette_assembler_runner\n", .{});
     std.debug.print("  direct launch: ./program for detected x86-64 ELF assignments\n", .{});
+    std.debug.print("  compatibility route: rosette route run --prefer-intel /path/to/App.app\n", .{});
     std.debug.print("  config: ~/.rosette/config.toml with dump_results=\"auto\"\n", .{});
     try runCmd(init.io, &[_][]const u8{ helper, "install", runtime_root });
 }

@@ -194,6 +194,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(assembler_runner);
 
+    const compat_router_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/compat/rosetta2/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const compat_router = b.addExecutable(.{
+        .name = "rosette-router",
+        .root_module = compat_router_mod,
+    });
+    b.installArtifact(compat_router);
+
     // Add WinForms native Cocoa bridge to the exe runner module
     // Temporarily disabled to debug hang
     // exe_runner_mod.addCSourceFile(.{
@@ -284,6 +296,14 @@ pub fn build(b: *std.Build) void {
     );
     assembler_runner_install.step.dependOn(&assembler_runner.step);
     bundle_step.dependOn(&assembler_runner_install.step);
+
+    const compat_router_install = b.addInstallFileWithDir(
+        compat_router.getEmittedBin(),
+        .{ .custom = b.fmt("{s}.app/Contents/MacOS", .{app_name}) },
+        "rosette-router",
+    );
+    compat_router_install.step.dependOn(&compat_router.step);
+    bundle_step.dependOn(&compat_router_install.step);
 
     const exe_runner_install = b.addInstallFileWithDir(
         standalone_runner.getEmittedBin(),
@@ -378,6 +398,7 @@ pub fn build(b: *std.Build) void {
         \\  README.md
         \\  rosette_app_exe.zig
         \\  rosette_exe_runner.zig
+        \\  src/compat/rosetta2
         \\permanent blacklist:
         \\  .rosette
         \\  docs
