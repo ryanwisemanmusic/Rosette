@@ -554,36 +554,13 @@ fn handleWriteShim(state: anytype) void {
     const fd = state.regs.rdi;
     const buf = state.regs.rsi;
     const len = state.regs.rdx;
-    const off = state.addrToOffset(buf) orelse {
+    const data = state.guestMemoryConst(buf, len) orelse {
         state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        state.traceGuestIo("libc.write", fd, buf, len, state.regs.rax);
         return;
     };
-    if (len > std.math.maxInt(usize)) {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
-        return;
-    }
-    const off_usize: usize = @intCast(off);
-    const len_usize: usize = @intCast(len);
-    if (off_usize > state.mem.len or len_usize > state.mem.len - off_usize) {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_address);
-        return;
-    }
-    const data = state.mem[off_usize .. off_usize + len_usize];
-    if (fd == 1) {
-        x64_syscalls.writeHostAll(std.posix.STDOUT_FILENO, data) catch {
-            state.regs.rax = x64_syscalls.errnoValue(.io);
-            return;
-        };
-    } else if (fd == 2) {
-        x64_syscalls.writeHostAll(std.posix.STDERR_FILENO, data) catch {
-            state.regs.rax = x64_syscalls.errnoValue(.io);
-            return;
-        };
-    } else {
-        state.regs.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
-        return;
-    }
-    state.regs.rax = len;
+    state.regs.rax = state.writeHostFd(fd, data);
+    state.traceGuestIo("libc.write", fd, buf, len, state.regs.rax);
 }
 
 fn handleWritevShim(state: anytype) void {
@@ -608,26 +585,20 @@ fn handleWritevShim(state: anytype) void {
         const len_usize: usize = @intCast(len);
         if (off_usize > state.mem.len or len_usize > state.mem.len - off_usize) {
             state.regs.rax = x64_syscalls.errnoValue(.bad_address);
+            state.traceGuestIo("libc.writev", fd, base, len, state.regs.rax);
             return;
         }
         const data = state.mem[off_usize .. off_usize + len_usize];
-        if (fd == 1) {
-            x64_syscalls.writeHostAll(std.posix.STDOUT_FILENO, data) catch {
-                state.regs.rax = x64_syscalls.errnoValue(.io);
-                return;
-            };
-        } else if (fd == 2) {
-            x64_syscalls.writeHostAll(std.posix.STDERR_FILENO, data) catch {
-                state.regs.rax = x64_syscalls.errnoValue(.io);
-                return;
-            };
-        } else {
-            state.regs.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
+        const result = state.writeHostFd(fd, data);
+        state.traceGuestIo("libc.writev", fd, base, len, result);
+        if (@as(i64, @bitCast(result)) < 0) {
+            state.regs.rax = result;
             return;
         }
         total +%= len;
     }
     state.regs.rax = total;
+    if (iovcnt == 0) state.traceGuestIo("libc.writev", fd, iov, 0, state.regs.rax);
 }
 
 fn symbolNameEql(name: []const u8, expected: []const u8) bool {

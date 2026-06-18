@@ -59,6 +59,9 @@ pub const ElfState = struct {
     pending_argc: u64 = 0,
     pending_argv: u64 = 0,
     heap_next: u64 = MEM_BASE + (MEM_SIZE / 2),
+    trace_syscalls: bool = false,
+    trace_syscall_bytes: bool = false,
+    trace_fd_filter: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator) ElfState {
         const mem = allocator.alloc(u8, MEM_SIZE) catch unreachable;
@@ -68,6 +71,9 @@ pub const ElfState = struct {
             .mem = mem,
             .mem_base = MEM_BASE,
             .mem_size = MEM_SIZE,
+            .trace_syscalls = envFlag("ROSETTE_ELF_TRACE_SYSCALLS"),
+            .trace_syscall_bytes = envFlag("ROSETTE_ELF_TRACE_SYSCALL_BYTES"),
+            .trace_fd_filter = envU64("ROSETTE_ELF_TRACE_FD"),
         };
     }
 
@@ -395,6 +401,112 @@ pub const ElfState = struct {
         const off = self.addrToOffset(addr) orelse return;
         if (off + 16 > self.mem.len) return;
         @memcpy(self.mem[off..][0..16], value[0..]);
+    }
+
+    pub fn guestMemory(self: *ElfState, addr: u64, count: u64) ?[]u8 {
+        if (count > std.math.maxInt(usize)) return null;
+        const off = self.addrToOffset(addr) orelse return null;
+        const off_usize: usize = @intCast(off);
+        const count_usize: usize = @intCast(count);
+        if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
+        return self.mem[off_usize .. off_usize + count_usize];
+    }
+
+    pub fn guestMemoryConst(self: *const ElfState, addr: u64, count: u64) ?[]const u8 {
+        if (count > std.math.maxInt(usize)) return null;
+        const off = self.addrToOffset(addr) orelse return null;
+        const off_usize: usize = @intCast(off);
+        const count_usize: usize = @intCast(count);
+        if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
+        return self.mem[off_usize .. off_usize + count_usize];
+    }
+
+    pub fn writeHostFd(self: *ElfState, fd: u64, data: []const u8) u64 {
+        _ = self;
+        const host_fd = hostFdFromGuest(fd) orelse return x64_syscalls.errnoValue(.bad_file_descriptor);
+        var written: usize = 0;
+        while (written < data.len) {
+            const n = std.c.write(host_fd, data[written..].ptr, data.len - written);
+            if (n <= 0) return x64_syscalls.errnoValue(.io);
+            written += @intCast(n);
+        }
+        return @intCast(data.len);
+    }
+
+    pub fn traceGuestIo(self: *const ElfState, operation: []const u8, fd: u64, addr: u64, count: u64, result: u64) void {
+        if (!self.shouldTraceFd(fd)) return;
+        log.info("runtime io: {s}(fd={d}, buf=0x{x}, count={d}) -> {d}", .{
+            operation,
+            fd,
+            addr,
+            count,
+            syscallResult(result),
+        });
+        if (!self.trace_syscall_bytes) return;
+        if (syscallResult(result) <= 0) return;
+        const available = @min(count, result);
+        const data = self.guestMemoryConst(addr, available) orelse return;
+        self.traceDataPreview(operation, fd, data);
+    }
+
+    fn traceSyscall(self: *const ElfState, comptime fmt: []const u8, args: anytype) void {
+        if (!self.trace_syscalls) return;
+        if (self.trace_fd_filter != null) return;
+        log.info("syscall: " ++ fmt, args);
+    }
+
+    fn traceOpenResult(self: *const ElfState, path: []const u8, flags_raw: u64, mode_raw: u64, result: u64) void {
+        if (!self.shouldTraceResultFd(result)) return;
+        log.info("syscall: open(\"{s}\", flags=0x{x}, mode=0o{o}) -> {d}", .{
+            path,
+            flags_raw,
+            mode_raw & 0o7777,
+            syscallResult(result),
+        });
+    }
+
+    fn traceCreatResult(self: *const ElfState, path: []const u8, mode_raw: u64, result: u64) void {
+        if (!self.shouldTraceResultFd(result)) return;
+        log.info("syscall: creat(\"{s}\", mode=0o{o}) -> {d}", .{
+            path,
+            mode_raw & 0o7777,
+            syscallResult(result),
+        });
+    }
+
+    fn shouldTraceFd(self: *const ElfState, fd: u64) bool {
+        if (!self.trace_syscalls) return false;
+        if (self.trace_fd_filter) |filter| return fd == filter;
+        return true;
+    }
+
+    fn shouldTraceResultFd(self: *const ElfState, result: u64) bool {
+        if (!self.trace_syscalls) return false;
+        if (self.trace_fd_filter) |filter| {
+            if (syscallResult(result) < 0) return false;
+            return result == filter;
+        }
+        return true;
+    }
+
+    fn traceDataPreview(self: *const ElfState, operation: []const u8, fd: u64, data: []const u8) void {
+        if (!self.trace_syscall_bytes) return;
+        var preview: [96]u8 = undefined;
+        const n = @min(preview.len, data.len);
+        for (data[0..n], 0..) |byte, i| {
+            preview[i] = switch (byte) {
+                0x20...0x7e => byte,
+                '\n' => '|',
+                '\r', '\t' => ' ',
+                else => '.',
+            };
+        }
+        log.info("runtime io bytes: {s}(fd={d}) {d} byte preview \"{s}\"", .{
+            operation,
+            fd,
+            data.len,
+            preview[0..n],
+        });
     }
 
     fn setFlagsSub(self: *ElfState, a: u64, b: u64, result: u64, size: Size) void {
@@ -1871,6 +1983,7 @@ pub const ElfState = struct {
             SYS_exit => {
                 self.exit_code = self.regs.rdi;
                 self.terminated = true;
+                self.traceSyscall("exit(code={d})", .{self.exit_code});
             },
             SYS_read => {
                 self.handleReadSyscall();
@@ -1889,6 +2002,7 @@ pub const ElfState = struct {
             },
             SYS_gettid => {
                 self.regs.rax = 1;
+                self.traceSyscall("gettid() -> {d}", .{self.regs.rax});
             },
             else => {
                 log.warn("unimplemented syscall {d}", .{self.regs.rax});
@@ -1908,27 +2022,55 @@ pub const ElfState = struct {
     }
 
     fn handleOpenSyscall(self: *ElfState) void {
+        const path_addr = self.regs.rdi;
+        const flags_raw = self.regs.rsi;
+        const mode_raw = self.regs.rdx;
         const path = self.guestCString(self.regs.rdi) orelse {
             self.regs.rax = x64_syscalls.errnoValue(.bad_address);
+            self.traceSyscall("open(path=0x{x}, flags=0x{x}, mode=0o{o}) -> {d}", .{
+                path_addr,
+                flags_raw,
+                mode_raw & 0o7777,
+                syscallResult(self.regs.rax),
+            });
             return;
         };
         const path_z = self.allocator.dupeZ(u8, path) catch {
             self.regs.rax = x64_syscalls.errnoValue(.io);
+            self.traceSyscall("open(\"{s}\", flags=0x{x}, mode=0o{o}) -> {d}", .{
+                path,
+                flags_raw,
+                mode_raw & 0o7777,
+                syscallResult(self.regs.rax),
+            });
             return;
         };
         defer self.allocator.free(path_z);
 
-        const fd = std.c.open(path_z.ptr, linuxOpenFlagsToHost(self.regs.rsi), @as(std.c.mode_t, @intCast(self.regs.rdx & 0o7777)));
+        const fd = std.c.open(path_z.ptr, linuxOpenFlagsToHost(flags_raw), @as(std.c.mode_t, @intCast(mode_raw & 0o7777)));
         self.regs.rax = if (fd < 0) x64_syscalls.errnoValue(.no_entry) else @as(u64, @intCast(fd));
+        self.traceOpenResult(path, flags_raw, mode_raw, self.regs.rax);
     }
 
     fn handleCreatSyscall(self: *ElfState) void {
+        const path_addr = self.regs.rdi;
+        const requested_mode = if (self.regs.rdx != 0) self.regs.rdx else self.regs.rsi;
         const path = self.guestCString(self.regs.rdi) orelse {
             self.regs.rax = x64_syscalls.errnoValue(.bad_address);
+            self.traceSyscall("creat(path=0x{x}, mode=0o{o}) -> {d}", .{
+                path_addr,
+                requested_mode & 0o7777,
+                syscallResult(self.regs.rax),
+            });
             return;
         };
         const path_z = self.allocator.dupeZ(u8, path) catch {
             self.regs.rax = x64_syscalls.errnoValue(.io);
+            self.traceSyscall("creat(\"{s}\", mode=0o{o}) -> {d}", .{
+                path,
+                requested_mode & 0o7777,
+                syscallResult(self.regs.rax),
+            });
             return;
         };
         defer self.allocator.free(path_z);
@@ -1937,89 +2079,80 @@ pub const ElfState = struct {
         flags.ACCMODE = .WRONLY;
         flags.CREAT = true;
         flags.TRUNC = true;
-        const mode_raw = if (self.regs.rdx != 0) self.regs.rdx else self.regs.rsi;
-        const mode: std.c.mode_t = @intCast(mode_raw & 0o7777);
+        const mode: std.c.mode_t = @intCast(requested_mode & 0o7777);
         var fd = std.c.open(path_z.ptr, flags, mode);
         if (fd < 0) {
             _ = std.c.unlink(path_z.ptr);
             fd = std.c.open(path_z.ptr, flags, mode);
         }
         self.regs.rax = if (fd < 0) x64_syscalls.errnoValue(.io) else @as(u64, @intCast(fd));
+        self.traceCreatResult(path, requested_mode, self.regs.rax);
     }
 
     fn handleReadSyscall(self: *ElfState) void {
-        const fd: std.c.fd_t = @intCast(self.regs.rdi);
-        const addr = self.regs.rsi;
-        const count = self.regs.rdx;
-        const off = self.addrToOffset(addr) orelse {
-            self.regs.rax = x64_syscalls.errnoValue(.bad_address);
+        const fd_raw = self.regs.rdi;
+        const fd = hostFdFromGuest(fd_raw) orelse {
+            self.regs.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
+            self.traceGuestIo("read", fd_raw, self.regs.rsi, self.regs.rdx, self.regs.rax);
             return;
         };
-        if (count > std.math.maxInt(usize)) {
+        const addr = self.regs.rsi;
+        const count = self.regs.rdx;
+        const data = self.guestMemory(addr, count) orelse {
             self.regs.rax = x64_syscalls.errnoValue(.bad_address);
+            self.traceGuestIo("read", fd_raw, addr, count, self.regs.rax);
             return;
-        }
-        const off_usize: usize = @intCast(off);
-        const count_usize: usize = @intCast(count);
-        if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) {
-            self.regs.rax = x64_syscalls.errnoValue(.bad_address);
-            return;
-        }
+        };
 
-        const n = std.c.read(fd, self.mem[off_usize..].ptr, count_usize);
+        const n = std.c.read(fd, data.ptr, data.len);
         self.regs.rax = if (n < 0) x64_syscalls.errnoValue(.io) else @as(u64, @intCast(n));
+        self.traceGuestIo("read", fd_raw, addr, count, self.regs.rax);
     }
 
     fn handleCloseSyscall(self: *ElfState) void {
-        const fd: std.c.fd_t = @intCast(self.regs.rdi);
+        const fd_raw = self.regs.rdi;
+        const fd = hostFdFromGuest(fd_raw) orelse {
+            self.regs.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
+            if (self.shouldTraceFd(fd_raw)) {
+                log.info("syscall: close(fd={d}) -> {d}", .{ fd_raw, syscallResult(self.regs.rax) });
+            }
+            return;
+        };
         if (fd <= 2) {
             self.regs.rax = 0;
+            if (self.shouldTraceFd(fd_raw)) {
+                log.info("syscall: close(fd={d}) -> {d}", .{ fd, syscallResult(self.regs.rax) });
+            }
             return;
         }
         self.regs.rax = if (std.c.close(fd) == 0) 0 else x64_syscalls.errnoValue(.bad_file_descriptor);
+        if (self.shouldTraceFd(fd_raw)) {
+            log.info("syscall: close(fd={d}) -> {d}", .{ fd, syscallResult(self.regs.rax) });
+        }
     }
 
     fn handleWriteSyscall(self: *ElfState) void {
         const fd = self.regs.rdi;
         const addr = self.regs.rsi;
         const count = self.regs.rdx;
-        const off = self.addrToOffset(addr) orelse {
+        const data = self.guestMemoryConst(addr, count) orelse {
             self.regs.rax = x64_syscalls.errnoValue(.bad_address);
+            self.traceGuestIo("write", fd, addr, count, self.regs.rax);
             return;
         };
-        if (count > std.math.maxInt(usize)) {
-            self.regs.rax = x64_syscalls.errnoValue(.bad_address);
-            return;
-        }
-        const off_usize: usize = @intCast(off);
-        const count_usize: usize = @intCast(count);
-        if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) {
-            self.regs.rax = x64_syscalls.errnoValue(.bad_address);
-            return;
-        }
-
-        const data = self.mem[off_usize .. off_usize + count_usize];
-        if (fd == 1) {
-            x64_syscalls.writeHostAll(std.posix.STDOUT_FILENO, data) catch {
-                self.regs.rax = x64_syscalls.errnoValue(.io);
-                return;
-            };
-            self.regs.rax = count;
-        } else if (fd == 2) {
-            x64_syscalls.writeHostAll(std.posix.STDERR_FILENO, data) catch {
-                self.regs.rax = x64_syscalls.errnoValue(.io);
-                return;
-            };
-            self.regs.rax = count;
-        } else if (fd > 2) {
-            const host_fd: std.c.fd_t = @intCast(fd);
-            const n = std.c.write(host_fd, data.ptr, data.len);
-            self.regs.rax = if (n < 0) x64_syscalls.errnoValue(.io) else @as(u64, @intCast(n));
-        } else {
-            self.regs.rax = x64_syscalls.errnoValue(.bad_file_descriptor);
-        }
+        self.regs.rax = self.writeHostFd(fd, data);
+        self.traceGuestIo("write", fd, addr, count, self.regs.rax);
     }
 };
+
+fn syscallResult(value: u64) i64 {
+    return @bitCast(value);
+}
+
+fn hostFdFromGuest(fd: u64) ?std.c.fd_t {
+    if (fd > std.math.maxInt(std.c.fd_t)) return null;
+    return @intCast(fd);
+}
 
 fn linuxOpenFlagsToHost(flags_raw: u64) std.c.O {
     var flags: std.c.O = .{};
@@ -3874,6 +4007,11 @@ fn envFlag(name: [:0]const u8) bool {
     if (std.ascii.eqlIgnoreCase(value, "false")) return false;
     if (std.ascii.eqlIgnoreCase(value, "no")) return false;
     return true;
+}
+
+fn envU64(name: [:0]const u8) ?u64 {
+    const raw = std.c.getenv(name) orelse return null;
+    return parseEnvU64(std.mem.sliceTo(raw, 0));
 }
 
 fn readSiblingAsmSource(io: std.Io, allocator: std.mem.Allocator, elf_path: []const u8) !?[]const u8 {
