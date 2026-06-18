@@ -1,6 +1,10 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+const c = @cImport({
+    @cInclude("stdio.h");
+});
+
 const FAT_MAGIC: u32 = 0xCAFEBABE;
 const FAT_CIGAM: u32 = 0xBEBAFECA;
 const FAT_MAGIC_64: u32 = 0xCAFEBABF;
@@ -40,7 +44,8 @@ pub fn classifyPath(io: std.Io, allocator: std.mem.Allocator, raw_path: []const 
 }
 
 pub fn classifyExecutableBytes(io: std.Io, allocator: std.mem.Allocator, executable_path: []const u8) !Classification {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, executable_path, allocator, .limited(1024 * 1024)) catch |err| {
+    _ = io;
+    const bytes = readHeaderWindow(allocator, executable_path, 1024 * 1024) catch |err| {
         return .{
             .target_kind = .file,
             .format = .unknown,
@@ -69,6 +74,18 @@ pub fn classifyExecutableBytes(io: std.Io, allocator: std.mem.Allocator, executa
         .executable_path = executable_path,
         .note = "unrecognized_binary_magic",
     };
+}
+
+fn readHeaderWindow(allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    const fp = c.fopen(path_z.ptr, "rb");
+    if (fp == null) return error.FileOpenFailed;
+    defer _ = c.fclose(fp);
+
+    const buffer = try allocator.alloc(u8, limit);
+    const read_len = c.fread(buffer.ptr, 1, buffer.len, fp);
+    if (read_len == 0) return error.FileReadFailed;
+    return buffer[0..read_len];
 }
 
 fn classifyElf(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !Classification {

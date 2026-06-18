@@ -161,7 +161,16 @@ pub fn decide(class: types.Classification, policy: Policy) types.Decision {
             return unsupported(.unsupported_guest, "PE machine is not supported by this router");
         },
         .mach_o => return decideMachO(class, policy),
-        .unknown => return unsupported(.unsupported_container, class.note),
+        .unknown => {
+            if (policy.prefer_intel_slice and policy.allow_rosetta2_fallback) {
+                return .{
+                    .backend = .apple_rosetta2,
+                    .reason = .unsupported_container,
+                    .detail = "unknown or script-like target came from an x86_64 arch request; deferring to /usr/bin/arch",
+                };
+            }
+            return unsupported(.unsupported_container, class.note);
+        },
     }
 }
 

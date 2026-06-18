@@ -154,6 +154,10 @@ pub fn main(init: std.process.Init) !void {
         try cleanState(init.io, allocator);
         return;
     }
+    if (std.mem.eql(u8, args[1], "route-arch")) {
+        try routeArch(init, allocator, args[2..]);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "route") or std.mem.eql(u8, args[1], "compat")) {
         try runCompatRouter(init, allocator, args[2..]);
         return;
@@ -197,6 +201,7 @@ fn usage(exe_name: []const u8) void {
         \\  {s} prepare-make <project-directory> <env-file> [make-args...]
         \\  {s} finish-make <project-directory> <status> [make-args...]
         \\  {s} clean-state
+        \\  {s} route-arch <arch-args...>
         \\  {s} route run [options] <target|Application.app> [-- target-args...]
         \\  {s} run-elf <x86-64-elf-path> [args...]
         \\  {s} tool <tool-name> [tool-args...]
@@ -210,7 +215,7 @@ fn usage(exe_name: []const u8) void {
         \\  [graphics]
         \\  enabled = false
         \\
-    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
@@ -222,6 +227,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
+    const bash_env_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
 
@@ -254,6 +260,8 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     );
     try writeFilePath(allocator, shell_path, snippet);
     try chmodPath(allocator, shell_path, 0o644);
+    try writeFilePath(allocator, bash_env_path, try buildBashEnvSnippet(allocator, helper_path));
+    try chmodPath(allocator, bash_env_path, 0o644);
 
     const block = try buildProfileBlock(allocator);
     try installProfileBlocks(init.io, allocator, home, block);
@@ -288,6 +296,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const lib_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "lib" });
     const wrapper_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "wrappers" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
+    const bash_env_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" });
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
@@ -299,6 +308,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     try removeProfileBlocks(init.io, allocator, home);
 
     try unlinkIfExists(allocator, shell_path);
+    try unlinkIfExists(allocator, bash_env_path);
     try unlinkIfExists(allocator, source_root);
     try unlinkIfExists(allocator, toml_path);
     try unlinkIfExists(allocator, elf_processor_path);
@@ -421,6 +431,54 @@ fn runCompatRouter(init: std.process.Init, allocator: std.mem.Allocator, route_a
 
     const code = try runArgvResult(init.io, argv.items);
     std.process.exit(code);
+}
+
+fn routeArch(init: std.process.Init, allocator: std.mem.Allocator, arch_args: []const []const u8) !void {
+    const real_arch = "/usr/bin/arch";
+    const routed = parseArchRoute(arch_args) orelse {
+        try execArgv(init.io, try prependArg(allocator, real_arch, arch_args));
+        return;
+    };
+
+    const router_path = resolveCompatRouterPath(init, allocator) catch "";
+    if (router_path.len == 0 or !canExecute(allocator, router_path)) {
+        try execArgv(init.io, try prependArg(allocator, real_arch, arch_args));
+        return;
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, router_path);
+    try argv.append(allocator, "run");
+    try argv.append(allocator, "--prefer-intel");
+    try argv.append(allocator, routed.target);
+    for (routed.target_args) |arg| try argv.append(allocator, arg);
+
+    const code = try runArgvResult(init.io, argv.items);
+    std.process.exit(code);
+}
+
+const ArchRoute = struct {
+    target: []const u8,
+    target_args: []const []const u8,
+};
+
+fn parseArchRoute(args: []const []const u8) ?ArchRoute {
+    if (args.len < 2) return null;
+    if (std.mem.eql(u8, args[0], "-x86_64")) {
+        return .{ .target = args[1], .target_args = args[2..] };
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[0], "-arch") and std.mem.eql(u8, args[1], "x86_64")) {
+        return .{ .target = args[2], .target_args = args[3..] };
+    }
+    return null;
+}
+
+fn prependArg(allocator: std.mem.Allocator, first: []const u8, rest: []const []const u8) ![]const []const u8 {
+    var argv = try allocator.alloc([]const u8, rest.len + 1);
+    argv[0] = first;
+    for (rest, 0..) |arg, i| argv[i + 1] = arg;
+    return argv;
 }
 
 fn runRecipeShell(init: std.process.Init, allocator: std.mem.Allocator, shell_args: []const []const u8) !void {
@@ -1092,6 +1150,13 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
 
     try out.appendSlice(allocator,
         \\export ROSETTE_ROUTER="$HOME/.rosette/bin/rosette-router"
+        \\export ROSETTE_BASH_ENV="$HOME/.rosette/rosette-bash-env.sh"
+        \\if [ -f "$ROSETTE_BASH_ENV" ]; then
+        \\  if [ "${BASH_ENV:-}" != "$ROSETTE_BASH_ENV" ]; then
+        \\    export ROSETTE_USER_BASH_ENV="${BASH_ENV:-}"
+        \\    export BASH_ENV="$ROSETTE_BASH_ENV"
+        \\  fi
+        \\fi
         \\
     );
 
@@ -1402,6 +1467,51 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\    }
         \\  fi
         \\fi
+        \\
+    );
+    return out.items;
+}
+
+fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator,
+        \\# Rosette non-interactive bash hook.
+        \\# Sourced through BASH_ENV so scripts that invoke `arch -x86_64 ...`
+        \\# can be traced and routed without editing those scripts.
+        \\
+        \\if [ -n "${ROSETTE_USER_BASH_ENV:-}" ] && [ "$ROSETTE_USER_BASH_ENV" != "${ROSETTE_BASH_ENV:-}" ] && [ -f "$ROSETTE_USER_BASH_ENV" ]; then
+        \\  . "$ROSETTE_USER_BASH_ENV"
+        \\fi
+        \\
+        \\export ROSETTE_SHELL_HELPER=
+    );
+    try appendShellQuoted(&out, allocator, helper_path);
+    try out.appendSlice(allocator,
+        \\
+        \\
+        \\arch() {
+        \\  if [ -n "${ROSETTE_SHELL_DISABLE:-}" ]; then
+        \\    command /usr/bin/arch "$@"
+        \\    return $?
+        \\  fi
+        \\  case "${1:-}" in
+        \\    -x86_64)
+        \\      if [ "$#" -ge 2 ] && [ -x "$ROSETTE_SHELL_HELPER" ]; then
+        \\        "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\        return $?
+        \\      fi
+        \\      ;;
+        \\    -arch)
+        \\      if [ "${2:-}" = "x86_64" ] && [ "$#" -ge 3 ] && [ -x "$ROSETTE_SHELL_HELPER" ]; then
+        \\        "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\        return $?
+        \\      fi
+        \\      ;;
+        \\  esac
+        \\  command /usr/bin/arch "$@"
+        \\}
         \\
     );
     return out.items;
@@ -2640,6 +2750,41 @@ test "shell snippet includes zsh direct ELF launcher" {
     try std.testing.expect(containsIgnoreCase(snippet, "functions[$__rosette_cmd]"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_ENABLE_DYLD_INTERPOSE:-0"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_strip_dyld_interposer"));
+}
+
+test "arch route parser handles x86_64 short form" {
+    const args = [_][]const u8{ "-x86_64", "/bin/bash", "-c", "true" };
+    const route = parseArchRoute(&args).?;
+    try std.testing.expectEqualStrings("/bin/bash", route.target);
+    try std.testing.expectEqual(@as(usize, 2), route.target_args.len);
+    try std.testing.expectEqualStrings("-c", route.target_args[0]);
+    try std.testing.expectEqualStrings("true", route.target_args[1]);
+}
+
+test "arch route parser handles x86_64 arch flag form" {
+    const args = [_][]const u8{ "-arch", "x86_64", "/usr/local/bin/brew", "--prefix" };
+    const route = parseArchRoute(&args).?;
+    try std.testing.expectEqualStrings("/usr/local/bin/brew", route.target);
+    try std.testing.expectEqual(@as(usize, 1), route.target_args.len);
+    try std.testing.expectEqualStrings("--prefix", route.target_args[0]);
+}
+
+test "arch route parser ignores plain and non-x86 requests" {
+    const plain_args = [_][]const u8{"arch"};
+    const arm_args = [_][]const u8{ "-arm64", "/bin/echo" };
+    try std.testing.expect(parseArchRoute(&plain_args) == null);
+    try std.testing.expect(parseArchRoute(&arm_args) == null);
+}
+
+test "bash env snippet routes x86 arch only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippet = try buildBashEnvSnippet(arena.allocator(), "/tmp/rosette/bin/rosette-shell");
+    try std.testing.expect(containsIgnoreCase(snippet, "route-arch"));
+    try std.testing.expect(containsIgnoreCase(snippet, "-x86_64"));
+    try std.testing.expect(containsIgnoreCase(snippet, "-arch"));
+    try std.testing.expect(containsIgnoreCase(snippet, "command /usr/bin/arch"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_USER_BASH_ENV"));
 }
 
 test "assembly global parser handles lists and bracket directives" {
