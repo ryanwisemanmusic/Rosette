@@ -4,6 +4,7 @@ const testing = std.testing;
 const log = std.log.scoped(.elf);
 const elf_loader = @import("elf_loader.zig");
 const result_dump = @import("result_dump.zig");
+const x64_guest_abi = @import("x64_guest_abi");
 const x64_decoder = @import("x64_decoder");
 const x64_interpreter = @import("x64_interpreter");
 const x64_linux_runtime = @import("x64_linux_runtime");
@@ -62,6 +63,11 @@ pub const ElfState = struct {
     trace_syscalls: bool = false,
     trace_syscall_bytes: bool = false,
     trace_fd_filter: ?u64 = null,
+    trace_calls: bool = false,
+    diagnose_abi: bool = false,
+    call_stack: x64_guest_abi.CallStack = .{},
+    interactive_output_path: ?[]u8 = null,
+    interactive_summary_printed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) ElfState {
         const mem = allocator.alloc(u8, MEM_SIZE) catch unreachable;
@@ -74,10 +80,14 @@ pub const ElfState = struct {
             .trace_syscalls = envFlag("ROSETTE_ELF_TRACE_SYSCALLS"),
             .trace_syscall_bytes = envFlag("ROSETTE_ELF_TRACE_SYSCALL_BYTES"),
             .trace_fd_filter = envU64("ROSETTE_ELF_TRACE_FD"),
+            .trace_calls = envFlag("ROSETTE_ELF_TRACE_CALLS"),
+            .diagnose_abi = envFlag("ROSETTE_ELF_DIAGNOSE_ABI") or envFlag("ROSETTE_ELF_INTERACTIVE_BRIDGE") or envFlag("ROSETTE_ELF_EDU_BRIDGE"),
         };
     }
 
     pub fn deinit(self: *ElfState) void {
+        if (self.interactive_output_path) |path| self.allocator.free(path);
+        self.call_stack.deinit(self.allocator);
         self.allocator.free(self.mem);
     }
 
@@ -507,6 +517,29 @@ pub const ElfState = struct {
             data.len,
             preview[0..n],
         });
+    }
+
+    fn abiTraceConfig(self: *const ElfState) x64_guest_abi.TraceConfig {
+        return .{
+            .trace_calls = self.trace_calls,
+            .diagnose = self.diagnose_abi,
+        };
+    }
+
+    fn noteGuestCall(self: *ElfState, kind: x64_guest_abi.CallKind, target: u64, return_rip: u64) void {
+        if (!self.trace_calls) return;
+        self.call_stack.enter(self.allocator, self.abiTraceConfig(), .{
+            .target = target,
+            .return_rip = return_rip,
+            .rsp_before_call = self.regs.rsp,
+            .symbol = self.localSymbolNameAt(target),
+            .kind = kind,
+        });
+    }
+
+    fn noteGuestReturn(self: *ElfState, return_rip: u64) void {
+        if (!self.trace_calls) return;
+        self.call_stack.leave(self.abiTraceConfig(), return_rip, self.regs.rsp, self.regs.rax);
     }
 
     fn setFlagsSub(self: *ElfState, a: u64, b: u64, result: u64, size: Size) void {
@@ -1862,6 +1895,7 @@ pub const ElfState = struct {
                 if (x64_linux_runtime.tryLocalFunctionShim(self, target_rip, next_rip)) {
                     return;
                 }
+                self.noteGuestCall(.direct, target_rip, next_rip);
                 self.push(next_rip);
                 self.regs.rip = target_rip;
                 return;
@@ -1885,12 +1919,15 @@ pub const ElfState = struct {
                     self.terminated = true;
                     return;
                 }
+                self.noteGuestCall(.indirect, target, next_rip);
                 self.push(next_rip);
                 self.regs.rip = target;
                 return;
             },
             .ret => {
-                self.regs.rip = self.pop();
+                const return_rip = self.pop();
+                self.regs.rip = return_rip;
+                self.noteGuestReturn(return_rip);
                 return;
             },
             .push_reg => {
@@ -1950,8 +1987,12 @@ pub const ElfState = struct {
 
             // ── Syscall ──
             .syscall => {
+                const syscall_number = self.regs.rax;
+                const syscall_fd = self.regs.rdi;
+                const syscall_buf = self.regs.rsi;
+                const syscall_count = self.regs.rdx;
                 self.invokeLinuxSyscall(
-                    self.regs.rax,
+                    syscall_number,
                     self.regs.rdi,
                     self.regs.rsi,
                     self.regs.rdx,
@@ -1959,6 +2000,7 @@ pub const ElfState = struct {
                     self.regs.r8,
                     self.regs.r9,
                 );
+                x64_guest_abi.diagnoseSyscall(self, syscall_number, syscall_fd, syscall_buf, syscall_count, self.regs.rax);
             },
         }
 
@@ -2074,6 +2116,7 @@ pub const ElfState = struct {
             return;
         };
         defer self.allocator.free(path_z);
+        if (self.diagnose_abi) self.rememberInteractiveOutputPath(path);
 
         var flags: std.c.O = .{};
         flags.ACCMODE = .WRONLY;
@@ -2087,6 +2130,13 @@ pub const ElfState = struct {
         }
         self.regs.rax = if (fd < 0) x64_syscalls.errnoValue(.io) else @as(u64, @intCast(fd));
         self.traceCreatResult(path, requested_mode, self.regs.rax);
+    }
+
+    fn rememberInteractiveOutputPath(self: *ElfState, path: []const u8) void {
+        const copy = self.allocator.dupe(u8, path) catch return;
+        if (self.interactive_output_path) |old| self.allocator.free(old);
+        self.interactive_output_path = copy;
+        self.interactive_summary_printed = false;
     }
 
     fn handleReadSyscall(self: *ElfState) void {
