@@ -49,7 +49,10 @@ fn makeRelative(allocator: std.mem.Allocator, base_dir: []const u8, target: []co
             var i: usize = 0;
             while (i < p.len) {
                 while (i < p.len and p[i] == '/') i += 1;
-                if (i < p.len) { n += 1; while (i < p.len and p[i] != '/') i += 1; }
+                if (i < p.len) {
+                    n += 1;
+                    while (i < p.len and p[i] != '/') i += 1;
+                }
             }
             return n;
         }
@@ -114,11 +117,24 @@ fn makeRelative(allocator: std.mem.Allocator, base_dir: []const u8, target: []co
         pos += 3;
     }
     for (common..tgt_count) |i| {
-        if (i > common) { result[pos] = '/'; pos += 1; }
+        if (i > common) {
+            result[pos] = '/';
+            pos += 1;
+        }
         @memcpy(result[pos..][0..tgt_parts[i].len], tgt_parts[i]);
         pos += tgt_parts[i].len;
     }
     return result;
+}
+
+fn resolvePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const resolved = try std.fs.path.resolve(allocator, &.{path});
+    if (std.fs.path.isAbsolute(resolved)) return resolved;
+
+    const cwd_buf = try allocator.alloc(u8, std.posix.PATH_MAX);
+    defer allocator.free(cwd_buf);
+    const cwd = std.c.realpath(".", cwd_buf.ptr) orelse return error.CwdResolveFailed;
+    return try std.fs.path.resolve(allocator, &.{ std.mem.sliceTo(cwd, 0), resolved });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -135,23 +151,18 @@ pub fn main(init: std.process.Init) !void {
     const output_exe = args[4];
 
     const raw_output_dir = std.fs.path.dirname(output_exe) orelse ".";
-    const output_dir = blk: {
-        const resolved = try std.fs.path.resolve(allocator, &.{raw_output_dir});
-        if (std.fs.path.isAbsolute(resolved)) break :blk resolved;
-        const cwd_buf = try allocator.alloc(u8, std.posix.PATH_MAX);
-        defer allocator.free(cwd_buf);
-        const cwd = std.c.realpath(".", cwd_buf.ptr) orelse return error.CwdResolveFailed;
-        break :blk try std.fs.path.resolve(allocator, &.{std.mem.sliceTo(cwd, 0), resolved});
-    };
+    const output_dir = try resolvePath(allocator, raw_output_dir);
+    const launch_abs = try resolvePath(allocator, launch_binary);
+    const working_dir_abs = try resolvePath(allocator, working_dir);
 
-    const launch_rel = try makeRelative(allocator, output_dir, launch_binary);
-    const cwd_rel = try makeRelative(allocator, output_dir, working_dir);
+    const launch_rel = try makeRelative(allocator, output_dir, launch_abs);
+    const cwd_rel = try makeRelative(allocator, output_dir, working_dir_abs);
 
     {
-        const host_basename = std.fs.path.basename(launch_binary);
+        const host_basename = std.fs.path.basename(launch_abs);
         const dest_host = try std.fs.path.join(allocator, &.{ output_dir, host_basename });
-        if (!std.mem.eql(u8, launch_binary, dest_host)) {
-            const host_data = try std.Io.Dir.cwd().readFileAlloc(init.io, launch_binary, allocator, .unlimited);
+        if (!std.mem.eql(u8, launch_abs, dest_host)) {
+            const host_data = try std.Io.Dir.cwd().readFileAlloc(init.io, launch_abs, allocator, .unlimited);
             defer allocator.free(host_data);
             try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = dest_host, .data = host_data });
         }

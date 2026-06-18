@@ -162,7 +162,7 @@ print_menu() {
 }
 
 # ---------------------------------------------------------------------------
-# load_suite_cfg — source suite.cfg if present, reset defaults first
+# load_suite_cfg — parse suite.cfg if present, reset defaults first
 # ---------------------------------------------------------------------------
 load_suite_cfg() {
     local suite_dir="$1"
@@ -175,9 +175,25 @@ load_suite_cfg() {
 
     local cfg="${suite_dir}/suite.cfg"
     if [[ -f "${cfg}" ]]; then
-        # Source in a subshell first to validate, then in current shell
-        # shellcheck source=/dev/null
-        source "${cfg}"
+        local line key value
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            line="${line%$'\r'}"
+            line="${line%%#*}"
+            [[ "${line}" == *"="* ]] || continue
+            key="${line%%=*}"
+            value="${line#*=}"
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            case "${key}" in
+                SUITE_CC) SUITE_CC="${value}" ;;
+                SUITE_CFLAGS) SUITE_CFLAGS="${value}" ;;
+                SUITE_LDFLAGS) SUITE_LDFLAGS="${value}" ;;
+                SUITE_LINK_ZIG) SUITE_LINK_ZIG="${value}" ;;
+                SUITE_INTERACTIVE) SUITE_INTERACTIVE="${value}" ;;
+            esac
+        done < "${cfg}"
     fi
 }
 
@@ -191,7 +207,13 @@ ensure_zig_lib() {
             printf "  ${C_RED}✗ zig not found in PATH — cannot build ${ZIG_LIB}${C_RESET}\n"
             return 1
         fi
-        ( cd "${ROOT_DIR}" && zig build --build-file build/build.zig install ) || return 1
+        (
+            cd "${ROOT_DIR}" &&
+                env \
+                    ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-build/.zig-cache}" \
+                    ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-build/.zig-cache/global}" \
+                    zig build --build-file build/build.zig install
+        ) || return 1
     fi
 }
 
@@ -214,6 +236,50 @@ run_suite() {
     printf "\n  ${C_BOLD}Suite: %s${C_RESET}  ${C_DIM}(%s)${C_RESET}\n" \
         "${suite_name}" "${suite_dir}"
     printf "  %s\n" "$(printf '─%.0s' {1..60})"
+
+    if [[ "${suite_dir}" == "${ROOT_DIR}/app_testing/"* ]]; then
+        local tmp_dir=""
+        tmp_dir="$(mktemp -d /tmp/r3prodder.XXXXXX)"
+        trap '[[ -n "${tmp_dir:-}" ]] && rm -rf "${tmp_dir}"' RETURN
+        local build_err="${tmp_dir}/build.err"
+        local binary="${tmp_dir}/${suite_name}.host"
+
+        printf "  ${C_DIM}build${C_RESET}  %-40s … " "${suite_name}"
+        if bash "${ROOT_DIR}/tools/build_suite_binary.sh" "${suite_name}" "${binary}" >"${build_err}" 2>&1; then
+            printf "${C_GREEN}OK${C_RESET}\n"
+
+            if [[ "${SUITE_INTERACTIVE}" == "yes" && "${non_interactive}" == "yes" ]]; then
+                printf "  ${C_DIM}run${C_RESET}    %-40s … ${C_YELLOW}SKIPPED (interactive)${C_RESET}\n" "${suite_name}"
+                (( skip++ )) || true
+            else
+                printf "  ${C_DIM}run${C_RESET}    %-40s … " "${suite_name}"
+                if "${binary}" >"${tmp_dir}/stdout.txt" 2>"${tmp_dir}/stderr.txt"; then
+                    printf "${C_GREEN}PASS${C_RESET}\n"
+                    (( pass++ )) || true
+                else
+                    printf "${C_RED}FAIL${C_RESET}\n"
+                    sed 's/^/    /' "${tmp_dir}/stderr.txt" | head -n 8
+                    (( fail++ )) || true
+                fi
+            fi
+        else
+            printf "${C_RED}BUILD FAIL${C_RESET}\n"
+            head -n 8 "${build_err}" | sed 's/^/    /'
+            (( fail++ )) || true
+        fi
+
+        end_ts=$(date +%s)
+        elapsed=$(( end_ts - start_ts ))
+        printf "  %s\n" "$(printf '─%.0s' {1..60})"
+        printf "  ${C_DIM}elapsed: %ds   pass: %s   fail: %s   skip: %s${C_RESET}\n\n" \
+            "${elapsed}" \
+            "${C_GREEN}${pass}${C_RESET}${C_DIM}" \
+            "${C_RED}${fail}${C_RESET}${C_DIM}" \
+            "${C_YELLOW}${skip}${C_RESET}${C_DIM}"
+
+        [[ "${fail}" -eq 0 ]]
+        return
+    fi
 
     # Should we link the Zig library?
     local link_zig="${SUITE_LINK_ZIG}"
@@ -243,7 +309,7 @@ run_suite() {
 
     local tmp_dir=""
     tmp_dir="$(mktemp -d /tmp/r3prodder.XXXXXX)"
-    trap 'rm -rf "${tmp_dir}"' RETURN
+    trap '[[ -n "${tmp_dir:-}" ]] && rm -rf "${tmp_dir}"' RETURN
     local build_err="${tmp_dir}/build.err"
 
     for src in "${sources[@]}"; do

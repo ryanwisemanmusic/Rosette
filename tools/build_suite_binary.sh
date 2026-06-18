@@ -22,6 +22,8 @@ INCLUDE_DIR="include"
 SHIM_WIN32_DIR="${INCLUDE_DIR}/shims/win32"
 SHIM_MACOS_DIR="${INCLUDE_DIR}/shims/macos"
 ZIG_LIB="zig-out/lib/librosette_zig.a"
+ZIG_LOCAL_CACHE_DIR_DEFAULT="build/.zig-cache"
+ZIG_GLOBAL_CACHE_DIR_DEFAULT="build/.zig-cache/global"
 WINDOW_LIB="librosette_window.a"
 CLI_LIB="librosette_cli.a"
 DEFAULT_OBJ="default_main.o"
@@ -130,7 +132,14 @@ is_cxx_compiler() {
 }
 
 ensure_zig_lib() {
-    ( cd "${ROOT_DIR}" && env MACOSX_DEPLOYMENT_TARGET=13.0 zig build --build-file build/build.zig install --prefix "${ROOT_DIR}/zig-out" )
+    (
+        cd "${ROOT_DIR}" &&
+            env \
+                MACOSX_DEPLOYMENT_TARGET=13.0 \
+                ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-${ZIG_LOCAL_CACHE_DIR_DEFAULT}}" \
+                ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-${ZIG_GLOBAL_CACHE_DIR_DEFAULT}}" \
+                zig build --build-file build/build.zig install --prefix "${ROOT_DIR}/zig-out"
+    )
 }
 
 safe_artifact_name() {
