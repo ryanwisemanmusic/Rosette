@@ -24,6 +24,7 @@ APP_SUITE ?= basic_snake
 APP_HOST_BIN ?= app_testing/$(APP_SUITE)/$(APP_SUITE).host
 APP_EXE ?= assets/exe_examples/$(APP_SUITE).exe
 APP_TRACE ?= assets/exe_examples/$(APP_SUITE).trace.log
+BUNDLED_APP_SUITES ?= Console-Tetris basic_snake snax86
 ROSETTE_RUNNER_TEMPLATE := app/bundling/zig-out/bin/rosette_exe_runner
 ROSETTE_RUNNER_KILL_PATTERN := rosette_([c]li_runner|[e]xe_runner).*assets/exe_examples
 ROSETTE_HOST_KILL_PATTERN := [/]app_testing/.*[.]host
@@ -90,7 +91,7 @@ FB_LOGGER_OBJ := fb_logger.o
 OBJC_FLAGS := -fobjc-arc -fmodules
 OBJC_FRAMEWORKS := -framework Cocoa -framework Foundation
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build elf-processor-dylib assembler-runner-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe app-exe-run app-exe-parse app-wrapper installer uninstaller app-all notarize-installer notarize-uninstaller notarize-app-all
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build elf-processor-dylib assembler-runner-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse app-wrapper installer uninstaller app-all notarize-installer notarize-uninstaller notarize-app-all
 
 all: headers-check zig-build test-run
 
@@ -186,7 +187,7 @@ shell-clean-state: shell-helper-build
 # Outputs land in program/ tree at the project root.
 # ---------------------------------------------------------------------------
 .PHONY: app-wrapper
-app-wrapper: mscoree-native shell-helper-build
+app-wrapper: mscoree-native shell-helper-build bundled-app-exes
 	@mkdir -p program/app
 	@echo "Building Rosette.app bundle..."
 	@zig build bundle --build-file app/bundling/build.zig --cache-dir build/.zig-cache --global-cache-dir build/.zig-cache/global 2>&1
@@ -493,7 +494,7 @@ exe-runner-cleanup:
 
 app-exe-builder-build:
 	@mkdir -p zig-out/bin
-	@zig build-exe "$(APP_EXE_BUILDER_SRC)" -femit-bin="$(APP_EXE_BUILDER_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe "$(APP_EXE_BUILDER_SRC)" -femit-bin="$(APP_EXE_BUILDER_BIN)"
 
 exe-run: exe-runner-build
 	@if [ ! -f "$(EXE)" ]; then \
@@ -542,6 +543,16 @@ app-exe: app-suite-binary app-exe-builder-build
 	@mkdir -p "$$(dirname "$(APP_EXE)")"
 	@"$(APP_EXE_BUILDER_BIN)" "$(APP_SUITE)" "$(ROOT_DIR)/$(APP_HOST_BIN)" "$(ROOT_DIR)/app_testing/$(APP_SUITE)" "$(APP_EXE)"
 	@echo "Packaged $(APP_SUITE) -> $(APP_EXE)"
+
+bundled-app-exes: app-exe-builder-build window-lib cli-lib
+	@mkdir -p assets/exe_examples
+	@for suite in $(BUNDLED_APP_SUITES); do \
+		host="app_testing/$$suite/$$suite.host"; \
+		exe="assets/exe_examples/$$suite.exe"; \
+		echo "Building bundled Rosette .exe wrapper for $$suite..."; \
+		./tools/build_suite_binary.sh "$$suite" "$$host"; \
+		"$(APP_EXE_BUILDER_BIN)" "$$suite" "$(ROOT_DIR)/$$host" "$(ROOT_DIR)/app_testing/$$suite" "$$exe"; \
+	done
 
 app-exe-parse: app-exe exe-runner-build
 	@$(MAKE) --no-print-directory exe-runner-cleanup
