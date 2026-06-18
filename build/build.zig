@@ -937,6 +937,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        const x64_guest_abi_mod = b.createModule(.{
+            .root_source_file = b.path("../src/x64-ASM/guest_abi.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         x64_linux_runtime_mod.addImport("x64_syscalls", x64_syscalls_mod);
         const elf_processor_mod = b.createModule(.{
             .root_source_file = b.path("../ELF_processor/main.zig"),
@@ -947,6 +952,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("x64_interpreter", x64_interpreter_mod);
         elf_processor_mod.addImport("x64_linux_runtime", x64_linux_runtime_mod);
         elf_processor_mod.addImport("x64_syscalls", x64_syscalls_mod);
+        elf_processor_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -962,8 +968,12 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("x64_interpreter", x64_interpreter_mod);
         elf_processor_test_mod.addImport("x64_linux_runtime", x64_linux_runtime_mod);
         elf_processor_test_mod.addImport("x64_syscalls", x64_syscalls_mod);
+        elf_processor_test_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&elf_processor_test.step);
+
+        const x64_guest_abi_test = b.addTest(.{ .root_module = x64_guest_abi_mod });
+        check_step.dependOn(&x64_guest_abi_test.step);
     }
 
     // Aggregate Win32 ABI handshake suite
