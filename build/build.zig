@@ -892,6 +892,29 @@ pub fn build(b: *std.Build) void {
     }
 
     {
+        const compat_router_mod = b.createModule(.{
+            .root_source_file = b.path("../src/compat/rosetta2/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const compat_router = b.addExecutable(.{
+            .name = "rosette-router",
+            .root_module = compat_router_mod,
+        });
+        b.installArtifact(compat_router);
+
+        const compat_router_test_mod = b.createModule(.{
+            .root_source_file = b.path("../src/compat/rosetta2/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const compat_router_test = b.addTest(.{ .root_module = compat_router_test_mod });
+        check_step.dependOn(&compat_router_test.step);
+    }
+
+    {
         const dll_unpacker = b.addExecutable(.{
             .name = "rosette_dll_unpacker",
             .root_module = dll_unpacker_module,
