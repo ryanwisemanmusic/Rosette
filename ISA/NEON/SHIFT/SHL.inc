@@ -54,4 +54,7 @@ neon_register_model = "x86 GP registers mapped to ARM64 X registers."
 neon_flag_model = "CF, OF, SF, ZF, PF, AF set per x86 shift semantics via ARM64 shifts + flag synthesis."
 neon_assembly = "// ARM64: LSL, shifted register or immediate"
 neon_notes = ["Runtime ABI validation checks both the x86 table shape and this NEON lowering shape."]
+syntax_examples = [
+  { syntax = "att", form = "shlq %cl, %r14", maps_to = "SHL r/m64, CL", opcode = "REX.W + D3 /4" }
+]
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape", "full_scope_preserved"]
