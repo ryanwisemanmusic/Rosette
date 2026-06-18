@@ -1,0 +1,141 @@
+const std = @import("std");
+const config = @import("config.zig");
+const router = @import("router.zig");
+const trace = @import("trace.zig");
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
+    const base_policy = try loadBasePolicy(init.io, allocator);
+    if (args.len < 2) return usage(args[0]);
+
+    if (std.mem.eql(u8, args[1], "help") or std.mem.eql(u8, args[1], "--help")) {
+        usage(args[0]);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "trace-path")) {
+        std.debug.print("{s}\n", .{try trace.defaultTracePath(allocator)});
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "diagnose")) {
+        const parsed = try parseRouteArgs(allocator, base_policy, args[2..]);
+        if (parsed.target == null) return usage(args[0]);
+        var policy = parsed.policy;
+        policy.dry_run = true;
+        try router.diagnoseTarget(init, allocator, parsed.target.?, parsed.target_args, policy);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "run")) {
+        const parsed = try parseRouteArgs(allocator, base_policy, args[2..]);
+        if (parsed.target == null) return usage(args[0]);
+        const code = try router.runTarget(init, allocator, parsed.target.?, parsed.target_args, parsed.policy);
+        std.process.exit(code);
+    }
+
+    const parsed = try parseRouteArgs(allocator, base_policy, args[1..]);
+    if (parsed.target == null) return usage(args[0]);
+    const code = try router.runTarget(init, allocator, parsed.target.?, parsed.target_args, parsed.policy);
+    std.process.exit(code);
+}
+
+const ParsedRouteArgs = struct {
+    policy: router.Policy,
+    target: ?[]const u8,
+    target_args: []const []const u8,
+};
+
+fn loadBasePolicy(io: std.Io, allocator: std.mem.Allocator) !router.Policy {
+    const cfg = try config.load(io, allocator);
+    var policy = router.Policy{};
+    if (cfg.prefer_rosette) |value| policy.prefer_rosette = value;
+    if (cfg.allow_rosetta2_fallback) |value| policy.allow_rosetta2_fallback = value;
+    if (cfg.prefer_intel_slice) |value| policy.prefer_intel_slice = value;
+    if (cfg.trace) |value| policy.trace_enabled = value;
+    return policy;
+}
+
+fn parseRouteArgs(allocator: std.mem.Allocator, base_policy: router.Policy, args: []const []const u8) !ParsedRouteArgs {
+    var policy = base_policy;
+    var target: ?[]const u8 = null;
+    var target_args_start: usize = args.len;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            if (index + 1 < args.len and target == null) {
+                target = args[index + 1];
+                target_args_start = index + 2;
+            } else {
+                target_args_start = index + 1;
+            }
+            break;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            policy.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--baseline-rosetta2")) {
+            policy.force_apple_rosetta2 = true;
+        } else if (std.mem.eql(u8, arg, "--no-fallback")) {
+            policy.allow_rosetta2_fallback = false;
+        } else if (std.mem.eql(u8, arg, "--prefer-intel")) {
+            policy.prefer_intel_slice = true;
+        } else if (std.mem.eql(u8, arg, "--trace-off")) {
+            policy.trace_enabled = false;
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            if (index + 1 >= args.len) return error.MissingTracePath;
+            index += 1;
+            policy.trace_path = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.InvalidOption;
+        } else {
+            target = arg;
+            target_args_start = index + 1;
+            break;
+        }
+    }
+
+    const target_args = if (target_args_start < args.len)
+        try allocator.dupe([]const u8, args[target_args_start..])
+    else
+        &.{};
+
+    return .{
+        .policy = policy,
+        .target = target,
+        .target_args = target_args,
+    };
+}
+
+fn usage(exe_name: []const u8) void {
+    std.debug.print(
+        \\Rosette compatibility router
+        \\
+        \\Usage:
+        \\  {s} run [options] <target|Application.app> [-- target-args...]
+        \\  {s} diagnose [options] <target|Application.app>
+        \\  {s} trace-path
+        \\
+        \\Options:
+        \\  --dry-run              Print and trace the selected route without launching
+        \\  --baseline-rosetta2    Force Apple Rosetta 2 for an x86_64 Mach-O slice
+        \\  --prefer-intel         Use an x86_64 slice from a universal Mach-O/app
+        \\  --no-fallback          Do not fall back to Apple Rosetta 2
+        \\  --trace <path>         Write the compatibility trace to a specific file
+        \\  --trace-off            Disable route trace writes for this invocation
+        \\
+        \\Environment:
+        \\  ROSETTE_ELF_PROCESSOR  Override elf_processor path
+        \\  ROSETTE_EXE_RUNNER     Override rosette_exe_runner path
+        \\  ROSETTE_COMPAT_TRACE   Override default handoff trace path
+        \\
+    , .{ exe_name, exe_name, exe_name });
+}
+
+test "parse target after options" {
+    const args = [_][]const u8{ "--dry-run", "--prefer-intel", "Xenia.app", "--", "--gpu", "vulkan" };
+    const parsed = try parseRouteArgs(std.testing.allocator, .{}, &args);
+    defer std.testing.allocator.free(parsed.target_args);
+    try std.testing.expect(parsed.policy.dry_run);
+    try std.testing.expect(parsed.policy.prefer_intel_slice);
+    try std.testing.expectEqualStrings("Xenia.app", parsed.target.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.target_args.len);
+}
