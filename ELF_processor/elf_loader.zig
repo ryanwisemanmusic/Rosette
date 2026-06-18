@@ -13,6 +13,7 @@ const EM_X86_64: u16 = 62;
 const ET_EXEC: u16 = 2;
 
 const PT_LOAD: u32 = 1;
+const PAGE_SIZE: u64 = 4096;
 
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
@@ -89,6 +90,65 @@ pub const DynamicRelocation = struct {
     rel_type: u32,
 };
 
+pub const LoadPlan = struct {
+    mem_base: u64,
+    image_low: u64,
+    image_high: u64,
+    heap_start: u64,
+    entry: u64,
+};
+
+pub fn planExecutableLoad(mem_len: usize, elf_bytes: []const u8, stack_reserve: u64) !LoadPlan {
+    const ehdr = try header(elf_bytes);
+    try validateHeader(&ehdr);
+
+    const phoff = ehdr.e_phoff;
+    const phentsize = ehdr.e_phentsize;
+    const phnum = ehdr.e_phnum;
+
+    if (phoff == 0 or phentsize < @sizeOf(Elf64_Phdr) or phnum == 0) return error.NoProgramHeaders;
+    if (phoff + phnum * phentsize > elf_bytes.len) return error.TruncatedProgramHeaders;
+
+    var min_vaddr: u64 = std.math.maxInt(u64);
+    var max_vaddr: u64 = 0;
+    var saw_load = false;
+
+    var i: u16 = 0;
+    while (i < phnum) : (i += 1) {
+        const phdr_off = phoff + i * phentsize;
+        if (phdr_off + @sizeOf(Elf64_Phdr) > elf_bytes.len) return error.TruncatedProgramHeaders;
+        const phdr = std.mem.bytesToValue(Elf64_Phdr, elf_bytes[phdr_off..][0..@sizeOf(Elf64_Phdr)]);
+        if (phdr.p_type != PT_LOAD or phdr.p_memsz == 0) continue;
+        if (phdr.p_offset + phdr.p_filesz > elf_bytes.len) return error.TruncatedSegment;
+
+        const segment_high = std.math.add(u64, phdr.p_vaddr, phdr.p_memsz) catch return error.SegmentAddressOverflow;
+        min_vaddr = @min(min_vaddr, phdr.p_vaddr);
+        max_vaddr = @max(max_vaddr, segment_high);
+        saw_load = true;
+    }
+
+    if (!saw_load) return error.NoLoadSegments;
+
+    const mem_base = alignDown(min_vaddr, PAGE_SIZE);
+    const image_high = alignUp(max_vaddr, PAGE_SIZE) catch return error.SegmentAddressOverflow;
+    const required_span = image_high - mem_base;
+    const mem_len_u64: u64 = @intCast(mem_len);
+    const effective_stack_reserve = @min(stack_reserve, mem_len_u64 / 2);
+    if (required_span > mem_len_u64 - effective_stack_reserve) return error.SegmentTooLarge;
+
+    const heap_start = image_high;
+    const heap_limit = std.math.add(u64, mem_base, mem_len_u64 - effective_stack_reserve) catch return error.SegmentAddressOverflow;
+    if (heap_start > heap_limit) return error.SegmentTooLarge;
+
+    return .{
+        .mem_base = mem_base,
+        .image_low = min_vaddr,
+        .image_high = image_high,
+        .heap_start = heap_start,
+        .entry = ehdr.e_entry,
+    };
+}
+
 pub fn loadExecutableSegments(mem_base: u64, mem: []u8, elf_bytes: []const u8) !u64 {
     const ehdr = try header(elf_bytes);
     try validateHeader(&ehdr);
@@ -118,6 +178,22 @@ pub fn loadExecutableSegments(mem_base: u64, mem: []u8, elf_bytes: []const u8) !
     }
 
     return ehdr.e_entry;
+}
+
+pub fn collectInitArray(allocator: std.mem.Allocator, elf_bytes: []const u8) !std.ArrayList(u64) {
+    const ehdr = try header(elf_bytes);
+    try validateHeader(&ehdr);
+    if (ehdr.e_shoff == 0 or ehdr.e_shnum == 0) return .empty;
+    if (ehdr.e_shentsize < @sizeOf(Elf64_Shdr)) return error.InvalidSectionHeaderSize;
+
+    var functions: std.ArrayList(u64) = .empty;
+    errdefer functions.deinit(allocator);
+
+    try collectInitArraySection(allocator, elf_bytes, &ehdr, ".preinit_array", &functions);
+    try collectInitArraySection(allocator, elf_bytes, &ehdr, ".init_array", &functions);
+    try collectInitArraySection(allocator, elf_bytes, &ehdr, ".ctors", &functions);
+
+    return functions;
 }
 
 pub fn collectSymbols(allocator: std.mem.Allocator, elf_bytes: []const u8) !std.ArrayList(Symbol) {
@@ -219,6 +295,31 @@ pub fn collectDynamicRelocations(allocator: std.mem.Allocator, elf_bytes: []cons
     return relocs;
 }
 
+fn collectInitArraySection(
+    allocator: std.mem.Allocator,
+    elf_bytes: []const u8,
+    ehdr: *const Elf64_Ehdr,
+    wanted_name: []const u8,
+    functions: *std.ArrayList(u64),
+) !void {
+    var section_index: u16 = 0;
+    while (section_index < ehdr.e_shnum) : (section_index += 1) {
+        const shdr = readSectionHeader(elf_bytes, ehdr, section_index) orelse return error.TruncatedSectionHeaders;
+        const name = sectionName(elf_bytes, ehdr, section_index) orelse continue;
+        if (!std.mem.eql(u8, name, wanted_name)) continue;
+        if (shdr.sh_entsize != 0 and shdr.sh_entsize < @sizeOf(u64)) return error.InvalidInitArrayEntry;
+        if ((shdr.sh_size % @sizeOf(u64)) != 0) return error.InvalidInitArrayEntry;
+
+        const bytes = sectionBytes(elf_bytes, &shdr) orelse return error.TruncatedSection;
+        var off: usize = 0;
+        while (off + @sizeOf(u64) <= bytes.len) : (off += @sizeOf(u64)) {
+            const fn_addr = std.mem.readInt(u64, bytes[off..][0..@sizeOf(u64)], .little);
+            if (fn_addr == 0) continue;
+            try functions.append(allocator, fn_addr);
+        }
+    }
+}
+
 fn header(elf_bytes: []const u8) !Elf64_Ehdr {
     if (elf_bytes.len < @sizeOf(Elf64_Ehdr)) return error.InvalidElf;
     return std.mem.bytesToValue(Elf64_Ehdr, elf_bytes[0..@sizeOf(Elf64_Ehdr)]);
@@ -267,4 +368,13 @@ fn addrToOffset(mem_base: u64, mem_len: usize, vaddr: u64) ?u64 {
     const off = vaddr - mem_base;
     if (off >= mem_len) return null;
     return off;
+}
+
+fn alignDown(value: u64, alignment: u64) u64 {
+    return value & ~(alignment - 1);
+}
+
+fn alignUp(value: u64, alignment: u64) !u64 {
+    const mask = alignment - 1;
+    return (try std.math.add(u64, value, mask)) & ~mask;
 }
