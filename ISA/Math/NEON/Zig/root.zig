@@ -320,6 +320,7 @@ const bt_bts = @import("BT/BTS.zig");
 const cache_cldemote = @import("CACHE/CLDEMOTE.zig");
 const cache_clflush = @import("CACHE/CLFLUSH.zig");
 const cache_clflushopt = @import("CACHE/CLFLUSHOPT.zig");
+const cache_clwb = @import("CACHE/clwb.zig");
 const sha_sha1msg1 = @import("SHA/SHA1MSG1.zig");
 const sha_sha1msg2 = @import("SHA/SHA1MSG2.zig");
 const sha_sha1nexte = @import("SHA/SHA1NEXTE.zig");
@@ -526,6 +527,18 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const accumulate_crc32 = @import("ACCUMULATE/crc32.zig");
+const reverse_fdivr = @import("REVERSE/fdivr.zig");
+const reverse_fdivrp = @import("REVERSE/fdivrp.zig");
+const reverse_fidivr = @import("REVERSE/fidivr.zig");
+const reverse_fsubr = @import("REVERSE/fsubr.zig");
+const reverse_fsubrp = @import("REVERSE/fsubrp.zig");
+const reverse_fisubr = @import("REVERSE/fisubr.zig");
+const scan_scas = @import("SCAN/scas.zig");
+const scan_scasb = @import("SCAN/scasb.zig");
+const scan_scasw = @import("SCAN/scasw.zig");
+const scan_scasd = @import("SCAN/scasd.zig");
+const scan_scasq = @import("SCAN/scasq.zig");
 
 pub const specs = blk: {
     @setEvalBranchQuota(5000);
@@ -843,6 +856,7 @@ pub const specs = blk: {
         spec(cache_cldemote.meta),
         spec(cache_clflush.meta),
         spec(cache_clflushopt.meta),
+        spec(cache_clwb.meta),
         spec(sha_sha1msg1.meta),
         spec(sha_sha1msg2.meta),
         spec(sha_sha1nexte.meta),
@@ -1053,6 +1067,18 @@ pub const specs = blk: {
         spec(trig_fsincos.meta),
         spec(wait_wait.meta),
         spec(wait_mwait.meta),
+        spec(accumulate_crc32.meta),
+        spec(reverse_fdivr.meta),
+        spec(reverse_fdivrp.meta),
+        spec(reverse_fidivr.meta),
+        spec(reverse_fsubr.meta),
+        spec(reverse_fsubrp.meta),
+        spec(reverse_fisubr.meta),
+        spec(scan_scas.meta),
+        spec(scan_scasb.meta),
+        spec(scan_scasw.meta),
+        spec(scan_scasd.meta),
+        spec(scan_scasq.meta),
     };
 };
 
@@ -1370,6 +1396,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     cache_cldemote.proof_report,
     cache_clflush.proof_report,
     cache_clflushopt.proof_report,
+    cache_clwb.proof_report,
     sha_sha1msg1.proof_report,
     sha_sha1msg2.proof_report,
     sha_sha1nexte.proof_report,
@@ -1580,6 +1607,18 @@ pub const proof_reports = [_]proofs.ProofReport{
     trig_fsincos.proof_report,
     wait_wait.proof_report,
     wait_mwait.proof_report,
+    accumulate_crc32.proof_report,
+    reverse_fdivr.proof_report,
+    reverse_fdivrp.proof_report,
+    reverse_fidivr.proof_report,
+    reverse_fsubr.proof_report,
+    reverse_fsubrp.proof_report,
+    reverse_fisubr.proof_report,
+    scan_scas.proof_report,
+    scan_scasb.proof_report,
+    scan_scasw.proof_report,
+    scan_scasd.proof_report,
+    scan_scasq.proof_report,
 };
 
 pub fn tableCount() usize {

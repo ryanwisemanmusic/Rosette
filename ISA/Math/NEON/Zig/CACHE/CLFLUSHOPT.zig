@@ -33,3 +33,4 @@ pub fn verifyProofs() !void {
 test "neon CLFLUSHOPT documented-contract proofs match table metadata" {
     try verifyProofs();
 }
+

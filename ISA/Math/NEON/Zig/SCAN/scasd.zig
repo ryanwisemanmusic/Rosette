@@ -2,10 +2,10 @@ const core = @import("../../../core.zig");
 const proofs = @import("../../../proofs.zig");
 
 pub const meta = core.InstructionMathMeta{
-    .name = "CLDEMOTE",
-    .family = "CACHE",
-    .path = "CACHE/CLDEMOTE.inc",
-    .source_table_path = "CACHE/CLDEMOTE.inc",
+    .name = "SCASD",
+    .family = "SCAN",
+    .path = "SCAN/SCASD.inc",
+    .source_table_path = "SCAN/SCASD.inc",
     .target_isa = .neon,
     .operation = .documented_contract,
     .register_model = .documented_contract,
@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "CLDEMOTE", .path = "CACHE/CLDEMOTE.inc", .encoding_count = 1, .source_path_len = 18 } },
-    .{ .documented_contract = .{ .name = "CLDEMOTE", .path = "CACHE/CLDEMOTE.inc", .encoding_count = 1, .source_path_len = 18 } },
+    .{ .documented_contract = .{ .name = "SCASD", .path = "SCAN/SCASD.inc", .encoding_count = 1, .source_path_len = 14 } },
+    .{ .documented_contract = .{ .name = "SCASD", .path = "SCAN/SCASD.inc", .encoding_count = 1, .source_path_len = 14 } },
 };
 
 pub const proof_report = proofs.ProofReport{
@@ -30,7 +30,7 @@ pub fn verifyProofs() !void {
     try proofs.verifyReport(proofReport());
 }
 
-test "neon CLDEMOTE documented-contract proofs match table metadata" {
+test "neon SCASD documented-contract proofs match table metadata" {
     try verifyProofs();
 }
 

@@ -2,10 +2,10 @@ const core = @import("../../../core.zig");
 const proofs = @import("../../../proofs.zig");
 
 pub const meta = core.InstructionMathMeta{
-    .name = "CLDEMOTE",
-    .family = "CACHE",
-    .path = "CACHE/CLDEMOTE.inc",
-    .source_table_path = "CACHE/CLDEMOTE.inc",
+    .name = "FDIVR",
+    .family = "REVERSE",
+    .path = "REVERSE/FDIVR.inc",
+    .source_table_path = "REVERSE/FDIVR.inc",
     .target_isa = .neon,
     .operation = .documented_contract,
     .register_model = .documented_contract,
@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "CLDEMOTE", .path = "CACHE/CLDEMOTE.inc", .encoding_count = 1, .source_path_len = 18 } },
-    .{ .documented_contract = .{ .name = "CLDEMOTE", .path = "CACHE/CLDEMOTE.inc", .encoding_count = 1, .source_path_len = 18 } },
+    .{ .documented_contract = .{ .name = "FDIVR", .path = "REVERSE/FDIVR.inc", .encoding_count = 4, .source_path_len = 17 } },
+    .{ .documented_contract = .{ .name = "FDIVR", .path = "REVERSE/FDIVR.inc", .encoding_count = 4, .source_path_len = 17 } },
 };
 
 pub const proof_report = proofs.ProofReport{
@@ -30,7 +30,7 @@ pub fn verifyProofs() !void {
     try proofs.verifyReport(proofReport());
 }
 
-test "neon CLDEMOTE documented-contract proofs match table metadata" {
+test "neon FDIVR documented-contract proofs match table metadata" {
     try verifyProofs();
 }
 
