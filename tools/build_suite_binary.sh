@@ -161,10 +161,10 @@ unpack_suite_dll_resources() {
         done < <(find "${SUITE_DIR}" -maxdepth 4 -type f \( -iname '*.dll' -o -iname '*.DLL' \) -print0)
     fi
 
-    if [[ -d "${ROOT_DIR}/assets/dll" ]]; then
+    if [[ -d "${ROOT_DIR}/include/assets/dll" ]]; then
         while IFS= read -r -d '' dll_path; do
             dll_paths+=("${dll_path}")
-        done < <(find "${ROOT_DIR}/assets/dll" -maxdepth 2 -type f \( -iname '*.dll' -o -iname '*.DLL' \) -print0)
+        done < <(find "${ROOT_DIR}/include/assets/dll" -maxdepth 2 -type f \( -iname '*.dll' -o -iname '*.DLL' \) -print0)
     fi
 
     if [[ ${#dll_paths[@]} -eq 0 ]]; then

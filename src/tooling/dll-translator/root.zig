@@ -297,11 +297,11 @@ fn validateIconIndex(bytes: []const u8, pe: PeInfo, index: usize) !void {
 }
 
 fn pathCandidates(allocator: std.mem.Allocator, path: []const u8) ![][]u8 {
-    const prefixed_1 = try std.fmt.allocPrint(allocator, "assets/dll/{s}", .{path});
+    const prefixed_1 = try std.fmt.allocPrint(allocator, "include/assets/dll/{s}", .{path});
     defer allocator.free(prefixed_1);
-    const prefixed_2 = try std.fmt.allocPrint(allocator, "../assets/dll/{s}", .{path});
+    const prefixed_2 = try std.fmt.allocPrint(allocator, "../include/assets/dll/{s}", .{path});
     defer allocator.free(prefixed_2);
-    const prefixed_3 = try std.fmt.allocPrint(allocator, "../../assets/dll/{s}", .{path});
+    const prefixed_3 = try std.fmt.allocPrint(allocator, "../../include/assets/dll/{s}", .{path});
     defer allocator.free(prefixed_3);
 
     const out = try allocator.alloc([]u8, 4);
