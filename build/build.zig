@@ -1007,6 +1007,21 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&x64_guest_abi_test.step);
     }
 
+    // Mach-O processor (x86_64 macOS binary loader/diagnostic backend)
+    {
+        const macho_processor_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/Mach-O/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const macho_processor = b.addExecutable(.{
+            .name = "macho_processor",
+            .root_module = macho_processor_mod,
+        });
+        b.installArtifact(macho_processor);
+    }
+
     // Aggregate Win32 ABI handshake suite
     {
         const abi_suite_mod = b.createModule(.{
