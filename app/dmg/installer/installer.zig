@@ -57,6 +57,7 @@ fn installApp(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8,
     std.debug.print("Installing Rosette global shell integration...\n", .{});
     std.debug.print("  installing ~/.rosette/bin/rosette, rosette-shell, and rosette-clean-state\n", .{});
     std.debug.print("  installing ~/.rosette/bin/elf_processor for make run and ./program\n", .{});
+    std.debug.print("  installing ~/.rosette/bin/macho_processor for traced x86_64 Mach-O routing diagnostics\n", .{});
     std.debug.print("  installing ~/.rosette/bin/rosette-router for traced Rosetta 2 fallback routing\n", .{});
     std.debug.print("  installing default ~/.rosette/config.toml with dump_results=\"auto\"\n", .{});
     try installShell(io, allocator, target_app);
@@ -80,6 +81,7 @@ fn verifyPayload(payload_app: []const u8, allocator: std.mem.Allocator) !void {
         "Contents/MacOS/rosette-shell",
         "Contents/MacOS/rosette-router",
         "Contents/MacOS/elf_processor",
+        "Contents/MacOS/macho_processor",
         "Contents/MacOS/rosette_assembler_runner",
         "Contents/MacOS/rosette-exec.dylib",
         "Contents/Resources/rosette-runtime/GNUmakefile",

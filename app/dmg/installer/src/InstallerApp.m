@@ -427,7 +427,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     } else if (value < 66.0) {
         message = @"Installing global shell commands and cleanup backend...";
     } else if (value < 80.0) {
-        message = @"Installing elf_processor, rosette-router, and assembler helpers...";
+        message = @"Installing elf_processor, macho_processor, rosette-router, and assembler helpers...";
     } else {
         message = @"Writing ~/.rosette/config.toml with automatic assignment result summaries...";
     }
@@ -480,7 +480,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
 
 - (NSString *)doneMessageForDestination:(NSString *)destination output:(NSString *)output {
     NSString *target = [destination stringByAppendingPathComponent:@"Rosette.app"];
-    NSString *base = [NSString stringWithFormat:@"Rosette was installed at:\n%@\n\nFinder can use Rosette through Open With for supported .exe and .com files.\n\nThe global shell is installed too. In supported x86-64 assembly assignment folders, run make run or ./program to see Rosette's normalized result summary.\n\nCompatibility routing is installed as rosette route, with traced Apple Rosetta 2 fallback for Intel macOS apps.", target];
+    NSString *base = [NSString stringWithFormat:@"Rosette was installed at:\n%@\n\nFinder can use Rosette through Open With for supported .exe and .com files.\n\nThe global shell is installed too. In supported x86-64 assembly assignment folders, run make run or ./program to see Rosette's normalized result summary.\n\nCompatibility routing is installed as rosette route, with traced x86_64 Mach-O diagnostics and Apple Rosetta 2 fallback for Intel macOS apps.", target];
     if (output.length == 0) {
         return base;
     }

@@ -216,6 +216,18 @@ pub fn build(b: *std.Build) void {
     compat_router_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
     b.installArtifact(compat_router);
 
+    const macho_processor_mod = b.createModule(.{
+        .root_source_file = b.path("../../lib/Mach-O/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const macho_processor = b.addExecutable(.{
+        .name = "macho_processor",
+        .root_module = macho_processor_mod,
+    });
+    b.installArtifact(macho_processor);
+
     // Add WinForms native Cocoa bridge to the exe runner module
     // Temporarily disabled to debug hang
     // exe_runner_mod.addCSourceFile(.{
@@ -314,6 +326,14 @@ pub fn build(b: *std.Build) void {
     );
     compat_router_install.step.dependOn(&compat_router.step);
     bundle_step.dependOn(&compat_router_install.step);
+
+    const macho_processor_install = b.addInstallFileWithDir(
+        macho_processor.getEmittedBin(),
+        .{ .custom = b.fmt("{s}.app/Contents/MacOS", .{app_name}) },
+        "macho_processor",
+    );
+    macho_processor_install.step.dependOn(&macho_processor.step);
+    bundle_step.dependOn(&macho_processor_install.step);
 
     const exe_runner_install = b.addInstallFileWithDir(
         standalone_runner.getEmittedBin(),
