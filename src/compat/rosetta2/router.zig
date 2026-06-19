@@ -4,7 +4,9 @@ const trace = @import("trace.zig");
 const types = @import("types.zig");
 
 const c = @cImport({
+    @cInclude("stdio.h");
     @cInclude("stdlib.h");
+    @cInclude("sys/stat.h");
     @cInclude("unistd.h");
 });
 
@@ -70,7 +72,18 @@ pub fn buildPlan(
     target_args: []const []const u8,
     policy: Policy,
 ) !RunPlan {
-    const decision = decide(class, policy);
+    var decision = decide(class, policy);
+    if (decision.backend == .unsupported) {
+        if (try scriptHandoffDecision(allocator, class, target_args, policy)) |script_decision| {
+            decision = script_decision;
+        } else if (try scriptHandoffDetail(allocator, class, target_args, policy)) |detail| {
+            decision = .{
+                .backend = .unsupported,
+                .reason = .script_handoff_requires_macho,
+                .detail = detail,
+            };
+        }
+    }
 
     var argv: std.ArrayList([]const u8) = .empty;
     errdefer argv.deinit(allocator);
@@ -117,6 +130,28 @@ pub fn buildPlan(
         },
         .rosette_macho => {
             return unsupportedPlan(allocator, .rosette_backend_pending, "Mach-O x86_64 execution is not implemented in Rosette yet");
+        },
+        .rosette_script => {
+            const shim_path = try ensureScriptShim(allocator, policy);
+            try argv.append(allocator, "/usr/bin/env");
+            try appendEnv(&argv, allocator, "ROSETTE_SCRIPT_HANDOFF_ACTIVE", "1");
+            try appendEnv(&argv, allocator, "ROSETTE_VIRTUAL_UNAME_M", "x86_64");
+            try appendEnv(&argv, allocator, "ROSETTE_VIRTUAL_LONG_BIT", "64");
+            try appendEnv(&argv, allocator, "ROSETTE_VIRTUAL_PROC_TRANSLATED", "1");
+            try appendEnv(&argv, allocator, "BASH_ENV", shim_path);
+            if (getenvSlice("BASH_ENV")) |previous| try appendEnv(&argv, allocator, "ROSETTE_SCRIPT_HANDOFF_PREV_BASH_ENV", previous);
+            if (policy.trace_path) |path| try appendEnv(&argv, allocator, "ROSETTE_COMPAT_TRACE", path);
+            if (resolveDylib(allocator)) |dylib| {
+                try appendEnv(&argv, allocator, "ROSETTE_MACHO_STRICT", "1");
+                if (getenvSlice("DYLD_INSERT_LIBRARIES")) |existing| {
+                    const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ dylib, existing });
+                    try appendEnv(&argv, allocator, "DYLD_INSERT_LIBRARIES", joined);
+                } else {
+                    try appendEnv(&argv, allocator, "DYLD_INSERT_LIBRARIES", dylib);
+                }
+            }
+            try argv.append(allocator, class.executable_path);
+            for (target_args) |arg| try argv.append(allocator, arg);
         },
         .unsupported => {
             try argv.append(allocator, "unsupported");
@@ -235,6 +270,172 @@ fn unsupported(reason: types.FallbackReason, detail: []const u8) types.Decision 
     };
 }
 
+fn scriptHandoffDecision(
+    allocator: std.mem.Allocator,
+    class: types.Classification,
+    target_args: []const []const u8,
+    policy: Policy,
+) !?types.Decision {
+    if (!policy.strict_rosette and !policy.abort_on_unsupported) return null;
+    if (!isScriptHandoff(class, target_args, policy)) return null;
+    const script = routedScriptArgument(target_args) orelse return null;
+    const detail = try std.fmt.allocPrint(
+        allocator,
+        "x86_64 script handoff requested via {s} for {s}; running the script under Rosette's diagnostic shell shim. x86_64 Mach-O process launches remain blocked/traced until Rosette's Mach-O backend exists.",
+        .{ std.fs.path.basename(class.executable_path), script },
+    );
+    return .{
+        .backend = .rosette_script,
+        .reason = .script_handoff_requires_macho,
+        .detail = detail,
+    };
+}
+
+fn scriptHandoffDetail(
+    allocator: std.mem.Allocator,
+    class: types.Classification,
+    target_args: []const []const u8,
+    policy: Policy,
+) !?[]const u8 {
+    if (!isScriptHandoff(class, target_args, policy)) return null;
+
+    const script = routedScriptArgument(target_args) orelse return null;
+    const detail = try std.fmt.allocPrint(
+        allocator,
+        "x86_64 script handoff requested via {s} for {s}; Rosette intercepted the handoff, but the Mach-O x86_64 process backend needed to run this shell/script is not implemented yet. Apple Rosetta 2 fallback is disabled by strict policy.",
+        .{ std.fs.path.basename(class.executable_path), script },
+    );
+    return detail;
+}
+
+fn isScriptHandoff(class: types.Classification, target_args: []const []const u8, policy: Policy) bool {
+    if (!policy.prefer_intel_slice) return false;
+    if (policy.allow_rosetta2_fallback and !policy.strict_rosette and !policy.abort_on_unsupported) return false;
+    if (class.format != .mach_o or !class.has_x86_64) return false;
+    if (!isShellExecutable(class.executable_path)) return false;
+    return routedScriptArgument(target_args) != null;
+}
+
+fn routedScriptArgument(args: []const []const u8) ?[]const u8 {
+    if (args.len == 0) return null;
+    if (std.mem.eql(u8, args[0], "-c")) {
+        if (args.len >= 2) return "bash -c inline command";
+        return null;
+    }
+    if (std.mem.eql(u8, args[0], "--")) {
+        if (args.len >= 2) return args[1];
+        return null;
+    }
+    if (std.mem.startsWith(u8, args[0], "-")) return null;
+    return args[0];
+}
+
+fn isShellExecutable(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.mem.eql(u8, base, "bash") or
+        std.mem.eql(u8, base, "sh") or
+        std.mem.eql(u8, base, "zsh");
+}
+
+fn appendEnv(argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    try argv.append(allocator, try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value }));
+}
+
+fn ensureScriptShim(allocator: std.mem.Allocator, policy: Policy) ![]const u8 {
+    const base = if (policy.trace_path) |path|
+        std.fs.path.dirname(path) orelse "/tmp"
+    else if (getenvSlice("HOME")) |home|
+        try std.fs.path.join(allocator, &.{ home, ".rosette", "logs" })
+    else
+        "/tmp";
+    try makePathRecursive(allocator, base);
+    const shim_path = try std.fs.path.join(allocator, &.{ base, "rosette-script-handoff.bashenv" });
+    try writeFilePath(allocator, shim_path, script_handoff_shim);
+    _ = chmodPath(allocator, shim_path, 0o644) catch {};
+    return shim_path;
+}
+
+const script_handoff_shim =
+    \\# Rosette x86_64 script handoff shim. Generated by rosette-router.
+    \\if [ -n "${ROSETTE_SCRIPT_HANDOFF_PREV_BASH_ENV:-}" ] && [ -f "$ROSETTE_SCRIPT_HANDOFF_PREV_BASH_ENV" ]; then
+    \\  . "$ROSETTE_SCRIPT_HANDOFF_PREV_BASH_ENV"
+    \\fi
+    \\
+    \\__rosette_script_trace() {
+    \\  if [ -n "${ROSETTE_COMPAT_TRACE:-}" ]; then
+    \\    {
+    \\      printf '# Rosette script handoff\n'
+    \\      printf 'event = "%s"\n' "$1"
+    \\      printf 'cwd = "%s"\n' "$PWD"
+    \\      printf '\n'
+    \\    } >> "$ROSETTE_COMPAT_TRACE" 2>/dev/null || true
+    \\  fi
+    \\}
+    \\
+    \\uname() {
+    \\  if [ "$#" -eq 1 ] && [ "$1" = "-m" ]; then
+    \\    printf '%s\n' "${ROSETTE_VIRTUAL_UNAME_M:-x86_64}"
+    \\    return 0
+    \\  fi
+    \\  command uname "$@"
+    \\}
+    \\
+    \\arch() {
+    \\  if [ "$#" -eq 0 ]; then
+    \\    printf '%s\n' "${ROSETTE_VIRTUAL_UNAME_M:-x86_64}"
+    \\    return 0
+    \\  fi
+    \\  command /usr/bin/arch "$@"
+    \\}
+    \\
+    \\getconf() {
+    \\  if [ "$#" -eq 1 ] && [ "$1" = "LONG_BIT" ]; then
+    \\    printf '%s\n' "${ROSETTE_VIRTUAL_LONG_BIT:-64}"
+    \\    return 0
+    \\  fi
+    \\  command getconf "$@"
+    \\}
+    \\
+    \\sysctl() {
+    \\  if [ "$#" -ge 2 ] && [ "$1" = "-in" ] && [ "$2" = "sysctl.proc_translated" ]; then
+    \\    printf '%s\n' "${ROSETTE_VIRTUAL_PROC_TRANSLATED:-1}"
+    \\    return 0
+    \\  fi
+    \\  command sysctl "$@"
+    \\}
+    \\
+    \\__rosette_block_macho_launch() {
+    \\  local __rosette_target="$1"
+    \\  shift || true
+    \\  __rosette_script_trace "blocked_x86_64_macho target=$__rosette_target"
+    \\  printf 'rosette-script: blocked x86_64 Mach-O launch without Apple Rosetta 2 fallback: %s\n' "$__rosette_target" >&2
+    \\  printf 'rosette-script: Mach-O x86_64 execution backend is not implemented yet.\n' >&2
+    \\  return 126
+    \\}
+    \\
+    \\__rosette_install_macho_blockers() {
+    \\  if [ -x ./xenia_canary.app/Contents/MacOS/xenia_canary ]; then
+    \\    eval 'function ./xenia_canary.app/Contents/MacOS/xenia_canary() { __rosette_block_macho_launch "./xenia_canary.app/Contents/MacOS/xenia_canary" "$@"; }'
+    \\  fi
+    \\}
+    \\
+    \\trap '__rosette_install_macho_blockers' DEBUG
+    \\__rosette_install_macho_blockers
+    \\__rosette_script_trace "entered_native_script_handoff"
+    \\
+;
+
+fn resolveDylib(allocator: std.mem.Allocator) ?[]const u8 {
+    if (getenvSlice("ROSETTE_DYLD_INTERPOSER")) |path| {
+        if (canExecuteOrExists(allocator, path)) return allocator.dupe(u8, path) catch null;
+    }
+    if (getenvSlice("HOME")) |home| {
+        const installed = std.fs.path.join(allocator, &.{ home, ".rosette", "lib", "rosette-exec.dylib" }) catch return null;
+        if (canExecuteOrExists(allocator, installed)) return installed;
+    }
+    return null;
+}
+
 fn shouldAbortRoute(policy: Policy, decision: types.Decision) bool {
     return switch (decision.backend) {
         .apple_rosetta2 => policy.strict_rosette or policy.abort_on_fallback,
@@ -342,6 +543,42 @@ fn canExecute(allocator: std.mem.Allocator, path: []const u8) bool {
     return c.access(path_z.ptr, 1) == 0;
 }
 
+fn canExecuteOrExists(allocator: std.mem.Allocator, path: []const u8) bool {
+    const path_z = allocator.dupeZ(u8, path) catch return false;
+    return c.access(path_z.ptr, 0) == 0;
+}
+
+fn writeFilePath(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    const fp = c.fopen(path_z.ptr, "wb");
+    if (fp == null) return error.FileWriteFailed;
+    defer _ = c.fclose(fp);
+    if (contents.len != 0 and c.fwrite(contents.ptr, 1, contents.len, fp) != contents.len) return error.FileWriteFailed;
+}
+
+fn chmodPath(allocator: std.mem.Allocator, path: []const u8, mode: u16) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    if (c.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
+}
+
+fn makePathRecursive(allocator: std.mem.Allocator, raw_path: []const u8) !void {
+    if (raw_path.len == 0) return;
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(allocator);
+
+    if (raw_path[0] == '/') try current.append(allocator, '/');
+    var it = std.mem.splitScalar(u8, raw_path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (current.items.len > 1 and current.items[current.items.len - 1] != '/') try current.append(allocator, '/');
+        try current.appendSlice(allocator, part);
+        const path_z = try allocator.dupeZ(u8, current.items);
+        if (c.mkdir(path_z.ptr, 0o755) != 0) {
+            if (c.access(path_z.ptr, 0) != 0) return error.MakePathFailed;
+        }
+    }
+}
+
 fn getenvSlice(name: [:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     return std.mem.sliceTo(value, 0);
@@ -393,4 +630,27 @@ test "strict policy marks unsupported routes as abortable" {
     try std.testing.expect(shouldAbortRoute(.{ .abort_on_fallback = true }, fallback_decision));
     try std.testing.expect(!shouldAbortRoute(.{}, unsupported_decision));
     try std.testing.expect(!shouldAbortRoute(.{}, fallback_decision));
+}
+
+test "strict bash script handoff selects diagnostic script backend" {
+    const class = types.Classification{
+        .target_kind = .file,
+        .format = .mach_o,
+        .arch = .universal,
+        .requested_path = "/bin/bash",
+        .executable_path = "/bin/bash",
+        .has_arm64 = true,
+        .has_x86_64 = true,
+    };
+    const args = [_][]const u8{"/tmp/xenia-rosetta.12345"};
+    const decision = (try scriptHandoffDecision(std.testing.allocator, class, &args, .{
+        .prefer_intel_slice = true,
+        .allow_rosetta2_fallback = false,
+        .strict_rosette = true,
+    })).?;
+    defer std.testing.allocator.free(decision.detail);
+    try std.testing.expectEqual(types.Backend.rosette_script, decision.backend);
+    try std.testing.expectEqual(types.FallbackReason.script_handoff_requires_macho, decision.reason);
+    try std.testing.expect(std.mem.indexOf(u8, decision.detail, "x86_64 script handoff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decision.detail, "/tmp/xenia-rosetta.12345") != null);
 }

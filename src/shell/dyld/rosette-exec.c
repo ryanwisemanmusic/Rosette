@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -63,6 +64,55 @@ static posix_spawn_func_t real_posix_spawnp = NULL;
 // ── ELF detection ─────────────────────────────────────────────────────
 // Check if `path` points to an x86-64 Linux ELF executable.
 // Returns 1 if yes, 0 if no or on error.
+static uint32_t read_u32_le(const unsigned char *buf) {
+    return ((uint32_t)buf[0]) |
+        ((uint32_t)buf[1] << 8) |
+        ((uint32_t)buf[2] << 16) |
+        ((uint32_t)buf[3] << 24);
+}
+
+static uint32_t read_u32_be(const unsigned char *buf) {
+    return ((uint32_t)buf[0] << 24) |
+        ((uint32_t)buf[1] << 16) |
+        ((uint32_t)buf[2] << 8) |
+        ((uint32_t)buf[3]);
+}
+
+static int env_enabled(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !*value) return 0;
+    return strcmp(value, "1") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0 ||
+        strcasecmp(value, "on") == 0 ||
+        strcasecmp(value, "enabled") == 0;
+}
+
+static int is_x86_64_macho_thin(const char *path) {
+    if (!path) return 0;
+
+    unsigned char buf[32];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (n < 8) return 0;
+
+    const uint32_t magic_le = read_u32_le(buf);
+    const uint32_t magic_be = read_u32_be(buf);
+    uint32_t cputype = 0;
+    if (magic_le == 0xFEEDFACF) {
+        cputype = read_u32_le(buf + 4);
+    } else if (magic_be == 0xFEEDFACF) {
+        cputype = read_u32_be(buf + 4);
+    } else {
+        return 0;
+    }
+
+    // CPU_TYPE_X86_64 = CPU_TYPE_X86 | CPU_ARCH_ABI64 = 0x01000007.
+    return cputype == 0x01000007;
+}
+
 static int is_x86_64_elf(const char *path) {
     if (!path) return 0;
 
@@ -86,6 +136,31 @@ static int is_x86_64_elf(const char *path) {
     // e_machine at offset 18: EM_X86_64 = 62
     uint16_t e_machine = (uint16_t)buf[0x12] | ((uint16_t)buf[0x13] << 8);
     return (e_machine == 62) ? 1 : 0;
+}
+
+static int maybe_block_x86_64_macho(const char *path) {
+    if (!env_enabled("ROSETTE_MACHO_STRICT")) return 0;
+    if (!path || !is_x86_64_macho_thin(path)) return 0;
+
+    const char *trace_path = getenv("ROSETTE_COMPAT_TRACE");
+    if (trace_path && *trace_path) {
+        FILE *fp = fopen(trace_path, "ab");
+        if (fp) {
+            fprintf(fp,
+                "# Rosette exec interpose\n"
+                "event = \"blocked_x86_64_macho_exec\"\n"
+                "path = \"%s\"\n\n",
+                path);
+            fclose(fp);
+        }
+    }
+
+    fprintf(stderr,
+        "rosette-exec: blocked x86_64 Mach-O launch without Apple Rosetta 2 fallback: %s\n"
+        "rosette-exec: Mach-O x86_64 execution backend is not implemented yet.\n",
+        path);
+    errno = ENOEXEC;
+    return 1;
 }
 
 // ── elf_processor path resolution ─────────────────────────────────────
@@ -146,6 +221,10 @@ static int my_execve(const char *path, char *const argv[], char *const envp[]) {
     if (!real_execve)
         real_execve = (execve_func_t)dlsym(RTLD_NEXT, "execve");
 
+    if (maybe_block_x86_64_macho(path)) {
+        return -1;
+    }
+
     if (path && is_x86_64_elf(path)) {
         const char *proc = elf_processor_path();
 
@@ -186,6 +265,10 @@ static int my_posix_spawn(pid_t *pid, const char *path,
     if (!real_posix_spawn)
         real_posix_spawn = (posix_spawn_func_t)dlsym(RTLD_NEXT, "posix_spawn");
 
+    if (maybe_block_x86_64_macho(path)) {
+        return ENOEXEC;
+    }
+
     if (path && is_x86_64_elf(path)) {
         const char *proc = elf_processor_path();
 
@@ -216,6 +299,10 @@ static int my_posix_spawnp(pid_t *pid, const char *file,
     char *const argv[], char *const envp[]) {
     if (!real_posix_spawnp)
         real_posix_spawnp = (posix_spawn_func_t)dlsym(RTLD_NEXT, "posix_spawnp");
+
+    if (maybe_block_x86_64_macho(file)) {
+        return ENOEXEC;
+    }
 
     if (file && is_x86_64_elf(file)) {
         const char *proc = elf_processor_path();

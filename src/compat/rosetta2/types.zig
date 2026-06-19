@@ -52,6 +52,7 @@ pub const Backend = enum {
     rosette_elf,
     rosette_pe,
     rosette_macho,
+    rosette_script,
     apple_rosetta2,
     native,
     unsupported,
@@ -61,6 +62,7 @@ pub const Backend = enum {
             .rosette_elf => "rosette_elf",
             .rosette_pe => "rosette_pe",
             .rosette_macho => "rosette_macho",
+            .rosette_script => "rosette_script",
             .apple_rosetta2 => "apple_rosetta2",
             .native => "native",
             .unsupported => "unsupported",
@@ -75,6 +77,7 @@ pub const FallbackReason = enum {
     rosette_tool_missing,
     apple_rosetta2_disabled,
     forced_baseline,
+    script_handoff_requires_macho,
     unsupported_guest,
     unsupported_container,
 
@@ -86,6 +89,7 @@ pub const FallbackReason = enum {
             .rosette_tool_missing => "rosette_tool_missing",
             .apple_rosetta2_disabled => "apple_rosetta2_disabled",
             .forced_baseline => "forced_baseline",
+            .script_handoff_requires_macho => "script_handoff_requires_macho",
             .unsupported_guest => "unsupported_guest",
             .unsupported_container => "unsupported_container",
         };
