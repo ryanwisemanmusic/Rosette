@@ -55,7 +55,7 @@ fn installApp(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8,
     };
 
     std.debug.print("Installing Rosette global shell integration...\n", .{});
-    std.debug.print("  installing ~/.rosette/bin/rosette and rosette-shell\n", .{});
+    std.debug.print("  installing ~/.rosette/bin/rosette, rosette-shell, and rosette-clean-state\n", .{});
     std.debug.print("  installing ~/.rosette/bin/elf_processor for make run and ./program\n", .{});
     std.debug.print("  installing ~/.rosette/bin/rosette-router for traced Rosetta 2 fallback routing\n", .{});
     std.debug.print("  installing default ~/.rosette/config.toml with dump_results=\"auto\"\n", .{});

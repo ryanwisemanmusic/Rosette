@@ -425,7 +425,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     } else if (value < 50.0) {
         message = @"Registering Finder Open With support for Rosette...";
     } else if (value < 66.0) {
-        message = @"Installing global shell command: rosette and rosette-shell...";
+        message = @"Installing global shell commands and cleanup backend...";
     } else if (value < 80.0) {
         message = @"Installing elf_processor, rosette-router, and assembler helpers...";
     } else {

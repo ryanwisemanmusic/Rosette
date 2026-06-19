@@ -60,6 +60,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const entrypoint_kernel_process_guard_module = b.createModule(.{
+        .root_source_file = b.path("../../src/entrypoint/kernel/process_guard.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const runtime_abi_module = b.createModule(.{
         .root_source_file = b.path("../../src/tooling/runtime-abi-handshake/runtime.zig"),
         .target = target,
@@ -140,6 +146,7 @@ pub fn build(b: *std.Build) void {
     exe_runner_mod.addImport("runtime_abi_handshake", runtime_abi_module);
     exe_runner_mod.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     exe_runner_mod.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
+    exe_runner_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
     exe_runner_mod.addImport("isa_registry", isa_module);
     exe_runner_mod.addImport("bridge_register_tracing", bridge_register_trace_module);
     exe_runner_mod.addImport("bridge_memory", bridge_memory_module);
@@ -152,6 +159,7 @@ pub fn build(b: *std.Build) void {
     exe_runner_cli_mod.addImport("runtime_abi_handshake", runtime_abi_module);
     exe_runner_cli_mod.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     exe_runner_cli_mod.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
+    exe_runner_cli_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
     exe_runner_cli_mod.addImport("isa_registry", isa_module);
     exe_runner_cli_mod.addImport("bridge_register_tracing", bridge_register_trace_module);
     exe_runner_cli_mod.addImport("bridge_memory", bridge_memory_module);
@@ -179,6 +187,7 @@ pub fn build(b: *std.Build) void {
         .name = "rosette-shell",
         .root_module = shell_helper_mod,
     });
+    shell_helper_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
     b.installArtifact(shell_helper);
 
     const assembler_runner_mod = b.createModule(.{
@@ -204,6 +213,7 @@ pub fn build(b: *std.Build) void {
         .name = "rosette-router",
         .root_module = compat_router_mod,
     });
+    compat_router_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
     b.installArtifact(compat_router);
 
     // Add WinForms native Cocoa bridge to the exe runner module
