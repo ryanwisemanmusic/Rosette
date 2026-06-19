@@ -1,10 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const process_guard = @import("entrypoint_kernel_process_guard");
 
 const c = @cImport({
+    @cInclude("errno.h");
+    @cInclude("libproc.h");
+    @cInclude("signal.h");
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
+    @cInclude("string.h");
     @cInclude("sys/stat.h");
+    @cInclude("sys/sysctl.h");
     @cInclude("unistd.h");
 });
 
@@ -169,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, args[1], "clean-state")) {
-        try cleanState(init.io, allocator);
+        try cleanState(init, allocator, args[2..]);
         return;
     }
     if (std.mem.eql(u8, args[1], "route-arch")) {
@@ -218,7 +224,7 @@ fn usage(exe_name: []const u8) void {
         \\  {s} diagnose [project-directory] [program]
         \\  {s} prepare-make <project-directory> <env-file> [make-args...]
         \\  {s} finish-make <project-directory> <status> [make-args...]
-        \\  {s} clean-state
+        \\  rosette-clean-state [--scan|--dry-run] [--no-xenia|--xenia]
         \\  {s} route-arch <arch-args...>
         \\  {s} route run [options] <target|Application.app> [-- target-args...]
         \\  {s} run-elf <x86-64-elf-path> [args...]
@@ -238,7 +244,7 @@ fn usage(exe_name: []const u8) void {
         \\  abort_on_fallback = false
         \\  abort_on_unsupported = false
         \\
-    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
@@ -249,6 +255,8 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     const wrapper_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "wrappers" });
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
+    const arch_wrapper_path = try std.fs.path.join(allocator, &.{ bin_dir, "arch" });
+    const clean_state_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
     const bash_env_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
@@ -259,6 +267,8 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     try makePathRecursive(allocator, lib_dir);
     try copySelf(init, allocator, helper_path);
     try copySelf(init, allocator, rosette_path);
+    try ensureArchWrapper(allocator, arch_wrapper_path, helper_path);
+    try ensureCleanStateBackend(allocator, clean_state_path);
     try ensureWrappers(allocator, wrapper_dir, helper_path);
     try ensureConfigFile(init.io, allocator, toml_path);
 
@@ -295,6 +305,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     std.debug.print("Rosette shell integration installed.\n", .{});
     std.debug.print("source: {s}\n", .{shell_path});
     std.debug.print("command: {s}\n", .{rosette_path});
+    std.debug.print("clean_state: {s}\n", .{clean_state_path});
     if (fileExists(allocator, elf_processor_path)) {
         std.debug.print("elf_processor: {s}\n", .{elf_processor_path});
     } else {
@@ -319,6 +330,8 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const bash_env_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" });
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
+    const arch_wrapper_path = try std.fs.path.join(allocator, &.{ bin_dir, "arch" });
+    const clean_state_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" });
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
     const source_root = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
@@ -333,6 +346,8 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     try unlinkIfExists(allocator, toml_path);
     try unlinkIfExists(allocator, elf_processor_path);
     try unlinkIfExists(allocator, compat_router_path);
+    try unlinkIfExists(allocator, arch_wrapper_path);
+    try unlinkIfExists(allocator, clean_state_path);
     try unlinkIfExists(allocator, dyld_lib_path);
     try removeWrappers(allocator, wrapper_dir);
     try unlinkIfExists(allocator, helper_path);
@@ -694,36 +709,310 @@ fn isShellCommandMode(arg: []const u8) bool {
     return arg.len >= 2 and arg[0] == '-' and std.mem.indexOfScalar(u8, arg[1..], 'c') != null;
 }
 
-fn cleanState(io: std.Io, allocator: std.mem.Allocator) !void {
-    const pkill = resolveOnPath(allocator, "pkill") orelse "/usr/bin/pkill";
-    const patterns = [_][]const u8{
-        "rosette-shell recipe-shell",
-        "rosette-shell -c",
-        "rosette-shell -ec",
-        "rosette-shell tool",
-        "rosette-router",
-        "elf_processor",
-        "rosette_assembler_runner",
-        "/usr/local/bin/rose",
-    };
+const CleanOptions = struct {
+    dry_run: bool = false,
+    include_xenia: bool = true,
+};
 
-    var killed: usize = 0;
-    for (patterns) |pattern| {
-        const code = runArgvResult(io, &[_][]const u8{ pkill, "-KILL", "-f", pattern }) catch |err| {
-            std.debug.print("rosette-shell: clean-state failed for pattern '{s}': {s}\n", .{ pattern, @errorName(err) });
-            continue;
-        };
-        if (code == 0) {
-            killed += 1;
-            std.debug.print("rosette-shell: clean-state signaled pattern '{s}'\n", .{pattern});
-        } else if (code != 1) {
-            std.debug.print("rosette-shell: clean-state pkill status {d} for pattern '{s}'\n", .{ code, pattern });
+const ProcessInfo = struct {
+    pid: i32,
+    ppid: i32,
+    stat: []const u8,
+    command: []const u8,
+};
+
+const CleanupCandidate = struct {
+    process: ProcessInfo,
+    reason: []const u8,
+};
+
+fn cleanState(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const backend = resolveCleanStateBackend(init, allocator) catch |err| {
+        std.debug.print(
+            "rosette-shell: clean-state backend is not installed ({s}); run `make shell-update`.\n",
+            .{@errorName(err)},
+        );
+        std.process.exit(127);
+    };
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, backend);
+    for (args) |arg| try argv.append(allocator, arg);
+    execArgvReplace(allocator, argv.items) catch |err| {
+        std.debug.print("rosette-shell: failed to exec clean-state backend: {s}\n", .{@errorName(err)});
+        std.process.exit(127);
+    };
+}
+
+fn resolveCleanStateBackend(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (getenvSlice("ROSETTE_CLEAN_STATE")) |path| {
+        if (canExecute(allocator, path)) return try allocator.dupe(u8, path);
+    }
+
+    const helper_path = currentHelperPath(init, allocator) catch "";
+    if (helper_path.len != 0) {
+        if (std.fs.path.dirname(helper_path)) |helper_dir| {
+            const sibling = try std.fs.path.join(allocator, &.{ helper_dir, "rosette-clean-state" });
+            if (canExecute(allocator, sibling)) return sibling;
         }
     }
 
-    if (killed == 0) {
-        std.debug.print("rosette-shell: clean-state found no matching live helpers\n", .{});
+    if (getenvSlice("HOME")) |home| {
+        const installed = try std.fs.path.join(allocator, &.{ home, ".rosette", "bin", "rosette-clean-state" });
+        if (canExecute(allocator, installed)) return installed;
     }
+
+    return error.CleanStateBackendMissing;
+}
+
+fn parseCleanOptions(args: []const []const u8) !CleanOptions {
+    var options = CleanOptions{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--dry-run") or std.mem.eql(u8, arg, "--scan")) {
+            options.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--no-xenia")) {
+            options.include_xenia = false;
+        } else if (std.mem.eql(u8, arg, "--xenia")) {
+            options.include_xenia = true;
+        } else {
+            std.debug.print("rosette-shell: unknown clean-state option: {s}\n", .{arg});
+            return error.InvalidCleanStateOption;
+        }
+    }
+    return options;
+}
+
+fn collectCleanupCandidates(allocator: std.mem.Allocator, options: CleanOptions) ![]CleanupCandidate {
+    const processes = try readProcessSnapshot(allocator);
+    var candidates: std.ArrayList(CleanupCandidate) = .empty;
+    errdefer candidates.deinit(allocator);
+
+    const self_pid: i32 = @intCast(c.getpid());
+    const parent_pid: i32 = @intCast(c.getppid());
+    for (processes) |process| {
+        if (process.pid <= 1) continue;
+        if (process.pid == self_pid or process.pid == parent_pid) continue;
+        if (process.ppid == self_pid) continue;
+        if (cleanupReason(process.command, options)) |reason| {
+            try candidates.append(allocator, .{
+                .process = process,
+                .reason = reason,
+            });
+        }
+    }
+    return try candidates.toOwnedSlice(allocator);
+}
+
+fn cleanupReason(command: []const u8, options: CleanOptions) ?[]const u8 {
+    if (containsIgnoreCase(command, " rosette-shell clean-state")) return null;
+    if (containsIgnoreCase(command, "/rosette-shell clean-state")) return null;
+    if (containsIgnoreCase(command, "rosette-shell route-arch")) return "Rosette arch handoff";
+    if (containsIgnoreCase(command, "rosette-shell detect")) return "Rosette project detector";
+    if (containsIgnoreCase(command, "rosette-shell recipe-shell")) return "Rosette make recipe shell";
+    if (containsIgnoreCase(command, "rosette-shell tool")) return "Rosette compiler/tool wrapper";
+    if (containsIgnoreCase(command, "rosette-router")) return "Rosette compatibility router";
+    if (containsIgnoreCase(command, "elf_processor")) return "Rosette ELF processor";
+    if (containsIgnoreCase(command, "rosette_assembler_runner")) return "Rosette assembler ABI runner";
+    if (containsIgnoreCase(command, "rosette_exe_runner")) return "Rosette EXE runner";
+    if (containsIgnoreCase(command, "rosette_mscoree_window_helper")) return "Rosette managed window helper";
+    if (containsIgnoreCase(command, "/usr/local/bin/rose")) return "legacy Rosette launcher";
+    if (containsIgnoreCase(command, "xenia-rosetta.")) return "Rosette Xenia handoff script";
+    if (options.include_xenia and containsIgnoreCase(command, "xenia_canary.app/contents/macos/xenia_canary")) return "Rosette-launched Xenia Canary";
+    return null;
+}
+
+fn readProcessSnapshot(allocator: std.mem.Allocator) ![]ProcessInfo {
+    if (comptime builtin.target.os.tag == .macos) {
+        return try readDarwinProcessSnapshot(allocator);
+    }
+    return error.ProcessSnapshotUnsupported;
+}
+
+fn readDarwinProcessSnapshot(allocator: std.mem.Allocator) ![]ProcessInfo {
+    var pid_capacity: usize = 4096;
+    while (pid_capacity <= 65536) : (pid_capacity *= 2) {
+        const pids = try allocator.alloc(c_int, pid_capacity);
+        const bytes = c.proc_listallpids(pids.ptr, @as(c_int, @intCast(pids.len * @sizeOf(c_int))));
+        if (bytes < 0) return error.ProcessSnapshotFailed;
+        const count: usize = @intCast(@divTrunc(bytes, @as(c_int, @intCast(@sizeOf(c_int)))));
+        if (count < pids.len) {
+            return try buildDarwinProcessSnapshot(allocator, pids[0..count]);
+        }
+    }
+    return error.ProcessSnapshotTooLarge;
+}
+
+fn buildDarwinProcessSnapshot(allocator: std.mem.Allocator, pids: []const c_int) ![]ProcessInfo {
+    var processes: std.ArrayList(ProcessInfo) = .empty;
+    errdefer processes.deinit(allocator);
+    for (pids) |pid| {
+        if (pid <= 0) continue;
+        if (readDarwinProcessInfo(allocator, pid)) |process| {
+            try processes.append(allocator, process);
+        } else |_| {}
+    }
+    return try processes.toOwnedSlice(allocator);
+}
+
+fn readDarwinProcessInfo(allocator: std.mem.Allocator, pid: c_int) !ProcessInfo {
+    var path_buffer: [c.PROC_PIDPATHINFO_MAXSIZE]u8 = undefined;
+    @memset(&path_buffer, 0);
+    const path_len = c.proc_pidpath(pid, &path_buffer, path_buffer.len);
+    const path = if (path_len > 0)
+        std.mem.sliceTo(path_buffer[0..@as(usize, @intCast(path_len))], 0)
+    else
+        "";
+
+    const command = try readDarwinProcessCommand(allocator, pid, path);
+    if (command.len == 0) return error.InvalidProcessLine;
+
+    return .{
+        .pid = @intCast(pid),
+        .ppid = try readDarwinParentPid(pid),
+        .stat = try allocator.dupe(u8, "unknown"),
+        .command = command,
+    };
+}
+
+fn readDarwinProcessCommand(allocator: std.mem.Allocator, pid: c_int, path: []const u8) ![]const u8 {
+    var mib = [_]c_int{ c.CTL_KERN, c.KERN_PROCARGS2, pid };
+    var buffer = try allocator.alloc(u8, 128 * 1024);
+    var size: usize = buffer.len;
+    if (c.sysctl(&mib, mib.len, buffer.ptr, &size, null, 0) != 0) {
+        if (path.len != 0) return try allocator.dupe(u8, path);
+        return error.InvalidProcessLine;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (path.len != 0) try out.appendSlice(allocator, path);
+
+    const bytes = buffer[0..size];
+    var index: usize = @sizeOf(c_int);
+    var strings_seen: usize = 0;
+    while (index < bytes.len and strings_seen < 64 and out.items.len < 64 * 1024) {
+        while (index < bytes.len and bytes[index] == 0) : (index += 1) {}
+        const start = index;
+        while (index < bytes.len and bytes[index] != 0) : (index += 1) {}
+        if (index <= start) continue;
+        const value = bytes[start..index];
+        strings_seen += 1;
+        if (value.len == 0) continue;
+        if (path.len != 0 and std.mem.eql(u8, value, path)) continue;
+        if (out.items.len != 0) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, value);
+    }
+
+    return out.items;
+}
+
+fn readDarwinParentPid(pid: c_int) !i32 {
+    var mib = [_]c_int{ c.CTL_KERN, c.KERN_PROC, c.KERN_PROC_PID, pid };
+    var info: c.struct_kinfo_proc = undefined;
+    var size: usize = @sizeOf(c.struct_kinfo_proc);
+    if (c.sysctl(&mib, mib.len, &info, &size, null, 0) != 0 or size < @sizeOf(c.struct_kinfo_proc)) {
+        return 0;
+    }
+    return @intCast(info.kp_eproc.e_ppid);
+}
+
+fn parseProcessLine(allocator: std.mem.Allocator, raw_line: []const u8) !ProcessInfo {
+    var line = std.mem.trim(u8, raw_line, " \t\r\n");
+    if (line.len == 0) return error.InvalidProcessLine;
+    const pid_text = takeField(&line) orelse return error.InvalidProcessLine;
+    const ppid_text = takeField(&line) orelse return error.InvalidProcessLine;
+    const stat_text = takeField(&line) orelse return error.InvalidProcessLine;
+    const command = std.mem.trim(u8, line, " \t\r\n");
+    if (command.len == 0) return error.InvalidProcessLine;
+    return .{
+        .pid = try std.fmt.parseInt(i32, pid_text, 10),
+        .ppid = try std.fmt.parseInt(i32, ppid_text, 10),
+        .stat = try allocator.dupe(u8, stat_text),
+        .command = try allocator.dupe(u8, command),
+    };
+}
+
+fn takeField(line: *[]const u8) ?[]const u8 {
+    line.* = trimLeftSpaces(line.*);
+    if (line.*.len == 0) return null;
+    var end: usize = 0;
+    while (end < line.*.len and line.*[end] != ' ' and line.*[end] != '\t') : (end += 1) {}
+    const field = line.*[0..end];
+    line.* = line.*[end..];
+    return field;
+}
+
+fn trimLeftSpaces(line: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
+    return line[start..];
+}
+
+fn signalCleanupCandidate(candidate: CleanupCandidate, sig: c_int) void {
+    const rc = c.kill(candidate.process.pid, sig);
+    if (rc == 0) {
+        std.debug.print(
+            "rosette-shell: sent {s} to pid={d} reason={s}\n",
+            .{ signalName(sig), candidate.process.pid, candidate.reason },
+        );
+    } else {
+        const err_name = errnoName(currentErrno());
+        std.debug.print(
+            "rosette-shell: failed {s} pid={d} reason={s}: {s}\n",
+            .{ signalName(sig), candidate.process.pid, candidate.reason, err_name },
+        );
+    }
+}
+
+fn printCleanupCandidate(prefix: []const u8, candidate: CleanupCandidate) void {
+    std.debug.print(
+        "{s}: pid={d} ppid={d} stat={s} reason={s}\n  command: {s}\n",
+        .{
+            prefix,
+            candidate.process.pid,
+            candidate.process.ppid,
+            candidate.process.stat,
+            candidate.reason,
+            candidate.process.command,
+        },
+    );
+}
+
+fn samePidInCandidates(pid: i32, candidates: []const CleanupCandidate) bool {
+    for (candidates) |candidate| {
+        if (candidate.process.pid == pid) return true;
+    }
+    return false;
+}
+
+fn isKernelHeldStatus(stat: []const u8) bool {
+    return std.mem.indexOfScalar(u8, stat, 'U') != null or
+        std.mem.indexOfScalar(u8, stat, 'E') != null;
+}
+
+fn signalName(sig: c_int) []const u8 {
+    if (sig == c.SIGTERM) return "SIGTERM";
+    if (sig == c.SIGKILL) return "SIGKILL";
+    return "signal";
+}
+
+fn errnoName(err: c_int) []const u8 {
+    return switch (err) {
+        c.ESRCH => "process not found",
+        c.EPERM => "permission denied",
+        c.EINVAL => "invalid signal",
+        else => "unknown errno",
+    };
+}
+
+fn currentErrno() c_int {
+    if (@hasDecl(c, "__error")) return c.__error().*;
+    if (@hasDecl(c, "__errno_location")) return c.__errno_location().*;
+    return 0;
+}
+
+fn sleepMillis(ms: u32) void {
+    _ = c.usleep(@as(c_uint, ms) * 1000);
 }
 
 fn diagnoseShell(init: std.process.Init, allocator: std.mem.Allocator, project_dir_raw: []const u8, target_raw: ?[]const u8) !void {
@@ -1403,6 +1692,25 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\  fi
         \\  return "$__rosette_status"
         \\}
+        \\__rosette_should_probe_direct_elf() {
+        \\  emulate -L zsh
+        \\  local __rosette_makefile
+        \\  local -a __rosette_asm_files
+        \\  if [ -f Makefile ]; then
+        \\    __rosette_makefile=Makefile
+        \\  elif [ -f makefile ]; then
+        \\    __rosette_makefile=makefile
+        \\  else
+        \\    return 1
+        \\  fi
+        \\  __rosette_asm_files=( ./*.asm(N[1,1]) )
+        \\  if (( ${#__rosette_asm_files[@]} == 0 )); then
+        \\    return 1
+        \\  fi
+        \\  command grep -Eiq "yasm" "$__rosette_makefile" 2>/dev/null || return 1
+        \\  command grep -Eiq "elf64" "$__rosette_makefile" 2>/dev/null || return 1
+        \\  return 0
+        \\}
         \\__rosette_refresh_elf_commands() {
         \\  emulate -L zsh
         \\  local __rosette_cmd __rosette_path __rosette_proc __rosette_count=0
@@ -1417,6 +1725,10 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\  __rosette_proc="${ROSETTE_ELF_PROCESSOR:-$HOME/.rosette/bin/elf_processor}"
         \\  if [ ! -x "$__rosette_proc" ]; then
         \\    [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: elf_processor missing/not executable: $__rosette_proc" >&2
+        \\    return 0
+        \\  fi
+        \\  if ! __rosette_should_probe_direct_elf; then
+        \\    [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: direct ELF launch skipped by cheap prefilter in $PWD" >&2
         \\    return 0
         \\  fi
         \\  if ! "$ROSETTE_SHELL_HELPER" detect "$PWD" >/dev/null 2>&1; then
@@ -1873,6 +2185,158 @@ fn ensureWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8, helper_
     try chmodPath(allocator, elf_processor_wrapper, 0o755);
 }
 
+fn ensureArchWrapper(allocator: std.mem.Allocator, arch_wrapper_path: []const u8, helper_path: []const u8) !void {
+    const script = try buildArchWrapperScript(allocator, helper_path);
+    try writeFilePath(allocator, arch_wrapper_path, script);
+    try chmodPath(allocator, arch_wrapper_path, 0o755);
+}
+
+fn buildArchWrapperScript(allocator: std.mem.Allocator, helper_path: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\# Generated by Rosette. Route x86_64 arch handoffs before Apple Rosetta 2.
+        \\ROSETTE_SHELL_HELPER={s}
+        \\if [ -z "${{ROSETTE_SCRIPT_HANDOFF_ACTIVE:-}}" ] && [ -z "${{ROSETTE_SHELL_DISABLE:-}}" ] && [ -x "$ROSETTE_SHELL_HELPER" ]; then
+        \\  case "${{1:-}}" in
+        \\    -x86_64)
+        \\      exec "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\      ;;
+        \\    -arch)
+        \\      if [ "${{2:-}}" = "x86_64" ]; then
+        \\        exec "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\      fi
+        \\      ;;
+        \\  esac
+        \\fi
+        \\exec /usr/bin/arch "$@"
+        \\
+    , .{try shellSingleQuoted(allocator, helper_path)});
+}
+
+fn ensureCleanStateBackend(allocator: std.mem.Allocator, clean_state_path: []const u8) !void {
+    try writeFilePath(allocator, clean_state_path, clean_state_backend_script);
+    try chmodPath(allocator, clean_state_path, 0o755);
+}
+
+const clean_state_backend_script =
+    \\#!/bin/sh
+    \\# Generated by Rosette. Targeted cleanup for Rosette/Xenia helper hangs.
+    \\set +e
+    \\
+    \\dry_run=0
+    \\include_xenia=1
+    \\for arg in "$@"; do
+    \\  case "$arg" in
+    \\    --scan|--dry-run) dry_run=1 ;;
+    \\    --no-xenia) include_xenia=0 ;;
+    \\    --xenia) include_xenia=1 ;;
+    \\    *)
+    \\      echo "rosette-clean-state: unknown option: $arg" >&2
+    \\      exit 2
+    \\      ;;
+    \\  esac
+    \\done
+    \\
+    \\tmp="${TMPDIR:-/tmp}/rosette-clean-state.$$"
+    \\trap 'rm -f "$tmp.ps" "$tmp.candidates"' EXIT INT TERM
+    \\
+    \\if ! /bin/ps -axo pid=,ppid=,stat=,command= > "$tmp.ps" 2>/dev/null; then
+    \\  echo "rosette-clean-state: failed to read process list" >&2
+    \\  exit 1
+    \\fi
+    \\
+    \\/usr/bin/awk -v self="$$" -v parent="$PPID" -v include_xenia="$include_xenia" '
+    \\function lower(s) { return tolower(s) }
+    \\{
+    \\  pid=$1; ppid=$2; stat=$3
+    \\  cmd=$0
+    \\  sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", cmd)
+    \\  lc=lower(cmd)
+    \\  reason=""
+    \\  if (pid <= 1 || pid == self || pid == parent || ppid == self) next
+    \\  if (index(lc, "rosette-clean-state") > 0) next
+    \\  if (index(lc, "rosette-shell route-arch") > 0) reason="Rosette arch handoff"
+    \\  else if (index(lc, "rosette-shell detect") > 0) reason="Rosette project detector"
+    \\  else if (index(lc, "rosette-shell clean-state") > 0) reason="stuck Rosette cleanup helper"
+    \\  else if (index(lc, "rosette-shell recipe-shell") > 0) reason="Rosette make recipe shell"
+    \\  else if (index(lc, "rosette-shell tool") > 0) reason="Rosette compiler/tool wrapper"
+    \\  else if (index(lc, "rosette-router") > 0) reason="Rosette compatibility router"
+    \\  else if (index(lc, "elf_processor") > 0) reason="Rosette ELF processor"
+    \\  else if (index(lc, "rosette_assembler_runner") > 0) reason="Rosette assembler ABI runner"
+    \\  else if (index(lc, "rosette_exe_runner") > 0) reason="Rosette EXE runner"
+    \\  else if (index(lc, "rosette_mscoree_window_helper") > 0) reason="Rosette managed window helper"
+    \\  else if (index(lc, "/usr/local/bin/rose") > 0) reason="legacy Rosette launcher"
+    \\  else if (index(lc, "xenia-rosetta.") > 0) reason="Rosette Xenia handoff script"
+    \\  else if (include_xenia == 1 && index(lc, "xenia_canary.app/contents/macos/xenia_canary") > 0) reason="Rosette-launched Xenia Canary"
+    \\  if (reason != "") {
+    \\    gsub(/\t/, " ", cmd)
+    \\    printf "%s\t%s\t%s\t%s\t%s\n", pid, ppid, stat, reason, cmd
+    \\  }
+    \\}
+    \\' "$tmp.ps" > "$tmp.candidates"
+    \\
+    \\count="$(/usr/bin/wc -l < "$tmp.candidates" | /usr/bin/tr -d ' ')"
+    \\if [ "$count" = "0" ]; then
+    \\  echo "rosette-clean-state: no matching live Rosette helpers"
+    \\  exit 0
+    \\fi
+    \\
+    \\echo "rosette-clean-state: found $count candidate process(es)"
+    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
+    \\  [ -n "$pid" ] || continue
+    \\  echo "candidate: pid=$pid ppid=$ppid stat=$stat reason=$reason"
+    \\  echo "  command: $cmd"
+    \\done < "$tmp.candidates"
+    \\
+    \\if [ "$dry_run" = "1" ]; then
+    \\  echo "rosette-clean-state: dry-run only; no signals sent"
+    \\  exit 0
+    \\fi
+    \\
+    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
+    \\  [ -n "$pid" ] || continue
+    \\  if /bin/kill -TERM "$pid" 2>/dev/null; then
+    \\    echo "rosette-clean-state: sent SIGTERM to pid=$pid reason=$reason"
+    \\  else
+    \\    echo "rosette-clean-state: SIGTERM failed for pid=$pid reason=$reason" >&2
+    \\  fi
+    \\done < "$tmp.candidates"
+    \\
+    \\/bin/sleep 0.25
+    \\
+    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
+    \\  [ -n "$pid" ] || continue
+    \\  if /bin/kill -0 "$pid" 2>/dev/null; then
+    \\    if /bin/kill -KILL "$pid" 2>/dev/null; then
+    \\      echo "rosette-clean-state: sent SIGKILL to pid=$pid reason=$reason"
+    \\    else
+    \\      echo "rosette-clean-state: SIGKILL failed for pid=$pid reason=$reason" >&2
+    \\    fi
+    \\  fi
+    \\done < "$tmp.candidates"
+    \\
+    \\/bin/sleep 0.25
+    \\survivors=0
+    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
+    \\  [ -n "$pid" ] || continue
+    \\  if /bin/kill -0 "$pid" 2>/dev/null; then
+    \\    survivors=$((survivors + 1))
+    \\    echo "survivor: pid=$pid ppid=$ppid stat=$stat reason=$reason"
+    \\    echo "  command: $cmd"
+    \\    case "$stat" in
+    \\      *U*|*E*) echo "  note: kernel-held state '$stat'; macOS may keep this until the kernel releases it or the machine reboots." ;;
+    \\    esac
+    \\  fi
+    \\done < "$tmp.candidates"
+    \\
+    \\if [ "$survivors" -eq 0 ]; then
+    \\  echo "rosette-clean-state: completed; no signaled candidates remain"
+    \\else
+    \\  echo "rosette-clean-state: signaled candidates, but $survivors survivor(s) remain"
+    \\fi
+    \\
+;
+
 fn removeWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8) !void {
     const tools = [_][]const u8{ "yasm", "ld", "g++", "c++", "gcc", "cc", "clang", "clang++" };
     for (tools) |tool| {
@@ -1926,7 +2390,8 @@ fn printConfig(io: std.Io, allocator: std.mem.Allocator) !void {
     std.debug.print("  [graphics] enabled = {s}\n", .{if (config.graphics_enabled) "true" else "false"});
     std.debug.print("\nUseful commands:\n", .{});
     std.debug.print("  rosette config-path\n", .{});
-    std.debug.print("  rosette clean-state\n", .{});
+    std.debug.print("  rosette-clean-state --scan\n", .{});
+    std.debug.print("  rosette-clean-state\n", .{});
     std.debug.print("  make run or ./program    # auto-dumps assignment results when configured\n", .{});
 }
 
@@ -2507,25 +2972,42 @@ fn execArgv(io: std.Io, argv: []const []const u8) !void {
     std.process.exit(code);
 }
 
+fn execArgvReplace(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    if (argv.len == 0) return error.EmptyArgv;
+
+    var argv_z: std.ArrayList(?[*:0]const u8) = .empty;
+    defer argv_z.deinit(allocator);
+
+    const path_z = try allocator.dupeZ(u8, argv[0]);
+    try argv_z.append(allocator, path_z.ptr);
+    for (argv[1..]) |arg| {
+        const arg_z = try allocator.dupeZ(u8, arg);
+        try argv_z.append(allocator, arg_z.ptr);
+    }
+    try argv_z.append(allocator, null);
+
+    _ = std.c.execve(path_z.ptr, @ptrCast(argv_z.items.ptr), @ptrCast(std.c.environ));
+    std.debug.print("rosette-shell: failed to exec {s}\n", .{argv[0]});
+    std.process.exit(127);
+}
+
 fn runArgvResult(io: std.Io, argv: []const []const u8) !u8 {
-    var child = std.process.spawn(io, .{
+    return process_guard.runExitCode(io, .{
         .argv = argv,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
+        .label = "rosette-shell",
+        .timeout_ms = process_guard.timeoutFromEnv(null),
+        .isolate_process_group = false,
+        .signal_policy = .child_only,
     }) catch |err| {
-        std.debug.print("rosette-shell: failed to spawn {s}: {s}\n", .{ argv[0], @errorName(err) });
+        if (argv.len > 0) {
+            std.debug.print("rosette-shell: guarded spawn failed for {s}: {s}\n", .{ argv[0], @errorName(err) });
+        } else {
+            std.debug.print("rosette-shell: guarded spawn failed: {s}\n", .{@errorName(err)});
+        }
         std.process.exit(127);
-    };
-    const term = child.wait(io) catch |err| {
-        std.debug.print("rosette-shell: failed waiting for {s}: {s}\n", .{ argv[0], @errorName(err) });
-        std.process.exit(127);
-    };
-    return switch (term) {
-        .exited => |code| code,
-        .signal => |sig| 128 + @as(u8, @intCast(@intFromEnum(sig))),
-        .stopped => 128,
-        .unknown => 1,
     };
 }
 
@@ -2574,6 +3056,13 @@ fn appendShellQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, valu
         }
     }
     try out.append(allocator, '\'');
+}
+
+fn shellSingleQuoted(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendShellQuoted(&out, allocator, value);
+    return out.items;
 }
 
 fn appendArgs(out: *std.ArrayList(u8), allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -2954,6 +3443,7 @@ test "shell snippet includes zsh direct ELF launcher" {
     try std.testing.expect(containsIgnoreCase(snippet, "run-elf"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_refresh_elf_commands"));
     try std.testing.expect(containsIgnoreCase(snippet, "detect \"$PWD\""));
+    try std.testing.expect(containsIgnoreCase(snippet, "__rosette_should_probe_direct_elf"));
     try std.testing.expect(containsIgnoreCase(snippet, "functions[$__rosette_cmd]"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_ENABLE_DYLD_INTERPOSE:-0"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_strip_dyld_interposer"));
@@ -2992,6 +3482,43 @@ test "bash env snippet routes x86 arch only" {
     try std.testing.expect(containsIgnoreCase(snippet, "-arch"));
     try std.testing.expect(containsIgnoreCase(snippet, "command /usr/bin/arch"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_USER_BASH_ENV"));
+}
+
+test "arch wrapper routes x86 handoffs through shell helper" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const script = try buildArchWrapperScript(arena.allocator(), "/tmp/rosette path/bin/rosette-shell");
+    try std.testing.expect(containsIgnoreCase(script, "route-arch"));
+    try std.testing.expect(containsIgnoreCase(script, "-x86_64"));
+    try std.testing.expect(containsIgnoreCase(script, "-arch"));
+    try std.testing.expect(containsIgnoreCase(script, "exec /usr/bin/arch"));
+    try std.testing.expect(containsIgnoreCase(script, "ROSETTE_SCRIPT_HANDOFF_ACTIVE"));
+    try std.testing.expect(containsIgnoreCase(script, "ROSETTE_SHELL_HELPER='/tmp/rosette path/bin/rosette-shell'"));
+}
+
+test "clean-state parser reads ps output lines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const process = try parseProcessLine(
+        arena.allocator(),
+        " 77587     1 UE   /Users/test/.rosette/bin/rosette-shell route-arch -x86_64 /bin/bash /tmp/xenia-rosetta.ABC\n",
+    );
+    try std.testing.expectEqual(@as(i32, 77587), process.pid);
+    try std.testing.expectEqual(@as(i32, 1), process.ppid);
+    try std.testing.expectEqualStrings("UE", process.stat);
+    try std.testing.expect(containsIgnoreCase(process.command, "rosette-shell route-arch"));
+    try std.testing.expect(isKernelHeldStatus(process.stat));
+}
+
+test "clean-state matcher can include or exclude Xenia launches" {
+    const command = "./xenia_canary.app/Contents/MacOS/xenia_canary --gpu=vulkan";
+    try std.testing.expect(cleanupReason(command, .{ .include_xenia = true }) != null);
+    try std.testing.expect(cleanupReason(command, .{ .include_xenia = false }) == null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell detect /repo", .{}) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell clean-state", .{}) == null);
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-shell route-arch"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "xenia_canary.app/contents/macos/xenia_canary"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "--no-xenia"));
 }
 
 test "assembly global parser handles lists and bracket directives" {
