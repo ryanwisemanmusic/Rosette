@@ -1,22 +1,22 @@
-// CACHE/CLFLUSH.inc
-// Source contract: CLFLUSH — cache_control.
+// CACHE/CLWB.inc
+// Source contract: CLWB — cache_control.
 
 source_isa = "x86"
 target_isa = "arm64_neon"
-x86_table = "CACHE/CLFLUSH.inc"
-x86_handler = "x86_clflush"
-neon_lowering = "arm64_clflush"
+x86_table = "CACHE/CLWB.inc"
+x86_handler = "x86_clwb"
+neon_lowering = "arm64_clwb"
 lowering_kind = "arm64_documented_contract"
 
-name = "CLFLUSH"
+name = "CLWB"
 aliases = []
 category = "cache_control"
-feature = "clflush"
+feature = "clwb"
 element_type = "none"
 element_size = 0
 
 encodings = [
-  { opcode = "NP 0F AE /7", form = "CLFLUSH m8", op_en = "M", feature = "clflush", vector_length = 0, encoding = "legacy" }
+  { opcode = "66 0F AE /6", form = "CLWB m8", op_en = "M", feature = "clwb", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encoding = {
@@ -26,23 +26,23 @@ operand_encoding = {
 simd_fp_exceptions = []
 
 semantic_general = """
-Flush Cache Line.
+Cache Line Write Back.
 """
 
-handler = "x86_clflush"
-jit_lowering = "arm64_clflush"
-fallback = "zig_clflush"
+handler = "x86_clwb"
+jit_lowering = "arm64_clwb"
+fallback = "zig_clwb"
 
 neon_register_model = """
-CLFLUSH is a cache_control instruction.
+CLWB is a cache_control instruction.
 """
 
 neon_flag_model = """
-CLFLUSH does not modify flags.
+CLWB does not modify flags.
 """
 
 neon_assembly = """
-// NEON lowering: CLFLUSH stub (cache_control)
+// NEON lowering: CLWB stub (cache_control)
 """
 
 neon_notes = [

@@ -1,18 +1,18 @@
-// CACHE/CLDEMOTE.inc
-// ARM64/NEON mirror generated from ISA/x86/CACHE/CLDEMOTE.inc.
-// Source contract: CLDEMOTE — cache_control.
+// SCAN/SCASW.inc
+// ARM64/NEON mirror generated from ISA/x86/SCAN/SCASW.inc.
+// Source contract: SCASW — string_op.
 
 source_isa = "x86"
 target_isa = "arm64_neon"
-x86_table = "CACHE/CLDEMOTE.inc"
-x86_handler = "x86_cldemote"
-neon_lowering = "arm64_cldemote"
+x86_table = "SCAN/SCASW.inc"
+x86_handler = "x86_scasw"
+neon_lowering = "arm64_scasw"
 lowering_kind = "arm64_documented_contract"
 
-name = "CLDEMOTE"
+name = "SCASW"
 aliases = []
-category = "cache_control"
-feature = "cldemote"
+category = "string_op"
+feature = "general"
 element_type = "none"
 element_size = 0
 
@@ -26,23 +26,23 @@ operand_encoding = {
 simd_fp_exceptions = []
 
 semantic_general = """
-Cache Line Demote.
+Scan String Word.
 """
 
-handler = "x86_cldemote"
-jit_lowering = "arm64_cldemote"
-fallback = "zig_cldemote"
+handler = "x86_scasw"
+jit_lowering = "arm64_scasw"
+fallback = "zig_scasw"
 
 neon_register_model = """
-CLDEMOTE is a cache_control instruction.
+SCASW is a string_op instruction.
 """
 
 neon_flag_model = """
-CLDEMOTE does not modify flags.
+SCASW does not modify flags.
 """
 
 neon_assembly = """
-// NEON lowering: CLDEMOTE stub (cache_control)
+// NEON lowering: SCASW stub (string_op)
 """
 
 neon_notes = [
