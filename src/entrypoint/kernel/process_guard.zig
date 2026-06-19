@@ -6,6 +6,7 @@ const c = @cImport({
     @cInclude("signal.h");
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
+    @cInclude("sys/stat.h");
     @cInclude("sys/wait.h");
     @cInclude("time.h");
     @cInclude("unistd.h");
@@ -106,8 +107,27 @@ pub fn tracePathFromEnv(allocator: std.mem.Allocator) ?[]const u8 {
         }
     }
 
+    if (routeRoot(allocator)) |root| {
+        return std.fs.path.join(allocator, &.{ root, ".rosette", "process-guard.log" }) catch null;
+    }
+
     const home = getenvSlice("HOME") orelse return null;
     return std.fs.path.join(allocator, &.{ home, ".rosette", "process-guard.log" }) catch null;
+}
+
+fn routeRoot(allocator: std.mem.Allocator) ?[]const u8 {
+    const env_names = [_][*:0]const u8{
+        "ROSETTE_TRACE_ROOT",
+        "ROSETTE_ROUTE_ROOT",
+        "ROSETTE_CALLER_CWD",
+        "PWD",
+    };
+    for (env_names) |name| {
+        if (getenvSlice(name)) |value| {
+            if (value.len != 0) return allocator.dupe(u8, value) catch null;
+        }
+    }
+    return null;
 }
 
 fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
@@ -230,6 +250,7 @@ fn traceLine(options: RunOptions, pid: i32, event: []const u8, status: ?RunStatu
     defer arena.deinit();
     const allocator = arena.allocator();
     const path = tracePathFromEnv(allocator) orelse return;
+    if (std.fs.path.dirname(path)) |parent| makePathRecursive(allocator, parent) catch {};
 
     const path_z = allocator.dupeZ(u8, path) catch return;
     const fp = c.fopen(path_z.ptr, "a");
@@ -245,6 +266,24 @@ fn traceLine(options: RunOptions, pid: i32, event: []const u8, status: ?RunStatu
         .{ @as(i64, @intCast(c.time(null))), event, pid, options.label, status_text, first_arg },
     ) catch return;
     _ = c.fwrite(line.ptr, 1, line.len, fp);
+}
+
+fn makePathRecursive(allocator: std.mem.Allocator, raw_path: []const u8) !void {
+    if (raw_path.len == 0) return;
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(allocator);
+
+    if (raw_path[0] == '/') try current.append(allocator, '/');
+    var it = std.mem.splitScalar(u8, raw_path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (current.items.len > 1 and current.items[current.items.len - 1] != '/') try current.append(allocator, '/');
+        try current.appendSlice(allocator, part);
+        const path_z = try allocator.dupeZ(u8, current.items);
+        if (c.mkdir(path_z.ptr, 0o755) != 0) {
+            if (c.access(path_z.ptr, 0) != 0) return error.MakePathFailed;
+        }
+    }
 }
 
 fn statusName(status: RunStatus) []const u8 {
