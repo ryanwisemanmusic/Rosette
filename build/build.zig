@@ -149,6 +149,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const entrypoint_kernel_process_guard_module = b.createModule(.{
+        .root_source_file = b.path("../src/entrypoint/kernel/process_guard.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const x86_asm_module = b.createModule(.{
         .root_source_file = b.path("../src/x86-ASM/title_entries.zig"),
         .target = target,
@@ -898,6 +904,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        compat_router_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
         const compat_router = b.addExecutable(.{
             .name = "rosette-router",
             .root_module = compat_router_mod,
@@ -910,6 +917,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        compat_router_test_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
         const compat_router_test = b.addTest(.{ .root_module = compat_router_test_mod });
         check_step.dependOn(&compat_router_test.step);
     }
