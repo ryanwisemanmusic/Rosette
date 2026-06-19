@@ -1,5 +1,6 @@
 const std = @import("std");
 const classifier = @import("classifier.zig");
+const process_guard = @import("entrypoint_kernel_process_guard");
 const trace = @import("trace.zig");
 const types = @import("types.zig");
 
@@ -129,20 +130,29 @@ pub fn buildPlan(
             }
         },
         .rosette_macho => {
-            return unsupportedPlan(allocator, .rosette_backend_pending, "Mach-O x86_64 execution is not implemented in Rosette yet");
+            const tool = try resolveTool(init, allocator, "ROSETTE_MACHO_PROCESSOR", "macho_processor");
+            if (tool) |path| {
+                try argv.append(allocator, path);
+                try argv.append(allocator, class.executable_path);
+                for (target_args) |arg| try argv.append(allocator, arg);
+            } else {
+                return unsupportedPlan(allocator, .rosette_tool_missing, "macho_processor could not be located");
+            }
         },
         .rosette_script => {
             const shim_path = try ensureScriptShim(allocator, policy);
             try argv.append(allocator, "/usr/bin/env");
+            const router_path = std.process.executablePathAlloc(init.io, allocator) catch "";
             try appendEnv(&argv, allocator, "ROSETTE_SCRIPT_HANDOFF_ACTIVE", "1");
             try appendEnv(&argv, allocator, "ROSETTE_VIRTUAL_UNAME_M", "x86_64");
             try appendEnv(&argv, allocator, "ROSETTE_VIRTUAL_LONG_BIT", "64");
             try appendEnv(&argv, allocator, "ROSETTE_VIRTUAL_PROC_TRANSLATED", "1");
+            try appendEnv(&argv, allocator, "ROSETTE_MACHO_STRICT", "1");
+            if (router_path.len != 0) try appendEnv(&argv, allocator, "ROSETTE_ROUTER", router_path);
             try appendEnv(&argv, allocator, "BASH_ENV", shim_path);
             if (getenvSlice("BASH_ENV")) |previous| try appendEnv(&argv, allocator, "ROSETTE_SCRIPT_HANDOFF_PREV_BASH_ENV", previous);
             if (policy.trace_path) |path| try appendEnv(&argv, allocator, "ROSETTE_COMPAT_TRACE", path);
             if (resolveDylib(allocator)) |dylib| {
-                try appendEnv(&argv, allocator, "ROSETTE_MACHO_STRICT", "1");
                 if (getenvSlice("DYLD_INSERT_LIBRARIES")) |existing| {
                     const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ dylib, existing });
                     try appendEnv(&argv, allocator, "DYLD_INSERT_LIBRARIES", joined);
@@ -238,14 +248,11 @@ fn decideMachO(class: types.Classification, policy: Policy) types.Decision {
     }
 
     if (policy.prefer_rosette and can_use_intel) {
-        if (policy.allow_rosetta2_fallback) {
-            return .{
-                .backend = .apple_rosetta2,
-                .reason = .rosette_backend_pending,
-                .detail = "Rosette Mach-O x86_64 backend is pending; falling back to Apple Rosetta 2 with trace",
-            };
-        }
-        return unsupported(.apple_rosetta2_disabled, "Rosette Mach-O x86_64 backend is pending and Apple Rosetta 2 fallback is disabled");
+        return .{
+            .backend = .rosette_macho,
+            .reason = .none,
+            .detail = "x86_64 Mach-O handled by Rosette Mach-O processor",
+        };
     }
 
     if (can_use_intel and policy.allow_rosetta2_fallback) {
@@ -281,7 +288,7 @@ fn scriptHandoffDecision(
     const script = routedScriptArgument(target_args) orelse return null;
     const detail = try std.fmt.allocPrint(
         allocator,
-        "x86_64 script handoff requested via {s} for {s}; running the script under Rosette's diagnostic shell shim. x86_64 Mach-O process launches remain blocked/traced until Rosette's Mach-O backend exists.",
+        "x86_64 script handoff requested via {s} for {s}; running the script under Rosette's diagnostic shell shim. Install macho_processor to enable x86_64 Mach-O execution.",
         .{ std.fs.path.basename(class.executable_path), script },
     );
     return .{
@@ -302,7 +309,7 @@ fn scriptHandoffDetail(
     const script = routedScriptArgument(target_args) orelse return null;
     const detail = try std.fmt.allocPrint(
         allocator,
-        "x86_64 script handoff requested via {s} for {s}; Rosette intercepted the handoff, but the Mach-O x86_64 process backend needed to run this shell/script is not implemented yet. Apple Rosetta 2 fallback is disabled by strict policy.",
+        "x86_64 script handoff requested via {s} for {s}; Rosette intercepted the handoff. Install macho_processor to enable x86_64 Mach-O execution.",
         .{ std.fs.path.basename(class.executable_path), script },
     );
     return detail;
@@ -408,14 +415,45 @@ const script_handoff_shim =
     \\  local __rosette_target="$1"
     \\  shift || true
     \\  __rosette_script_trace "blocked_x86_64_macho target=$__rosette_target"
+    \\  printf 'rosette-script: intercepted x86_64 Mach-O launch: %s\n' "$__rosette_target" >&2
+    \\  if [ -n "${ROSETTE_ROUTER:-}" ] && [ -x "$ROSETTE_ROUTER" ]; then
+    \\    if [ -n "${ROSETTE_COMPAT_TRACE:-}" ]; then
+    \\      ROSETTE_COMPAT_STRICT=0 ROSETTE_COMPAT_ABORT_ON_UNSUPPORTED=0 "$ROSETTE_ROUTER" run --prefer-intel --no-fallback --trace "$ROSETTE_COMPAT_TRACE" "$__rosette_target" -- "$@"
+    \\    else
+    \\      ROSETTE_COMPAT_STRICT=0 ROSETTE_COMPAT_ABORT_ON_UNSUPPORTED=0 "$ROSETTE_ROUTER" run --prefer-intel --no-fallback "$__rosette_target" -- "$@"
+    \\    fi
+    \\    local __rosette_status=$?
+    \\    if [ "$__rosette_status" -ne 0 ]; then
+    \\      return "$__rosette_status"
+    \\    fi
+    \\  fi
     \\  printf 'rosette-script: blocked x86_64 Mach-O launch without Apple Rosetta 2 fallback: %s\n' "$__rosette_target" >&2
     \\  printf 'rosette-script: Mach-O x86_64 execution backend is not implemented yet.\n' >&2
     \\  return 126
     \\}
     \\
+    \\__rosette_path_can_be_function_name() {
+    \\  case "$1" in
+    \\    *" "*|*"'"*|"") return 1 ;;
+    \\    */*) return 0 ;;
+    \\    *) return 1 ;;
+    \\  esac
+    \\}
+    \\
+    \\__rosette_install_macho_blocker_for() {
+    \\  local __rosette_target="$1"
+    \\  [ -x "$__rosette_target" ] || return 0
+    \\  __rosette_path_can_be_function_name "$__rosette_target" || return 0
+    \\  eval "function $__rosette_target() { __rosette_block_macho_launch '$__rosette_target' \"\$@\"; }"
+    \\}
+    \\
     \\__rosette_install_macho_blockers() {
-    \\  if [ -x ./xenia_canary.app/Contents/MacOS/xenia_canary ]; then
-    \\    eval 'function ./xenia_canary.app/Contents/MacOS/xenia_canary() { __rosette_block_macho_launch "./xenia_canary.app/Contents/MacOS/xenia_canary" "$@"; }'
+    \\  __rosette_install_macho_blocker_for "./xenia_canary.app/Contents/MacOS/xenia_canary"
+    \\  if [ -n "${XENIA_BIN:-}" ]; then
+    \\    __rosette_install_macho_blocker_for "$XENIA_BIN"
+    \\  fi
+    \\  if [ -n "${BUILD_DIR:-}" ]; then
+    \\    __rosette_install_macho_blocker_for "$BUILD_DIR/xenia_canary.app/Contents/MacOS/xenia_canary"
     \\  fi
     \\}
     \\
@@ -492,35 +530,21 @@ fn resolveOnPath(allocator: std.mem.Allocator, tool_name: []const u8) ?[]const u
 }
 
 fn runArgv(io: std.Io, argv: []const []const u8, cwd: ?[]const u8) !u8 {
-    const child = if (cwd) |dir|
-        std.process.spawn(io, .{
-            .argv = argv,
-            .cwd = .{ .path = dir },
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        })
-    else
-        std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        });
-
-    var process = child catch |err| {
-        std.debug.print("rosette-router: failed to spawn {s}: {s}\n", .{ argv[0], @errorName(err) });
+    return process_guard.runExitCode(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .label = "rosette-router",
+        .timeout_ms = process_guard.timeoutFromEnv(null),
+    }) catch |err| {
+        if (argv.len > 0) {
+            std.debug.print("rosette-router: guarded spawn failed for {s}: {s}\n", .{ argv[0], @errorName(err) });
+        } else {
+            std.debug.print("rosette-router: guarded spawn failed: {s}\n", .{@errorName(err)});
+        }
         return 127;
-    };
-    const term = process.wait(io) catch |err| {
-        std.debug.print("rosette-router: failed waiting for {s}: {s}\n", .{ argv[0], @errorName(err) });
-        return 127;
-    };
-    return switch (term) {
-        .exited => |code| code,
-        .signal => |sig| 128 + @as(u8, @intCast(@intFromEnum(sig))),
-        .stopped => 128,
-        .unknown => 1,
     };
 }
 
@@ -584,7 +608,7 @@ fn getenvSlice(name: [:0]const u8) ?[]const u8 {
     return std.mem.sliceTo(value, 0);
 }
 
-test "x86_64 Mach-O falls back to Apple Rosetta 2 while backend is pending" {
+test "x86_64 Mach-O routes to Rosette Mach-O processor by default" {
     const class = types.Classification{
         .target_kind = .file,
         .format = .mach_o,
@@ -594,8 +618,8 @@ test "x86_64 Mach-O falls back to Apple Rosetta 2 while backend is pending" {
         .has_x86_64 = true,
     };
     const decision = decide(class, .{});
-    try std.testing.expectEqual(types.Backend.apple_rosetta2, decision.backend);
-    try std.testing.expectEqual(types.FallbackReason.rosette_backend_pending, decision.reason);
+    try std.testing.expectEqual(types.Backend.rosette_macho, decision.backend);
+    try std.testing.expectEqual(types.FallbackReason.none, decision.reason);
 }
 
 test "universal Mach-O stays native unless Intel is requested" {
@@ -609,8 +633,8 @@ test "universal Mach-O stays native unless Intel is requested" {
         .has_x86_64 = true,
     };
     try std.testing.expectEqual(types.Backend.native, decide(class, .{}).backend);
-    try std.testing.expectEqual(types.Backend.apple_rosetta2, decide(class, .{ .prefer_intel_slice = true }).backend);
-    try std.testing.expectEqual(types.Backend.unsupported, decide(class, .{ .prefer_intel_slice = true, .allow_rosetta2_fallback = false, .strict_rosette = true }).backend);
+    try std.testing.expectEqual(types.Backend.rosette_macho, decide(class, .{ .prefer_intel_slice = true }).backend);
+    try std.testing.expectEqual(types.Backend.rosette_macho, decide(class, .{ .prefer_intel_slice = true, .allow_rosetta2_fallback = false, .strict_rosette = true }).backend);
 }
 
 test "strict policy marks unsupported routes as abortable" {
