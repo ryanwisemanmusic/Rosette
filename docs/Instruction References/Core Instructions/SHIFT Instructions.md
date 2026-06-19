@@ -52,6 +52,8 @@ D3 /4	SHL r/m32, CL	                MC	    Valid	    Valid	        Multiply r/m3
 REX.W + D3 /4	SHL r/m64, CL	        MC	    Valid	    N.E.	        Multiply r/m64 by 2, CL times.
 C1 /4 ib	SHL r/m32, imm8	            MI	    Valid	    Valid	        Multiply r/m32 by 2, imm8 times.
 REX.W + C1 /4 ib	SHL r/m64, imm8	    MI	    Valid	    N.E.	        Multiply r/m64 by 2, imm8 times.
+
+AT&T syntax note: `shlq %cl, %r14` corresponds to Intel syntax `SHL r14, CL`.
 D0 /5	SHR r/m8,1	                    M1	    Valid	    Valid	        Unsigned divide r/m8 by 2, once.
 REX + D0 /5	SHR r/m82, 1	            M1	    Valid	    N.E.	        Unsigned divide r/m8 by 2, once.
 D2 /5	SHR r/m8, CL	                MC	    Valid	    Valid	        Unsigned divide r/m8 by 2, CL times.
