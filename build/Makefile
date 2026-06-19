@@ -171,11 +171,11 @@ assembler-runner-build:
 
 compat-router-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe "$(COMPAT_ROUTER_SRC)" -lc -femit-bin="$(COMPAT_ROUTER_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_kernel_process_guard -Mroot="$(COMPAT_ROUTER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -femit-bin="$(COMPAT_ROUTER_BIN)"
 
 shell-helper-build: assembler-runner-build elf-processor-build elf-processor-dylib compat-router-build
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe "$(SHELL_HELPER_SRC)" -lc -femit-bin="$(SHELL_HELPER_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_kernel_process_guard -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
 shell: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" install "$(ROOT_DIR)"
