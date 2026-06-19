@@ -256,18 +256,21 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const arch_wrapper_path = try std.fs.path.join(allocator, &.{ bin_dir, "arch" });
+    const arch_backend_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-arch" });
     const clean_state_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
     const bash_env_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
+    const macho_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "macho_processor" });
 
     try makePathRecursive(allocator, bin_dir);
     try makePathRecursive(allocator, wrapper_dir);
     try makePathRecursive(allocator, lib_dir);
     try copySelf(init, allocator, helper_path);
     try copySelf(init, allocator, rosette_path);
-    try ensureArchWrapper(allocator, arch_wrapper_path, helper_path);
+    try ensureArchBackend(allocator, arch_backend_path);
+    try ensureArchWrapper(allocator, arch_wrapper_path, arch_backend_path);
     try ensureCleanStateBackend(allocator, clean_state_path);
     try ensureWrappers(allocator, wrapper_dir, helper_path);
     try ensureConfigFile(init.io, allocator, toml_path);
@@ -279,6 +282,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     if (source_root.len != 0) {
         try copyElfProcessor(init, allocator, source_root, elf_processor_path);
         try copyCompatRouter(init, allocator, source_root, compat_router_path);
+        try copyMachoProcessor(init, allocator, source_root, macho_processor_path);
         if (is_macos) try installDylib(init, allocator, source_root, dyld_lib_path);
     }
 
@@ -305,6 +309,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     std.debug.print("Rosette shell integration installed.\n", .{});
     std.debug.print("source: {s}\n", .{shell_path});
     std.debug.print("command: {s}\n", .{rosette_path});
+    std.debug.print("arch_backend: {s}\n", .{arch_backend_path});
     std.debug.print("clean_state: {s}\n", .{clean_state_path});
     if (fileExists(allocator, elf_processor_path)) {
         std.debug.print("elf_processor: {s}\n", .{elf_processor_path});
@@ -315,6 +320,11 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
         std.debug.print("compat_router: {s}\n", .{compat_router_path});
     } else {
         std.debug.print("compat_router: missing; build/install did not copy rosette-router\n", .{});
+    }
+    if (fileExists(allocator, macho_processor_path)) {
+        std.debug.print("macho_processor: {s}\n", .{macho_processor_path});
+    } else {
+        std.debug.print("macho_processor: missing; x86_64 Mach-O routing will stop at diagnostics\n", .{});
     }
     std.debug.print("current terminal reload: source ~/.rosette/rosette-shell.sh\n", .{});
     std.debug.print("diagnose from a project: rosette-diagnose-shell ./program\n", .{});
@@ -331,11 +341,13 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const arch_wrapper_path = try std.fs.path.join(allocator, &.{ bin_dir, "arch" });
+    const arch_backend_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-arch" });
     const clean_state_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" });
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
     const source_root = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
     const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
+    const macho_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "macho_processor" });
     const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
 
     try removeProfileBlocks(init.io, allocator, home);
@@ -345,8 +357,10 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     try unlinkIfExists(allocator, source_root);
     try unlinkIfExists(allocator, toml_path);
     try unlinkIfExists(allocator, elf_processor_path);
+    try unlinkIfExists(allocator, macho_processor_path);
     try unlinkIfExists(allocator, compat_router_path);
     try unlinkIfExists(allocator, arch_wrapper_path);
+    try unlinkIfExists(allocator, arch_backend_path);
     try unlinkIfExists(allocator, clean_state_path);
     try unlinkIfExists(allocator, dyld_lib_path);
     try removeWrappers(allocator, wrapper_dir);
@@ -627,6 +641,15 @@ fn compatTracePath(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn compatTraceBase(allocator: std.mem.Allocator) ![]const u8 {
+    if (getenvSlice("ROSETTE_TRACE_ROOT")) |root| {
+        if (root.len != 0) return try allocator.dupe(u8, root);
+    }
+    if (getenvSlice("ROSETTE_ROUTE_ROOT")) |root| {
+        if (root.len != 0) return try allocator.dupe(u8, root);
+    }
+    if (getenvSlice("ROSETTE_CALLER_CWD")) |root| {
+        if (root.len != 0) return try allocator.dupe(u8, root);
+    }
     if (getenvSlice("ROSETTE_PROJECT_ROOT")) |root| {
         if (root.len != 0) return try allocator.dupe(u8, root);
     }
@@ -807,6 +830,7 @@ fn cleanupReason(command: []const u8, options: CleanOptions) ?[]const u8 {
     if (containsIgnoreCase(command, " rosette-shell clean-state")) return null;
     if (containsIgnoreCase(command, "/rosette-shell clean-state")) return null;
     if (containsIgnoreCase(command, "rosette-shell route-arch")) return "Rosette arch handoff";
+    if (containsIgnoreCase(command, "rosette-arch")) return "Rosette arch backend";
     if (containsIgnoreCase(command, "rosette-shell detect")) return "Rosette project detector";
     if (containsIgnoreCase(command, "rosette-shell recipe-shell")) return "Rosette make recipe shell";
     if (containsIgnoreCase(command, "rosette-shell tool")) return "Rosette compiler/tool wrapper";
@@ -1619,7 +1643,8 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
     }
 
     try out.appendSlice(allocator,
-        \\export ROSETTE_ROUTER="$HOME/.rosette/bin/rosette-router"
+        \\: "${ROSETTE_ROUTER:=$HOME/.rosette/bin/rosette-router}"
+        \\export ROSETTE_ROUTER
         \\export ROSETTE_BASH_ENV="$HOME/.rosette/rosette-bash-env.sh"
         \\if [ -f "$ROSETTE_BASH_ENV" ]; then
         \\  if [ "${BASH_ENV:-}" != "$ROSETTE_BASH_ENV" ]; then
@@ -1985,20 +2010,21 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
         \\
         \\
         \\arch() {
+        \\  local __rosette_arch_backend="${ROSETTE_ARCH_BACKEND:-$HOME/.rosette/bin/rosette-arch}"
         \\  if [ -n "${ROSETTE_SHELL_DISABLE:-}" ]; then
         \\    command /usr/bin/arch "$@"
         \\    return $?
         \\  fi
         \\  case "${1:-}" in
         \\    -x86_64)
-        \\      if [ "$#" -ge 2 ] && [ -x "$ROSETTE_SHELL_HELPER" ]; then
-        \\        "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\      if [ "$#" -ge 2 ] && [ -x "$__rosette_arch_backend" ]; then
+        \\        ROSETTE_CALLER_CWD="${ROSETTE_CALLER_CWD:-$PWD}" "$__rosette_arch_backend" "$@"
         \\        return $?
         \\      fi
         \\      ;;
         \\    -arch)
-        \\      if [ "${2:-}" = "x86_64" ] && [ "$#" -ge 3 ] && [ -x "$ROSETTE_SHELL_HELPER" ]; then
-        \\        "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\      if [ "${2:-}" = "x86_64" ] && [ "$#" -ge 3 ] && [ -x "$__rosette_arch_backend" ]; then
+        \\        ROSETTE_CALLER_CWD="${ROSETTE_CALLER_CWD:-$PWD}" "$__rosette_arch_backend" "$@"
         \\        return $?
         \\      fi
         \\      ;;
@@ -2185,33 +2211,171 @@ fn ensureWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8, helper_
     try chmodPath(allocator, elf_processor_wrapper, 0o755);
 }
 
-fn ensureArchWrapper(allocator: std.mem.Allocator, arch_wrapper_path: []const u8, helper_path: []const u8) !void {
-    const script = try buildArchWrapperScript(allocator, helper_path);
+fn ensureArchWrapper(allocator: std.mem.Allocator, arch_wrapper_path: []const u8, arch_backend_path: []const u8) !void {
+    const script = try buildArchWrapperScript(allocator, arch_backend_path);
     try writeFilePath(allocator, arch_wrapper_path, script);
     try chmodPath(allocator, arch_wrapper_path, 0o755);
 }
 
-fn buildArchWrapperScript(allocator: std.mem.Allocator, helper_path: []const u8) ![]const u8 {
+fn buildArchWrapperScript(allocator: std.mem.Allocator, arch_backend_path: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator,
         \\#!/bin/sh
         \\# Generated by Rosette. Route x86_64 arch handoffs before Apple Rosetta 2.
-        \\ROSETTE_SHELL_HELPER={s}
-        \\if [ -z "${{ROSETTE_SCRIPT_HANDOFF_ACTIVE:-}}" ] && [ -z "${{ROSETTE_SHELL_DISABLE:-}}" ] && [ -x "$ROSETTE_SHELL_HELPER" ]; then
+        \\ROSETTE_ARCH_BACKEND=${{ROSETTE_ARCH_BACKEND:-{s}}}
+        \\if [ -z "${{ROSETTE_SCRIPT_HANDOFF_ACTIVE:-}}" ] && [ -z "${{ROSETTE_SHELL_DISABLE:-}}" ] && [ -x "$ROSETTE_ARCH_BACKEND" ]; then
         \\  case "${{1:-}}" in
         \\    -x86_64)
-        \\      exec "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\      ROSETTE_CALLER_CWD="${{ROSETTE_CALLER_CWD:-$PWD}}" exec "$ROSETTE_ARCH_BACKEND" "$@"
         \\      ;;
         \\    -arch)
         \\      if [ "${{2:-}}" = "x86_64" ]; then
-        \\        exec "$ROSETTE_SHELL_HELPER" route-arch "$@"
+        \\        ROSETTE_CALLER_CWD="${{ROSETTE_CALLER_CWD:-$PWD}}" exec "$ROSETTE_ARCH_BACKEND" "$@"
         \\      fi
         \\      ;;
         \\  esac
         \\fi
         \\exec /usr/bin/arch "$@"
         \\
-    , .{try shellSingleQuoted(allocator, helper_path)});
+    , .{try shellSingleQuoted(allocator, arch_backend_path)});
 }
+
+fn ensureArchBackend(allocator: std.mem.Allocator, arch_backend_path: []const u8) !void {
+    try writeFilePath(allocator, arch_backend_path, arch_backend_script);
+    try chmodPath(allocator, arch_backend_path, 0o755);
+}
+
+const arch_backend_script =
+    \\#!/bin/sh
+    \\# Generated by Rosette. Standalone arch handoff router.
+    \\set +e
+    \\
+    \\orig_args="$*"
+    \\case "${1:-}" in
+    \\  -x86_64)
+    \\    shift
+    \\    ;;
+    \\  -arch)
+    \\    if [ "${2:-}" = "x86_64" ]; then
+    \\      shift 2
+    \\    else
+    \\      exec /usr/bin/arch "$@"
+    \\    fi
+    \\    ;;
+    \\  *)
+    \\    exec /usr/bin/arch "$@"
+    \\    ;;
+    \\esac
+    \\
+    \\target="${1:-}"
+    \\if [ -z "$target" ]; then
+    \\  exec /usr/bin/arch $orig_args
+    \\fi
+    \\shift
+    \\
+    \\route_root="${ROSETTE_TRACE_ROOT:-${ROSETTE_ROUTE_ROOT:-${ROSETTE_CALLER_CWD:-$PWD}}}"
+    \\export ROSETTE_ROUTE_ROOT="$route_root"
+    \\
+    \\router_source=""
+    \\router=""
+    \\
+    \\__rosette_try_source_router() {
+    \\  __source_root="$1"
+    \\  if [ -n "$__source_root" ] && [ -x "$__source_root/zig-out/bin/rosette-router" ]; then
+    \\    router="$__source_root/zig-out/bin/rosette-router"
+    \\    router_source="$2"
+    \\    return 0
+    \\  fi
+    \\  return 1
+    \\}
+    \\
+    \\if [ "${ROSETTE_ROUTER_FORCE:-0}" = "1" ]; then
+    \\  router="${ROSETTE_ROUTER:-}"
+    \\  if [ -n "$router" ] && [ -x "$router" ]; then
+    \\    router_source="ROSETTE_ROUTER_FORCE"
+    \\  else
+    \\    router=""
+    \\  fi
+    \\fi
+    \\
+    \\if [ -z "$router" ]; then
+    \\  __rosette_try_source_router "${ROSETTE_SOURCE_ROOT:-}" "ROSETTE_SOURCE_ROOT" || true
+    \\fi
+    \\if [ -z "$router" ] && [ -f "$HOME/.rosette/source-root" ]; then
+    \\  IFS= read -r __rosette_source_root < "$HOME/.rosette/source-root" 2>/dev/null || __rosette_source_root=""
+    \\  __rosette_try_source_router "$__rosette_source_root" "source-root" || true
+    \\fi
+    \\if [ -z "$router" ]; then
+    \\  self_dir="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
+    \\  if [ -x "$self_dir/rosette-router" ]; then
+    \\    router="$self_dir/rosette-router"
+    \\    router_source="sibling"
+    \\  fi
+    \\fi
+    \\if [ -z "$router" ]; then
+    \\  router="${ROSETTE_ROUTER:-}"
+    \\  if [ -n "$router" ] && [ -x "$router" ]; then
+    \\    router_source="ROSETTE_ROUTER"
+    \\  else
+    \\    router=""
+    \\  fi
+    \\fi
+    \\if [ -z "$router" ] && [ -x "$HOME/.rosette/bin/rosette-router" ]; then
+    \\  router="$HOME/.rosette/bin/rosette-router"
+    \\  router_source="installed"
+    \\fi
+    \\
+    \\trace_path="${ROSETTE_COMPAT_TRACE:-}"
+    \\if [ -z "$trace_path" ]; then
+    \\  mkdir -p "$route_root/.rosette" 2>/dev/null || true
+    \\  trace_path="$route_root/.rosette/rosetta2-handoff.trace.log"
+    \\fi
+    \\
+    \\{
+    \\  printf '# Rosette arch handoff\n'
+    \\  printf 'event = "arch_backend_enter"\n'
+    \\  printf 'target = "%s"\n' "$target"
+    \\  printf 'cwd = "%s"\n' "$PWD"
+    \\  printf 'route_root = "%s"\n' "$route_root"
+    \\  printf 'router = "%s"\n' "$router"
+    \\  printf 'router_source = "%s"\n' "$router_source"
+    \\  printf '\n'
+    \\} >> "$trace_path" 2>/dev/null || true
+    \\
+    \\if [ ! -x "$router" ]; then
+    \\  {
+    \\    printf '# Rosette arch handoff\n'
+    \\    printf 'event = "arch_backend_missing_router"\n'
+    \\    printf 'target = "%s"\n' "$target"
+    \\    printf '\n'
+    \\  } >> "$trace_path" 2>/dev/null || true
+    \\  exec /usr/bin/arch -x86_64 "$target" "$@"
+    \\fi
+    \\
+    \\if [ "${ROSETTE_ARCH_DRY_RUN:-0}" = "1" ]; then
+    \\  export ROSETTE_ROUTER="$router"
+    \\  {
+    \\    printf '# Rosette arch handoff\n'
+    \\    printf 'event = "arch_backend_exec_router"\n'
+    \\    printf 'mode = "diagnose"\n'
+    \\    printf 'router = "%s"\n' "$router"
+    \\    printf 'target = "%s"\n' "$target"
+    \\    printf '\n'
+    \\  } >> "$trace_path" 2>/dev/null || true
+    \\  exec "$router" diagnose --prefer-intel --trace "$trace_path" "$target" "$@"
+    \\fi
+    \\
+    \\export ROSETTE_ROUTER="$router"
+    \\{
+    \\  printf '# Rosette arch handoff\n'
+    \\  printf 'event = "arch_backend_exec_router"\n'
+    \\  printf 'mode = "run"\n'
+    \\  printf 'router = "%s"\n' "$router"
+    \\  printf 'target = "%s"\n' "$target"
+    \\  printf '\n'
+    \\} >> "$trace_path" 2>/dev/null || true
+    \\exec "$router" run --prefer-intel --trace "$trace_path" "$target" "$@"
+    \\
+;
 
 fn ensureCleanStateBackend(allocator: std.mem.Allocator, clean_state_path: []const u8) !void {
     try writeFilePath(allocator, clean_state_path, clean_state_backend_script);
@@ -2256,6 +2420,7 @@ const clean_state_backend_script =
     \\  if (pid <= 1 || pid == self || pid == parent || ppid == self) next
     \\  if (index(lc, "rosette-clean-state") > 0) next
     \\  if (index(lc, "rosette-shell route-arch") > 0) reason="Rosette arch handoff"
+    \\  else if (index(lc, "rosette-arch") > 0) reason="Rosette arch backend"
     \\  else if (index(lc, "rosette-shell detect") > 0) reason="Rosette project detector"
     \\  else if (index(lc, "rosette-shell clean-state") > 0) reason="stuck Rosette cleanup helper"
     \\  else if (index(lc, "rosette-shell recipe-shell") > 0) reason="Rosette make recipe shell"
@@ -2521,10 +2686,20 @@ fn resolveElfProcessorPath(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn resolveCompatRouterPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
-    if (getenvSlice("ROSETTE_ROUTER")) |router_path| {
-        if (canExecute(allocator, router_path) or fileExists(allocator, router_path)) {
-            return try allocator.dupe(u8, router_path);
+    if (getenvSlice("ROSETTE_ROUTER_FORCE")) |force| {
+        if (std.mem.eql(u8, force, "1")) {
+            if (getenvSlice("ROSETTE_ROUTER")) |router_path| {
+                if (canExecute(allocator, router_path) or fileExists(allocator, router_path)) {
+                    return try allocator.dupe(u8, router_path);
+                }
+            }
         }
+    }
+
+    const source_root = currentSourceRoot(init.io, allocator) catch "";
+    if (source_root.len != 0) {
+        const from_source = try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "rosette-router" });
+        if (canExecute(allocator, from_source) or fileExists(allocator, from_source)) return from_source;
     }
 
     const self_path = std.process.executablePathAlloc(init.io, allocator) catch "";
@@ -2535,14 +2710,14 @@ fn resolveCompatRouterPath(init: std.process.Init, allocator: std.mem.Allocator)
         }
     }
 
-    const source_root = currentSourceRoot(init.io, allocator) catch "";
-    if (source_root.len != 0) {
-        const from_source = try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "rosette-router" });
-        if (canExecute(allocator, from_source) or fileExists(allocator, from_source)) return from_source;
-    }
-
     const cwd_candidate = try std.fs.path.join(allocator, &.{ "zig-out", "bin", "rosette-router" });
     if (canExecute(allocator, cwd_candidate) or fileExists(allocator, cwd_candidate)) return cwd_candidate;
+
+    if (getenvSlice("ROSETTE_ROUTER")) |router_path| {
+        if (canExecute(allocator, router_path) or fileExists(allocator, router_path)) {
+            return try allocator.dupe(u8, router_path);
+        }
+    }
 
     const helper_path = currentHelperPath(init, allocator) catch "";
     if (helper_path.len != 0) {
@@ -3277,6 +3452,23 @@ fn copyElfProcessor(init: std.process.Init, allocator: std.mem.Allocator, source
     std.debug.print("rosette-shell: warning: elf_processor binary not found; build with 'zig build' first\n", .{});
 }
 
+fn copyMachoProcessor(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8, dest_path: []const u8) !void {
+    const candidates = [_][]const u8{
+        try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "macho_processor" }),
+        try std.fs.path.join(allocator, &.{ source_root, "..", "..", "MacOS", "macho_processor" }),
+        try std.fs.path.join(allocator, &.{ source_root, "macho_processor" }),
+    };
+
+    for (candidates) |candidate| {
+        if (fileExists(allocator, candidate) and canExecute(allocator, candidate)) {
+            try copyFile(init, allocator, candidate, dest_path, "macho_processor");
+            _ = chmodPath(allocator, dest_path, 0o755) catch {};
+            return;
+        }
+    }
+    std.debug.print("rosette-shell: warning: macho_processor binary not found; build with 'make macho-processor-build' first\n", .{});
+}
+
 fn copyCompatRouter(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8, dest_path: []const u8) !void {
     const candidates = [_][]const u8{
         try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "rosette-router" }),
@@ -3477,23 +3669,39 @@ test "bash env snippet routes x86 arch only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const snippet = try buildBashEnvSnippet(arena.allocator(), "/tmp/rosette/bin/rosette-shell");
-    try std.testing.expect(containsIgnoreCase(snippet, "route-arch"));
+    try std.testing.expect(containsIgnoreCase(snippet, "rosette-arch"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_ARCH_BACKEND"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_CALLER_CWD"));
     try std.testing.expect(containsIgnoreCase(snippet, "-x86_64"));
     try std.testing.expect(containsIgnoreCase(snippet, "-arch"));
     try std.testing.expect(containsIgnoreCase(snippet, "command /usr/bin/arch"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_USER_BASH_ENV"));
 }
 
-test "arch wrapper routes x86 handoffs through shell helper" {
+test "arch wrapper routes x86 handoffs through standalone backend" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const script = try buildArchWrapperScript(arena.allocator(), "/tmp/rosette path/bin/rosette-shell");
-    try std.testing.expect(containsIgnoreCase(script, "route-arch"));
+    const script = try buildArchWrapperScript(arena.allocator(), "/tmp/rosette path/bin/rosette-arch");
+    try std.testing.expect(containsIgnoreCase(script, "ROSETTE_ARCH_BACKEND"));
+    try std.testing.expect(containsIgnoreCase(script, "ROSETTE_CALLER_CWD"));
     try std.testing.expect(containsIgnoreCase(script, "-x86_64"));
     try std.testing.expect(containsIgnoreCase(script, "-arch"));
     try std.testing.expect(containsIgnoreCase(script, "exec /usr/bin/arch"));
     try std.testing.expect(containsIgnoreCase(script, "ROSETTE_SCRIPT_HANDOFF_ACTIVE"));
-    try std.testing.expect(containsIgnoreCase(script, "ROSETTE_SHELL_HELPER='/tmp/rosette path/bin/rosette-shell'"));
+    try std.testing.expect(containsIgnoreCase(script, "rosette-arch"));
+    try std.testing.expect(containsIgnoreCase(script, "/tmp/rosette path/bin/rosette-arch"));
+}
+
+test "arch backend prefers source-built router before installed router" {
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "ROSETTE_SOURCE_ROOT"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "$HOME/.rosette/source-root"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "ROSETTE_ROUTER_FORCE"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "ROSETTE_ROUTE_ROOT"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "route_root"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "zig-out/bin/rosette-router"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "router_source"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "arch_backend_exec_router"));
+    try std.testing.expect(containsIgnoreCase(arch_backend_script, "ROSETTE_ARCH_DRY_RUN"));
 }
 
 test "clean-state parser reads ps output lines" {
@@ -3515,8 +3723,10 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(cleanupReason(command, .{ .include_xenia = true }) != null);
     try std.testing.expect(cleanupReason(command, .{ .include_xenia = false }) == null);
     try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell detect /repo", .{}) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-arch -x86_64 /bin/bash /tmp/xenia-rosetta.ABC", .{}) != null);
     try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell clean-state", .{}) == null);
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-shell route-arch"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-arch"));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "xenia_canary.app/contents/macos/xenia_canary"));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "--no-xenia"));
 }
