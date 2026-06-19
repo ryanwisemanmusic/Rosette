@@ -38,6 +38,24 @@ const default_config_text =
     \\# Apple Rosetta 2 remains a traced fallback while Rosette's Mach-O
     \\# x86_64 backend is being brought up.
     \\allow_rosetta2_fallback = true
+    \\# Strict is for diagnostics: Rosette must own the route, and fallback or
+    \\# unsupported routes abort loudly instead of quietly using Apple Rosetta 2.
+    \\strict = false
+    \\abort_on_fallback = false
+    \\abort_on_unsupported = false
+    \\trace = true
+    \\
+;
+
+const compat_config_upgrade_text =
+    \\# Apple Rosetta 2 remains a traced fallback while Rosette's Mach-O
+    \\# x86_64 backend is being brought up.
+    \\allow_rosetta2_fallback = true
+    \\# Strict is for diagnostics: Rosette must own the route, and fallback or
+    \\# unsupported routes abort loudly instead of quietly using Apple Rosetta 2.
+    \\strict = false
+    \\abort_on_fallback = false
+    \\abort_on_unsupported = false
     \\trace = true
     \\
 ;
@@ -214,6 +232,11 @@ fn usage(exe_name: []const u8) void {
         \\  dump_all_results = false
         \\  [graphics]
         \\  enabled = false
+        \\  [compat]
+        \\  allow_rosetta2_fallback = true
+        \\  strict = false
+        \\  abort_on_fallback = false
+        \\  abort_on_unsupported = false
         \\
     , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
 }
@@ -237,10 +260,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     try copySelf(init, allocator, helper_path);
     try copySelf(init, allocator, rosette_path);
     try ensureWrappers(allocator, wrapper_dir, helper_path);
-    if (!fileExists(allocator, toml_path)) {
-        try writeFilePath(allocator, toml_path, default_config_text);
-        try chmodPath(allocator, toml_path, 0o644);
-    }
+    try ensureConfigFile(init.io, allocator, toml_path);
 
     const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
     const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
@@ -323,6 +343,127 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     rmdirIfEmpty(allocator, rosette_dir) catch {};
 
     std.debug.print("Rosette shell integration removed.\n", .{});
+}
+
+fn ensureConfigFile(io: std.Io, allocator: std.mem.Allocator, toml_path: []const u8) !void {
+    if (!fileExists(allocator, toml_path)) {
+        try writeFilePath(allocator, toml_path, default_config_text);
+        try chmodPath(allocator, toml_path, 0o644);
+        return;
+    }
+
+    const contents = std.Io.Dir.cwd().readFileAlloc(io, toml_path, allocator, .limited(max_text_file)) catch return;
+    if (try upgradeConfigText(allocator, contents)) |upgraded| {
+        try writeFilePath(allocator, toml_path, upgraded);
+        try chmodPath(allocator, toml_path, 0o644);
+    }
+}
+
+const TomlSectionRange = struct {
+    header_end: usize,
+    body_end: usize,
+};
+
+const CompatConfigLine = struct {
+    key: []const u8,
+    line: []const u8,
+    strict_group: bool = false,
+};
+
+const compat_config_lines = [_]CompatConfigLine{
+    .{ .key = "allow_rosetta2_fallback", .line = "allow_rosetta2_fallback = true\n" },
+    .{ .key = "strict", .line = "strict = false\n", .strict_group = true },
+    .{ .key = "abort_on_fallback", .line = "abort_on_fallback = false\n", .strict_group = true },
+    .{ .key = "abort_on_unsupported", .line = "abort_on_unsupported = false\n", .strict_group = true },
+    .{ .key = "trace", .line = "trace = true\n" },
+};
+
+fn upgradeConfigText(allocator: std.mem.Allocator, contents: []const u8) !?[]const u8 {
+    const range = findTomlSectionRange(contents, "compat") orelse {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, contents);
+        if (contents.len != 0 and contents[contents.len - 1] != '\n') try out.append(allocator, '\n');
+        if (contents.len != 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, "[compat]\n");
+        try out.appendSlice(allocator, compat_config_upgrade_text);
+        return try out.toOwnedSlice(allocator);
+    };
+
+    var missing: std.ArrayList(u8) = .empty;
+    defer missing.deinit(allocator);
+    var wrote_strict_comment = false;
+    for (compat_config_lines) |entry| {
+        if (compatSettingPresent(contents, range, entry.key)) continue;
+        if (entry.strict_group and !wrote_strict_comment) {
+            try missing.appendSlice(allocator, "# Strict is for diagnostics: Rosette must own the route, and fallback or\n");
+            try missing.appendSlice(allocator, "# unsupported routes abort loudly instead of quietly using Apple Rosetta 2.\n");
+            wrote_strict_comment = true;
+        }
+        try missing.appendSlice(allocator, entry.line);
+    }
+    if (missing.items.len == 0) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, contents[0..range.header_end]);
+    if (range.header_end != 0 and contents[range.header_end - 1] != '\n') try out.append(allocator, '\n');
+    try out.appendSlice(allocator, missing.items);
+    try out.appendSlice(allocator, contents[range.header_end..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn findTomlSectionRange(contents: []const u8, wanted: []const u8) ?TomlSectionRange {
+    var offset: usize = 0;
+    var found = false;
+    var header_end: usize = 0;
+    while (offset < contents.len) {
+        const line_start = offset;
+        const newline = std.mem.indexOfScalar(u8, contents[offset..], '\n');
+        const line_end = if (newline) |pos| offset + pos else contents.len;
+        const next = if (newline) |pos| offset + pos + 1 else contents.len;
+        const line = contents[line_start..line_end];
+        const no_comment = if (std.mem.indexOfScalar(u8, line, '#')) |pos| line[0..pos] else line;
+        const trimmed = std.mem.trim(u8, no_comment, " \t\r\n");
+        if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+            const name = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+            if (found) {
+                return .{ .header_end = header_end, .body_end = line_start };
+            }
+            if (std.ascii.eqlIgnoreCase(name, wanted)) {
+                found = true;
+                header_end = next;
+            }
+        }
+        offset = next;
+    }
+    if (!found) return null;
+    return .{ .header_end = header_end, .body_end = contents.len };
+}
+
+fn compatSettingPresent(contents: []const u8, range: TomlSectionRange, key: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(key, "strict")) {
+        return tomlRangeHasKey(contents, range, "strict") or tomlRangeHasKey(contents, range, "strict_rosette");
+    }
+    if (std.ascii.eqlIgnoreCase(key, "abort_on_unsupported")) {
+        return tomlRangeHasKey(contents, range, "abort_on_unsupported") or
+            tomlRangeHasKey(contents, range, "abort_on_failure") or
+            tomlRangeHasKey(contents, range, "trap_on_failure");
+    }
+    return tomlRangeHasKey(contents, range, key);
+}
+
+fn tomlRangeHasKey(contents: []const u8, range: TomlSectionRange, key: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, contents[range.header_end..range.body_end], '\n');
+    while (lines.next()) |raw_line| {
+        const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |pos| raw_line[0..pos] else raw_line;
+        const line = std.mem.trim(u8, no_comment, " \t\r\n");
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const parsed_key = std.mem.trim(u8, line[0..eq], " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(parsed_key, key)) return true;
+    }
+    return false;
 }
 
 fn prepareMake(
@@ -2741,6 +2882,32 @@ test "shell config parser accepts TOML and uppercase aliases" {
     try std.testing.expect(config.graphics_enabled);
     try std.testing.expectEqual(ConfigMode.on, config.elf_dump_results);
     try std.testing.expect(!config.elf_dump_all_results);
+}
+
+test "config upgrade adds strict compat keys without replacing existing values" {
+    const toml =
+        \\[compat]
+        \\allow_rosetta2_fallback = false
+        \\trace = true
+    ;
+    const upgraded = (try upgradeConfigText(std.testing.allocator, toml)).?;
+    defer std.testing.allocator.free(upgraded);
+    try std.testing.expect(containsIgnoreCase(upgraded, "allow_rosetta2_fallback = false"));
+    try std.testing.expect(containsIgnoreCase(upgraded, "strict = false"));
+    try std.testing.expect(containsIgnoreCase(upgraded, "abort_on_fallback = false"));
+    try std.testing.expect(containsIgnoreCase(upgraded, "abort_on_unsupported = false"));
+}
+
+test "config upgrade leaves complete compat section unchanged" {
+    const toml =
+        \\[compat]
+        \\allow_rosetta2_fallback = false
+        \\strict = true
+        \\abort_on_fallback = true
+        \\abort_on_unsupported = true
+        \\trace = true
+    ;
+    try std.testing.expect((try upgradeConfigText(std.testing.allocator, toml)) == null);
 }
 
 test "auto result dump triggers for detected yasm elf64 run targets" {

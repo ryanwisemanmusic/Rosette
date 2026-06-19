@@ -4,6 +4,9 @@ pub const CompatConfig = struct {
     prefer_rosette: ?bool = null,
     allow_rosetta2_fallback: ?bool = null,
     prefer_intel_slice: ?bool = null,
+    strict: ?bool = null,
+    abort_on_fallback: ?bool = null,
+    abort_on_unsupported: ?bool = null,
     trace: ?bool = null,
 };
 
@@ -31,7 +34,7 @@ pub fn parse(contents: []const u8) CompatConfig {
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq], " \t\r\n");
         const value = trimTomlValue(std.mem.trim(u8, line[eq + 1 ..], " \t\r\n"));
-        const parsed_bool = parseBool(value) orelse continue;
+        const parsed_bool = parseBoolText(value) orelse continue;
 
         if (std.ascii.eqlIgnoreCase(key, "prefer_rosette")) {
             cfg.prefer_rosette = parsed_bool;
@@ -39,6 +42,17 @@ pub fn parse(contents: []const u8) CompatConfig {
             cfg.allow_rosetta2_fallback = parsed_bool;
         } else if (std.ascii.eqlIgnoreCase(key, "prefer_intel_slice")) {
             cfg.prefer_intel_slice = parsed_bool;
+        } else if (std.ascii.eqlIgnoreCase(key, "strict") or
+            std.ascii.eqlIgnoreCase(key, "strict_rosette"))
+        {
+            cfg.strict = parsed_bool;
+        } else if (std.ascii.eqlIgnoreCase(key, "abort_on_fallback")) {
+            cfg.abort_on_fallback = parsed_bool;
+        } else if (std.ascii.eqlIgnoreCase(key, "abort_on_unsupported") or
+            std.ascii.eqlIgnoreCase(key, "abort_on_failure") or
+            std.ascii.eqlIgnoreCase(key, "trap_on_failure"))
+        {
+            cfg.abort_on_unsupported = parsed_bool;
         } else if (std.ascii.eqlIgnoreCase(key, "trace")) {
             cfg.trace = parsed_bool;
         }
@@ -62,7 +76,7 @@ fn trimTomlValue(value: []const u8) []const u8 {
     return value;
 }
 
-fn parseBool(value: []const u8) ?bool {
+pub fn parseBoolText(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "1") or
         std.ascii.eqlIgnoreCase(value, "true") or
         std.ascii.eqlIgnoreCase(value, "yes") or
@@ -93,8 +107,14 @@ test "parses compat policy keys" {
         \\allow_rosetta2_fallback = false
         \\trace = true
         \\prefer_intel_slice = "on"
+        \\strict = yes
+        \\abort_on_fallback = enabled
+        \\abort_on_failure = 1
     );
     try std.testing.expectEqual(false, cfg.allow_rosetta2_fallback.?);
     try std.testing.expectEqual(true, cfg.trace.?);
     try std.testing.expectEqual(true, cfg.prefer_intel_slice.?);
+    try std.testing.expectEqual(true, cfg.strict.?);
+    try std.testing.expectEqual(true, cfg.abort_on_fallback.?);
+    try std.testing.expectEqual(true, cfg.abort_on_unsupported.?);
 }

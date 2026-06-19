@@ -4,6 +4,7 @@ const trace = @import("trace.zig");
 const types = @import("types.zig");
 
 const c = @cImport({
+    @cInclude("stdlib.h");
     @cInclude("unistd.h");
 });
 
@@ -12,6 +13,9 @@ pub const Policy = struct {
     allow_rosetta2_fallback: bool = true,
     force_apple_rosetta2: bool = false,
     prefer_intel_slice: bool = false,
+    strict_rosette: bool = false,
+    abort_on_fallback: bool = false,
+    abort_on_unsupported: bool = false,
     trace_enabled: bool = true,
     dry_run: bool = false,
     trace_path: ?[]const u8 = null,
@@ -41,6 +45,7 @@ pub fn runTarget(
 
     printPlan(class, plan, if (policy.trace_enabled) trace_path else null);
     if (policy.dry_run) return 0;
+    if (shouldAbortRoute(policy, plan.decision)) abortRoute(plan.decision);
     if (plan.decision.backend == .unsupported) return 126;
 
     return try runArgv(init.io, plan.argv, plan.cwd);
@@ -230,6 +235,23 @@ fn unsupported(reason: types.FallbackReason, detail: []const u8) types.Decision 
     };
 }
 
+fn shouldAbortRoute(policy: Policy, decision: types.Decision) bool {
+    return switch (decision.backend) {
+        .apple_rosetta2 => policy.strict_rosette or policy.abort_on_fallback,
+        .unsupported => policy.strict_rosette or policy.abort_on_unsupported,
+        else => false,
+    };
+}
+
+fn abortRoute(decision: types.Decision) noreturn {
+    std.debug.print("rosette-router: strict compatibility abort\n", .{});
+    std.debug.print("  backend: {s}\n", .{decision.backend.label()});
+    std.debug.print("  reason: {s}\n", .{decision.reason.label()});
+    std.debug.print("  detail: {s}\n", .{decision.detail});
+    c.abort();
+    unreachable;
+}
+
 fn resolveTool(init: std.process.Init, allocator: std.mem.Allocator, env_name: [:0]const u8, tool_name: []const u8) !?[]const u8 {
     if (getenvSlice(env_name)) |env_path| {
         if (canExecute(allocator, env_path)) return try allocator.dupe(u8, env_path);
@@ -351,4 +373,24 @@ test "universal Mach-O stays native unless Intel is requested" {
     };
     try std.testing.expectEqual(types.Backend.native, decide(class, .{}).backend);
     try std.testing.expectEqual(types.Backend.apple_rosetta2, decide(class, .{ .prefer_intel_slice = true }).backend);
+    try std.testing.expectEqual(types.Backend.unsupported, decide(class, .{ .prefer_intel_slice = true, .allow_rosetta2_fallback = false, .strict_rosette = true }).backend);
+}
+
+test "strict policy marks unsupported routes as abortable" {
+    const unsupported_decision = types.Decision{
+        .backend = .unsupported,
+        .reason = .rosette_backend_pending,
+        .detail = "test",
+    };
+    const fallback_decision = types.Decision{
+        .backend = .apple_rosetta2,
+        .reason = .rosette_backend_pending,
+        .detail = "test",
+    };
+    try std.testing.expect(shouldAbortRoute(.{ .strict_rosette = true }, unsupported_decision));
+    try std.testing.expect(shouldAbortRoute(.{ .abort_on_unsupported = true }, unsupported_decision));
+    try std.testing.expect(shouldAbortRoute(.{ .strict_rosette = true }, fallback_decision));
+    try std.testing.expect(shouldAbortRoute(.{ .abort_on_fallback = true }, fallback_decision));
+    try std.testing.expect(!shouldAbortRoute(.{}, unsupported_decision));
+    try std.testing.expect(!shouldAbortRoute(.{}, fallback_decision));
 }

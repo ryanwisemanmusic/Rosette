@@ -50,8 +50,38 @@ fn loadBasePolicy(io: std.Io, allocator: std.mem.Allocator) !router.Policy {
     if (cfg.prefer_rosette) |value| policy.prefer_rosette = value;
     if (cfg.allow_rosetta2_fallback) |value| policy.allow_rosetta2_fallback = value;
     if (cfg.prefer_intel_slice) |value| policy.prefer_intel_slice = value;
+    if (cfg.strict) |value| applyStrictMode(&policy, value);
+    if (cfg.abort_on_fallback) |value| policy.abort_on_fallback = value;
+    if (cfg.abort_on_unsupported) |value| policy.abort_on_unsupported = value;
     if (cfg.trace) |value| policy.trace_enabled = value;
+    applyEnvironmentPolicy(&policy);
     return policy;
+}
+
+fn applyStrictMode(policy: *router.Policy, enabled: bool) void {
+    policy.strict_rosette = enabled;
+    if (enabled) {
+        policy.allow_rosetta2_fallback = false;
+        policy.abort_on_fallback = true;
+        policy.abort_on_unsupported = true;
+    }
+}
+
+fn applyEnvironmentPolicy(policy: *router.Policy) void {
+    if (getenvBool("ROSETTE_COMPAT_STRICT")) |value| applyStrictMode(policy, value);
+    if (getenvBool("ROSETTE_COMPAT_ALLOW_FALLBACK")) |value| policy.allow_rosetta2_fallback = value;
+    if (getenvBool("ROSETTE_COMPAT_NO_FALLBACK")) |value| {
+        if (value) policy.allow_rosetta2_fallback = false;
+    }
+    if (getenvBool("ROSETTE_COMPAT_ABORT_ON_FALLBACK")) |value| policy.abort_on_fallback = value;
+    if (getenvBool("ROSETTE_COMPAT_ABORT_ON_UNSUPPORTED")) |value| policy.abort_on_unsupported = value;
+    if (getenvBool("ROSETTE_COMPAT_ABORT_ON_FAILURE")) |value| policy.abort_on_unsupported = value;
+}
+
+fn getenvBool(name: [:0]const u8) ?bool {
+    const raw = std.c.getenv(name) orelse return null;
+    const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+    return config.parseBoolText(value);
 }
 
 fn parseRouteArgs(allocator: std.mem.Allocator, base_policy: router.Policy, args: []const []const u8) !ParsedRouteArgs {
@@ -76,6 +106,16 @@ fn parseRouteArgs(allocator: std.mem.Allocator, base_policy: router.Policy, args
             policy.force_apple_rosetta2 = true;
         } else if (std.mem.eql(u8, arg, "--no-fallback")) {
             policy.allow_rosetta2_fallback = false;
+        } else if (std.mem.eql(u8, arg, "--allow-fallback")) {
+            policy.allow_rosetta2_fallback = true;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            applyStrictMode(&policy, true);
+        } else if (std.mem.eql(u8, arg, "--abort-on-fallback")) {
+            policy.abort_on_fallback = true;
+        } else if (std.mem.eql(u8, arg, "--abort-on-unsupported") or
+            std.mem.eql(u8, arg, "--abort-on-failure"))
+        {
+            policy.abort_on_unsupported = true;
         } else if (std.mem.eql(u8, arg, "--prefer-intel")) {
             policy.prefer_intel_slice = true;
         } else if (std.mem.eql(u8, arg, "--trace-off")) {
@@ -119,6 +159,10 @@ fn usage(exe_name: []const u8) void {
         \\  --baseline-rosetta2    Force Apple Rosetta 2 for an x86_64 Mach-O slice
         \\  --prefer-intel         Use an x86_64 slice from a universal Mach-O/app
         \\  --no-fallback          Do not fall back to Apple Rosetta 2
+        \\  --allow-fallback       Allow Apple Rosetta 2 fallback for this invocation
+        \\  --strict               Require Rosette ownership; abort on fallback/unsupported routes
+        \\  --abort-on-fallback    Abort if a route selects Apple Rosetta 2
+        \\  --abort-on-unsupported Abort if Rosette cannot launch the selected target
         \\  --trace <path>         Write the compatibility trace to a specific file
         \\  --trace-off            Disable route trace writes for this invocation
         \\
@@ -126,6 +170,7 @@ fn usage(exe_name: []const u8) void {
         \\  ROSETTE_ELF_PROCESSOR  Override elf_processor path
         \\  ROSETTE_EXE_RUNNER     Override rosette_exe_runner path
         \\  ROSETTE_COMPAT_TRACE   Override default handoff trace path
+        \\  ROSETTE_COMPAT_STRICT  Same policy as --strict when set to 1/true/on
         \\
     , .{ exe_name, exe_name, exe_name });
 }
@@ -138,4 +183,15 @@ test "parse target after options" {
     try std.testing.expect(parsed.policy.prefer_intel_slice);
     try std.testing.expectEqualStrings("Xenia.app", parsed.target.?);
     try std.testing.expectEqual(@as(usize, 2), parsed.target_args.len);
+}
+
+test "parse strict route policy" {
+    const args = [_][]const u8{ "--strict", "Xenia.app", "--gpu" };
+    const parsed = try parseRouteArgs(std.testing.allocator, .{}, &args);
+    defer std.testing.allocator.free(parsed.target_args);
+    try std.testing.expect(parsed.policy.strict_rosette);
+    try std.testing.expect(!parsed.policy.allow_rosetta2_fallback);
+    try std.testing.expect(parsed.policy.abort_on_fallback);
+    try std.testing.expect(parsed.policy.abort_on_unsupported);
+    try std.testing.expectEqual(@as(usize, 1), parsed.target_args.len);
 }
