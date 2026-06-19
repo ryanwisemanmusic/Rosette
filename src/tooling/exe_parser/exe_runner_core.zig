@@ -4,6 +4,7 @@ const parser = @import("pe_parser.zig");
 const pkg = @import("rosette_package.zig");
 const trace = @import("mandatory_trace.zig");
 const x86_disasm = @import("../disasm_logger/x86_disasm.zig");
+const process_guard = @import("entrypoint_kernel_process_guard");
 const raw_decode = @import("../../x86-ASM/raw_decoder.zig");
 const runtime_abi = @import("runtime_abi_handshake");
 const traps = runtime_abi.traps;
@@ -510,16 +511,17 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
         try setEnvValue(allocator, "ROSETTE_EXE_PATH", abs_exe_path);
         try setEnvValue(allocator, "ROSETTE_TRACE_PATH", abs_log_path);
 
-        var child = try std.process.spawn(init.io, .{
+        const status = try process_guard.run(init.io, .{
             .argv = &.{final_launch_abs},
-            .cwd = .{ .path = final_cwd_abs },
+            .cwd = final_cwd_abs,
             .stdin = .inherit,
             .stdout = .inherit,
             .stderr = .inherit,
+            .label = "rosette-exe-host",
+            .timeout_ms = process_guard.timeoutFromEnv(null),
         });
-        const term = try child.wait(init.io);
         var term_buf: [128]u8 = undefined;
-        const term_line = try std.fmt.bufPrint(&term_buf, "launch_term = {s}\n", .{@tagName(term)});
+        const term_line = try std.fmt.bufPrint(&term_buf, "launch_term = {s}\n", .{@tagName(status)});
         trace.logText(term_line);
         return;
     }
