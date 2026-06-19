@@ -487,6 +487,16 @@ const rpl_arpl = @import("RPL/ARPL.zig");
 const select_vpmultishiftqb = @import("SELECT/VPMULTISHIFTQB.zig");
 const send_senduipi = @import("SEND/SENDUIPI.zig");
 const serialize_serialize = @import("SERIALIZE/SERIALIZE.zig");
+const enqueue_enqcmd = @import("ENQUEUE/enqcmd.zig");
+const extr_bextr = @import("EXTR/bextr.zig");
+const extr_extractps = @import("EXTR/extractps.zig");
+const extr_fxtract = @import("EXTR/fxtract.zig");
+const extr_pext = @import("EXTR/pext.zig");
+const lock_lock = @import("LOCK/lock.zig");
+const lock_xacquire = @import("LOCK/xacquire.zig");
+const lock_xrelease = @import("LOCK/xrelease.zig");
+const neg_neg = @import("NEG/neg.zig");
+const round_frndint = @import("ROUND/frndint.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -1033,6 +1043,31 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(empty_emms.family, empty_emms.path, empty_emms.source),
     mirror(end_xend.family, end_xend.path, end_xend.source),
     mirror(examine_fxam.family, examine_fxam.path, examine_fxam.source),
+    mirror(expand_vpexpandb.family, expand_vpexpandb.path, expand_vpexpandb.source),
+    mirror(expand_vpexpandw.family, expand_vpexpandw.path, expand_vpexpandw.source),
+    mirror(pause_tpause.family, pause_tpause.path, pause_tpause.source),
+    mirror(prefetch_prefetchw.family, prefetch_prefetchw.path, prefetch_prefetchw.source),
+    mirror(prefetch_prefetcht0.family, prefetch_prefetcht0.path, prefetch_prefetcht0.source),
+    mirror(prefetch_prefetcht1.family, prefetch_prefetcht1.path, prefetch_prefetcht1.source),
+    mirror(prefetch_prefetcht2.family, prefetch_prefetcht2.path, prefetch_prefetcht2.source),
+    mirror(prefetch_prefetchnta.family, prefetch_prefetchnta.path, prefetch_prefetchnta.source),
+    mirror(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
+    mirror(reset_hreset.family, reset_hreset.path, reset_hreset.source),
+    mirror(resume_rsm.family, resume_rsm.path, resume_rsm.source),
+    mirror(rpl_arpl.family, rpl_arpl.path, rpl_arpl.source),
+    mirror(select_vpmultishiftqb.family, select_vpmultishiftqb.path, select_vpmultishiftqb.source),
+    mirror(send_senduipi.family, send_senduipi.path, send_senduipi.source),
+    mirror(serialize_serialize.family, serialize_serialize.path, serialize_serialize.source),
+    mirror(enqueue_enqcmd.family, enqueue_enqcmd.path, enqueue_enqcmd.source),
+    mirror(extr_bextr.family, extr_bextr.path, extr_bextr.source),
+    mirror(extr_extractps.family, extr_extractps.path, extr_extractps.source),
+    mirror(extr_fxtract.family, extr_fxtract.path, extr_fxtract.source),
+    mirror(extr_pext.family, extr_pext.path, extr_pext.source),
+    mirror(lock_lock.family, lock_lock.path, lock_lock.source),
+    mirror(lock_xacquire.family, lock_xacquire.path, lock_xacquire.source),
+    mirror(lock_xrelease.family, lock_xrelease.path, lock_xrelease.source),
+    mirror(neg_neg.family, neg_neg.path, neg_neg.source),
+    mirror(round_frndint.family, round_frndint.path, round_frndint.source),
 };
 
 pub fn tableCount() usize {

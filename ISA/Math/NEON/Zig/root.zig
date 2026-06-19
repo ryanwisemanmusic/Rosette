@@ -489,6 +489,16 @@ const rpl_arpl = @import("RPL/arpl.zig");
 const select_vpmultishiftqb = @import("SELECT/vpmultishiftqb.zig");
 const send_senduipi = @import("SEND/senduipi.zig");
 const serialize_serialize = @import("SERIALIZE/serialize.zig");
+const enqueue_enqcmd = @import("ENQUEUE/enqcmd.zig");
+const extr_bextr = @import("EXTR/bextr.zig");
+const extr_extractps = @import("EXTR/extractps.zig");
+const extr_fxtract = @import("EXTR/fxtract.zig");
+const extr_pext = @import("EXTR/pext.zig");
+const lock_lock = @import("LOCK/lock.zig");
+const lock_xacquire = @import("LOCK/xacquire.zig");
+const lock_xrelease = @import("LOCK/xrelease.zig");
+const neg_neg = @import("NEG/neg.zig");
+const round_frndint = @import("ROUND/frndint.zig");
 
 pub const specs = [_]core.InstructionMathSpec{
     spec(add_adc.meta),
@@ -977,6 +987,16 @@ pub const specs = [_]core.InstructionMathSpec{
     spec(select_vpmultishiftqb.meta),
     spec(send_senduipi.meta),
     spec(serialize_serialize.meta),
+    spec(enqueue_enqcmd.meta),
+    spec(extr_bextr.meta),
+    spec(extr_extractps.meta),
+    spec(extr_fxtract.meta),
+    spec(extr_pext.meta),
+    spec(lock_lock.meta),
+    spec(lock_xacquire.meta),
+    spec(lock_xrelease.meta),
+    spec(neg_neg.meta),
+    spec(round_frndint.meta),
 };
 
 pub const proof_reports = [_]proofs.ProofReport{
@@ -1466,6 +1486,16 @@ pub const proof_reports = [_]proofs.ProofReport{
     select_vpmultishiftqb.proof_report,
     send_senduipi.proof_report,
     serialize_serialize.proof_report,
+    enqueue_enqcmd.proof_report,
+    extr_bextr.proof_report,
+    extr_extractps.proof_report,
+    extr_fxtract.proof_report,
+    extr_pext.proof_report,
+    lock_lock.proof_report,
+    lock_xacquire.proof_report,
+    lock_xrelease.proof_report,
+    neg_neg.proof_report,
+    round_frndint.proof_report,
 };
 
 pub fn tableCount() usize {
