@@ -11,8 +11,26 @@ pub fn defaultTracePath(allocator: std.mem.Allocator) ![]const u8 {
     if (getenvSlice("ROSETTE_COMPAT_TRACE")) |path| {
         if (path.len != 0) return try allocator.dupe(u8, path);
     }
+    if (try routeRoot(allocator)) |root| {
+        return std.fs.path.join(allocator, &.{ root, ".rosette", "rosetta2-handoff.trace.log" });
+    }
     const home = getenvSlice("HOME") orelse return "rosette2-handoff.trace.log";
     return std.fs.path.join(allocator, &.{ home, ".rosette", "logs", "rosetta2-handoff.trace.log" });
+}
+
+fn routeRoot(allocator: std.mem.Allocator) !?[]const u8 {
+    const env_names = [_][:0]const u8{
+        "ROSETTE_TRACE_ROOT",
+        "ROSETTE_ROUTE_ROOT",
+        "ROSETTE_CALLER_CWD",
+        "PWD",
+    };
+    for (env_names) |name| {
+        if (getenvSlice(name)) |value| {
+            if (value.len != 0) return try allocator.dupe(u8, value);
+        }
+    }
+    return null;
 }
 
 pub fn appendDecision(
