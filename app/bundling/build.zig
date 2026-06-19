@@ -350,7 +350,7 @@ pub fn build(b: *std.Build) void {
     };
     const runtime_dirs = [_]RuntimeDir{
         .{ .source = "../../Assemblers", .destination = "Assemblers" },
-        .{ .source = "../../ELF_processor", .destination = "ELF_processor" },
+        .{ .source = "../../lib/processor/ELF_processor", .destination = "ELF_processor" },
         .{ .source = "../../ISA", .destination = "ISA" },
         .{ .source = "../../app_testing/basic_snake", .destination = "app_testing/basic_snake" },
         .{ .source = "../../app_testing/Console-Tetris", .destination = "app_testing/Console-Tetris" },
@@ -364,9 +364,9 @@ pub fn build(b: *std.Build) void {
         .{ .source = "../../app_testing/tetrisx86_windowed", .destination = "app_testing/tetrisx86_windowed" },
         .{ .source = "../../app_testing/tetrisx86", .destination = "app_testing/tetrisx86" },
         .{ .source = "../../assets", .destination = "assets" },
-        .{ .source = "../../bat_processor", .destination = "bat_processor" },
+        .{ .source = "../../lib/processor/bat_processor", .destination = "bat_processor" },
         .{ .source = "../../include", .destination = "include" },
-        .{ .source = "../../ps1_processor", .destination = "ps1_processor" },
+        .{ .source = "../../lib/processor/ps1_processor", .destination = "ps1_processor" },
         .{ .source = "../../scripts", .destination = "scripts" },
         .{ .source = "../../src", .destination = "src" },
         .{ .source = "../../test", .destination = "test" },

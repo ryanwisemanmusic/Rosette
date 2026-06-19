@@ -1,4 +1,4 @@
-from ps1_processor.translator import main
+from .translator import main
 import sys
 
 if __name__ == "__main__":

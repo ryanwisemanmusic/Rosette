@@ -975,7 +975,7 @@ pub fn build(b: *std.Build) void {
         });
         x64_linux_runtime_mod.addImport("x64_syscalls", x64_syscalls_mod);
         const elf_processor_mod = b.createModule(.{
-            .root_source_file = b.path("../ELF_processor/main.zig"),
+            .root_source_file = b.path("../lib/processor/ELF_processor/main.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -991,7 +991,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(elf_processor);
 
         const elf_processor_test_mod = b.createModule(.{
-            .root_source_file = b.path("../ELF_processor/process.zig"),
+            .root_source_file = b.path("../lib/processor/ELF_processor/process.zig"),
             .target = target,
             .optimize = optimize,
         });
