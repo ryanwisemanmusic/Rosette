@@ -445,17 +445,57 @@ fn routeArch(init: std.process.Init, allocator: std.mem.Allocator, arch_args: []
         try execArgv(init.io, try prependArg(allocator, real_arch, arch_args));
         return;
     }
+    const trace_path = try compatTracePath(allocator);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, router_path);
     try argv.append(allocator, "run");
     try argv.append(allocator, "--prefer-intel");
+    try argv.append(allocator, "--trace");
+    try argv.append(allocator, trace_path);
     try argv.append(allocator, routed.target);
     for (routed.target_args) |arg| try argv.append(allocator, arg);
 
     const code = try runArgvResult(init.io, argv.items);
     std.process.exit(code);
+}
+
+fn compatTracePath(allocator: std.mem.Allocator) ![]const u8 {
+    if (getenvSlice("ROSETTE_COMPAT_TRACE")) |existing| {
+        if (existing.len != 0) return try allocator.dupe(u8, existing);
+    }
+
+    const base = try compatTraceBase(allocator);
+    return try std.fs.path.join(allocator, &.{ base, ".rosette", "rosetta2-handoff.trace.log" });
+}
+
+fn compatTraceBase(allocator: std.mem.Allocator) ![]const u8 {
+    if (getenvSlice("ROSETTE_PROJECT_ROOT")) |root| {
+        if (root.len != 0) return try allocator.dupe(u8, root);
+    }
+    const cwd = try absolutePath(allocator, ".");
+    return try nearestProjectRoot(allocator, cwd);
+}
+
+fn nearestProjectRoot(allocator: std.mem.Allocator, start_dir: []const u8) ![]const u8 {
+    var current = try allocator.dupe(u8, start_dir);
+    while (true) {
+        if (hasProjectRootMarker(allocator, current)) return current;
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = try allocator.dupe(u8, parent);
+    }
+    return try allocator.dupe(u8, start_dir);
+}
+
+fn hasProjectRootMarker(allocator: std.mem.Allocator, dir: []const u8) bool {
+    const markers = [_][]const u8{ ".git", ".rosette-project", "build.zig", "CMakeLists.txt", "Makefile", "GNUmakefile", "package.json", "pyproject.toml", "Cargo.toml", "xb" };
+    for (markers) |marker| {
+        const candidate = std.fs.path.join(allocator, &.{ dir, marker }) catch continue;
+        if (fileExists(allocator, candidate)) return true;
+    }
+    return false;
 }
 
 const ArchRoute = struct {
