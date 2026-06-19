@@ -486,6 +486,16 @@ const rpl_arpl = @import("RPL/ARPL.zig");
 const select_vpmultishiftqb = @import("SELECT/VPMULTISHIFTQB.zig");
 const send_senduipi = @import("SEND/SENDUIPI.zig");
 const serialize_serialize = @import("SERIALIZE/SERIALIZE.zig");
+const enqueue_enqcmd = @import("ENQUEUE/enqcmd.zig");
+const extr_bextr = @import("EXTR/bextr.zig");
+const extr_extractps = @import("EXTR/extractps.zig");
+const extr_fxtract = @import("EXTR/fxtract.zig");
+const extr_pext = @import("EXTR/pext.zig");
+const lock_lock = @import("LOCK/lock.zig");
+const lock_xacquire = @import("LOCK/xacquire.zig");
+const lock_xrelease = @import("LOCK/xrelease.zig");
+const neg_neg = @import("NEG/neg.zig");
+const round_frndint = @import("ROUND/frndint.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -974,6 +984,16 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VPMULTISHIFTQB",
     "SENDUIPI",
     "SERIALIZE",
+    "ENQCMD",
+    "BEXTR",
+    "EXTRACTPS",
+    "FXTRACT",
+    "PEXT",
+    "LOCK",
+    "XACQUIRE",
+    "XRELEASE",
+    "NEG",
+    "FRNDINT",
 };
 
 pub const TableMetadata = struct {
@@ -1523,6 +1543,16 @@ pub const tables = [_]InstructionTable{
     entry(select_vpmultishiftqb.family, select_vpmultishiftqb.path, select_vpmultishiftqb.source),
     entry(send_senduipi.family, send_senduipi.path, send_senduipi.source),
     entry(serialize_serialize.family, serialize_serialize.path, serialize_serialize.source),
+    entry(enqueue_enqcmd.family, enqueue_enqcmd.path, enqueue_enqcmd.source),
+    entry(extr_bextr.family, extr_bextr.path, extr_bextr.source),
+    entry(extr_extractps.family, extr_extractps.path, extr_extractps.source),
+    entry(extr_fxtract.family, extr_fxtract.path, extr_fxtract.source),
+    entry(extr_pext.family, extr_pext.path, extr_pext.source),
+    entry(lock_lock.family, lock_lock.path, lock_lock.source),
+    entry(lock_xacquire.family, lock_xacquire.path, lock_xacquire.source),
+    entry(lock_xrelease.family, lock_xrelease.path, lock_xrelease.source),
+    entry(neg_neg.family, neg_neg.path, neg_neg.source),
+    entry(round_frndint.family, round_frndint.path, round_frndint.source),
 };
 
 pub fn tableCount() usize {
