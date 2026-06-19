@@ -11,7 +11,7 @@ ZIG_VERSION ?= 0.16.0
 ZIG_LIB := zig-out/lib/librosette_zig.a
 EXE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
 ASSEMBLER_RUNNER_BIN := zig-out/bin/rosette_assembler_runner
-APP_EXE_BUILDER_SRC := rosette_app_exe.zig
+APP_EXE_BUILDER_SRC := src/tooling/exe_parser/rosette_app_exe.zig
 APP_EXE_BUILDER_BIN := zig-out/bin/rosette_app_exe
 ELF_PROCESSOR_BIN := zig-out/bin/elf_processor
 ELF_PROCESSOR_SRC := lib/processor/ELF_processor/main.zig
@@ -43,7 +43,7 @@ exit $$status
 endef
 
 # Standalone runner used by make exe-run and legacy/debug invocations.
-EXE_GATE_RUNNER_SRC := rosette_exe_runner.zig
+EXE_GATE_RUNNER_SRC := src/tooling/exe_parser/rosette_exe_runner.zig
 EXE_GATE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
 
 # Entitlements for codesigning (JIT, unsigned-executable-memory, etc.)

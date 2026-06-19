@@ -1,11 +1,11 @@
 const std = @import("std");
-const cpu = @import("src/DOS/execution/cpu_state.zig");
-const mem = @import("src/DOS/execution/segmented_memory.zig");
-const interrupts = @import("src/DOS/execution/interrupt_services.zig");
-const session = @import("src/DOS/execution/session.zig");
-const bridge = @import("src/tooling/binary_converter/dos16_loader_bridge.zig");
-const exporter = @import("src/tooling/binary_exporter/dos_mz_exporter.zig");
-const host_mod = @import("src/DOS/execution/host_services.zig");
+const cpu = @import("../../src/DOS/execution/cpu_state.zig");
+const mem = @import("../../src/DOS/execution/segmented_memory.zig");
+const interrupts = @import("../../src/DOS/execution/interrupt_services.zig");
+const session = @import("../../src/DOS/execution/session.zig");
+const bridge = @import("../../src/tooling/binary_converter/dos16_loader_bridge.zig");
+const exporter = @import("../../src/tooling/binary_exporter/dos_mz_exporter.zig");
+const host_mod = @import("../../src/DOS/execution/host_services.zig");
 
 test "dos execution integration compiles bridge and exporter" {
     _ = cpu.CpuState{};

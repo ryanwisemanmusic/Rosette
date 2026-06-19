@@ -1,5 +1,5 @@
 const std = @import("std");
-const core = @import("src/tooling/exe_parser/exe_runner_core.zig");
+const core = @import("exe_runner_core.zig");
 
 fn bootWrite(text: []const u8) void {
     _ = std.c.write(2, text.ptr, text.len);

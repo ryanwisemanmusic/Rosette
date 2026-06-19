@@ -39,13 +39,13 @@ pub fn build(b: *std.Build) void {
     helper_mod.addImport("app_macho_parser", app_macho_parser_mod);
 
     const exe_runner_mod = b.createModule(.{
-        .root_source_file = b.path("../../rosette_exe_runner.zig"),
+        .root_source_file = b.path("../../src/tooling/exe_parser/rosette_exe_runner.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     const exe_runner_cli_mod = b.createModule(.{
-        .root_source_file = b.path("../../exe_runner_bridge.zig"),
+        .root_source_file = b.path("../../src/tooling/exe_parser/exe_runner_bridge.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -394,8 +394,8 @@ pub fn build(b: *std.Build) void {
         .{ .source = "../../GNUmakefile", .destination = "GNUmakefile" },
         .{ .source = "../../LICENSE", .destination = "LICENSE" },
         .{ .source = "../../README.md", .destination = "README.md" },
-        .{ .source = "../../rosette_app_exe.zig", .destination = "rosette_app_exe.zig" },
-        .{ .source = "../../rosette_exe_runner.zig", .destination = "rosette_exe_runner.zig" },
+        .{ .source = "../../src/tooling/exe_parser/rosette_app_exe.zig", .destination = "rosette_app_exe.zig" },
+        .{ .source = "../../src/tooling/exe_parser/rosette_exe_runner.zig", .destination = "rosette_exe_runner.zig" },
         .{ .source = "build.zig", .destination = "app/bundling/build.zig" },
         .{ .source = "Info.plist", .destination = "app/bundling/Info.plist" },
         .{ .source = "../dmg/installer/build.zig", .destination = "app/dmg/installer/build.zig" },
@@ -436,8 +436,8 @@ pub fn build(b: *std.Build) void {
         \\  GNUmakefile
         \\  LICENSE
         \\  README.md
-        \\  rosette_app_exe.zig
-        \\  rosette_exe_runner.zig
+        \\  src/tooling/exe_parser/rosette_app_exe.zig
+        \\  src/tooling/exe_parser/rosette_exe_runner.zig
         \\  src/compat/rosetta2
         \\  app_testing/basic_snake
         \\  app_testing/Console-Tetris
