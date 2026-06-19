@@ -4,7 +4,7 @@ test_main
 libbarrier.a
 libpause.a
 tools/test_prodder
-/bat_processor/__pycache__
+/lib/processor/bat_processor/__pycache__
 .rosette/
 librosette_window.a
 snake_game
