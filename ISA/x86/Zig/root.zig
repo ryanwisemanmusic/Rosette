@@ -317,6 +317,7 @@ const bt_bts = @import("BT/BTS.zig");
 const cache_cldemote = @import("CACHE/CLDEMOTE.zig");
 const cache_clflush = @import("CACHE/CLFLUSH.zig");
 const cache_clflushopt = @import("CACHE/CLFLUSHOPT.zig");
+const cache_clwb = @import("CACHE/clwb.zig");
 const sha_sha1msg1 = @import("SHA/SHA1MSG1.zig");
 const sha_sha1msg2 = @import("SHA/SHA1MSG2.zig");
 const sha_sha1nexte = @import("SHA/SHA1NEXTE.zig");
@@ -523,6 +524,18 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const accumulate_crc32 = @import("ACCUMULATE/crc32.zig");
+const reverse_fdivr = @import("REVERSE/fdivr.zig");
+const reverse_fdivrp = @import("REVERSE/fdivrp.zig");
+const reverse_fidivr = @import("REVERSE/fidivr.zig");
+const reverse_fsubr = @import("REVERSE/fsubr.zig");
+const reverse_fsubrp = @import("REVERSE/fsubrp.zig");
+const reverse_fisubr = @import("REVERSE/fisubr.zig");
+const scan_scas = @import("SCAN/scas.zig");
+const scan_scasb = @import("SCAN/scasb.zig");
+const scan_scasw = @import("SCAN/scasw.zig");
+const scan_scasd = @import("SCAN/scasd.zig");
+const scan_scasq = @import("SCAN/scasq.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -1397,6 +1410,7 @@ pub const tables = [_]InstructionTable{
     entry(cache_cldemote.family, cache_cldemote.path, cache_cldemote.source),
     entry(cache_clflush.family, cache_clflush.path, cache_clflush.source),
     entry(cache_clflushopt.family, cache_clflushopt.path, cache_clflushopt.source),
+    entry(cache_clwb.family, cache_clwb.path, cache_clwb.source),
     entry(sha_sha1msg1.family, sha_sha1msg1.path, sha_sha1msg1.source),
     entry(sha_sha1msg2.family, sha_sha1msg2.path, sha_sha1msg2.source),
     entry(sha_sha1nexte.family, sha_sha1nexte.path, sha_sha1nexte.source),
@@ -1607,6 +1621,18 @@ pub const tables = [_]InstructionTable{
     entry(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),
     entry(wait_wait.family, wait_wait.path, wait_wait.source),
     entry(wait_mwait.family, wait_mwait.path, wait_mwait.source),
+    entry(accumulate_crc32.family, accumulate_crc32.path, accumulate_crc32.source),
+    entry(reverse_fdivr.family, reverse_fdivr.path, reverse_fdivr.source),
+    entry(reverse_fdivrp.family, reverse_fdivrp.path, reverse_fdivrp.source),
+    entry(reverse_fidivr.family, reverse_fidivr.path, reverse_fidivr.source),
+    entry(reverse_fsubr.family, reverse_fsubr.path, reverse_fsubr.source),
+    entry(reverse_fsubrp.family, reverse_fsubrp.path, reverse_fsubrp.source),
+    entry(reverse_fisubr.family, reverse_fisubr.path, reverse_fisubr.source),
+    entry(scan_scas.family, scan_scas.path, scan_scas.source),
+    entry(scan_scasb.family, scan_scasb.path, scan_scasb.source),
+    entry(scan_scasw.family, scan_scasw.path, scan_scasw.source),
+    entry(scan_scasd.family, scan_scasd.path, scan_scasd.source),
+    entry(scan_scasq.family, scan_scasq.path, scan_scasq.source),
 };
 
 pub fn tableCount() usize {

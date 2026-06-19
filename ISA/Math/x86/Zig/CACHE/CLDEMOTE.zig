@@ -33,3 +33,4 @@ pub fn verifyProofs() !void {
 test "x86 CLDEMOTE documented-contract proofs match table metadata" {
     try verifyProofs();
 }
+

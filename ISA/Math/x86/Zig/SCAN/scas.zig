@@ -2,10 +2,10 @@ const core = @import("../../../core.zig");
 const proofs = @import("../../../proofs.zig");
 
 pub const meta = core.InstructionMathMeta{
-    .name = "CLFLUSH",
-    .family = "CACHE",
-    .path = "CACHE/CLFLUSH.inc",
-    .source_table_path = "CACHE/CLFLUSH.inc",
+    .name = "SCAS",
+    .family = "SCAN",
+    .path = "SCAN/SCAS.inc",
+    .source_table_path = "SCAN/SCAS.inc",
     .target_isa = .x86,
     .operation = .documented_contract,
     .register_model = .documented_contract,
@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "CLFLUSH", .path = "CACHE/CLFLUSH.inc", .encoding_count = 1, .source_path_len = 17 } },
-    .{ .documented_contract = .{ .name = "CLFLUSH", .path = "CACHE/CLFLUSH.inc", .encoding_count = 1, .source_path_len = 17 } },
+    .{ .documented_contract = .{ .name = "SCAS", .path = "SCAN/SCAS.inc", .encoding_count = 4, .source_path_len = 13 } },
+    .{ .documented_contract = .{ .name = "SCAS", .path = "SCAN/SCAS.inc", .encoding_count = 4, .source_path_len = 13 } },
 };
 
 pub const proof_report = proofs.ProofReport{
@@ -30,7 +30,7 @@ pub fn verifyProofs() !void {
     try proofs.verifyReport(proofReport());
 }
 
-test "x86 CLFLUSH documented-contract proofs match table metadata" {
+test "x86 SCAS documented-contract proofs match table metadata" {
     try verifyProofs();
 }
 
