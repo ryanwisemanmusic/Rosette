@@ -496,6 +496,33 @@ const lock_xacquire = @import("LOCK/xacquire.zig");
 const lock_xrelease = @import("LOCK/xrelease.zig");
 const neg_neg = @import("NEG/neg.zig");
 const round_frndint = @import("ROUND/frndint.zig");
+const encode_encodekey128 = @import("ENCODE/encodekey128.zig");
+const galois_gf2p8affineinvqb = @import("GALOIS/gf2p8affineinvqb.zig");
+const galois_gf2p8affineqb = @import("GALOIS/gf2p8affineqb.zig");
+const galois_gf2p8mulb = @import("GALOIS/gf2p8mulb.zig");
+const invalidate_invd = @import("INVALIDATE/invd.zig");
+const invalidate_invlpg = @import("INVALIDATE/invlpg.zig");
+const invalidate_invpcid = @import("INVALIDATE/invpcid.zig");
+const make_enter = @import("MAKE/enter.zig");
+const repeat_rep = @import("REPEAT/rep.zig");
+const repeat_repe = @import("REPEAT/repe.zig");
+const repeat_repne = @import("REPEAT/repne.zig");
+const scatter_vpscatterdd = @import("SCATTER/vpscatterdd.zig");
+const scatter_vpscatterdq = @import("SCATTER/vpscatterdq.zig");
+const scatter_vpscatterqd = @import("SCATTER/vpscatterqd.zig");
+const scatter_vpscatterqq = @import("SCATTER/vpscatterqq.zig");
+const scatter_vscatterdps = @import("SCATTER/vscatterdps.zig");
+const scatter_vscatterdpd = @import("SCATTER/vscatterdpd.zig");
+const scatter_vscatterqps = @import("SCATTER/vscatterqps.zig");
+const scatter_vscatterqpd = @import("SCATTER/vscatterqpd.zig");
+const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
+const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
+const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
+const trig_fcos = @import("TRIG/fcos.zig");
+const trig_fsin = @import("TRIG/fsin.zig");
+const trig_fsincos = @import("TRIG/fsincos.zig");
+const wait_wait = @import("WAIT/wait.zig");
+const wait_mwait = @import("WAIT/mwait.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -1553,6 +1580,33 @@ pub const tables = [_]InstructionTable{
     entry(lock_xrelease.family, lock_xrelease.path, lock_xrelease.source),
     entry(neg_neg.family, neg_neg.path, neg_neg.source),
     entry(round_frndint.family, round_frndint.path, round_frndint.source),
+    entry(encode_encodekey128.family, encode_encodekey128.path, encode_encodekey128.source),
+    entry(galois_gf2p8affineinvqb.family, galois_gf2p8affineinvqb.path, galois_gf2p8affineinvqb.source),
+    entry(galois_gf2p8affineqb.family, galois_gf2p8affineqb.path, galois_gf2p8affineqb.source),
+    entry(galois_gf2p8mulb.family, galois_gf2p8mulb.path, galois_gf2p8mulb.source),
+    entry(invalidate_invd.family, invalidate_invd.path, invalidate_invd.source),
+    entry(invalidate_invlpg.family, invalidate_invlpg.path, invalidate_invlpg.source),
+    entry(invalidate_invpcid.family, invalidate_invpcid.path, invalidate_invpcid.source),
+    entry(make_enter.family, make_enter.path, make_enter.source),
+    entry(repeat_rep.family, repeat_rep.path, repeat_rep.source),
+    entry(repeat_repe.family, repeat_repe.path, repeat_repe.source),
+    entry(repeat_repne.family, repeat_repne.path, repeat_repne.source),
+    entry(scatter_vpscatterdd.family, scatter_vpscatterdd.path, scatter_vpscatterdd.source),
+    entry(scatter_vpscatterdq.family, scatter_vpscatterdq.path, scatter_vpscatterdq.source),
+    entry(scatter_vpscatterqd.family, scatter_vpscatterqd.path, scatter_vpscatterqd.source),
+    entry(scatter_vpscatterqq.family, scatter_vpscatterqq.path, scatter_vpscatterqq.source),
+    entry(scatter_vscatterdps.family, scatter_vscatterdps.path, scatter_vscatterdps.source),
+    entry(scatter_vscatterdpd.family, scatter_vscatterdpd.path, scatter_vscatterdpd.source),
+    entry(scatter_vscatterqps.family, scatter_vscatterqps.path, scatter_vscatterqps.source),
+    entry(scatter_vscatterqpd.family, scatter_vscatterqpd.path, scatter_vscatterqpd.source),
+    entry(square_root_fsqrt.family, square_root_fsqrt.path, square_root_fsqrt.source),
+    entry(square_root_sqrtpd.family, square_root_sqrtpd.path, square_root_sqrtpd.source),
+    entry(square_root_sqrtps.family, square_root_sqrtps.path, square_root_sqrtps.source),
+    entry(trig_fcos.family, trig_fcos.path, trig_fcos.source),
+    entry(trig_fsin.family, trig_fsin.path, trig_fsin.source),
+    entry(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),
+    entry(wait_wait.family, wait_wait.path, wait_wait.source),
+    entry(wait_mwait.family, wait_mwait.path, wait_mwait.source),
 };
 
 pub fn tableCount() usize {
