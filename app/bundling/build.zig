@@ -349,7 +349,7 @@ pub fn build(b: *std.Build) void {
         destination: []const u8,
     };
     const runtime_dirs = [_]RuntimeDir{
-        .{ .source = "../../Assemblers", .destination = "Assemblers" },
+        .{ .source = "../../lib/Assemblers", .destination = "Assemblers" },
         .{ .source = "../../lib/processor/ELF_processor", .destination = "ELF_processor" },
         .{ .source = "../../ISA", .destination = "ISA" },
         .{ .source = "../../app_testing/basic_snake", .destination = "app_testing/basic_snake" },
