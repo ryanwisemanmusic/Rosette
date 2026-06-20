@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process_guard = @import("entrypoint_kernel_process_guard");
+const third_party_includes = @import("compat_third_party_include_compat");
 
 const c = @cImport({
     @cInclude("errno.h");
@@ -2009,6 +2010,75 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
     try out.appendSlice(allocator,
         \\
         \\
+        \\__rosette_env_path_prepend() {
+        \\  local __rosette_var="$1"
+        \\  local __rosette_entry="$2"
+        \\  local __rosette_old="${!__rosette_var:-}"
+        \\  [ -n "$__rosette_entry" ] && [ -d "$__rosette_entry" ] || return 1
+        \\  case ":$__rosette_old:" in
+        \\    *":$__rosette_entry:"*) return 1 ;;
+        \\  esac
+        \\  if [ -n "$__rosette_old" ]; then
+        \\    export "$__rosette_var=$__rosette_entry:$__rosette_old"
+        \\  else
+        \\    export "$__rosette_var=$__rosette_entry"
+        \\  fi
+        \\  return 0
+        \\}
+        \\
+        \\__rosette_dir_has_direct_headers() {
+        \\  local __rosette_dir="$1"
+        \\  local __rosette_match
+        \\  [ -d "$__rosette_dir" ] || return 1
+        \\  for __rosette_match in "$__rosette_dir"/*.h "$__rosette_dir"/*.hh "$__rosette_dir"/*.hpp "$__rosette_dir"/*.hxx; do
+        \\    [ -e "$__rosette_match" ] && return 0
+        \\  done
+        \\  return 1
+        \\}
+        \\
+        \\__rosette_trace_third_party_includes() {
+        \\  [ -n "${ROSETTE_COMPAT_TRACE:-}" ] || return 0
+        \\  {
+        \\    printf '# Rosette third-party include compatibility\n'
+        \\    printf 'event = "third_party_include_compat"\n'
+        \\    printf 'root = "%s"\n' "$1"
+        \\    printf 'include_dirs = "%s"\n' "$2"
+        \\    printf '\n'
+        \\  } >> "$ROSETTE_COMPAT_TRACE" 2>/dev/null || true
+        \\}
+        \\
+        \\__rosette_apply_third_party_include_compat() {
+        \\  case "${ROSETTE_THIRD_PARTY_INCLUDE_COMPAT:-auto}" in
+        \\    0|off|OFF|false|FALSE|no|NO) return 0 ;;
+        \\  esac
+        \\
+        \\  local __rosette_root __rosette_tp __rosette_pkg __rosette_candidate __rosette_added
+        \\  for __rosette_root in "${ROSETTE_THIRD_PARTY_INCLUDE_ROOT:-}" "${ROSETTE_ROUTE_ROOT:-}" "${ROSETTE_CALLER_CWD:-}" "${ROSETTE_PROJECT_ROOT:-}" "$PWD"; do
+        \\    [ -n "$__rosette_root" ] || continue
+        \\    __rosette_tp="$__rosette_root/third_party"
+        \\    [ -d "$__rosette_tp" ] || continue
+        \\
+        \\    for __rosette_pkg in "$__rosette_tp"/*; do
+        \\      [ -d "$__rosette_pkg" ] || continue
+        \\      for __rosette_candidate in "$__rosette_pkg/include" "$__rosette_pkg/lib" "$__rosette_pkg/src"; do
+        \\        if __rosette_dir_has_direct_headers "$__rosette_candidate"; then
+        \\          if __rosette_env_path_prepend CPATH "$__rosette_candidate"; then
+        \\            __rosette_added="${__rosette_added:+$__rosette_added:}$__rosette_candidate"
+        \\          fi
+        \\        fi
+        \\      done
+        \\    done
+        \\
+        \\    if [ -n "$__rosette_added" ]; then
+        \\      export ROSETTE_THIRD_PARTY_INCLUDE_DIRS="${__rosette_added}${ROSETTE_THIRD_PARTY_INCLUDE_DIRS:+:$ROSETTE_THIRD_PARTY_INCLUDE_DIRS}"
+        \\      __rosette_trace_third_party_includes "$__rosette_root" "$__rosette_added"
+        \\    fi
+        \\    return 0
+        \\  done
+        \\}
+        \\
+        \\__rosette_apply_third_party_include_compat
+        \\
         \\arch() {
         \\  local __rosette_arch_backend="${ROSETTE_ARCH_BACKEND:-$HOME/.rosette/bin/rosette-arch}"
         \\  if [ -n "${ROSETTE_SHELL_DISABLE:-}" ]; then
@@ -2813,6 +2883,7 @@ fn runZigCompiler(io: std.Io, allocator: std.mem.Allocator, zig_mode: []const u8
     try argv.append(allocator, "x86_64-linux-gnu");
     try argv.append(allocator, "-w");
     try argv.append(allocator, "-Wno-nullability-completeness");
+    try appendThirdPartyIncludeArgs(io, &argv, allocator);
     try appendFilteredLinuxArgs(&argv, allocator, tool_args, false);
     return try runArgvResult(io, argv.items);
 }
@@ -3132,6 +3203,50 @@ fn appendFilteredLinuxArgs(
         }
         try argv.append(allocator, arg);
     }
+}
+
+fn appendThirdPartyIncludeArgs(io: std.Io, argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    if (!thirdPartyIncludeCompatEnabled()) return;
+    const root = thirdPartyIncludeRoot(allocator) catch return;
+    var dirs = third_party_includes.discoverIncludeDirs(io, allocator, root) catch return;
+    defer {
+        for (dirs.items) |dir| allocator.free(dir);
+        dirs.deinit(allocator);
+    }
+
+    for (dirs.items) |dir| {
+        try argv.append(allocator, "-I");
+        try argv.append(allocator, dir);
+    }
+}
+
+fn thirdPartyIncludeCompatEnabled() bool {
+    const value = getenvSlice("ROSETTE_THIRD_PARTY_INCLUDE_COMPAT") orelse return true;
+    return !isFalseEnvValue(value);
+}
+
+fn thirdPartyIncludeRoot(allocator: std.mem.Allocator) ![]const u8 {
+    const candidates = [_]?[]const u8{
+        getenvSlice("ROSETTE_THIRD_PARTY_INCLUDE_ROOT"),
+        getenvSlice("ROSETTE_ROUTE_ROOT"),
+        getenvSlice("ROSETTE_CALLER_CWD"),
+        getenvSlice("ROSETTE_PROJECT_ROOT"),
+        getenvSlice("PWD"),
+    };
+
+    for (candidates) |candidate| {
+        const raw = candidate orelse continue;
+        if (raw.len == 0) continue;
+        return absolutePath(allocator, raw) catch try allocator.dupe(u8, raw);
+    }
+    return absolutePath(allocator, ".") catch try allocator.dupe(u8, ".");
+}
+
+fn isFalseEnvValue(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "0") or
+        std.ascii.eqlIgnoreCase(value, "off") or
+        std.ascii.eqlIgnoreCase(value, "false") or
+        std.ascii.eqlIgnoreCase(value, "no");
 }
 
 fn execResolved(io: std.Io, allocator: std.mem.Allocator, tool_name: []const u8, tool_args: []const []const u8) !void {
@@ -3676,6 +3791,17 @@ test "bash env snippet routes x86 arch only" {
     try std.testing.expect(containsIgnoreCase(snippet, "-arch"));
     try std.testing.expect(containsIgnoreCase(snippet, "command /usr/bin/arch"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_USER_BASH_ENV"));
+}
+
+test "bash env snippet enables scoped third-party include compatibility" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippet = try buildBashEnvSnippet(arena.allocator(), "/tmp/rosette/bin/rosette-shell");
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_THIRD_PARTY_INCLUDE_COMPAT"));
+    try std.testing.expect(containsIgnoreCase(snippet, "__rosette_apply_third_party_include_compat"));
+    try std.testing.expect(containsIgnoreCase(snippet, "third_party"));
+    try std.testing.expect(containsIgnoreCase(snippet, "CPATH"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_THIRD_PARTY_INCLUDE_DIRS"));
 }
 
 test "arch wrapper routes x86 handoffs through standalone backend" {
