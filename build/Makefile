@@ -8,6 +8,9 @@ CC ?= clang
 CXX ?= clang++
 CFLAGS ?= -Wall -Wextra -Wno-ignored-attributes
 ZIG_VERSION ?= 0.16.0
+ZIG_CACHE_DIR ?= build/.zig-cache
+ZIG_GLOBAL_CACHE_DIR ?= build/.zig-cache/global
+ZIG_BUILD_ENV := ZIG_LOCAL_CACHE_DIR=$(ZIG_CACHE_DIR) ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR)
 ZIG_LIB := zig-out/lib/librosette_zig.a
 EXE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
 ASSEMBLER_RUNNER_BIN := zig-out/bin/rosette_assembler_runner
@@ -22,15 +25,18 @@ SHELL_HELPER_SRC := src/shell/global_config/rosette_shell.zig
 SHELL_HELPER_BIN := zig-out/bin/rosette-shell
 COMPAT_ROUTER_SRC := src/compat/rosetta2/main.zig
 COMPAT_ROUTER_BIN := zig-out/bin/rosette-router
-EXE ?= assets/exe_examples/Notepad.exe
-EXE_LOG ?= assets/exe_examples/$(basename $(notdir $(EXE))).trace.log
+ASSETS_DIR ?= $(if $(wildcard assets/dll/mscoree),assets,include/assets)
+DLL_ASSETS_DIR := $(ASSETS_DIR)/dll
+EXE_EXAMPLES_DIR := $(ASSETS_DIR)/exe_examples
+EXE ?= $(EXE_EXAMPLES_DIR)/Notepad.exe
+EXE_LOG ?= $(EXE_EXAMPLES_DIR)/$(basename $(notdir $(EXE))).trace.log
 APP_SUITE ?= basic_snake
 APP_HOST_BIN ?= app_testing/$(APP_SUITE)/$(APP_SUITE).host
-APP_EXE ?= assets/exe_examples/$(APP_SUITE).exe
-APP_TRACE ?= assets/exe_examples/$(APP_SUITE).trace.log
+APP_EXE ?= $(EXE_EXAMPLES_DIR)/$(APP_SUITE).exe
+APP_TRACE ?= $(EXE_EXAMPLES_DIR)/$(APP_SUITE).trace.log
 BUNDLED_APP_SUITES ?= Console-Tetris basic_snake snax86
 ROSETTE_RUNNER_TEMPLATE := app/bundling/zig-out/bin/rosette_exe_runner
-ROSETTE_RUNNER_KILL_PATTERN := rosette_([c]li_runner|[e]xe_runner).*assets/exe_examples
+ROSETTE_RUNNER_KILL_PATTERN := rosette_([c]li_runner|[e]xe_runner).*(assets|include/assets)/exe_examples
 ROSETTE_HOST_KILL_PATTERN := [/]app_testing/.*[.]host
 
 define RUN_ROSETTE_EXE
@@ -108,9 +114,9 @@ help:
 		'  make run          Build and run test/main.c' \
 		'  make prodder      Launch interactive test selector' \
 		'  make prodder-all  Run all suites non-interactively (CI)' \
-		'  make exe-list     List .exe files available under assets/exe_examples/' \
-		'  make exe-run EXE=assets/exe_examples/Notepad.exe  Parse/log one .exe intake session' \
-		'  make exe-export SRC_EXE=/path/to/file.exe [OUT_EXE=assets/exe_examples/Game.exe]' \
+		'  make exe-list     List .exe files available under $(EXE_EXAMPLES_DIR)/' \
+		'  make exe-run EXE=$(EXE_EXAMPLES_DIR)/Notepad.exe  Parse/log one .exe intake session' \
+		'  make exe-export SRC_EXE=/path/to/file.exe [OUT_EXE=$(EXE_EXAMPLES_DIR)/Game.exe]' \
 		'  make app-exe APP_SUITE=basic_snake      Build a Rosette .exe wrapper for one app_testing suite' \
 		'  make app-exe-parse APP_SUITE=basic_snake Build and parse one app_testing suite wrapper without launching it' \
 		'  make app-exe-run APP_SUITE=basic_snake  Build, parse, and launch one app_testing suite via .exe intake' \
@@ -203,7 +209,8 @@ shell-clean-state: shell-helper-build
 app-wrapper: mscoree-native shell-helper-build bundled-app-exes
 	@mkdir -p program/app
 	@echo "Building Rosette.app bundle..."
-	@zig build bundle --build-file app/bundling/build.zig --cache-dir build/.zig-cache --global-cache-dir build/.zig-cache/global 2>&1
+	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
+	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/bundling/build.zig 2>&1
 	@rm -rf program/app/Rosette.app
 	@cp -R app/bundling/zig-out/Rosette.app program/app/
 	@rm -rf "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
@@ -230,7 +237,8 @@ app-wrapper: mscoree-native shell-helper-build bundled-app-exes
 installer: app-wrapper
 	@mkdir -p program/installer
 	@echo "Building Rosette Installer.app..."
-	@zig build bundle --build-file app/dmg/installer/build.zig --cache-dir build/.zig-cache --global-cache-dir build/.zig-cache/global -Dpayload-app=program/app/Rosette.app 2>&1
+	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
+	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/dmg/installer/build.zig -Dpayload-app=program/app/Rosette.app 2>&1
 	@echo "Signing Rosette Installer.app..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/installer/zig-out/Rosette Installer.app/Contents/MacOS/rosette-install-helper"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/installer/zig-out/Rosette Installer.app/Contents/MacOS/rosette-installer"
@@ -265,7 +273,8 @@ installer: app-wrapper
 uninstaller:
 	@mkdir -p program/uninstaller
 	@echo "Building Rosette Uninstaller.app..."
-	@zig build bundle --build-file app/dmg/uninstaller/build.zig --cache-dir build/.zig-cache --global-cache-dir build/.zig-cache/global 2>&1
+	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
+	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/dmg/uninstaller/build.zig 2>&1
 	@echo "Signing Rosette Uninstaller.app..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app/Contents/MacOS/rosette-uninstall-helper"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app/Contents/MacOS/rosette-uninstaller"
@@ -442,9 +451,9 @@ prodder-all: window-lib cli-lib
 	@./tools/test_prodder --all
 
 exe-list:
-	@find assets/exe_examples -maxdepth 1 -type f \( -name '*.exe' -o -name '*.EXE' \) | sort
+	@find "$(EXE_EXAMPLES_DIR)" -maxdepth 1 -type f \( -name '*.exe' -o -name '*.EXE' \) | sort
 
-MSCOREE_NATIVE_DIR := assets/dll/mscoree
+MSCOREE_NATIVE_DIR := $(DLL_ASSETS_DIR)/mscoree
 MSCOREE_NATIVE_LIB := zig-out/bin/libmscoree_native.dylib
 MSCOREE_NATIVE_HELPER := zig-out/bin/rosette_mscoree_window_helper
 MSCOREE_NATIVE_HELPER_APP := zig-out/bin/RosetteMscoreeWindow.app
@@ -498,7 +507,8 @@ $(MSCOREE_NATIVE_HELPER_APP): $(MSCOREE_NATIVE_WINDOW_SRC) $(MSCOREE_NATIVE_HELP
 
 exe-runner-build: mscoree-native
 	@mkdir -p zig-out/bin
-	@zig build exe-runner --build-file app/bundling/build.zig --cache-dir build/.zig-cache --global-cache-dir build/.zig-cache/global 2>&1
+	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
+	@$(ZIG_BUILD_ENV) zig build exe-runner --build-file app/bundling/build.zig 2>&1
 	@cp app/bundling/zig-out/bin/rosette_exe_runner "$(EXE_RUNNER_BIN)"
 
 gate-runner-build: exe-runner-build
@@ -541,7 +551,7 @@ exe-export: exe-runner-build
 	fi; \
 	out="$(OUT_EXE)"; \
 	if [ -z "$$out" ]; then \
-		out="assets/exe_examples/$$(basename "$$src")"; \
+		out="$(EXE_EXAMPLES_DIR)/$$(basename "$$src")"; \
 	fi; \
 	mkdir -p "$$(dirname "$$out")"; \
 	cp "$$src" "$$out"; \
@@ -563,10 +573,10 @@ app-exe: app-suite-binary app-exe-builder-build
 	@echo "Packaged $(APP_SUITE) -> $(APP_EXE)"
 
 bundled-app-exes: app-exe-builder-build window-lib cli-lib
-	@mkdir -p assets/exe_examples
+	@mkdir -p "$(EXE_EXAMPLES_DIR)"
 	@for suite in $(BUNDLED_APP_SUITES); do \
 		host="app_testing/$$suite/$$suite.host"; \
-		exe="assets/exe_examples/$$suite.exe"; \
+		exe="$(EXE_EXAMPLES_DIR)/$$suite.exe"; \
 		echo "Building bundled Rosette .exe wrapper for $$suite..."; \
 		./tools/build_suite_binary.sh "$$suite" "$$host"; \
 		"$(APP_EXE_BUILDER_BIN)" "$$suite" "$(ROOT_DIR)/$$host" "$(ROOT_DIR)/app_testing/$$suite" "$$exe"; \
