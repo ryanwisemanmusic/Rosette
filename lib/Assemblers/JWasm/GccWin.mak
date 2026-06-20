@@ -16,7 +16,7 @@ ifndef DEBUG
 DEBUG=0
 endif
 
-inc_dirs  = -Isrc/H
+inc_dirs  = -IH
 
 #cflags stuff
 
@@ -25,9 +25,9 @@ ifeq ($(DEBUG),1)
 extra_c_flags = -DDEBUG_OUT -g
 lflagsd=
 ifeq ($(CYGWIN),1)
-OUTD=build/CygwinD
+OUTD=CygwinD
 else
-OUTD=build/MinGWD
+OUTD=MinGWD
 endif
 
 else
@@ -35,9 +35,9 @@ else
 extra_c_flags = -DNDEBUG -O2 -fomit-frame-pointer
 lflagsd=-s
 ifeq ($(CYGWIN),1)
-OUTD=build/CygwinR
+OUTD=CygwinR
 else
-OUTD=build/MinGWR
+OUTD=MinGWR
 endif
 
 endif
@@ -47,7 +47,7 @@ c_flags = -D__NT__ $(extra_c_flags)
 CC=gcc.exe -c $(inc_dirs) $(c_flags)
 LINK=gcc.exe
 
-$(OUTD)/%.o: src/%.c
+$(OUTD)/%.o: %.c
 	$(CC) -o $(OUTD)/$*.o $<
 
 include gccmod.inc
@@ -62,11 +62,11 @@ $(OUTD):
 $(OUTD)/$(name).exe : $(OUTD)/main.o $(proj_obj)
 	$(LINK) $(OUTD)/main.o $(proj_obj) $(lflagsd) -o $(OUTD)/$(name).exe -Wl,-Map,$(OUTD)/$(name).map
 
-$(OUTD)/msgtext.o: src/msgtext.c src/H/msgdef.h
-	$(CC) -o $(OUTD)/msgtext.o src/msgtext.c
+$(OUTD)/msgtext.o: msgtext.c H/msgdef.h
+	$(CC) -o $(OUTD)/msgtext.o msgtext.c
 
-$(OUTD)/reswords.o: src/reswords.c src/H/instruct.h src/H/special.h src/H/directve.h
-	$(CC) -o $(OUTD)/reswords.o src/reswords.c
+$(OUTD)/reswords.o: reswords.c H/instruct.h H/special.h H/directve.h
+	$(CC) -o $(OUTD)/reswords.o reswords.c
 
 ######
 

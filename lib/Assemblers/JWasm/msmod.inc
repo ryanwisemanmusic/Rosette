@@ -13,7 +13,6 @@ $(OUTD)/context.obj  \
 $(OUTD)/cpumodel.obj \
 $(OUTD)/data.obj     \
 $(OUTD)/dbgcv.obj    \
-$(OUTD)/dbgdw.obj    \
 $(OUTD)/directiv.obj \
 $(OUTD)/elf.obj      \
 $(OUTD)/end.obj      \
