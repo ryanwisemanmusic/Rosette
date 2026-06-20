@@ -272,9 +272,12 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
     const macho_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "macho_processor" });
 
+    const include_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "include" });
     try makePathRecursive(allocator, bin_dir);
     try makePathRecursive(allocator, wrapper_dir);
     try makePathRecursive(allocator, lib_dir);
+    try makePathRecursive(allocator, include_dir);
+    try ensureX86CompatHeader(allocator, include_dir);
     try copySelf(init, allocator, helper_path);
     try copySelf(init, allocator, rosette_path);
     try ensureArchBackend(allocator, arch_backend_path);
@@ -2856,6 +2859,45 @@ const clean_state_backend_script =
     \\
 ;
 
+const x86IntrinsicsCompatH =
+    \\#ifndef ROSETTE_X86_INTRINSICS_COMPAT_H
+    \\#define ROSETTE_X86_INTRINSICS_COMPAT_H
+    \\
+    \\/*
+    \\ * Rosette x86 intrinsic compatibility header.
+    \\ *
+    \\ * When cross-compiling x86_64 code from a non-x86 host, certain
+    \\ * compiler builtins may not be available.  This file provides
+    \\ * portable fallback definitions using inline assembly.
+    \\ */
+    \\
+    \\#ifdef __x86_64__
+    \\#ifndef __cpuid_count
+    \\#define __cpuid_count(leaf, subleaf, eax, ebx, ecx, edx)           \
+    \\    __asm__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) \
+    \\                   :  "a"(leaf), "c"(subleaf))
+    \\#endif
+    \\#endif
+    \\
+    \\#endif
+    \\
+;
+
+fn ensureX86CompatHeader(allocator: std.mem.Allocator, include_dir: []const u8) !void {
+    const header_path = try std.fs.path.join(allocator, &.{ include_dir, "x86_intrinsics_compat.h" });
+    writeFilePath(allocator, header_path, x86IntrinsicsCompatH) catch |err| {
+        std.debug.print("warning: could not write x86 compat header: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn resolveX86CompatHeaderPath(io: std.Io, allocator: std.mem.Allocator) ?[]const u8 {
+    _ = io;
+    const home = homeDir(allocator) catch return null;
+    const installed = std.fs.path.join(allocator, &.{ home, ".rosette", "include", "x86_intrinsics_compat.h" }) catch return null;
+    if (fileExists(allocator, installed)) return installed;
+    return null;
+}
+
 fn removeWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8) !void {
     const tools = [_][]const u8{ "yasm", "ld", "g++", "c++", "gcc", "cc", "clang", "clang++" };
     for (tools) |tool| {
@@ -3128,7 +3170,7 @@ fn execZigLd(io: std.Io, allocator: std.mem.Allocator, tool_args: []const []cons
     try argv.append(allocator, "-target");
     try argv.append(allocator, "x86_64-linux-gnu");
     try argv.append(allocator, "-nostdlib");
-    try appendFilteredLinuxArgs(&argv, allocator, tool_args, true);
+    try appendFilteredLinuxArgs(io, &argv, allocator, tool_args, true);
     try execArgv(io, argv.items);
 }
 
@@ -3164,8 +3206,7 @@ fn runCompilerSanitizer(io: std.Io, allocator: std.mem.Allocator, compiler_argv:
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, compiler_argv[0]);
-    try appendSanitizedCompilerArgs(&argv, allocator, compiler_argv[1..], compilerArgsTargetX86(compiler_argv[1..]), false);
-    _ = io;
+    try appendSanitizedCompilerArgs(io, &argv, allocator, compiler_argv[1..], compilerArgsTargetX86(compiler_argv[1..]), false);
     try execArgvReplace(allocator, argv.items);
 }
 
@@ -3178,7 +3219,7 @@ fn runZigCompiler(io: std.Io, allocator: std.mem.Allocator, zig_mode: []const u8
     try argv.append(allocator, "x86_64-linux-gnu");
     try argv.append(allocator, "-Wno-nullability-completeness");
     try appendProjectIncludeArgs(io, &argv, allocator);
-    try appendSanitizedCompilerArgs(&argv, allocator, tool_args, true, false);
+    try appendSanitizedCompilerArgs(io, &argv, allocator, tool_args, true, false);
     return try runArgvResult(io, argv.items);
 }
 
@@ -3490,15 +3531,17 @@ fn pathContainsSimdBridgeDir(path: []const u8) bool {
 }
 
 fn appendFilteredLinuxArgs(
+    io: std.Io,
     argv: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
     tool_args: []const []const u8,
     strip_ld_debug: bool,
 ) !void {
-    try appendSanitizedCompilerArgs(argv, allocator, tool_args, true, strip_ld_debug);
+    try appendSanitizedCompilerArgs(io, argv, allocator, tool_args, true, strip_ld_debug);
 }
 
 fn appendSanitizedCompilerArgs(
+    io: std.Io,
     argv: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
     tool_args: []const []const u8,
@@ -3529,6 +3572,15 @@ fn appendSanitizedCompilerArgs(
             }
         }
         try argv.append(allocator, arg);
+    }
+    // Inject x86 intrinsic compat header when targeting x86, to bridge
+    // builtins that may be absent when cross-compiling from a non-x86 host
+    // (e.g. __cpuid_count on Apple Clang for ARM64).
+    if (target_x86) {
+        if (resolveX86CompatHeaderPath(io, allocator)) |header_path| {
+            try argv.append(allocator, "-include");
+            try argv.append(allocator, header_path);
+        }
     }
 }
 
@@ -3640,6 +3692,12 @@ fn execArgv(io: std.Io, argv: []const []const u8) !void {
 fn execArgvReplace(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     if (argv.len == 0) return error.EmptyArgv;
 
+    // Pre-flight: verify the binary exists and is executable.
+    if (!canExecute(allocator, argv[0])) {
+        std.debug.print("rosette-shell: cannot exec {s} — not found or not executable\n", .{argv[0]});
+        std.process.exit(127);
+    }
+
     var argv_z: std.ArrayList(?[*:0]const u8) = .empty;
     defer argv_z.deinit(allocator);
 
@@ -3651,9 +3709,146 @@ fn execArgvReplace(allocator: std.mem.Allocator, argv: []const []const u8) !void
     }
     try argv_z.append(allocator, null);
 
-    _ = std.c.execve(path_z.ptr, @ptrCast(argv_z.items.ptr), @ptrCast(std.c.environ));
-    std.debug.print("rosette-shell: failed to exec {s}\n", .{argv[0]});
-    std.process.exit(127);
+    // Build a clean environment: strip Rosette vars and DYLD_INSERT_LIBRARIES
+    // to prevent recursive interception or arch-mismatch dylib hangs.
+    var clean_env: std.ArrayList(?[*:0]const u8) = .empty;
+    defer clean_env.deinit(allocator);
+
+    {
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry| : (i += 1) {
+            const entry_str = std.mem.sliceTo(entry, 0);
+            const eq_pos = std.mem.indexOfScalar(u8, entry_str, '=') orelse {
+                const e = try allocator.dupeZ(u8, entry_str);
+                try clean_env.append(allocator, e.ptr);
+                continue;
+            };
+            const var_name = entry_str[0..eq_pos];
+            if (std.mem.startsWith(u8, var_name, "ROSETTE_")) continue;
+            if (std.mem.eql(u8, var_name, "DYLD_INSERT_LIBRARIES")) continue;
+            const e = try allocator.dupeZ(u8, entry_str);
+            try clean_env.append(allocator, e.ptr);
+        }
+    }
+    try clean_env.append(allocator, null);
+
+    if (getenvSlice("ROSETTE_SANITIZER_TRACE")) |_| {
+        std.debug.print("rosette-shell: exec {s}", .{argv[0]});
+        for (argv[1..]) |a| std.debug.print(" {s}", .{a});
+        std.debug.print("\n", .{});
+    }
+
+    // Use fork+exec with timeout so the parent survives and can diagnose.
+    // Direct execve can hang at kernel level if Rosette's kext blocks.
+    execForkWait(argv_z.items, path_z.ptr, clean_env.items);
+}
+
+fn monotonicMs() u64 {
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(0, &ts) == 0) {
+        // clock_gettime with CLOCK_MONOTONIC = 0 on most systems
+        return @as(u64, @intCast(ts.tv_sec)) * 1000 + @as(u64, @intCast(@divTrunc(ts.tv_nsec, @as(c_long, 1_000_000))));
+    }
+    // Fallback: use gettimeofday
+    var tv: c.struct_timeval = undefined;
+    _ = c.gettimeofday(&tv, null);
+    return @as(u64, @intCast(tv.tv_sec)) * 1000 + @as(u64, @intCast(@divTrunc(tv.tv_usec, @as(c_int, 1000))));
+}
+
+fn execForkWait(argv: [](?[*:0]const u8), path: [*:0]const u8, env: [](?[*:0]const u8)) noreturn {
+    const pid = c.fork();
+    switch (pid) {
+        -1 => {
+            const err = currentErrno();
+            std.debug.print("rosette-shell: fork failed (errno={d}: {s})\n", .{ err, errnoName(err) });
+            std.process.exit(127);
+        },
+        0 => {
+            // Child: exec with clean environment.
+            _ = c.execve(path, @ptrCast(argv.ptr), @ptrCast(env.ptr));
+            // Only reachable if execve fails.
+            const err = currentErrno();
+            std.debug.print("rosette-shell: child execve({s}) failed (errno={d}: {s})\n", .{
+                std.mem.sliceTo(path, 0), err, errnoName(err),
+            });
+            c._exit(127);
+        },
+        else => {
+            // Parent: wait with timeout.
+            const timeout_ms: u64 = 30000;
+            const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
+            var deadline: ?u64 = null;
+
+            if (getenvSlice("ROSETTE_SANITIZER_TIMEOUT_MS")) |timeout_str| {
+                if (std.fmt.parseUnsigned(u64, timeout_str, 10)) |parsed| {
+                    deadline = if (parsed > 0) monotonicMs() + parsed else null;
+                } else |_| {}
+            }
+            if (deadline == null) deadline = monotonicMs() + timeout_ms;
+            const deadline_ms = deadline.?;
+
+            var status: i32 = 0;
+            while (true) {
+                const now_ms = monotonicMs();
+                if (now_ms >= deadline_ms) {
+                    // Timeout — kill child and report.
+                    _ = c.kill(pid, c.SIGKILL);
+                    // Small grace for kill to take effect.
+                    _ = c.usleep(100_000);
+                    _ = c.kill(pid, c.SIGKILL);
+                    std.debug.print("rosette-shell: {s} timed out after {}ms — killed\n", .{
+                        std.mem.sliceTo(path, 0), now_ms - (deadline_ms - timeout_ms),
+                    });
+
+                    // Print diagnostics about the stuck process.
+                    _ = tryResolveProcPath(pid);
+                    _ = tryKmemStack(pid);
+
+                    std.process.exit(124);
+                }
+
+                const rc = c.waitpid(pid, &status, c.WNOHANG);
+                if (rc == pid) {
+                    // Child exited.
+                    if (c.WIFEXITED(status)) std.process.exit(@intCast(c.WEXITSTATUS(status)));
+                    if (c.WIFSIGNALED(status)) {
+                        const sig = c.WTERMSIG(status);
+                        std.debug.print("rosette-shell: {s} killed by signal {d}\n", .{
+                            std.mem.sliceTo(path, 0), sig,
+                        });
+                        std.process.exit(128 + @as(u8, @intCast(sig)));
+                    }
+                    std.debug.print("rosette-shell: {s} exited abnormally (status={x})\n", .{
+                        std.mem.sliceTo(path, 0), status,
+                    });
+                    std.process.exit(1);
+                } else if (rc == -1) {
+                    const err = currentErrno();
+                    std.debug.print("rosette-shell: waitpid failed (errno={d}: {s})\n", .{ err, errnoName(err) });
+                    std.process.exit(127);
+                }
+                // rc == 0: child still running, poll again.
+                _ = c.usleep(@intCast(poll_interval_ns / std.time.ns_per_us));
+            }
+        },
+    }
+}
+
+fn tryResolveProcPath(pid: i32) bool {
+    // Attempt to read the child's cwd via proc_regionfilename or proc_pidpath.
+    var path_buf: [4096]u8 = undefined;
+    const len = c.proc_regionfilename(pid, 0, &path_buf, @as(u32, @intCast(path_buf.len)));
+    if (len > 0) {
+        const path_slice = path_buf[0..@intCast(len)];
+        std.debug.print("rosette-shell: stuck pid {d} region: {s}\n", .{ pid, path_slice });
+        return true;
+    }
+    return false;
+}
+
+fn tryKmemStack(pid: i32) bool {
+    _ = pid;
+    return false;
 }
 
 fn runArgvResult(io: std.Io, argv: []const []const u8) !u8 {
@@ -4206,7 +4401,7 @@ test "compiler sanitizer strips SIMD bridge include dirs only for x86 targets" {
         "-c",
         "file.c",
     };
-    try appendSanitizedCompilerArgs(&argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try appendSanitizedCompilerArgs(undefined, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
     try std.testing.expect(hasString(argv.items, "-I/repo/third_party/zstd"));
     try std.testing.expect(hasString(argv.items, "/repo/include"));
     try std.testing.expect(!hasString(argv.items, "/repo/third_party/AvxToNeon"));
@@ -4218,7 +4413,7 @@ test "compiler sanitizer keeps SIMD bridge dirs for non-x86 targets" {
     defer argv.deinit(std.testing.allocator);
 
     const args = [_][]const u8{ "-arch", "arm64", "-isystem", "/repo/third_party/AvxToNeon", "-c", "file.c" };
-    try appendSanitizedCompilerArgs(&argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try appendSanitizedCompilerArgs(undefined, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
     try std.testing.expect(hasString(argv.items, "/repo/third_party/AvxToNeon"));
 }
 
