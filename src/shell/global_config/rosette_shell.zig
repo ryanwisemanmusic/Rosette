@@ -257,12 +257,8 @@ fn usage(exe_name: []const u8) void {
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
     std.debug.print("[INSTALL] Starting Rosette shell installation/update\n", .{});
-    std.debug.print("[INSTALL] Pre-flight cleanup: killing any existing Rosette helper processes\n", .{});
-    pid_manager.killRosetteHelpers(allocator) catch |err| {
-        std.debug.print("[INSTALL] Warning: pre-flight cleanup failed: {s}\n", .{@errorName(err)});
-    };
 
-    std.debug.print("[INSTALL] Step 1: Building directory paths\n", .{});
+    // Check for existing installation stamp
     const home = homeDir(allocator) catch |err| {
         std.debug.print("[INSTALL] CRITICAL ERROR: Failed to get home directory: {s}\n", .{@errorName(err)});
         return err;
@@ -271,6 +267,20 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
         std.debug.print("[INSTALL] ERROR: Failed to build rosette_dir path: {s}\n", .{@errorName(err)});
         return err;
     };
+    const stamp_path = std.fs.path.join(allocator, &.{ rosette_dir, ".install-stamp" }) catch unreachable;
+
+    if (fileExists(allocator, stamp_path)) {
+        const contents = std.Io.Dir.cwd().readFileAlloc(init.io, stamp_path, allocator, .limited(256)) catch "";
+        if (contents.len > 0) {
+            std.debug.print("[INSTALL] Found existing installation stamp\n", .{});
+            std.debug.print("[INSTALL] Previous installation info: {s}\n", .{contents});
+            std.debug.print("[INSTALL] Continuing with update (will overwrite existing installation)\n", .{});
+        }
+    }
+
+    std.debug.print("[INSTALL] Pre-flight cleanup: skipped during install/update; use rosette-clean-state explicitly for stale helpers\n", .{});
+
+    std.debug.print("[INSTALL] Step 1: Building directory paths\n", .{});
     const bin_dir = std.fs.path.join(allocator, &.{ rosette_dir, "bin" }) catch |err| {
         std.debug.print("[INSTALL] ERROR: Failed to build bin_dir path: {s}\n", .{@errorName(err)});
         return err;
@@ -526,8 +536,28 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     std.debug.print("current terminal reload: source ~/.rosette/rosette-shell.sh\n", .{});
     std.debug.print("diagnose from a project: rosette-diagnose-shell ./program\n", .{});
 
-    std.debug.print("[INSTALL] Installation/update completed successfully\n", .{});
+    // Write installation stamp
+    const stamp_path_final = std.fs.path.join(allocator, &.{ rosette_dir, ".install-stamp" }) catch unreachable;
+    const timestamp = c.time(null);
+    const source_info = if (source_root.len > 0)
+        try std.fmt.allocPrint(allocator, "source={s} ", .{source_root})
+    else
+        try allocator.dupe(u8, "");
+    const stamp_content = try std.fmt.allocPrint(allocator, "{s}timestamp={d}\n", .{ source_info, timestamp });
+    writeFilePath(allocator, stamp_path_final, stamp_content) catch |err| {
+        std.debug.print("[INSTALL] Warning: Failed to write installation stamp: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Installation stamp written to: {s}\n", .{stamp_path_final});
+
+    // Post-installation cleanup to ensure no processes are left behind
+    std.debug.print("[INSTALL] Running post-installation process cleanup\n", .{});
+    pid_manager.reapZombies();
+
+    // Final check for any remaining Rosette processes
+    std.debug.print("[INSTALL] Final process check\n", .{});
     pid_manager.printTrackedProcessStatus();
+
+    std.debug.print("[INSTALL] Installation/update completed successfully\n", .{});
 }
 
 fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
@@ -547,6 +577,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
     const source_root = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
     const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
+    const stamp_path = try std.fs.path.join(allocator, &.{ rosette_dir, ".install-stamp" });
     const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
     const macho_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "macho_processor" });
     const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
@@ -557,6 +588,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     try unlinkIfExists(allocator, bash_env_path);
     try unlinkIfExists(allocator, source_root);
     try unlinkIfExists(allocator, toml_path);
+    try unlinkIfExists(allocator, stamp_path);
     try unlinkIfExists(allocator, elf_processor_path);
     try unlinkIfExists(allocator, macho_processor_path);
     try unlinkIfExists(allocator, compat_router_path);
@@ -1852,6 +1884,8 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\export ROSETTE_ROUTER
         \\: "${ROSETTE_COMPILER_SANITIZER:=$HOME/.rosette/bin/rosette-compiler-sanitize}"
         \\export ROSETTE_COMPILER_SANITIZER
+        \\: "${ROSETTE_X86_INTRINSICS_COMPAT:=$HOME/.rosette/include/x86_intrinsics_compat.h}"
+        \\export ROSETTE_X86_INTRINSICS_COMPAT
         \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ] && [ "${ROSETTE_COMPILER_SANITIZER_ENABLE:-auto}" != "0" ] && [ -x "$ROSETTE_COMPILER_SANITIZER" ]; then
         \\  : "${CMAKE_C_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
         \\  : "${CMAKE_CXX_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
@@ -2051,6 +2085,17 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\      local __rosette_old_elf_proc __rosette_had_elf_proc
         \\      local __rosette_old_zig_local __rosette_had_zig_local
         \\      local __rosette_old_zig_global __rosette_had_zig_global
+        \\      local __rosette_make_arg
+        \\      for __rosette_make_arg in "$@"; do
+        \\        case "$__rosette_make_arg" in
+        \\          shell|shell-update|install-shell|shell-uninstall|shell-clean-state)
+        \\            ROSETTE_SHELL_DISABLE=1 command make "$@"
+        \\            __rosette_status=$?
+        \\            __rosette_after_make "$__rosette_status" "$@"
+        \\            return "$?"
+        \\            ;;
+        \\        esac
+        \\      done
         \\      __rosette_env="${TMPDIR:-/tmp}/rosette-shell-env.$$"
         \\      __rosette_old_path="$PATH"
         \\      __rosette_had_makefiles=0
@@ -2250,6 +2295,8 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
         \\
         \\: "${ROSETTE_COMPILER_SANITIZER:=$HOME/.rosette/bin/rosette-compiler-sanitize}"
         \\export ROSETTE_COMPILER_SANITIZER
+        \\: "${ROSETTE_X86_INTRINSICS_COMPAT:=$HOME/.rosette/include/x86_intrinsics_compat.h}"
+        \\export ROSETTE_X86_INTRINSICS_COMPAT
         \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ] && [ "${ROSETTE_COMPILER_SANITIZER_ENABLE:-auto}" != "0" ] && [ -x "$ROSETTE_COMPILER_SANITIZER" ]; then
         \\  : "${CMAKE_C_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
         \\  : "${CMAKE_CXX_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
@@ -2293,23 +2340,6 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
         \\  return 1
         \\}
         \\
-        \\__rosette_path_has_simd_bridge_dir() {
-        \\  local __rosette_path="$1"
-        \\  local __rosette_part __rosette_old_ifs
-        \\  __rosette_old_ifs="$IFS"
-        \\  IFS=/
-        \\  for __rosette_part in $__rosette_path; do
-        \\    case "$__rosette_part" in
-        \\      *2[Nn][Ee][Oo][Nn]*|*[Tt][Oo][Nn][Ee][Oo][Nn]*)
-        \\        IFS="$__rosette_old_ifs"
-        \\        return 0
-        \\        ;;
-        \\    esac
-        \\  done
-        \\  IFS="$__rosette_old_ifs"
-        \\  return 1
-        \\}
-        \\
         \\__rosette_dir_has_standard_header_shadow() {
         \\  local __rosette_dir="$1"
         \\  local __rosette_name
@@ -2320,10 +2350,20 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
         \\  return 1
         \\}
         \\
+        \\__rosette_dir_has_x86_intrinsic_shadow() {
+        \\  local __rosette_dir="$1"
+        \\  local __rosette_name
+        \\  [ -d "$__rosette_dir" ] || return 1
+        \\  for __rosette_name in adxintrin.h ammintrin.h avx2intrin.h avx512bfintrin.h avx512bitalgintrin.h avx512bwbf16vlintrin.h avx512bwintrin.h avx512cdintrin.h avx512dqintrin.h avx512erintrin.h avx512fintrin.h avx512fp16intrin.h avx512ifmainintrin.h avx512ifmavlintrin.h avx512pfintrin.h avx512vbmi2intrin.h avx512vbmiintrin.h avx512vlbitalgintrin.h avx512vlbwintrin.h avx512vldqintrin.h avx512vlintrin.h avx512vlvbmi2intrin.h avx512vlvnniintrin.h avx512vnniintrin.h avx512vp2intersectintrin.h avx512vpopcntdqintrin.h avx512vpopcntdqvlintrin.h avx512vpopcntintrin.h avx512vpopcntvlintrin.h avx512vpshufbitqmbintrin.h avxintrin.h avxintrin512.h bmi2intrin.h bmiintrin.h clflushoptintrin.h clwbintrin.h cpuid.h emmintrin.h f16cintrin.h fma4intrin.h fmaintrin.h fxsrintrin.h ia32intrin.h immintrin.h lwpintrin.h lzcntintrin.h mmintrin.h movdirintrin.h mwaitxintrin.h nmmintrin.h pconfigintrin.h pkuintrin.h pmmintrin.h popcntintrin.h prfchwintrin.h rdseedintrin.h rtmintrin.h serializeintrin.h sgxintrin.h shaintrin.h smmintrin.h tbmintrin.h tmmintrin.h uintrintrin.h vaesintrin.h vpclmulqdqintrin.h waitpkgintrin.h wbnoinvdintrin.h wmmintrin.h x86gprintrin.h x86intrin.h xmmintrin.h xopintrin.h; do
+        \\    [ -e "$__rosette_dir/$__rosette_name" ] && return 0
+        \\  done
+        \\  return 1
+        \\}
+        \\
         \\__rosette_dir_is_safe_include_root() {
         \\  local __rosette_dir="$1"
         \\  [ -d "$__rosette_dir" ] || return 1
-        \\  __rosette_path_has_simd_bridge_dir "$__rosette_dir" && return 1
+        \\  __rosette_dir_has_x86_intrinsic_shadow "$__rosette_dir" && return 1
         \\  __rosette_dir_has_standard_header_shadow "$__rosette_dir" && return 1
         \\  __rosette_dir_has_direct_headers "$__rosette_dir" && return 0
         \\  __rosette_dir_has_child_headers "$__rosette_dir" && return 0
@@ -2639,6 +2679,7 @@ const compiler_launcher_script =
     \\
     \\compiler="$1"
     \\shift
+    \\x86_compat_header="${ROSETTE_X86_INTRINSICS_COMPAT:-$HOME/.rosette/include/x86_intrinsics_compat.h}"
     \\
     \\__rosette_compiler_arg_is_x86() {
     \\  case "$1" in
@@ -2647,10 +2688,13 @@ const compiler_launcher_script =
     \\  return 1
     \\}
     \\
-    \\__rosette_path_is_simd_bridge() {
-    \\  case "$1" in
-    \\    *2[Nn][Ee][Oo][Nn]*|*[Tt][Oo][Nn][Ee][Oo][Nn]*) return 0 ;;
-    \\  esac
+    \\__rosette_path_has_x86_intrinsic_shadow() {
+    \\  local dir="$1"
+    \\  local name
+    \\  [ -d "$dir" ] || return 1
+    \\  for name in adxintrin.h ammintrin.h avx2intrin.h avx512bfintrin.h avx512bitalgintrin.h avx512bwbf16vlintrin.h avx512bwintrin.h avx512cdintrin.h avx512dqintrin.h avx512erintrin.h avx512fintrin.h avx512fp16intrin.h avx512ifmainintrin.h avx512ifmavlintrin.h avx512pfintrin.h avx512vbmi2intrin.h avx512vbmiintrin.h avx512vlbitalgintrin.h avx512vlbwintrin.h avx512vldqintrin.h avx512vlintrin.h avx512vlvbmi2intrin.h avx512vlvnniintrin.h avx512vnniintrin.h avx512vp2intersectintrin.h avx512vpopcntdqintrin.h avx512vpopcntdqvlintrin.h avx512vpopcntintrin.h avx512vpopcntvlintrin.h avx512vpshufbitqmbintrin.h avxintrin.h avxintrin512.h bmi2intrin.h bmiintrin.h clflushoptintrin.h clwbintrin.h cpuid.h emmintrin.h f16cintrin.h fma4intrin.h fmaintrin.h fxsrintrin.h ia32intrin.h immintrin.h lwpintrin.h lzcntintrin.h mmintrin.h movdirintrin.h mwaitxintrin.h nmmintrin.h pconfigintrin.h pkuintrin.h pmmintrin.h popcntintrin.h prfchwintrin.h rdseedintrin.h rtmintrin.h serializeintrin.h sgxintrin.h shaintrin.h smmintrin.h tbmintrin.h tmmintrin.h uintrintrin.h vaesintrin.h vpclmulqdqintrin.h waitpkgintrin.h wbnoinvdintrin.h wmmintrin.h x86gprintrin.h x86intrin.h xmmintrin.h xopintrin.h; do
+    \\    [ -e "$dir/$name" ] && return 0
+    \\  done
     \\  return 1
     \\}
     \\
@@ -2678,6 +2722,9 @@ const compiler_launcher_script =
     \\done
     \\
     \\filtered=()
+    \\if [ "$target_x86" = "1" ] && [ "${ROSETTE_X86_INTRINSICS_COMPAT_ENABLE:-auto}" != "0" ] && [ -f "$x86_compat_header" ]; then
+    \\  filtered+=("-include" "$x86_compat_header")
+    \\fi
     \\while [ "$#" -gt 0 ]; do
     \\  arg="$1"
     \\  shift
@@ -2686,7 +2733,7 @@ const compiler_launcher_script =
     \\      if [ "$#" -gt 0 ]; then
     \\        path="$1"
     \\        shift
-    \\        if [ "$target_x86" = "1" ] && __rosette_path_is_simd_bridge "$path"; then
+    \\        if [ "$target_x86" = "1" ] && __rosette_path_has_x86_intrinsic_shadow "$path"; then
     \\          continue
     \\        fi
     \\        filtered+=("$arg" "$path")
@@ -2696,7 +2743,7 @@ const compiler_launcher_script =
     \\      ;;
     \\    -I*)
     \\      path="${arg#-I}"
-    \\      if [ "$target_x86" = "1" ] && __rosette_path_is_simd_bridge "$path"; then
+    \\      if [ "$target_x86" = "1" ] && __rosette_path_has_x86_intrinsic_shadow "$path"; then
     \\        continue
     \\      fi
     \\      filtered+=("$arg")
@@ -2708,7 +2755,7 @@ const compiler_launcher_script =
     \\        -idirafter*) path="${arg#-idirafter}" ;;
     \\      esac
     \\      path="${path#=}"
-    \\      if [ "$target_x86" = "1" ] && [ -n "$path" ] && __rosette_path_is_simd_bridge "$path"; then
+    \\      if [ "$target_x86" = "1" ] && [ -n "$path" ] && __rosette_path_has_x86_intrinsic_shadow "$path"; then
     \\        continue
     \\      fi
     \\      filtered+=("$arg")
@@ -3056,13 +3103,35 @@ const x86IntrinsicsCompatH =
     \\ * When cross-compiling x86_64 code from a non-x86 host, certain
     \\ * compiler builtins may not be available.  This file provides
     \\ * portable fallback definitions using inline assembly.
+    \\ *
+    \\ * Each public definition is guarded by #ifndef so the compiler's own
+    \\ * definition (when present) takes precedence. Some bundled projects provide
+    \\ * their own compatibility macro later in the include graph, so keep Clang's
+    \\ * macro-redefinition warning quiet for this translation unit while Rosette is
+    \\ * acting as the injected compatibility layer.
     \\ */
     \\
     \\#ifdef __x86_64__
+    \\
+    \\#if defined(__clang__)
+    \\#pragma clang diagnostic ignored "-Wmacro-redefined"
+    \\#endif
+    \\
+    \\#ifndef __rosette_cpuid_count
+    \\#define __rosette_cpuid_count(leaf, subleaf, eax, ebx, ecx, edx)       \
+    \\    __asm__ __volatile__("cpuid\n"                                    \
+    \\                         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) \
+    \\                         : "0"(leaf), "2"(subleaf))
+    \\#endif
+    \\
+    \\#ifndef __cpuid
+    \\#define __cpuid(leaf, eax, ebx, ecx, edx)                              \
+    \\    __rosette_cpuid_count((leaf), 0, (eax), (ebx), (ecx), (edx))
+    \\#endif
+    \\
     \\#ifndef __cpuid_count
-    \\#define __cpuid_count(leaf, subleaf, eax, ebx, ecx, edx)           \
-    \\    __asm__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) \
-    \\                   :  "a"(leaf), "c"(subleaf))
+    \\#define __cpuid_count(leaf, subleaf, eax, ebx, ecx, edx)              \
+    \\    __rosette_cpuid_count((leaf), (subleaf), (eax), (ebx), (ecx), (edx))
     \\#endif
     \\#endif
     \\
@@ -3077,12 +3146,10 @@ fn ensureX86CompatHeader(allocator: std.mem.Allocator, include_dir: []const u8) 
     };
 }
 
-fn resolveX86CompatHeaderPath(io: std.Io, allocator: std.mem.Allocator) ?[]const u8 {
-    _ = io;
-    const home = homeDir(allocator) catch return null;
-    const installed = std.fs.path.join(allocator, &.{ home, ".rosette", "include", "x86_intrinsics_compat.h" }) catch return null;
-    if (fileExists(allocator, installed)) return installed;
-    return null;
+fn resolveX86CompatHeaderPath() ?[]const u8 {
+    const installed = getenvSlice("ROSETTE_X86_INTRINSICS_COMPAT") orelse return null;
+    if (installed.len == 0) return null;
+    return installed;
 }
 
 fn removeWrappers(allocator: std.mem.Allocator, wrapper_dir: []const u8) !void {
@@ -3709,12 +3776,8 @@ fn hasString(values: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn pathContainsSimdBridgeDir(path: []const u8) bool {
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |component| {
-        if (component.len > 0 and project_includes.isSimdBridgeDir(component)) return true;
-    }
-    return false;
+fn includeDirShadowsX86Intrinsics(io: std.Io, path: []const u8) bool {
+    return project_includes.containsX86IntrinsicShadow(io, path);
 }
 
 fn appendFilteredLinuxArgs(
@@ -3735,6 +3798,19 @@ fn appendSanitizedCompilerArgs(
     target_x86: bool,
     strip_ld_debug: bool,
 ) !void {
+    // Inject x86 intrinsic compat header when targeting x86, to bridge
+    // builtins that may be absent when cross-compiling from a non-x86 host
+    // (e.g. __cpuid_count on Apple Clang for ARM64). The installed Bash
+    // launcher provides the default ~/.rosette path; this legacy Zig path
+    // consumes only explicit environment configuration to avoid owned argv
+    // lifetime hazards.
+    if (target_x86) {
+        if (resolveX86CompatHeaderPath()) |header_path| {
+            try argv.append(allocator, "-include");
+            try argv.append(allocator, header_path);
+        }
+    }
+
     var i: usize = 0;
     while (i < tool_args.len) : (i += 1) {
         const arg = tool_args[i];
@@ -3743,31 +3819,21 @@ fn appendSanitizedCompilerArgs(
             i += 1;
             continue;
         }
-        // Generalised SIMD bridge dir filtering: strip include paths that
-        // point to CPU-architecture emulation layers (e.g. AvxToNeon on
-        // x86_64). Matches by directory-name pattern, no hardcoded per-
-        // project list, so it works for any codebase that bundles these.
+        // Strip include paths that shadow native x86 intrinsic headers
+        // (for example a bundled emmintrin.h). Keep bridge entry headers like
+        // vex2neon.h locatable when a project explicitly includes them.
         if (target_x86 and isIncludeFlag(arg) != null) {
-            if (i + 1 < tool_args.len and pathContainsSimdBridgeDir(tool_args[i + 1])) {
+            if (i + 1 < tool_args.len and includeDirShadowsX86Intrinsics(io, tool_args[i + 1])) {
                 i += 1;
                 continue;
             }
         }
         if (target_x86) {
             if (joinedIncludePath(arg)) |path| {
-                if (pathContainsSimdBridgeDir(path)) continue;
+                if (includeDirShadowsX86Intrinsics(io, path)) continue;
             }
         }
         try argv.append(allocator, arg);
-    }
-    // Inject x86 intrinsic compat header when targeting x86, to bridge
-    // builtins that may be absent when cross-compiling from a non-x86 host
-    // (e.g. __cpuid_count on Apple Clang for ARM64).
-    if (target_x86) {
-        if (resolveX86CompatHeaderPath(io, allocator)) |header_path| {
-            try argv.append(allocator, "-include");
-            try argv.append(allocator, header_path);
-        }
     }
 }
 
@@ -3823,8 +3889,8 @@ fn appendProjectIncludeArgs(io: std.Io, argv: *std.ArrayList([]const u8), alloca
     }
 
     for (dirs.items) |dir| {
-        // Same SIMD bridge dir filtering as appendFilteredLinuxArgs above.
-        if (pathContainsSimdBridgeDir(dir)) continue;
+        // Same intrinsic-shadow filtering as appendSanitizedCompilerArgs.
+        if (includeDirShadowsX86Intrinsics(io, dir)) continue;
         try argv.append(allocator, "-I");
         try argv.append(allocator, dir);
     }
@@ -4192,6 +4258,7 @@ fn makePathRecursive(allocator: std.mem.Allocator, raw_path: []const u8) !void {
         if (current.items.len > 1 and current.items[current.items.len - 1] != '/') try current.append(allocator, '/');
         try current.appendSlice(allocator, part);
         const path_z = try allocator.dupeZ(u8, current.items);
+        defer allocator.free(path_z);
         if (c.mkdir(path_z.ptr, 0o755) != 0) {
             if (c.access(path_z.ptr, 0) != 0) return error.MakePathFailed;
         }
@@ -4202,6 +4269,7 @@ fn writeFilePath(allocator: std.mem.Allocator, path: []const u8, data: []const u
     const parent = std.fs.path.dirname(path);
     if (parent) |dir| try makePathRecursive(allocator, dir);
     const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
     const fp = c.fopen(path_z.ptr, "wb");
     if (fp == null) return error.OpenFailed;
     defer _ = c.fclose(fp);
@@ -4216,6 +4284,7 @@ fn appendFilePath(allocator: std.mem.Allocator, path: []const u8, data: []const 
     const parent = std.fs.path.dirname(path);
     if (parent) |dir| try makePathRecursive(allocator, dir);
     const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
     const fp = c.fopen(path_z.ptr, "ab");
     if (fp == null) return error.OpenFailed;
     defer _ = c.fclose(fp);
@@ -4228,6 +4297,7 @@ fn appendFilePath(allocator: std.mem.Allocator, path: []const u8, data: []const 
 
 fn chmodPath(allocator: std.mem.Allocator, path: []const u8, mode: u16) !void {
     const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
     if (c.chmod(path_z.ptr, mode) != 0) return error.ChmodFailed;
 }
 
@@ -4394,21 +4464,25 @@ fn copyFile(init: std.process.Init, allocator: std.mem.Allocator, source_path: [
 
 fn unlinkIfExists(allocator: std.mem.Allocator, path: []const u8) !void {
     const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
     if (c.unlink(path_z.ptr) != 0 and c.access(path_z.ptr, 0) == 0) return error.UnlinkFailed;
 }
 
 fn rmdirIfEmpty(allocator: std.mem.Allocator, path: []const u8) !void {
     const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
     if (c.rmdir(path_z.ptr) != 0 and c.access(path_z.ptr, 0) == 0) return error.RmdirFailed;
 }
 
 fn fileExists(allocator: std.mem.Allocator, path: []const u8) bool {
     const path_z = allocator.dupeZ(u8, path) catch return false;
+    defer allocator.free(path_z);
     return c.access(path_z.ptr, 0) == 0;
 }
 
 fn canExecute(allocator: std.mem.Allocator, path: []const u8) bool {
     const path_z = allocator.dupeZ(u8, path) catch return false;
+    defer allocator.free(path_z);
     return c.access(path_z.ptr, 1) == 0;
 }
 
@@ -4531,6 +4605,8 @@ test "shell snippet includes zsh direct ELF launcher" {
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_detect_project_with_timeout"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_DIRECT_ELF_FULL_DETECT"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_DIRECT_ELF_DETECT_TIMEOUT_MS"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_X86_INTRINSICS_COMPAT"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_SHELL_DISABLE=1 command make"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_should_probe_direct_elf"));
     try std.testing.expect(containsIgnoreCase(snippet, "functions[$__rosette_cmd]"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_ENABLE_DYLD_INTERPOSE:-0"));
@@ -4579,6 +4655,7 @@ test "bash env snippet enables scoped project include compatibility" {
     defer arena.deinit();
     const snippet = try buildBashEnvSnippet(arena.allocator(), "/tmp/rosette/bin/rosette-shell");
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_COMPILER_SANITIZER"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_X86_INTRINSICS_COMPAT"));
     try std.testing.expect(containsIgnoreCase(snippet, "CMAKE_C_COMPILER_LAUNCHER"));
     try std.testing.expect(containsIgnoreCase(snippet, "CMAKE_CXX_COMPILER_LAUNCHER"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_PROJECT_INCLUDE_COMPAT"));
@@ -4594,27 +4671,61 @@ test "bash env snippet enables scoped project include compatibility" {
     try std.testing.expect(!containsIgnoreCase(snippet, "capstone_compat.h"));
 }
 
-test "compiler sanitizer strips SIMD bridge include dirs only for x86 targets" {
+test "compiler sanitizer strips x86 intrinsic shadows but keeps bridge entry headers" {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(std.testing.allocator);
+
+    const allocator = std.testing.allocator;
+    const test_root = try std.fmt.allocPrint(allocator, "/tmp/rosette-compiler-sanitize-{d}", .{c.getpid()});
+    defer allocator.free(test_root);
+
+    const shadow_dir = try std.fs.path.join(allocator, &.{ test_root, "AvxToNeon" });
+    defer allocator.free(shadow_dir);
+    const bridge_dir = try std.fs.path.join(allocator, &.{ test_root, "vex2NEON" });
+    defer allocator.free(bridge_dir);
+    const safe_dir = try std.fs.path.join(allocator, &.{ test_root, "zstd" });
+    defer allocator.free(safe_dir);
+    const shadow_header = try std.fs.path.join(allocator, &.{ shadow_dir, "emmintrin.h" });
+    defer allocator.free(shadow_header);
+    const bridge_header = try std.fs.path.join(allocator, &.{ bridge_dir, "vex2neon.h" });
+    defer allocator.free(bridge_header);
+    const safe_header = try std.fs.path.join(allocator, &.{ safe_dir, "zstd.h" });
+    defer allocator.free(safe_header);
+    const bridge_joined = try std.fmt.allocPrint(allocator, "-I{s}", .{bridge_dir});
+    defer allocator.free(bridge_joined);
+    const safe_joined = try std.fmt.allocPrint(allocator, "-I{s}", .{safe_dir});
+    defer allocator.free(safe_joined);
+
+    try writeFilePath(allocator, shadow_header, "");
+    try writeFilePath(allocator, bridge_header, "");
+    try writeFilePath(allocator, safe_header, "");
+    defer {
+        unlinkIfExists(allocator, shadow_header) catch {};
+        unlinkIfExists(allocator, bridge_header) catch {};
+        unlinkIfExists(allocator, safe_header) catch {};
+        rmdirIfEmpty(allocator, shadow_dir) catch {};
+        rmdirIfEmpty(allocator, bridge_dir) catch {};
+        rmdirIfEmpty(allocator, safe_dir) catch {};
+        rmdirIfEmpty(allocator, test_root) catch {};
+    }
 
     const args = [_][]const u8{
         "-arch",
         "x86_64",
         "-isystem",
-        "/repo/third_party/AvxToNeon",
-        "-I/repo/third_party/zstd",
-        "-I/repo/third_party/sse2neon",
+        shadow_dir,
+        safe_joined,
+        bridge_joined,
         "-iquote",
-        "/repo/include",
+        bridge_dir,
         "-c",
         "file.c",
     };
-    try appendSanitizedCompilerArgs(undefined, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
-    try std.testing.expect(hasString(argv.items, "-I/repo/third_party/zstd"));
-    try std.testing.expect(hasString(argv.items, "/repo/include"));
-    try std.testing.expect(!hasString(argv.items, "/repo/third_party/AvxToNeon"));
-    try std.testing.expect(!hasString(argv.items, "-I/repo/third_party/sse2neon"));
+    try appendSanitizedCompilerArgs(std.testing.io, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try std.testing.expect(hasString(argv.items, safe_joined));
+    try std.testing.expect(hasString(argv.items, bridge_joined));
+    try std.testing.expect(hasString(argv.items, bridge_dir));
+    try std.testing.expect(!hasString(argv.items, shadow_dir));
 }
 
 test "compiler sanitizer keeps SIMD bridge dirs for non-x86 targets" {
@@ -4622,7 +4733,7 @@ test "compiler sanitizer keeps SIMD bridge dirs for non-x86 targets" {
     defer argv.deinit(std.testing.allocator);
 
     const args = [_][]const u8{ "-arch", "arm64", "-isystem", "/repo/third_party/AvxToNeon", "-c", "file.c" };
-    try appendSanitizedCompilerArgs(undefined, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try appendSanitizedCompilerArgs(std.testing.io, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
     try std.testing.expect(hasString(argv.items, "/repo/third_party/AvxToNeon"));
 }
 
@@ -4677,6 +4788,11 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-arch -x86_64 /bin/bash /tmp/xenia-rosetta.ABC", .{}) != null);
     try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell clean-state", .{}) == null);
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "filtered=()"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "-include"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "x86_intrinsics_compat.h"));
+    try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid("));
+    try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid_count"));
+    try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "-Wmacro-redefined"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "exec \"$compiler\""));
     try std.testing.expect(!containsIgnoreCase(compiler_launcher_script, "compiler-sanitize \"$@\""));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-shell route-arch"));

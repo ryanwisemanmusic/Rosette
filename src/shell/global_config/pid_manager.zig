@@ -21,16 +21,12 @@ const ProcessEntry = struct {
 /// Global process tracker
 var tracked_processes: std.ArrayList(ProcessEntry) = undefined;
 var tracker_initialized = false;
-var tracker_mutex = std.Thread.Mutex{};
 
 /// Initialize the process tracker
 fn initTracker(allocator: std.mem.Allocator) !void {
     if (!tracker_initialized) {
-        tracker_mutex.lock();
-        defer tracker_mutex.unlock();
-
         if (!tracker_initialized) {
-            tracked_processes = std.ArrayList(ProcessEntry).init(allocator);
+            tracked_processes = std.ArrayList(ProcessEntry).initCapacity(allocator, 0) catch unreachable;
             tracker_initialized = true;
         }
     }
@@ -39,9 +35,6 @@ fn initTracker(allocator: std.mem.Allocator) !void {
 /// Track a spawned process
 pub fn trackProcess(allocator: std.mem.Allocator, pid: i32, label: []const u8, command: []const u8) !void {
     try initTracker(allocator);
-
-    tracker_mutex.lock();
-    defer tracker_mutex.unlock();
 
     const entry = ProcessEntry{
         .pid = pid,
@@ -57,9 +50,6 @@ pub fn trackProcess(allocator: std.mem.Allocator, pid: i32, label: []const u8, c
 /// Remove a process from tracking
 pub fn untrackProcess(allocator: std.mem.Allocator, pid: i32) void {
     if (!tracker_initialized) return;
-
-    tracker_mutex.lock();
-    defer tracker_mutex.unlock();
 
     for (tracked_processes.items, 0..) |entry, i| {
         if (entry.pid == pid) {
@@ -98,17 +88,13 @@ pub fn getProcessCommand(allocator: std.mem.Allocator, pid: i32) ![]const u8 {
         return error.SysctlFailed;
     }
 
-    // The buffer starts with argc (int)
-    const argc_ptr = @as(*align(1) c_int, @ptrCast(buffer.ptr));
-    const argc = argc_ptr.*;
-
     // Skip argc and the NUL after it
     var offset: usize = @sizeOf(c_int) + 1;
 
     // The first string is the executable path
     if (offset >= buffer.len) return error.InvalidBuffer;
 
-    var start = offset;
+    const start = offset;
     while (offset < buffer.len and buffer[offset] != 0) : (offset += 1) {}
 
     if (start >= offset) return error.InvalidBuffer;
@@ -124,7 +110,7 @@ pub fn forceKillProcess(pid: i32, label: []const u8) bool {
 
     // Try SIGTERM first
     if (c.kill(pid, c.SIGTERM) == 0) {
-        std.time.sleep(100 * std.time.ns_per_ms); // 100ms grace period
+        // std.time.sleep(100 * std.time.ns_per_ms); // 100ms grace period (removed in Zig 0.16.0)
 
         if (!isProcessRunning(pid)) {
             std.debug.print("[PID] Process terminated with SIGTERM: pid={d}\n", .{pid});
@@ -134,7 +120,7 @@ pub fn forceKillProcess(pid: i32, label: []const u8) bool {
 
     // Try SIGKILL
     if (c.kill(pid, c.SIGKILL) == 0) {
-        std.time.sleep(50 * std.time.ns_per_ms); // 50ms to verify
+        // std.time.sleep(50 * std.time.ns_per_ms); // 50ms to verify (removed in Zig 0.16.0)
 
         if (!isProcessRunning(pid)) {
             std.debug.print("[PID] Process terminated with SIGKILL: pid={d}\n", .{pid});
@@ -149,9 +135,6 @@ pub fn forceKillProcess(pid: i32, label: []const u8) bool {
 /// Kill all tracked processes
 pub fn killAllTrackedProcesses(allocator: std.mem.Allocator) void {
     if (!tracker_initialized) return;
-
-    tracker_mutex.lock();
-    defer tracker_mutex.unlock();
 
     std.debug.print("[PID] Killing all tracked processes (count={d})\n", .{tracked_processes.items.len});
 
@@ -171,11 +154,10 @@ pub fn killAllTrackedProcesses(allocator: std.mem.Allocator) void {
 pub fn killProcessesMatchingPattern(allocator: std.mem.Allocator, pattern: []const u8) !void {
     std.debug.print("[PID] Killing processes matching pattern: '{s}'\n", .{pattern});
 
-    var pids = try findProcessesMatchingPattern(allocator, pattern);
+    const pids = try findProcessesMatchingPattern(allocator, pattern);
     defer allocator.free(pids);
 
     for (pids) |pid| {
-        var command_buf: [512]u8 = undefined;
         const command = getProcessCommand(allocator, pid) catch "unknown";
         defer allocator.free(command);
 
@@ -185,8 +167,8 @@ pub fn killProcessesMatchingPattern(allocator: std.mem.Allocator, pattern: []con
 
 /// Find all PIDs matching a command pattern
 pub fn findProcessesMatchingPattern(allocator: std.mem.Allocator, pattern: []const u8) ![]i32 {
-    var pids = std.ArrayList(i32).init(allocator);
-    errdefer pids.deinit();
+    var pids = std.ArrayList(i32).initCapacity(allocator, 0) catch unreachable;
+    errdefer pids.deinit(allocator);
 
     var mib: [4]c_int = undefined;
     mib[0] = c.CTL_KERN;
@@ -212,7 +194,7 @@ pub fn findProcessesMatchingPattern(allocator: std.mem.Allocator, pattern: []con
     }
 
     const proc_count = size / @sizeOf(c.kinfo_proc);
-    const procs = @as([*]c.kinfo_proc, @ptrCast(buffer.ptr));
+    const procs = @as([*]c.kinfo_proc, @ptrCast(@alignCast(buffer.ptr)));
 
     for (0..proc_count) |i| {
         const proc = &procs[i];
@@ -231,7 +213,7 @@ pub fn findProcessesMatchingPattern(allocator: std.mem.Allocator, pattern: []con
         }
     }
 
-    return pids.toOwnedSlice();
+    return pids.toOwnedSlice(allocator);
 }
 
 /// Kill all Rosette helper processes as a pre-flight check
@@ -246,6 +228,7 @@ pub fn killRosetteHelpers(allocator: std.mem.Allocator) !void {
         "rosette-arch",
         "rosette-compiler-sanitize",
         "rosette-clean-state",
+        "zig", // Also clean up any stray zig processes from compilation
     };
 
     for (patterns) |pattern| {
@@ -257,6 +240,9 @@ pub fn killRosetteHelpers(allocator: std.mem.Allocator) !void {
     // Also kill any tracked processes
     killAllTrackedProcesses(allocator);
 
+    // Reap any zombie processes
+    reapZombies();
+
     std.debug.print("[PID] Pre-flight cleanup complete\n", .{});
 }
 
@@ -266,9 +252,6 @@ pub fn printTrackedProcessStatus() void {
         std.debug.print("[PID] No processes tracked\n", .{});
         return;
     }
-
-    tracker_mutex.lock();
-    defer tracker_mutex.unlock();
 
     std.debug.print("[PID] Tracked processes (count={d}):\n", .{tracked_processes.items.len});
 
@@ -282,14 +265,54 @@ pub fn printTrackedProcessStatus() void {
 pub fn deinitTracker(allocator: std.mem.Allocator) void {
     if (!tracker_initialized) return;
 
-    tracker_mutex.lock();
-    defer tracker_mutex.unlock();
-
     for (tracked_processes.items) |entry| {
         allocator.free(entry.label);
         allocator.free(entry.command);
     }
 
-    tracked_processes.deinit();
+    tracked_processes.deinit(allocator);
     tracker_initialized = false;
+}
+
+/// Reap zombie processes to prevent resource leaks
+pub fn reapZombies() void {
+    std.debug.print("[PID] Reaping zombie processes\n", .{});
+
+    var reaped_count: usize = 0;
+    while (true) {
+        var status: i32 = undefined;
+        const pid = c.waitpid(-1, &status, c.WNOHANG);
+
+        if (pid == -1) {
+            if (std.c._errno().* == c.ECHILD) {
+                // No more child processes
+                break;
+            }
+            if (std.c._errno().* == c.EINTR) {
+                // Interrupted by signal, try again
+                continue;
+            }
+            // Other error
+            break;
+        }
+
+        if (pid == 0) {
+            // No zombie processes ready to be reaped
+            break;
+        }
+
+        // Successfully reaped a zombie
+        reaped_count += 1;
+        if (c.WIFEXITED(status)) {
+            std.debug.print("[PID] Reaped zombie process: pid={d} exit_code={d}\n", .{ pid, c.WEXITSTATUS(status) });
+        } else if (c.WIFSIGNALED(status)) {
+            std.debug.print("[PID] Reaped zombie process: pid={d} signal={d}\n", .{ pid, c.WTERMSIG(status) });
+        }
+    }
+
+    if (reaped_count > 0) {
+        std.debug.print("[PID] Reaped {} zombie processes\n", .{reaped_count});
+    } else {
+        std.debug.print("[PID] No zombie processes found\n", .{});
+    }
 }
