@@ -115,6 +115,21 @@ pub fn tracePathFromEnv(allocator: std.mem.Allocator) ?[]const u8 {
     return std.fs.path.join(allocator, &.{ home, ".rosette", "process-guard.log" }) catch null;
 }
 
+fn quarantinePathFromEnv(allocator: std.mem.Allocator) ?[]const u8 {
+    if (getenvSlice("ROSETTE_PROCESS_QUARANTINE")) |path| {
+        if (path.len != 0 and !std.ascii.eqlIgnoreCase(path, "off")) {
+            return allocator.dupe(u8, path) catch null;
+        }
+    }
+
+    if (routeRoot(allocator)) |root| {
+        return std.fs.path.join(allocator, &.{ root, ".rosette", "process-quarantine.log" }) catch null;
+    }
+
+    const home = getenvSlice("HOME") orelse return null;
+    return std.fs.path.join(allocator, &.{ home, ".rosette", "process-quarantine.log" }) catch null;
+}
+
 fn routeRoot(allocator: std.mem.Allocator) ?[]const u8 {
     const env_names = [_][*:0]const u8{
         "ROSETTE_TRACE_ROOT",
@@ -168,6 +183,9 @@ fn waitWithTimeout(
     const survived = childStillAlive(pid);
     if (!survived) {
         _ = try pollChild(child, pid);
+    } else {
+        signalChild(pid, signal_policy, c.SIGSTOP);
+        quarantineSurvivor(pid, signal_policy);
     }
     child.id = null;
     return .{ .timed_out = .{
@@ -229,6 +247,31 @@ fn childStillAlive(pid: i32) bool {
     if (pid <= 0) return false;
     if (c.kill(pid, 0) == 0) return true;
     return std.c._errno().* != c.ESRCH;
+}
+
+fn quarantineSurvivor(pid: i32, signal_policy: SignalPolicy) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = quarantinePathFromEnv(allocator) orelse return;
+    if (std.fs.path.dirname(path)) |parent| makePathRecursive(allocator, parent) catch {};
+
+    const path_z = allocator.dupeZ(u8, path) catch return;
+    const fp = c.fopen(path_z.ptr, "a");
+    if (fp == null) return;
+    defer _ = c.fclose(fp);
+
+    const policy = switch (signal_policy) {
+        .child_only => "child_only",
+        .process_group => "process_group",
+    };
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "{d}\tpid={d}\tstatus=timed_out_survived\taction=sigstop\tpolicy={s}\n",
+        .{ @as(i64, @intCast(c.time(null))), pid, policy },
+    ) catch return;
+    _ = c.fwrite(line.ptr, 1, line.len, fp);
 }
 
 fn sleepMs(ms: u64) void {
