@@ -2088,7 +2088,7 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\      local __rosette_make_arg
         \\      for __rosette_make_arg in "$@"; do
         \\        case "$__rosette_make_arg" in
-        \\          shell|shell-update|install-shell|shell-uninstall|shell-clean-state)
+        \\          shell|shell-update|install-shell|shell-uninstall|shell-clean-state|app-wrapper|installer|uninstaller|app-all|notarize-installer|notarize-uninstaller|notarize-app-all)
         \\            ROSETTE_SHELL_DISABLE=1 command make "$@"
         \\            __rosette_status=$?
         \\            __rosette_after_make "$__rosette_status" "$@"
