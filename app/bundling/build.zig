@@ -131,6 +131,33 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const clr_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../../include/runtime_module.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cleo_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/CLEO/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const x86_asm_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x86-ASM/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const x86_disasm_module = b.createModule(.{
+        .root_source_file = b.path("../../src/tooling/disasm_logger/x86_disasm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const x86_trace_logger_module = b.createModule(.{
+        .root_source_file = b.path("../../src/tooling/disasm_logger/x86_trace_logger.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
 
     runtime_abi_module.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     runtime_abi_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
@@ -152,6 +179,22 @@ pub fn build(b: *std.Build) void {
     bridge_string_ops_module.addImport("bridge_model", bridge_model_module);
     bridge_exceptions_module.addImport("runtime_abi_handshake", runtime_abi_module);
     bridge_exceptions_module.addImport("bridge_model", bridge_model_module);
+    x86_asm_module.addImport("runtime_abi_handshake", runtime_abi_module);
+    x86_asm_module.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
+    x86_asm_module.addImport("isa_registry", isa_module);
+    x86_asm_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
+    x86_asm_module.addImport("bridge_register_tracing", bridge_register_trace_module);
+    x86_asm_module.addImport("bridge_memory", bridge_memory_module);
+    x86_asm_module.addImport("bridge_stack", bridge_stack_module);
+    x86_asm_module.addImport("bridge_heap", bridge_heap_module);
+    x86_asm_module.addImport("bridge_instruction_decoding", bridge_instruction_decoding_module);
+    x86_asm_module.addImport("bridge_flags", bridge_flags_module);
+    x86_asm_module.addImport("bridge_string_ops", bridge_string_ops_module);
+    x86_asm_module.addImport("bridge_exceptions", bridge_exceptions_module);
+    x86_asm_module.addImport("clr_runtime", clr_runtime_module);
+    x86_asm_module.addImport("cleo", cleo_module);
+    x86_disasm_module.addImport("x86_asm", x86_asm_module);
+    x86_trace_logger_module.addImport("x86_asm", x86_asm_module);
 
     exe_runner_mod.addImport("runtime_abi_handshake", runtime_abi_module);
     exe_runner_mod.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
@@ -166,6 +209,10 @@ pub fn build(b: *std.Build) void {
     exe_runner_mod.addImport("bridge_flags", bridge_flags_module);
     exe_runner_mod.addImport("bridge_string_ops", bridge_string_ops_module);
     exe_runner_mod.addImport("bridge_exceptions", bridge_exceptions_module);
+    exe_runner_mod.addImport("clr_runtime", clr_runtime_module);
+    exe_runner_mod.addImport("x86_asm", x86_asm_module);
+    exe_runner_mod.addImport("x86_disasm", x86_disasm_module);
+    exe_runner_mod.addImport("x86_trace_logger", x86_trace_logger_module);
     exe_runner_cli_mod.addImport("runtime_abi_handshake", runtime_abi_module);
     exe_runner_cli_mod.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     exe_runner_cli_mod.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
@@ -179,6 +226,10 @@ pub fn build(b: *std.Build) void {
     exe_runner_cli_mod.addImport("bridge_flags", bridge_flags_module);
     exe_runner_cli_mod.addImport("bridge_string_ops", bridge_string_ops_module);
     exe_runner_cli_mod.addImport("bridge_exceptions", bridge_exceptions_module);
+    exe_runner_cli_mod.addImport("clr_runtime", clr_runtime_module);
+    exe_runner_cli_mod.addImport("x86_asm", x86_asm_module);
+    exe_runner_cli_mod.addImport("x86_disasm", x86_disasm_module);
+    exe_runner_cli_mod.addImport("x86_trace_logger", x86_trace_logger_module);
     helper_mod.addImport("exe_runner", exe_runner_cli_mod);
 
     const helper = b.addExecutable(.{
