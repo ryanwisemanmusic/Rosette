@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process_guard = @import("entrypoint_kernel_process_guard");
-const third_party_includes = @import("compat_third_party_include_compat");
+const project_includes = @import("compat_source_include_compat");
 
 const c = @cImport({
     @cInclude("errno.h");
@@ -197,6 +197,11 @@ pub fn main(init: std.process.Init) !void {
         try runTool(init, allocator, args[2], args[3..]);
         return;
     }
+    if (std.mem.eql(u8, args[1], "compiler-sanitize")) {
+        if (args.len < 3) return usage(args[0]);
+        try runCompilerSanitizer(init.io, allocator, args[2..]);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "recipe-shell")) {
         try runRecipeShell(init, allocator, args[2..]);
         return;
@@ -230,6 +235,7 @@ fn usage(exe_name: []const u8) void {
         \\  {s} route run [options] <target|Application.app> [-- target-args...]
         \\  {s} run-elf <x86-64-elf-path> [args...]
         \\  {s} tool <tool-name> [tool-args...]
+        \\  {s} compiler-sanitize <compiler> [compiler-args...]
         \\  {s} recipe-shell [sh-args...]
         \\  {s} is-elf64 <path>
         \\
@@ -245,7 +251,7 @@ fn usage(exe_name: []const u8) void {
         \\  abort_on_fallback = false
         \\  abort_on_unsupported = false
         \\
-    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
@@ -258,6 +264,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const arch_wrapper_path = try std.fs.path.join(allocator, &.{ bin_dir, "arch" });
     const arch_backend_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-arch" });
+    const compiler_launcher_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-compiler-sanitize" });
     const clean_state_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" });
     const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
     const bash_env_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" });
@@ -272,6 +279,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     try copySelf(init, allocator, rosette_path);
     try ensureArchBackend(allocator, arch_backend_path);
     try ensureArchWrapper(allocator, arch_wrapper_path, arch_backend_path);
+    try ensureCompilerLauncher(allocator, compiler_launcher_path, helper_path);
     try ensureCleanStateBackend(allocator, clean_state_path);
     try ensureWrappers(allocator, wrapper_dir, helper_path);
     try ensureConfigFile(init.io, allocator, toml_path);
@@ -311,6 +319,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     std.debug.print("source: {s}\n", .{shell_path});
     std.debug.print("command: {s}\n", .{rosette_path});
     std.debug.print("arch_backend: {s}\n", .{arch_backend_path});
+    std.debug.print("compiler_launcher: {s}\n", .{compiler_launcher_path});
     std.debug.print("clean_state: {s}\n", .{clean_state_path});
     if (fileExists(allocator, elf_processor_path)) {
         std.debug.print("elf_processor: {s}\n", .{elf_processor_path});
@@ -343,6 +352,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
     const arch_wrapper_path = try std.fs.path.join(allocator, &.{ bin_dir, "arch" });
     const arch_backend_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-arch" });
+    const compiler_launcher_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-compiler-sanitize" });
     const clean_state_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" });
     const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
     const source_root = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
@@ -362,6 +372,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     try unlinkIfExists(allocator, compat_router_path);
     try unlinkIfExists(allocator, arch_wrapper_path);
     try unlinkIfExists(allocator, arch_backend_path);
+    try unlinkIfExists(allocator, compiler_launcher_path);
     try unlinkIfExists(allocator, clean_state_path);
     try unlinkIfExists(allocator, dyld_lib_path);
     try removeWrappers(allocator, wrapper_dir);
@@ -830,6 +841,9 @@ fn collectCleanupCandidates(allocator: std.mem.Allocator, options: CleanOptions)
 fn cleanupReason(command: []const u8, options: CleanOptions) ?[]const u8 {
     if (containsIgnoreCase(command, " rosette-shell clean-state")) return null;
     if (containsIgnoreCase(command, "/rosette-shell clean-state")) return null;
+    if (!options.include_xenia and containsIgnoreCase(command, "xenia_canary.app/contents/macos/xenia_canary")) return null;
+    if (containsIgnoreCase(command, "rosette-shell compiler-sanitize")) return "Rosette compiler sanitizer";
+    if (containsIgnoreCase(command, "rosette-compiler-sanitize")) return "Rosette compiler sanitizer launcher";
     if (containsIgnoreCase(command, "rosette-shell route-arch")) return "Rosette arch handoff";
     if (containsIgnoreCase(command, "rosette-arch")) return "Rosette arch backend";
     if (containsIgnoreCase(command, "rosette-shell detect")) return "Rosette project detector";
@@ -1646,6 +1660,13 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
     try out.appendSlice(allocator,
         \\: "${ROSETTE_ROUTER:=$HOME/.rosette/bin/rosette-router}"
         \\export ROSETTE_ROUTER
+        \\: "${ROSETTE_COMPILER_SANITIZER:=$HOME/.rosette/bin/rosette-compiler-sanitize}"
+        \\export ROSETTE_COMPILER_SANITIZER
+        \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ] && [ "${ROSETTE_COMPILER_SANITIZER_ENABLE:-auto}" != "0" ] && [ -x "$ROSETTE_COMPILER_SANITIZER" ]; then
+        \\  : "${CMAKE_C_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
+        \\  : "${CMAKE_CXX_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
+        \\  export CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
+        \\fi
         \\export ROSETTE_BASH_ENV="$HOME/.rosette/rosette-bash-env.sh"
         \\if [ -f "$ROSETTE_BASH_ENV" ]; then
         \\  if [ "${BASH_ENV:-}" != "$ROSETTE_BASH_ENV" ]; then
@@ -1737,6 +1758,32 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\  command grep -Eiq "elf64" "$__rosette_makefile" 2>/dev/null || return 1
         \\  return 0
         \\}
+        \\__rosette_detect_project_with_timeout() {
+        \\  emulate -L zsh
+        \\  local __rosette_detect_timeout="${ROSETTE_DIRECT_ELF_DETECT_TIMEOUT_MS:-500}"
+        \\  local __rosette_done="${TMPDIR:-/tmp}/rosette-detect.$$.$RANDOM"
+        \\  local __rosette_pid __rosette_elapsed=0 __rosette_status=1
+        \\  ( "$ROSETTE_SHELL_HELPER" detect "$PWD" >/dev/null 2>&1; print -r -- "$?" > "$__rosette_done" ) &
+        \\  __rosette_pid=$!
+        \\  while kill -0 "$__rosette_pid" 2>/dev/null; do
+        \\    if (( __rosette_elapsed >= __rosette_detect_timeout )); then
+        \\      kill -TERM "$__rosette_pid" 2>/dev/null || true
+        \\      sleep 0.05
+        \\      kill -KILL "$__rosette_pid" 2>/dev/null || true
+        \\      rm -f "$__rosette_done"
+        \\      return 1
+        \\    fi
+        \\    sleep 0.05
+        \\    __rosette_elapsed=$((__rosette_elapsed + 50))
+        \\  done
+        \\  wait "$__rosette_pid" 2>/dev/null || true
+        \\  if [ -f "$__rosette_done" ]; then
+        \\    IFS= read -r __rosette_status < "$__rosette_done" 2>/dev/null || __rosette_status=1
+        \\    rm -f "$__rosette_done"
+        \\    return "$__rosette_status"
+        \\  fi
+        \\  return 1
+        \\}
         \\__rosette_refresh_elf_commands() {
         \\  emulate -L zsh
         \\  local __rosette_cmd __rosette_path __rosette_proc __rosette_count=0
@@ -1757,9 +1804,11 @@ fn buildShellSnippet(allocator: std.mem.Allocator, helper_path: []const u8, dyld
         \\    [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: direct ELF launch skipped by cheap prefilter in $PWD" >&2
         \\    return 0
         \\  fi
-        \\  if ! "$ROSETTE_SHELL_HELPER" detect "$PWD" >/dev/null 2>&1; then
-        \\    [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: direct ELF launch disabled; project was not detected in $PWD" >&2
-        \\    return 0
+        \\  if [ "${ROSETTE_DIRECT_ELF_FULL_DETECT:-0}" = "1" ]; then
+        \\    if ! __rosette_detect_project_with_timeout; then
+        \\      [ "${ROSETTE_SHELL_DEBUG:-0}" = "1" ] && print -r -- "rosette-shell: direct ELF launch disabled; project detector timed out or did not match $PWD" >&2
+        \\      return 0
+        \\    fi
         \\  fi
         \\  for __rosette_path in ./*(N); do
         \\    [ -f "$__rosette_path" ] || continue
@@ -2009,6 +2058,13 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
     try appendShellQuoted(&out, allocator, helper_path);
     try out.appendSlice(allocator,
         \\
+        \\: "${ROSETTE_COMPILER_SANITIZER:=$HOME/.rosette/bin/rosette-compiler-sanitize}"
+        \\export ROSETTE_COMPILER_SANITIZER
+        \\if [ -z "${ROSETTE_SHELL_DISABLE:-}" ] && [ "${ROSETTE_COMPILER_SANITIZER_ENABLE:-auto}" != "0" ] && [ -x "$ROSETTE_COMPILER_SANITIZER" ]; then
+        \\  : "${CMAKE_C_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
+        \\  : "${CMAKE_CXX_COMPILER_LAUNCHER:=$ROSETTE_COMPILER_SANITIZER}"
+        \\  export CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
+        \\fi
         \\
         \\__rosette_env_path_prepend() {
         \\  local __rosette_var="$1"
@@ -2036,48 +2092,108 @@ fn buildBashEnvSnippet(allocator: std.mem.Allocator, helper_path: []const u8) ![
         \\  return 1
         \\}
         \\
-        \\__rosette_trace_third_party_includes() {
+        \\__rosette_dir_has_child_headers() {
+        \\  local __rosette_dir="$1"
+        \\  local __rosette_child
+        \\  [ -d "$__rosette_dir" ] || return 1
+        \\  for __rosette_child in "$__rosette_dir"/*; do
+        \\    [ -d "$__rosette_child" ] || continue
+        \\    __rosette_dir_has_direct_headers "$__rosette_child" && return 0
+        \\  done
+        \\  return 1
+        \\}
+        \\
+        \\__rosette_path_has_simd_bridge_dir() {
+        \\  local __rosette_path="$1"
+        \\  local __rosette_part __rosette_old_ifs
+        \\  __rosette_old_ifs="$IFS"
+        \\  IFS=/
+        \\  for __rosette_part in $__rosette_path; do
+        \\    case "$__rosette_part" in
+        \\      *2[Nn][Ee][Oo][Nn]*|*[Tt][Oo][Nn][Ee][Oo][Nn]*)
+        \\        IFS="$__rosette_old_ifs"
+        \\        return 0
+        \\        ;;
+        \\    esac
+        \\  done
+        \\  IFS="$__rosette_old_ifs"
+        \\  return 1
+        \\}
+        \\
+        \\__rosette_dir_has_standard_header_shadow() {
+        \\  local __rosette_dir="$1"
+        \\  local __rosette_name
+        \\  [ -d "$__rosette_dir" ] || return 1
+        \\  for __rosette_name in algorithm any array atomic barrier bit bitset charconv chrono codecvt compare complex concepts condition_variable coroutine cstddef cstdint cstdio cstdlib cstring deque exception execution filesystem format forward_list fstream functional future initializer_list iomanip ios iosfwd iostream istream iterator latch limits list locale map memory memory_resource mutex new numbers numeric optional ostream queue random ranges ratio regex scoped_allocator semaphore set shared_mutex source_location span sstream stack stdexcept stop_token streambuf string string_view strstream syncstream system_error thread tuple type_traits typeindex typeinfo unordered_map unordered_set utility valarray variant vector version; do
+        \\    [ -e "$__rosette_dir/$__rosette_name" ] && return 0
+        \\  done
+        \\  return 1
+        \\}
+        \\
+        \\__rosette_dir_is_safe_include_root() {
+        \\  local __rosette_dir="$1"
+        \\  [ -d "$__rosette_dir" ] || return 1
+        \\  __rosette_path_has_simd_bridge_dir "$__rosette_dir" && return 1
+        \\  __rosette_dir_has_standard_header_shadow "$__rosette_dir" && return 1
+        \\  __rosette_dir_has_direct_headers "$__rosette_dir" && return 0
+        \\  __rosette_dir_has_child_headers "$__rosette_dir" && return 0
+        \\  return 1
+        \\}
+        \\
+        \\__rosette_trace_project_includes() {
         \\  [ -n "${ROSETTE_COMPAT_TRACE:-}" ] || return 0
         \\  {
-        \\    printf '# Rosette third-party include compatibility\n'
-        \\    printf 'event = "third_party_include_compat"\n'
+        \\    printf '# Rosette project include compatibility\n'
+        \\    printf 'event = "project_include_compat"\n'
         \\    printf 'root = "%s"\n' "$1"
         \\    printf 'include_dirs = "%s"\n' "$2"
         \\    printf '\n'
         \\  } >> "$ROSETTE_COMPAT_TRACE" 2>/dev/null || true
         \\}
         \\
-        \\__rosette_apply_third_party_include_compat() {
-        \\  case "${ROSETTE_THIRD_PARTY_INCLUDE_COMPAT:-auto}" in
+        \\__rosette_add_project_include_dir() {
+        \\  local __rosette_dir="$1"
+        \\  __rosette_dir_is_safe_include_root "$__rosette_dir" || return 1
+        \\  if __rosette_env_path_prepend CPATH "$__rosette_dir"; then
+        \\    __rosette_added="${__rosette_added:+$__rosette_added:}$__rosette_dir"
+        \\    return 0
+        \\  fi
+        \\  return 1
+        \\}
+        \\
+        \\__rosette_apply_project_include_compat() {
+        \\  case "${ROSETTE_PROJECT_INCLUDE_COMPAT:-${ROSETTE_THIRD_PARTY_INCLUDE_COMPAT:-auto}}" in
         \\    0|off|OFF|false|FALSE|no|NO) return 0 ;;
         \\  esac
         \\
-        \\  local __rosette_root __rosette_tp __rosette_pkg __rosette_candidate __rosette_added
-        \\  for __rosette_root in "${ROSETTE_THIRD_PARTY_INCLUDE_ROOT:-}" "${ROSETTE_ROUTE_ROOT:-}" "${ROSETTE_CALLER_CWD:-}" "${ROSETTE_PROJECT_ROOT:-}" "$PWD"; do
-        \\    [ -n "$__rosette_root" ] || continue
-        \\    __rosette_tp="$__rosette_root/third_party"
-        \\    [ -d "$__rosette_tp" ] || continue
+        \\  local __rosette_root __rosette_vendor __rosette_pkg __rosette_candidate __rosette_added
+        \\  for __rosette_root in "${ROSETTE_PROJECT_INCLUDE_ROOT:-}" "${ROSETTE_THIRD_PARTY_INCLUDE_ROOT:-}" "${ROSETTE_ROUTE_ROOT:-}" "${ROSETTE_CALLER_CWD:-}" "${ROSETTE_PROJECT_ROOT:-}" "$PWD"; do
+        \\    [ -n "$__rosette_root" ] && [ -d "$__rosette_root" ] || continue
+        \\    __rosette_added=""
         \\
-        \\    for __rosette_pkg in "$__rosette_tp"/*; do
-        \\      [ -d "$__rosette_pkg" ] || continue
-        \\      for __rosette_candidate in "$__rosette_pkg/include" "$__rosette_pkg/lib" "$__rosette_pkg/src"; do
-        \\        if __rosette_dir_has_direct_headers "$__rosette_candidate"; then
-        \\          if __rosette_env_path_prepend CPATH "$__rosette_candidate"; then
-        \\            __rosette_added="${__rosette_added:+$__rosette_added:}$__rosette_candidate"
-        \\          fi
-        \\        fi
+        \\    for __rosette_candidate in "$__rosette_root" "$__rosette_root/include" "$__rosette_root/inc" "$__rosette_root/src" "$__rosette_root/lib"; do
+        \\      __rosette_add_project_include_dir "$__rosette_candidate" || true
+        \\    done
+        \\
+        \\    for __rosette_vendor in "$__rosette_root/third_party" "$__rosette_root/vendor" "$__rosette_root/external" "$__rosette_root/extern" "$__rosette_root/deps" "$__rosette_root/dependencies" "$__rosette_root/libraries"; do
+        \\      [ -d "$__rosette_vendor" ] || continue
+        \\      for __rosette_pkg in "$__rosette_vendor"/*; do
+        \\        [ -d "$__rosette_pkg" ] || continue
+        \\        for __rosette_candidate in "$__rosette_pkg" "$__rosette_pkg/include" "$__rosette_pkg/inc" "$__rosette_pkg/src" "$__rosette_pkg/lib"; do
+        \\          __rosette_add_project_include_dir "$__rosette_candidate" || true
+        \\        done
         \\      done
         \\    done
         \\
         \\    if [ -n "$__rosette_added" ]; then
-        \\      export ROSETTE_THIRD_PARTY_INCLUDE_DIRS="${__rosette_added}${ROSETTE_THIRD_PARTY_INCLUDE_DIRS:+:$ROSETTE_THIRD_PARTY_INCLUDE_DIRS}"
-        \\      __rosette_trace_third_party_includes "$__rosette_root" "$__rosette_added"
+        \\      export ROSETTE_PROJECT_INCLUDE_DIRS="${__rosette_added}${ROSETTE_PROJECT_INCLUDE_DIRS:+:$ROSETTE_PROJECT_INCLUDE_DIRS}"
+        \\      __rosette_trace_project_includes "$__rosette_root" "$__rosette_added"
         \\    fi
         \\    return 0
         \\  done
         \\}
         \\
-        \\__rosette_apply_third_party_include_compat
+        \\__rosette_apply_project_include_compat
         \\
         \\arch() {
         \\  local __rosette_arch_backend="${ROSETTE_ARCH_BACKEND:-$HOME/.rosette/bin/rosette-arch}"
@@ -2314,6 +2430,109 @@ fn ensureArchBackend(allocator: std.mem.Allocator, arch_backend_path: []const u8
     try chmodPath(allocator, arch_backend_path, 0o755);
 }
 
+fn ensureCompilerLauncher(allocator: std.mem.Allocator, compiler_launcher_path: []const u8, helper_path: []const u8) !void {
+    _ = helper_path;
+    try writeFilePath(allocator, compiler_launcher_path, compiler_launcher_script);
+    try chmodPath(allocator, compiler_launcher_path, 0o755);
+}
+
+const compiler_launcher_script =
+    \\#!/bin/bash
+    \\# Generated by Rosette. Sanitize compiler command lines without editing projects.
+    \\set +e
+    \\unset DYLD_INSERT_LIBRARIES
+    \\
+    \\if [ "$#" -eq 0 ]; then
+    \\  echo "rosette-compiler-sanitize: missing compiler argv" >&2
+    \\  exit 64
+    \\fi
+    \\
+    \\compiler="$1"
+    \\shift
+    \\
+    \\__rosette_compiler_arg_is_x86() {
+    \\  case "$1" in
+    \\    x86_64|x86_64-*|*-x86_64-*|amd64|amd64-*|*-amd64-*) return 0 ;;
+    \\  esac
+    \\  return 1
+    \\}
+    \\
+    \\__rosette_path_is_simd_bridge() {
+    \\  case "$1" in
+    \\    *2[Nn][Ee][Oo][Nn]*|*[Tt][Oo][Nn][Ee][Oo][Nn]*) return 0 ;;
+    \\  esac
+    \\  return 1
+    \\}
+    \\
+    \\target_x86=0
+    \\prev=""
+    \\for arg in "$@"; do
+    \\  if [ -n "$prev" ]; then
+    \\    if __rosette_compiler_arg_is_x86 "$arg"; then
+    \\      target_x86=1
+    \\    fi
+    \\    prev=""
+    \\    continue
+    \\  fi
+    \\  case "$arg" in
+    \\    -arch|-target|--target)
+    \\      prev="$arg"
+    \\      ;;
+    \\    -arch=*|-target=*|--target=*)
+    \\      value="${arg#*=}"
+    \\      if __rosette_compiler_arg_is_x86 "$value"; then
+    \\        target_x86=1
+    \\      fi
+    \\      ;;
+    \\  esac
+    \\done
+    \\
+    \\filtered=()
+    \\while [ "$#" -gt 0 ]; do
+    \\  arg="$1"
+    \\  shift
+    \\  case "$arg" in
+    \\    -I|-isystem|-iquote|-idirafter)
+    \\      if [ "$#" -gt 0 ]; then
+    \\        path="$1"
+    \\        shift
+    \\        if [ "$target_x86" = "1" ] && __rosette_path_is_simd_bridge "$path"; then
+    \\          continue
+    \\        fi
+    \\        filtered+=("$arg" "$path")
+    \\      else
+    \\        filtered+=("$arg")
+    \\      fi
+    \\      ;;
+    \\    -I*)
+    \\      path="${arg#-I}"
+    \\      if [ "$target_x86" = "1" ] && __rosette_path_is_simd_bridge "$path"; then
+    \\        continue
+    \\      fi
+    \\      filtered+=("$arg")
+    \\      ;;
+    \\    -isystem*|-iquote*|-idirafter*)
+    \\      case "$arg" in
+    \\        -isystem*) path="${arg#-isystem}" ;;
+    \\        -iquote*) path="${arg#-iquote}" ;;
+    \\        -idirafter*) path="${arg#-idirafter}" ;;
+    \\      esac
+    \\      path="${path#=}"
+    \\      if [ "$target_x86" = "1" ] && [ -n "$path" ] && __rosette_path_is_simd_bridge "$path"; then
+    \\        continue
+    \\      fi
+    \\      filtered+=("$arg")
+    \\      ;;
+    \\    *)
+    \\      filtered+=("$arg")
+    \\      ;;
+    \\  esac
+    \\done
+    \\
+    \\exec "$compiler" "${filtered[@]}"
+    \\
+;
+
 const arch_backend_script =
     \\#!/bin/sh
     \\# Generated by Rosette. Standalone arch handoff router.
@@ -2459,11 +2678,17 @@ const clean_state_backend_script =
     \\
     \\dry_run=0
     \\include_xenia=1
+    \\quarantine=1
+    \\zap_groups=1
     \\for arg in "$@"; do
     \\  case "$arg" in
     \\    --scan|--dry-run) dry_run=1 ;;
     \\    --no-xenia) include_xenia=0 ;;
     \\    --xenia) include_xenia=1 ;;
+    \\    --no-quarantine) quarantine=0 ;;
+    \\    --quarantine) quarantine=1 ;;
+    \\    --no-groups|--no-process-groups) zap_groups=0 ;;
+    \\    --groups|--process-groups) zap_groups=1 ;;
     \\    *)
     \\      echo "rosette-clean-state: unknown option: $arg" >&2
     \\      exit 2
@@ -2473,8 +2698,10 @@ const clean_state_backend_script =
     \\
     \\tmp="${TMPDIR:-/tmp}/rosette-clean-state.$$"
     \\trap 'rm -f "$tmp.ps" "$tmp.candidates"' EXIT INT TERM
+    \\self_pgid="$(/bin/ps -o pgid= -p "$$" 2>/dev/null | /usr/bin/awk '{print $1}')"
+    \\quarantine_path="${ROSETTE_PROCESS_QUARANTINE:-$HOME/.rosette/process-quarantine.log}"
     \\
-    \\if ! /bin/ps -axo pid=,ppid=,stat=,command= > "$tmp.ps" 2>/dev/null; then
+    \\if ! /bin/ps -axo pid=,ppid=,pgid=,stat=,command= > "$tmp.ps" 2>/dev/null; then
     \\  echo "rosette-clean-state: failed to read process list" >&2
     \\  exit 1
     \\fi
@@ -2482,14 +2709,17 @@ const clean_state_backend_script =
     \\/usr/bin/awk -v self="$$" -v parent="$PPID" -v include_xenia="$include_xenia" '
     \\function lower(s) { return tolower(s) }
     \\{
-    \\  pid=$1; ppid=$2; stat=$3
+    \\  pid=$1; ppid=$2; pgid=$3; stat=$4
     \\  cmd=$0
-    \\  sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", cmd)
+    \\  sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", cmd)
     \\  lc=lower(cmd)
     \\  reason=""
     \\  if (pid <= 1 || pid == self || pid == parent || ppid == self) next
     \\  if (index(lc, "rosette-clean-state") > 0) next
-    \\  if (index(lc, "rosette-shell route-arch") > 0) reason="Rosette arch handoff"
+    \\  if (include_xenia != 1 && index(lc, "xenia_canary.app/contents/macos/xenia_canary") > 0) next
+    \\  if (index(lc, "rosette-shell compiler-sanitize") > 0) reason="Rosette compiler sanitizer"
+    \\  else if (index(lc, "rosette-compiler-sanitize") > 0) reason="Rosette compiler sanitizer launcher"
+    \\  else if (index(lc, "rosette-shell route-arch") > 0) reason="Rosette arch handoff"
     \\  else if (index(lc, "rosette-arch") > 0) reason="Rosette arch backend"
     \\  else if (index(lc, "rosette-shell detect") > 0) reason="Rosette project detector"
     \\  else if (index(lc, "rosette-shell clean-state") > 0) reason="stuck Rosette cleanup helper"
@@ -2505,7 +2735,7 @@ const clean_state_backend_script =
     \\  else if (include_xenia == 1 && index(lc, "xenia_canary.app/contents/macos/xenia_canary") > 0) reason="Rosette-launched Xenia Canary"
     \\  if (reason != "") {
     \\    gsub(/\t/, " ", cmd)
-    \\    printf "%s\t%s\t%s\t%s\t%s\n", pid, ppid, stat, reason, cmd
+    \\    printf "%s\t%s\t%s\t%s\t%s\t%s\n", pid, ppid, pgid, stat, reason, cmd
     \\  }
     \\}
     \\' "$tmp.ps" > "$tmp.candidates"
@@ -2517,9 +2747,9 @@ const clean_state_backend_script =
     \\fi
     \\
     \\echo "rosette-clean-state: found $count candidate process(es)"
-    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
+    \\while IFS="$(printf '\t')" read -r pid ppid pgid stat reason cmd; do
     \\  [ -n "$pid" ] || continue
-    \\  echo "candidate: pid=$pid ppid=$ppid stat=$stat reason=$reason"
+    \\  echo "candidate: pid=$pid ppid=$ppid pgid=$pgid stat=$stat reason=$reason"
     \\  echo "  command: $cmd"
     \\done < "$tmp.candidates"
     \\
@@ -2528,39 +2758,90 @@ const clean_state_backend_script =
     \\  exit 0
     \\fi
     \\
-    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
-    \\  [ -n "$pid" ] || continue
-    \\  if /bin/kill -TERM "$pid" 2>/dev/null; then
-    \\    echo "rosette-clean-state: sent SIGTERM to pid=$pid reason=$reason"
-    \\  else
-    \\    echo "rosette-clean-state: SIGTERM failed for pid=$pid reason=$reason" >&2
+    \\__rosette_alive() {
+    \\  /bin/kill -0 "$1" 2>/dev/null
+    \\}
+    \\
+    \\__rosette_signal_group() {
+    \\  sig="$1"
+    \\  pgid="$2"
+    \\  reason="$3"
+    \\  [ "$zap_groups" = "1" ] || return 0
+    \\  [ -n "$pgid" ] || return 0
+    \\  [ "$pgid" != "0" ] || return 0
+    \\  [ "$pgid" != "1" ] || return 0
+    \\  if [ -n "$self_pgid" ] && [ "$pgid" = "$self_pgid" ]; then
+    \\    return 0
     \\  fi
+    \\  if /bin/kill "-$sig" "-$pgid" 2>/dev/null; then
+    \\    echo "rosette-clean-state: sent SIG$sig to pgid=$pgid reason=$reason"
+    \\  fi
+    \\}
+    \\
+    \\__rosette_signal_pid() {
+    \\  sig="$1"
+    \\  pid="$2"
+    \\  reason="$3"
+    \\  if /bin/kill "-$sig" "$pid" 2>/dev/null; then
+    \\    echo "rosette-clean-state: sent SIG$sig to pid=$pid reason=$reason"
+    \\  else
+    \\    echo "rosette-clean-state: SIG$sig failed for pid=$pid reason=$reason" >&2
+    \\  fi
+    \\}
+    \\
+    \\__rosette_quarantine_survivor() {
+    \\  pid="$1"
+    \\  ppid="$2"
+    \\  pgid="$3"
+    \\  stat="$4"
+    \\  reason="$5"
+    \\  cmd="$6"
+    \\  [ "$quarantine" = "1" ] || return 0
+    \\  quarantine_dir="$(dirname "$quarantine_path" 2>/dev/null)"
+    \\  [ -n "$quarantine_dir" ] && mkdir -p "$quarantine_dir" 2>/dev/null || true
+    \\  {
+    \\    printf '%s\tpid=%s\tppid=%s\tpgid=%s\tstat=%s\treason=%s\tcmd=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$pid" "$ppid" "$pgid" "$stat" "$reason" "$cmd"
+    \\  } >> "$quarantine_path" 2>/dev/null || true
+    \\}
+    \\
+    \\while IFS="$(printf '\t')" read -r pid ppid pgid stat reason cmd; do
+    \\  [ -n "$pid" ] || continue
+    \\  __rosette_signal_group TERM "$pgid" "$reason"
+    \\  __rosette_signal_pid TERM "$pid" "$reason"
     \\done < "$tmp.candidates"
     \\
     \\/bin/sleep 0.25
     \\
-    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
+    \\while IFS="$(printf '\t')" read -r pid ppid pgid stat reason cmd; do
     \\  [ -n "$pid" ] || continue
-    \\  if /bin/kill -0 "$pid" 2>/dev/null; then
-    \\    if /bin/kill -KILL "$pid" 2>/dev/null; then
-    \\      echo "rosette-clean-state: sent SIGKILL to pid=$pid reason=$reason"
-    \\    else
-    \\      echo "rosette-clean-state: SIGKILL failed for pid=$pid reason=$reason" >&2
-    \\    fi
+    \\  if __rosette_alive "$pid"; then
+    \\    __rosette_signal_group KILL "$pgid" "$reason"
+    \\    __rosette_signal_pid KILL "$pid" "$reason"
     \\  fi
     \\done < "$tmp.candidates"
     \\
     \\/bin/sleep 0.25
     \\survivors=0
-    \\while IFS="$(printf '\t')" read -r pid ppid stat reason cmd; do
+    \\while IFS="$(printf '\t')" read -r pid ppid pgid stat reason cmd; do
     \\  [ -n "$pid" ] || continue
-    \\  if /bin/kill -0 "$pid" 2>/dev/null; then
+    \\  if __rosette_alive "$pid"; then
     \\    survivors=$((survivors + 1))
-    \\    echo "survivor: pid=$pid ppid=$ppid stat=$stat reason=$reason"
+    \\    echo "survivor: pid=$pid ppid=$ppid pgid=$pgid stat=$stat reason=$reason"
     \\    echo "  command: $cmd"
     \\    case "$stat" in
-    \\      *U*|*E*) echo "  note: kernel-held state '$stat'; macOS may keep this until the kernel releases it or the machine reboots." ;;
+    \\      *U*|*E*)
+    \\        echo "  note: kernel-held state '$stat'; macOS may keep this until the kernel releases it or the machine reboots."
+    \\        ;;
+    \\      *)
+    \\        if /bin/kill -STOP "$pid" 2>/dev/null; then
+    \\          echo "  action: suspended survivor with SIGSTOP so it stops consuming userland time"
+    \\        fi
+    \\        if [ -x /usr/bin/renice ]; then
+    \\          /usr/bin/renice 20 -p "$pid" >/dev/null 2>&1 && echo "  action: lowered survivor priority with renice +20"
+    \\        fi
+    \\        ;;
     \\    esac
+    \\    __rosette_quarantine_survivor "$pid" "$ppid" "$pgid" "$stat" "$reason" "$cmd"
     \\  fi
     \\done < "$tmp.candidates"
     \\
@@ -2568,6 +2849,9 @@ const clean_state_backend_script =
     \\  echo "rosette-clean-state: completed; no signaled candidates remain"
     \\else
     \\  echo "rosette-clean-state: signaled candidates, but $survivors survivor(s) remain"
+    \\  if [ "$quarantine" = "1" ]; then
+    \\    echo "rosette-clean-state: survivor ledger: $quarantine_path"
+    \\  fi
     \\fi
     \\
 ;
@@ -2874,6 +3158,17 @@ fn runZigCompilerWithCompatibility(
     std.process.exit(0);
 }
 
+fn runCompilerSanitizer(io: std.Io, allocator: std.mem.Allocator, compiler_argv: []const []const u8) !void {
+    if (compiler_argv.len == 0) return error.EmptyArgv;
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, compiler_argv[0]);
+    try appendSanitizedCompilerArgs(&argv, allocator, compiler_argv[1..], compilerArgsTargetX86(compiler_argv[1..]), false);
+    _ = io;
+    try execArgvReplace(allocator, argv.items);
+}
+
 fn runZigCompiler(io: std.Io, allocator: std.mem.Allocator, zig_mode: []const u8, tool_args: []const []const u8) !u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -2881,10 +3176,9 @@ fn runZigCompiler(io: std.Io, allocator: std.mem.Allocator, zig_mode: []const u8
     try argv.append(allocator, zig_mode);
     try argv.append(allocator, "-target");
     try argv.append(allocator, "x86_64-linux-gnu");
-    try argv.append(allocator, "-w");
     try argv.append(allocator, "-Wno-nullability-completeness");
-    try appendThirdPartyIncludeArgs(io, &argv, allocator);
-    try appendFilteredLinuxArgs(&argv, allocator, tool_args, false);
+    try appendProjectIncludeArgs(io, &argv, allocator);
+    try appendSanitizedCompilerArgs(&argv, allocator, tool_args, true, false);
     return try runArgvResult(io, argv.items);
 }
 
@@ -3187,10 +3481,28 @@ fn hasString(values: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn pathContainsSimdBridgeDir(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |component| {
+        if (component.len > 0 and project_includes.isSimdBridgeDir(component)) return true;
+    }
+    return false;
+}
+
 fn appendFilteredLinuxArgs(
     argv: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
     tool_args: []const []const u8,
+    strip_ld_debug: bool,
+) !void {
+    try appendSanitizedCompilerArgs(argv, allocator, tool_args, true, strip_ld_debug);
+}
+
+fn appendSanitizedCompilerArgs(
+    argv: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+    tool_args: []const []const u8,
+    target_x86: bool,
     strip_ld_debug: bool,
 ) !void {
     var i: usize = 0;
@@ -3201,32 +3513,95 @@ fn appendFilteredLinuxArgs(
             i += 1;
             continue;
         }
+        // Generalised SIMD bridge dir filtering: strip include paths that
+        // point to CPU-architecture emulation layers (e.g. AvxToNeon on
+        // x86_64). Matches by directory-name pattern, no hardcoded per-
+        // project list, so it works for any codebase that bundles these.
+        if (target_x86 and isIncludeFlag(arg) != null) {
+            if (i + 1 < tool_args.len and pathContainsSimdBridgeDir(tool_args[i + 1])) {
+                i += 1;
+                continue;
+            }
+        }
+        if (target_x86) {
+            if (joinedIncludePath(arg)) |path| {
+                if (pathContainsSimdBridgeDir(path)) continue;
+            }
+        }
         try argv.append(allocator, arg);
     }
 }
 
-fn appendThirdPartyIncludeArgs(io: std.Io, argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
-    if (!thirdPartyIncludeCompatEnabled()) return;
-    const root = thirdPartyIncludeRoot(allocator) catch return;
-    var dirs = third_party_includes.discoverIncludeDirs(io, allocator, root) catch return;
+fn isIncludeFlag(arg: []const u8) ?[]const u8 {
+    const flags = [_][]const u8{ "-I", "-isystem", "-iquote", "-idirafter" };
+    for (flags) |flag| {
+        if (std.mem.eql(u8, arg, flag)) return flag;
+    }
+    return null;
+}
+
+fn joinedIncludePath(arg: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, arg, "-I") and arg.len > 2) return arg[2..];
+    const joined_flags = [_][]const u8{ "-isystem", "-iquote", "-idirafter" };
+    for (joined_flags) |flag| {
+        if (std.mem.startsWith(u8, arg, flag) and arg.len > flag.len) {
+            var path = arg[flag.len..];
+            if (path.len != 0 and path[0] == '=') path = path[1..];
+            if (path.len != 0) return path;
+        }
+    }
+    return null;
+}
+
+fn compilerArgsTargetX86(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-arch") and i + 1 < args.len and targetNameIsX86(args[i + 1])) return true;
+        if (std.mem.eql(u8, arg, "-target") and i + 1 < args.len and targetNameIsX86(args[i + 1])) return true;
+        if (std.mem.startsWith(u8, arg, "--target=") and targetNameIsX86(arg["--target=".len..])) return true;
+        if (std.mem.startsWith(u8, arg, "-target") and arg.len > "-target".len and targetNameIsX86(arg["-target".len..])) return true;
+    }
+    return false;
+}
+
+fn targetNameIsX86(value: []const u8) bool {
+    return containsIgnoreCase(value, "x86_64") or
+        containsIgnoreCase(value, "amd64") or
+        containsIgnoreCase(value, "i386") or
+        containsIgnoreCase(value, "i486") or
+        containsIgnoreCase(value, "i586") or
+        containsIgnoreCase(value, "i686");
+}
+
+fn appendProjectIncludeArgs(io: std.Io, argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    if (!projectIncludeCompatEnabled()) return;
+    const root = projectIncludeRoot(allocator) catch return;
+    var dirs = project_includes.discoverIncludeDirs(io, allocator, root) catch return;
     defer {
         for (dirs.items) |dir| allocator.free(dir);
         dirs.deinit(allocator);
     }
 
     for (dirs.items) |dir| {
+        // Same SIMD bridge dir filtering as appendFilteredLinuxArgs above.
+        if (pathContainsSimdBridgeDir(dir)) continue;
         try argv.append(allocator, "-I");
         try argv.append(allocator, dir);
     }
 }
 
-fn thirdPartyIncludeCompatEnabled() bool {
+fn projectIncludeCompatEnabled() bool {
+    if (getenvSlice("ROSETTE_PROJECT_INCLUDE_COMPAT")) |value| {
+        return !isFalseEnvValue(value);
+    }
     const value = getenvSlice("ROSETTE_THIRD_PARTY_INCLUDE_COMPAT") orelse return true;
     return !isFalseEnvValue(value);
 }
 
-fn thirdPartyIncludeRoot(allocator: std.mem.Allocator) ![]const u8 {
+fn projectIncludeRoot(allocator: std.mem.Allocator) ![]const u8 {
     const candidates = [_]?[]const u8{
+        getenvSlice("ROSETTE_PROJECT_INCLUDE_ROOT"),
         getenvSlice("ROSETTE_THIRD_PARTY_INCLUDE_ROOT"),
         getenvSlice("ROSETTE_ROUTE_ROOT"),
         getenvSlice("ROSETTE_CALLER_CWD"),
@@ -3749,7 +4124,9 @@ test "shell snippet includes zsh direct ELF launcher" {
     );
     try std.testing.expect(containsIgnoreCase(snippet, "run-elf"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_refresh_elf_commands"));
-    try std.testing.expect(containsIgnoreCase(snippet, "detect \"$PWD\""));
+    try std.testing.expect(containsIgnoreCase(snippet, "__rosette_detect_project_with_timeout"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_DIRECT_ELF_FULL_DETECT"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_DIRECT_ELF_DETECT_TIMEOUT_MS"));
     try std.testing.expect(containsIgnoreCase(snippet, "__rosette_should_probe_direct_elf"));
     try std.testing.expect(containsIgnoreCase(snippet, "functions[$__rosette_cmd]"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_ENABLE_DYLD_INTERPOSE:-0"));
@@ -3793,15 +4170,56 @@ test "bash env snippet routes x86 arch only" {
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_USER_BASH_ENV"));
 }
 
-test "bash env snippet enables scoped third-party include compatibility" {
+test "bash env snippet enables scoped project include compatibility" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const snippet = try buildBashEnvSnippet(arena.allocator(), "/tmp/rosette/bin/rosette-shell");
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_COMPILER_SANITIZER"));
+    try std.testing.expect(containsIgnoreCase(snippet, "CMAKE_C_COMPILER_LAUNCHER"));
+    try std.testing.expect(containsIgnoreCase(snippet, "CMAKE_CXX_COMPILER_LAUNCHER"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_PROJECT_INCLUDE_COMPAT"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_PROJECT_INCLUDE_ROOT"));
+    try std.testing.expect(containsIgnoreCase(snippet, "__rosette_apply_project_include_compat"));
     try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_THIRD_PARTY_INCLUDE_COMPAT"));
-    try std.testing.expect(containsIgnoreCase(snippet, "__rosette_apply_third_party_include_compat"));
     try std.testing.expect(containsIgnoreCase(snippet, "third_party"));
+    try std.testing.expect(containsIgnoreCase(snippet, "vendor"));
+    try std.testing.expect(containsIgnoreCase(snippet, "external"));
     try std.testing.expect(containsIgnoreCase(snippet, "CPATH"));
-    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_THIRD_PARTY_INCLUDE_DIRS"));
+    try std.testing.expect(containsIgnoreCase(snippet, "ROSETTE_PROJECT_INCLUDE_DIRS"));
+    try std.testing.expect(!containsIgnoreCase(snippet, "Wno-error=shorten-64-to-32"));
+    try std.testing.expect(!containsIgnoreCase(snippet, "capstone_compat.h"));
+}
+
+test "compiler sanitizer strips SIMD bridge include dirs only for x86 targets" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+
+    const args = [_][]const u8{
+        "-arch",
+        "x86_64",
+        "-isystem",
+        "/repo/third_party/AvxToNeon",
+        "-I/repo/third_party/zstd",
+        "-I/repo/third_party/sse2neon",
+        "-iquote",
+        "/repo/include",
+        "-c",
+        "file.c",
+    };
+    try appendSanitizedCompilerArgs(&argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try std.testing.expect(hasString(argv.items, "-I/repo/third_party/zstd"));
+    try std.testing.expect(hasString(argv.items, "/repo/include"));
+    try std.testing.expect(!hasString(argv.items, "/repo/third_party/AvxToNeon"));
+    try std.testing.expect(!hasString(argv.items, "-I/repo/third_party/sse2neon"));
+}
+
+test "compiler sanitizer keeps SIMD bridge dirs for non-x86 targets" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+
+    const args = [_][]const u8{ "-arch", "arm64", "-isystem", "/repo/third_party/AvxToNeon", "-c", "file.c" };
+    try appendSanitizedCompilerArgs(&argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try std.testing.expect(hasString(argv.items, "/repo/third_party/AvxToNeon"));
 }
 
 test "arch wrapper routes x86 handoffs through standalone backend" {
@@ -3848,10 +4266,20 @@ test "clean-state matcher can include or exclude Xenia launches" {
     const command = "./xenia_canary.app/Contents/MacOS/xenia_canary --gpu=vulkan";
     try std.testing.expect(cleanupReason(command, .{ .include_xenia = true }) != null);
     try std.testing.expect(cleanupReason(command, .{ .include_xenia = false }) == null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-router run ./xenia_canary.app/Contents/MacOS/xenia_canary", .{ .include_xenia = false }) == null);
     try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell detect /repo", .{}) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell compiler-sanitize /bin/echo", .{}) != null);
+    try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-compiler-sanitize /bin/echo", .{}) != null);
     try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-arch -x86_64 /bin/bash /tmp/xenia-rosetta.ABC", .{}) != null);
     try std.testing.expect(cleanupReason("/Users/test/.rosette/bin/rosette-shell clean-state", .{}) == null);
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "filtered=()"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "exec \"$compiler\""));
+    try std.testing.expect(!containsIgnoreCase(compiler_launcher_script, "compiler-sanitize \"$@\""));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-shell route-arch"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-shell compiler-sanitize"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "process-quarantine.log"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "pgid"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "-STOP"));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-arch"));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "xenia_canary.app/contents/macos/xenia_canary"));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "--no-xenia"));
