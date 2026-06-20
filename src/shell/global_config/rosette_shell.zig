@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const process_guard = @import("entrypoint_kernel_process_guard");
 const project_includes = @import("compat_source_include_compat");
+const pid_manager = @import("pid_manager.zig");
 
 const c = @cImport({
     @cInclude("errno.h");
@@ -255,69 +256,252 @@ fn usage(exe_name: []const u8) void {
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
-    const home = try homeDir(allocator);
-    const rosette_dir = try std.fs.path.join(allocator, &.{ home, ".rosette" });
-    const bin_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "bin" });
-    const lib_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "lib" });
-    const wrapper_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "wrappers" });
-    const helper_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" });
-    const rosette_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette" });
-    const arch_wrapper_path = try std.fs.path.join(allocator, &.{ bin_dir, "arch" });
-    const arch_backend_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-arch" });
-    const compiler_launcher_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-compiler-sanitize" });
-    const clean_state_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" });
-    const shell_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" });
-    const bash_env_path = try std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" });
-    const toml_path = try std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" });
-    const compat_router_path = try std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" });
-    const macho_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "macho_processor" });
+    std.debug.print("[INSTALL] Starting Rosette shell installation/update\n", .{});
+    std.debug.print("[INSTALL] Pre-flight cleanup: killing any existing Rosette helper processes\n", .{});
+    pid_manager.killRosetteHelpers(allocator) catch |err| {
+        std.debug.print("[INSTALL] Warning: pre-flight cleanup failed: {s}\n", .{@errorName(err)});
+    };
 
-    const include_dir = try std.fs.path.join(allocator, &.{ rosette_dir, "include" });
-    try makePathRecursive(allocator, bin_dir);
-    try makePathRecursive(allocator, wrapper_dir);
-    try makePathRecursive(allocator, lib_dir);
-    try makePathRecursive(allocator, include_dir);
-    try ensureX86CompatHeader(allocator, include_dir);
-    try copySelf(init, allocator, helper_path);
-    try copySelf(init, allocator, rosette_path);
-    try ensureArchBackend(allocator, arch_backend_path);
-    try ensureArchWrapper(allocator, arch_wrapper_path, arch_backend_path);
-    try ensureCompilerLauncher(allocator, compiler_launcher_path, helper_path);
-    try ensureCleanStateBackend(allocator, clean_state_path);
-    try ensureWrappers(allocator, wrapper_dir, helper_path);
-    try ensureConfigFile(init.io, allocator, toml_path);
+    std.debug.print("[INSTALL] Step 1: Building directory paths\n", .{});
+    const home = homeDir(allocator) catch |err| {
+        std.debug.print("[INSTALL] CRITICAL ERROR: Failed to get home directory: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const rosette_dir = std.fs.path.join(allocator, &.{ home, ".rosette" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build rosette_dir path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const bin_dir = std.fs.path.join(allocator, &.{ rosette_dir, "bin" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build bin_dir path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const lib_dir = std.fs.path.join(allocator, &.{ rosette_dir, "lib" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build lib_dir path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const wrapper_dir = std.fs.path.join(allocator, &.{ rosette_dir, "wrappers" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build wrapper_dir path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const helper_path = std.fs.path.join(allocator, &.{ bin_dir, "rosette-shell" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build helper_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const rosette_path = std.fs.path.join(allocator, &.{ bin_dir, "rosette" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build rosette_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const arch_wrapper_path = std.fs.path.join(allocator, &.{ bin_dir, "arch" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build arch_wrapper_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const arch_backend_path = std.fs.path.join(allocator, &.{ bin_dir, "rosette-arch" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build arch_backend_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const compiler_launcher_path = std.fs.path.join(allocator, &.{ bin_dir, "rosette-compiler-sanitize" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build compiler_launcher_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const clean_state_path = std.fs.path.join(allocator, &.{ bin_dir, "rosette-clean-state" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build clean_state_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const shell_path = std.fs.path.join(allocator, &.{ rosette_dir, "rosette-shell.sh" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build shell_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const bash_env_path = std.fs.path.join(allocator, &.{ rosette_dir, "rosette-bash-env.sh" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build bash_env_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const toml_path = std.fs.path.join(allocator, &.{ rosette_dir, "config.toml" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build toml_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const compat_router_path = std.fs.path.join(allocator, &.{ bin_dir, "rosette-router" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build compat_router_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const macho_processor_path = std.fs.path.join(allocator, &.{ bin_dir, "macho_processor" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build macho_processor_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
 
-    const elf_processor_path = try std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" });
-    const dyld_lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" });
+    std.debug.print("[INSTALL] Step 2: Creating directory structure\n", .{});
+    const include_dir = std.fs.path.join(allocator, &.{ rosette_dir, "include" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build include_dir: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    makePathRecursive(allocator, bin_dir) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to create bin_dir: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    std.debug.print("[INSTALL] Created bin_dir: {s}\n", .{bin_dir});
+    makePathRecursive(allocator, wrapper_dir) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to create wrapper_dir: {s}\n", .{@errorName(err)});
+        std.debug.print("[INSTALL] Wrappers will not be installed\n", .{});
+    };
+    std.debug.print("[INSTALL] Created wrapper_dir: {s}\n", .{wrapper_dir});
+    makePathRecursive(allocator, lib_dir) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to create lib_dir: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    std.debug.print("[INSTALL] Created lib_dir: {s}\n", .{lib_dir});
+    makePathRecursive(allocator, include_dir) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to create include_dir: {s}\n", .{@errorName(err)});
+        std.debug.print("[INSTALL] Compatibility headers will not be installed\n", .{});
+    };
+    std.debug.print("[INSTALL] Created include_dir: {s}\n", .{include_dir});
+
+    std.debug.print("[INSTALL] Step 3: Installing x86 compatibility header\n", .{});
+    ensureX86CompatHeader(allocator, include_dir) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install x86 compatibility header: {s}\n", .{@errorName(err)});
+    };
+
+    std.debug.print("[INSTALL] Step 4: Copying helper binaries\n", .{});
+    copySelf(init, allocator, helper_path) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to copy rosette-shell: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    std.debug.print("[INSTALL] Copied rosette-shell to: {s}\n", .{helper_path});
+    copySelf(init, allocator, rosette_path) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to copy rosette: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Copied rosette to: {s}\n", .{rosette_path});
+
+    std.debug.print("[INSTALL] Step 5: Installing arch backend\n", .{});
+    ensureArchBackend(allocator, arch_backend_path) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install arch backend: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Installed arch backend: {s}\n", .{arch_backend_path});
+    ensureArchWrapper(allocator, arch_wrapper_path, arch_backend_path) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install arch wrapper: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Installed arch wrapper: {s}\n", .{arch_wrapper_path});
+
+    std.debug.print("[INSTALL] Step 6: Installing compiler launcher\n", .{});
+    ensureCompilerLauncher(allocator, compiler_launcher_path, helper_path) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install compiler launcher: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Installed compiler launcher: {s}\n", .{compiler_launcher_path});
+
+    std.debug.print("[INSTALL] Step 7: Installing clean state backend\n", .{});
+    ensureCleanStateBackend(allocator, clean_state_path) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install clean state backend: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Installed clean state backend: {s}\n", .{clean_state_path});
+
+    std.debug.print("[INSTALL] Step 8: Installing tool wrappers\n", .{});
+    ensureWrappers(allocator, wrapper_dir, helper_path) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install tool wrappers: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Installed wrappers in: {s}\n", .{wrapper_dir});
+
+    std.debug.print("[INSTALL] Step 9: Ensuring config file\n", .{});
+    ensureConfigFile(init.io, allocator, toml_path) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to ensure config file: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Config file: {s}\n", .{toml_path});
+
+    const elf_processor_path = std.fs.path.join(allocator, &.{ bin_dir, "elf_processor" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build elf_processor_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const dyld_lib_path = std.fs.path.join(allocator, &.{ lib_dir, "rosette-exec.dylib" }) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build dyld_lib_path: {s}\n", .{@errorName(err)});
+        return err;
+    };
     const is_macos = comptime builtin.target.os.tag == .macos;
 
     if (source_root.len != 0) {
-        try copyElfProcessor(init, allocator, source_root, elf_processor_path);
-        try copyCompatRouter(init, allocator, source_root, compat_router_path);
-        try copyMachoProcessor(init, allocator, source_root, macho_processor_path);
-        if (is_macos) try installDylib(init, allocator, source_root, dyld_lib_path);
+        std.debug.print("[INSTALL] Step 10: Copying processors from source root: {s}\n", .{source_root});
+        copyElfProcessor(init, allocator, source_root, elf_processor_path) catch |err| {
+            std.debug.print("[INSTALL] WARNING: Failed to copy ELF processor: {s}\n", .{@errorName(err)});
+        };
+        std.debug.print("[INSTALL] Copied ELF processor to: {s}\n", .{elf_processor_path});
+        copyCompatRouter(init, allocator, source_root, compat_router_path) catch |err| {
+            std.debug.print("[INSTALL] WARNING: Failed to copy compat router: {s}\n", .{@errorName(err)});
+        };
+        std.debug.print("[INSTALL] Copied compat router to: {s}\n", .{compat_router_path});
+        copyMachoProcessor(init, allocator, source_root, macho_processor_path) catch |err| {
+            std.debug.print("[INSTALL] WARNING: Failed to copy Mach-O processor: {s}\n", .{@errorName(err)});
+        };
+        std.debug.print("[INSTALL] Copied Mach-O processor to: {s}\n", .{macho_processor_path});
+
+        if (is_macos) {
+            std.debug.print("[INSTALL] Step 11: Compiling dylib (this may take a moment)\n", .{});
+            installDylib(init, allocator, source_root, dyld_lib_path) catch |err| {
+                std.debug.print("[INSTALL] WARNING: Failed to install dylib: {s}\n", .{@errorName(err)});
+                std.debug.print("[INSTALL] DYLD interposition will not be available\n", .{});
+            };
+            std.debug.print("[INSTALL] Compiled dylib to: {s}\n", .{dyld_lib_path});
+        }
+    } else {
+        std.debug.print("[INSTALL] Step 10-11: Skipped (no source_root provided)\n", .{});
     }
 
-    const snippet = try buildShellSnippet(
+    std.debug.print("[INSTALL] Step 12: Building shell snippet\n", .{});
+    const snippet = buildShellSnippet(
         allocator,
         helper_path,
         if (is_macos and fileExists(allocator, dyld_lib_path)) dyld_lib_path else null,
         if (fileExists(allocator, elf_processor_path)) elf_processor_path else null,
-    );
-    try writeFilePath(allocator, shell_path, snippet);
-    try chmodPath(allocator, shell_path, 0o644);
-    try writeFilePath(allocator, bash_env_path, try buildBashEnvSnippet(allocator, helper_path));
-    try chmodPath(allocator, bash_env_path, 0o644);
+    ) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build shell snippet: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    writeFilePath(allocator, shell_path, snippet) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to write shell snippet: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    chmodPath(allocator, shell_path, 0o644) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to chmod shell snippet: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Wrote shell snippet: {s}\n", .{shell_path});
 
-    const block = try buildProfileBlock(allocator);
-    try installProfileBlocks(init.io, allocator, home, block);
+    std.debug.print("[INSTALL] Step 13: Building bash env snippet\n", .{});
+    const bash_env_snippet = buildBashEnvSnippet(allocator, helper_path) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build bash env snippet: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    writeFilePath(allocator, bash_env_path, bash_env_snippet) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to write bash env snippet: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    chmodPath(allocator, bash_env_path, 0o644) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to chmod bash env snippet: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("[INSTALL] Wrote bash env snippet: {s}\n", .{bash_env_path});
+
+    std.debug.print("[INSTALL] Step 14: Installing profile blocks\n", .{});
+    const block = buildProfileBlock(allocator) catch |err| {
+        std.debug.print("[INSTALL] ERROR: Failed to build profile block: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    installProfileBlocks(init.io, allocator, home, block) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install profile blocks: {s}\n", .{@errorName(err)});
+        std.debug.print("[INSTALL] You may need to manually source the shell script\n", .{});
+    };
+    std.debug.print("[INSTALL] Installed profile blocks in home: {s}\n", .{home});
 
     if (source_root.len != 0) {
-        const config_path = try std.fs.path.join(allocator, &.{ rosette_dir, "source-root" });
-        const source_text = try std.fmt.allocPrint(allocator, "{s}\n", .{source_root});
-        try writeFilePath(allocator, config_path, source_text);
+        std.debug.print("[INSTALL] Step 15: Writing source-root config\n", .{});
+        const config_path = std.fs.path.join(allocator, &.{ rosette_dir, "source-root" }) catch |err| {
+            std.debug.print("[INSTALL] WARNING: Failed to build source-root config path: {s}\n", .{@errorName(err)});
+            return;
+        };
+        const source_text = std.fmt.allocPrint(allocator, "{s}\n", .{source_root}) catch |err| {
+            std.debug.print("[INSTALL] WARNING: Failed to format source-root: {s}\n", .{@errorName(err)});
+            return;
+        };
+        writeFilePath(allocator, config_path, source_text) catch |err| {
+            std.debug.print("[INSTALL] WARNING: Failed to write source-root config: {s}\n", .{@errorName(err)});
+        };
+        std.debug.print("[INSTALL] Wrote source-root: {s}\n", .{config_path});
     }
 
+    std.debug.print("[INSTALL] Step 16: Printing installation summary\n", .{});
     std.debug.print("Rosette shell integration installed.\n", .{});
     std.debug.print("source: {s}\n", .{shell_path});
     std.debug.print("command: {s}\n", .{rosette_path});
@@ -341,6 +525,9 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     }
     std.debug.print("current terminal reload: source ~/.rosette/rosette-shell.sh\n", .{});
     std.debug.print("diagnose from a project: rosette-diagnose-shell ./program\n", .{});
+
+    std.debug.print("[INSTALL] Installation/update completed successfully\n", .{});
+    pid_manager.printTrackedProcessStatus();
 }
 
 fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
@@ -4016,12 +4203,12 @@ fn writeFilePath(allocator: std.mem.Allocator, path: []const u8, data: []const u
     if (parent) |dir| try makePathRecursive(allocator, dir);
     const path_z = try allocator.dupeZ(u8, path);
     const fp = c.fopen(path_z.ptr, "wb");
-    if (fp == null) return error.FileWriteFailed;
+    if (fp == null) return error.OpenFailed;
     defer _ = c.fclose(fp);
 
     if (data.len != 0) {
         const wrote = c.fwrite(data.ptr, 1, data.len, fp);
-        if (wrote != data.len) return error.FileWriteFailed;
+        if (wrote != data.len) return error.WriteFailed;
     }
 }
 
@@ -4030,12 +4217,12 @@ fn appendFilePath(allocator: std.mem.Allocator, path: []const u8, data: []const 
     if (parent) |dir| try makePathRecursive(allocator, dir);
     const path_z = try allocator.dupeZ(u8, path);
     const fp = c.fopen(path_z.ptr, "ab");
-    if (fp == null) return error.FileWriteFailed;
+    if (fp == null) return error.OpenFailed;
     defer _ = c.fclose(fp);
 
     if (data.len != 0) {
         const wrote = c.fwrite(data.ptr, 1, data.len, fp);
-        if (wrote != data.len) return error.FileWriteFailed;
+        if (wrote != data.len) return error.WriteFailed;
     }
 }
 
@@ -4084,6 +4271,7 @@ fn compileDylibFromSource(init: std.process.Init, allocator: std.mem.Allocator, 
         return;
     };
 
+    std.debug.print("[DYLIB] Compiling dylib from source: {s}\n", .{source_path});
     const tmp = getenvSlice("TMPDIR") orelse "/tmp";
     const local_cache = try std.fs.path.join(allocator, &.{ tmp, "rosette-zig-cache" });
     const global_cache = try std.fs.path.join(allocator, &.{ tmp, "rosette-zig-global-cache" });
@@ -4105,13 +4293,34 @@ fn compileDylibFromSource(init: std.process.Init, allocator: std.mem.Allocator, 
     try argv.append(allocator, "-install_name");
     try argv.append(allocator, "@rpath/rosette-exec.dylib");
 
-    const code = runArgvResult(init.io, argv.items) catch |err| {
-        std.debug.print("rosette-shell: warning: failed to compile rosette-exec.dylib: {s}\n", .{@errorName(err)});
+    std.debug.print("[DYLIB] Spawning zig cc with timeout (30s)\n", .{});
+    std.debug.print("[DYLIB] Command: {s}\n", .{try std.mem.join(allocator, " ", argv.items)});
+
+    // Use process_guard with a 30-second timeout for compilation
+    const code = process_guard.runExitCode(init.io, .{
+        .argv = argv.items,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .label = "zig-cc-dylib",
+        .timeout_ms = 30000, // 30 second timeout
+        .kill_grace_ms = 5000, // 5 second grace period
+        .isolate_process_group = true,
+        .signal_policy = .process_group,
+    }) catch |err| {
+        std.debug.print("[DYLIB] Error: failed to compile rosette-exec.dylib: {s}\n", .{@errorName(err)});
+        std.debug.print("[DYLIB] Attempting cleanup of any zig processes...\n", .{});
+        pid_manager.killProcessesMatchingPattern(allocator, "zig") catch {};
         std.debug.print("  elf_processor binary installed, DYLD interposition not available\n", .{});
         return;
     };
+
+    std.debug.print("[DYLIB] zig cc exited with code: {d}\n", .{code});
+
     if (code != 0) {
-        std.debug.print("rosette-shell: warning: zig cc returned exit code {d} for dylib compilation\n", .{code});
+        std.debug.print("[DYLIB] Warning: zig cc returned exit code {d} for dylib compilation\n", .{code});
+        std.debug.print("[DYLIB] Attempting cleanup of any zig processes...\n", .{});
+        pid_manager.killProcessesMatchingPattern(allocator, "zig") catch {};
         std.debug.print("  elf_processor binary installed, DYLD interposition not available\n", .{});
         return;
     }
