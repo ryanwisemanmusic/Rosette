@@ -83,7 +83,7 @@ fn appendUniqueOwned(allocator: std.mem.Allocator, dirs: *std.ArrayList([]const 
 
 fn isUsableIncludeDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, policy: CandidatePolicy) bool {
     if (!dirExists(io, path)) return false;
-    if (pathContainsSimdBridgeDir(path)) return false;
+    if (containsX86IntrinsicShadow(io, path)) return false;
     if (containsStandardHeaderShadow(io, path)) return false;
     if (containsImmediateHeader(io, path)) return true;
     return policy == .header_root and containsImmediateChildWithHeader(io, allocator, path);
@@ -133,6 +133,18 @@ fn containsStandardHeaderShadow(io: std.Io, path: []const u8) bool {
     return false;
 }
 
+pub fn containsX86IntrinsicShadow(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (isX86IntrinsicShadowHeaderName(entry.name)) return true;
+    }
+    return false;
+}
+
 pub fn hasHeaderExtension(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".h") or
         std.ascii.endsWithIgnoreCase(name, ".hh") or
@@ -164,6 +176,88 @@ pub fn isStandardHeaderShadowName(name: []const u8) bool {
         "type_traits",   "typeindex",          "typeinfo",         "unordered_map",
         "unordered_set", "utility",            "valarray",         "variant",
         "vector",        "version",
+    };
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(name, header)) return true;
+    }
+    return false;
+}
+
+pub fn isX86IntrinsicShadowHeaderName(name: []const u8) bool {
+    const headers = [_][]const u8{
+        "adxintrin.h",
+        "ammintrin.h",
+        "avx2intrin.h",
+        "avx512bfintrin.h",
+        "avx512bitalgintrin.h",
+        "avx512bwbf16vlintrin.h",
+        "avx512bwintrin.h",
+        "avx512cdintrin.h",
+        "avx512dqintrin.h",
+        "avx512erintrin.h",
+        "avx512fintrin.h",
+        "avx512fp16intrin.h",
+        "avx512ifmainintrin.h",
+        "avx512ifmavlintrin.h",
+        "avx512pfintrin.h",
+        "avx512vbmi2intrin.h",
+        "avx512vbmiintrin.h",
+        "avx512vlbitalgintrin.h",
+        "avx512vlbwintrin.h",
+        "avx512vldqintrin.h",
+        "avx512vlintrin.h",
+        "avx512vlvbmi2intrin.h",
+        "avx512vlvnniintrin.h",
+        "avx512vnniintrin.h",
+        "avx512vp2intersectintrin.h",
+        "avx512vpopcntdqintrin.h",
+        "avx512vpopcntdqvlintrin.h",
+        "avx512vpopcntintrin.h",
+        "avx512vpopcntvlintrin.h",
+        "avx512vpshufbitqmbintrin.h",
+        "avxintrin.h",
+        "avxintrin512.h",
+        "bmi2intrin.h",
+        "bmiintrin.h",
+        "clflushoptintrin.h",
+        "clwbintrin.h",
+        "cpuid.h",
+        "emmintrin.h",
+        "f16cintrin.h",
+        "fma4intrin.h",
+        "fmaintrin.h",
+        "fxsrintrin.h",
+        "ia32intrin.h",
+        "immintrin.h",
+        "lwpintrin.h",
+        "lzcntintrin.h",
+        "mmintrin.h",
+        "movdirintrin.h",
+        "mwaitxintrin.h",
+        "nmmintrin.h",
+        "pconfigintrin.h",
+        "pkuintrin.h",
+        "pmmintrin.h",
+        "popcntintrin.h",
+        "prfchwintrin.h",
+        "rdseedintrin.h",
+        "rtmintrin.h",
+        "serializeintrin.h",
+        "sgxintrin.h",
+        "shaintrin.h",
+        "smmintrin.h",
+        "tbmintrin.h",
+        "tmmintrin.h",
+        "uintrintrin.h",
+        "vaesintrin.h",
+        "vpclmulqdqintrin.h",
+        "waitpkgintrin.h",
+        "wbnoinvdintrin.h",
+        "wmmintrin.h",
+        "x86gprintrin.h",
+        "x86intrin.h",
+        "xmmintrin.h",
+        "xopintrin.h",
     };
     for (headers) |header| {
         if (std.ascii.eqlIgnoreCase(name, header)) return true;
@@ -226,4 +320,13 @@ test "standard library extensionless headers are treated as unsafe shadows" {
     try std.testing.expect(isStandardHeaderShadowName("type_traits"));
     try std.testing.expect(!isStandardHeaderShadowName("version.h"));
     try std.testing.expect(!isStandardHeaderShadowName("project-version"));
+}
+
+test "x86 intrinsic shadow headers are detected separately from bridge entry headers" {
+    try std.testing.expect(isX86IntrinsicShadowHeaderName("emmintrin.h"));
+    try std.testing.expect(isX86IntrinsicShadowHeaderName("IMMINTRIN.H"));
+    try std.testing.expect(isX86IntrinsicShadowHeaderName("cpuid.h"));
+    try std.testing.expect(!isX86IntrinsicShadowHeaderName("vex2neon.h"));
+    try std.testing.expect(!isX86IntrinsicShadowHeaderName("bmi2neon.h"));
+    try std.testing.expect(!isX86IntrinsicShadowHeaderName("ppcfloat2neon.h"));
 }
