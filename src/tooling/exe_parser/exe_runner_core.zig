@@ -3,14 +3,15 @@ const fmt = @import("pe_format.zig");
 const parser = @import("pe_parser.zig");
 const pkg = @import("rosette_package.zig");
 const trace = @import("mandatory_trace.zig");
-const x86_disasm = @import("../disasm_logger/x86_disasm.zig");
+const x86_disasm = @import("x86_disasm");
+const x86_asm = @import("x86_asm");
 const process_guard = @import("entrypoint_kernel_process_guard");
-const raw_decode = @import("../../x86-ASM/raw_decoder.zig");
+const raw_decode = x86_asm.raw_decoder;
 const runtime_abi = @import("runtime_abi_handshake");
 const traps = runtime_abi.traps;
 const code_text = @import("entrypoint_code_text_segment");
 const imports_mod = @import("imports/imports.zig");
-const clr_runtime = @import("../../../include/runtime/clr_runtime.zig");
+const clr_runtime = @import("clr_runtime");
 
 const image_scn_mem_execute: u32 = 0x2000_0000;
 
@@ -528,10 +529,10 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
 
     if (launch_allowed) {
         bootLog("7_import_exec_engine: loading x86 emulation modules");
-        const exec_engine = @import("../../x86-ASM/execution_engine.zig");
-        const win32 = @import("../../x86-ASM/win32_thunks.zig");
-        const mscoree = @import("../../x86-ASM/mscoree_thunks.zig");
-        const Executor = @import("../../x86-ASM/instruction_operations.zig").Executor;
+        const exec_engine = x86_asm.execution_engine;
+        const win32 = x86_asm.win32_thunks;
+        const mscoree = x86_asm.mscoree_thunks;
+        const Executor = x86_asm.instruction_operations.Executor;
 
         bootLog("8_abi_x86_init: initializing ABI handshake");
         runtime_abi.x86.init();

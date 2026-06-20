@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Executor = @import("instruction_operations.zig").Executor;
 const abi = @import("abi_handshake.zig");
-const clr_runtime = @import("../../include/runtime/clr_runtime.zig");
+const clr_runtime = @import("clr_runtime");
 
 const RTLD_NOW = 2;
 

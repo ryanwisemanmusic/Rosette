@@ -1,8 +1,9 @@
 const std = @import("std");
-const isa = @import("../../x86-ASM/instruction_set.zig");
-const raw_decode = @import("../../x86-ASM/raw_decoder.zig");
+const x86_asm = @import("x86_asm");
+const isa = x86_asm.instruction_set;
+const raw_decode = x86_asm.raw_decoder;
 const Register = isa.Register;
-const Executor = @import("../../x86-ASM/instruction_operations.zig").Executor;
+const Executor = x86_asm.instruction_operations.Executor;
 
 extern "C" fn rosette_debug_x86_disasm_enabled() c_int;
 extern "C" fn rosette_debug_log_path() [*:0]const u8;

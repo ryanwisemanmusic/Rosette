@@ -1,6 +1,7 @@
 const std = @import("std");
-const scaffold = @import("../../x86-ASM/decode_scaffold.zig");
-const core = @import("../../x86-ASM/family_core.zig");
+const x86_asm = @import("x86_asm");
+const scaffold = x86_asm.decode_scaffold;
+const core = x86_asm.family_core;
 
 const ModRm = scaffold.ModRm;
 const Sib = scaffold.Sib;
@@ -176,17 +177,52 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
     while (cursor.remaining() > 0) {
         const b = try cursor.readU8();
         start_offset = cursor.offset - 1;
-        if (b == 0x66) { opsize_32 = false; prefixes.operand_size_override = true; continue; }
-        if (b == 0x67) { addr_size_32 = false; prefixes.address_size_override = true; continue; }
-        if (b == 0xF0) { prefixes.lock = true; continue; }
-        if (b == 0xF2) { prefixes.repne = true; continue; }
-        if (b == 0xF3) { prefixes.rep = true; continue; }
-        if (b == 0x2E) { prefixes.segment_override = .cs; continue; }
-        if (b == 0x36) { prefixes.segment_override = .ss; continue; }
-        if (b == 0x3E) { prefixes.segment_override = .ds; continue; }
-        if (b == 0x26) { prefixes.segment_override = .es; continue; }
-        if (b == 0x64) { prefixes.segment_override = .fs; continue; }
-        if (b == 0x65) { prefixes.segment_override = .gs; continue; }
+        if (b == 0x66) {
+            opsize_32 = false;
+            prefixes.operand_size_override = true;
+            continue;
+        }
+        if (b == 0x67) {
+            addr_size_32 = false;
+            prefixes.address_size_override = true;
+            continue;
+        }
+        if (b == 0xF0) {
+            prefixes.lock = true;
+            continue;
+        }
+        if (b == 0xF2) {
+            prefixes.repne = true;
+            continue;
+        }
+        if (b == 0xF3) {
+            prefixes.rep = true;
+            continue;
+        }
+        if (b == 0x2E) {
+            prefixes.segment_override = .cs;
+            continue;
+        }
+        if (b == 0x36) {
+            prefixes.segment_override = .ss;
+            continue;
+        }
+        if (b == 0x3E) {
+            prefixes.segment_override = .ds;
+            continue;
+        }
+        if (b == 0x26) {
+            prefixes.segment_override = .es;
+            continue;
+        }
+        if (b == 0x64) {
+            prefixes.segment_override = .fs;
+            continue;
+        }
+        if (b == 0x65) {
+            prefixes.segment_override = .gs;
+            continue;
+        }
         break;
     }
 
@@ -211,14 +247,54 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
     const two_byte_op: u8 = 0;
 
     switch (op1) {
-        0x00...0x03 => { mnemonic = "add"; has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
-        0x08...0x0B => { mnemonic = "or";  has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
-        0x10...0x13 => { mnemonic = "adc"; has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
-        0x18...0x1B => { mnemonic = "sbb"; has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
-        0x20...0x23 => { mnemonic = "and"; has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
-        0x28...0x2B => { mnemonic = "sub"; has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
-        0x30...0x33 => { mnemonic = "xor"; has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
-        0x38...0x3B => { mnemonic = "cmp"; has_modrm = true; w = @truncate(op1 & 1); d = @as(u1, @truncate((op1 >> 1) & 1)); },
+        0x00...0x03 => {
+            mnemonic = "add";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
+        0x08...0x0B => {
+            mnemonic = "or";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
+        0x10...0x13 => {
+            mnemonic = "adc";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
+        0x18...0x1B => {
+            mnemonic = "sbb";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
+        0x20...0x23 => {
+            mnemonic = "and";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
+        0x28...0x2B => {
+            mnemonic = "sub";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
+        0x30...0x33 => {
+            mnemonic = "xor";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
+        0x38...0x3B => {
+            mnemonic = "cmp";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            d = @as(u1, @truncate((op1 >> 1) & 1));
+        },
 
         0x50...0x57 => {
             const reg: u3 = @truncate(op1 - 0x50);
@@ -245,40 +321,152 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
             return result;
         },
 
-        0x68 => { mnemonic = "push"; imm_size = 4; },
-        0x6A => { mnemonic = "push"; imm_size = 1; s = 1; },
+        0x68 => {
+            mnemonic = "push";
+            imm_size = 4;
+        },
+        0x6A => {
+            mnemonic = "push";
+            imm_size = 1;
+            s = 1;
+        },
 
-        0x70 => { mnemonic = "jo";   rel_size = 1; },
-        0x71 => { mnemonic = "jno";  rel_size = 1; },
-        0x72 => { mnemonic = "jb";   rel_size = 1; },
-        0x73 => { mnemonic = "jnb";  rel_size = 1; },
-        0x74 => { mnemonic = "jz";   rel_size = 1; },
-        0x75 => { mnemonic = "jnz";  rel_size = 1; },
-        0x76 => { mnemonic = "jbe";  rel_size = 1; },
-        0x77 => { mnemonic = "ja";   rel_size = 1; },
-        0x78 => { mnemonic = "js";   rel_size = 1; },
-        0x79 => { mnemonic = "jns";  rel_size = 1; },
-        0x7A => { mnemonic = "jp";   rel_size = 1; },
-        0x7B => { mnemonic = "jnp";  rel_size = 1; },
-        0x7C => { mnemonic = "jl";   rel_size = 1; },
-        0x7D => { mnemonic = "jnl";  rel_size = 1; },
-        0x7E => { mnemonic = "jle";  rel_size = 1; },
-        0x7F => { mnemonic = "jg";   rel_size = 1; },
+        0x70 => {
+            mnemonic = "jo";
+            rel_size = 1;
+        },
+        0x71 => {
+            mnemonic = "jno";
+            rel_size = 1;
+        },
+        0x72 => {
+            mnemonic = "jb";
+            rel_size = 1;
+        },
+        0x73 => {
+            mnemonic = "jnb";
+            rel_size = 1;
+        },
+        0x74 => {
+            mnemonic = "jz";
+            rel_size = 1;
+        },
+        0x75 => {
+            mnemonic = "jnz";
+            rel_size = 1;
+        },
+        0x76 => {
+            mnemonic = "jbe";
+            rel_size = 1;
+        },
+        0x77 => {
+            mnemonic = "ja";
+            rel_size = 1;
+        },
+        0x78 => {
+            mnemonic = "js";
+            rel_size = 1;
+        },
+        0x79 => {
+            mnemonic = "jns";
+            rel_size = 1;
+        },
+        0x7A => {
+            mnemonic = "jp";
+            rel_size = 1;
+        },
+        0x7B => {
+            mnemonic = "jnp";
+            rel_size = 1;
+        },
+        0x7C => {
+            mnemonic = "jl";
+            rel_size = 1;
+        },
+        0x7D => {
+            mnemonic = "jnl";
+            rel_size = 1;
+        },
+        0x7E => {
+            mnemonic = "jle";
+            rel_size = 1;
+        },
+        0x7F => {
+            mnemonic = "jg";
+            rel_size = 1;
+        },
 
-        0x80, 0x82 => { mnemonic = "group1"; is_group = true; has_modrm = true; w = 0; imm_size = 1; },
-        0x81 => { mnemonic = "group1"; is_group = true; has_modrm = true; w = 1; imm_size = if (opsize_32) @as(u8, 4) else 2; },
-        0x83 => { mnemonic = "group1"; is_group = true; has_modrm = true; w = 1; imm_size = 1; s = 1; },
+        0x80, 0x82 => {
+            mnemonic = "group1";
+            is_group = true;
+            has_modrm = true;
+            w = 0;
+            imm_size = 1;
+        },
+        0x81 => {
+            mnemonic = "group1";
+            is_group = true;
+            has_modrm = true;
+            w = 1;
+            imm_size = if (opsize_32) @as(u8, 4) else 2;
+        },
+        0x83 => {
+            mnemonic = "group1";
+            is_group = true;
+            has_modrm = true;
+            w = 1;
+            imm_size = 1;
+            s = 1;
+        },
 
-        0x84 => { mnemonic = "test"; has_modrm = true; w = 0; },
-        0x85 => { mnemonic = "test"; has_modrm = true; w = 1; },
-        0x86, 0x87 => { mnemonic = "xchg"; has_modrm = true; w = @truncate(op1 & 1); },
-        0x88 => { mnemonic = "mov"; has_modrm = true; w = 0; d = 0; },
-        0x89 => { mnemonic = "mov"; has_modrm = true; w = 1; d = 0; },
-        0x8A => { mnemonic = "mov"; has_modrm = true; w = 0; d = 1; },
-        0x8B => { mnemonic = "mov"; has_modrm = true; w = 1; d = 1; },
-        0x8D => { mnemonic = "lea"; has_modrm = true; },
+        0x84 => {
+            mnemonic = "test";
+            has_modrm = true;
+            w = 0;
+        },
+        0x85 => {
+            mnemonic = "test";
+            has_modrm = true;
+            w = 1;
+        },
+        0x86, 0x87 => {
+            mnemonic = "xchg";
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+        },
+        0x88 => {
+            mnemonic = "mov";
+            has_modrm = true;
+            w = 0;
+            d = 0;
+        },
+        0x89 => {
+            mnemonic = "mov";
+            has_modrm = true;
+            w = 1;
+            d = 0;
+        },
+        0x8A => {
+            mnemonic = "mov";
+            has_modrm = true;
+            w = 0;
+            d = 1;
+        },
+        0x8B => {
+            mnemonic = "mov";
+            has_modrm = true;
+            w = 1;
+            d = 1;
+        },
+        0x8D => {
+            mnemonic = "lea";
+            has_modrm = true;
+        },
 
-        0x8F => { mnemonic = "pop"; has_modrm = true; },
+        0x8F => {
+            mnemonic = "pop";
+            has_modrm = true;
+        },
 
         0x90 => {
             const txt = "nop";
@@ -300,30 +488,146 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
             @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
             return result;
         },
-        0x98 => { const txt = "cwde"; @memcpy(result.text[0..txt.len], txt); result.text_len = 4; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0x99 => { const txt = "cdq";  @memcpy(result.text[0..txt.len], txt); result.text_len = 3; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0x9C => { const txt = "pushf"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0x9D => { const txt = "popf";  @memcpy(result.text[0..txt.len], txt); result.text_len = 4; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
+        0x98 => {
+            const txt = "cwde";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 4;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0x99 => {
+            const txt = "cdq";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 3;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0x9C => {
+            const txt = "pushf";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0x9D => {
+            const txt = "popf";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 4;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
 
-        0xA0 => { mnemonic = "mov"; w = 0; d = 1; imm_size = 4; },
-        0xA1 => { mnemonic = "mov"; w = 1; d = 1; imm_size = 4; },
-        0xA2 => { mnemonic = "mov"; w = 0; d = 0; imm_size = 4; },
-        0xA3 => { mnemonic = "mov"; w = 1; d = 0; imm_size = 4; },
+        0xA0 => {
+            mnemonic = "mov";
+            w = 0;
+            d = 1;
+            imm_size = 4;
+        },
+        0xA1 => {
+            mnemonic = "mov";
+            w = 1;
+            d = 1;
+            imm_size = 4;
+        },
+        0xA2 => {
+            mnemonic = "mov";
+            w = 0;
+            d = 0;
+            imm_size = 4;
+        },
+        0xA3 => {
+            mnemonic = "mov";
+            w = 1;
+            d = 0;
+            imm_size = 4;
+        },
 
-        0xA4 => { const txt = "movsb"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xA5 => { const txt = "movsd"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xAA => { const txt = "stosb"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xAB => { const txt = "stosd"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xAC => { const txt = "lodsb"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xAD => { const txt = "lodsd"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xAE => { const txt = "scasb"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xAF => { const txt = "scasd"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
+        0xA4 => {
+            const txt = "movsb";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xA5 => {
+            const txt = "movsd";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xAA => {
+            const txt = "stosb";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xAB => {
+            const txt = "stosd";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xAC => {
+            const txt = "lodsb";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xAD => {
+            const txt = "lodsd";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xAE => {
+            const txt = "scasb";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xAF => {
+            const txt = "scasd";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
 
         0xB0...0xB7 => {
             const reg: u3 = @truncate(op1 - 0xB0);
             const imm = try cursor.readImmediate(.byte);
             var tmp: [32]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&tmp, "mov {s}, 0x{X:0>2}", .{reg8Name(reg), imm.value});
+            const txt = try std.fmt.bufPrint(&tmp, "mov {s}, 0x{X:0>2}", .{ reg8Name(reg), imm.value });
             @memcpy(result.text[0..txt.len], txt);
             result.text_len = @intCast(txt.len);
             result.byte_len = @intCast(cursor.offset);
@@ -335,7 +639,7 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
             const reg: u3 = @truncate(op1 - 0xB8);
             const imm = try cursor.readImmediate(.dword);
             var tmp: [32]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&tmp, "mov {s}, 0x{X:0>8}", .{reg32Name(reg), imm.value});
+            const txt = try std.fmt.bufPrint(&tmp, "mov {s}, 0x{X:0>8}", .{ reg32Name(reg), imm.value });
             @memcpy(result.text[0..txt.len], txt);
             result.text_len = @intCast(txt.len);
             result.byte_len = @intCast(cursor.offset);
@@ -344,31 +648,145 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
             return result;
         },
 
-        0xC0, 0xC1 => { mnemonic = "group2"; is_group = true; has_modrm = true; w = @truncate(op1 & 1); imm_size = 1; },
-        0xC2 => { mnemonic = "ret"; imm_size = 2; },
-        0xC3 => { const txt = "ret"; @memcpy(result.text[0..txt.len], txt); result.text_len = 3; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xC6 => { mnemonic = "mov"; has_modrm = true; w = 0; imm_size = 1; },
-        0xC7 => { mnemonic = "mov"; has_modrm = true; w = 1; imm_size = if (opsize_32) @as(u8, 4) else 2; },
-        0xC9 => { const txt = "leave"; @memcpy(result.text[0..txt.len], txt); result.text_len = 5; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xCC => { const txt = "int3"; @memcpy(result.text[0..txt.len], txt); result.text_len = 4; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xCD => { const imm = try cursor.readImmediate(.byte); var tmp: [32]u8 = undefined; const txt = try std.fmt.bufPrint(&tmp, "int 0x{X:0>2}", .{imm.value}); @memcpy(result.text[0..txt.len], txt); result.text_len = @intCast(txt.len); result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
+        0xC0, 0xC1 => {
+            mnemonic = "group2";
+            is_group = true;
+            has_modrm = true;
+            w = @truncate(op1 & 1);
+            imm_size = 1;
+        },
+        0xC2 => {
+            mnemonic = "ret";
+            imm_size = 2;
+        },
+        0xC3 => {
+            const txt = "ret";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 3;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xC6 => {
+            mnemonic = "mov";
+            has_modrm = true;
+            w = 0;
+            imm_size = 1;
+        },
+        0xC7 => {
+            mnemonic = "mov";
+            has_modrm = true;
+            w = 1;
+            imm_size = if (opsize_32) @as(u8, 4) else 2;
+        },
+        0xC9 => {
+            const txt = "leave";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 5;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xCC => {
+            const txt = "int3";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 4;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xCD => {
+            const imm = try cursor.readImmediate(.byte);
+            var tmp: [32]u8 = undefined;
+            const txt = try std.fmt.bufPrint(&tmp, "int 0x{X:0>2}", .{imm.value});
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = @intCast(txt.len);
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
 
-        0xD0, 0xD2 => { mnemonic = "group2"; is_group = true; has_modrm = true; w = 0; },
-        0xD1, 0xD3 => { mnemonic = "group2"; is_group = true; has_modrm = true; w = 1; },
+        0xD0, 0xD2 => {
+            mnemonic = "group2";
+            is_group = true;
+            has_modrm = true;
+            w = 0;
+        },
+        0xD1, 0xD3 => {
+            mnemonic = "group2";
+            is_group = true;
+            has_modrm = true;
+            w = 1;
+        },
 
-        0xE0 => { rel_size = 1; mnemonic = "loopne"; },
-        0xE1 => { rel_size = 1; mnemonic = "loope"; },
-        0xE2 => { rel_size = 1; mnemonic = "loop"; },
-        0xE3 => { rel_size = 1; mnemonic = "jecxz"; },
-        0xE8 => { rel_size = if (opsize_32) @as(u8, 4) else 2; mnemonic = "call"; is_jmp_call = true; },
-        0xE9 => { rel_size = if (opsize_32) @as(u8, 4) else 2; mnemonic = "jmp"; is_jmp_call = true; },
-        0xEB => { rel_size = 1; mnemonic = "jmp"; is_jmp_call = true; },
+        0xE0 => {
+            rel_size = 1;
+            mnemonic = "loopne";
+        },
+        0xE1 => {
+            rel_size = 1;
+            mnemonic = "loope";
+        },
+        0xE2 => {
+            rel_size = 1;
+            mnemonic = "loop";
+        },
+        0xE3 => {
+            rel_size = 1;
+            mnemonic = "jecxz";
+        },
+        0xE8 => {
+            rel_size = if (opsize_32) @as(u8, 4) else 2;
+            mnemonic = "call";
+            is_jmp_call = true;
+        },
+        0xE9 => {
+            rel_size = if (opsize_32) @as(u8, 4) else 2;
+            mnemonic = "jmp";
+            is_jmp_call = true;
+        },
+        0xEB => {
+            rel_size = 1;
+            mnemonic = "jmp";
+            is_jmp_call = true;
+        },
 
-        0xF4 => { const txt = "hlt"; @memcpy(result.text[0..txt.len], txt); result.text_len = 3; result.byte_len = @intCast(cursor.offset); const copy_len = @min(@as(usize, cursor.offset), result.bytes.len); @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]); return result; },
-        0xF6 => { mnemonic = "group3"; is_group = true; has_modrm = true; w = 0; },
-        0xF7 => { mnemonic = "group3"; is_group = true; has_modrm = true; w = 1; },
-        0xFE => { mnemonic = "group4"; is_group = true; has_modrm = true; w = 0; },
-        0xFF => { mnemonic = "group5"; is_group = true; has_modrm = true; },
+        0xF4 => {
+            const txt = "hlt";
+            @memcpy(result.text[0..txt.len], txt);
+            result.text_len = 3;
+            result.byte_len = @intCast(cursor.offset);
+            const copy_len = @min(@as(usize, cursor.offset), result.bytes.len);
+            @memcpy(result.bytes[0..copy_len], bytes[0..copy_len]);
+            return result;
+        },
+        0xF6 => {
+            mnemonic = "group3";
+            is_group = true;
+            has_modrm = true;
+            w = 0;
+        },
+        0xF7 => {
+            mnemonic = "group3";
+            is_group = true;
+            has_modrm = true;
+            w = 1;
+        },
+        0xFE => {
+            mnemonic = "group4";
+            is_group = true;
+            has_modrm = true;
+            w = 0;
+        },
+        0xFF => {
+            mnemonic = "group5";
+            is_group = true;
+            has_modrm = true;
+        },
 
         else => {
             mnemonic = "db";
@@ -391,15 +809,25 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
         if (std.mem.eql(u8, mnemonic, "group1")) mnemonic = groupName(group_op);
         if (std.mem.eql(u8, mnemonic, "group2")) {
             mnemonic = switch (group_op) {
-                0 => "rol", 1 => "ror", 2 => "rcl", 3 => "rcr",
-                4 => "shl", 5 => "shr",
+                0 => "rol",
+                1 => "ror",
+                2 => "rcl",
+                3 => "rcr",
+                4 => "shl",
+                5 => "shr",
                 else => "group2",
             };
         }
         if (std.mem.eql(u8, mnemonic, "group3")) {
             mnemonic = switch (group_op) {
-                0 => "test", 1 => "test", 2 => "not", 3 => "neg",
-                4 => "mul", 5 => "imul", 6 => "div", 7 => "idiv",
+                0 => "test",
+                1 => "test",
+                2 => "not",
+                3 => "neg",
+                4 => "mul",
+                5 => "imul",
+                6 => "div",
+                7 => "idiv",
             };
         }
         if (std.mem.eql(u8, mnemonic, "group4")) {
@@ -407,7 +835,11 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
         }
         if (std.mem.eql(u8, mnemonic, "group5")) {
             mnemonic = switch (group_op) {
-                0 => "inc", 1 => "dec", 2 => "call", 4 => "jmp", 6 => "push",
+                0 => "inc",
+                1 => "dec",
+                2 => "call",
+                4 => "jmp",
+                6 => "push",
                 else => "group5",
             };
         }
@@ -429,7 +861,7 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
         };
         const target = @as(u32, @bitCast(@as(i32, @bitCast(next_addr)) + rel));
         var tmp: [48]u8 = undefined;
-        const txt = try std.fmt.bufPrint(&tmp, "{s} 0x{X:0>8}", .{mnemonic, target});
+        const txt = try std.fmt.bufPrint(&tmp, "{s} 0x{X:0>8}", .{ mnemonic, target });
         @memcpy(result.text[0..txt.len], txt);
         result.text_len = @intCast(txt.len);
         result.byte_len = @intCast(cursor.offset);
@@ -450,7 +882,7 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
         if (has_modrm and modrm != null) {
             if (std.mem.eql(u8, mnemonic, "test") or std.mem.eql(u8, mnemonic, "mov")) {
                 var tmp: [80]u8 = undefined;
-                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, 0x{X}", .{mnemonic, modrm_str, imm.value});
+                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, 0x{X}", .{ mnemonic, modrm_str, imm.value });
                 @memcpy(result.text[0..txt.len], txt);
                 result.text_len = @intCast(txt.len);
             } else if (std.mem.eql(u8, mnemonic, "push")) {
@@ -461,12 +893,12 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
             } else if (s == 1) {
                 const signed_val = @as(i8, @bitCast(@as(u8, @truncate(imm.value))));
                 var tmp: [80]u8 = undefined;
-                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, {d}", .{mnemonic, modrm_str, signed_val});
+                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, {d}", .{ mnemonic, modrm_str, signed_val });
                 @memcpy(result.text[0..txt.len], txt);
                 result.text_len = @intCast(txt.len);
             } else {
                 var tmp: [80]u8 = undefined;
-                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, 0x{X}", .{mnemonic, modrm_str, imm.value});
+                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, 0x{X}", .{ mnemonic, modrm_str, imm.value });
                 @memcpy(result.text[0..txt.len], txt);
                 result.text_len = @intCast(txt.len);
             }
@@ -477,45 +909,47 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
             result.text_len = @intCast(txt.len);
         } else {
             var tmp: [32]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&tmp, "{s} 0x{X}", .{mnemonic, imm.value});
+            const txt = try std.fmt.bufPrint(&tmp, "{s} 0x{X}", .{ mnemonic, imm.value });
             @memcpy(result.text[0..txt.len], txt);
             result.text_len = @intCast(txt.len);
         }
     } else if (has_modrm and modrm != null) {
         if (std.mem.eql(u8, mnemonic, "lea")) {
             var tmp: [80]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&tmp, "lea {s}, {s}", .{reg32Name(modrm.?.reg), modrm_str});
+            const txt = try std.fmt.bufPrint(&tmp, "lea {s}, {s}", .{ reg32Name(modrm.?.reg), modrm_str });
             @memcpy(result.text[0..txt.len], txt);
             result.text_len = @intCast(txt.len);
         } else if (std.mem.eql(u8, mnemonic, "mov") or std.mem.eql(u8, mnemonic, "xchg") or
-                   std.mem.eql(u8, mnemonic, "add") or std.mem.eql(u8, mnemonic, "sub") or
-                   std.mem.eql(u8, mnemonic, "cmp") or std.mem.eql(u8, mnemonic, "and") or
-                   std.mem.eql(u8, mnemonic, "or") or std.mem.eql(u8, mnemonic, "xor") or
-                   std.mem.eql(u8, mnemonic, "adc") or std.mem.eql(u8, mnemonic, "sbb") or
-                   std.mem.eql(u8, mnemonic, "test")) {
+            std.mem.eql(u8, mnemonic, "add") or std.mem.eql(u8, mnemonic, "sub") or
+            std.mem.eql(u8, mnemonic, "cmp") or std.mem.eql(u8, mnemonic, "and") or
+            std.mem.eql(u8, mnemonic, "or") or std.mem.eql(u8, mnemonic, "xor") or
+            std.mem.eql(u8, mnemonic, "adc") or std.mem.eql(u8, mnemonic, "sbb") or
+            std.mem.eql(u8, mnemonic, "test"))
+        {
             if (d == 1) {
                 var tmp: [80]u8 = undefined;
-                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, {s}", .{mnemonic, reg32Name(modrm.?.reg), modrm_str});
+                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, {s}", .{ mnemonic, reg32Name(modrm.?.reg), modrm_str });
                 @memcpy(result.text[0..txt.len], txt);
                 result.text_len = @intCast(txt.len);
             } else {
                 var tmp: [80]u8 = undefined;
-                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, {s}", .{mnemonic, modrm_str, reg32Name(modrm.?.reg)});
+                const txt = try std.fmt.bufPrint(&tmp, "{s} {s}, {s}", .{ mnemonic, modrm_str, reg32Name(modrm.?.reg) });
                 @memcpy(result.text[0..txt.len], txt);
                 result.text_len = @intCast(txt.len);
             }
         } else if (std.mem.eql(u8, mnemonic, "pop") or std.mem.eql(u8, mnemonic, "not") or
-                   std.mem.eql(u8, mnemonic, "neg") or std.mem.eql(u8, mnemonic, "mul") or
-                   std.mem.eql(u8, mnemonic, "imul") or std.mem.eql(u8, mnemonic, "div") or
-                   std.mem.eql(u8, mnemonic, "idiv") or std.mem.eql(u8, mnemonic, "inc") or
-                   std.mem.eql(u8, mnemonic, "dec")) {
+            std.mem.eql(u8, mnemonic, "neg") or std.mem.eql(u8, mnemonic, "mul") or
+            std.mem.eql(u8, mnemonic, "imul") or std.mem.eql(u8, mnemonic, "div") or
+            std.mem.eql(u8, mnemonic, "idiv") or std.mem.eql(u8, mnemonic, "inc") or
+            std.mem.eql(u8, mnemonic, "dec"))
+        {
             var tmp: [80]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&tmp, "{s} {s}", .{mnemonic, modrm_str});
+            const txt = try std.fmt.bufPrint(&tmp, "{s} {s}", .{ mnemonic, modrm_str });
             @memcpy(result.text[0..txt.len], txt);
             result.text_len = @intCast(txt.len);
         } else if (std.mem.eql(u8, mnemonic, "call") or std.mem.eql(u8, mnemonic, "jmp")) {
             var tmp: [80]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&tmp, "{s} {s}", .{mnemonic, modrm_str});
+            const txt = try std.fmt.bufPrint(&tmp, "{s} {s}", .{ mnemonic, modrm_str });
             @memcpy(result.text[0..txt.len], txt);
             result.text_len = @intCast(txt.len);
         } else if (std.mem.eql(u8, mnemonic, "push")) {
@@ -525,7 +959,7 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DisasmLine {
             result.text_len = @intCast(txt.len);
         } else {
             var tmp: [80]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&tmp, "{s} {s}", .{mnemonic, modrm_str});
+            const txt = try std.fmt.bufPrint(&tmp, "{s} {s}", .{ mnemonic, modrm_str });
             @memcpy(result.text[0..txt.len], txt);
             result.text_len = @intCast(txt.len);
         }
