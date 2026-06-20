@@ -66,6 +66,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const compat_source_include_module = b.createModule(.{
+        .root_source_file = b.path("../../src/compat/source/include_compat.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const compat_third_party_include_module = b.createModule(.{
         .root_source_file = b.path("../../src/compat/third_party/include_compat.zig"),
         .target = target,
@@ -193,6 +198,7 @@ pub fn build(b: *std.Build) void {
         .root_module = shell_helper_mod,
     });
     shell_helper_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
+    shell_helper_mod.addImport("compat_source_include_compat", compat_source_include_module);
     shell_helper_mod.addImport("compat_third_party_include_compat", compat_third_party_include_module);
     b.installArtifact(shell_helper);
 
