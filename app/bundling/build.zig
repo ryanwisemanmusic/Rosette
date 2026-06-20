@@ -66,6 +66,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const compat_third_party_include_module = b.createModule(.{
+        .root_source_file = b.path("../../src/compat/third_party/include_compat.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const runtime_abi_module = b.createModule(.{
         .root_source_file = b.path("../../src/tooling/runtime-abi-handshake/runtime.zig"),
         .target = target,
@@ -188,6 +193,7 @@ pub fn build(b: *std.Build) void {
         .root_module = shell_helper_mod,
     });
     shell_helper_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
+    shell_helper_mod.addImport("compat_third_party_include_compat", compat_third_party_include_module);
     b.installArtifact(shell_helper);
 
     const assembler_runner_mod = b.createModule(.{
