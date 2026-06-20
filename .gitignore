@@ -42,3 +42,8 @@ app/bundling/app_image/rosette_app_icon.icns
 /test/Internal_Assembly/x86-64-Ast03-main
 /test/Internal_Assembly/x86-64-Ast04
 /app_testing/xenia
+/build/.zig-cache-app
+/build/.zig-cache-app2
+/build/.zig-cache-bundle-env
+/build/.zig-cache-direct
+/build/.zig-cache-env
