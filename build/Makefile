@@ -25,6 +25,7 @@ SHELL_HELPER_SRC := src/shell/global_config/rosette_shell.zig
 SHELL_HELPER_BIN := zig-out/bin/rosette-shell
 COMPAT_ROUTER_SRC := src/compat/rosetta2/main.zig
 COMPAT_ROUTER_BIN := zig-out/bin/rosette-router
+C_FIX_BIN := zig-out/bin/rosette-c-fix
 ASSETS_DIR ?= $(if $(wildcard assets/dll/mscoree),assets,include/assets)
 DLL_ASSETS_DIR := $(ASSETS_DIR)/dll
 EXE_EXAMPLES_DIR := $(ASSETS_DIR)/exe_examples
@@ -101,7 +102,7 @@ FB_LOGGER_OBJ := fb_logger.o
 OBJC_FLAGS := -fobjc-arc -fmodules
 OBJC_FRAMEWORKS := -framework Cocoa -framework Foundation
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib assembler-runner-build compat-router-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse app-wrapper installer uninstaller app-all notarize-installer notarize-uninstaller notarize-app-all
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib assembler-runner-build compat-router-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse app-wrapper installer uninstaller app-all notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -127,6 +128,8 @@ help:
 		'  make shell-update Refresh the Rosette shell helper/snippet/wrappers' \
 		'  make shell-uninstall Remove Rosette shell integration' \
 		'  make shell-clean-state Kill stale Rosette shell/ELF helper processes' \
+		'  make c-fix        Run C transpiler on C sources to fix implicit narrowing conversions' \
+		'  make c-fix-build Build the C transpiler tool' \
 		'  zig-out/bin/rosette-router run --prefer-intel /path/to/Xenia.app  Route an Intel macOS app with traced Rosetta 2 fallback' \
 		'  make clean        Remove build artifacts'
 
@@ -154,6 +157,30 @@ check:
 	trap 'rm -f "$$tmp"' EXIT INT TERM; \
 	printf '%s\n' '#include "win32/windows_base.h"' 'int main(void) { return 0; }' > "$$tmp"; \
 	"$(CC)" $(CFLAGS) -fsyntax-only $(MACOS_SHIM_INC) $(SHIM_INC) $(INCLUDE_INC) "$$tmp"
+
+# ---------------------------------------------------------------------------
+# C transpiler for fixing implicit narrowing conversions
+# ---------------------------------------------------------------------------
+C_SOURCES := $(shell find $(ROOT_DIR)/src -name "*.c" -type f 2>/dev/null)
+
+c-fix-build:
+	@mkdir -p zig-out/bin build/.zig-cache/global
+	@$(ZIG_BUILD_ENV) zig build --build-file build/build.zig 2>&1
+	@echo "Built $(C_FIX_BIN)"
+
+c-fix: c-fix-build
+	@if [ -z "$(C_SOURCES)" ]; then \
+		echo "No C sources found to fix"; \
+	else \
+		echo "Running C transpiler on C sources..."; \
+		for src in $(C_SOURCES); do \
+			if [ -f "$$src" ]; then \
+				echo "  Processing: $$src"; \
+				"$(C_FIX_BIN)" --in-place "$$src" || echo "  Warning: Failed to process $$src"; \
+			fi; \
+		done; \
+		echo "C transpiler complete"; \
+	fi
 
 
 clean: exe-runner-cleanup
