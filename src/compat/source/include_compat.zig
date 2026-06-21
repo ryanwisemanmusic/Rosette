@@ -145,7 +145,66 @@ pub fn containsX86IntrinsicShadow(io: std.Io, path: []const u8) bool {
     return false;
 }
 
-pub fn hasHeaderExtension(name: []const u8) bool {
+/// Detect whether a source tree uses capstone (or similar ARM/ARM64
+/// disassembly libraries) whose enum types need forcing to plain int
+/// on Apple Clang in C++ mode.  When true, force-including
+/// `shims/macos/force_types.h` (or adding `-include`) is recommended.
+pub fn detectCapstoneUsage(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.basename;
+        if (!hasHeaderExtension(name) and
+            !std.ascii.endsWithIgnoreCase(name, ".c") and
+            !std.ascii.endsWithIgnoreCase(name, ".cc") and
+            !std.ascii.endsWithIgnoreCase(name, ".cpp") and
+            !std.ascii.endsWithIgnoreCase(name, ".cxx") and
+            !std.ascii.endsWithIgnoreCase(name, ".m") and
+            !std.ascii.endsWithIgnoreCase(name, ".mm"))
+            continue;
+        const content = entry.dir.readFileAlloc(io, name, allocator, .limited(32 * 4096)) catch continue;
+        defer allocator.free(content);
+        if (std.mem.indexOf(u8, content, "#include <capstone")) |_| return true;
+        if (std.mem.indexOf(u8, content, "#include \"capstone")) |_| return true;
+        if (std.mem.indexOf(u8, content, "arm_cc") != null and
+            std.mem.indexOf(u8, content, "arm64_cc") != null and
+            std.mem.indexOf(u8, content, "arm_reg") != null and
+            std.mem.indexOf(u8, content, "arm64_reg") != null)
+            return true;
+    }
+    return false;
+}
+
+/// Detect whether a source tree references LLVM bitcode parsing code
+/// that may be incompatible on the current platform.  When true, the
+/// Zig stub at `compat/source/bitcode_stub.zig` can be linked instead
+/// of the incompatible C++ implementation.
+pub fn detectBitcodeParserUsage(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.basename;
+        if (!hasHeaderExtension(name) and
+            !std.ascii.endsWithIgnoreCase(name, ".c") and
+            !std.ascii.endsWithIgnoreCase(name, ".cc") and
+            !std.ascii.endsWithIgnoreCase(name, ".cpp") and
+            !std.ascii.endsWithIgnoreCase(name, ".cxx"))
+            continue;
+        const content = entry.dir.readFileAlloc(io, name, allocator, .limited(32 * 4096)) catch continue;
+        defer allocator.free(content);
+        if (std.mem.indexOf(u8, content, "LLVMBitcodeParser")) |_| return true;
+        if (std.mem.indexOf(u8, content, "BitcodeParser")) |_| return true;
+    }
+    return false;
+}
+
+fn hasHeaderExtension(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".h") or
         std.ascii.endsWithIgnoreCase(name, ".hh") or
         std.ascii.endsWithIgnoreCase(name, ".hpp") or
@@ -290,6 +349,219 @@ pub fn pathContainsSimdBridgeDir(path: []const u8) bool {
         if (component.len > 0 and isSimdBridgeDir(component)) return true;
     }
     return false;
+}
+
+/// Generalized detection and compatibility helpers for macOS third-party
+/// C/C++ compilation issues.  Each function maps to one or more patches
+/// in patch/ and can be eliminated via compat headers (in include/shims/macos/)
+/// or compiler flags.
+fn isSourceOrHeaderFile(name: []const u8) bool {
+    return hasHeaderExtension(name) or
+        std.ascii.endsWithIgnoreCase(name, ".c") or
+        std.ascii.endsWithIgnoreCase(name, ".cc") or
+        std.ascii.endsWithIgnoreCase(name, ".cpp") or
+        std.ascii.endsWithIgnoreCase(name, ".cxx") or
+        std.ascii.endsWithIgnoreCase(name, ".m") or
+        std.ascii.endsWithIgnoreCase(name, ".mm");
+}
+
+fn readFileContent(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u8) ?[]const u8 {
+    const content = dir.readFileAlloc(io, basename, allocator, .limited(8 * 4096)) catch return null;
+    return content;
+}
+
+/// Detect whether a source directory uses `#include <endian.h>` in any of
+/// its C/C++ source or header files.  On macOS, <endian.h> does not exist
+/// natively; include/shims/macos/endian.h provides a general compat shim.
+pub fn scanForEndianHeaderUsage(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+        if (std.mem.indexOf(u8, content, "#include <endian.h>")) |_| return true;
+        if (std.mem.indexOf(u8, content, "#include <machine/endian.h>")) |_| return true;
+    }
+    return false;
+}
+
+/// Detect whether a source directory uses the `asm` keyword instead of
+/// `__asm__`.  Apple Clang rejects bare `asm` in non-GNU C++ modes.
+pub fn scanForAsmKeyword(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+        if (std.mem.indexOf(u8, content, "asm (")) |_| return true;
+        if (std.mem.indexOf(u8, content, "asm\n(")) |_| return true;
+        if (std.mem.indexOf(u8, content, "asm volatile")) |_| return true;
+        if (std.mem.indexOf(u8, content, "asm __volatile")) |_| return true;
+    }
+    return false;
+}
+
+/// Detect whether a library uses angle-bracket includes (`#include <...>`)
+/// that refer to its own internal headers rather than external system headers.
+/// Matching files are those where the included path (everything between `<` and
+/// `>`) points to a file whose basename appears within the same source tree.
+/// Such includes need either `-I` pointing at the package root or conversion
+/// to quotes.
+pub fn scanForAngleBracketLocalIncludes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, content, pos, "#include <")) |start| {
+            const after_open = start + "#include <".len;
+            const close = std.mem.indexOfScalarPos(u8, content, after_open, '>') orelse break;
+            const included = content[after_open..close];
+            pos = close + 1;
+            const last_slash = std.mem.lastIndexOfScalar(u8, included, '/') orelse continue;
+            const basename = included[last_slash + 1 ..];
+            if (basename.len == 0) continue;
+            if (std.mem.indexOf(u8, entry.path, included[0..last_slash])) |_| return true;
+        }
+    }
+    return false;
+}
+
+/// Detect whether a source tree has patterns that typically trigger
+/// -Wshorten-64-to-32 on LP64 platforms (macOS ARM64, Linux ARM64).
+/// This includes explicit cast-to-32-bit patterns around function calls
+/// that return `unsigned long` or `size_t`, and pointer-difference
+/// narrowing to 32-bit types.
+pub fn scanForShorten64To32Risk(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+        const patterns = [_][]const u8{
+            "(uint32_t)",
+            "(u_int32_t)",
+            "static_cast<uint32_t>",
+            "static_cast<UINT4>",
+            "static_cast<int>(",
+            "(guint)",
+            "static_cast<guint>",
+        };
+        for (patterns) |pat| {
+            if (std.mem.indexOf(u8, content, pat)) |_| return true;
+        }
+    }
+    return false;
+}
+
+/// Detect whether a source directory uses stb-style assertion macros
+/// (STBTT_assert, STBI_ASSERT, etc.) that abort on failure in debug
+/// builds.  macOS/Clang debug builds of bundled third-party libraries
+/// frequently hit runtime assertions on valid-but-unusual input.
+/// include/shims/macos/stb_compat.h redefines these as no-ops.
+pub fn scanForStbAssertUsage(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    const patterns = [_][]const u8{
+        "STBTT_assert",
+        "STBI_ASSERT",
+        "STBV_ASSERT",
+        "STBRP_ASSERT",
+    };
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+        for (patterns) |pat| {
+            if (std.mem.indexOf(u8, content, pat)) |_| return true;
+        }
+    }
+    return false;
+}
+
+/// Detect whether a source directory references `secure_getenv`.
+/// macOS does not provide this GNU extension; `posix_compat.h` defines
+/// it as `getenv(name)`.  Projects like Xenia's GTK windowed app and
+/// any Linux-originated code that uses `secure_getenv` need this shim.
+pub fn scanForSecureGetenvUsage(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+        if (std.mem.indexOf(u8, content, "secure_getenv")) |_| return true;
+    }
+    return false;
+}
+
+/// Detect whether a source directory uses the `ATOMIC_VAR_INIT` macro.
+/// This C11 macro was removed in C17 and may not be defined by Apple
+/// Clang.  `posix_compat.h` provides a no-op fallback.
+pub fn scanForAtomicVarInitUsage(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+        if (std.mem.indexOf(u8, content, "ATOMIC_VAR_INIT")) |_| return true;
+    }
+    return false;
+}
+
+test "secure_getenv usage detection returns false for non-existent dir" {
+    try std.testing.expect(!scanForSecureGetenvUsage(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
+}
+
+test "ATOMIC_VAR_INIT usage detection returns false for non-existent dir" {
+    try std.testing.expect(!scanForAtomicVarInitUsage(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
+}
+
+test "endian header detection returns false for non-existent dir" {
+    try std.testing.expect(!scanForEndianHeaderUsage(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
+}
+
+test "asm keyword detection returns false for non-existent dir" {
+    try std.testing.expect(!scanForAsmKeyword(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
+}
+
+test "angle bracket local include detection returns false for non-existent dir" {
+    try std.testing.expect(!scanForAngleBracketLocalIncludes(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
+}
+
+test "stb assert usage detection returns false for non-existent dir" {
+    try std.testing.expect(!scanForStbAssertUsage(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
+}
+
+test "shorten 64-to-32 risk detection returns false for non-existent dir" {
+    try std.testing.expect(!scanForShorten64To32Risk(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
 }
 
 test "isSimdBridgeDir recognises known emulation layer names" {
