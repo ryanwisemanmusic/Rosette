@@ -1066,6 +1066,16 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&pseudo_kernel_cache_test.step);
     }
 
+    {
+        const transpiler_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/transpiler/c_fix.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const transpiler_test = b.addTest(.{ .root_module = transpiler_mod });
+        check_step.dependOn(&transpiler_test.step);
+    }
+
     const lib = b.addLibrary(.{
         .name = "rosette_zig",
         .linkage = .static,
