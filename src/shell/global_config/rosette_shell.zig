@@ -451,6 +451,18 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
         std.debug.print("[INSTALL] Step 10-11: Skipped (no source_root provided)\n", .{});
     }
 
+    if (source_root.len != 0) {
+        const rosette_c_fix_path = std.fs.path.join(allocator, &.{ bin_dir, "rosette-c-fix" }) catch |err| {
+            std.debug.print("[INSTALL] ERROR: Failed to build rosette-c-fix path: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        std.debug.print("[INSTALL] Step 11a: Installing rosette-c-fix binary\n", .{});
+        copyRosetteCFix(init, allocator, source_root, rosette_c_fix_path) catch |err| {
+            std.debug.print("[INSTALL] WARNING: Failed to install rosette-c-fix: {s}\n", .{@errorName(err)});
+        };
+        std.debug.print("[INSTALL] Installed rosette-c-fix: {s}\n", .{rosette_c_fix_path});
+    }
+
     std.debug.print("[INSTALL] Step 12: Building shell snippet\n", .{});
     const snippet = buildShellSnippet(
         allocator,
@@ -600,6 +612,7 @@ fn uninstallShell(init: std.process.Init, allocator: std.mem.Allocator) !void {
     try removeWrappers(allocator, wrapper_dir);
     try unlinkIfExists(allocator, helper_path);
     try unlinkIfExists(allocator, rosette_path);
+    try unlinkIfExists(allocator, try std.fs.path.join(allocator, &.{ bin_dir, "rosette-c-fix" }));
     rmdirIfEmpty(allocator, wrapper_dir) catch {};
     rmdirIfEmpty(allocator, bin_dir) catch {};
     rmdirIfEmpty(allocator, lib_dir) catch {};
@@ -2766,6 +2779,18 @@ const compiler_launcher_script =
     \\  esac
     \\done
     \\
+    \\# rosette-c-fix pass: pre-apply narrowing casts to C/C++/ObjC source files
+    \\rosette_fix_bin="${ROSETTE_C_FIX_BIN:-$HOME/.rosette/bin/rosette-c-fix}"
+    \\if [ "${ROSETTE_C_FIX_ENABLE:-auto}" != "0" ] && [ -x "$rosette_fix_bin" ]; then
+    \\  for src_file in "${filtered[@]}"; do
+    \\    case "$src_file" in
+    \\      *.c|*.cc|*.cpp|*.cxx|*.m|*.mm)
+    \\        "$rosette_fix_bin" --in-place "$src_file" 2>/dev/null || true
+    \\        ;;
+    \\    esac
+    \\  done
+    \\fi
+    \\
     \\exec "$compiler" "${filtered[@]}"
     \\
 ;
@@ -3456,6 +3481,35 @@ fn runZigCompilerWithCompatibility(
 
 fn runCompilerSanitizer(io: std.Io, allocator: std.mem.Allocator, compiler_argv: []const []const u8) !void {
     if (compiler_argv.len == 0) return error.EmptyArgv;
+
+    // Scan for C/C++/ObjC source files and run rosette-c-fix on each
+    {
+        const fix_bin_env = std.c.getenv("ROSETTE_C_FIX_BIN");
+        const rosette_dir_env = std.c.getenv("HOME");
+        const default_fix_path = if (rosette_dir_env) |home|
+            std.fs.path.join(allocator, &.{ std.mem.span(home), ".rosette", "bin", "rosette-c-fix" }) catch null
+        else
+            null;
+        const fix_bin = if (fix_bin_env) |env| std.mem.span(env) else (default_fix_path orelse "rosette-c-fix");
+        if (canExecute(allocator, fix_bin)) {
+            const enable_env = std.c.getenv("ROSETTE_C_FIX_ENABLE");
+            const enable = if (enable_env) |env| std.mem.span(env) else "auto";
+            if (!std.mem.eql(u8, enable, "0")) {
+                for (compiler_argv[1..]) |arg| {
+                    const is_source = std.mem.endsWith(u8, arg, ".c") or
+                        std.mem.endsWith(u8, arg, ".cc") or
+                        std.mem.endsWith(u8, arg, ".cpp") or
+                        std.mem.endsWith(u8, arg, ".cxx") or
+                        std.mem.endsWith(u8, arg, ".m") or
+                        std.mem.endsWith(u8, arg, ".mm");
+                    if (is_source) {
+                        const fix_argv = [_][]const u8{ fix_bin, "--in-place", arg };
+                        _ = runArgvResult(io, &fix_argv) catch {};
+                    }
+                }
+            }
+        }
+    }
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -4448,6 +4502,23 @@ fn copyCompatRouter(init: std.process.Init, allocator: std.mem.Allocator, source
         }
     }
     std.debug.print("rosette-shell: warning: rosette-router binary not found; build with 'make compat-router-build' first\n", .{});
+}
+
+fn copyRosetteCFix(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8, dest_path: []const u8) !void {
+    const candidates = [_][]const u8{
+        try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "rosette-c-fix" }),
+        try std.fs.path.join(allocator, &.{ source_root, "..", "..", "MacOS", "rosette-c-fix" }),
+        try std.fs.path.join(allocator, &.{ source_root, "rosette-c-fix" }),
+    };
+
+    for (candidates) |candidate| {
+        if (fileExists(allocator, candidate) and canExecute(allocator, candidate)) {
+            try copyFile(init, allocator, candidate, dest_path, "rosette-c-fix");
+            _ = chmodPath(allocator, dest_path, 0o755) catch {};
+            return;
+        }
+    }
+    std.debug.print("rosette-shell: warning: rosette-c-fix binary not found; build with 'zig build' first\n", .{});
 }
 
 fn copyFile(init: std.process.Init, allocator: std.mem.Allocator, source_path: []const u8, dest_path: []const u8, label: []const u8) !void {

@@ -81,6 +81,12 @@ fn appendUniqueOwned(allocator: std.mem.Allocator, dirs: *std.ArrayList([]const 
     try dirs.append(allocator, try allocator.dupe(u8, candidate));
 }
 
+fn fileExistsAbsolute(io: std.Io, path: []const u8) bool {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
 fn isUsableIncludeDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, policy: CandidatePolicy) bool {
     if (!dirExists(io, path)) return false;
     if (containsX86IntrinsicShadow(io, path)) return false;
@@ -351,6 +357,27 @@ pub fn pathContainsSimdBridgeDir(path: []const u8) bool {
     return false;
 }
 
+pub fn isSimdFacadeDir(name: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const len = @min(name.len, buf.len);
+    for (name[0..len], 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    const lowered = buf[0..len];
+    return std.mem.eql(u8, lowered, "simde") or
+        std.mem.eql(u8, lowered, "xsimd");
+}
+
+pub fn isSimdCompatibilityDir(name: []const u8) bool {
+    return isSimdBridgeDir(name) or isSimdFacadeDir(name);
+}
+
+pub fn pathContainsSimdCompatibilityDir(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |component| {
+        if (component.len > 0 and isSimdCompatibilityDir(component)) return true;
+    }
+    return false;
+}
+
 /// Generalized detection and compatibility helpers for macOS third-party
 /// C/C++ compilation issues.  Each function maps to one or more patches
 /// in patch/ and can be eliminated via compat headers (in include/shims/macos/)
@@ -366,7 +393,7 @@ fn isSourceOrHeaderFile(name: []const u8) bool {
 }
 
 fn readFileContent(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, basename: []const u8) ?[]const u8 {
-    const content = dir.readFileAlloc(io, basename, allocator, .limited(8 * 4096)) catch return null;
+    const content = dir.readFileAlloc(io, basename, allocator, .limited(256 * 1024)) catch return null;
     return content;
 }
 
@@ -440,6 +467,117 @@ pub fn scanForAngleBracketLocalIncludes(io: std.Io, allocator: std.mem.Allocator
     return false;
 }
 
+pub fn discoverAngleBracketIncludeDirs(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !std.ArrayList([]const u8) {
+    var dirs: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (dirs.items) |owned| allocator.free(owned);
+        dirs.deinit(allocator);
+    }
+
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return dirs;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return dirs;
+    defer walker.deinit();
+
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSourceOrHeaderFile(entry.basename)) continue;
+        const content = readFileContent(io, allocator, entry.dir, entry.basename) orelse continue;
+        defer allocator.free(content);
+
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, content, pos, "#include <")) |start| {
+            const after_open = start + "#include <".len;
+            const close = std.mem.indexOfScalarPos(u8, content, after_open, '>') orelse break;
+            const included = content[after_open..close];
+            pos = close + 1;
+            if (isLikelySystemAngleInclude(included)) continue;
+            try appendLocalAngleIncludeDir(io, allocator, &dirs, dir_path, entry.path, included);
+        }
+    }
+
+    return dirs;
+}
+
+fn appendLocalAngleIncludeDir(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dirs: *std.ArrayList([]const u8),
+    root: []const u8,
+    source_rel_path: []const u8,
+    included: []const u8,
+) !void {
+    if (included.len == 0) return;
+
+    if (std.fs.path.dirname(source_rel_path)) |source_rel_dir| {
+        const source_abs_dir = try std.fs.path.join(allocator, &.{ root, source_rel_dir });
+        defer allocator.free(source_abs_dir);
+        try appendIncludeRootIfHeaderExists(io, allocator, dirs, source_abs_dir, included);
+    } else {
+        try appendIncludeRootIfHeaderExists(io, allocator, dirs, root, included);
+    }
+
+    try appendIncludeRootIfHeaderExists(io, allocator, dirs, root, included);
+
+    const subdirs = [_][]const u8{ "include", "inc", "src", "lib" };
+    for (subdirs) |subdir| {
+        const candidate_root = try std.fs.path.join(allocator, &.{ root, subdir });
+        defer allocator.free(candidate_root);
+        try appendIncludeRootIfHeaderExists(io, allocator, dirs, candidate_root, included);
+    }
+}
+
+fn appendIncludeRootIfHeaderExists(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dirs: *std.ArrayList([]const u8),
+    include_root: []const u8,
+    included: []const u8,
+) !void {
+    const candidate = try std.fs.path.join(allocator, &.{ include_root, included });
+    defer allocator.free(candidate);
+    if (!fileExistsAbsolute(io, candidate)) return;
+    try appendUniqueOwned(allocator, dirs, include_root);
+}
+
+fn isLikelySystemAngleInclude(included: []const u8) bool {
+    if (included.len == 0) return true;
+    if (std.mem.indexOfScalar(u8, included, '/') != null) {
+        const system_prefixes = [_][]const u8{
+            "arpa/",
+            "CoreFoundation/",
+            "dispatch/",
+            "mach/",
+            "machine/",
+            "net/",
+            "netinet/",
+            "objc/",
+            "pthread/",
+            "sys/",
+        };
+        for (system_prefixes) |prefix| {
+            if (std.mem.startsWith(u8, included, prefix)) return true;
+        }
+        return false;
+    }
+    return isStandardHeaderShadowName(included) or isCSystemHeaderName(included);
+}
+
+fn isCSystemHeaderName(name: []const u8) bool {
+    const headers = [_][]const u8{
+        "assert.h",    "complex.h",  "ctype.h",       "errno.h",    "fenv.h",
+        "float.h",     "inttypes.h", "iso646.h",      "limits.h",   "locale.h",
+        "math.h",      "setjmp.h",   "signal.h",      "stdalign.h", "stdarg.h",
+        "stdatomic.h", "stdbit.h",   "stdbool.h",     "stddef.h",   "stdint.h",
+        "stdio.h",     "stdlib.h",   "stdnoreturn.h", "string.h",   "tgmath.h",
+        "threads.h",   "time.h",     "uchar.h",       "wchar.h",    "wctype.h",
+    };
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(name, header)) return true;
+    }
+    return false;
+}
+
 /// Detect whether a source tree has patterns that typically trigger
 /// -Wshorten-64-to-32 on LP64 platforms (macOS ARM64, Linux ARM64).
 /// This includes explicit cast-to-32-bit patterns around function calls
@@ -484,6 +622,7 @@ pub fn scanForStbAssertUsage(io: std.Io, allocator: std.mem.Allocator, dir_path:
     const patterns = [_][]const u8{
         "STBTT_assert",
         "STBI_ASSERT",
+        "STBIW_ASSERT",
         "STBV_ASSERT",
         "STBRP_ASSERT",
     };
@@ -556,6 +695,12 @@ test "angle bracket local include detection returns false for non-existent dir" 
     try std.testing.expect(!scanForAngleBracketLocalIncludes(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
 }
 
+test "angle bracket include dir discovery returns empty for non-existent dir" {
+    var dirs = try discoverAngleBracketIncludeDirs(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9");
+    defer dirs.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), dirs.items.len);
+}
+
 test "stb assert usage detection returns false for non-existent dir" {
     try std.testing.expect(!scanForStbAssertUsage(.failing, std.testing.allocator, "/nonexistent/path_R2Jqk9"));
 }
@@ -573,11 +718,14 @@ test "isSimdBridgeDir recognises known emulation layer names" {
     try std.testing.expect(isSimdBridgeDir("ppcFloat2NEON"));
     try std.testing.expect(!isSimdBridgeDir("simde"));
     try std.testing.expect(!isSimdBridgeDir("xsimd"));
+    try std.testing.expect(isSimdCompatibilityDir("simde"));
+    try std.testing.expect(isSimdCompatibilityDir("xsimd"));
     try std.testing.expect(!isSimdBridgeDir("zstd"));
     try std.testing.expect(!isSimdBridgeDir("Vulkan-Headers"));
     try std.testing.expect(!isSimdBridgeDir("capstone"));
     try std.testing.expect(pathContainsSimdBridgeDir("/tmp/third_party/AvxToNeon"));
     try std.testing.expect(!pathContainsSimdBridgeDir("/tmp/third_party/simde"));
+    try std.testing.expect(pathContainsSimdCompatibilityDir("/tmp/third_party/simde"));
 }
 
 test "header extension detection covers C and C++ headers" {

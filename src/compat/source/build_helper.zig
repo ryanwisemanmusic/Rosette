@@ -11,6 +11,20 @@ pub fn compatCFlags(is_macos: bool) []const []const u8 {
     return &.{ "-include", "shims/macos/compiler_compat.h" };
 }
 
+pub fn fullMacOSCompatCFlags(is_macos: bool) []const []const u8 {
+    if (!is_macos) return &.{};
+    return &.{
+        "-include",
+        "shims/macos/compiler_compat.h",
+        "-include",
+        "shims/macos/posix_compat.h",
+        "-include",
+        "shims/macos/endian.h",
+        "-include",
+        "shims/rosette/cpu_feature_probe.h",
+    };
+}
+
 pub fn stbCompatCFlag(is_macos: bool) []const []const u8 {
     if (!is_macos) return &.{};
     return &.{ "-include", "shims/macos/stb_compat.h" };
@@ -19,4 +33,19 @@ pub fn stbCompatCFlag(is_macos: bool) []const []const u8 {
 pub fn posixCompatCFlag(is_macos: bool) []const []const u8 {
     if (!is_macos) return &.{};
     return &.{ "-include", "shims/macos/posix_compat.h" };
+}
+
+pub fn endianCompatCFlag(is_macos: bool) []const []const u8 {
+    if (!is_macos) return &.{};
+    return &.{ "-include", "shims/macos/endian.h" };
+}
+
+pub fn forceTypesCompatCFlag(is_macos: bool) []const []const u8 {
+    if (!is_macos) return &.{};
+    return &.{ "-include", "shims/macos/force_types.h" };
+}
+
+pub fn cpuFeatureProbeCFlag(is_macos: bool) []const []const u8 {
+    if (!is_macos) return &.{};
+    return &.{ "-include", "shims/rosette/cpu_feature_probe.h" };
 }
