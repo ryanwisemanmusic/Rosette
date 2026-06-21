@@ -47,3 +47,4 @@ app/bundling/app_image/rosette_app_icon.icns
 /build/.zig-cache-bundle-env
 /build/.zig-cache-direct
 /build/.zig-cache-env
+/patch
