@@ -85,6 +85,42 @@ fn isNarrowType(kind: Token.Kind) bool {
     };
 }
 
+fn isNarrowTypedefName(slice: []const u8) bool {
+    const names = [_][]const u8{
+        "BOOL",
+        "BYTE",
+        "DWORD",
+        "GLenum",
+        "GLint",
+        "GLsizei",
+        "INT",
+        "INT32",
+        "LONG",
+        "UINT",
+        "UINT4",
+        "UINT32",
+        "WORD",
+        "__int32",
+        "gint",
+        "guint",
+        "int32",
+        "int32_t",
+        "int16_t",
+        "int8_t",
+        "s32",
+        "u32",
+        "uint",
+        "uint32",
+        "uint32_t",
+        "uint16_t",
+        "uint8_t",
+    };
+    for (names) |name| {
+        if (std.mem.eql(u8, slice, name)) return true;
+    }
+    return false;
+}
+
 fn typeIsNarrow(tokens: []const Token, idx: usize, source: []const u8) bool {
     var j = idx;
     while (j < tokens.len) {
@@ -100,6 +136,7 @@ fn typeIsNarrow(tokens: []const Token, idx: usize, source: []const u8) bool {
         }
         if (t.kind == .identifier) {
             const slice = source[t.start..t.end];
+            if (isNarrowTypedefName(slice)) return true;
             if (std.mem.endsWith(u8, slice, "_t")) {
                 const prefix = slice[0 .. slice.len - 2];
                 if (std.mem.eql(u8, prefix, "int32") or
@@ -113,22 +150,6 @@ fn typeIsNarrow(tokens: []const Token, idx: usize, source: []const u8) bool {
                 {
                     return true;
                 }
-                if (std.mem.eql(u8, slice, "DWORD") or
-                    std.mem.eql(u8, slice, "BOOL"))
-                {
-                    return true;
-                }
-            }
-            if (std.mem.eql(u8, slice, "DWORD") or
-                std.mem.eql(u8, slice, "BOOL") or
-                std.mem.eql(u8, slice, "int32_t") or
-                std.mem.eql(u8, slice, "int16_t") or
-                std.mem.eql(u8, slice, "int8_t") or
-                std.mem.eql(u8, slice, "uint32_t") or
-                std.mem.eql(u8, slice, "uint16_t") or
-                std.mem.eql(u8, slice, "uint8_t"))
-            {
-                return true;
             }
         }
         return false;
@@ -142,6 +163,8 @@ fn isWideFunctionName(tok: Token, source: []const u8) bool {
         std.mem.eql(u8, slice, "wcslen") or
         std.mem.eql(u8, slice, "strnlen") or
         std.mem.eql(u8, slice, "strnlen_s") or
+        std.mem.eql(u8, slice, "mbstowcs") or
+        std.mem.eql(u8, slice, "wcstombs") or
         std.mem.eql(u8, slice, "_countof") or
         std.mem.eql(u8, slice, "ARRAYSIZE") or
         std.mem.eql(u8, slice, "ARRAY_SIZE") or
@@ -162,6 +185,16 @@ fn isWideExpressionStart(tok: Token, source: []const u8) bool {
             std.mem.indexOf(u8, slice, "Count") != null or
             std.mem.indexOf(u8, slice, "index") != null or
             std.mem.indexOf(u8, slice, "Index") != null or
+            std.mem.indexOf(u8, slice, "bytes") != null or
+            std.mem.indexOf(u8, slice, "Bytes") != null or
+            std.mem.indexOf(u8, slice, "offset") != null or
+            std.mem.indexOf(u8, slice, "Offset") != null or
+            std.mem.indexOf(u8, slice, "capacity") != null or
+            std.mem.indexOf(u8, slice, "Capacity") != null or
+            std.mem.indexOf(u8, slice, "stride") != null or
+            std.mem.indexOf(u8, slice, "Stride") != null or
+            std.mem.indexOf(u8, slice, "pitch") != null or
+            std.mem.indexOf(u8, slice, "Pitch") != null or
             std.mem.endsWith(u8, slice, "_t") or
             std.mem.eql(u8, slice, "size") or
             std.mem.eql(u8, slice, "length") or
@@ -266,6 +299,7 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
         if (isIdentifierToken(tokens[i].kind)) {
             const slice = source[tokens[i].start..tokens[i].end];
             if (!std.mem.endsWith(u8, slice, "_t") and
+                !isNarrowTypedefName(slice) and
                 !isWideFunctionName(tokens[i], source) and
                 slice.len > 0 and (slice[0] < 'A' or slice[0] > 'Z'))
             {
@@ -378,6 +412,24 @@ test "fix sizeof assigned to int32_t" {
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "(int32_t)") != null);
+}
+
+test "fix strlen assigned to Windows-style UINT4" {
+    const src = "UINT4 x = strlen(s);";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("UINT4 x = (UINT4)strlen(s);", output);
+}
+
+test "fix sizeof assigned to GLib guint" {
+    const src = "guint x = sizeof(buf);";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("guint x = (guint)sizeof(buf);", output);
 }
 
 test "fix return strlen" {
