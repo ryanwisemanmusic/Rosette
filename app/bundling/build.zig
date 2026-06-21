@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const is_macos = if (b.standardTargetOptionsQueryOnly(.{}).os_tag) |t| t == .macos else @import("builtin").target.os.tag == .macos;
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -17,13 +18,17 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     helper_mod.addIncludePath(b.path("../../include"));
+    const arch_flags: []const []const u8 = if (is_macos)
+        &[_][]const u8{ "-std=c11", "-include", "shims/macos/compiler_compat.h" }
+    else
+        &[_][]const u8{"-std=c11"};
     helper_mod.addCSourceFile(.{
         .file = b.path("../../src/graphics/common/debug_runtime.c"),
-        .flags = &.{"-std=c11"},
+        .flags = arch_flags,
     });
     helper_mod.addCSourceFile(.{
         .file = b.path("../../src/graphics/CLI/window_main.c"),
-        .flags = &.{"-std=c11"},
+        .flags = arch_flags,
     });
     const app_bundle_parser_mod = b.createModule(.{
         .root_source_file = b.path("../../src/tooling/app_parser/bundle_parser.zig"),
@@ -326,7 +331,10 @@ pub fn build(b: *std.Build) void {
     });
     app_mod.addCSourceFile(.{
         .file = b.path("src/RosetteApp.m"),
-        .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra" },
+        .flags = if (is_macos)
+            &[_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra", "-include", "shims/macos/compiler_compat.h" }
+        else
+            &[_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra" },
     });
     app_mod.linkFramework("Cocoa", .{});
 
