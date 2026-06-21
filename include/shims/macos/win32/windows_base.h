@@ -17,6 +17,12 @@
 
 #include <stdint.h>
 
+/* Activate centralised Clang warning suppression before any third-party
+ * headers are processed by translate-c.  This eliminates the need for
+ * per-patch -Wno-* pragma injection into windows.h, sysinfo.h, and the
+ * hundreds of transitive Win32 SDK headers. */
+#include <compiler_compat.h>
+
 /* Suppress the upstream canonical (guarded by #ifndef _WINDOWS_) and the
  * existing shim wrapper (guarded by its own #ifndef ...). Defining both
  * here means any later #include of either file is a no-op. */
