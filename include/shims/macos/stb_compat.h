@@ -31,6 +31,12 @@
 #endif
 #define STBI_ASSERT(x) ((void)(x))
 
+/* stb_image_write.h  —  STBIW_ASSERT(expr) */
+#ifdef STBIW_ASSERT
+#undef STBIW_ASSERT
+#endif
+#define STBIW_ASSERT(x) ((void)(x))
+
 /* stb_vorbis.h  —  STBV_ASSERT(expr) */
 #ifdef STBV_ASSERT
 #undef STBV_ASSERT
