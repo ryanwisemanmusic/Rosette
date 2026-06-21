@@ -1,5 +1,7 @@
 const source_include_compat = @import("../source/include_compat.zig");
 const source_build_helper = @import("../source/build_helper.zig");
+const source_narrow = @import("../source/narrow.zig");
+const source_c_tokenizer = @import("../../../lib/transpiler/c_tokenizer.zig");
 
 pub const discoverIncludeDirs = source_include_compat.discoverIncludeDirs;
 pub const hasHeaderExtension = source_include_compat.hasHeaderExtension;
@@ -24,3 +26,6 @@ pub const posixCompatCFlag = source_build_helper.posixCompatCFlag;
 pub const scanForStbAssertUsage = source_include_compat.scanForStbAssertUsage;
 pub const scanForSecureGetenvUsage = source_include_compat.scanForSecureGetenvUsage;
 pub const scanForAtomicVarInitUsage = source_include_compat.scanForAtomicVarInitUsage;
+
+pub const narrow = source_narrow;
+pub const c_tokenizer = source_c_tokenizer;
