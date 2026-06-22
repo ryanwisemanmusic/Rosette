@@ -2750,7 +2750,6 @@ const compiler_launcher_script =
     \\  filtered+=("-Wno-error=unused-variable")
     \\  filtered+=("-Wno-error=unused-but-set-variable")
     \\  filtered+=("-Wno-error=switch")
-    \\  filtered+=("-Wno-error=shorten-64-to-32")
     \\  filtered+=("-Wno-error=implicit-int-conversion")
     \\  filtered+=("-Wno-error=constant-conversion")
     \\}
@@ -3989,7 +3988,6 @@ const macos_warning_compat_flags = [_][]const u8{
     "-Wno-error=unused-variable",
     "-Wno-error=unused-but-set-variable",
     "-Wno-error=switch",
-    "-Wno-error=shorten-64-to-32",
     "-Wno-error=implicit-int-conversion",
     "-Wno-error=constant-conversion",
 };
@@ -4980,7 +4978,7 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "ROSETTE_MACOS_WARNING_COMPAT_ENABLE"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=unused-variable"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=switch"));
-    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=shorten-64-to-32"));
+    try std.testing.expect(!containsIgnoreCase(compiler_launcher_script, "Wno-error=shorten-64-to-32"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid("));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid_count"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "-Wmacro-redefined"));
