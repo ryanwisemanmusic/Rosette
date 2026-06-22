@@ -52,6 +52,16 @@
 #pragma clang diagnostic ignored "-Wold-style-cast"
 
 /* ------------------------------------------------------------------ */
+/*  -Wundefined-reinterpret-cast / -Wstrict-aliasing                  */
+/*  Emulators, codecs, and graphics code often type-pun scalar bits   */
+/*  via pointer casts in hot paths.  Apple Clang may flag these under  */
+/*  strict warning sets even when the project accepts the upstream     */
+/*  implementation.                                                   */
+/* ------------------------------------------------------------------ */
+#pragma clang diagnostic ignored "-Wundefined-reinterpret-cast"
+#pragma clang diagnostic ignored "-Wstrict-aliasing"
+
+/* ------------------------------------------------------------------ */
 /*  -Wdeprecated-declarations                                         */
 /*  sprintf, strcpy, and other POSIX-fixed functions are deprecated   */
 /*  on macOS in favour of the _s variants.  Bundled third-party code  */

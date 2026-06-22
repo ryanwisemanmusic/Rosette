@@ -2752,6 +2752,8 @@ const compiler_launcher_script =
     \\  filtered+=("-Wno-error=implicit-int-conversion")
     \\  filtered+=("-Wno-error=constant-conversion")
     \\  filtered+=("-Wno-error=old-style-cast")
+    \\  filtered+=("-Wno-error=undefined-reinterpret-cast")
+    \\  filtered+=("-Wno-error=strict-aliasing")
     \\}
     \\
     \\if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ "${ROSETTE_MACOS_COMPAT_ENABLE:-auto}" != "0" ]; then
@@ -3990,6 +3992,8 @@ const macos_warning_compat_flags = [_][]const u8{
     "-Wno-error=implicit-int-conversion",
     "-Wno-error=constant-conversion",
     "-Wno-error=old-style-cast",
+    "-Wno-error=undefined-reinterpret-cast",
+    "-Wno-error=strict-aliasing",
 };
 
 fn appendMacOSWarningCompatFlags(argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
@@ -4854,8 +4858,11 @@ test "bash env snippet enables scoped project include compatibility" {
 }
 
 test "compiler sanitizer strips x86 intrinsic shadows but keeps bridge entry headers" {
+    var argv_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer argv_arena.deinit();
+    const argv_allocator = argv_arena.allocator();
     var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(std.testing.allocator);
+    defer argv.deinit(argv_allocator);
 
     const allocator = std.testing.allocator;
     const test_root = try std.fmt.allocPrint(allocator, "/tmp/rosette-compiler-sanitize-{d}", .{c.getpid()});
@@ -4903,7 +4910,7 @@ test "compiler sanitizer strips x86 intrinsic shadows but keeps bridge entry hea
         "-c",
         "file.c",
     };
-    try appendSanitizedCompilerArgs(std.testing.io, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try appendSanitizedCompilerArgs(std.testing.io, &argv, argv_allocator, &args, compilerArgsTargetX86(&args), false);
     try std.testing.expect(hasString(argv.items, safe_joined));
     try std.testing.expect(hasString(argv.items, bridge_joined));
     try std.testing.expect(hasString(argv.items, bridge_dir));
@@ -4911,11 +4918,14 @@ test "compiler sanitizer strips x86 intrinsic shadows but keeps bridge entry hea
 }
 
 test "compiler sanitizer keeps SIMD bridge dirs for non-x86 targets" {
+    var argv_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer argv_arena.deinit();
+    const argv_allocator = argv_arena.allocator();
     var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(std.testing.allocator);
+    defer argv.deinit(argv_allocator);
 
     const args = [_][]const u8{ "-arch", "arm64", "-isystem", "/repo/third_party/AvxToNeon", "-c", "file.c" };
-    try appendSanitizedCompilerArgs(std.testing.io, &argv, std.testing.allocator, &args, compilerArgsTargetX86(&args), false);
+    try appendSanitizedCompilerArgs(std.testing.io, &argv, argv_allocator, &args, compilerArgsTargetX86(&args), false);
     try std.testing.expect(hasString(argv.items, "/repo/third_party/AvxToNeon"));
 }
 
@@ -4978,6 +4988,7 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "ROSETTE_MACOS_WARNING_COMPAT_ENABLE"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=unused-variable"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=switch"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=undefined-reinterpret-cast"));
     try std.testing.expect(!containsIgnoreCase(compiler_launcher_script, "Wno-error=shorten-64-to-32"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid("));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid_count"));
