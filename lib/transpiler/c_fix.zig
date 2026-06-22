@@ -233,7 +233,7 @@ fn skipToSemicolon(tokens: []const Token, start: usize) usize {
 
 fn findMatchingClose(tokens: []const Token, start: usize) usize {
     var depth: u32 = 1;
-    var i = start;
+    var i = start + 1;
     while (i < tokens.len) : (i += 1) {
         switch (tokens[i].kind) {
             .lparen, .lbrace, .lbracket => depth += 1,
@@ -277,6 +277,11 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
     try appendTrivialMacIncludeCollapses(allocator, source, &edits);
     try appendLocalAngleIncludeQuotes(allocator, source, &edits);
     try appendUnusedLocalAnnotations(allocator, source, &edits);
+    try appendUnusedConstAnnotations(allocator, source, &edits);
+    try appendUnusedSetLocalSuppressions(allocator, source, &edits);
+    try appendParenthesesEquality(allocator, source, tokens, &edits);
+    try appendSwitchDefaultClauses(allocator, source, tokens, &edits);
+    try appendMissingFieldInitializers(allocator, source, tokens, &edits);
 
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
@@ -326,12 +331,8 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
 
         if (type_end >= tokens.len) continue;
 
-        const has_ptr = tokens[type_end].kind == .star;
-        var name_pos = type_end;
-        if (has_ptr) {
-            name_pos = type_end + 1;
-            if (name_pos >= tokens.len) continue;
-        }
+        const has_ptr = type_end > i and tokens[type_end - 1].kind == .star;
+        const name_pos = type_end;
 
         if (!isIdentifierToken(tokens[name_pos].kind)) continue;
 
@@ -345,7 +346,31 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
             const rhs_start = eq_pos + 1;
             const rhs = tokens[rhs_start];
 
+            if (has_ptr) {
+                if (isCharPointerType(tokens, i)) |lhs_unsigned| {
+                    var need_cast = false;
+                    if (rhs.kind == .string_literal and lhs_unsigned) {
+                        need_cast = true;
+                    } else if (rhs.kind == .identifier) {
+                        if (expressionIsCharPointerUnsigned(tokens, rhs_start, source)) |rhs_unsigned| {
+                            if (lhs_unsigned != rhs_unsigned) need_cast = true;
+                        }
+                    }
+                    if (need_cast) {
+                        const cast_text = if (lhs_unsigned) "(unsigned char *)" else "(char *)";
+                        try edits.append(allocator, .{
+                            .start = rhs.start,
+                            .end = rhs.start,
+                            .replacement = try allocator.dupe(u8, cast_text),
+                        });
+                    }
+                }
+                continue;
+            }
+
             if (!typeIsNarrow(tokens, i, source)) continue;
+
+            try appendConstantConversionCasts(allocator, source, tokens, i, type_end, rhs_start, &edits);
 
             if (rhs.kind == .keyword_sizeof or isWideExpressionStart(rhs, source)) {
                 const cast_type = source[tokens[i].start..tokens[type_end - 1].end];
@@ -356,6 +381,13 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
                     .replacement = try std.fmt.allocPrint(allocator, "({s})", .{cast_type}),
                 });
             } else if (isPointerSubtraction(tokens, rhs_start)) {
+                const cast_type = source[tokens[i].start..tokens[type_end - 1].end];
+                try edits.append(allocator, .{
+                    .start = rhs.start,
+                    .end = rhs.start,
+                    .replacement = try std.fmt.allocPrint(allocator, "({s})", .{cast_type}),
+                });
+            } else if (isFunctionCall(tokens, rhs_start)) {
                 const cast_type = source[tokens[i].start..tokens[type_end - 1].end];
                 try edits.append(allocator, .{
                     .start = rhs.start,
@@ -663,6 +695,470 @@ fn isIdentifierToken(kind: Token.Kind) bool {
     return kind == .identifier;
 }
 
+fn appendUnusedSetLocalSuppressions(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        pos = line.next;
+        if (editOverlaps(edits.items, line.start, line.next)) continue;
+        if (!appearsInsideBlock(source, line.start)) continue;
+
+        const trimmed = trimLine(line.text);
+        if (trimmed.len == 0) continue;
+
+        if (trimmed[0] == '#' or trimmed[0] == '}') continue;
+
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const semi = std.mem.lastIndexOfScalar(u8, trimmed, ';') orelse continue;
+        if (semi < eq) continue;
+
+        const lhs = std.mem.trim(u8, trimmed[0..eq], " \t");
+        if (lhs.len == 0) continue;
+
+        if (std.mem.indexOfScalar(u8, lhs, '.') != null) continue;
+        if (std.mem.indexOf(u8, lhs, "->") != null) continue;
+        if (std.mem.indexOfScalar(u8, lhs, '(') != null) continue;
+        if (std.mem.indexOfScalar(u8, lhs, '[') != null) continue;
+        if (std.mem.indexOfScalar(u8, lhs, '*') != null) continue;
+        if (std.mem.indexOfScalar(u8, lhs, '&') != null) continue;
+
+        var name_end = lhs.len;
+        while (name_end > 0 and !isIdentChar(lhs[name_end - 1])) name_end -= 1;
+        if (name_end == 0) continue;
+        var name_start = name_end;
+        while (name_start > 0 and isIdentChar(lhs[name_start - 1])) name_start -= 1;
+        if (name_start == name_end) continue;
+        const name = lhs[name_start..name_end];
+        if (name.len == 0) continue;
+
+        const prefix = std.mem.trim(u8, lhs[0..name_start], " \t*&");
+        if (prefix.len > 0) continue;
+
+        const eq_in_text = std.mem.indexOfScalar(u8, line.text, '=') orelse continue;
+        const semi_in_text = std.mem.lastIndexOfScalar(u8, line.text, ';') orelse continue;
+        const rhs_region = line.text[eq_in_text + 1 .. semi_in_text];
+        if (std.mem.indexOf(u8, rhs_region, name) != null) continue;
+
+        if (identifierAppearsAfter(source, line.next, name)) continue;
+
+        var indent_len: usize = 0;
+        while (indent_len < line.text.len and (line.text[indent_len] == ' ' or line.text[indent_len] == '\t')) {
+            indent_len += 1;
+        }
+
+        try edits.append(allocator, .{
+            .start = line.next,
+            .end = line.next,
+            .replacement = try std.fmt.allocPrint(allocator, "{s}(void){s};\n", .{ line.text[0..indent_len], name }),
+        });
+    }
+}
+
+fn isFunctionCall(tokens: []const Token, idx: usize) bool {
+    if (idx >= tokens.len) return false;
+    if (tokens[idx].kind != .identifier) return false;
+    if (idx + 1 >= tokens.len) return false;
+    return tokens[idx + 1].kind == .lparen;
+}
+
+fn expressionIsCharPointerUnsigned(tokens: []const Token, idx: usize, source: []const u8) ?bool {
+    if (idx >= tokens.len) return null;
+    const tok = tokens[idx];
+    if (tok.kind == .string_literal) return false;
+    if (tok.kind != .identifier) return null;
+    const slice = source[tok.start..tok.end];
+    const unsigned_patterns = [_][]const u8{ "buf", "Buf", "data", "Data", "bytes", "Bytes", "raw", "Raw", "mem", "Mem" };
+    for (unsigned_patterns) |pat| {
+        if (std.mem.indexOf(u8, slice, pat) != null) return true;
+    }
+    const signed_patterns = [_][]const u8{ "str", "Str", "text", "Text", "name", "Name", "label", "Label", "msg", "Msg" };
+    for (signed_patterns) |pat| {
+        if (std.mem.indexOf(u8, slice, pat) != null) {
+            if (std.mem.eql(u8, slice, "stbi__") or std.mem.startsWith(u8, slice, "stbi_")) return true;
+            return false;
+        }
+    }
+    return null;
+}
+
+fn isCharPointerType(tokens: []const Token, idx: usize) ?bool {
+    var j = idx;
+    while (j < tokens.len and isTypeQualifier(tokens[j].kind)) j += 1;
+    if (j >= tokens.len) return null;
+    if (tokens[j].kind == .keyword_unsigned) {
+        j += 1;
+        if (j < tokens.len and tokens[j].kind == .keyword_char) return true;
+        return null;
+    }
+    if (tokens[j].kind == .keyword_char) return false;
+    if (tokens[j].kind == .keyword_signed) {
+        j += 1;
+        if (j < tokens.len and tokens[j].kind == .keyword_char) return false;
+        return null;
+    }
+    return null;
+}
+
+fn hasTopLevelAssign(tokens: []const Token, start: usize, end: usize) bool {
+    var depth: u32 = 0;
+    var i = start;
+    while (i < end) : (i += 1) {
+        switch (tokens[i].kind) {
+            .lparen, .lbrace, .lbracket => depth += 1,
+            .rparen, .rbrace, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .eq => {
+                if (depth == 0) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn appendUnusedConstAnnotations(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        pos = line.next;
+        if (editOverlaps(edits.items, line.start, line.next)) continue;
+        if (appearsInsideBlock(source, line.start)) continue;
+
+        const trimmed = trimLine(line.text);
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        if (std.mem.indexOf(u8, trimmed, "const") == null) continue;
+        if (std.mem.startsWith(u8, trimmed, "static ") or
+            std.mem.indexOf(u8, trimmed, " static ") != null) continue;
+        if (std.mem.startsWith(u8, trimmed, "extern ") or
+            std.mem.indexOf(u8, trimmed, " extern ") != null) continue;
+        if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) continue;
+
+        const name = unusedLocalDeclarationName(line.text) orelse continue;
+        if (identifierAppearsAfter(source, line.next, name)) continue;
+
+        var indent_len: usize = 0;
+        while (indent_len < line.text.len and (line.text[indent_len] == ' ' or line.text[indent_len] == '\t')) {
+            indent_len += 1;
+        }
+
+        try edits.append(allocator, .{
+            .start = line.start + indent_len,
+            .end = line.start + indent_len,
+            .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+        });
+    }
+}
+
+fn appendParenthesesEquality(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    _ = source;
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .keyword_if and tokens[i].kind != .keyword_while) continue;
+        if (i + 1 >= tokens.len) continue;
+        if (tokens[i + 1].kind != .lparen) continue;
+
+        const close = findMatchingClose(tokens, i + 1);
+        if (close >= tokens.len or close <= i + 2) continue;
+
+        if (hasTopLevelAssign(tokens, i + 2, close)) {
+            try edits.append(allocator, .{
+                .start = tokens[i + 1].start + 1,
+                .end = tokens[i + 1].start + 1,
+                .replacement = try allocator.dupe(u8, "("),
+            });
+            try edits.append(allocator, .{
+                .start = tokens[close].start,
+                .end = tokens[close].start,
+                .replacement = try allocator.dupe(u8, ")"),
+            });
+        }
+    }
+}
+
+fn typeIsUnsigned(tokens: []const Token, idx: usize, source: []const u8) bool {
+    var j = idx;
+    while (j < tokens.len and isTypeQualifier(tokens[j].kind)) j += 1;
+    if (j >= tokens.len) return false;
+    if (tokens[j].kind == .keyword_unsigned) return true;
+    if (tokens[j].kind == .identifier) {
+        const slice = source[tokens[j].start..tokens[j].end];
+        return slice.len > 0 and (slice[0] == 'u' or slice[0] == 'U');
+    }
+    return false;
+}
+
+fn appendConstantConversionCasts(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    i: usize,
+    type_end: usize,
+    rhs_start: usize,
+    edits: *std.ArrayList(Edit),
+) !void {
+    if (rhs_start >= tokens.len) return;
+    const rhs = tokens[rhs_start];
+
+    const is_negative_literal = rhs.kind == .minus and
+        rhs_start + 1 < tokens.len and
+        tokens[rhs_start + 1].kind == .int_literal;
+
+    if (is_negative_literal and typeIsUnsigned(tokens, i, source)) {
+        const cast_type = source[tokens[i].start..tokens[type_end - 1].end];
+        try edits.append(allocator, .{
+            .start = rhs.start,
+            .end = rhs.start,
+            .replacement = try std.fmt.allocPrint(allocator, "({s})", .{cast_type}),
+        });
+    }
+}
+
+fn appendSwitchDefaultClauses(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    _ = source;
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .keyword_switch) continue;
+        if (i + 1 >= tokens.len) continue;
+        if (tokens[i + 1].kind != .lparen) continue;
+
+        const close_paren = findMatchingClose(tokens, i + 1);
+        if (close_paren >= tokens.len) continue;
+        const after_paren = close_paren + 1;
+        if (after_paren >= tokens.len) continue;
+        if (tokens[after_paren].kind != .lbrace) continue;
+
+        const body_start = after_paren;
+        const body_end = findMatchingClose(tokens, body_start);
+        if (body_end >= tokens.len) continue;
+
+        var depth: u32 = 1;
+        var has_default = false;
+        var j = body_start + 1;
+        while (j < body_end) : (j += 1) {
+            switch (tokens[j].kind) {
+                .lbrace => depth += 1,
+                .rbrace => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                .keyword_default => {
+                    if (depth == 1 and j + 1 < body_end and tokens[j + 1].kind == .colon) {
+                        has_default = true;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (!has_default) {
+            try edits.append(allocator, .{
+                .start = tokens[body_end].start,
+                .end = tokens[body_end].start,
+                .replacement = try allocator.dupe(u8, "default: break;\n"),
+            });
+        }
+    }
+}
+
+fn collectStructDefs(
+    allocator: std.mem.Allocator,
+    tokens: []const Token,
+    source: []const u8,
+) !std.StringHashMap(usize) {
+    var map = std.StringHashMap(usize).init(allocator);
+
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        const is_typedef = tokens[i].kind == .keyword_typedef;
+        if (!is_typedef and tokens[i].kind != .keyword_struct) continue;
+        if (is_typedef) {
+            var sp = i + 1;
+            while (sp < tokens.len and tokens[sp].kind != .keyword_struct) {
+                sp += 1;
+            }
+            if (sp >= tokens.len) continue;
+            i = sp;
+        }
+
+        var j = i + 1;
+        var struct_name: ?[]const u8 = null;
+        if (j < tokens.len and tokens[j].kind == .identifier) {
+            struct_name = source[tokens[j].start..tokens[j].end];
+            j += 1;
+        }
+
+        while (j < tokens.len and (isTypeQualifier(tokens[j].kind) or tokens[j].kind == .identifier)) {
+            j += 1;
+        }
+
+        if (j >= tokens.len or tokens[j].kind != .lbrace) continue;
+
+        const body_start = j;
+        const body_end = findMatchingClose(tokens, body_start);
+        if (body_end >= tokens.len) continue;
+
+        var field_count: usize = 0;
+        var depth: u32 = 1;
+        var t = body_start + 1;
+        while (t < body_end) : (t += 1) {
+            switch (tokens[t].kind) {
+                .lbrace, .lbracket => depth += 1,
+                .rbrace, .rbracket => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                .semicolon => {
+                    if (depth == 1) field_count += 1;
+                },
+                else => {},
+            }
+        }
+
+        if (struct_name) |name| {
+            try map.put(name, field_count);
+        }
+
+        if (is_typedef) {
+            var k = body_end + 1;
+            while (k < tokens.len and tokens[k].kind != .semicolon) {
+                if (tokens[k].kind == .identifier) {
+                    try map.put(source[tokens[k].start..tokens[k].end], field_count);
+                    break;
+                }
+                k += 1;
+            }
+        }
+    }
+
+    return map;
+}
+
+fn hasDesignatedInitializers(tokens: []const Token, init_start: usize, init_end: usize) bool {
+    var depth: u32 = 1;
+    var j = init_start + 1;
+    while (j < init_end) : (j += 1) {
+        if (tokens[j].kind == .lbrace or tokens[j].kind == .lbracket) {
+            depth += 1;
+        } else if (tokens[j].kind == .rbrace or tokens[j].kind == .rbracket) {
+            depth -= 1;
+            if (depth == 0) break;
+        } else if (depth == 1 and tokens[j].kind == .dot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn countTopLevelCommas(tokens: []const Token, init_start: usize, init_end: usize) usize {
+    if (init_end <= init_start + 1) return 0;
+    var count: usize = 1;
+    var depth: u32 = 1;
+    var j = init_start + 1;
+    while (j < init_end) : (j += 1) {
+        if (tokens[j].kind == .lbrace or tokens[j].kind == .lbracket) {
+            depth += 1;
+        } else if (tokens[j].kind == .rbrace or tokens[j].kind == .rbracket) {
+            depth -= 1;
+            if (depth == 0) break;
+        } else if (depth == 1 and tokens[j].kind == .comma) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn findStructTypeName(
+    tokens: []const Token,
+    start: usize,
+    source: []const u8,
+    struct_map: std.StringHashMap(usize),
+) ?[]const u8 {
+    if (start == 0) return null;
+    var j = start;
+    var skip_depth: u32 = 0;
+    while (j > 0) {
+        j -= 1;
+        if (skip_depth > 0) {
+            switch (tokens[j].kind) {
+                .rbrace, .rbracket, .rparen => skip_depth += 1,
+                .lbrace, .lbracket, .lparen => {
+                    skip_depth -= 1;
+                },
+                else => {},
+            }
+            continue;
+        }
+
+        switch (tokens[j].kind) {
+            .identifier => {
+                const name = source[tokens[j].start..tokens[j].end];
+                if (struct_map.contains(name)) return name;
+            },
+            .keyword_const, .keyword_volatile, .keyword_restrict, .star, .keyword_struct, .comma, .eq, .keyword_unsigned, .keyword_signed => continue,
+            .rbrace, .rbracket, .rparen => {
+                skip_depth = 1;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn appendMissingFieldInitializers(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var struct_map = try collectStructDefs(allocator, tokens, source);
+    defer struct_map.deinit();
+
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .eq) continue;
+        if (i + 1 >= tokens.len or tokens[i + 1].kind != .lbrace) continue;
+
+        const init_start = i + 1;
+        const init_end = findMatchingClose(tokens, init_start);
+        if (init_end >= tokens.len or init_end <= init_start + 1) continue;
+
+        const type_name = findStructTypeName(tokens, i, source, struct_map) orelse continue;
+        const field_count = struct_map.get(type_name) orelse continue;
+        if (field_count == 0) continue;
+
+        if (hasDesignatedInitializers(tokens, init_start, init_end)) continue;
+
+        const init_count = countTopLevelCommas(tokens, init_start, init_end);
+        if (init_count >= field_count) continue;
+
+        try edits.append(allocator, .{
+            .start = tokens[init_end].start,
+            .end = tokens[init_end].start,
+            .replacement = try allocator.dupe(u8, ", 0"),
+        });
+    }
+}
+
 pub fn applyEdits(allocator: std.mem.Allocator, source: []const u8, edits: []const Edit) ![]u8 {
     if (edits.len == 0) return try allocator.dupe(u8, source);
 
@@ -857,4 +1353,232 @@ test "do not collapse real mac include conditional" {
     var result = try fixSource(std.testing.allocator, src);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "unused but set local gets (void) suppression" {
+    const src =
+        \\void f(void) {
+        \\  int x;
+        \\  x = 42;
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(void)x;") != null);
+}
+
+test "unused but set local used on RHS gets no suppression" {
+    const src =
+        \\void f(void) {
+        \\  int x;
+        \\  x = x + 1;
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "used variable after assignment gets no (void) suppression" {
+    const src =
+        \\void f(void) {
+        \\  int x;
+        \\  x = 42;
+        \\  use(x);
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "sign-conversion cast for function call RHS" {
+    const src = "uint32_t x = getchar();";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(uint32_t)") != null);
+}
+
+test "pointer-sign cast unsigned char* from string literal" {
+    const src = "unsigned char *p = \"hello\";";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(unsigned char *)") != null);
+}
+
+test "no pointer-sign cast for already-correct pointer" {
+    const src = "char *p = \"hello\";";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "parentheses-equality wraps if assignment" {
+    const src = "if (x = y) { f(); }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("if ((x = y)) { f(); }", output);
+}
+
+test "parentheses-equality wraps while assignment" {
+    const src = "while (x = next()) { process(); }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "((x = next()))") != null);
+}
+
+test "no parentheses-equality for comparison" {
+    const src = "if (x == y) { f(); }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "no parentheses-equality for for-loop init" {
+    const src = "for (i = 0; i < n; i++) { }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "constant-conversion cast negative literal to unsigned" {
+    const src = "uint32_t x = -1;";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(uint32_t)") != null);
+}
+
+test "switch default clause inserted when missing" {
+    const src =
+        \\switch (x) {
+        \\  case 1: break;
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "default: break;") != null);
+}
+
+test "switch no default when default already present" {
+    const src =
+        \\switch (x) {
+        \\  case 1: break;
+        \\  default: break;
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "unused file-scope const gets maybe_unused" {
+    const src =
+        \\const int FOO = 42;
+        \\void f(void) {}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] const int FOO") != null);
+}
+
+test "used file-scope const gets no annotation" {
+    const src =
+        \\const int BAR = 42;
+        \\void f(void) { int x = BAR; }
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "static const at file scope skipped" {
+    const src =
+        \\static const int BAZ = 42;
+        \\void f(void) {}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "extern const at file scope skipped" {
+    const src =
+        \\extern const int QUX;
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "struct partial initializer gets padded" {
+    const src =
+        \\struct Foo { int a; int b; int c; };
+        \\void f(void) { struct Foo x = {1, 2}; }
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, ", 0") != null);
+}
+
+test "struct full initializer unchanged" {
+    const src =
+        \\struct Foo { int a; int b; };
+        \\void f(void) { struct Foo x = {1, 2}; }
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "struct designated initializer skipped" {
+    const src =
+        \\struct Foo { int a; int b; int c; };
+        \\void f(void) { struct Foo x = {.a = 1, .b = 2}; }
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "typedef struct partial initializer gets padded" {
+    const src =
+        \\typedef struct { int a; int b; int c; } Foo;
+        \\void f(void) { Foo x = {1}; }
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, ", 0") != null);
 }
