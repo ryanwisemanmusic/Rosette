@@ -42,6 +42,14 @@
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-const-variable"
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+
+/* ------------------------------------------------------------------ */
+/*  -Wold-style-cast                                                  */
+/*  C++ projects with C heritage often use `(Type*)expr` casts.       */
+/*  Apple Clang may promote this to an error under project -Werror.   */
+/* ------------------------------------------------------------------ */
+#pragma clang diagnostic ignored "-Wold-style-cast"
 
 /* ------------------------------------------------------------------ */
 /*  -Wdeprecated-declarations                                         */
@@ -97,6 +105,16 @@
 /* ------------------------------------------------------------------ */
 #ifndef asm
 #define asm __asm__
+#endif
+
+/* ------------------------------------------------------------------ */
+/*  MoltenVK / Vulkan-Hpp platform selection                          */
+/*  macOS Vulkan projects usually need VK_USE_PLATFORM_METAL_EXT      */
+/*  before including Vulkan headers.  Defining it centrally avoids    */
+/*  per-project *_mac API wrapper headers.                            */
+/* ------------------------------------------------------------------ */
+#ifndef VK_USE_PLATFORM_METAL_EXT
+#define VK_USE_PLATFORM_METAL_EXT
 #endif
 
 #endif /* __APPLE__ && __clang__ */

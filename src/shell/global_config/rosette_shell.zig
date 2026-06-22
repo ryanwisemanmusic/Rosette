@@ -2751,6 +2751,7 @@ const compiler_launcher_script =
     \\  filtered+=("-Wno-error=switch")
     \\  filtered+=("-Wno-error=implicit-int-conversion")
     \\  filtered+=("-Wno-error=constant-conversion")
+    \\  filtered+=("-Wno-error=old-style-cast")
     \\}
     \\
     \\if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ "${ROSETTE_MACOS_COMPAT_ENABLE:-auto}" != "0" ]; then
@@ -3988,6 +3989,7 @@ const macos_warning_compat_flags = [_][]const u8{
     "-Wno-error=switch",
     "-Wno-error=implicit-int-conversion",
     "-Wno-error=constant-conversion",
+    "-Wno-error=old-style-cast",
 };
 
 fn appendMacOSWarningCompatFlags(argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
