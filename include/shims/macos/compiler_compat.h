@@ -42,7 +42,6 @@
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wunused-variable"
 #pragma clang diagnostic ignored "-Wunused-const-variable"
-#pragma clang diagnostic ignored "-Wunused-but-set-variable"
 
 /* ------------------------------------------------------------------ */
 /*  -Wold-style-cast                                                  */
@@ -52,14 +51,13 @@
 #pragma clang diagnostic ignored "-Wold-style-cast"
 
 /* ------------------------------------------------------------------ */
-/*  -Wundefined-reinterpret-cast / -Wstrict-aliasing                  */
+/*  -Wundefined-reinterpret-cast                                       */
 /*  Emulators, codecs, and graphics code often type-pun scalar bits   */
 /*  via pointer casts in hot paths.  Apple Clang may flag these under  */
 /*  strict warning sets even when the project accepts the upstream     */
 /*  implementation.                                                   */
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wundefined-reinterpret-cast"
-#pragma clang diagnostic ignored "-Wstrict-aliasing"
 
 /* ------------------------------------------------------------------ */
 /*  -Wdeprecated-declarations                                         */
@@ -70,22 +68,11 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 /* ------------------------------------------------------------------ */
-/*  -Wmissing-braces / -Wmissing-field-initializers                   */
+/*  -Wmissing-braces                                                  */
 /*  Apple Clang sometimes warns about aggregate initialisation that   */
 /*  is valid C/C++.  Common in C libraries ported to C++.             */
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wmissing-braces"
-#pragma clang diagnostic ignored "-Wmissing-field-initializers"
-
-/* ------------------------------------------------------------------ */
-/*  -Wswitch / -Wswitch-enum                                          */
-/*  Enums used in switch statements that only cover a subset of       */
-/*  values (e.g. opcode tables, codec dispatch).  Apple Clang enables */
-/*  these in -Wall; many cross-platform projects omit default cases   */
-/*  when the switch is exhaustive at the time of writing.             */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wswitch"
-#pragma clang diagnostic ignored "-Wswitch-enum"
 
 /* ------------------------------------------------------------------ */
 /*  -Wlogical-op-parentheses                                          */
@@ -93,14 +80,6 @@
 /*  intent.  Common in FFmpeg, libavformat, and similar media libs.   */
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wlogical-op-parentheses"
-
-/* ------------------------------------------------------------------ */
-/*  -Wpointer-sign                                                    */
-/*  Warns when a `char *` is implicitly converted to `unsigned char *`*/
-/*  or vice versa.  Many C libraries mix raw-byte buffers (uint8_t *) */
-/*  with string pointers (char *) freely.  Common in FFmpeg.          */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wpointer-sign"
 
 /* ------------------------------------------------------------------ */
 /*  asm → __asm__                                                     */

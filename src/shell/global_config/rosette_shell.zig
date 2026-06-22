@@ -2748,12 +2748,10 @@ const compiler_launcher_script =
     \\  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
     \\  [ "${ROSETTE_MACOS_WARNING_COMPAT_ENABLE:-auto}" != "0" ] || return 0
     \\  filtered+=("-Wno-error=unused-variable")
-    \\  filtered+=("-Wno-error=switch")
     \\  filtered+=("-Wno-error=implicit-int-conversion")
     \\  filtered+=("-Wno-error=constant-conversion")
     \\  filtered+=("-Wno-error=old-style-cast")
     \\  filtered+=("-Wno-error=undefined-reinterpret-cast")
-    \\  filtered+=("-Wno-error=strict-aliasing")
     \\}
     \\
     \\if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ "${ROSETTE_MACOS_COMPAT_ENABLE:-auto}" != "0" ]; then
@@ -3988,12 +3986,10 @@ fn macOSCompatIncludeRoot(allocator: std.mem.Allocator) ![]const u8 {
 
 const macos_warning_compat_flags = [_][]const u8{
     "-Wno-error=unused-variable",
-    "-Wno-error=switch",
     "-Wno-error=implicit-int-conversion",
     "-Wno-error=constant-conversion",
     "-Wno-error=old-style-cast",
     "-Wno-error=undefined-reinterpret-cast",
-    "-Wno-error=strict-aliasing",
 };
 
 fn appendMacOSWarningCompatFlags(argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
@@ -4987,7 +4983,7 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "cpu_feature_probe.h"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "ROSETTE_MACOS_WARNING_COMPAT_ENABLE"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=unused-variable"));
-    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=switch"));
+    try std.testing.expect(!containsIgnoreCase(compiler_launcher_script, "Wno-error=switch"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=undefined-reinterpret-cast"));
     try std.testing.expect(!containsIgnoreCase(compiler_launcher_script, "Wno-error=shorten-64-to-32"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid("));
