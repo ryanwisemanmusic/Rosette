@@ -364,9 +364,12 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     };
     std.debug.print("[INSTALL] Created include_dir: {s}\n", .{include_dir});
 
-    std.debug.print("[INSTALL] Step 3: Installing x86 compatibility header\n", .{});
+    std.debug.print("[INSTALL] Step 3: Installing compiler compatibility headers\n", .{});
     ensureX86CompatHeader(allocator, include_dir) catch |err| {
         std.debug.print("[INSTALL] WARNING: Failed to install x86 compatibility header: {s}\n", .{@errorName(err)});
+    };
+    ensureMacOSCompatHeaders(init.io, allocator, include_dir) catch |err| {
+        std.debug.print("[INSTALL] WARNING: Failed to install macOS compatibility headers: {s}\n", .{@errorName(err)});
     };
 
     std.debug.print("[INSTALL] Step 4: Copying helper binaries\n", .{});
@@ -2693,6 +2696,7 @@ const compiler_launcher_script =
     \\compiler="$1"
     \\shift
     \\x86_compat_header="${ROSETTE_X86_INTRINSICS_COMPAT:-$HOME/.rosette/include/x86_intrinsics_compat.h}"
+    \\macos_shim_root="${ROSETTE_MACOS_COMPAT_INCLUDE_ROOT:-$HOME/.rosette/include}"
     \\
     \\__rosette_compiler_arg_is_x86() {
     \\  case "$1" in
@@ -2735,6 +2739,18 @@ const compiler_launcher_script =
     \\done
     \\
     \\filtered=()
+    \\__rosette_add_macos_compat_header() {
+    \\  local header="$1"
+    \\  [ -f "$header" ] || return 0
+    \\  filtered+=("-include" "$header")
+    \\}
+    \\
+    \\if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ "${ROSETTE_MACOS_COMPAT_ENABLE:-auto}" != "0" ]; then
+    \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/macos/compiler_compat.h"
+    \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/macos/posix_compat.h"
+    \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/macos/endian.h"
+    \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/rosette/cpu_feature_probe.h"
+    \\fi
     \\if [ "$target_x86" = "1" ] && [ "${ROSETTE_X86_INTRINSICS_COMPAT_ENABLE:-auto}" != "0" ] && [ -f "$x86_compat_header" ]; then
     \\  filtered+=("-include" "$x86_compat_header")
     \\fi
@@ -3169,6 +3185,41 @@ fn ensureX86CompatHeader(allocator: std.mem.Allocator, include_dir: []const u8) 
     writeFilePath(allocator, header_path, x86IntrinsicsCompatH) catch |err| {
         std.debug.print("warning: could not write x86 compat header: {s}\n", .{@errorName(err)});
     };
+}
+
+fn ensureMacOSCompatHeaders(io: std.Io, allocator: std.mem.Allocator, include_dir: []const u8) !void {
+    const source_root = try macOSCompatSourceRoot(io, allocator);
+    if (source_root.len == 0) return;
+
+    const headers = [_][]const u8{
+        "shims/macos/compiler_compat.h",
+        "shims/macos/posix_compat.h",
+        "shims/macos/endian.h",
+        "shims/macos/force_types.h",
+        "shims/macos/stb_compat.h",
+        "shims/rosette/cpu_feature_probe.h",
+    };
+    for (headers) |header| {
+        const source_path = try std.fs.path.join(allocator, &.{ source_root, "include", header });
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(256 * 1024)) catch continue;
+        const dest_path = try std.fs.path.join(allocator, &.{ include_dir, header });
+        try writeFilePath(allocator, dest_path, bytes);
+    }
+}
+
+fn macOSCompatSourceRoot(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
+    const configured = try currentSourceRoot(io, allocator);
+    if (configured.len != 0 and macOSCompatSourceRootHasHeaders(allocator, configured)) return configured;
+
+    const cwd = absolutePath(allocator, ".") catch "";
+    if (cwd.len != 0 and macOSCompatSourceRootHasHeaders(allocator, cwd)) return cwd;
+
+    return configured;
+}
+
+fn macOSCompatSourceRootHasHeaders(allocator: std.mem.Allocator, source_root: []const u8) bool {
+    const marker = std.fs.path.join(allocator, &.{ source_root, "include", "shims", "macos", "compiler_compat.h" }) catch return false;
+    return fileExists(allocator, marker);
 }
 
 fn resolveX86CompatHeaderPath() ?[]const u8 {
@@ -3852,6 +3903,8 @@ fn appendSanitizedCompilerArgs(
     target_x86: bool,
     strip_ld_debug: bool,
 ) !void {
+    try appendMacOSCompatIncludes(allocator, argv);
+
     // Inject x86 intrinsic compat header when targeting x86, to bridge
     // builtins that may be absent when cross-compiling from a non-x86 host
     // (e.g. __cpuid_count on Apple Clang for ARM64). The installed Bash
@@ -3889,6 +3942,35 @@ fn appendSanitizedCompilerArgs(
         }
         try argv.append(allocator, arg);
     }
+}
+
+fn appendMacOSCompatIncludes(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8)) !void {
+    if (builtin.target.os.tag != .macos) return;
+    if (getenvSlice("ROSETTE_MACOS_COMPAT_ENABLE")) |value| {
+        if (isFalseEnvValue(value)) return;
+    }
+
+    const root = try macOSCompatIncludeRoot(allocator);
+    const headers = [_][]const u8{
+        "shims/macos/compiler_compat.h",
+        "shims/macos/posix_compat.h",
+        "shims/macos/endian.h",
+        "shims/rosette/cpu_feature_probe.h",
+    };
+    for (headers) |header| {
+        const header_path = try std.fs.path.join(allocator, &.{ root, header });
+        if (!fileExists(allocator, header_path)) continue;
+        try argv.append(allocator, "-include");
+        try argv.append(allocator, header_path);
+    }
+}
+
+fn macOSCompatIncludeRoot(allocator: std.mem.Allocator) ![]const u8 {
+    if (getenvSlice("ROSETTE_MACOS_COMPAT_INCLUDE_ROOT")) |root| {
+        if (root.len != 0) return try allocator.dupe(u8, root);
+    }
+    const home = try homeDir(allocator);
+    return try std.fs.path.join(allocator, &.{ home, ".rosette", "include" });
 }
 
 fn isIncludeFlag(arg: []const u8) ?[]const u8 {
@@ -4861,6 +4943,9 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "filtered=()"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "-include"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "x86_intrinsics_compat.h"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "compiler_compat.h"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "posix_compat.h"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "cpu_feature_probe.h"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid("));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid_count"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "-Wmacro-redefined"));

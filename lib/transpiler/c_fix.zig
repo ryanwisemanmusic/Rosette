@@ -270,6 +270,8 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
     }
     const warning = false;
 
+    try appendTrivialMacIncludeCollapses(allocator, source, &edits);
+
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
         if (isStorageClass(tokens[i].kind)) continue;
@@ -359,6 +361,132 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
     }
 
     return .{ .edits = edits, .warning = warning };
+}
+
+const Line = struct {
+    start: usize,
+    end: usize,
+    next: usize,
+    text: []const u8,
+};
+
+fn nextLine(source: []const u8, start: usize) ?Line {
+    if (start >= source.len) return null;
+    const end = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse source.len;
+    return .{
+        .start = start,
+        .end = end,
+        .next = if (end < source.len) end + 1 else end,
+        .text = source[start..end],
+    };
+}
+
+fn trimLine(line: []const u8) []const u8 {
+    return std.mem.trim(u8, line, " \t\r\n");
+}
+
+fn includePath(line: []const u8) ?[]const u8 {
+    const trimmed = trimLine(line);
+    if (!std.mem.startsWith(u8, trimmed, "#include")) return null;
+    var rest = std.mem.trim(u8, trimmed["#include".len..], " \t");
+    if (rest.len < 3) return null;
+    const opener = rest[0];
+    const closer: u8 = switch (opener) {
+        '"' => '"',
+        '<' => '>',
+        else => return null,
+    };
+    rest = rest[1..];
+    const close = std.mem.indexOfScalar(u8, rest, closer) orelse return null;
+    return rest[0..close];
+}
+
+fn macIncludeNormalizesTo(mac_path: []const u8, normal_path: []const u8) bool {
+    if (std.mem.eql(u8, mac_path, normal_path) and isTrivialMacCanonicalBasename(mac_path)) return true;
+    if (!std.mem.endsWith(u8, mac_path, "_mac.h")) return false;
+    if (!isTrivialMacWrapperBasename(mac_path)) return false;
+    if (mac_path.len != normal_path.len + "_mac".len) return false;
+    const suffix_start = mac_path.len - "_mac.h".len;
+    return std.mem.eql(u8, mac_path[0..suffix_start], normal_path[0..suffix_start]) and
+        std.mem.eql(u8, normal_path[suffix_start..], ".h");
+}
+
+fn isTrivialMacWrapperBasename(path: []const u8) bool {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return isTrivialMacWrapperName(path);
+    return isTrivialMacWrapperName(path[slash + 1 ..]);
+}
+
+fn isTrivialMacCanonicalBasename(path: []const u8) bool {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return isTrivialMacCanonicalName(path);
+    return isTrivialMacCanonicalName(path[slash + 1 ..]);
+}
+
+fn isTrivialMacWrapperName(name: []const u8) bool {
+    const names = [_][]const u8{
+        "byte_order_mac.h",
+        "math_mac.h",
+        "memory_mac.h",
+        "windowed_app_context_mac.h",
+    };
+    for (names) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+fn isTrivialMacCanonicalName(name: []const u8) bool {
+    const names = [_][]const u8{
+        "byte_order.h",
+        "math.h",
+        "memory.h",
+        "windowed_app_context.h",
+    };
+    for (names) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+fn appendTrivialMacIncludeCollapses(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |if_line| {
+        pos = if_line.next;
+        const condition = trimLine(if_line.text);
+        if (!std.mem.startsWith(u8, condition, "#if")) continue;
+        if (std.mem.indexOf(u8, condition, "MACOS") == null and
+            std.mem.indexOf(u8, condition, "__APPLE__") == null and
+            std.mem.indexOf(u8, condition, "APPLE") == null)
+        {
+            continue;
+        }
+
+        const include_a = nextLine(source, if_line.next) orelse continue;
+        const else_line = nextLine(source, include_a.next) orelse continue;
+        const include_b = nextLine(source, else_line.next) orelse continue;
+        const endif_line = nextLine(source, include_b.next) orelse continue;
+        if (!std.mem.eql(u8, trimLine(else_line.text), "#else")) continue;
+        if (!std.mem.startsWith(u8, trimLine(endif_line.text), "#endif")) continue;
+
+        const path_a = includePath(include_a.text) orelse continue;
+        const path_b = includePath(include_b.text) orelse continue;
+        const normal_path = if (macIncludeNormalizesTo(path_a, path_b))
+            path_b
+        else if (macIncludeNormalizesTo(path_b, path_a))
+            path_a
+        else
+            continue;
+
+        try edits.append(allocator, .{
+            .start = if_line.start,
+            .end = endif_line.next,
+            .replacement = try std.fmt.allocPrint(allocator, "#include \"{s}\"\n", .{normal_path}),
+        });
+        pos = endif_line.next;
+    }
 }
 
 fn isIdentifierToken(kind: Token.Kind) bool {
@@ -464,6 +592,52 @@ test "fix sizeof in for-loop init" {
 
 test "no edit for uint64_t" {
     const src = "uint64_t x = strlen(s);";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "collapse trivial mac include conditional" {
+    const src =
+        \\#if XE_PLATFORM_MACOS
+        \\#include "xenia/base/math_mac.h"
+        \\#else
+        \\#include "xenia/base/math.h"
+        \\#endif
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("#include \"xenia/base/math.h\"\n", output);
+}
+
+test "collapse duplicate canonical trivial mac include conditional" {
+    const src =
+        \\#if XE_PLATFORM_MACOS
+        \\#include "xenia/base/math.h"
+        \\#else
+        \\#include "xenia/base/math.h"
+        \\#endif
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("#include \"xenia/base/math.h\"\n", output);
+}
+
+test "do not collapse real mac include conditional" {
+    const src =
+        \\#if XE_PLATFORM_MACOS
+        \\#include "xenia/kernel/kernel_state_mac.h"
+        \\#else
+        \\#include "xenia/kernel/kernel_state.h"
+        \\#endif
+        \\
+    ;
     var result = try fixSource(std.testing.allocator, src);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
