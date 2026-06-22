@@ -170,7 +170,11 @@ fn isWideFunctionName(tok: Token, source: []const u8) bool {
         std.mem.eql(u8, slice, "ARRAY_SIZE") or
         std.mem.eql(u8, slice, "put_bits_count") or
         std.mem.eql(u8, slice, "alignof") or
-        std.mem.eql(u8, slice, "offsetof");
+        std.mem.eql(u8, slice, "offsetof") or
+        std.mem.eql(u8, slice, "strtol") or
+        std.mem.eql(u8, slice, "strtoll") or
+        std.mem.eql(u8, slice, "strtoul") or
+        std.mem.eql(u8, slice, "strtoull");
 }
 
 fn isWideExpressionStart(tok: Token, source: []const u8) bool {
@@ -271,6 +275,8 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
     const warning = false;
 
     try appendTrivialMacIncludeCollapses(allocator, source, &edits);
+    try appendLocalAngleIncludeQuotes(allocator, source, &edits);
+    try appendUnusedLocalAnnotations(allocator, source, &edits);
 
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
@@ -401,6 +407,70 @@ fn includePath(line: []const u8) ?[]const u8 {
     return rest[0..close];
 }
 
+fn editOverlaps(edits: []const Edit, start: usize, end: usize) bool {
+    for (edits) |edit| {
+        if (start < edit.end and edit.start < end) return true;
+    }
+    return false;
+}
+
+fn isVendoredAngleInclude(path: []const u8) bool {
+    const prefixes = [_][]const u8{
+        "llvm/",
+        "simde/",
+        "xbyak/",
+        "xsimd/",
+    };
+    for (prefixes) |candidate| {
+        if (std.mem.startsWith(u8, path, candidate)) return true;
+    }
+
+    const headers = [_][]const u8{
+        "bmi2neon.h",
+        "ppcfloat2neon.h",
+        "vex2neon.h",
+        "ymm2neon.h",
+    };
+    for (headers) |candidate| {
+        if (std.mem.eql(u8, path, candidate)) return true;
+    }
+    return false;
+}
+
+fn appendLocalAngleIncludeQuotes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        pos = line.next;
+        if (editOverlaps(edits.items, line.start, line.next)) continue;
+        const trimmed = trimLine(line.text);
+        if (!std.mem.startsWith(u8, trimmed, "#include")) continue;
+
+        const open_rel = std.mem.indexOfScalar(u8, line.text, '<') orelse continue;
+        const close_rel = std.mem.indexOfScalarPos(u8, line.text, open_rel + 1, '>') orelse continue;
+        const path = line.text[open_rel + 1 .. close_rel];
+        if (!isVendoredAngleInclude(path)) continue;
+
+        var replacement: std.ArrayList(u8) = .empty;
+        errdefer replacement.deinit(allocator);
+        try replacement.appendSlice(allocator, line.text[0..open_rel]);
+        try replacement.append(allocator, '"');
+        try replacement.appendSlice(allocator, path);
+        try replacement.append(allocator, '"');
+        try replacement.appendSlice(allocator, line.text[close_rel + 1 ..]);
+        if (line.next > line.end) try replacement.append(allocator, '\n');
+
+        try edits.append(allocator, .{
+            .start = line.start,
+            .end = line.next,
+            .replacement = try replacement.toOwnedSlice(allocator),
+        });
+    }
+}
+
 fn macIncludeNormalizesTo(mac_path: []const u8, normal_path: []const u8) bool {
     if (std.mem.eql(u8, mac_path, normal_path) and isTrivialMacCanonicalBasename(mac_path)) return true;
     if (!std.mem.endsWith(u8, mac_path, "_mac.h")) return false;
@@ -486,6 +556,106 @@ fn appendTrivialMacIncludeCollapses(
             .replacement = try std.fmt.allocPrint(allocator, "#include \"{s}\"\n", .{normal_path}),
         });
         pos = endif_line.next;
+    }
+}
+
+fn isIdentChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_';
+}
+
+fn identifierAppearsAfter(source: []const u8, start: usize, name: []const u8) bool {
+    var pos = start;
+    while (std.mem.indexOfPos(u8, source, pos, name)) |match| {
+        const before_ok = match == 0 or !isIdentChar(source[match - 1]);
+        const after_index = match + name.len;
+        const after_ok = after_index >= source.len or !isIdentChar(source[after_index]);
+        if (before_ok and after_ok) return true;
+        pos = match + name.len;
+    }
+    return false;
+}
+
+fn unusedLocalDeclarationName(line: []const u8) ?[]const u8 {
+    const trimmed = trimLine(line);
+    if (trimmed.len == 0 or trimmed[0] == '#') return null;
+    if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) return null;
+    if (std.mem.startsWith(u8, trimmed, "if ") or
+        std.mem.startsWith(u8, trimmed, "if(") or
+        std.mem.startsWith(u8, trimmed, "for ") or
+        std.mem.startsWith(u8, trimmed, "for(") or
+        std.mem.startsWith(u8, trimmed, "while ") or
+        std.mem.startsWith(u8, trimmed, "while(") or
+        std.mem.startsWith(u8, trimmed, "switch ") or
+        std.mem.startsWith(u8, trimmed, "switch(") or
+        std.mem.startsWith(u8, trimmed, "return ") or
+        std.mem.startsWith(u8, trimmed, "case ") or
+        std.mem.startsWith(u8, trimmed, "default:") or
+        std.mem.startsWith(u8, trimmed, "using ") or
+        std.mem.startsWith(u8, trimmed, "typedef ") or
+        std.mem.startsWith(u8, trimmed, "namespace ") or
+        std.mem.startsWith(u8, trimmed, "class ") or
+        std.mem.startsWith(u8, trimmed, "struct ") or
+        std.mem.startsWith(u8, trimmed, "}"))
+    {
+        return null;
+    }
+
+    const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return null;
+    const semi = std.mem.lastIndexOfScalar(u8, trimmed, ';') orelse return null;
+    if (semi < eq) return null;
+
+    const lhs = std.mem.trim(u8, trimmed[0..eq], " \t");
+    if (std.mem.indexOfScalar(u8, lhs, '.') != null or std.mem.indexOf(u8, lhs, "->") != null) return null;
+    if (std.mem.indexOfScalar(u8, lhs, '(') != null or std.mem.indexOfScalar(u8, lhs, ')') != null) return null;
+    if (lhs.len == 0) return null;
+
+    var end = lhs.len;
+    while (end > 0 and !isIdentChar(lhs[end - 1])) end -= 1;
+    if (end == 0) return null;
+    var start = end;
+    while (start > 0 and isIdentChar(lhs[start - 1])) start -= 1;
+    if (start == end) return null;
+
+    const prefix = std.mem.trim(u8, lhs[0..start], " \t*&");
+    if (prefix.len == 0) return null;
+    return lhs[start..end];
+}
+
+fn appearsInsideBlock(source: []const u8, offset: usize) bool {
+    var depth: isize = 0;
+    for (source[0..offset]) |ch| {
+        if (ch == '{') {
+            depth += 1;
+        } else if (ch == '}' and depth > 0) {
+            depth -= 1;
+        }
+    }
+    return depth > 0;
+}
+
+fn appendUnusedLocalAnnotations(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        pos = line.next;
+        if (editOverlaps(edits.items, line.start, line.next)) continue;
+        if (!appearsInsideBlock(source, line.start)) continue;
+        const name = unusedLocalDeclarationName(line.text) orelse continue;
+        if (identifierAppearsAfter(source, line.next, name)) continue;
+
+        var indent_len: usize = 0;
+        while (indent_len < line.text.len and (line.text[indent_len] == ' ' or line.text[indent_len] == '\t')) {
+            indent_len += 1;
+        }
+
+        try edits.append(allocator, .{
+            .start = line.start + indent_len,
+            .end = line.start + indent_len,
+            .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+        });
     }
 }
 
@@ -627,6 +797,52 @@ test "collapse duplicate canonical trivial mac include conditional" {
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("#include \"xenia/base/math.h\"\n", output);
+}
+
+test "quote vendored angle include" {
+    const src =
+        \\#include <llvm/ADT/BitVector.h>
+        \\#include <vector>
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings(
+        "#include \"llvm/ADT/BitVector.h\"\n#include <vector>\n",
+        output,
+    );
+}
+
+test "annotate unused single line local declaration" {
+    const src =
+        \\void f() {
+        \\  auto arena = builder->arena();
+        \\  use(builder);
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] auto arena") != null);
+}
+
+test "do not annotate used local declaration" {
+    const src =
+        \\void f() {
+        \\  uint32_t index_buffer_base = regs[0];
+        \\  use(index_buffer_base);
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]]") == null);
 }
 
 test "do not collapse real mac include conditional" {

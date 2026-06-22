@@ -2744,6 +2744,16 @@ const compiler_launcher_script =
     \\  [ -f "$header" ] || return 0
     \\  filtered+=("-include" "$header")
     \\}
+    \\__rosette_add_macos_warning_compat_flags() {
+    \\  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+    \\  [ "${ROSETTE_MACOS_WARNING_COMPAT_ENABLE:-auto}" != "0" ] || return 0
+    \\  filtered+=("-Wno-error=unused-variable")
+    \\  filtered+=("-Wno-error=unused-but-set-variable")
+    \\  filtered+=("-Wno-error=switch")
+    \\  filtered+=("-Wno-error=shorten-64-to-32")
+    \\  filtered+=("-Wno-error=implicit-int-conversion")
+    \\  filtered+=("-Wno-error=constant-conversion")
+    \\}
     \\
     \\if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ "${ROSETTE_MACOS_COMPAT_ENABLE:-auto}" != "0" ]; then
     \\  __rosette_add_macos_compat_header "$macos_shim_root/shims/macos/compiler_compat.h"
@@ -2794,6 +2804,7 @@ const compiler_launcher_script =
     \\      ;;
     \\  esac
     \\done
+    \\__rosette_add_macos_warning_compat_flags
     \\
     \\# rosette-c-fix pass: pre-apply narrowing casts to C/C++/ObjC source files
     \\rosette_fix_bin="${ROSETTE_C_FIX_BIN:-$HOME/.rosette/bin/rosette-c-fix}"
@@ -3942,6 +3953,7 @@ fn appendSanitizedCompilerArgs(
         }
         try argv.append(allocator, arg);
     }
+    try appendMacOSWarningCompatFlags(argv, allocator);
 }
 
 fn appendMacOSCompatIncludes(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8)) !void {
@@ -3971,6 +3983,25 @@ fn macOSCompatIncludeRoot(allocator: std.mem.Allocator) ![]const u8 {
     }
     const home = try homeDir(allocator);
     return try std.fs.path.join(allocator, &.{ home, ".rosette", "include" });
+}
+
+const macos_warning_compat_flags = [_][]const u8{
+    "-Wno-error=unused-variable",
+    "-Wno-error=unused-but-set-variable",
+    "-Wno-error=switch",
+    "-Wno-error=shorten-64-to-32",
+    "-Wno-error=implicit-int-conversion",
+    "-Wno-error=constant-conversion",
+};
+
+fn appendMacOSWarningCompatFlags(argv: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    if (builtin.target.os.tag != .macos) return;
+    if (getenvSlice("ROSETTE_MACOS_WARNING_COMPAT_ENABLE")) |value| {
+        if (isFalseEnvValue(value)) return;
+    }
+    for (macos_warning_compat_flags) |flag| {
+        try argv.append(allocator, flag);
+    }
 }
 
 fn isIncludeFlag(arg: []const u8) ?[]const u8 {
@@ -4946,6 +4977,10 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "compiler_compat.h"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "posix_compat.h"));
     try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "cpu_feature_probe.h"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "ROSETTE_MACOS_WARNING_COMPAT_ENABLE"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=unused-variable"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=switch"));
+    try std.testing.expect(containsIgnoreCase(compiler_launcher_script, "Wno-error=shorten-64-to-32"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid("));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "__cpuid_count"));
     try std.testing.expect(containsIgnoreCase(x86IntrinsicsCompatH, "-Wmacro-redefined"));
