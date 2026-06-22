@@ -256,6 +256,10 @@ fn isPointerSubtraction(tokens: []const Token, idx: usize) bool {
 }
 
 pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
+    return fixSourceWithMode(allocator, source, false);
+}
+
+pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_mode: bool) !FixResult {
     var tok = Tokenizer.init(source);
     var all_tokens: std.ArrayList(Token) = .empty;
     defer all_tokens.deinit(allocator);
@@ -283,6 +287,10 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
     try appendSwitchDefaultClauses(allocator, source, tokens, &edits);
     try appendMissingFieldInitializers(allocator, source, tokens, &edits);
     try appendStrictAliasingTypePuns(allocator, source, tokens, &edits);
+    try appendLogicalOpParentheses(allocator, source, tokens, &edits);
+    if (cpp_mode) {
+        try appendOldStyleCastConversion(allocator, source, tokens, &edits);
+    }
 
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
@@ -837,10 +845,6 @@ fn appendUnusedConstAnnotations(
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
         if (std.mem.indexOf(u8, trimmed, "const") == null) continue;
-        if (std.mem.startsWith(u8, trimmed, "static ") or
-            std.mem.indexOf(u8, trimmed, " static ") != null) continue;
-        if (std.mem.startsWith(u8, trimmed, "extern ") or
-            std.mem.indexOf(u8, trimmed, " extern ") != null) continue;
         if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) continue;
 
         const name = unusedLocalDeclarationName(line.text) orelse continue;
@@ -1213,6 +1217,257 @@ fn appendStrictAliasingTypePuns(
     }
 }
 
+fn appendLogicalOpParentheses(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    _ = source;
+
+    // Forward scan: && followed by ||  (handles a && b || c)
+    {
+        var i: usize = 0;
+        while (i < tokens.len) : (i += 1) {
+            if (tokens[i].kind != .amp_amp) continue;
+
+            var open_depth: u32 = 0;
+            var j = i;
+            while (j > 0) {
+                j -= 1;
+                switch (tokens[j].kind) {
+                    .lparen, .lbrace, .lbracket => {
+                        if (open_depth == 0) break;
+                        open_depth -= 1;
+                    },
+                    .rparen, .rbrace, .rbracket => open_depth += 1,
+                    .semicolon, .keyword_if, .keyword_while, .keyword_for, .keyword_switch, .comma, .eq, .colon, .keyword_return, .keyword_case, .pipe_pipe, .amp_amp => {
+                        if (open_depth == 0) break;
+                    },
+                    else => {},
+                }
+            }
+
+            var k = i + 1;
+            var close_depth: u32 = 0;
+            while (k < tokens.len) : (k += 1) {
+                switch (tokens[k].kind) {
+                    .lparen, .lbrace, .lbracket => close_depth += 1,
+                    .rparen, .rbrace, .rbracket => {
+                        if (close_depth == 0) break;
+                        close_depth -= 1;
+                    },
+                    .pipe_pipe => {
+                        if (close_depth == 0) {
+                            const left = tokens[j + 1].start;
+                            if (editOverlaps(edits.items, left, tokens[k].start)) break;
+                            try edits.append(allocator, .{ .start = left, .end = left, .replacement = try allocator.dupe(u8, "(") });
+                            try edits.append(allocator, .{ .start = tokens[k].start, .end = tokens[k].start, .replacement = try allocator.dupe(u8, ")") });
+                            break;
+                        }
+                    },
+                    .semicolon, .comma, .eq, .colon, .keyword_if, .keyword_while, .keyword_for => {
+                        if (close_depth == 0) break;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    // Forward scan: || followed by && at depth 0  (handles a || b && c)
+    {
+        var i: usize = 0;
+        while (i < tokens.len) : (i += 1) {
+            if (tokens[i].kind != .pipe_pipe) continue;
+            var depth: u32 = 0;
+            var k = i + 1;
+            while (k < tokens.len) : (k += 1) {
+                switch (tokens[k].kind) {
+                    .lparen, .lbrace, .lbracket => depth += 1,
+                    .rparen, .rbrace, .rbracket => {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    },
+                    .amp_amp => {
+                        if (depth == 0) {
+                            var left = k;
+                            var ld: u32 = 0;
+                            while (left > 0) {
+                                left -= 1;
+                                switch (tokens[left].kind) {
+                                    .lparen, .lbrace, .lbracket => {
+                                        if (ld == 0) {
+                                            left += 1;
+                                            break;
+                                        }
+                                        ld -= 1;
+                                    },
+                                    .rparen, .rbrace, .rbracket => ld += 1,
+                                    .semicolon, .comma, .eq, .colon, .keyword_if, .keyword_while, .keyword_for, .keyword_switch, .keyword_return, .keyword_case, .pipe_pipe, .amp_amp => {
+                                        if (ld == 0) {
+                                            left += 1;
+                                            break;
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                            var end = k + 1;
+                            var ed: u32 = 0;
+                            while (end < tokens.len) : (end += 1) {
+                                switch (tokens[end].kind) {
+                                    .lparen, .lbrace, .lbracket => ed += 1,
+                                    .rparen, .rbrace, .rbracket => {
+                                        if (ed == 0) break;
+                                        ed -= 1;
+                                    },
+                                    .semicolon, .comma, .eq, .colon, .pipe_pipe, .keyword_if, .keyword_while, .keyword_for => {
+                                        if (ed == 0) break;
+                                    },
+                                    else => {},
+                                }
+                            }
+                            if (end > k + 1) end -= 1;
+                            if (tokens[end].kind == .rparen or tokens[end].kind == .rbrace or tokens[end].kind == .rbracket) end -= 1;
+                            if (left <= i + 1) left = i + 1;
+                            if (end < left or end >= tokens.len) break;
+                            if (editOverlaps(edits.items, tokens[left].start, tokens[end - 1].end)) break;
+                            try edits.append(allocator, .{ .start = tokens[left].start, .end = tokens[left].start, .replacement = try allocator.dupe(u8, "(") });
+                            try edits.append(allocator, .{ .start = tokens[end].end, .end = tokens[end].end, .replacement = try allocator.dupe(u8, ")") });
+                            break;
+                        }
+                    },
+                    .semicolon, .comma, .eq, .colon, .keyword_if, .keyword_while, .keyword_for => {
+                        if (depth == 0) break;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+}
+
+fn appendOldStyleCastConversion(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .lparen) continue;
+        if (i == 0) continue;
+
+        const prev_kind = tokens[i - 1].kind;
+        if (prev_kind == .identifier or
+            prev_kind == .keyword_sizeof or
+            prev_kind == .keyword_if or
+            prev_kind == .keyword_while or
+            prev_kind == .keyword_switch or
+            prev_kind == .keyword_for or
+            prev_kind == .keyword_return)
+        {
+            continue;
+        }
+
+        const close = findMatchingClose(tokens, i);
+        if (close >= tokens.len or close <= i + 1) continue;
+
+        if (close + 1 >= tokens.len) continue;
+        const after_kind = tokens[close + 1].kind;
+        if (after_kind == .lbrace or after_kind == .lparen) continue;
+
+        const inner_start = i + 1;
+        const inner_end = close;
+
+        var has_type_kw = false;
+        var has_ptr = false;
+        var has_ref = false;
+        var all_valid = true;
+        {
+            var t = inner_start;
+            while (t < inner_end) : (t += 1) {
+                const k = tokens[t].kind;
+                if (isCompoundType(k) or isTypeQualifier(k) or k == .keyword_signed or k == .keyword_unsigned) {
+                    has_type_kw = true;
+                } else if (k == .star) {
+                    has_ptr = true;
+                } else if (k == .amp) {
+                    has_ref = true;
+                } else if (k == .identifier) {
+                    const slice = source[tokens[t].start..tokens[t].end];
+                    if (isNarrowTypedefName(slice) or
+                        std.mem.endsWith(u8, slice, "_t") or
+                        std.mem.eql(u8, slice, "size_t") or
+                        std.mem.eql(u8, slice, "intptr_t") or
+                        std.mem.eql(u8, slice, "uintptr_t") or
+                        std.mem.eql(u8, slice, "ptrdiff_t") or
+                        std.mem.eql(u8, slice, "wchar_t") or
+                        (slice.len > 0 and slice[0] >= 'A' and slice[0] <= 'Z'))
+                    {
+                        has_type_kw = true;
+                    } else {
+                        all_valid = false;
+                    }
+                } else if (k == .keyword_struct or k == .keyword_union or k == .keyword_enum) {
+                    has_type_kw = true;
+                } else {
+                    all_valid = false;
+                }
+            }
+        }
+
+        if (!all_valid or !has_type_kw) continue;
+
+        if (editOverlaps(edits.items, tokens[i].start, tokens[close].end)) continue;
+
+        const type_text = source[tokens[inner_start].start..tokens[inner_end - 1].end];
+
+        if (editOverlaps(edits.items, tokens[i].start, tokens[close + 1].start)) continue;
+
+        const cast_kind = if (has_ptr or has_ref) "reinterpret_cast" else "static_cast";
+        const replacement = try std.fmt.allocPrint(allocator, "{s}<{s}>(", .{ cast_kind, type_text });
+
+        try edits.append(allocator, .{
+            .start = tokens[i].start,
+            .end = tokens[close].end,
+            .replacement = replacement,
+        });
+
+        const expr_start = close + 1;
+        var expr_end = expr_start;
+        var expr_depth: u32 = 0;
+        while (expr_end < tokens.len) : (expr_end += 1) {
+            const k = tokens[expr_end].kind;
+            if (expr_depth == 0) {
+                if (k == .semicolon or k == .comma or k == .rparen or k == .rbrace or
+                    k == .rbracket or k == .eq or k == .colon or k == .question or
+                    k == .amp_amp or k == .pipe_pipe or k == .plus_eq or k == .minus_eq)
+                {
+                    break;
+                }
+            }
+            switch (k) {
+                .lparen, .lbrace, .lbracket => expr_depth += 1,
+                .rparen, .rbrace, .rbracket => {
+                    if (expr_depth == 0) break;
+                    expr_depth -= 1;
+                },
+                else => {},
+            }
+        }
+
+        if (!editOverlaps(edits.items, tokens[expr_end - 1].end, tokens[expr_end - 1].end)) {
+            try edits.append(allocator, .{
+                .start = tokens[expr_end - 1].end,
+                .end = tokens[expr_end - 1].end,
+                .replacement = try allocator.dupe(u8, ")"),
+            });
+        }
+    }
+}
+
 pub fn applyEdits(allocator: std.mem.Allocator, source: []const u8, edits: []const Edit) ![]u8 {
     if (edits.len == 0) return try allocator.dupe(u8, source);
 
@@ -1568,7 +1823,7 @@ test "used file-scope const gets no annotation" {
     try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }
 
-test "static const at file scope skipped" {
+test "static const at file scope gets maybe_unused" {
     const src =
         \\static const int BAZ = 42;
         \\void f(void) {}
@@ -1576,7 +1831,9 @@ test "static const at file scope skipped" {
     ;
     var result = try fixSource(std.testing.allocator, src);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] static const int BAZ") != null);
 }
 
 test "extern const at file scope skipped" {
@@ -1662,4 +1919,81 @@ test "strict-aliasing no match without cast" {
     var result = try fixSource(std.testing.allocator, src);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "logical-op-parentheses wraps && before ||" {
+    const src = "if (a && b || c) { }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(result.edits.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, output, "&& b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "|| c") != null);
+}
+
+test "logical-op-parentheses wraps && after ||" {
+    const src = "if (a || b && c) { }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(result.edits.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, output, "&& c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "a || ") != null);
+}
+
+test "logical-op-parentheses no wrap on single operator" {
+    const src = "if (a && b) { }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "logical-op-parentheses no wrap when already parenthesised" {
+    const src = "if ((a && b) || c) { }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "old-style-cast int to float in cpp mode" {
+    const src = "double x = (double)42;";
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "static_cast<double>") != null);
+}
+
+test "old-style-cast pointer cast in cpp mode" {
+    const src = "void *p = (uint32_t *)ptr;";
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "reinterpret_cast<uint32_t *>") != null);
+}
+
+test "old-style-cast does not run in C mode" {
+    const src = "double x = (double)42;";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "old-style-cast does not touch function call parens" {
+    const src = "void f(void) { }";
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "old-style-cast struct keyword cast" {
+    const src = "struct Foo *p = (struct Foo *)ptr;";
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "reinterpret_cast<struct Foo *>") != null);
 }

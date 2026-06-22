@@ -44,13 +44,6 @@
 #pragma clang diagnostic ignored "-Wunused-const-variable"
 
 /* ------------------------------------------------------------------ */
-/*  -Wold-style-cast                                                  */
-/*  C++ projects with C heritage often use `(Type*)expr` casts.       */
-/*  Apple Clang may promote this to an error under project -Werror.   */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wold-style-cast"
-
-/* ------------------------------------------------------------------ */
 /*  -Wundefined-reinterpret-cast                                       */
 /*  Emulators, codecs, and graphics code often type-pun scalar bits   */
 /*  via pointer casts in hot paths.  Apple Clang may flag these under  */
@@ -73,13 +66,6 @@
 /*  is valid C/C++.  Common in C libraries ported to C++.             */
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wmissing-braces"
-
-/* ------------------------------------------------------------------ */
-/*  -Wlogical-op-parentheses                                          */
-/*  Clang warns on `a && b || c` without parentheses to clarify       */
-/*  intent.  Common in FFmpeg, libavformat, and similar media libs.   */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wlogical-op-parentheses"
 
 /* ------------------------------------------------------------------ */
 /*  asm → __asm__                                                     */

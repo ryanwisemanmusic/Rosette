@@ -2750,7 +2750,6 @@ const compiler_launcher_script =
     \\  filtered+=("-Wno-error=unused-variable")
     \\  filtered+=("-Wno-error=implicit-int-conversion")
     \\  filtered+=("-Wno-error=constant-conversion")
-    \\  filtered+=("-Wno-error=old-style-cast")
     \\  filtered+=("-Wno-error=undefined-reinterpret-cast")
     \\}
     \\
@@ -2810,7 +2809,10 @@ const compiler_launcher_script =
     \\if [ "${ROSETTE_C_FIX_ENABLE:-auto}" != "0" ] && [ -x "$rosette_fix_bin" ]; then
     \\  for src_file in "${filtered[@]}"; do
     \\    case "$src_file" in
-    \\      *.c|*.cc|*.cpp|*.cxx|*.m|*.mm)
+    \\      *.cc|*.cpp|*.cxx|*.mm)
+    \\        "$rosette_fix_bin" --cpp --in-place "$src_file" 2>/dev/null || true
+    \\        ;;
+    \\      *.c|*.m)
     \\        "$rosette_fix_bin" --in-place "$src_file" 2>/dev/null || true
     \\        ;;
     \\    esac
@@ -3988,7 +3990,6 @@ const macos_warning_compat_flags = [_][]const u8{
     "-Wno-error=unused-variable",
     "-Wno-error=implicit-int-conversion",
     "-Wno-error=constant-conversion",
-    "-Wno-error=old-style-cast",
     "-Wno-error=undefined-reinterpret-cast",
 };
 
