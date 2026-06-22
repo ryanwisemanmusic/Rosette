@@ -282,6 +282,7 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
     try appendParenthesesEquality(allocator, source, tokens, &edits);
     try appendSwitchDefaultClauses(allocator, source, tokens, &edits);
     try appendMissingFieldInitializers(allocator, source, tokens, &edits);
+    try appendStrictAliasingTypePuns(allocator, source, tokens, &edits);
 
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
@@ -1159,6 +1160,59 @@ fn appendMissingFieldInitializers(
     }
 }
 
+fn appendStrictAliasingTypePuns(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .star) continue;
+        if (i + 1 >= tokens.len or tokens[i + 1].kind != .lparen) continue;
+
+        const cast_start = i + 1;
+        const cast_end = findMatchingClose(tokens, cast_start);
+        if (cast_end >= tokens.len or cast_end <= cast_start + 2) continue;
+        if (tokens[cast_end - 1].kind != .star) continue;
+
+        if (cast_end + 1 >= tokens.len or tokens[cast_end + 1].kind != .amp) continue;
+        if (cast_end + 2 >= tokens.len or tokens[cast_end + 2].kind != .identifier) continue;
+
+        const type_name = source[tokens[cast_start + 1].start..tokens[cast_end - 2].end];
+        const var_name = source[tokens[cast_end + 2].start..tokens[cast_end + 2].end];
+        const deref_start = tokens[i].start;
+
+        if (cast_end + 3 < tokens.len and tokens[cast_end + 3].kind == .eq) {
+            const write_expr_start = cast_end + 4;
+            const semi = skipToSemicolon(tokens, write_expr_start);
+            if (semi < tokens.len) {
+                const write_expr = source[tokens[write_expr_start].start..tokens[semi].start];
+                try edits.append(allocator, .{
+                    .start = deref_start,
+                    .end = tokens[semi].end,
+                    .replacement = try std.fmt.allocPrint(
+                        allocator,
+                        "{{ {s} _v = {s}; memcpy(&({s}), &_v, sizeof _v); }}",
+                        .{ type_name, write_expr, var_name },
+                    ),
+                });
+            }
+        } else {
+            const read_replacement = try std.fmt.allocPrint(
+                allocator,
+                "({{ {s} _r__; memcpy(&_r__, &({s}), sizeof _r__); _r__; }})",
+                .{ type_name, var_name },
+            );
+            try edits.append(allocator, .{
+                .start = deref_start,
+                .end = tokens[cast_end + 2].end,
+                .replacement = read_replacement,
+            });
+        }
+    }
+}
+
 pub fn applyEdits(allocator: std.mem.Allocator, source: []const u8, edits: []const Edit) ![]u8 {
     if (edits.len == 0) return try allocator.dupe(u8, source);
 
@@ -1581,4 +1635,31 @@ test "typedef struct partial initializer gets padded" {
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, ", 0") != null);
+}
+
+test "strict-aliasing read pun via memcpy" {
+    const src = "uint32_t x = *(uint32_t *)&f;";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.edits.items.len > 0);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "memcpy") != null);
+}
+
+test "strict-aliasing write pun via memcpy" {
+    const src = "*(uint32_t *)&f = 0x3f800000;";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.edits.items.len > 0);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "memcpy") != null);
+}
+
+test "strict-aliasing no match without cast" {
+    const src = "int x = *p;";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }
