@@ -70,13 +70,11 @@
 #pragma clang diagnostic ignored "-Wswitch-enum"
 
 /* ------------------------------------------------------------------ */
-/*  -Wlogical-op-parentheses / -Wparentheses-equality                 */
+/*  -Wlogical-op-parentheses                                          */
 /*  Clang warns on `a && b || c` without parentheses to clarify       */
-/*  intent, and on `if (a = b)` without extra parentheses.            */
-/*  Common in FFmpeg, libavformat, and similar media libs.            */
+/*  intent.  Common in FFmpeg, libavformat, and similar media libs.   */
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wlogical-op-parentheses"
-#pragma clang diagnostic ignored "-Wparentheses-equality"
 
 /* ------------------------------------------------------------------ */
 /*  -Wpointer-sign                                                    */

@@ -2748,7 +2748,6 @@ const compiler_launcher_script =
     \\  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
     \\  [ "${ROSETTE_MACOS_WARNING_COMPAT_ENABLE:-auto}" != "0" ] || return 0
     \\  filtered+=("-Wno-error=unused-variable")
-    \\  filtered+=("-Wno-error=unused-but-set-variable")
     \\  filtered+=("-Wno-error=switch")
     \\  filtered+=("-Wno-error=implicit-int-conversion")
     \\  filtered+=("-Wno-error=constant-conversion")
@@ -3986,7 +3985,6 @@ fn macOSCompatIncludeRoot(allocator: std.mem.Allocator) ![]const u8 {
 
 const macos_warning_compat_flags = [_][]const u8{
     "-Wno-error=unused-variable",
-    "-Wno-error=unused-but-set-variable",
     "-Wno-error=switch",
     "-Wno-error=implicit-int-conversion",
     "-Wno-error=constant-conversion",
