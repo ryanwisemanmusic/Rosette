@@ -18,15 +18,6 @@
 #if defined(__APPLE__) && defined(__clang__)
 
 /* ------------------------------------------------------------------ */
-/*  -Wshorten-64-to-32                                                */
-/*  Triggered whenever a 64-bit value (unsigned long, size_t, …) is   */
-/*  implicitly narrowed to 32 bits on LP64 (macOS arm64, x86_64).     */
-/*  Libraries that target ILP32 (Win32) or were written before 64-bit */
-/*  was widespread hit this in hundreds of places.                    */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-
-/* ------------------------------------------------------------------ */
 /*  -Wconversion  (subsets not suppressed by -Wshorten-64-to-32)      */
 /*  Covers sign conversion, implicit integer promotion changes, and   */
 /*  other implicit narrowing that -Wshorten-64-to-32 leaves alone.    */
