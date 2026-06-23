@@ -247,6 +247,27 @@ fn findMatchingClose(tokens: []const Token, start: usize) usize {
     return tokens.len;
 }
 
+fn findMatchingCloseGt(tokens: []const Token, start: usize) usize {
+    var depth: u32 = 1;
+    var i = start + 1;
+    while (i < tokens.len) : (i += 1) {
+        switch (tokens[i].kind) {
+            .lt => depth += 1,
+            .gt => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            .lparen, .lbrace, .lbracket => {
+                const close = findMatchingClose(tokens, i);
+                if (close >= tokens.len) return tokens.len;
+                i = close;
+            },
+            else => {},
+        }
+    }
+    return tokens.len;
+}
+
 fn isPointerSubtraction(tokens: []const Token, idx: usize) bool {
     if (idx + 2 >= tokens.len) return false;
     if (tokens[idx].kind != .identifier and tokens[idx].kind != .int_literal) return false;
@@ -280,16 +301,21 @@ pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_m
 
     try appendTrivialMacIncludeCollapses(allocator, source, &edits);
     try appendLocalAngleIncludeQuotes(allocator, source, &edits);
+    try appendVoidSuppressorElisions(allocator, source, &edits);
     try appendUnusedLocalAnnotations(allocator, source, &edits);
+    try appendUnusedVarDeclarations(allocator, source, tokens, &edits);
+    try appendUnusedSetLocalAnnotations(allocator, source, &edits);
     try appendUnusedConstAnnotations(allocator, source, &edits);
-    try appendUnusedSetLocalSuppressions(allocator, source, &edits);
     try appendParenthesesEquality(allocator, source, tokens, &edits);
     try appendSwitchDefaultClauses(allocator, source, tokens, &edits);
     try appendMissingFieldInitializers(allocator, source, tokens, &edits);
     try appendStrictAliasingTypePuns(allocator, source, tokens, &edits);
+    try appendMissingBraces(allocator, source, tokens, &edits);
+    try appendDeprecatedDeclReplacement(allocator, source, tokens, &edits);
     try appendLogicalOpParentheses(allocator, source, tokens, &edits);
     if (cpp_mode) {
         try appendOldStyleCastConversion(allocator, source, tokens, &edits);
+        try appendUndefinedReinterpretCast(allocator, source, tokens, &edits);
     }
 
     var i: usize = 0;
@@ -448,6 +474,295 @@ fn includePath(line: []const u8) ?[]const u8 {
     return rest[0..close];
 }
 
+fn skipInitializerToDelim(tokens: []const Token, start: usize) usize {
+    var depth: u32 = 0;
+    var i = start;
+    while (i < tokens.len) : (i += 1) {
+        switch (tokens[i].kind) {
+            .lparen, .lbrace, .lbracket => depth += 1,
+            .rparen, .rbrace, .rbracket => {
+                if (depth == 0) return i;
+                depth -= 1;
+            },
+            .comma, .semicolon => {
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return tokens.len;
+}
+
+fn hasMaybeUnusedPrefix(tokens: []const Token, type_start: usize, source: []const u8) bool {
+    if (type_start < 5) return false;
+    if (tokens[type_start - 5].kind != .lbracket) return false;
+    if (tokens[type_start - 4].kind != .lbracket) return false;
+    if (tokens[type_start - 3].kind != .identifier) return false;
+    if (!std.mem.eql(u8, source[tokens[type_start - 3].start..tokens[type_start - 3].end], "maybe_unused")) return false;
+    if (tokens[type_start - 2].kind != .rbracket) return false;
+    if (tokens[type_start - 1].kind != .rbracket) return false;
+    return true;
+}
+
+fn appendUnusedVarDeclarations(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (!isCompoundType(tokens[i].kind) and !isIdentifierToken(tokens[i].kind)) continue;
+
+        if (isIdentifierToken(tokens[i].kind)) {
+            const slice = source[tokens[i].start..tokens[i].end];
+            if (!std.mem.endsWith(u8, slice, "_t") and
+                !isNarrowTypedefName(slice) and
+                slice.len > 0 and (slice[0] < 'A' or slice[0] > 'Z'))
+            {
+                continue;
+            }
+        }
+
+        if (hasMaybeUnusedPrefix(tokens, i, source)) continue;
+
+        var type_end = i + 1;
+        while (type_end < tokens.len and
+            (isCompoundType(tokens[type_end].kind) or
+                isTypeQualifier(tokens[type_end].kind) or
+                tokens[type_end].kind == .star))
+        {
+            type_end += 1;
+        }
+
+        if (type_end >= tokens.len) continue;
+        if (!isIdentifierToken(tokens[type_end].kind)) continue;
+
+        if (type_end + 1 >= tokens.len) continue;
+        if (tokens[type_end + 1].kind == .lparen) continue;
+
+        if (!appearsInsideBlock(source, tokens[i].start)) continue;
+
+        var var_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (var_names.items) |name| {
+                allocator.free(name);
+            }
+            var_names.deinit(allocator);
+        }
+
+        var scan = type_end;
+        var decl_end: usize = tokens[type_end].end;
+        var has_initializer = false;
+
+        while (scan < tokens.len) {
+            switch (tokens[scan].kind) {
+                .identifier => {
+                    const name_dupe = try allocator.dupe(u8, source[tokens[scan].start..tokens[scan].end]);
+                    try var_names.append(allocator, name_dupe);
+                    scan += 1;
+                },
+                .eq => {
+                    has_initializer = true;
+                    scan = skipInitializerToDelim(tokens, scan + 1);
+                    if (scan >= tokens.len) break;
+                    if (tokens[scan].kind == .semicolon) {
+                        decl_end = tokens[scan].end;
+                        break;
+                    }
+                    scan += 1;
+                },
+                .comma => {
+                    scan += 1;
+                },
+                .semicolon => {
+                    decl_end = tokens[scan].end;
+                    break;
+                },
+                else => break,
+            }
+        }
+
+        // Skip declarations without initializers (like struct fields)
+        if (!has_initializer) continue;
+
+        if (var_names.items.len == 0) continue;
+        if (editOverlaps(edits.items, tokens[i].start, decl_end)) continue;
+
+        var any_unused = false;
+        for (var_names.items) |nv| {
+            if (!identifierAppearsAfter(source, decl_end, nv)) {
+                any_unused = true;
+                break;
+            }
+        }
+
+        if (any_unused) {
+            try edits.append(allocator, .{
+                .start = tokens[i].start,
+                .end = tokens[i].start,
+                .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+            });
+        }
+    }
+}
+
+fn primitiveSize(name: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, name, " \t");
+    if (std.mem.eql(u8, trimmed, "char") or
+        std.mem.eql(u8, trimmed, "signed char") or
+        std.mem.eql(u8, trimmed, "unsigned char") or
+        std.mem.eql(u8, trimmed, "uint8_t") or
+        std.mem.eql(u8, trimmed, "int8_t") or
+        std.mem.eql(u8, trimmed, "BYTE"))
+    {
+        return 1;
+    }
+    if (std.mem.eql(u8, trimmed, "short") or
+        std.mem.eql(u8, trimmed, "short int") or
+        std.mem.eql(u8, trimmed, "unsigned short") or
+        std.mem.eql(u8, trimmed, "uint16_t") or
+        std.mem.eql(u8, trimmed, "int16_t") or
+        std.mem.eql(u8, trimmed, "WORD"))
+    {
+        return 2;
+    }
+    if (std.mem.eql(u8, trimmed, "int") or
+        std.mem.eql(u8, trimmed, "unsigned int") or
+        std.mem.eql(u8, trimmed, "unsigned") or
+        std.mem.eql(u8, trimmed, "float") or
+        std.mem.eql(u8, trimmed, "int32_t") or
+        std.mem.eql(u8, trimmed, "uint32_t") or
+        std.mem.eql(u8, trimmed, "INT") or
+        std.mem.eql(u8, trimmed, "UINT") or
+        std.mem.eql(u8, trimmed, "DWORD") or
+        std.mem.eql(u8, trimmed, "BOOL"))
+    {
+        return 4;
+    }
+    if (std.mem.eql(u8, trimmed, "double") or
+        std.mem.eql(u8, trimmed, "long") or
+        std.mem.eql(u8, trimmed, "long int") or
+        std.mem.eql(u8, trimmed, "unsigned long") or
+        std.mem.eql(u8, trimmed, "long long") or
+        std.mem.eql(u8, trimmed, "unsigned long long") or
+        std.mem.eql(u8, trimmed, "int64_t") or
+        std.mem.eql(u8, trimmed, "uint64_t") or
+        std.mem.eql(u8, trimmed, "size_t") or
+        std.mem.eql(u8, trimmed, "intptr_t") or
+        std.mem.eql(u8, trimmed, "uintptr_t") or
+        std.mem.eql(u8, trimmed, "LONG") or
+        std.mem.eql(u8, trimmed, "INT64"))
+    {
+        return 8;
+    }
+    return null;
+}
+
+fn findDeclaredSize(tokens: []const Token, var_token: usize, source: []const u8) ?usize {
+    const name = source[tokens[var_token].start..tokens[var_token].end];
+    var scan = var_token;
+    while (scan > 0) {
+        scan -= 1;
+        if (tokens[scan].kind == .semicolon or tokens[scan].kind == .lbrace) {
+            var fwd = scan + 1;
+            while (fwd < var_token) {
+                if (tokens[fwd].kind == .semicolon) break;
+                if (!isCompoundType(tokens[fwd].kind) and !isIdentifierToken(tokens[fwd].kind)) {
+                    fwd += 1;
+                    continue;
+                }
+                if (isIdentifierToken(tokens[fwd].kind)) {
+                    const slice = source[tokens[fwd].start..tokens[fwd].end];
+                    if (std.mem.endsWith(u8, slice, "_t") or isNarrowTypedefName(slice)) {} else if (fwd > 0 and fwd - 1 > scan and tokens[fwd - 1].kind == .star) {} else {
+                        fwd += 1;
+                        continue;
+                    }
+                }
+                var te = fwd + 1;
+                while (te < tokens.len and
+                    (isCompoundType(tokens[te].kind) or
+                        isTypeQualifier(tokens[te].kind) or
+                        tokens[te].kind == .star))
+                {
+                    te += 1;
+                }
+                if (te >= var_token) break;
+                if (!isIdentifierToken(tokens[te].kind)) {
+                    fwd += 1;
+                    continue;
+                }
+                const decl_name = source[tokens[te].start..tokens[te].end];
+                if (std.mem.eql(u8, decl_name, name)) {
+                    return primitiveSize(source[tokens[fwd].start..tokens[te - 1].end]);
+                }
+                fwd = te + 1;
+            }
+        }
+    }
+    return null;
+}
+
+fn appendUndefinedReinterpretCast(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .identifier) continue;
+        const name = source[tokens[i].start..tokens[i].end];
+        if (!std.mem.eql(u8, name, "reinterpret_cast")) continue;
+
+        if (i + 1 >= tokens.len or tokens[i + 1].kind != .lt) continue;
+
+        const gt_pos = findMatchingCloseGt(tokens, i + 1);
+        if (gt_pos >= tokens.len) continue;
+
+        if (gt_pos + 1 >= tokens.len or tokens[gt_pos + 1].kind != .lparen) continue;
+        const expr_end = findMatchingClose(tokens, gt_pos + 1);
+        if (expr_end >= tokens.len) continue;
+
+        if (editOverlaps(edits.items, tokens[i].start, tokens[expr_end].end)) continue;
+
+        const type_start = i + 2;
+        const type_end = gt_pos;
+        if (type_start >= type_end) continue;
+
+        var has_ref = false;
+        var last_type = type_end - 1;
+        if (tokens[last_type].kind == .amp) {
+            has_ref = true;
+            if (last_type == type_start) continue;
+            last_type -= 1;
+        }
+
+        if (!has_ref) continue;
+
+        const dest_type_src = source[tokens[type_start].start..tokens[last_type].end];
+        const dest_size = primitiveSize(dest_type_src) orelse continue;
+
+        const expr_start = gt_pos + 2;
+        if (expr_start >= expr_end) continue;
+
+        if (expr_end - expr_start != 1) continue;
+        if (tokens[expr_start].kind != .identifier) continue;
+
+        const src_name = source[tokens[expr_start].start..tokens[expr_start].end];
+        const src_size = findDeclaredSize(tokens, expr_start, source) orelse continue;
+
+        if (dest_size == src_size) continue;
+
+        const replacement = try std.fmt.allocPrint(allocator, "({s} __r; memcpy(&__r, &{s}, sizeof(__r)), __r)", .{ dest_type_src, src_name });
+        try edits.append(allocator, .{
+            .start = tokens[i].start,
+            .end = tokens[expr_end].end,
+            .replacement = replacement,
+        });
+    }
+}
+
 fn editOverlaps(edits: []const Edit, start: usize, end: usize) bool {
     for (edits) |edit| {
         if (start < edit.end and edit.start < end) return true;
@@ -604,14 +919,116 @@ fn isIdentChar(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '_';
 }
 
-fn identifierAppearsAfter(source: []const u8, start: usize, name: []const u8) bool {
-    var pos = start;
-    while (std.mem.indexOfPos(u8, source, pos, name)) |match| {
-        const before_ok = match == 0 or !isIdentChar(source[match - 1]);
+const MacBranchState = enum {
+    known_true,
+    known_false,
+    unknown,
+};
+
+fn macBranchActive(stack: []const MacBranchState) bool {
+    for (stack) |state| {
+        if (state == .known_false) return false;
+    }
+    return true;
+}
+
+fn macIfExpressionState(expr: []const u8) MacBranchState {
+    const trimmed = std.mem.trim(u8, expr, " \t()");
+    if (std.mem.indexOf(u8, trimmed, "__APPLE__") == null and
+        std.mem.indexOf(u8, trimmed, "XE_PLATFORM_MACOS") == null)
+    {
+        return .unknown;
+    }
+
+    if (std.mem.indexOf(u8, trimmed, "!defined(__APPLE__)") != null or
+        std.mem.indexOf(u8, trimmed, "! defined(__APPLE__)") != null or
+        std.mem.indexOf(u8, trimmed, "!__APPLE__") != null or
+        std.mem.indexOf(u8, trimmed, "!XE_PLATFORM_MACOS") != null or
+        std.mem.indexOf(u8, trimmed, "XE_PLATFORM_MACOS == 0") != null or
+        std.mem.indexOf(u8, trimmed, "XE_PLATFORM_MACOS != 1") != null)
+    {
+        return .known_false;
+    }
+
+    return .known_true;
+}
+
+fn macDirectiveState(trimmed: []const u8) ?MacBranchState {
+    if (std.mem.startsWith(u8, trimmed, "#ifdef")) {
+        const symbol = std.mem.trim(u8, trimmed["#ifdef".len..], " \t");
+        if (std.mem.eql(u8, symbol, "__APPLE__") or
+            std.mem.eql(u8, symbol, "XE_PLATFORM_MACOS"))
+        {
+            return .known_true;
+        }
+        return .unknown;
+    }
+    if (std.mem.startsWith(u8, trimmed, "#ifndef")) {
+        const symbol = std.mem.trim(u8, trimmed["#ifndef".len..], " \t");
+        if (std.mem.eql(u8, symbol, "__APPLE__") or
+            std.mem.eql(u8, symbol, "XE_PLATFORM_MACOS"))
+        {
+            return .known_false;
+        }
+        return .unknown;
+    }
+    if (std.mem.startsWith(u8, trimmed, "#if")) {
+        return macIfExpressionState(trimmed["#if".len..]);
+    }
+    return null;
+}
+
+fn toggledMacBranchState(state: MacBranchState) MacBranchState {
+    return switch (state) {
+        .known_true => .known_false,
+        .known_false => .known_true,
+        .unknown => .unknown,
+    };
+}
+
+fn identifierAppearsInSlice(slice: []const u8, name: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, slice, pos, name)) |match| {
+        const before_ok = match == 0 or !isIdentChar(slice[match - 1]);
         const after_index = match + name.len;
-        const after_ok = after_index >= source.len or !isIdentChar(source[after_index]);
+        const after_ok = after_index >= slice.len or !isIdentChar(slice[after_index]);
         if (before_ok and after_ok) return true;
         pos = match + name.len;
+    }
+    return false;
+}
+
+fn identifierAppearsAfter(source: []const u8, start: usize, name: []const u8) bool {
+    var stack: [64]MacBranchState = undefined;
+    var depth: usize = 0;
+
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        pos = line.next;
+
+        const trimmed = trimLine(line.text);
+        if (macDirectiveState(trimmed)) |state| {
+            if (depth < stack.len) {
+                stack[depth] = state;
+                depth += 1;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "#else")) {
+            if (depth > 0) {
+                stack[depth - 1] = toggledMacBranchState(stack[depth - 1]);
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "#endif")) {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+
+        if (line.end <= start or !macBranchActive(stack[0..depth])) continue;
+        const line_search_start = if (start > line.start) start - line.start else 0;
+        if (line_search_start >= line.text.len) continue;
+        if (identifierAppearsInSlice(line.text[line_search_start..], name)) return true;
     }
     return false;
 }
@@ -662,6 +1079,206 @@ fn unusedLocalDeclarationName(line: []const u8) ?[]const u8 {
     return lhs[start..end];
 }
 
+fn isVoidSuppressorGuard(trimmed: []const u8) bool {
+    if (!std.mem.startsWith(u8, trimmed, "#if") and
+        !std.mem.startsWith(u8, trimmed, "#ifdef"))
+    {
+        return false;
+    }
+    return std.mem.indexOf(u8, trimmed, "__APPLE__") != null or
+        std.mem.indexOf(u8, trimmed, "XE_PLATFORM_MACOS") != null;
+}
+
+fn voidSuppressorName(line: []const u8) ?[]const u8 {
+    const trimmed = trimLine(line);
+    if (!std.mem.startsWith(u8, trimmed, "(void)")) return null;
+
+    var rest = std.mem.trim(u8, trimmed["(void)".len..], " \t");
+    if (rest.len < 2 or rest[rest.len - 1] != ';') return null;
+    rest = std.mem.trim(u8, rest[0 .. rest.len - 1], " \t");
+    if (rest.len == 0 or (rest[0] >= '0' and rest[0] <= '9')) return null;
+
+    for (rest) |ch| {
+        if (!isIdentChar(ch)) return null;
+    }
+    return rest;
+}
+
+fn isDeclarationPrefixReject(trimmed: []const u8) bool {
+    if (trimmed.len == 0 or trimmed[0] == '#') return true;
+    if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) return true;
+    return std.mem.startsWith(u8, trimmed, "if ") or
+        std.mem.startsWith(u8, trimmed, "if(") or
+        std.mem.startsWith(u8, trimmed, "for ") or
+        std.mem.startsWith(u8, trimmed, "for(") or
+        std.mem.startsWith(u8, trimmed, "while ") or
+        std.mem.startsWith(u8, trimmed, "while(") or
+        std.mem.startsWith(u8, trimmed, "switch ") or
+        std.mem.startsWith(u8, trimmed, "switch(") or
+        std.mem.startsWith(u8, trimmed, "return ") or
+        std.mem.startsWith(u8, trimmed, "case ") or
+        std.mem.startsWith(u8, trimmed, "default:") or
+        std.mem.startsWith(u8, trimmed, "using ") or
+        std.mem.startsWith(u8, trimmed, "typedef ") or
+        std.mem.startsWith(u8, trimmed, "namespace ") or
+        std.mem.startsWith(u8, trimmed, "class ") or
+        std.mem.startsWith(u8, trimmed, "struct ") or
+        std.mem.startsWith(u8, trimmed, "enum ") or
+        std.mem.startsWith(u8, trimmed, "template") or
+        std.mem.startsWith(u8, trimmed, "static_assert") or
+        std.mem.startsWith(u8, trimmed, "}") or
+        std.mem.indexOf(u8, trimmed, "[[maybe_unused]]") != null;
+}
+
+fn localDeclarationInsertOffset(line: []const u8, name: []const u8) ?usize {
+    const trimmed = trimLine(line);
+    if (isDeclarationPrefixReject(trimmed)) return null;
+    if (!std.mem.endsWith(u8, trimmed, ";")) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, '(') != null or
+        std.mem.indexOfScalar(u8, trimmed, ')') != null or
+        std.mem.indexOfScalar(u8, trimmed, '[') != null or
+        std.mem.indexOf(u8, trimmed, "->") != null or
+        std.mem.indexOfScalar(u8, trimmed, '.') != null)
+    {
+        return null;
+    }
+
+    const semi = std.mem.lastIndexOfScalar(u8, trimmed, ';') orelse return null;
+    const eq_or_semi = std.mem.indexOfScalar(u8, trimmed, '=') orelse semi;
+    const lhs = std.mem.trim(u8, trimmed[0..eq_or_semi], " \t");
+    if (lhs.len == 0) return null;
+
+    var ident_end = lhs.len;
+    while (ident_end > 0 and !isIdentChar(lhs[ident_end - 1])) ident_end -= 1;
+    if (ident_end == 0) return null;
+    var ident_start = ident_end;
+    while (ident_start > 0 and isIdentChar(lhs[ident_start - 1])) ident_start -= 1;
+    if (!std.mem.eql(u8, lhs[ident_start..ident_end], name)) return null;
+
+    const prefix = std.mem.trim(u8, lhs[0..ident_start], " \t*&");
+    if (prefix.len == 0) return null;
+
+    var indent_len: usize = 0;
+    while (indent_len < line.len and (line[indent_len] == ' ' or line[indent_len] == '\t')) {
+        indent_len += 1;
+    }
+    return indent_len;
+}
+
+fn previousParameterDelimiter(line: []const u8, before: usize) ?usize {
+    var pos = before;
+    while (pos > 0) {
+        pos -= 1;
+        if (line[pos] == '(' or line[pos] == ',') return pos;
+        if (line[pos] == ';' or line[pos] == '{' or line[pos] == '}') return null;
+    }
+    return null;
+}
+
+fn nextParameterDelimiter(line: []const u8, after: usize) ?usize {
+    var pos = after;
+    while (pos < line.len) : (pos += 1) {
+        if (line[pos] == ')' or line[pos] == ',') return pos;
+        if (line[pos] == ';' or line[pos] == '{' or line[pos] == '}') return null;
+    }
+    return null;
+}
+
+fn parameterDeclarationInsertOffset(line: []const u8, name: []const u8) ?usize {
+    if (std.mem.indexOf(u8, line, "[[maybe_unused]]") != null) return null;
+
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, line, search, name)) |match| {
+        const before_ok = match == 0 or !isIdentChar(line[match - 1]);
+        const after_index = match + name.len;
+        const after_ok = after_index >= line.len or !isIdentChar(line[after_index]);
+        if (!before_ok or !after_ok) {
+            search = match + name.len;
+            continue;
+        }
+
+        const left = previousParameterDelimiter(line, match) orelse {
+            search = match + name.len;
+            continue;
+        };
+        const right = nextParameterDelimiter(line, after_index) orelse {
+            search = match + name.len;
+            continue;
+        };
+        if (right <= left + 1) {
+            search = match + name.len;
+            continue;
+        }
+
+        const segment = line[left + 1 .. right];
+        const rel_name = match - (left + 1);
+        const prefix = std.mem.trim(u8, segment[0..rel_name], " \t*&");
+        if (prefix.len == 0) {
+            search = match + name.len;
+            continue;
+        }
+        if (std.mem.indexOfScalar(u8, prefix, '"') != null or
+            std.mem.indexOfScalar(u8, prefix, '\'') != null)
+        {
+            search = match + name.len;
+            continue;
+        }
+
+        var insert = left + 1;
+        while (insert < line.len and (line[insert] == ' ' or line[insert] == '\t')) {
+            insert += 1;
+        }
+        return insert;
+    }
+    return null;
+}
+
+fn maybeUnusedInsertOffsetForName(source: []const u8, before: usize, name: []const u8) ?usize {
+    var best: ?usize = null;
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        if (line.start >= before) break;
+        pos = line.next;
+
+        if (localDeclarationInsertOffset(line.text, name)) |offset| {
+            best = line.start + offset;
+            continue;
+        }
+        if (parameterDeclarationInsertOffset(line.text, name)) |offset| {
+            best = line.start + offset;
+        }
+    }
+    return best;
+}
+
+fn hasMaybeUnusedInsertion(edits: []const Edit, offset: usize) bool {
+    for (edits) |edit| {
+        if (edit.start == offset and edit.end == offset and
+            std.mem.eql(u8, edit.replacement, "[[maybe_unused]] "))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendMaybeUnusedAnnotationForName(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    before: usize,
+    name: []const u8,
+    edits: *std.ArrayList(Edit),
+) !void {
+    const insert = maybeUnusedInsertOffsetForName(source, before, name) orelse return;
+    if (hasMaybeUnusedInsertion(edits.items, insert)) return;
+
+    try edits.append(allocator, .{
+        .start = insert,
+        .end = insert,
+        .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+    });
+}
+
 fn appearsInsideBlock(source: []const u8, offset: usize) bool {
     var depth: isize = 0;
     for (source[0..offset]) |ch| {
@@ -704,7 +1321,72 @@ fn isIdentifierToken(kind: Token.Kind) bool {
     return kind == .identifier;
 }
 
-fn appendUnusedSetLocalSuppressions(
+fn appendVoidSuppressorElisions(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        const trimmed = trimLine(line.text);
+
+        if (isVoidSuppressorGuard(trimmed)) {
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(allocator);
+
+            var scan_pos = line.next;
+            var valid_block = true;
+            var block_end: ?usize = null;
+            while (nextLine(source, scan_pos)) |block_line| {
+                scan_pos = block_line.next;
+                const block_trimmed = trimLine(block_line.text);
+                if (block_trimmed.len == 0) continue;
+                if (std.mem.eql(u8, block_trimmed, "#endif")) {
+                    block_end = block_line.next;
+                    break;
+                }
+                if (voidSuppressorName(block_line.text)) |name| {
+                    try names.append(allocator, name);
+                    continue;
+                }
+                valid_block = false;
+                break;
+            }
+
+            if (valid_block and names.items.len > 0) {
+                if (block_end) |end| {
+                    if (!editOverlaps(edits.items, line.start, end)) {
+                        for (names.items) |name| {
+                            try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits);
+                        }
+                        try edits.append(allocator, .{
+                            .start = line.start,
+                            .end = end,
+                            .replacement = try allocator.dupe(u8, ""),
+                        });
+                        pos = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if (voidSuppressorName(line.text)) |name| {
+            if (!editOverlaps(edits.items, line.start, line.next)) {
+                try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits);
+                try edits.append(allocator, .{
+                    .start = line.start,
+                    .end = line.next,
+                    .replacement = try allocator.dupe(u8, ""),
+                });
+            }
+        }
+
+        pos = line.next;
+    }
+}
+
+fn appendUnusedSetLocalAnnotations(
     allocator: std.mem.Allocator,
     source: []const u8,
     edits: *std.ArrayList(Edit),
@@ -753,16 +1435,7 @@ fn appendUnusedSetLocalSuppressions(
 
         if (identifierAppearsAfter(source, line.next, name)) continue;
 
-        var indent_len: usize = 0;
-        while (indent_len < line.text.len and (line.text[indent_len] == ' ' or line.text[indent_len] == '\t')) {
-            indent_len += 1;
-        }
-
-        try edits.append(allocator, .{
-            .start = line.next,
-            .end = line.next,
-            .replacement = try std.fmt.allocPrint(allocator, "{s}(void){s};\n", .{ line.text[0..indent_len], name }),
-        });
+        try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits);
     }
 }
 
@@ -844,7 +1517,13 @@ fn appendUnusedConstAnnotations(
         const trimmed = trimLine(line.text);
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
-        if (std.mem.indexOf(u8, trimmed, "const") == null) continue;
+        // Check for "const" keyword with word boundaries
+        const const_idx = std.mem.indexOf(u8, trimmed, "const") orelse continue;
+        const before_ok = const_idx == 0 or !isIdentChar(trimmed[const_idx - 1]);
+        const after_idx = const_idx + 5;
+        const after_ok = after_idx >= trimmed.len or !isIdentChar(trimmed[after_idx]);
+        if (!before_ok or !after_ok) continue;
+
         if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) continue;
 
         const name = unusedLocalDeclarationName(line.text) orelse continue;
@@ -1154,6 +1833,8 @@ fn appendMissingFieldInitializers(
         if (hasDesignatedInitializers(tokens, init_start, init_end)) continue;
 
         const init_count = countTopLevelCommas(tokens, init_start, init_end);
+        // Debug
+        // std.debug.print("Struct: {s}, field_count: {}, init_count: {}, adding: {}\n", .{type_name, field_count, init_count, init_count < field_count});
         if (init_count >= field_count) continue;
 
         try edits.append(allocator, .{
@@ -1213,6 +1894,176 @@ fn appendStrictAliasingTypePuns(
                 .end = tokens[cast_end + 2].end,
                 .replacement = read_replacement,
             });
+        }
+    }
+}
+
+fn hasNestedBraces(tokens: []const Token, init_start: usize, init_end: usize) bool {
+    var depth: u32 = 1;
+    var j = init_start + 1;
+    while (j < init_end) : (j += 1) {
+        if (tokens[j].kind == .lbrace or tokens[j].kind == .lbracket) {
+            depth += 1;
+            if (depth > 1) return true;
+        } else if (tokens[j].kind == .rbrace or tokens[j].kind == .rbracket) {
+            if (depth == 0) break;
+            depth -= 1;
+        }
+    }
+    return false;
+}
+
+fn findArraySize(tokens: []const Token, eq_pos: usize, source: []const u8) ?usize {
+    if (eq_pos == 0) return null;
+    var j = eq_pos - 1;
+    if (tokens[j].kind != .rbracket) return null;
+    var depth: u32 = 1;
+    while (j > 0) {
+        j -= 1;
+        if (depth == 0) break;
+        switch (tokens[j].kind) {
+            .rbracket => depth += 1,
+            .lbracket => {
+                depth -= 1;
+                if (depth == 0) {
+                    const dist = eq_pos - 1 - j;
+                    if (dist == 2 and tokens[j + 1].kind == .int_literal) {
+                        const slice = source[tokens[j + 1].start..tokens[j + 1].end];
+                        return std.fmt.parseInt(usize, slice, 0) catch null;
+                    }
+                    return null;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn appendMissingBraces(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var struct_map = try collectStructDefs(allocator, tokens, source);
+    defer struct_map.deinit();
+
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .eq) continue;
+        if (i + 1 >= tokens.len or tokens[i + 1].kind != .lbrace) continue;
+
+        const init_start = i + 1;
+        const init_end = findMatchingClose(tokens, init_start);
+        if (init_end >= tokens.len or init_end <= init_start + 1) continue;
+
+        if (hasNestedBraces(tokens, init_start, init_end)) continue;
+
+        const type_name = findStructTypeName(tokens, i, source, struct_map) orelse continue;
+        const field_count = struct_map.get(type_name) orelse continue;
+        if (field_count == 0) continue;
+
+        const array_size = findArraySize(tokens, i, source) orelse continue;
+        if (array_size == 0) continue;
+
+        const init_count = countTopLevelCommas(tokens, init_start, init_end);
+        if (init_count != array_size * field_count) continue;
+
+        if (editOverlaps(edits.items, tokens[init_start].start, tokens[init_end].end)) continue;
+
+        const opening = try allocator.dupe(u8, "{");
+        const closing = try allocator.dupe(u8, "}");
+        const sep = try allocator.dupe(u8, "}, {");
+
+        try edits.append(allocator, .{ .start = tokens[init_start].start + 1, .end = tokens[init_start].start + 1, .replacement = opening });
+        try edits.append(allocator, .{ .start = tokens[init_end].start, .end = tokens[init_end].start, .replacement = closing });
+
+        var group_count: usize = 0;
+        var depth: u32 = 1;
+        var j = init_start + 1;
+        while (j < init_end) : (j += 1) {
+            switch (tokens[j].kind) {
+                .lbrace, .lbracket => depth += 1,
+                .rbrace, .rbracket => {
+                    if (depth == 0) break;
+                    depth -= 1;
+                },
+                .comma => {
+                    if (depth == 1) group_count += 1;
+                    if (depth == 1 and group_count % field_count == 0 and group_count < init_count) {
+                        try edits.append(allocator, .{ .start = tokens[j].start, .end = tokens[j].end, .replacement = sep });
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+fn appendDeprecatedDeclReplacement(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .identifier) continue;
+        const name = source[tokens[i].start..tokens[i].end];
+
+        const is_sprintf = std.mem.eql(u8, name, "sprintf");
+        const is_strcpy = std.mem.eql(u8, name, "strcpy");
+        const is_strcat = std.mem.eql(u8, name, "strcat");
+        if (!is_sprintf and !is_strcpy and !is_strcat) continue;
+
+        if (i + 1 >= tokens.len or tokens[i + 1].kind != .lparen) continue;
+        const call_end = findMatchingClose(tokens, i + 1);
+        if (call_end >= tokens.len or call_end <= i + 2) continue;
+
+        if (editOverlaps(edits.items, tokens[i].start, tokens[call_end].end)) continue;
+
+        if (is_sprintf) {
+            const arg1_start = i + 2;
+            if (arg1_start >= call_end) continue;
+            const arg1_name = source[tokens[arg1_start].start..tokens[arg1_start].end];
+
+            var comma_pos: ?usize = null;
+            var depth: u32 = 1;
+            var j = i + 2;
+            while (j < call_end) : (j += 1) {
+                switch (tokens[j].kind) {
+                    .lparen, .lbrace, .lbracket => depth += 1,
+                    .rparen, .rbrace, .rbracket => {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    },
+                    .comma => {
+                        if (depth == 1) {
+                            comma_pos = j;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (comma_pos) |cp| {
+                const replacement = try std.fmt.allocPrint(allocator, "{s}, sizeof({s})", .{ source[tokens[cp].start..tokens[cp].end], arg1_name });
+                try edits.append(allocator, .{ .start = tokens[cp].start, .end = tokens[cp].end, .replacement = replacement });
+                const func_name = source[tokens[i].start..tokens[i].end];
+                const new_name = try std.fmt.allocPrint(allocator, "sn{s}", .{func_name[1..]});
+                try edits.append(allocator, .{ .start = tokens[i].start, .end = tokens[i].end, .replacement = new_name });
+            }
+        } else if (is_strcpy or is_strcat) {
+            const arg1_start = i + 2;
+            if (arg1_start >= call_end) continue;
+            const arg1_name = source[tokens[arg1_start].start..tokens[arg1_start].end];
+
+            const func_name = source[tokens[i].start..tokens[i].end];
+            const new_name = try std.fmt.allocPrint(allocator, "strl{s}", .{func_name[3..]});
+            try edits.append(allocator, .{ .start = tokens[i].start, .end = tokens[i].end, .replacement = new_name });
+            try edits.append(allocator, .{ .start = tokens[call_end].start, .end = tokens[call_end].start, .replacement = try std.fmt.allocPrint(allocator, ", sizeof({s})", .{arg1_name}) });
         }
     }
 }
@@ -1650,6 +2501,40 @@ test "do not annotate used local declaration" {
     try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]]") == null);
 }
 
+test "local used only in non-apple branch gets maybe_unused annotation" {
+    const src =
+        \\void f() {
+        \\  int x = 0;
+        \\#ifndef __APPLE__
+        \\  use(x);
+        \\#endif
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] int x") != null);
+}
+
+test "local used in apple branch gets no maybe_unused annotation" {
+    const src =
+        \\void f() {
+        \\  int x = 0;
+        \\#ifdef __APPLE__
+        \\  use(x);
+        \\#endif
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]]") == null);
+}
+
 test "do not collapse real mac include conditional" {
     const src =
         \\#if XE_PLATFORM_MACOS
@@ -1664,7 +2549,7 @@ test "do not collapse real mac include conditional" {
     try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }
 
-test "unused but set local gets (void) suppression" {
+test "unused but set local gets maybe_unused annotation" {
     const src =
         \\void f(void) {
         \\  int x;
@@ -1676,7 +2561,42 @@ test "unused but set local gets (void) suppression" {
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "(void)x;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] int x;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(void)x") == null);
+}
+
+test "standalone void suppressor becomes maybe_unused local annotation" {
+    const src =
+        \\void f(void) {
+        \\  int x;
+        \\  (void)x;
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] int x;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(void)x") == null);
+}
+
+test "apple-only void suppressor block becomes maybe_unused parameter annotation" {
+    const src =
+        \\void f(int dfn) {
+        \\#ifdef __APPLE__
+        \\  (void)dfn;
+        \\#endif
+        \\}
+        \\
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "void f([[maybe_unused]] int dfn)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(void)dfn") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "#ifdef __APPLE__") == null);
 }
 
 test "unused but set local used on RHS gets no suppression" {
@@ -1692,7 +2612,7 @@ test "unused but set local used on RHS gets no suppression" {
     try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }
 
-test "used variable after assignment gets no (void) suppression" {
+test "used variable after assignment gets no unused-set suppression" {
     const src =
         \\void f(void) {
         \\  int x;
@@ -1815,7 +2735,7 @@ test "unused file-scope const gets maybe_unused" {
 test "used file-scope const gets no annotation" {
     const src =
         \\const int BAR = 42;
-        \\void f(void) { int x = BAR; }
+        \\int f(void) { return BAR; }
         \\
     ;
     var result = try fixSource(std.testing.allocator, src);
@@ -1862,7 +2782,7 @@ test "struct partial initializer gets padded" {
 test "struct full initializer unchanged" {
     const src =
         \\struct Foo { int a; int b; };
-        \\void f(void) { struct Foo x = {1, 2}; }
+        \\struct Foo f(void) { return (struct Foo){1, 2}; }
         \\
     ;
     var result = try fixSource(std.testing.allocator, src);
@@ -1873,7 +2793,7 @@ test "struct full initializer unchanged" {
 test "struct designated initializer skipped" {
     const src =
         \\struct Foo { int a; int b; int c; };
-        \\void f(void) { struct Foo x = {.a = 1, .b = 2}; }
+        \\struct Foo f(void) { return (struct Foo){.a = 1, .b = 2}; }
         \\
     ;
     var result = try fixSource(std.testing.allocator, src);
@@ -1996,4 +2916,77 @@ test "old-style-cast struct keyword cast" {
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "reinterpret_cast<struct Foo *>") != null);
+}
+
+test "missing-braces insert inner braces for array of struct" {
+    const src =
+        \\struct Foo { int a; int b; };
+        \\void f(void) { struct Foo arr[2] = { 1, 2, 3, 4 }; }
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(result.edits.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, output, "{{ 1, 2}") != null);
+}
+
+test "missing-braces no change when already braced" {
+    const src =
+        \\struct Foo { int a; int b; };
+        \\struct Foo* f(void) { static struct Foo arr[2] = { {1, 2}, {3, 4} }; return arr; }
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "missing-braces no change for non-array struct" {
+    const src =
+        \\struct Foo { int a; int b; };
+        \\struct Foo f(void) { return (struct Foo){ 1, 2 }; }
+    ;
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "deprecated sprintf replaced with snprintf" {
+    const src = "void f(void) { sprintf(buf, \"%d\", x); }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(result.edits.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, output, "snprintf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sizeof(buf)") != null);
+}
+
+test "deprecated strcpy replaced with strlcpy" {
+    const src = "void f(void) { strcpy(dst, src); }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(result.edits.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, output, "strlcpy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sizeof(dst)") != null);
+}
+
+test "deprecated strcat replaced with strlcat" {
+    const src = "void f(void) { strcat(dst, src); }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(result.edits.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, output, "strlcat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sizeof(dst)") != null);
+}
+
+test "deprecated no false positive on unrelated sprintf-like" {
+    const src = "int f(void) { int foo_sprintf = 42; return foo_sprintf; }";
+    var result = try fixSource(std.testing.allocator, src);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }

@@ -34,14 +34,13 @@
 #pragma clang diagnostic ignored "-Wsign-conversion"
 
 /* ------------------------------------------------------------------ */
-/*  -Wunused-variable / -Wunused-const-variable                       */
+/*  -Wunused-variable                                                  */
 /*  macOS enables -Wunused-variable in -Wall; many projects keep      */
 /*  variables around for debug-only assertions that are stripped in   */
 /*  release builds.  VMA (vk_mem_alloc) and similar projects hit      */
 /*  this pattern frequently.                                          */
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wunused-variable"
-#pragma clang diagnostic ignored "-Wunused-const-variable"
 
 /* ------------------------------------------------------------------ */
 /*  -Wundefined-reinterpret-cast                                       */
@@ -51,21 +50,6 @@
 /*  implementation.                                                   */
 /* ------------------------------------------------------------------ */
 #pragma clang diagnostic ignored "-Wundefined-reinterpret-cast"
-
-/* ------------------------------------------------------------------ */
-/*  -Wdeprecated-declarations                                         */
-/*  sprintf, strcpy, and other POSIX-fixed functions are deprecated   */
-/*  on macOS in favour of the _s variants.  Bundled third-party code  */
-/*  rarely uses the _s forms.  stb_image_write hits this.             */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-
-/* ------------------------------------------------------------------ */
-/*  -Wmissing-braces                                                  */
-/*  Apple Clang sometimes warns about aggregate initialisation that   */
-/*  is valid C/C++.  Common in C libraries ported to C++.             */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wmissing-braces"
 
 /* ------------------------------------------------------------------ */
 /*  asm → __asm__                                                     */
