@@ -302,6 +302,7 @@ pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_m
     try appendTrivialMacIncludeCollapses(allocator, source, &edits);
     try appendLocalAngleIncludeQuotes(allocator, source, &edits);
     try appendVoidSuppressorElisions(allocator, source, &edits);
+    try appendStaticCastVoidUnwrap(allocator, source, tokens, &edits);
     try appendUnusedLocalAnnotations(allocator, source, &edits);
     try appendUnusedVarDeclarations(allocator, source, tokens, &edits);
     try appendUnusedSetLocalAnnotations(allocator, source, &edits);
@@ -1319,6 +1320,136 @@ fn appendUnusedLocalAnnotations(
 
 fn isIdentifierToken(kind: Token.Kind) bool {
     return kind == .identifier;
+}
+
+fn appendStaticCastVoidUnwrap(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var i: usize = 0;
+    while (i + 5 < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .identifier) continue;
+        if (!std.mem.eql(u8, source[tokens[i].start..tokens[i].end], "static_cast")) continue;
+        if (tokens[i + 1].kind != .lt) continue;
+        if (tokens[i + 2].kind != .keyword_void) continue;
+        if (tokens[i + 3].kind != .gt) continue;
+        if (tokens[i + 4].kind != .lparen) continue;
+
+        const close = findMatchingClose(tokens, i + 4);
+        if (close >= tokens.len or close <= i + 4) continue;
+        if (editOverlaps(edits.items, tokens[i].start, tokens[close].end)) continue;
+
+        const inner_start = tokens[i + 4].end;
+        const inner_end = tokens[close].start;
+        try edits.append(allocator, .{
+            .start = tokens[i].start,
+            .end = tokens[close].end,
+            .replacement = try allocator.dupe(u8, std.mem.trim(u8, source[inner_start..inner_end], " \t\r\n")),
+        });
+    }
+
+    for (tokens) |token| {
+        if (token.kind != .pp_define) continue;
+        try appendStaticCastVoidTextUnwrap(allocator, source, token.start, token.end, edits);
+    }
+}
+
+fn appendStaticCastVoidTextUnwrap(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    start: usize,
+    end: usize,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var pos = start;
+    while (std.mem.indexOfPos(u8, source, pos, "static_cast")) |cast_start| {
+        if (cast_start >= end) break;
+        pos = cast_start + "static_cast".len;
+        if (cast_start > start and isIdentByte(source[cast_start - 1])) continue;
+        var i = cast_start + "static_cast".len;
+        i = skipAsciiSpace(source, i, end);
+        if (i >= end or source[i] != '<') continue;
+        i += 1;
+        i = skipAsciiSpace(source, i, end);
+        if (i + "void".len > end or !std.mem.eql(u8, source[i .. i + "void".len], "void")) continue;
+        i += "void".len;
+        if (i < end and isIdentByte(source[i])) continue;
+        i = skipAsciiSpace(source, i, end);
+        if (i >= end or source[i] != '>') continue;
+        i += 1;
+        i = skipAsciiSpace(source, i, end);
+        if (i >= end or source[i] != '(') continue;
+
+        const close = findMatchingByteParen(source, i, end) orelse continue;
+        if (editOverlaps(edits.items, cast_start, close + 1)) continue;
+        const inner = std.mem.trim(u8, source[i + 1 .. close], " \t\r\n");
+        try edits.append(allocator, .{
+            .start = cast_start,
+            .end = close + 1,
+            .replacement = try allocator.dupe(u8, inner),
+        });
+        pos = close + 1;
+    }
+}
+
+fn skipAsciiSpace(source: []const u8, start: usize, end: usize) usize {
+    var i = start;
+    while (i < end) : (i += 1) {
+        switch (source[i]) {
+            ' ', '\t', '\r', '\n' => {},
+            else => break,
+        }
+    }
+    return i;
+}
+
+fn isIdentByte(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_' => true,
+        else => false,
+    };
+}
+
+fn findMatchingByteParen(source: []const u8, open: usize, end: usize) ?usize {
+    var depth: u32 = 1;
+    var i = open + 1;
+    while (i < end) : (i += 1) {
+        switch (source[i]) {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            '"' => i = skipQuotedByteString(source, i, end, '"'),
+            '\'' => i = skipQuotedByteString(source, i, end, '\''),
+            '/' => {
+                if (i + 1 < end and source[i + 1] == '/') {
+                    i += 2;
+                    while (i < end and source[i] != '\n') : (i += 1) {}
+                } else if (i + 1 < end and source[i + 1] == '*') {
+                    i += 2;
+                    while (i + 1 < end and !(source[i] == '*' and source[i + 1] == '/')) : (i += 1) {}
+                    if (i + 1 < end) i += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn skipQuotedByteString(source: []const u8, quote_start: usize, end: usize, quote: u8) usize {
+    var i = quote_start + 1;
+    while (i < end) : (i += 1) {
+        if (source[i] == '\\') {
+            if (i + 1 < end) i += 1;
+            continue;
+        }
+        if (source[i] == quote) return i;
+    }
+    return end;
 }
 
 fn appendVoidSuppressorElisions(
@@ -2597,6 +2728,35 @@ test "apple-only void suppressor block becomes maybe_unused parameter annotation
     try std.testing.expect(std.mem.indexOf(u8, output, "void f([[maybe_unused]] int dfn)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "(void)dfn") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "#ifdef __APPLE__") == null);
+}
+
+test "static_cast void expression keeps side effects without suppressor cast" {
+    const src =
+        \\void f(void) {
+        \\  static_cast<void>(call());
+        \\}
+        \\
+    ;
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "call();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "static_cast<void>") == null);
+}
+
+test "static_cast void macro continuation keeps expression" {
+    const src =
+        \\#define LOAD_KERNEL_MODULE(t) \
+        \\  static_cast<void>(kernel_state_->LoadKernelModule<kernel::t>())
+        \\
+    ;
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "kernel_state_->LoadKernelModule<kernel::t>()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "static_cast<void>") == null);
 }
 
 test "unused but set local used on RHS gets no suppression" {
