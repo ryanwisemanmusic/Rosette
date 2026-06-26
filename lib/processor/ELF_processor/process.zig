@@ -1053,6 +1053,13 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, .bits8, r);
                 self.setFlagsLogic(r, .bits8);
             },
+            .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64 => {
+                const a = self.readMemVal(d.addr, d.size);
+                const b = self.regVal(d.src_reg, d.size);
+                const r = a & b;
+                self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsLogic(r, d.size);
+            },
             .and_reg8_imm8, .and_reg16_imm8, .and_reg32_imm8, .and_reg64_imm8 => {
                 const a = self.regVal(d.dst_reg, d.size);
                 const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
@@ -1081,6 +1088,13 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
+            .or_mem8_reg8, .or_mem16_reg16, .or_mem32_reg32, .or_mem64_reg64 => {
+                const a = self.readMemVal(d.addr, d.size);
+                const b = self.regVal(d.src_reg, d.size);
+                const r = a | b;
+                self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsLogic(r, d.size);
+            },
             .or_reg8_imm8 => {
                 const a = self.regVal(d.dst_reg, .bits8);
                 const b = d.imm;
@@ -1100,6 +1114,13 @@ pub const ElfState = struct {
                 const imm = testImmForSize(d.imm, d.size);
                 const r = a | imm;
                 self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsLogic(r, d.size);
+            },
+            .xor_reg8_mem8 => {
+                const a = self.regVal(d.dst_reg, d.size);
+                const b = self.readMemVal(d.addr, d.size);
+                const r = a ^ b;
+                self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
             .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {

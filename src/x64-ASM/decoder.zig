@@ -19,7 +19,7 @@ pub const evalCond = flags.evalCond;
 pub const regVal = cpu_state.regVal;
 pub const setReg = cpu_state.setReg;
 
-pub const Op = enum(u8) {
+pub const Op = enum(u16) {
     invalid,
     nop,
     // mov
@@ -102,6 +102,10 @@ pub const Op = enum(u8) {
     and_reg32_reg32,
     and_reg64_reg64,
     and_reg8_mem8,
+    and_mem8_reg8,
+    and_mem16_reg16,
+    and_mem32_reg32,
+    and_mem64_reg64,
     and_reg8_imm8,
     and_reg16_imm8,
     and_reg32_imm8,
@@ -117,6 +121,10 @@ pub const Op = enum(u8) {
     or_reg16_mem16,
     or_reg32_mem32,
     or_reg64_mem64,
+    or_mem8_reg8,
+    or_mem16_reg16,
+    or_mem32_reg32,
+    or_mem64_reg64,
     or_reg8_imm8,
     or_mem8_imm8,
     or_mem16_imm8,
