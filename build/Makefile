@@ -194,7 +194,7 @@ elf-processor-build:
 
 macho-processor-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc -Mroot="$(MACHO_PROCESSOR_SRC)" -femit-bin="$(MACHO_PROCESSOR_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe --dep x64_decoder --dep x64_interpreter --dep macho_runtime -lc -Mroot="$(MACHO_PROCESSOR_SRC)" -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -femit-bin="$(MACHO_PROCESSOR_BIN)"
 
 elf-processor-dylib:
 	@mkdir -p zig-out/lib
