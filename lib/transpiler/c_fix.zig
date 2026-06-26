@@ -303,6 +303,7 @@ pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_m
     try appendLocalAngleIncludeQuotes(allocator, source, &edits);
     try appendVoidSuppressorElisions(allocator, source, &edits);
     try appendStaticCastVoidUnwrap(allocator, source, tokens, &edits);
+    try appendFmtPointerCasts(allocator, source, tokens, &edits);
     try appendUnusedLocalAnnotations(allocator, source, &edits);
     try appendUnusedVarDeclarations(allocator, source, tokens, &edits);
     try appendUnusedSetLocalAnnotations(allocator, source, &edits);
@@ -1450,6 +1451,184 @@ fn skipQuotedByteString(source: []const u8, quote_start: usize, end: usize, quot
         if (source[i] == quote) return i;
     }
     return end;
+}
+
+const StaticCastVoidPointer = struct {
+    close: usize,
+    expr_open: usize,
+    expr_close: usize,
+};
+
+fn staticCastVoidPointer(tokens: []const Token, start: usize) ?StaticCastVoidPointer {
+    if (start + 5 >= tokens.len) return null;
+    if (tokens[start].kind != .identifier) return null;
+    if (tokens[start + 1].kind != .lt) return null;
+
+    var i = start + 2;
+    var saw_void = false;
+    var saw_star = false;
+    while (i < tokens.len) : (i += 1) {
+        switch (tokens[i].kind) {
+            .keyword_const, .keyword_volatile => {},
+            .keyword_void => {
+                if (saw_void) return null;
+                saw_void = true;
+            },
+            .star => {
+                if (saw_star) return null;
+                saw_star = true;
+            },
+            .gt => {
+                if (!saw_void or !saw_star) return null;
+                if (i + 1 >= tokens.len or tokens[i + 1].kind != .lparen) return null;
+                const expr_close = findMatchingClose(tokens, i + 1);
+                if (expr_close >= tokens.len) return null;
+                return .{
+                    .close = expr_close,
+                    .expr_open = i + 1,
+                    .expr_close = expr_close,
+                };
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn previousTokenIsCallCallee(source: []const u8, tokens: []const Token, open: usize) bool {
+    if (open == 0) return false;
+    const prev = tokens[open - 1];
+    if (prev.kind == .identifier) {
+        const name = source[prev.start..prev.end];
+        return !std.mem.eql(u8, name, "if") and
+            !std.mem.eql(u8, name, "while") and
+            !std.mem.eql(u8, name, "for") and
+            !std.mem.eql(u8, name, "switch") and
+            !std.mem.eql(u8, name, "return");
+    }
+    return prev.kind == .rparen or prev.kind == .rbracket or prev.kind == .gt;
+}
+
+fn callCalleeName(source: []const u8, tokens: []const Token, open: usize) ?[]const u8 {
+    if (open == 0) return null;
+    var i = open - 1;
+    while (true) {
+        if (tokens[i].kind == .identifier) return source[tokens[i].start..tokens[i].end];
+        if (i == 0) break;
+        i -= 1;
+    }
+    return null;
+}
+
+fn isPrintfStyleCallee(name: []const u8) bool {
+    const names = [_][]const u8{
+        "printf",
+        "fprintf",
+        "sprintf",
+        "snprintf",
+        "vprintf",
+        "vfprintf",
+        "vsprintf",
+        "vsnprintf",
+        "XBDM_TRACE",
+    };
+    for (names) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+fn findNearestEnclosingParen(tokens: []const Token, before: usize) ?usize {
+    if (before == 0) return null;
+    var depth: u32 = 0;
+    var i = before;
+    while (i > 0) {
+        i -= 1;
+        switch (tokens[i].kind) {
+            .rparen, .rbrace, .rbracket => depth += 1,
+            .lparen, .lbrace, .lbracket => {
+                if (depth == 0) {
+                    if (tokens[i].kind == .lparen) return i;
+                    return null;
+                }
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn stringTokenContainsFmtPlaceholder(source: []const u8, token: Token) bool {
+    if (token.kind != .string_literal) return false;
+    const text = source[token.start..token.end];
+    return std.mem.indexOfScalar(u8, text, '{') != null;
+}
+
+fn callFirstArgumentIsFmtString(source: []const u8, tokens: []const Token, open: usize, cast_index: usize) bool {
+    var i = open + 1;
+    var depth: u32 = 0;
+    var saw_fmt_string = false;
+    while (i < tokens.len) : (i += 1) {
+        if (i >= cast_index and depth == 0) return false;
+        switch (tokens[i].kind) {
+            .lparen, .lbrace, .lbracket => depth += 1,
+            .rparen, .rbrace, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .comma => {
+                if (depth == 0) return saw_fmt_string;
+            },
+            .string_literal => {
+                if (depth == 0 and stringTokenContainsFmtPlaceholder(source, tokens[i])) {
+                    saw_fmt_string = true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn isDirectFmtArgument(source: []const u8, tokens: []const Token, cast_index: usize) bool {
+    var search = cast_index;
+    while (findNearestEnclosingParen(tokens, search)) |open| {
+        if (!previousTokenIsCallCallee(source, tokens, open)) {
+            search = open;
+            continue;
+        }
+        if (callCalleeName(source, tokens, open)) |name| {
+            if (isPrintfStyleCallee(name)) return false;
+        }
+        return callFirstArgumentIsFmtString(source, tokens, open, cast_index);
+    }
+    return false;
+}
+
+fn appendFmtPointerCasts(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+) !void {
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        if (!std.mem.eql(u8, source[tokens[i].start..tokens[i].end], "static_cast")) continue;
+        const cast = staticCastVoidPointer(tokens, i) orelse continue;
+        if (!isDirectFmtArgument(source, tokens, i)) continue;
+        if (editOverlaps(edits.items, tokens[i].start, tokens[cast.close].end)) continue;
+
+        const inner_start = tokens[cast.expr_open].end;
+        const inner_end = tokens[cast.expr_close].start;
+        const inner = std.mem.trim(u8, source[inner_start..inner_end], " \t\r\n");
+        const replacement = try std.fmt.allocPrint(allocator, "fmt::ptr({s})", .{inner});
+        try edits.append(allocator, .{
+            .start = tokens[i].start,
+            .end = tokens[cast.close].end,
+            .replacement = replacement,
+        });
+    }
 }
 
 fn appendVoidSuppressorElisions(
@@ -2757,6 +2936,60 @@ test "static_cast void macro continuation keeps expression" {
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "kernel_state_->LoadKernelModule<kernel::t>()") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "static_cast<void>") == null);
+}
+
+test "fmt logging pointer cast becomes fmt ptr" {
+    const src =
+        \\void f(Object* object) {
+        \\  XELOGI("Object pointer: {}", static_cast<void*>(object));
+        \\}
+        \\
+    ;
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "fmt::ptr(object)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "static_cast<void*>") == null);
+}
+
+test "fmt logging const pointer cast becomes fmt ptr" {
+    const src =
+        \\void f(const Device* device) {
+        \\  XELOGI("Device pointer: {}", static_cast<const void*>(device));
+        \\}
+        \\
+    ;
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "fmt::ptr(device)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "static_cast<const void*>") == null);
+}
+
+test "printf style pointer cast is not fmt ptr" {
+    const src =
+        \\void f(Object* object) {
+        \\  XBDM_TRACE("Object pointer: %p\n", static_cast<void*>(object));
+        \\}
+        \\
+    ;
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
+}
+
+test "nested non-format pointer cast is not fmt ptr" {
+    const src =
+        \\void f(Object* object) {
+        \\  XELOGI("Object pointer: {}", wrap(static_cast<void*>(object)));
+        \\}
+        \\
+    ;
+    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }
 
 test "unused but set local used on RHS gets no suppression" {
