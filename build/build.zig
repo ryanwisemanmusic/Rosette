@@ -946,18 +946,20 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(assembler_runner);
     }
 
+    // Shared x86-64 decoder/interpreter modules
+    const x64_decoder_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/decoder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const x64_interpreter_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/interpreter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ELF processor (x86-64 ELF binary loader/emulator)
     {
-        const x64_decoder_mod = b.createModule(.{
-            .root_source_file = b.path("../src/x64-ASM/decoder.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const x64_interpreter_mod = b.createModule(.{
-            .root_source_file = b.path("../src/x64-ASM/interpreter.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
         const x64_linux_runtime_mod = b.createModule(.{
             .root_source_file = b.path("../src/x64-ASM/linux_runtime.zig"),
             .target = target,
@@ -1009,12 +1011,20 @@ pub fn build(b: *std.Build) void {
 
     // Mach-O processor (x86_64 macOS binary loader/diagnostic backend)
     {
+        const macho_runtime_mod = b.createModule(.{
+            .root_source_file = b.path("../src/x64-ASM/macho_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         const macho_processor_mod = b.createModule(.{
             .root_source_file = b.path("../lib/Mach-O/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
+        macho_processor_mod.addImport("x64_decoder", x64_decoder_mod);
+        macho_processor_mod.addImport("x64_interpreter", x64_interpreter_mod);
+        macho_processor_mod.addImport("macho_runtime", macho_runtime_mod);
         const macho_processor = b.addExecutable(.{
             .name = "macho_processor",
             .root_module = macho_processor_mod,
