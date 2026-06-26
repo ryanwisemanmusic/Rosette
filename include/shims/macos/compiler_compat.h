@@ -43,15 +43,6 @@
 #pragma clang diagnostic ignored "-Wunused-variable"
 
 /* ------------------------------------------------------------------ */
-/*  -Wundefined-reinterpret-cast                                       */
-/*  Emulators, codecs, and graphics code often type-pun scalar bits   */
-/*  via pointer casts in hot paths.  Apple Clang may flag these under  */
-/*  strict warning sets even when the project accepts the upstream     */
-/*  implementation.                                                   */
-/* ------------------------------------------------------------------ */
-#pragma clang diagnostic ignored "-Wundefined-reinterpret-cast"
-
-/* ------------------------------------------------------------------ */
 /*  asm → __asm__                                                     */
 /*  Apple Clang in strict C++ modes (-std=c++17, not gnu++17) rejects */
 /*  the GCC `asm` keyword.  `__asm__` is the portable ISO C spelling  */
