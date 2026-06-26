@@ -63,6 +63,7 @@ pub const Op = enum(u8) {
     adc_reg16_imm8,
     adc_reg32_imm8,
     adc_reg64_imm8,
+    sbb_reg8_imm8,
     add_reg16_imm32,
     add_reg32_imm32,
     add_reg64_imm32,
@@ -70,6 +71,8 @@ pub const Op = enum(u8) {
     add_mem16_imm8,
     add_mem32_imm8,
     add_mem64_imm8,
+    adc_reg8_mem8,
+    sbb_reg8_mem8,
     // sub (reg, r/m) d=1
     sub_reg8_mem8,
     sub_reg16_mem16,
@@ -98,6 +101,7 @@ pub const Op = enum(u8) {
     and_reg16_reg16,
     and_reg32_reg32,
     and_reg64_reg64,
+    and_reg8_mem8,
     and_reg8_imm8,
     and_reg16_imm8,
     and_reg32_imm8,
@@ -113,6 +117,7 @@ pub const Op = enum(u8) {
     or_reg16_mem16,
     or_reg32_mem32,
     or_reg64_mem64,
+    or_reg8_imm8,
     or_mem8_imm8,
     or_mem16_imm8,
     or_mem32_imm8,
@@ -124,6 +129,7 @@ pub const Op = enum(u8) {
     xor_reg16_reg16,
     xor_reg32_reg32,
     xor_reg64_reg64,
+    xor_reg8_mem8,
     xor_reg8_imm8,
     xor_reg16_imm8,
     xor_reg32_imm8,
@@ -282,6 +288,7 @@ pub const Op = enum(u8) {
     // conditional / unconditional jumps
     jmp_rel8,
     jcc_rel8,
+    jcc_rel32,
     jmp_mem64,
     jmp_reg64,
     // syscall
