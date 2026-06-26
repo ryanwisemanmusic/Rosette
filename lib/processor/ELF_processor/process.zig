@@ -865,7 +865,15 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsAdd(a, imm, r, d.size);
             },
-            .adc_reg8_imm8, .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8 => {
+            .adc_reg8_imm8 => {
+                const a = self.regVal(d.dst_reg, .bits8);
+                const b = d.imm;
+                const cf = (self.regs.rflags & RFL_CF) != 0;
+                const r = a +% b +% @as(u8, @intFromBool(cf));
+                self.setReg(d.dst_reg, .bits8, r);
+                self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
+            },
+            .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8 => {
                 const a = self.regVal(d.dst_reg, d.size);
                 const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
                 const carry: u64 = if ((self.regs.rflags & RFL_CF) != 0) 1 else 0;
@@ -873,6 +881,22 @@ pub const ElfState = struct {
                 const r = a +% operand;
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsAdd(a, operand, r, d.size);
+            },
+            .adc_reg8_mem8 => {
+                const a = self.regVal(d.dst_reg, .bits8);
+                const b = self.readMemVal(d.addr, .bits8);
+                const cf = (self.regs.rflags & RFL_CF) != 0;
+                const r = a +% b +% @as(u8, @intFromBool(cf));
+                self.setReg(d.dst_reg, .bits8, r);
+                self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
+            },
+            .sbb_reg8_mem8 => {
+                const a = self.regVal(d.dst_reg, .bits8);
+                const b = self.readMemVal(d.addr, .bits8);
+                const cf = (self.regs.rflags & RFL_CF) != 0;
+                const r = a -% b -% @as(u8, @intFromBool(cf));
+                self.setReg(d.dst_reg, .bits8, r);
+                self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
             },
             .add_reg16_imm32, .add_reg32_imm32, .add_reg64_imm32 => {
                 const a = self.regVal(d.dst_reg, d.size);
@@ -972,6 +996,14 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, .bits8, r);
                 self.setFlagsSub(a, d.imm, r, .bits8);
             },
+            .sbb_reg8_imm8 => {
+                const a = self.regVal(d.dst_reg, .bits8);
+                const b = d.imm;
+                const cf = (self.regs.rflags & RFL_CF) != 0;
+                const r = a -% b -% @as(u8, @intFromBool(cf));
+                self.setReg(d.dst_reg, .bits8, r);
+                self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
+            },
             .sub_reg16_imm8 => {
                 const a = self.regVal(d.dst_reg, .bits16);
                 const imm = signExtendImm8(d.imm);
@@ -1014,6 +1046,13 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
+            .and_reg8_mem8 => {
+                const a = self.regVal(d.dst_reg, .bits8);
+                const b = self.readMemVal(d.addr, .bits8);
+                const r = a & b;
+                self.setReg(d.dst_reg, .bits8, r);
+                self.setFlagsLogic(r, .bits8);
+            },
             .and_reg8_imm8, .and_reg16_imm8, .and_reg32_imm8, .and_reg64_imm8 => {
                 const a = self.regVal(d.dst_reg, d.size);
                 const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
@@ -1041,6 +1080,13 @@ pub const ElfState = struct {
                 const r = a | b;
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsLogic(r, d.size);
+            },
+            .or_reg8_imm8 => {
+                const a = self.regVal(d.dst_reg, .bits8);
+                const b = d.imm;
+                const r = a | b;
+                self.setReg(d.dst_reg, .bits8, r);
+                self.setFlagsLogic(r, .bits8);
             },
             .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8 => {
                 const a = self.readMemVal(d.addr, d.size);
@@ -1978,6 +2024,13 @@ pub const ElfState = struct {
 
             // ── Conditional jump rel8 ──
             .jcc_rel8 => {
+                if (evalCond(self.regs.rflags, d.cond)) {
+                    const target = @as(i64, @bitCast(self.regs.rip)) + d.len + @as(i64, @bitCast(d.imm));
+                    self.regs.rip = @as(u64, @bitCast(target));
+                    return;
+                }
+            },
+            .jcc_rel32 => {
                 if (evalCond(self.regs.rflags, d.cond)) {
                     const target = @as(i64, @bitCast(self.regs.rip)) + d.len + @as(i64, @bitCast(d.imm));
                     self.regs.rip = @as(u64, @bitCast(target));
