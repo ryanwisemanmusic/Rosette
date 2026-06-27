@@ -143,6 +143,18 @@ const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
+const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
+const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
+const concatenate_vpshldvd = @import("CONCATENATE/vpshldvd.zig");
+const concatenate_vpshldvq = @import("CONCATENATE/vpshldvq.zig");
+const concatenate_vpshldvw = @import("CONCATENATE/vpshldvw.zig");
+const concatenate_vpshldw = @import("CONCATENATE/vpshldw.zig");
+const concatenate_vpshrdd = @import("CONCATENATE/vpshrdd.zig");
+const concatenate_vpshrdq = @import("CONCATENATE/vpshrdq.zig");
+const concatenate_vpshrdvd = @import("CONCATENATE/vpshrdvd.zig");
+const concatenate_vpshrdvq = @import("CONCATENATE/vpshrdvq.zig");
+const concatenate_vpshrdvw = @import("CONCATENATE/vpshrdvw.zig");
+const concatenate_vpshrdw = @import("CONCATENATE/vpshrdw.zig");
 const conditional_cmova = @import("CONDITIONAL/CMOVA.zig");
 const conditional_cmovae = @import("CONDITIONAL/CMOVAE.zig");
 const conditional_cmovb = @import("CONDITIONAL/CMOVB.zig");
@@ -698,6 +710,18 @@ pub const specs = blk: {
         spec(load_xsusldtrk.meta),
         spec(abort_xabort.meta),
         spec(begin_xbegin.meta),
+        spec(concatenate_vpshldd.meta),
+        spec(concatenate_vpshldq.meta),
+        spec(concatenate_vpshldvd.meta),
+        spec(concatenate_vpshldvq.meta),
+        spec(concatenate_vpshldvw.meta),
+        spec(concatenate_vpshldw.meta),
+        spec(concatenate_vpshrdd.meta),
+        spec(concatenate_vpshrdq.meta),
+        spec(concatenate_vpshrdvd.meta),
+        spec(concatenate_vpshrdvq.meta),
+        spec(concatenate_vpshrdvw.meta),
+        spec(concatenate_vpshrdw.meta),
         spec(conditional_cmova.meta),
         spec(conditional_cmovae.meta),
         spec(conditional_cmovb.meta),
@@ -1253,6 +1277,18 @@ pub const proof_reports = [_]proofs.ProofReport{
     load_xsusldtrk.proof_report,
     abort_xabort.proof_report,
     begin_xbegin.proof_report,
+    concatenate_vpshldd.proof_report,
+    concatenate_vpshldq.proof_report,
+    concatenate_vpshldvd.proof_report,
+    concatenate_vpshldvq.proof_report,
+    concatenate_vpshldvw.proof_report,
+    concatenate_vpshldw.proof_report,
+    concatenate_vpshrdd.proof_report,
+    concatenate_vpshrdq.proof_report,
+    concatenate_vpshrdvd.proof_report,
+    concatenate_vpshrdvq.proof_report,
+    concatenate_vpshrdvw.proof_report,
+    concatenate_vpshrdw.proof_report,
     conditional_cmova.proof_report,
     conditional_cmovae.proof_report,
     conditional_cmovb.proof_report,
