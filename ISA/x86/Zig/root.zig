@@ -10,6 +10,15 @@ const add_addss = @import("ADD/ADDSS.zig");
 const add_addsubpd = @import("ADD/ADDSUBPD.zig");
 const add_addsubps = @import("ADD/ADDSUBPS.zig");
 const add_adox = @import("ADD/ADOX.zig");
+const add_fadd = @import("ADD/fadd.zig");
+const add_faddp = @import("ADD/faddp.zig");
+const add_fiadd = @import("ADD/fiadd.zig");
+const add_haddpd = @import("ADD/haddpd.zig");
+const add_haddps = @import("ADD/haddps.zig");
+const add_kaddb = @import("ADD/kaddb.zig");
+const add_kaddd = @import("ADD/kaddd.zig");
+const add_kaddq = @import("ADD/kaddq.zig");
+const add_kaddw = @import("ADD/kaddw.zig");
 const ascii_aaa = @import("ASCII/AAA.zig");
 const ascii_aad = @import("ASCII/AAD.zig");
 const ascii_aam = @import("ASCII/AAM.zig");
@@ -1113,6 +1122,15 @@ pub const tables = [_]InstructionTable{
     entry(add_addsubpd.family, add_addsubpd.path, add_addsubpd.source),
     entry(add_addsubps.family, add_addsubps.path, add_addsubps.source),
     entry(add_adox.family, add_adox.path, add_adox.source),
+    entry(add_fadd.family, add_fadd.path, add_fadd.source),
+    entry(add_faddp.family, add_faddp.path, add_faddp.source),
+    entry(add_fiadd.family, add_fiadd.path, add_fiadd.source),
+    entry(add_haddpd.family, add_haddpd.path, add_haddpd.source),
+    entry(add_haddps.family, add_haddps.path, add_haddps.source),
+    entry(add_kaddb.family, add_kaddb.path, add_kaddb.source),
+    entry(add_kaddd.family, add_kaddd.path, add_kaddd.source),
+    entry(add_kaddq.family, add_kaddq.path, add_kaddq.source),
+    entry(add_kaddw.family, add_kaddw.path, add_kaddw.source),
     entry(ascii_aaa.family, ascii_aaa.path, ascii_aaa.source),
     entry(ascii_aad.family, ascii_aad.path, ascii_aad.source),
     entry(ascii_aam.family, ascii_aam.path, ascii_aam.source),
