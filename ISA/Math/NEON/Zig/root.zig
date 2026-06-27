@@ -498,6 +498,10 @@ const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
 const expand_vpexpandb = @import("EXPAND/vpexpandb.zig");
 const expand_vpexpandw = @import("EXPAND/vpexpandw.zig");
+const partial_fpatan = @import("PARTIAL/FPATAN.zig");
+const partial_fprem = @import("PARTIAL/FPREM.zig");
+const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
+const partial_fptan = @import("PARTIAL/FPTAN.zig");
 const pause_tpause = @import("PAUSE/tpause.zig");
 const prefetch_prefetchw = @import("PREFETCH/prefetchw.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/prefetcht0.zig");
@@ -1065,6 +1069,10 @@ pub const specs = blk: {
         spec(examine_fxam.meta),
         spec(expand_vpexpandb.meta),
         spec(expand_vpexpandw.meta),
+        spec(partial_fpatan.meta),
+        spec(partial_fprem.meta),
+        spec(partial_fprem1.meta),
+        spec(partial_fptan.meta),
         spec(pause_tpause.meta),
         spec(prefetch_prefetchw.meta),
         spec(prefetch_prefetcht0.meta),
@@ -1632,6 +1640,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     examine_fxam.proof_report,
     expand_vpexpandb.proof_report,
     expand_vpexpandw.proof_report,
+    partial_fpatan.proof_report,
+    partial_fprem.proof_report,
+    partial_fprem1.proof_report,
+    partial_fptan.proof_report,
     pause_tpause.proof_report,
     prefetch_prefetchw.proof_report,
     prefetch_prefetcht0.proof_report,
