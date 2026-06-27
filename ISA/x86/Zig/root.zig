@@ -298,6 +298,9 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const save_fsave = @import("SAVE/FSAVE.zig");
+const save_fxsave = @import("SAVE/FXSAVE.zig");
+const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
 const swap_swapgs = @import("SWAP/SWAPGS.zig");
 const sub_sub = @import("SUB/SUB.zig");
 const sub_subpd = @import("SUB/SUBPD.zig");
@@ -1429,6 +1432,9 @@ pub const tables = [_]InstructionTable{
     entry(rotate_rcr.family, rotate_rcr.path, rotate_rcr.source),
     entry(rotate_rol.family, rotate_rol.path, rotate_rol.source),
     entry(rotate_ror.family, rotate_ror.path, rotate_ror.source),
+    entry(save_fsave.family, save_fsave.path, save_fsave.source),
+    entry(save_fxsave.family, save_fxsave.path, save_fxsave.source),
+    entry(save_saveprevssp.family, save_saveprevssp.path, save_saveprevssp.source),
     entry(swap_swapgs.family, swap_swapgs.path, swap_swapgs.source),
     entry(sub_sub.family, sub_sub.path, sub_sub.source),
     entry(sub_subpd.family, sub_subpd.path, sub_subpd.source),

@@ -300,6 +300,9 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const save_fsave = @import("SAVE/FSAVE.zig");
+const save_fxsave = @import("SAVE/FXSAVE.zig");
+const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
 const swap_swapgs = @import("SWAP/SWAPGS.zig");
 const sub_sub = @import("SUB/SUB.zig");
 const sub_subpd = @import("SUB/SUBPD.zig");
@@ -872,6 +875,9 @@ pub const specs = blk: {
         spec(rotate_rcr.meta),
         spec(rotate_rol.meta),
         spec(rotate_ror.meta),
+        spec(save_fsave.meta),
+        spec(save_fxsave.meta),
+        spec(save_saveprevssp.meta),
         spec(swap_swapgs.meta),
         spec(sub_sub.meta),
         spec(sub_subpd.meta),
@@ -1444,6 +1450,9 @@ pub const proof_reports = [_]proofs.ProofReport{
     rotate_rcr.proof_report,
     rotate_rol.proof_report,
     rotate_ror.proof_report,
+    save_fsave.proof_report,
+    save_fxsave.proof_report,
+    save_saveprevssp.proof_report,
     swap_swapgs.proof_report,
     sub_sub.proof_report,
     sub_subpd.proof_report,
