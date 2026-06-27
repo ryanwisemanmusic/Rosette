@@ -4,6 +4,8 @@ const fat = @import("fat.zig");
 const x64_decoder = @import("x64_decoder");
 const x64_interpreter = @import("x64_interpreter");
 const macho_runtime = @import("macho_runtime");
+const exit_diagnostics = @import("exit_diagnostics");
+const macho_metadata = @import("metadata.zig");
 
 const log = std.log.scoped(.macho);
 
@@ -25,7 +27,9 @@ const MEM_SIZE: u64 = 512 * 1024 * 1024;
 const MEM_BASE: u64 = 0x0;
 const PAGE_SIZE: u64 = 4096;
 const TRACE_BUFFER_LEN: usize = 256;
+const IMPORT_TRACE_BUFFER_LEN: usize = 64;
 const STUB_ENTRY_SIZE: u64 = 10;
+const UNSUPPORTED_RUNTIME_EXIT_CODE: u64 = 125;
 
 const MachSegment = macho.MachSegment;
 
@@ -39,6 +43,16 @@ const TraceEntry = struct {
     rdx: u64 = 0,
 };
 
+const ImportTraceEntry = struct {
+    symbol: []const u8 = "",
+    dylib: []const u8 = "",
+    stub_address: u64 = 0,
+    return_address: u64 = 0,
+    synthetic_result: u64 = 0,
+    caller_symbol: []const u8 = "",
+    caller_offset: u64 = 0,
+};
+
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
     mem: []u8,
@@ -49,8 +63,10 @@ pub const MachOState = struct {
     terminated: bool = false,
     exit_code: u64 = 0,
     faulted: bool = false,
+    termination_reason: u8 = @intFromEnum(exit_diagnostics.TerminationReason.unknown),
     data: []const u8,
     segments: []const MachSegment,
+    metadata: macho_metadata.Metadata,
     entry_point_vaddr: u64 = 0,
     stack_size: u64 = 0,
     guest_fds: [16]i32 = .{0} ** 16,
@@ -62,12 +78,19 @@ pub const MachOState = struct {
     trace_range_end: ?u64 = null,
     pending_stub_slot: ?u32 = null,
     pending_stub_entry_rip: ?u64 = null,
+    pending_import_stub_rip: ?u64 = null,
     helper_cluster_start: ?u64 = null,
     helper_cluster_end: ?u64 = null,
+    import_trace_entries: [IMPORT_TRACE_BUFFER_LEN]ImportTraceEntry = [_]ImportTraceEntry{ImportTraceEntry{}} ** IMPORT_TRACE_BUFFER_LEN,
+    import_trace_index: usize = 0,
+    import_trace_filled: bool = false,
+    unresolved_import_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, binary_data: []const u8) !MachOState {
         var state = try macho.load(allocator, binary_data);
         errdefer state.deinit();
+        var metadata = try macho_metadata.Metadata.init(allocator, binary_data);
+        errdefer metadata.deinit();
 
         var min_vaddr: u64 = std.math.maxInt(u64);
         var max_vaddr: u64 = 0;
@@ -129,12 +152,14 @@ pub const MachOState = struct {
             .mem_size = final_mem_size,
             .data = binary_data,
             .segments = try allocator.dupe(MachSegment, state.segments),
+            .metadata = metadata,
             .entry_point_vaddr = entry_vaddr,
             .stack_size = if (state.stack_size > 0) state.stack_size else STACK_SIZE,
         };
     }
 
     pub fn deinit(self: *MachOState) void {
+        self.metadata.deinit();
         self.allocator.free(self.mem);
         self.allocator.free(self.segments);
     }
@@ -325,6 +350,23 @@ pub const MachOState = struct {
         return .{ .start = start, .end = end };
     }
 
+    fn dumpGuestStack(self: *const MachOState) void {
+        const count: usize = 12;
+        std.debug.print("    [stack backtrace (rsp=0x{x}):\n", .{self.regs.rsp});
+        var addr = self.regs.rsp;
+        for (0..count) |i| {
+            const val = self.read64(addr);
+            if (val == 0) {
+                std.debug.print("      [{d}] 0x{x}: 0x0\n", .{ i, addr });
+            } else if (self.metadata.nearestSymbol(val)) |sym| {
+                std.debug.print("      [{d}] 0x{x}: 0x{x} → {s}+0x{x}\n", .{ i, addr, val, sym.name, sym.offset });
+            } else {
+                std.debug.print("      [{d}] 0x{x}: 0x{x}\n", .{ i, addr, val });
+            }
+            addr +%= 8;
+        }
+    }
+
     fn handleStubHelperTransition(self: *MachOState) bool {
         if (self.isStubPushJmpEntry(self.regs.rip)) |stub| {
             self.pending_stub_slot = stub.slot;
@@ -346,6 +388,25 @@ pub const MachOState = struct {
             self.pending_stub_slot = null;
             self.pending_stub_entry_rip = null;
             self.regs.rax = 0;
+            if (self.pending_import_stub_rip) |import_stub_rip| {
+                if (self.metadata.importAtStub(import_stub_rip)) |imported| {
+                    self.recordUnresolvedImport(imported, synthetic_return, self.regs.rax);
+                    if (self.metadata.nearestSymbol(synthetic_return)) |caller_sym| {
+                        std.debug.print(
+                            "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller={s}+0x{x} return=0x{x}\n",
+                            .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, caller_sym.name, caller_sym.offset, synthetic_return },
+                        );
+                    } else {
+                        std.debug.print(
+                            "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller=0x{x}\n",
+                            .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, synthetic_return },
+                        );
+                    }
+                    self.dumpGuestStack();
+                    std.debug.print("    [synthesized rax=0x{x}]\n", .{self.regs.rax});
+                }
+            }
+            self.pending_import_stub_rip = null;
             if (synthetic_return != 0 and self.addrToOffset(synthetic_return) != null) {
                 log.warn("stub-helper aggressive fallback: helper_rip=0x{x} slot=0x{x} entry_rip=0x{x} synthetic_return=0x{x}; simulating resolved helper return", .{ self.regs.rip, slot, entry_rip, synthetic_return });
                 _ = self.pop();
@@ -368,6 +429,29 @@ pub const MachOState = struct {
         }
 
         return false;
+    }
+
+    fn recordUnresolvedImport(
+        self: *MachOState,
+        imported: macho_metadata.ImportedSymbol,
+        return_address: u64,
+        synthetic_result: u64,
+    ) void {
+        var entry = ImportTraceEntry{
+            .symbol = imported.name,
+            .dylib = imported.dylib,
+            .stub_address = imported.stub_address,
+            .return_address = return_address,
+            .synthetic_result = synthetic_result,
+        };
+        if (self.metadata.nearestSymbol(return_address)) |caller_sym| {
+            entry.caller_symbol = caller_sym.name;
+            entry.caller_offset = caller_sym.offset;
+        }
+        self.import_trace_entries[self.import_trace_index] = entry;
+        self.import_trace_index = (self.import_trace_index + 1) % IMPORT_TRACE_BUFFER_LEN;
+        if (self.import_trace_index == 0) self.import_trace_filled = true;
+        self.unresolved_import_count += 1;
     }
 
     fn recordTrace(self: *MachOState, decoded: DecodedInsn) void {
@@ -557,6 +641,7 @@ pub const MachOState = struct {
         }
         const decoded = self.decodeAt() orelse {
             log.err("decode failed at rip=0x{x}", .{self.regs.rip});
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.decode_failed);
             self.terminated = true;
             return false;
         };
@@ -574,6 +659,7 @@ pub const MachOState = struct {
             self.dumpRecentTrace();
             self.faulted = true;
             self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
             self.terminated = true;
             return false;
         }
@@ -614,8 +700,102 @@ pub const MachOState = struct {
             log.warn("reached max steps ({d})", .{max_steps});
             self.faulted = true;
             self.exit_code = 124;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.max_steps_reached);
             self.terminated = true;
         }
+        if (self.unresolved_import_count != 0) {
+            const current_reason = exit_diagnostics.reasonFromValue(self.termination_reason);
+            if (current_reason == .unknown or current_reason == .ret_stack_empty or current_reason == .exit_syscall) {
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+            }
+        }
+        if (self.terminated and (self.exit_code != 0 or self.unresolved_import_count != 0)) {
+            self.logExitDiagnostics();
+        }
+    }
+
+    fn logExitDiagnostics(self: *const MachOState) void {
+        const reason: exit_diagnostics.TerminationReason = exit_diagnostics.reasonFromValue(self.termination_reason);
+        var report = exit_diagnostics.ExitReport{
+            .exit_code = self.exit_code,
+            .reason = reason,
+            .faulted = self.faulted,
+            .rip = self.regs.rip,
+            .regs = .{
+                .rax = self.regs.rax,
+                .rbx = self.regs.rbx,
+                .rcx = self.regs.rcx,
+                .rdx = self.regs.rdx,
+                .rsi = self.regs.rsi,
+                .rdi = self.regs.rdi,
+                .rbp = self.regs.rbp,
+                .rsp = self.regs.rsp,
+                .r8 = self.regs.r8,
+                .r9 = self.regs.r9,
+                .r10 = self.regs.r10,
+                .r11 = self.regs.r11,
+                .r12 = self.regs.r12,
+                .r13 = self.regs.r13,
+                .r14 = self.regs.r14,
+                .r15 = self.regs.r15,
+            },
+            .execution_authoritative = self.unresolved_import_count == 0,
+        };
+
+        if (self.metadata.nearestSymbol(self.regs.rip)) |symbol| {
+            report.terminal_symbol = .{
+                .address = symbol.address,
+                .symbol = symbol.name,
+                .symbol_offset = symbol.offset,
+            };
+        }
+
+        const import_trace_count: usize = if (self.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else self.import_trace_index;
+        if (import_trace_count > 0) {
+            var import_trace_buf: [IMPORT_TRACE_BUFFER_LEN]exit_diagnostics.DependencyCall = undefined;
+            for (0..import_trace_count) |i| {
+                const idx = if (self.import_trace_filled)
+                    (self.import_trace_index + i) % IMPORT_TRACE_BUFFER_LEN
+                else
+                    i;
+                const entry = self.import_trace_entries[idx];
+                import_trace_buf[i] = .{
+                    .symbol = entry.symbol,
+                    .image = entry.dylib,
+                    .stub_address = entry.stub_address,
+                    .return_address = entry.return_address,
+                    .synthetic_result = entry.synthetic_result,
+                    .caller_symbol = entry.caller_symbol,
+                    .caller_offset = entry.caller_offset,
+                };
+            }
+            report.dependency_calls = import_trace_buf[0..import_trace_count];
+            report.detail = "The interpreter did not execute these dynamic-library functions; the guest exit code is not authoritative.";
+        }
+
+        const trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        if (trace_count > 0) {
+            var trace_buf: [TRACE_BUFFER_LEN]exit_diagnostics.TraceEntry = undefined;
+            for (0..trace_count) |i| {
+                const idx = if (self.trace_filled)
+                    (self.trace_index + i) % TRACE_BUFFER_LEN
+                else
+                    i;
+                const entry = self.trace_entries[idx];
+                trace_buf[i] = .{
+                    .rip = entry.rip,
+                    .op = @tagName(entry.op),
+                    .len = entry.len,
+                    .rsp = entry.rsp,
+                    .rax = entry.rax,
+                    .rcx = entry.rcx,
+                    .rdx = entry.rdx,
+                };
+            }
+            report.last_instructions = trace_buf[0..trace_count];
+        }
+
+        exit_diagnostics.logExitReport(report);
     }
 
     pub fn execute(self: *MachOState, d: DecodedInsn) void {
@@ -623,27 +803,61 @@ pub const MachOState = struct {
             .invalid => unreachable,
             .nop => {},
 
-            .mov_reg8_mem8 => { self.setReg(d.dst_reg, .bits8, self.readMemVal(d.addr, .bits8)); },
-            .mov_reg16_mem16 => { self.setReg(d.dst_reg, .bits16, self.readMemVal(d.addr, .bits16)); },
-            .mov_reg32_mem32 => { self.setReg(d.dst_reg, .bits32, self.readMemVal(d.addr, .bits32)); },
-            .mov_reg64_mem64 => { self.setReg(d.dst_reg, .bits64, self.readMemVal(d.addr, .bits64)); },
+            .mov_reg8_mem8 => {
+                self.setReg(d.dst_reg, .bits8, self.readMemVal(d.addr, .bits8));
+            },
+            .mov_reg16_mem16 => {
+                self.setReg(d.dst_reg, .bits16, self.readMemVal(d.addr, .bits16));
+            },
+            .mov_reg32_mem32 => {
+                self.setReg(d.dst_reg, .bits32, self.readMemVal(d.addr, .bits32));
+            },
+            .mov_reg64_mem64 => {
+                self.setReg(d.dst_reg, .bits64, self.readMemVal(d.addr, .bits64));
+            },
 
-            .mov_mem8_reg8 => { self.writeMemVal(d.addr, .bits8, self.regVal(d.src_reg, .bits8)); },
-            .mov_mem16_reg16 => { self.writeMemVal(d.addr, .bits16, self.regVal(d.src_reg, .bits16)); },
-            .mov_mem32_reg32 => { self.writeMemVal(d.addr, .bits32, self.regVal(d.src_reg, .bits32)); },
-            .mov_mem64_reg64 => { self.writeMemVal(d.addr, .bits64, self.regVal(d.src_reg, .bits64)); },
+            .mov_mem8_reg8 => {
+                self.writeMemVal(d.addr, .bits8, self.regVal(d.src_reg, .bits8));
+            },
+            .mov_mem16_reg16 => {
+                self.writeMemVal(d.addr, .bits16, self.regVal(d.src_reg, .bits16));
+            },
+            .mov_mem32_reg32 => {
+                self.writeMemVal(d.addr, .bits32, self.regVal(d.src_reg, .bits32));
+            },
+            .mov_mem64_reg64 => {
+                self.writeMemVal(d.addr, .bits64, self.regVal(d.src_reg, .bits64));
+            },
 
-            .mov_reg_imm => { self.setReg(d.dst_reg, d.size, d.imm); },
+            .mov_reg_imm => {
+                self.setReg(d.dst_reg, d.size, d.imm);
+            },
 
-            .mov_mem8_imm8 => { self.writeMemVal(d.addr, .bits8, d.imm); },
-            .mov_mem16_imm16 => { self.writeMemVal(d.addr, .bits16, d.imm); },
-            .mov_mem32_imm32 => { self.writeMemVal(d.addr, .bits32, d.imm); },
-            .mov_mem64_imm32 => { self.writeMemVal(d.addr, .bits64, d.imm); },
+            .mov_mem8_imm8 => {
+                self.writeMemVal(d.addr, .bits8, d.imm);
+            },
+            .mov_mem16_imm16 => {
+                self.writeMemVal(d.addr, .bits16, d.imm);
+            },
+            .mov_mem32_imm32 => {
+                self.writeMemVal(d.addr, .bits32, d.imm);
+            },
+            .mov_mem64_imm32 => {
+                self.writeMemVal(d.addr, .bits64, d.imm);
+            },
 
-            .mov_reg8_reg8 => { self.setReg(d.dst_reg, .bits8, self.regVal(d.src_reg, .bits8)); },
-            .mov_reg16_reg16 => { self.setReg(d.dst_reg, .bits16, self.regVal(d.src_reg, .bits16)); },
-            .mov_reg32_reg32 => { self.setReg(d.dst_reg, .bits32, self.regVal(d.src_reg, .bits32)); },
-            .mov_reg64_reg64 => { self.setReg(d.dst_reg, .bits64, self.regVal(d.src_reg, .bits64)); },
+            .mov_reg8_reg8 => {
+                self.setReg(d.dst_reg, .bits8, self.regVal(d.src_reg, .bits8));
+            },
+            .mov_reg16_reg16 => {
+                self.setReg(d.dst_reg, .bits16, self.regVal(d.src_reg, .bits16));
+            },
+            .mov_reg32_reg32 => {
+                self.setReg(d.dst_reg, .bits32, self.regVal(d.src_reg, .bits32));
+            },
+            .mov_reg64_reg64 => {
+                self.setReg(d.dst_reg, .bits64, self.regVal(d.src_reg, .bits64));
+            },
 
             .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_mem8) + @intFromEnum(Size.bits8));
@@ -860,12 +1074,22 @@ pub const MachOState = struct {
                 self.setFlag(RFL_CF, a != 0);
             },
 
-            .push_reg => { self.push(self.regVal(d.dst_reg, .bits64)); },
-            .push_mem64 => { self.push(self.readMemVal(d.addr, .bits64)); },
-            .push_imm => { self.push(d.imm); },
+            .push_reg => {
+                self.push(self.regVal(d.dst_reg, .bits64));
+            },
+            .push_mem64 => {
+                self.push(self.readMemVal(d.addr, .bits64));
+            },
+            .push_imm => {
+                self.push(d.imm);
+            },
 
-            .pop_reg => { self.setReg(d.dst_reg, .bits64, self.pop()); },
-            .pop_mem64 => { self.writeMemVal(d.addr, .bits64, self.pop()); },
+            .pop_reg => {
+                self.setReg(d.dst_reg, .bits64, self.pop());
+            },
+            .pop_mem64 => {
+                self.writeMemVal(d.addr, .bits64, self.pop());
+            },
 
             .lods => {
                 const src_addr = self.regs.rsi;
@@ -918,6 +1142,7 @@ pub const MachOState = struct {
                 }
                 const ret_addr = self.pop();
                 if (ret_addr == 0) {
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.ret_stack_empty);
                     self.terminated = true;
                     self.exit_code = self.regs.rax;
                     return;
@@ -931,6 +1156,7 @@ pub const MachOState = struct {
                 self.regs.rip = d.addr;
             },
             .jmp_mem64 => {
+                self.pending_import_stub_rip = if (self.metadata.importAtStub(self.regs.rip) != null) self.regs.rip else null;
                 const target = self.readMemVal(d.addr, .bits64);
                 self.logControlFlow("jmp_mem64", self.regs.rip, target, d.len, null);
                 self.regs.rip = target;
@@ -1004,6 +1230,7 @@ pub const MachOState = struct {
                     self.faulted = true;
                     self.terminated = true;
                     self.exit_code = 136;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.divide_by_zero);
                     return;
                 }
                 const dividend = (@as(u128, self.regs.rdx) << 64) | self.regs.rax;
@@ -1175,12 +1402,17 @@ pub const MachOState = struct {
 
             .syscall => {
                 self.dispatchMacOSSyscall(
-                    self.regs.rdi, self.regs.rsi, self.regs.rdx,
-                    self.regs.r10, self.regs.r8, self.regs.r9,
+                    self.regs.rdi,
+                    self.regs.rsi,
+                    self.regs.rdx,
+                    self.regs.r10,
+                    self.regs.r8,
+                    self.regs.r9,
                 );
             },
 
             .hlt => {
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.hlt);
                 self.terminated = true;
                 self.exit_code = self.regs.rax;
             },
@@ -1189,6 +1421,7 @@ pub const MachOState = struct {
                 log.warn("unimplemented instruction: {s} at rip=0x{x}", .{ @tagName(d.op), self.regs.rip });
                 self.faulted = true;
                 self.exit_code = 127;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unimplemented_instruction);
                 self.terminated = true;
             },
         }
@@ -1220,13 +1453,16 @@ pub const MachOState = struct {
         const number = self.regs.rax;
         log.info("syscall: number=0x{x} ({s}) args=({d}, {d}, {d}, {d}, {d}, {d})", .{
             number, macho_runtime.syscallName(number),
-            arg1, arg2, arg3, arg4, arg5, arg6,
+            arg1,   arg2,
+            arg3,   arg4,
+            arg5,   arg6,
         });
 
         switch (number) {
             @intFromEnum(macho_runtime.Syscall.exit) => {
                 const exit_code = arg1;
                 log.info("exit({d})", .{exit_code});
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
                 self.terminated = true;
                 self.exit_code = exit_code;
             },
@@ -1385,6 +1621,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     std.debug.print("  stack:    0x{x}\n", .{temp_state.stack_size});
     std.debug.print("  mem_base: 0x{x}\n", .{state.mem_base});
     std.debug.print("  entry_vaddr: 0x{x}\n", .{state.entry_point_vaddr});
+    std.debug.print("  dylibs:    {d}\n", .{state.metadata.dylibs.len});
+    std.debug.print("  imports:   {d}\n", .{state.metadata.imports.len});
+    std.debug.print("  initializers: {d}\n", .{state.metadata.initializer_count});
+    if (state.metadata.nearestSymbol(state.entry_point_vaddr)) |entry_symbol| {
+        std.debug.print("  entry_symbol: {s}+0x{x}\n", .{ entry_symbol.name, entry_symbol.offset });
+    }
 
     for (temp_state.segments, 0..) |seg, i| {
         const prot_str = switch (seg.initprot) {
@@ -1416,6 +1658,14 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
 
     std.debug.print("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
 
+    if (state.unresolved_import_count != 0 and !state.faulted) {
+        std.debug.print(
+            "macho-processor: runtime incomplete: {d} unresolved import call(s); guest exit {d} is diagnostic only, returning processor status {d}\n",
+            .{ state.unresolved_import_count, state.exit_code, UNSUPPORTED_RUNTIME_EXIT_CODE },
+        );
+        return UNSUPPORTED_RUNTIME_EXIT_CODE;
+    }
+
     return state.exit_code;
 }
 
@@ -1443,11 +1693,25 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
 
     while (pos < bytes.len) {
         switch (bytes[pos]) {
-            0x66 => { has_66 = true; pos += 1; },
-            0x67 => { pos += 1; },
-            0xF0 => { has_f0 = true; pos += 1; },
-            0xF2 => { has_f2 = true; pos += 1; },
-            0xF3 => { has_f3 = true; pos += 1; },
+            0x66 => {
+                has_66 = true;
+                pos += 1;
+            },
+            0x67 => {
+                pos += 1;
+            },
+            0xF0 => {
+                has_f0 = true;
+                pos += 1;
+            },
+            0xF2 => {
+                has_f2 = true;
+                pos += 1;
+            },
+            0xF3 => {
+                has_f3 = true;
+                pos += 1;
+            },
             0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F => {
                 rex = bytes[pos];
                 pos += 1;
@@ -2156,12 +2420,12 @@ fn decodeArithRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
     const is_mem_to_reg = (opcode & 0x02) != 0;
 
     const op_map: [8]Op = .{
-        .add_reg8_mem8, .or_reg8_mem8, .adc_reg8_mem8, .sbb_reg8_mem8,
+        .add_reg8_mem8, .or_reg8_mem8,  .adc_reg8_mem8, .sbb_reg8_mem8,
         .and_reg8_mem8, .sub_reg8_mem8, .xor_reg8_mem8, .cmp_reg8_mem8,
     };
     const op_map_rev: [8]Op = .{
         .add_mem8_reg8, .or_mem8_reg8, .invalid, .invalid,
-        .and_mem8_reg8, .invalid, .invalid, .cmp_mem8_reg8,
+        .and_mem8_reg8, .invalid,      .invalid, .cmp_mem8_reg8,
     };
 
     if (is_reg_reg or is_mem_to_reg) {
@@ -2318,14 +2582,14 @@ fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     const base_sz = if (sz == .bits8) Size.bits8 else if (sz == .bits16) Size.bits16 else if (sz == .bits32) Size.bits32 else Size.bits64;
 
     const group_ops: [8]Op = .{
-        .add_reg8_imm8, .or_reg8_imm8, .adc_reg8_imm8, .sbb_reg8_imm8,
+        .add_reg8_imm8, .or_reg8_imm8,  .adc_reg8_imm8, .sbb_reg8_imm8,
         .and_reg8_imm8, .sub_reg8_imm8, .xor_reg8_imm8, .cmp_reg8_imm8,
     };
 
     if (is_mem) {
         const mem_group_ops: [8]Op = .{
             .add_mem8_imm8, .invalid, .invalid, .invalid,
-            .invalid, .invalid, .invalid, .cmp_mem8_imm8,
+            .invalid,       .invalid, .invalid, .cmp_mem8_imm8,
         };
         const base = mem_group_ops[group_op];
         if (base == .invalid) {
@@ -2515,11 +2779,21 @@ fn decodeTestRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (is_mem) {
-        d.op = switch (sz) { .bits8 => .test_mem8_reg8, .bits16 => .test_mem16_reg16, .bits32 => .test_mem32_reg32, .bits64 => .test_mem64_reg64 };
+        d.op = switch (sz) {
+            .bits8 => .test_mem8_reg8,
+            .bits16 => .test_mem16_reg16,
+            .bits32 => .test_mem32_reg32,
+            .bits64 => .test_mem64_reg64,
+        };
         d.addr = rm.addr;
         d.src_reg = rm.reg;
     } else {
-        d.op = switch (sz) { .bits8 => .test_reg8_reg8, .bits16 => .test_reg16_reg16, .bits32 => .test_reg32_reg32, .bits64 => .test_reg64_reg64 };
+        d.op = switch (sz) {
+            .bits8 => .test_reg8_reg8,
+            .bits16 => .test_reg16_reg16,
+            .bits32 => .test_reg32_reg32,
+            .bits64 => .test_reg64_reg64,
+        };
         d.dst_reg = rm.reg;
         d.src_reg = @enumFromInt(rm.addr);
     }
@@ -2538,11 +2812,19 @@ fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (is_mem) {
-        d.op = switch (sz) { .bits32 => .xchg_mem32_reg32, .bits64 => .xchg_mem64_reg64, else => .invalid };
+        d.op = switch (sz) {
+            .bits32 => .xchg_mem32_reg32,
+            .bits64 => .xchg_mem64_reg64,
+            else => .invalid,
+        };
         d.addr = rm.addr;
         d.src_reg = rm.reg;
     } else {
-        d.op = switch (sz) { .bits32 => .xchg_mem32_reg32, .bits64 => .xchg_mem64_reg64, else => .invalid };
+        d.op = switch (sz) {
+            .bits32 => .xchg_mem32_reg32,
+            .bits64 => .xchg_mem64_reg64,
+            else => .invalid,
+        };
         d.dst_reg = @enumFromInt(rm.addr);
         d.src_reg = rm.reg;
     }
@@ -2573,11 +2855,19 @@ fn decodeImulImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, 
     pos += imm_size;
 
     if (is_mem) {
-        d.op = switch (sz) { .bits32 => .imul_reg32_mem32_imm8, .bits64 => .imul_reg64_mem64_imm8, else => .imul_reg32_mem32_imm8 };
+        d.op = switch (sz) {
+            .bits32 => .imul_reg32_mem32_imm8,
+            .bits64 => .imul_reg64_mem64_imm8,
+            else => .imul_reg32_mem32_imm8,
+        };
         d.dst_reg = rm.reg;
         d.addr = rm.addr;
     } else {
-        d.op = switch (sz) { .bits32 => .imul_reg32_reg32_imm8, .bits64 => .imul_reg64_reg64_imm8, else => .imul_reg32_reg32_imm8 };
+        d.op = switch (sz) {
+            .bits32 => .imul_reg32_reg32_imm8,
+            .bits64 => .imul_reg64_reg64_imm8,
+            else => .imul_reg32_reg32_imm8,
+        };
         d.dst_reg = rm.reg;
         d.src_reg = @enumFromInt(rm.addr);
     }
@@ -2599,11 +2889,19 @@ fn decodeImulTwoOp(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (is_mem) {
-        d.op = switch (sz) { .bits32 => .imul_reg32_mem32, .bits64 => .imul_reg64_mem64, else => .imul_reg32_mem32 };
+        d.op = switch (sz) {
+            .bits32 => .imul_reg32_mem32,
+            .bits64 => .imul_reg64_mem64,
+            else => .imul_reg32_mem32,
+        };
         d.dst_reg = rm.reg;
         d.addr = rm.addr;
     } else {
-        d.op = switch (sz) { .bits32 => .imul_reg32_reg32, .bits64 => .imul_reg64_reg64, else => .imul_reg32_reg32 };
+        d.op = switch (sz) {
+            .bits32 => .imul_reg32_reg32,
+            .bits64 => .imul_reg64_reg64,
+            else => .imul_reg32_reg32,
+        };
         d.dst_reg = rm.reg;
         d.src_reg = @enumFromInt(rm.addr);
     }
@@ -2623,11 +2921,19 @@ fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, 
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (is_mem) {
-        d.op = switch (sz) { .bits32 => .cmpxchg_mem32_reg32, .bits64 => .cmpxchg_mem64_reg64, else => .cmpxchg_mem32_reg32 };
+        d.op = switch (sz) {
+            .bits32 => .cmpxchg_mem32_reg32,
+            .bits64 => .cmpxchg_mem64_reg64,
+            else => .cmpxchg_mem32_reg32,
+        };
         d.addr = rm.addr;
         d.src_reg = rm.reg;
     } else {
-        d.op = switch (sz) { .bits32 => .cmpxchg_mem32_reg32, .bits64 => .cmpxchg_mem64_reg64, else => .cmpxchg_mem32_reg32 };
+        d.op = switch (sz) {
+            .bits32 => .cmpxchg_mem32_reg32,
+            .bits64 => .cmpxchg_mem64_reg64,
+            else => .cmpxchg_mem32_reg32,
+        };
         d.dst_reg = @enumFromInt(rm.addr);
         d.src_reg = rm.reg;
     }
@@ -2695,7 +3001,11 @@ fn decodeXadd(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (is_mem) {
-        d.op = switch (sz) { .bits32 => .xadd_mem32_reg32, .bits64 => .xadd_mem64_reg64, else => .xadd_mem32_reg32 };
+        d.op = switch (sz) {
+            .bits32 => .xadd_mem32_reg32,
+            .bits64 => .xadd_mem64_reg64,
+            else => .xadd_mem32_reg32,
+        };
         d.addr = rm.addr;
         d.src_reg = rm.reg;
     }
