@@ -495,6 +495,10 @@ const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
 const expand_vpexpandb = @import("EXPAND/VPEXPANDB.zig");
 const expand_vpexpandw = @import("EXPAND/VPEXPANDW.zig");
+const partial_fpatan = @import("PARTIAL/FPATAN.zig");
+const partial_fprem = @import("PARTIAL/FPREM.zig");
+const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
+const partial_fptan = @import("PARTIAL/FPTAN.zig");
 const pause_tpause = @import("PAUSE/TPAUSE.zig");
 const prefetch_prefetchw = @import("PREFETCH/PREFETCHW.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
@@ -1619,6 +1623,10 @@ pub const tables = [_]InstructionTable{
     entry(examine_fxam.family, examine_fxam.path, examine_fxam.source),
     entry(expand_vpexpandb.family, expand_vpexpandb.path, expand_vpexpandb.source),
     entry(expand_vpexpandw.family, expand_vpexpandw.path, expand_vpexpandw.source),
+    entry(partial_fpatan.family, partial_fpatan.path, partial_fpatan.source),
+    entry(partial_fprem.family, partial_fprem.path, partial_fprem.source),
+    entry(partial_fprem1.family, partial_fprem1.path, partial_fprem1.source),
+    entry(partial_fptan.family, partial_fptan.path, partial_fptan.source),
     entry(pause_tpause.family, pause_tpause.path, pause_tpause.source),
     entry(prefetch_prefetchw.family, prefetch_prefetchw.path, prefetch_prefetchw.source),
     entry(prefetch_prefetcht0.family, prefetch_prefetcht0.path, prefetch_prefetcht0.source),
