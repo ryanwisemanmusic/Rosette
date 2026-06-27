@@ -299,6 +299,9 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const save_fsave = @import("SAVE/FSAVE.zig");
+const save_fxsave = @import("SAVE/FXSAVE.zig");
+const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
 const swap_swapgs = @import("SWAP/SWAPGS.zig");
 const sub_sub = @import("SUB/SUB.zig");
 const sub_subpd = @import("SUB/SUBPD.zig");
@@ -942,6 +945,9 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(rotate_rcr.family, rotate_rcr.path, rotate_rcr.source),
     mirror(rotate_rol.family, rotate_rol.path, rotate_rol.source),
     mirror(rotate_ror.family, rotate_ror.path, rotate_ror.source),
+    mirror(save_fsave.family, save_fsave.path, save_fsave.source),
+    mirror(save_fxsave.family, save_fxsave.path, save_fxsave.source),
+    mirror(save_saveprevssp.family, save_saveprevssp.path, save_saveprevssp.source),
     mirror(swap_swapgs.family, swap_swapgs.path, swap_swapgs.source),
     mirror(sub_sub.family, sub_sub.path, sub_sub.source),
     mirror(sub_subpd.family, sub_subpd.path, sub_subpd.source),
