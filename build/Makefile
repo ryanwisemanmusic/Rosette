@@ -102,7 +102,7 @@ FB_LOGGER_OBJ := fb_logger.o
 OBJC_FLAGS := -fobjc-arc -fmodules
 OBJC_FRAMEWORKS := -framework Cocoa -framework Foundation
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib assembler-runner-build compat-router-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse app-wrapper installer uninstaller app-all notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse app-wrapper installer uninstaller app-all notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -204,6 +204,16 @@ elf-processor-dylib:
 		-install_name @rpath/rosette-exec.dylib
 	@echo "Built $(DYLD_DYLIB)"
 
+AVX_SHIM_DYLIB := zig-out/lib/avx-shim.dylib
+avx-shim-build:
+	@mkdir -p zig-out/lib
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig cc -target x86_64-macos -dynamiclib \
+		-o "$(AVX_SHIM_DYLIB)" \
+		"$(ROOT_DIR)/src/compat/rosetta2/avx-shim.c" \
+		-install_name @rpath/avx-shim.dylib \
+		-Wl,-dead_strip_dylibs
+	@echo "Built $(AVX_SHIM_DYLIB)"
+
 assembler-runner-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
 	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep runtime_abi_handshake -Mroot=src/Assemblers/runner.zig --dep abort_trap_taxonomy --dep entrypoint_code_text_segment -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mabort_trap_taxonomy=src/tooling/abort_trap_taxonomy/root.zig -Mentrypoint_code_text_segment=src/entrypoint/code-text-segment/root.zig -femit-bin="$(ASSEMBLER_RUNNER_BIN)"
@@ -212,7 +222,7 @@ compat-router-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
 	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_kernel_process_guard -Mroot="$(COMPAT_ROUTER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -femit-bin="$(COMPAT_ROUTER_BIN)"
 
-shell-helper-build: assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib compat-router-build
+shell-helper-build: assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
 	@mkdir -p zig-out/bin build/.zig-cache/global
 	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
