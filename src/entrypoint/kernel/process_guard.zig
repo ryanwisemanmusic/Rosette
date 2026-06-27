@@ -130,6 +130,12 @@ fn quarantinePathFromEnv(allocator: std.mem.Allocator) ?[]const u8 {
     return std.fs.path.join(allocator, &.{ home, ".rosette", "process-quarantine.log" }) catch null;
 }
 
+fn activePidPathFromEnv(allocator: std.mem.Allocator) ?[]const u8 {
+    const path = getenvSlice("ROSETTE_PROCESS_ACTIVE_PID_FILE") orelse return null;
+    if (path.len == 0 or std.ascii.eqlIgnoreCase(path, "off")) return null;
+    return allocator.dupe(u8, path) catch null;
+}
+
 fn routeRoot(allocator: std.mem.Allocator) ?[]const u8 {
     const env_names = [_][*:0]const u8{
         "ROSETTE_TRACE_ROOT",
@@ -282,10 +288,57 @@ fn sleepMs(ms: u64) void {
 
 fn traceLaunch(options: RunOptions, pid: i32) void {
     traceLine(options, pid, "launch", null);
+    writeActivePidRecord(options, pid, "launch", null);
 }
 
 fn traceExit(options: RunOptions, pid: i32, status: RunStatus) void {
     traceLine(options, pid, "exit", status);
+    writeActivePidRecord(options, pid, "exit", status);
+}
+
+fn writeActivePidRecord(options: RunOptions, pid: i32, event: []const u8, status: ?RunStatus) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = activePidPathFromEnv(allocator) orelse return;
+    if (std.fs.path.dirname(path)) |parent| makePathRecursive(allocator, parent) catch return;
+
+    const temporary_path = std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, c.getpid() }) catch return;
+    const temporary_path_z = allocator.dupeZ(u8, temporary_path) catch return;
+    const final_path_z = allocator.dupeZ(u8, path) catch return;
+    const fp = c.fopen(temporary_path_z.ptr, "wb");
+    if (fp == null) return;
+
+    var record_buffer: [2048]u8 = undefined;
+    const record = formatActivePidRecord(&record_buffer, options, pid, event, status) catch {
+        _ = c.fclose(fp);
+        _ = c.unlink(temporary_path_z.ptr);
+        return;
+    };
+    const written = c.fwrite(record.ptr, 1, record.len, fp);
+    const close_result = c.fclose(fp);
+    if (written != record.len or close_result != 0) {
+        _ = c.unlink(temporary_path_z.ptr);
+        return;
+    }
+    if (c.rename(temporary_path_z.ptr, final_path_z.ptr) != 0) {
+        _ = c.unlink(temporary_path_z.ptr);
+    }
+}
+
+fn formatActivePidRecord(
+    buffer: []u8,
+    options: RunOptions,
+    pid: i32,
+    event: []const u8,
+    status: ?RunStatus,
+) ![]const u8 {
+    const first_arg = if (options.argv.len > 0) options.argv[0] else "";
+    return std.fmt.bufPrint(
+        buffer,
+        "pid={d}\nevent={s}\nlabel={s}\nstatus={s}\nargv0={s}\nepoch={d}\n",
+        .{ pid, event, options.label, if (status) |value| statusName(value) else "pending", first_arg, @as(i64, @intCast(c.time(null))) },
+    );
 }
 
 fn traceLine(options: RunOptions, pid: i32, event: []const u8, status: ?RunStatus) void {
@@ -347,4 +400,16 @@ test "wait status decodes exit codes" {
 test "run status maps timeout to shell timeout code" {
     const status = RunStatus{ .timed_out = .{ .pid = 10, .signaled_group = true, .survived = false } };
     try std.testing.expectEqual(@as(u8, 124), status.exitCode());
+}
+
+test "active pid record identifies the routed child" {
+    var buffer: [512]u8 = undefined;
+    const record = try formatActivePidRecord(&buffer, .{
+        .argv = &.{ "/usr/bin/env", "/usr/bin/arch", "-x86_64", "Xenia" },
+        .label = "apple_rosetta2",
+    }, 4242, "launch", null);
+    try std.testing.expect(std.mem.indexOf(u8, record, "pid=4242\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record, "event=launch\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record, "label=apple_rosetta2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record, "argv0=/usr/bin/env\n") != null);
 }
