@@ -3,6 +3,7 @@ const classifier = @import("classifier.zig");
 const process_guard = @import("entrypoint_kernel_process_guard");
 const trace = @import("trace.zig");
 const types = @import("types.zig");
+const exit_diagnostics = @import("exit_diagnostics");
 
 const c = @cImport({
     @cInclude("stdio.h");
@@ -53,7 +54,7 @@ pub fn runTarget(
     if (shouldAbortRoute(effective_policy, plan.decision)) abortRoute(plan.decision);
     if (plan.decision.backend == .unsupported) return 126;
 
-    const exit_code = try runArgv(init.io, plan.argv, plan.cwd);
+    const exit_code = try runArgv(init.io, plan.argv, plan.cwd, plan.decision.backend.label());
     if (try fallbackAfterRosetteMachOFailure(init, allocator, class, target_args, effective_policy, plan.decision, exit_code, trace_path)) |fallback_code| {
         return fallback_code;
     }
@@ -228,6 +229,9 @@ fn fallbackAfterRosetteMachOFailure(
     if (decision.backend != .rosette_macho) return null;
     if (!allowsFallbackAfterRosetteFailure(policy)) return null;
 
+    std.debug.print("rosette-router: \x1b[33mEXIT BROADCAST\x1b[0m backend={s} exit_code={d}\n", .{ @tagName(decision.backend), exit_code });
+    std.debug.print("rosette-router: {s}\n", .{decision.detail});
+
     const fallback_plan = try appleRosetta2FallbackPlan(allocator, class, target_args, exit_code);
     if (policy.trace_enabled) {
         trace.appendDecision(allocator, trace_path, class, fallback_plan.decision, fallback_plan.argv) catch |err| {
@@ -236,7 +240,7 @@ fn fallbackAfterRosetteMachOFailure(
     }
     printPlan(allocator, class, fallback_plan, if (policy.trace_enabled) trace_path else null);
     if (shouldAbortRoute(policy, fallback_plan.decision)) abortRoute(fallback_plan.decision);
-    return try runArgv(init.io, fallback_plan.argv, fallback_plan.cwd);
+    return try runArgv(init.io, fallback_plan.argv, fallback_plan.cwd, fallback_plan.decision.backend.label());
 }
 
 fn allowsFallbackAfterRosetteFailure(policy: Policy) bool {
@@ -270,12 +274,15 @@ fn appleRosetta2FallbackPlan(
     return .{
         .decision = .{
             .backend = .apple_rosetta2,
-            .reason = .rosette_backend_pending,
-            .detail = try std.fmt.allocPrint(
-                allocator,
-                "Rosette Mach-O backend exited with status {d}; falling back to Apple Rosetta 2",
-                .{exit_code},
-            ),
+            .reason = if (exit_code == 125) .macho_runtime_incomplete else .rosette_backend_pending,
+            .detail = if (exit_code == 125)
+                try allocator.dupe(u8, "Rosette Mach-O diagnostics found unresolved dynamic-library calls; falling back to Apple Rosetta 2 for authoritative execution")
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "Rosette Mach-O backend exited with status {d}; falling back to Apple Rosetta 2",
+                    .{exit_code},
+                ),
         },
         .argv = try argv.toOwnedSlice(allocator),
         .cwd = if (class.target_kind == .app_bundle) std.fs.path.dirname(class.executable_path) else null,
@@ -637,14 +644,14 @@ fn resolveOnPath(allocator: std.mem.Allocator, tool_name: []const u8) ?[]const u
     return null;
 }
 
-fn runArgv(io: std.Io, argv: []const []const u8, cwd: ?[]const u8) !u8 {
+fn runArgv(io: std.Io, argv: []const []const u8, cwd: ?[]const u8, label: []const u8) !u8 {
     return process_guard.runExitCode(io, .{
         .argv = argv,
         .cwd = cwd,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
-        .label = "rosette-router",
+        .label = label,
         .timeout_ms = process_guard.timeoutFromEnv(null),
     }) catch |err| {
         if (argv.len > 0) {
@@ -859,6 +866,9 @@ test "non-strict bash script handoff still selects script backend" {
 }
 
 test "Apple Rosetta fallback plan strips or overrides DYLD interposer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const class = types.Classification{
         .target_kind = .file,
         .format = .mach_o,
@@ -868,9 +878,7 @@ test "Apple Rosetta fallback plan strips or overrides DYLD interposer" {
         .has_x86_64 = true,
     };
     const args = [_][]const u8{"--gpu=vulkan"};
-    const plan = try appleRosetta2FallbackPlan(std.testing.allocator, class, &args, 2);
-    defer std.testing.allocator.free(plan.argv);
-    defer std.testing.allocator.free(plan.decision.detail);
+    const plan = try appleRosetta2FallbackPlan(allocator, class, &args, 2);
     try std.testing.expectEqual(types.Backend.apple_rosetta2, plan.decision.backend);
     try std.testing.expectEqualStrings("/usr/bin/env", plan.argv[0]);
     // Find /usr/bin/arch index regardless of DYLD_INSERT_LIBRARIES setup
@@ -884,7 +892,24 @@ test "Apple Rosetta fallback plan strips or overrides DYLD interposer" {
     // (strip) or DYLD_INSERT_LIBRARIES=<path> (override) must appear
     try std.testing.expect(std.mem.startsWith(u8, plan.argv[arch_idx - 1], "DYLD_INSERT_LIBRARIES") or
         (std.mem.eql(u8, plan.argv[arch_idx - 2], "-u") and
-         std.mem.eql(u8, plan.argv[arch_idx - 1], "DYLD_INSERT_LIBRARIES")));
+            std.mem.eql(u8, plan.argv[arch_idx - 1], "DYLD_INSERT_LIBRARIES")));
+}
+
+test "Mach-O status 125 identifies an incomplete dynamic runtime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const class = types.Classification{
+        .target_kind = .file,
+        .format = .mach_o,
+        .arch = .x86_64,
+        .requested_path = "xenia_canary",
+        .executable_path = "xenia_canary",
+        .has_x86_64 = true,
+    };
+    const plan = try appleRosetta2FallbackPlan(allocator, class, &.{}, 125);
+    try std.testing.expectEqual(types.FallbackReason.macho_runtime_incomplete, plan.decision.reason);
+    try std.testing.expect(std.mem.indexOf(u8, plan.decision.detail, "unresolved dynamic-library calls") != null);
 }
 
 test "script shim passes target separator before target args" {
