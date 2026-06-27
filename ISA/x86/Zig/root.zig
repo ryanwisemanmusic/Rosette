@@ -524,6 +524,12 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const absolute_fabs = @import("ABSOLUTE/fabs.zig");
+const absolute_pabsb = @import("ABSOLUTE/pabsb.zig");
+const absolute_pabsd = @import("ABSOLUTE/pabsd.zig");
+const absolute_pabsq = @import("ABSOLUTE/pabsq.zig");
+const absolute_pabsw = @import("ABSOLUTE/pabsw.zig");
+const absolute_vdbpsadbw = @import("ABSOLUTE/vdbpsadbw.zig");
 const accumulate_crc32 = @import("ACCUMULATE/crc32.zig");
 const reverse_fdivr = @import("REVERSE/fdivr.zig");
 const reverse_fdivrp = @import("REVERSE/fdivrp.zig");
@@ -1621,6 +1627,12 @@ pub const tables = [_]InstructionTable{
     entry(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),
     entry(wait_wait.family, wait_wait.path, wait_wait.source),
     entry(wait_mwait.family, wait_mwait.path, wait_mwait.source),
+    entry(absolute_fabs.family, absolute_fabs.path, absolute_fabs.source),
+    entry(absolute_pabsb.family, absolute_pabsb.path, absolute_pabsb.source),
+    entry(absolute_pabsd.family, absolute_pabsd.path, absolute_pabsd.source),
+    entry(absolute_pabsq.family, absolute_pabsq.path, absolute_pabsq.source),
+    entry(absolute_pabsw.family, absolute_pabsw.path, absolute_pabsw.source),
+    entry(absolute_vdbpsadbw.family, absolute_vdbpsadbw.path, absolute_vdbpsadbw.source),
     entry(accumulate_crc32.family, accumulate_crc32.path, accumulate_crc32.source),
     entry(reverse_fdivr.family, reverse_fdivr.path, reverse_fdivr.source),
     entry(reverse_fdivrp.family, reverse_fdivrp.path, reverse_fdivrp.source),
