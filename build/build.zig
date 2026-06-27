@@ -155,6 +155,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const exit_diagnostics_module = b.createModule(.{
+        .root_source_file = b.path("../src/tooling/exit_diagnostics/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const x86_asm_module = b.createModule(.{
         .root_source_file = b.path("../src/x86-ASM/title_entries.zig"),
         .target = target,
@@ -905,6 +910,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         compat_router_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
+        compat_router_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         const compat_router = b.addExecutable(.{
             .name = "rosette-router",
             .root_module = compat_router_mod,
@@ -918,6 +924,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         compat_router_test_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
+        compat_router_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         const compat_router_test = b.addTest(.{ .root_module = compat_router_test_mod });
         check_step.dependOn(&compat_router_test.step);
     }
@@ -1025,6 +1032,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("x64_decoder", x64_decoder_mod);
         macho_processor_mod.addImport("x64_interpreter", x64_interpreter_mod);
         macho_processor_mod.addImport("macho_runtime", macho_runtime_mod);
+        macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         const macho_processor = b.addExecutable(.{
             .name = "macho_processor",
             .root_module = macho_processor_mod,
