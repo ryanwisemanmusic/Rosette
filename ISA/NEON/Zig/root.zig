@@ -142,6 +142,18 @@ const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
+const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
+const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
+const concatenate_vpshldvd = @import("CONCATENATE/vpshldvd.zig");
+const concatenate_vpshldvq = @import("CONCATENATE/vpshldvq.zig");
+const concatenate_vpshldvw = @import("CONCATENATE/vpshldvw.zig");
+const concatenate_vpshldw = @import("CONCATENATE/vpshldw.zig");
+const concatenate_vpshrdd = @import("CONCATENATE/vpshrdd.zig");
+const concatenate_vpshrdq = @import("CONCATENATE/vpshrdq.zig");
+const concatenate_vpshrdvd = @import("CONCATENATE/vpshrdvd.zig");
+const concatenate_vpshrdvq = @import("CONCATENATE/vpshrdvq.zig");
+const concatenate_vpshrdvw = @import("CONCATENATE/vpshrdvw.zig");
+const concatenate_vpshrdw = @import("CONCATENATE/vpshrdw.zig");
 const conditional_cmova = @import("CONDITIONAL/CMOVA.zig");
 const conditional_cmovae = @import("CONDITIONAL/CMOVAE.zig");
 const conditional_cmovb = @import("CONDITIONAL/CMOVB.zig");
@@ -768,6 +780,18 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(load_xsusldtrk.family, load_xsusldtrk.path, load_xsusldtrk.source),
     mirror(abort_xabort.family, abort_xabort.path, abort_xabort.source),
     mirror(begin_xbegin.family, begin_xbegin.path, begin_xbegin.source),
+    mirror(concatenate_vpshldd.family, concatenate_vpshldd.path, concatenate_vpshldd.source),
+    mirror(concatenate_vpshldq.family, concatenate_vpshldq.path, concatenate_vpshldq.source),
+    mirror(concatenate_vpshldvd.family, concatenate_vpshldvd.path, concatenate_vpshldvd.source),
+    mirror(concatenate_vpshldvq.family, concatenate_vpshldvq.path, concatenate_vpshldvq.source),
+    mirror(concatenate_vpshldvw.family, concatenate_vpshldvw.path, concatenate_vpshldvw.source),
+    mirror(concatenate_vpshldw.family, concatenate_vpshldw.path, concatenate_vpshldw.source),
+    mirror(concatenate_vpshrdd.family, concatenate_vpshrdd.path, concatenate_vpshrdd.source),
+    mirror(concatenate_vpshrdq.family, concatenate_vpshrdq.path, concatenate_vpshrdq.source),
+    mirror(concatenate_vpshrdvd.family, concatenate_vpshrdvd.path, concatenate_vpshrdvd.source),
+    mirror(concatenate_vpshrdvq.family, concatenate_vpshrdvq.path, concatenate_vpshrdvq.source),
+    mirror(concatenate_vpshrdvw.family, concatenate_vpshrdvw.path, concatenate_vpshrdvw.source),
+    mirror(concatenate_vpshrdw.family, concatenate_vpshrdw.path, concatenate_vpshrdw.source),
     mirror(conditional_cmova.family, conditional_cmova.path, conditional_cmova.source),
     mirror(conditional_cmovae.family, conditional_cmovae.path, conditional_cmovae.source),
     mirror(conditional_cmovb.family, conditional_cmovb.path, conditional_cmovb.source),
