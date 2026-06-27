@@ -525,6 +525,12 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const absolute_fabs = @import("ABSOLUTE/fabs.zig");
+const absolute_pabsb = @import("ABSOLUTE/pabsb.zig");
+const absolute_pabsd = @import("ABSOLUTE/pabsd.zig");
+const absolute_pabsq = @import("ABSOLUTE/pabsq.zig");
+const absolute_pabsw = @import("ABSOLUTE/pabsw.zig");
+const absolute_vdbpsadbw = @import("ABSOLUTE/vdbpsadbw.zig");
 const accumulate_crc32 = @import("ACCUMULATE/crc32.zig");
 const reverse_fdivr = @import("REVERSE/fdivr.zig");
 const reverse_fdivrp = @import("REVERSE/fdivrp.zig");
@@ -1136,6 +1142,12 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),
     mirror(wait_wait.family, wait_wait.path, wait_wait.source),
     mirror(wait_mwait.family, wait_mwait.path, wait_mwait.source),
+    mirror(absolute_fabs.family, absolute_fabs.path, absolute_fabs.source),
+    mirror(absolute_pabsb.family, absolute_pabsb.path, absolute_pabsb.source),
+    mirror(absolute_pabsd.family, absolute_pabsd.path, absolute_pabsd.source),
+    mirror(absolute_pabsq.family, absolute_pabsq.path, absolute_pabsq.source),
+    mirror(absolute_pabsw.family, absolute_pabsw.path, absolute_pabsw.source),
+    mirror(absolute_vdbpsadbw.family, absolute_vdbpsadbw.path, absolute_vdbpsadbw.source),
     mirror(accumulate_crc32.family, accumulate_crc32.path, accumulate_crc32.source),
     mirror(reverse_fdivr.family, reverse_fdivr.path, reverse_fdivr.source),
     mirror(reverse_fdivrp.family, reverse_fdivrp.path, reverse_fdivrp.source),

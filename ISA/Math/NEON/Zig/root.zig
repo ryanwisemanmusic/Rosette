@@ -527,6 +527,12 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const absolute_fabs = @import("ABSOLUTE/fabs.zig");
+const absolute_pabsb = @import("ABSOLUTE/pabsb.zig");
+const absolute_pabsd = @import("ABSOLUTE/pabsd.zig");
+const absolute_pabsq = @import("ABSOLUTE/pabsq.zig");
+const absolute_pabsw = @import("ABSOLUTE/pabsw.zig");
+const absolute_vdbpsadbw = @import("ABSOLUTE/vdbpsadbw.zig");
 const accumulate_crc32 = @import("ACCUMULATE/crc32.zig");
 const reverse_fdivr = @import("REVERSE/fdivr.zig");
 const reverse_fdivrp = @import("REVERSE/fdivrp.zig");
@@ -1067,6 +1073,12 @@ pub const specs = blk: {
         spec(trig_fsincos.meta),
         spec(wait_wait.meta),
         spec(wait_mwait.meta),
+        spec(absolute_fabs.meta),
+        spec(absolute_pabsb.meta),
+        spec(absolute_pabsd.meta),
+        spec(absolute_pabsq.meta),
+        spec(absolute_pabsw.meta),
+        spec(absolute_vdbpsadbw.meta),
         spec(accumulate_crc32.meta),
         spec(reverse_fdivr.meta),
         spec(reverse_fdivrp.meta),
@@ -1607,6 +1619,12 @@ pub const proof_reports = [_]proofs.ProofReport{
     trig_fsincos.proof_report,
     wait_wait.proof_report,
     wait_mwait.proof_report,
+    absolute_fabs.proof_report,
+    absolute_pabsb.proof_report,
+    absolute_pabsd.proof_report,
+    absolute_pabsq.proof_report,
+    absolute_pabsw.proof_report,
+    absolute_vdbpsadbw.proof_report,
     accumulate_crc32.proof_report,
     reverse_fdivr.proof_report,
     reverse_fdivrp.proof_report,
