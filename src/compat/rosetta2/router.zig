@@ -106,8 +106,12 @@ pub fn buildPlan(
         },
         .apple_rosetta2 => {
             try argv.append(allocator, "/usr/bin/env");
-            try argv.append(allocator, "-u");
-            try argv.append(allocator, "DYLD_INSERT_LIBRARIES");
+            if (resolveAvxShim(allocator)) |shim| {
+                try appendEnv(&argv, allocator, "DYLD_INSERT_LIBRARIES", shim);
+            } else {
+                try argv.append(allocator, "-u");
+                try argv.append(allocator, "DYLD_INSERT_LIBRARIES");
+            }
             try argv.append(allocator, "/usr/bin/arch");
             try argv.append(allocator, "-x86_64");
             try argv.append(allocator, class.executable_path);
@@ -252,8 +256,12 @@ fn appleRosetta2FallbackPlan(
     errdefer argv.deinit(allocator);
 
     try argv.append(allocator, "/usr/bin/env");
-    try argv.append(allocator, "-u");
-    try argv.append(allocator, "DYLD_INSERT_LIBRARIES");
+    if (resolveAvxShim(allocator)) |shim| {
+        try appendEnv(&argv, allocator, "DYLD_INSERT_LIBRARIES", shim);
+    } else {
+        try argv.append(allocator, "-u");
+        try argv.append(allocator, "DYLD_INSERT_LIBRARIES");
+    }
     try argv.append(allocator, "/usr/bin/arch");
     try argv.append(allocator, "-x86_64");
     try argv.append(allocator, class.executable_path);
@@ -563,6 +571,17 @@ fn resolveDylib(allocator: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
+fn resolveAvxShim(allocator: std.mem.Allocator) ?[]const u8 {
+    if (getenvSlice("ROSETTE_AVX_SHIM")) |path| {
+        if (canExecuteOrExists(allocator, path)) return allocator.dupe(u8, path) catch null;
+    }
+    if (getenvSlice("HOME")) |home| {
+        const installed = std.fs.path.join(allocator, &.{ home, ".rosette", "lib", "avx-shim.dylib" }) catch return null;
+        if (canExecuteOrExists(allocator, installed)) return installed;
+    }
+    return null;
+}
+
 fn shouldAbortRoute(policy: Policy, decision: types.Decision) bool {
     return switch (decision.backend) {
         .apple_rosetta2 => policy.strict_rosette or policy.abort_on_fallback,
@@ -839,7 +858,7 @@ test "non-strict bash script handoff still selects script backend" {
     try std.testing.expectEqual(types.Backend.rosette_script, decision.backend);
 }
 
-test "Apple Rosetta fallback plan strips DYLD interposer" {
+test "Apple Rosetta fallback plan strips or overrides DYLD interposer" {
     const class = types.Classification{
         .target_kind = .file,
         .format = .mach_o,
@@ -854,10 +873,18 @@ test "Apple Rosetta fallback plan strips DYLD interposer" {
     defer std.testing.allocator.free(plan.decision.detail);
     try std.testing.expectEqual(types.Backend.apple_rosetta2, plan.decision.backend);
     try std.testing.expectEqualStrings("/usr/bin/env", plan.argv[0]);
-    try std.testing.expectEqualStrings("-u", plan.argv[1]);
-    try std.testing.expectEqualStrings("DYLD_INSERT_LIBRARIES", plan.argv[2]);
-    try std.testing.expectEqualStrings("/usr/bin/arch", plan.argv[3]);
-    try std.testing.expectEqualStrings("-x86_64", plan.argv[4]);
+    // Find /usr/bin/arch index regardless of DYLD_INSERT_LIBRARIES setup
+    const arch_idx = for (plan.argv, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "/usr/bin/arch")) break i;
+    } else @panic("expected /usr/bin/arch in argv");
+    try std.testing.expectEqualStrings("-x86_64", plan.argv[arch_idx + 1]);
+    try std.testing.expectEqualStrings(class.executable_path, plan.argv[arch_idx + 2]);
+    try std.testing.expectEqualStrings(args[0], plan.argv[arch_idx + 3]);
+    // Between plan.argv[0] (env) and arch_idx, either -u DYLD_INSERT_LIBRARIES
+    // (strip) or DYLD_INSERT_LIBRARIES=<path> (override) must appear
+    try std.testing.expect(std.mem.startsWith(u8, plan.argv[arch_idx - 1], "DYLD_INSERT_LIBRARIES") or
+        (std.mem.eql(u8, plan.argv[arch_idx - 2], "-u") and
+         std.mem.eql(u8, plan.argv[arch_idx - 1], "DYLD_INSERT_LIBRARIES")));
 }
 
 test "script shim passes target separator before target args" {
