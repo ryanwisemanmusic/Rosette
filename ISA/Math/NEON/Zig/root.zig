@@ -13,6 +13,15 @@ const add_addss = @import("ADD/ADDSS.zig");
 const add_addsubpd = @import("ADD/ADDSUBPD.zig");
 const add_addsubps = @import("ADD/ADDSUBPS.zig");
 const add_adox = @import("ADD/ADOX.zig");
+const add_fadd = @import("ADD/fadd.zig");
+const add_faddp = @import("ADD/faddp.zig");
+const add_fiadd = @import("ADD/fiadd.zig");
+const add_haddpd = @import("ADD/haddpd.zig");
+const add_haddps = @import("ADD/haddps.zig");
+const add_kaddb = @import("ADD/kaddb.zig");
+const add_kaddd = @import("ADD/kaddd.zig");
+const add_kaddq = @import("ADD/kaddq.zig");
+const add_kaddw = @import("ADD/kaddw.zig");
 const ascii_aaa = @import("ASCII/AAA.zig");
 const ascii_aad = @import("ASCII/AAD.zig");
 const ascii_aam = @import("ASCII/AAM.zig");
@@ -559,6 +568,15 @@ pub const specs = blk: {
         spec(add_addsubpd.meta),
         spec(add_addsubps.meta),
         spec(add_adox.meta),
+        spec(add_fadd.meta),
+        spec(add_faddp.meta),
+        spec(add_fiadd.meta),
+        spec(add_haddpd.meta),
+        spec(add_haddps.meta),
+        spec(add_kaddb.meta),
+        spec(add_kaddd.meta),
+        spec(add_kaddq.meta),
+        spec(add_kaddw.meta),
         spec(ascii_aaa.meta),
         spec(ascii_aad.meta),
         spec(ascii_aam.meta),
@@ -1105,6 +1123,15 @@ pub const proof_reports = [_]proofs.ProofReport{
     add_addsubpd.proof_report,
     add_addsubps.proof_report,
     add_adox.proof_report,
+    add_fadd.proof_report,
+    add_faddp.proof_report,
+    add_fiadd.proof_report,
+    add_haddpd.proof_report,
+    add_haddps.proof_report,
+    add_kaddb.proof_report,
+    add_kaddd.proof_report,
+    add_kaddq.proof_report,
+    add_kaddw.proof_report,
     ascii_aaa.proof_report,
     ascii_aad.proof_report,
     ascii_aam.proof_report,
