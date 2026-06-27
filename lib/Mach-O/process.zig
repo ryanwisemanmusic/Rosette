@@ -84,8 +84,20 @@ pub const MachOState = struct {
         }
 
         var entry_vaddr: u64 = state.entry_point;
-        if (state.entry_point > 0 and state.entry_point < image_size) {
-            entry_vaddr = image_base + state.entry_point;
+        if (state.entry_point > 0) {
+            var mapped_entry: ?u64 = null;
+            for (state.segments) |seg| {
+                const file_range_end = seg.fileoff + seg.filesize;
+                if (state.entry_point >= seg.fileoff and state.entry_point < file_range_end) {
+                    mapped_entry = seg.vmaddr + (state.entry_point - seg.fileoff);
+                    break;
+                }
+            }
+            if (mapped_entry) |resolved| {
+                entry_vaddr = resolved;
+            } else if (state.entry_point < image_size) {
+                entry_vaddr = image_base + state.entry_point;
+            }
         }
 
         return MachOState{
@@ -363,7 +375,11 @@ pub const MachOState = struct {
             return false;
         }
         log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
+        const old_rip = self.regs.rip;
         x64_interpreter.execute(self, decoded);
+        if (!self.terminated and self.regs.rip == old_rip) {
+            self.regs.rip +%= decoded.len;
+        }
         return !self.terminated;
     }
 
@@ -1425,6 +1441,31 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
         0x8C => {
             d.op = .nop;
             d.len = @as(u8, @intCast(pos + 2));
+        },
+
+        0xB8...0xBF => {
+            d.op = .mov_reg_imm;
+            d.dst_reg = mapReg(opcode - 0xB8, rex_b);
+            const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+            d.size = sz;
+            switch (sz) {
+                .bits16 => {
+                    if (pos + 3 > bytes.len) return .{};
+                    d.imm = std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .little);
+                    d.len = @as(u8, @intCast(pos + 3));
+                },
+                .bits32 => {
+                    if (pos + 5 > bytes.len) return .{};
+                    d.imm = std.mem.readInt(u32, bytes[pos + 1 ..][0..4], .little);
+                    d.len = @as(u8, @intCast(pos + 5));
+                },
+                .bits64 => {
+                    if (pos + 9 > bytes.len) return .{};
+                    d.imm = std.mem.readInt(u64, bytes[pos + 1 ..][0..8], .little);
+                    d.len = @as(u8, @intCast(pos + 9));
+                },
+                .bits8 => unreachable,
+            }
         },
 
         0x0C => {
