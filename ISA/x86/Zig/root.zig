@@ -346,6 +346,7 @@ const sha_sha1rnds4 = @import("SHA/SHA1RNDS4.zig");
 const sha_sha256msg1 = @import("SHA/SHA256MSG1.zig");
 const sha_sha256msg2 = @import("SHA/SHA256MSG2.zig");
 const sha_sha256rnds2 = @import("SHA/SHA256RNDS2.zig");
+const shadow_incssp = @import("SHADOW/INCSSP.zig");
 const terminate_endbr32 = @import("TERMINATE/ENDBR32.zig");
 const terminate_endbr64 = @import("TERMINATE/ENDBR64.zig");
 const shuffle_shufpd = @import("SHUFFLE/SHUFPD.zig");
@@ -1470,6 +1471,7 @@ pub const tables = [_]InstructionTable{
     entry(sha_sha256msg1.family, sha_sha256msg1.path, sha_sha256msg1.source),
     entry(sha_sha256msg2.family, sha_sha256msg2.path, sha_sha256msg2.source),
     entry(sha_sha256rnds2.family, sha_sha256rnds2.path, sha_sha256rnds2.source),
+    entry(shadow_incssp.family, shadow_incssp.path, shadow_incssp.source),
     entry(terminate_endbr32.family, terminate_endbr32.path, terminate_endbr32.source),
     entry(terminate_endbr64.family, terminate_endbr64.path, terminate_endbr64.source),
     entry(sys_syscall.family, sys_syscall.path, sys_syscall.source),

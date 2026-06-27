@@ -348,6 +348,7 @@ const sha_sha1rnds4 = @import("SHA/SHA1RNDS4.zig");
 const sha_sha256msg1 = @import("SHA/SHA256MSG1.zig");
 const sha_sha256msg2 = @import("SHA/SHA256MSG2.zig");
 const sha_sha256rnds2 = @import("SHA/SHA256RNDS2.zig");
+const shadow_incssp = @import("SHADOW/INCSSP.zig");
 const terminate_endbr32 = @import("TERMINATE/ENDBR32.zig");
 const terminate_endbr64 = @import("TERMINATE/ENDBR64.zig");
 const shuffle_shufpd = @import("SHUFFLE/SHUFPD.zig");
@@ -915,6 +916,7 @@ pub const specs = blk: {
         spec(sha_sha256msg1.meta),
         spec(sha_sha256msg2.meta),
         spec(sha_sha256rnds2.meta),
+        spec(shadow_incssp.meta),
         spec(terminate_endbr32.meta),
         spec(terminate_endbr64.meta),
         spec(sys_syscall.meta),
@@ -1486,6 +1488,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     sha_sha256msg1.proof_report,
     sha_sha256msg2.proof_report,
     sha_sha256rnds2.proof_report,
+    shadow_incssp.proof_report,
     terminate_endbr32.proof_report,
     terminate_endbr64.proof_report,
     sys_syscall.proof_report,
