@@ -18,13 +18,26 @@ const RFL_CF = x64_decoder.RFL_CF;
 const RFL_ZF = x64_decoder.RFL_ZF;
 const RFL_SF = x64_decoder.RFL_SF;
 const RFL_OF = x64_decoder.RFL_OF;
+const RFL_DF: u32 = 1 << 10;
 
 const STACK_SIZE: u64 = 8 * 1024 * 1024;
 const MEM_SIZE: u64 = 512 * 1024 * 1024;
 const MEM_BASE: u64 = 0x0;
 const PAGE_SIZE: u64 = 4096;
+const TRACE_BUFFER_LEN: usize = 256;
+const STUB_ENTRY_SIZE: u64 = 10;
 
 const MachSegment = macho.MachSegment;
+
+const TraceEntry = struct {
+    rip: u64 = 0,
+    op: Op = .invalid,
+    len: u8 = 0,
+    rsp: u64 = 0,
+    rax: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+};
 
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
@@ -42,6 +55,15 @@ pub const MachOState = struct {
     stack_size: u64 = 0,
     guest_fds: [16]i32 = .{0} ** 16,
     next_guest_fd: u64 = 3,
+    trace_entries: [TRACE_BUFFER_LEN]TraceEntry = [_]TraceEntry{TraceEntry{}} ** TRACE_BUFFER_LEN,
+    trace_index: usize = 0,
+    trace_filled: bool = false,
+    trace_range_start: ?u64 = null,
+    trace_range_end: ?u64 = null,
+    pending_stub_slot: ?u32 = null,
+    pending_stub_entry_rip: ?u64 = null,
+    helper_cluster_start: ?u64 = null,
+    helper_cluster_end: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, binary_data: []const u8) !MachOState {
         var state = try macho.load(allocator, binary_data);
@@ -228,6 +250,172 @@ pub const MachOState = struct {
         return self.mem[off_usize .. off_usize + count_usize];
     }
 
+    fn fileOffsetForVaddr(self: *const MachOState, vaddr: u64) ?u64 {
+        for (self.segments) |seg| {
+            if (vaddr < seg.vmaddr) continue;
+            const delta = vaddr - seg.vmaddr;
+            if (delta < seg.filesize) {
+                return seg.fileoff + delta;
+            }
+        }
+        return null;
+    }
+
+    fn logControlFlow(self: *const MachOState, kind: []const u8, from_rip: u64, to_rip: u64, decoded_len: u64, return_addr: ?u64) void {
+        if (return_addr) |ret_addr| {
+            log.info("cf({s}): rip=0x{x} -> 0x{x} len={d} ret=0x{x} rsp=0x{x}", .{ kind, from_rip, to_rip, decoded_len, ret_addr, self.regs.rsp });
+        } else {
+            log.info("cf({s}): rip=0x{x} -> 0x{x} len={d} rsp=0x{x}", .{ kind, from_rip, to_rip, decoded_len, self.regs.rsp });
+        }
+    }
+
+    fn isStubPushJmpEntry(self: *const MachOState, rip: u64) ?struct { slot: u32, target: u64 } {
+        const bytes = self.guestMemoryConst(rip, STUB_ENTRY_SIZE) orelse return null;
+        if (bytes.len < STUB_ENTRY_SIZE) return null;
+        if (bytes[0] != 0x68 or bytes[5] != 0xE9) return null;
+        const slot = std.mem.readInt(u32, bytes[1..5], .little);
+        const rel = std.mem.readInt(i32, bytes[6..10], .little);
+        const target = @as(u64, @bitCast(@as(i64, @as(i64, @intCast(rip + STUB_ENTRY_SIZE)) + rel)));
+        return .{ .slot = slot, .target = target };
+    }
+
+    fn isSharedStubHelper(self: *const MachOState, rip: u64) bool {
+        const bytes = self.guestMemoryConst(rip, 16) orelse return false;
+        if (bytes.len < 16) return false;
+        return bytes[0] == 0x4C and bytes[1] == 0x8D and bytes[7] == 0x41 and bytes[8] == 0x53 and bytes[9] == 0xFF and bytes[10] == 0x25;
+    }
+
+    fn inHelperCluster(self: *const MachOState, rip: u64) bool {
+        if (self.helper_cluster_start) |start| {
+            const end = self.helper_cluster_end orelse start;
+            return rip >= start and rip < end;
+        }
+        return false;
+    }
+
+    fn findSharedHelperCluster(self: *const MachOState, helper_rip: u64) ?struct { start: u64, end: u64 } {
+        const helper_bytes = self.guestMemoryConst(helper_rip, 16) orelse return null;
+        if (helper_bytes.len < 16) return null;
+        var scan = helper_rip;
+        var found_start: ?u64 = null;
+        var count: usize = 0;
+        while (count < 4096) : (count += 1) {
+            if (scan < STUB_ENTRY_SIZE) break;
+            scan -= STUB_ENTRY_SIZE;
+            if (self.isStubPushJmpEntry(scan)) |stub| {
+                if (stub.target == helper_rip) {
+                    found_start = scan;
+                    continue;
+                }
+            }
+            break;
+        }
+        const start = found_start orelse return null;
+        var end = start;
+        count = 0;
+        while (count < 4096) : (count += 1) {
+            if (self.isStubPushJmpEntry(end)) |stub| {
+                if (stub.target == helper_rip) {
+                    end += STUB_ENTRY_SIZE;
+                    continue;
+                }
+            }
+            break;
+        }
+        return .{ .start = start, .end = end };
+    }
+
+    fn handleStubHelperTransition(self: *MachOState) bool {
+        if (self.isStubPushJmpEntry(self.regs.rip)) |stub| {
+            self.pending_stub_slot = stub.slot;
+            self.pending_stub_entry_rip = self.regs.rip;
+            log.info("stub-entry: rip=0x{x} slot=0x{x} shared_helper=0x{x}", .{ self.regs.rip, stub.slot, stub.target });
+            self.regs.rip = stub.target;
+            return true;
+        }
+
+        if (self.pending_stub_slot != null and self.isSharedStubHelper(self.regs.rip)) {
+            const slot = self.pending_stub_slot.?;
+            const entry_rip = self.pending_stub_entry_rip orelse self.regs.rip;
+            const synthetic_return = self.read64(self.regs.rsp);
+            if (self.findSharedHelperCluster(self.regs.rip)) |cluster| {
+                self.helper_cluster_start = cluster.start;
+                self.helper_cluster_end = cluster.end;
+                log.info("stub-helper cluster: helper_rip=0x{x} cluster=[0x{x}, 0x{x})", .{ self.regs.rip, cluster.start, cluster.end });
+            }
+            self.pending_stub_slot = null;
+            self.pending_stub_entry_rip = null;
+            self.regs.rax = 0;
+            if (synthetic_return != 0 and self.addrToOffset(synthetic_return) != null) {
+                log.warn("stub-helper aggressive fallback: helper_rip=0x{x} slot=0x{x} entry_rip=0x{x} synthetic_return=0x{x}; simulating resolved helper return", .{ self.regs.rip, slot, entry_rip, synthetic_return });
+                _ = self.pop();
+                self.regs.rip = synthetic_return;
+            } else {
+                log.warn("stub-helper conservative fallback: helper_rip=0x{x} slot=0x{x} entry_rip=0x{x}; synthetic_return invalid (0x{x}), skipping helper entry", .{ self.regs.rip, slot, entry_rip, synthetic_return });
+                self.regs.rip = entry_rip + STUB_ENTRY_SIZE;
+            }
+            return true;
+        }
+
+        if (self.inHelperCluster(self.regs.rip)) {
+            const cluster_end = self.helper_cluster_end orelse self.regs.rip;
+            log.warn("helper-cluster escape: rip=0x{x} cluster_end=0x{x}; forcing exit from packed stub region", .{ self.regs.rip, cluster_end });
+            self.regs.rax = 0;
+            self.regs.rip = cluster_end;
+            self.helper_cluster_start = null;
+            self.helper_cluster_end = null;
+            return true;
+        }
+
+        return false;
+    }
+
+    fn recordTrace(self: *MachOState, decoded: DecodedInsn) void {
+        self.trace_entries[self.trace_index] = .{
+            .rip = self.regs.rip,
+            .op = decoded.op,
+            .len = decoded.len,
+            .rsp = self.regs.rsp,
+            .rax = self.regs.rax,
+            .rcx = self.regs.rcx,
+            .rdx = self.regs.rdx,
+        };
+        self.trace_index = (self.trace_index + 1) % TRACE_BUFFER_LEN;
+        if (self.trace_index == 0) self.trace_filled = true;
+    }
+
+    fn shouldTraceRIP(self: *const MachOState, rip: u64) bool {
+        if (self.trace_range_start) |start| {
+            const end = self.trace_range_end orelse start;
+            return rip >= start and rip <= end;
+        }
+        return false;
+    }
+
+    fn dumpRecentTrace(self: *const MachOState) void {
+        const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        if (count == 0) return;
+        log.err("recent trace dump (most recent last, count={d})", .{count});
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const idx = if (self.trace_filled)
+                (self.trace_index + i) % TRACE_BUFFER_LEN
+            else
+                i;
+            const entry = self.trace_entries[idx];
+            log.err("trace[{d}]: rip=0x{x} op={s} len={d} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
+                i,
+                entry.rip,
+                @tagName(entry.op),
+                entry.len,
+                entry.rsp,
+                entry.rax,
+                entry.rcx,
+                entry.rdx,
+            });
+        }
+    }
+
     fn regVal(self: *const MachOState, id: RegId, size: Size) u64 {
         return x64_decoder.regVal(&self.regs, id, size);
     }
@@ -336,6 +524,8 @@ pub const MachOState = struct {
         full_args.append(self.allocator, path) catch {};
         for (args) |a| full_args.append(self.allocator, a) catch {};
 
+        self.trace_range_start = 0x1332000;
+        self.trace_range_end = 0x1333000;
         self.setupInitialStack(full_args.items);
         self.regs.rip = self.entry_point_vaddr;
     }
@@ -362,19 +552,47 @@ pub const MachOState = struct {
     }
 
     fn step(self: *MachOState) bool {
+        if (self.handleStubHelperTransition()) {
+            return !self.terminated;
+        }
         const decoded = self.decodeAt() orelse {
             log.err("decode failed at rip=0x{x}", .{self.regs.rip});
             self.terminated = true;
             return false;
         };
         if (decoded.op == .invalid) {
-            log.err("invalid instruction at rip=0x{x}, bytes: {any}", .{ self.regs.rip, self.mem[self.addrToOffset(self.regs.rip) orelse 0..][0..@min(@as(usize, 16), self.mem.len - (self.addrToOffset(self.regs.rip) orelse 0))] });
+            const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
+            const mem_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
+            log.err("invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}", .{ self.regs.rip, mem_off, mem_bytes });
+            if (self.fileOffsetForVaddr(self.regs.rip)) |file_off| {
+                const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
+                const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
+                log.err("invalid instruction source-map: rip=0x{x} file_off=0x{x} file_bytes={any}", .{ self.regs.rip, file_off, file_bytes });
+            } else {
+                log.err("invalid instruction source-map: rip=0x{x} file_off=<unmapped>", .{self.regs.rip});
+            }
+            self.dumpRecentTrace();
             self.faulted = true;
             self.exit_code = 127;
             self.terminated = true;
             return false;
         }
+        self.recordTrace(decoded);
         log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
+        if (self.shouldTraceRIP(self.regs.rip)) {
+            const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
+            const trace_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
+            log.info("target-trace: rip=0x{x} op={s} len={d} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
+                self.regs.rip,
+                @tagName(decoded.op),
+                decoded.len,
+                self.regs.rsp,
+                self.regs.rax,
+                self.regs.rcx,
+                self.regs.rdx,
+            });
+            log.info("target-trace-bytes: rip=0x{x} bytes={any}", .{ self.regs.rip, trace_bytes });
+        }
         const old_rip = self.regs.rip;
         x64_interpreter.execute(self, decoded);
         if (!self.terminated and self.regs.rip == old_rip) {
@@ -649,20 +867,49 @@ pub const MachOState = struct {
             .pop_reg => { self.setReg(d.dst_reg, .bits64, self.pop()); },
             .pop_mem64 => { self.writeMemVal(d.addr, .bits64, self.pop()); },
 
+            .lods => {
+                const src_addr = self.regs.rsi;
+                switch (d.size) {
+                    .bits8 => self.setReg(.al_ax_eax_rax, .bits8, self.readMemVal(src_addr, .bits8)),
+                    .bits16 => self.setReg(.al_ax_eax_rax, .bits16, self.readMemVal(src_addr, .bits16)),
+                    .bits32 => self.setReg(.al_ax_eax_rax, .bits32, self.readMemVal(src_addr, .bits32)),
+                    .bits64 => self.setReg(.al_ax_eax_rax, .bits64, self.readMemVal(src_addr, .bits64)),
+                }
+                const stride: u64 = switch (d.size) {
+                    .bits8 => 1,
+                    .bits16 => 2,
+                    .bits32 => 4,
+                    .bits64 => 8,
+                };
+                if ((self.regs.rflags & RFL_DF) != 0) {
+                    self.regs.rsi -|= stride;
+                } else {
+                    self.regs.rsi +|= stride;
+                }
+            },
+
             .call_rel32 => {
                 const target = d.addr;
-                self.push(self.regs.rip);
+                const return_addr = self.regs.rip + d.len;
+                self.push(return_addr);
                 self.regs.rip = target;
+                self.logControlFlow("call_rel32", self.regs.rip - d.len, target, d.len, return_addr);
             },
             .call_reg64 => {
+                const from_rip = self.regs.rip;
                 const target = self.regVal(d.dst_reg, .bits64);
-                self.push(self.regs.rip);
+                const return_addr = self.regs.rip + d.len;
+                self.push(return_addr);
                 self.regs.rip = target;
+                self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
             },
             .call_mem64 => {
+                const from_rip = self.regs.rip;
                 const target = self.readMemVal(d.addr, .bits64);
-                self.push(self.regs.rip);
+                const return_addr = self.regs.rip + d.len;
+                self.push(return_addr);
                 self.regs.rip = target;
+                self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
             },
 
             .ret => {
@@ -675,19 +922,26 @@ pub const MachOState = struct {
                     self.exit_code = self.regs.rax;
                     return;
                 }
+                self.logControlFlow("ret", self.regs.rip, ret_addr, d.len, null);
                 self.regs.rip = ret_addr;
             },
 
             .jmp_rel8, .jmp_reg64 => {
+                self.logControlFlow("jmp", self.regs.rip, d.addr, d.len, null);
                 self.regs.rip = d.addr;
             },
             .jmp_mem64 => {
-                self.regs.rip = self.readMemVal(d.addr, .bits64);
+                const target = self.readMemVal(d.addr, .bits64);
+                self.logControlFlow("jmp_mem64", self.regs.rip, target, d.len, null);
+                self.regs.rip = target;
             },
 
             .jcc_rel8, .jcc_rel32 => {
                 const condMet = x64_decoder.evalCond(self.regs.rflags, d.cond);
-                if (condMet) self.regs.rip = d.addr;
+                if (condMet) {
+                    self.logControlFlow("jcc_taken", self.regs.rip, d.addr, d.len, null);
+                    self.regs.rip = d.addr;
+                }
             },
 
             .shl_reg_cl, .shl_mem_cl => {
@@ -1256,6 +1510,12 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             }
         },
 
+        0xAC, 0xAD => {
+            d.op = .lods;
+            d.size = if (opcode == 0xAC) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+            d.len = @as(u8, @intCast(pos + 1));
+        },
+
         0x69, 0x6B => {
             return decodeImulImm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
         },
@@ -1310,6 +1570,15 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
 
         0x80...0x83 => {
             return decodeGroup1Imm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+        },
+
+        0xB0...0xB7 => {
+            d.op = .mov_reg_imm;
+            d.dst_reg = mapReg(opcode - 0xB0, rex_b);
+            d.size = .bits8;
+            if (pos + 2 > bytes.len) return .{};
+            d.imm = bytes[pos + 1];
+            d.len = @as(u8, @intCast(pos + 2));
         },
 
         0xC2, 0xC3 => {
