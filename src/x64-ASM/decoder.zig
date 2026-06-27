@@ -264,6 +264,7 @@ pub const Op = enum(u16) {
     push_imm,
     pop_reg,
     pop_mem64,
+    lods,
     // sign extend
     cbw,
     cwde,

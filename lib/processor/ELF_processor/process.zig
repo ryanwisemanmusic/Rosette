@@ -23,6 +23,7 @@ const RFL_CF = x64_decoder.RFL_CF;
 const RFL_ZF = x64_decoder.RFL_ZF;
 const RFL_SF = x64_decoder.RFL_SF;
 const RFL_OF = x64_decoder.RFL_OF;
+const RFL_DF: u32 = 1 << 10;
 
 const STACK_SIZE: u64 = 1024 * 1024; // 1 MB stack
 const MEM_SIZE: u64 = 64 * 1024 * 1024; // 64 MB total address space
@@ -735,6 +736,27 @@ pub const ElfState = struct {
             // ── mov reg, imm ──
             .mov_reg_imm => {
                 self.setReg(d.dst_reg, d.size, d.imm);
+            },
+
+            .lods => {
+                const src_addr = self.regs.rsi;
+                switch (d.size) {
+                    .bits8 => self.setReg(.al_ax_eax_rax, .bits8, self.readMemVal(src_addr, .bits8)),
+                    .bits16 => self.setReg(.al_ax_eax_rax, .bits16, self.readMemVal(src_addr, .bits16)),
+                    .bits32 => self.setReg(.al_ax_eax_rax, .bits32, self.readMemVal(src_addr, .bits32)),
+                    .bits64 => self.setReg(.al_ax_eax_rax, .bits64, self.readMemVal(src_addr, .bits64)),
+                }
+                const stride: u64 = switch (d.size) {
+                    .bits8 => 1,
+                    .bits16 => 2,
+                    .bits32 => 4,
+                    .bits64 => 8,
+                };
+                if ((self.regs.rflags & RFL_DF) != 0) {
+                    self.regs.rsi -|= stride;
+                } else {
+                    self.regs.rsi +|= stride;
+                }
             },
 
             // ── mov mem, imm ──
