@@ -998,3 +998,345 @@ Same exceptions as in protected mode.
     For a page fault.
 #AC(0):	
     If alignment checking is enabled and an unaligned memory reference is made while the current privilege level is 3.
+
+
+
+FADD/FADDP/FIADD — Add
+
+Opcode	Instruction	        64-Bit Mode	    Compat/Leg Mode	    Description
+D8 /0	FADD m32fp	        Valid	        Valid	            Add m32fp to ST(0) and store result in ST(0).
+DC /0	FADD m64fp	        Valid	        Valid	            Add m64fp to ST(0) and store result in ST(0).
+D8 C0+i	FADD ST(0), ST(i)	Valid	        Valid	            Add ST(0) to ST(i) and store result in ST(0).
+DC C0+i	FADD ST(i), ST(0)	Valid	        Valid	            Add ST(i) to ST(0) and store result in ST(i).
+DE C0+i	FADDP ST(i), ST(0)	Valid	        Valid	            Add ST(0) to ST(i), store result in ST(i), and pop the register stack.
+DE C1	FADDP	            Valid	        Valid	            Add ST(0) to ST(1), store result in ST(1), and pop the register stack.
+DA /0	FIADD m32int	    Valid	        Valid	            Add m32int to ST(0) and store result in ST(0).
+DE /0	FIADD m16int	    Valid	        Valid	            Add m16int to ST(0) and store result in ST(0).
+
+Description:
+
+Adds the destination and source operands and stores the sum in the destination location. The destination operand is always an FPU register; the source operand can be a register or a memory location. Source operands in memory can be in single precision or double precision floating-point format or in word or doubleword integer format.
+
+The no-operand version of the instruction adds the contents of the ST(0) register to the ST(1) register. The one-operand version adds the contents of a memory location (either a floating-point or an integer value) to the contents of the ST(0) register. The two-operand version, adds the contents of the ST(0) register to the ST(i) register or vice versa. The value in ST(0) can be doubled by coding:
+
+FADD ST(0), ST(0);
+
+The FADDP instructions perform the additional operation of popping the FPU register stack after storing the result. To pop the register stack, the processor marks the ST(0) register as empty and increments the stack pointer (TOP) by 1. (The no-operand version of the floating-point add instructions always results in the register stack being popped. In some assemblers, the mnemonic for this instruction is FADD rather than FADDP.)
+
+The FIADD instructions convert an integer source operand to double extended-precision floating-point format before performing the addition.
+
+The table on the following page shows the results obtained when adding various classes of numbers, assuming that neither overflow nor underflow occurs.
+
+When the sum of two operands with opposite signs is 0, the result is +0, except for the round toward −∞ mode, in which case the result is −0. When the source operand is an integer 0, it is treated as a +0.
+
+When both operand are infinities of the same sign, the result is ∞ of the expected sign. If both operands are infinities of opposite signs, an invalid-operation exception is generated. See Table 3-18.
+
+
+Operation:
+
+IF Instruction = FIADD
+    THEN
+        DEST := DEST + ConvertToDoubleExtendedPrecisionFP(SRC);
+    ELSE (* Source operand is floating-point value *)
+        DEST := DEST + SRC;
+FI;
+IF Instruction = FADDP
+    THEN
+        PopRegisterStack;
+FI;
+
+FPU Flags Affected:
+
+C1	Set to 0 if stack underflow occurred.
+Set if result was rounded up; cleared otherwise.
+C0, C2, C3	Undefined.
+
+Floating-Point Exceptions:
+
+#IS:
+	Stack underflow occurred.
+#IA:
+	Operand is an SNaN value or unsupported format.
+    Operands are infinities of unlike sign.
+#D:
+	Source operand is a denormal value.
+#U:
+	Result is too small for destination format.
+#O:
+	Result is too large for destination format.
+#P:
+	Value cannot be represented exactly in destination format.
+
+Protected Mode Exceptions:
+
+#GP(0):
+	If a memory operand effective address is outside the CS, DS, ES, FS, or GS segment limit.
+    If the DS, ES, FS, or GS register contains a NULL segment selector.
+#SS(0):
+	If a memory operand effective address is outside the SS segment limit.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#PF(fault-code):
+	If a page fault occurs.
+#AC(0):
+	If alignment checking is enabled and an unaligned memory reference is made while the current privilege level is 3.
+#UD:
+	If the LOCK prefix is used.
+
+Real-Address Mode Exceptions:
+
+#GP:
+	If a memory operand effective address is outside the CS, DS, ES, FS, or GS segment limit.
+#SS:
+	If a memory operand effective address is outside the SS segment limit.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#UD:
+	If the LOCK prefix is used.
+
+Virtual-8086 Mode Exceptions:
+
+#GP(0):
+	If a memory operand effective address is outside the CS, DS, ES, FS, or GS segment limit.
+#SS(0):
+	If a memory operand effective address is outside the SS segment limit.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#PF(fault-code):
+	If a page fault occurs.
+#AC(0):
+	If alignment checking is enabled and an unaligned memory reference is made.
+#UD:
+	If the LOCK prefix is used.
+
+Compatibility Mode Exceptions:
+
+Same exceptions as in protected mode.
+
+64-Bit Mode Exceptions:
+
+#SS(0):
+	If a memory address referencing the SS segment is in a non-canonical form.
+#GP(0):
+	If the memory address is in a non-canonical form.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#MF:
+	If there is a pending x87 FPU exception.
+#PF(fault-code):
+	If a page fault occurs.
+#AC(0):
+	If alignment checking is enabled and an unaligned memory reference is made while the current privilege level is 3.
+#UD:
+	If the LOCK prefix is used.
+
+
+
+HADDPD — Packed Double Precision Floating-Point Horizontal Add
+
+Opcode/Instruction	                                    Op/En	64/32-bit Mode	CPUID Feature Flag	Description
+66 0F 7C /r HADDPD xmm1, xmm2/m128	                    RM	    V/V	            SSE3	            Horizontal add packed double precision floating-point values from xmm2/m128 to xmm1.
+VEX.128.66.0F.WIG 7C /r VHADDPD xmm1,xmm2, xmm3/m128	RVM	    V/V	            AVX	                Horizontal add packed double precision floating-point values from xmm2 and xmm3/mem.
+VEX.256.66.0F.WIG 7C /r VHADDPD ymm1, ymm2, ymm3/m256	RVM	    V/V	            AVX	                Horizontal add packed double precision floating-point values from ymm2 and ymm3/mem.
+
+Instruction Operand Encoding:
+
+Op/En	Operand 1	        Operand 2	    Operand 3	    Operand 4
+RM	    ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+RVM	    ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Adds the double precision floating-point values in the high and low quadwords of the destination operand and stores the result in the low quadword of the destination operand.
+
+Adds the double precision floating-point values in the high and low quadwords of the source operand and stores the result in the high quadword of the destination operand.
+
+In 64-bit mode, use of the REX.R prefix permits this instruction to access additional registers (XMM8-XMM15).
+
+128-bit Legacy SSE version: The second source can be an XMM register or an 128-bit memory location. The destination is not distinct from the first source XMM register and the upper bits (MAXVL-1:128) of the corresponding YMM register destination are unmodified.
+
+VEX.128 encoded version: the first source operand is an XMM register or 128-bit memory location. The destination operand is an XMM register. The upper bits (MAXVL-1:128) of the corresponding YMM register destination are zeroed.
+
+VEX.256 encoded version: The first source operand is a YMM register. The second source operand can be a YMM register or a 256-bit memory location. The destination operand is a YMM register.
+
+Operation:
+
+HADDPD (128-bit Legacy SSE Version):
+
+DEST[63:0] := SRC1[127:64] + SRC1[63:0]
+DEST[127:64] := SRC2[127:64] + SRC2[63:0]
+DEST[MAXVL-1:128] (Unmodified)
+
+VHADDPD (VEX.128 Encoded Version):
+
+DEST[63:0] := SRC1[127:64] + SRC1[63:0]
+DEST[127:64] := SRC2[127:64] + SRC2[63:0]
+DEST[MAXVL-1:128] := 0
+
+VHADDPD (VEX.256 Encoded Version):
+
+DEST[63:0] := SRC1[127:64] + SRC1[63:0]
+DEST[127:64] := SRC2[127:64] + SRC2[63:0]
+DEST[191:128] := SRC1[255:192] + SRC1[191:128]
+DEST[255:192] := SRC2[255:192] + SRC2[191:128]
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VHADDPD __m256d _mm256_hadd_pd (__m256d a, __m256d b);
+HADDPD __m128d _mm_hadd_pd (__m128d a, __m128d b);
+
+Exceptions:
+
+When the source operand is a memory operand, the operand must be aligned on a 16-byte boundary or a general-protection exception (#GP) will be generated.
+
+Numeric Exceptions:
+
+Overflow, Underflow, Invalid, Precision, Denormal.
+
+Other Exceptions:
+
+See Table 2-19, “Type 2 Class Exception Conditions.”
+
+
+
+
+HADDPS — Packed Single Precision Floating-Point Horizontal Add
+
+Opcode/Instruction	                                    Op/En	64/32-bit Mode	CPUID Feature Flag	Description
+F2 0F 7C /r HADDPS xmm1, xmm2/m128	                    RM	    V/V         	SSE3	            Horizontal add packed single precision floating-point values from xmm2/m128 to xmm1.
+VEX.128.F2.0F.WIG 7C /r VHADDPS xmm1, xmm2, xmm3/m128	RVM	    V/V	            AVX	                Horizontal add packed single precision floating-point values from xmm2 and xmm3/mem.
+VEX.256.F2.0F.WIG 7C /r VHADDPS ymm1, ymm2, ymm3/m256	RVM	    V/V	            AVX	                Horizontal add packed single precision floating-point values from ymm2 and ymm3/mem.
+
+Instruction Operand Encoding:
+
+Op/En	Operand 1	        Operand 2	    Operand 3	    Operand 4
+RM	    ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+RVM	    ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Adds the single precision floating-point values in the first and second dwords of the destination operand and stores the result in the first dword of the destination operand.
+
+Adds single precision floating-point values in the third and fourth dword of the destination operand and stores the result in the second dword of the destination operand.
+
+Adds single precision floating-point values in the first and second dword of the source operand and stores the result in the third dword of the destination operand.
+
+Adds single precision floating-point values in the third and fourth dword of the source operand and stores the result in the fourth dword of the destination operand.
+
+In 64-bit mode, use of the REX.R prefix permits this instruction to access additional registers (XMM8-XMM15).
+
+See Figure 3-19 for HADDPS; see Figure 3-20 for VHADDPS.
+
+128-bit Legacy SSE version: The second source can be an XMM register or an 128-bit memory location. The destination is not distinct from the first source XMM register and the upper bits (MAXVL-1:128) of the corresponding YMM register destination are unmodified.
+
+VEX.128 encoded version: the first source operand is an XMM register or 128-bit memory location. The destination operand is an XMM register. The upper bits (MAXVL-1:128) of the corresponding YMM register destination are zeroed.
+
+VEX.256 encoded version: The first source operand is a YMM register. The second source operand can be a YMM register or a 256-bit memory location. The destination operand is a YMM register.
+
+Operation:
+
+HADDPS (128-bit Legacy SSE Version):
+
+DEST[31:0] := SRC1[63:32] + SRC1[31:0]
+DEST[63:32] := SRC1[127:96] + SRC1[95:64]
+DEST[95:64] := SRC2[63:32] + SRC2[31:0]
+DEST[127:96] := SRC2[127:96] + SRC2[95:64]
+DEST[MAXVL-1:128] (Unmodified)
+
+VHADDPS (VEX.128 Encoded Version):
+
+DEST[31:0] := SRC1[63:32] + SRC1[31:0]
+DEST[63:32] := SRC1[127:96] + SRC1[95:64]
+DEST[95:64] := SRC2[63:32] + SRC2[31:0]
+DEST[127:96] := SRC2[127:96] + SRC2[95:64]
+DEST[MAXVL-1:128] := 0
+
+VHADDPS (VEX.256 Encoded Version):
+
+DEST[31:0] := SRC1[63:32] + SRC1[31:0]
+DEST[63:32] := SRC1[127:96] + SRC1[95:64]
+DEST[95:64] := SRC2[63:32] + SRC2[31:0]
+DEST[127:96] := SRC2[127:96] + SRC2[95:64]
+DEST[159:128] := SRC1[191:160] + SRC1[159:128]
+DEST[191:160] := SRC1[255:224] + SRC1[223:192]
+DEST[223:192] := SRC2[191:160] + SRC2[159:128]
+DEST[255:224] := SRC2[255:224] + SRC2[223:192]
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+HADDPS __m128 _mm_hadd_ps (__m128 a, __m128 b);
+VHADDPS __m256 _mm256_hadd_ps (__m256 a, __m256 b);
+
+Exceptions:
+
+When the source operand is a memory operand, the operand must be aligned on a 16-byte boundary or a general-protection exception (#GP) will be generated.
+
+Numeric Exceptions:
+
+Overflow, Underflow, Invalid, Precision, Denormal.
+
+Other Exceptions:
+
+See Table 2-19, “Type 2 Class Exception Conditions.”
+
+
+
+KADDW/KADDB/KADDQ/KADDD — ADD Two Masks
+
+Opcode/Instruction	                        Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+VEX.L1.0F.W0 4A /r KADDW k1, k2, k3	        RVR	    V/V	                    AVX512DQ	        Add 16 bits masks in k2 and k3 and place result in k1.
+VEX.L1.66.0F.W0 4A /r KADDB k1, k2, k3	    RVR	    V/V	                    AVX512DQ	        Add 8 bits masks in k2 and k3 and place result in k1.
+VEX.L1.0F.W1 4A /r KADDQ k1, k2, k3	        RVR	    V/V	                    AVX512BW	        Add 64 bits masks in k2 and k3 and place result in k1.
+VEX.L1.66.0F.W1 4A /r KADDD k1, k2, k3	    RVR	    V/V	                    AVX512BW	        Add 32 bits masks in k2 and k3 and place result in k1.
+
+Instruction Operand Encoding:
+
+Op/En	Operand 1	    Operand 2	    Operand 3
+RVR	    ModRM:reg (w)	VEX.1vvv (r)	ModRM:r/m (r, ModRM:[7:6] must be 11b)
+
+Description:
+
+Adds the vector mask k2 and the vector mask k3, and writes the result into vector mask k1.
+
+Operation:
+
+KADDW:
+
+DEST[15:0] := SRC1[15:0] + SRC2[15:0]
+DEST[MAX_KL-1:16] := 0
+
+KADDB:
+
+DEST[7:0] := SRC1[7:0] + SRC2[7:0]
+DEST[MAX_KL-1:8] := 0
+
+KADDQ:
+
+DEST[63:0] := SRC1[63:0] + SRC2[63:0]
+DEST[MAX_KL-1:64] := 0
+
+KADDD:
+
+DEST[31:0] := SRC1[31:0] + SRC2[31:0]
+DEST[MAX_KL-1:32] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+KADDW __mmask16 _kadd_mask16 (__mmask16 a, __mmask16 b);
+KADDB __mmask8 _kadd_mask8 (__mmask8 a, __mmask8 b);
+KADDQ __mmask64 _kadd_mask64 (__mmask64 a, __mmask64 b);
+KADDD __mmask32 _kadd_mask32 (__mmask32 a, __mmask32 b);
+
+Flags Affected:
+
+None.
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+See Table 2-63, “TYPE K20 Exception Definition (VEX-Encoded OpMask Instructions w/o Memory Arg).”
+
+
