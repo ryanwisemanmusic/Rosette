@@ -155,6 +155,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const entrypoint_alignment_module = b.createModule(.{
+        .root_source_file = b.path("../src/entrypoint/alignment/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const exit_diagnostics_module = b.createModule(.{
         .root_source_file = b.path("../src/tooling/exit_diagnostics/root.zig"),
         .target = target,
@@ -625,6 +630,8 @@ pub fn build(b: *std.Build) void {
     zig_module.addImport("pseudo_kernel_cache", pseudo_kernel_cache_module);
 
     const check_step = b.step("check", "Check Rosette Zig sources");
+    const entrypoint_alignment_test = b.addTest(.{ .root_module = entrypoint_alignment_module });
+    check_step.dependOn(&entrypoint_alignment_test.step);
 
     const zig_tests = b.addTest(.{
         .root_module = zig_module,
@@ -1038,6 +1045,19 @@ pub fn build(b: *std.Build) void {
             .root_module = macho_processor_mod,
         });
         b.installArtifact(macho_processor);
+
+        const macho_processor_test_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/Mach-O/process.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        macho_processor_test_mod.addImport("x64_decoder", x64_decoder_mod);
+        macho_processor_test_mod.addImport("x64_interpreter", x64_interpreter_mod);
+        macho_processor_test_mod.addImport("macho_runtime", macho_runtime_mod);
+        macho_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        const macho_processor_test = b.addTest(.{ .root_module = macho_processor_test_mod });
+        check_step.dependOn(&macho_processor_test.step);
     }
 
     // Aggregate Win32 ABI handshake suite
@@ -1092,6 +1112,17 @@ pub fn build(b: *std.Build) void {
         });
         const transpiler_test = b.addTest(.{ .root_module = transpiler_mod });
         check_step.dependOn(&transpiler_test.step);
+
+        const transpiler_cli_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/transpiler/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const transpiler_cli = b.addExecutable(.{
+            .name = "rosette-c-fix",
+            .root_module = transpiler_cli_mod,
+        });
+        b.installArtifact(transpiler_cli);
     }
 
     const lib = b.addLibrary(.{
