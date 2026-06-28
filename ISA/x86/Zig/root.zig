@@ -43,6 +43,8 @@ const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
 const interrupt_into = @import("INTERRUPT/INTO.zig");
+const interrupt_iret = @import("INTERRUPT/IRET.zig");
+const interrupt_sidt = @import("INTERRUPT/SIDT.zig");
 const jmp_ja = @import("JMP/JA.zig");
 const jmp_jae = @import("JMP/JAE.zig");
 const jmp_jb = @import("JMP/JB.zig");
@@ -1213,6 +1215,8 @@ pub const tables = [_]InstructionTable{
     entry(interrupt_int1.family, interrupt_int1.path, interrupt_int1.source),
     entry(interrupt_int3.family, interrupt_int3.path, interrupt_int3.source),
     entry(interrupt_into.family, interrupt_into.path, interrupt_into.source),
+    entry(interrupt_iret.family, interrupt_iret.path, interrupt_iret.source),
+    entry(interrupt_sidt.family, interrupt_sidt.path, interrupt_sidt.source),
     entry(jmp_ja.family, jmp_ja.path, jmp_ja.source),
     entry(jmp_jae.family, jmp_jae.path, jmp_jae.source),
     entry(jmp_jb.family, jmp_jb.path, jmp_jb.source),
@@ -1923,7 +1927,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 507), tableCount());
+    try std.testing.expectEqual(@as(usize, 509), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
