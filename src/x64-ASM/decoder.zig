@@ -1,6 +1,7 @@
 const std = @import("std");
 const cpu_state = @import("cpu_state.zig");
 const flags = @import("flags.zig");
+pub const capabilities = @import("capabilities.zig");
 
 pub const OperandSize = flags.OperandSize;
 pub const Condition = flags.Condition;
@@ -41,6 +42,14 @@ pub const Op = enum(u16) {
     mov_reg16_reg16,
     mov_reg32_reg32,
     mov_reg64_reg64,
+    add_accum_imm,
+    or_accum_imm,
+    adc_accum_imm,
+    sbb_accum_imm,
+    and_accum_imm,
+    sub_accum_imm,
+    xor_accum_imm,
+    cmp_accum_imm,
     // add (reg, r/m) d=1
     add_reg8_mem8,
     add_reg16_mem16,
@@ -311,9 +320,57 @@ pub const Op = enum(u16) {
     xadd_mem32_reg32,
     xadd_mem64_reg64,
     xorps_xmm_xmm,
+    movups_xmm_xmm,
+    movups_xmm_mem,
+    movups_mem_xmm,
     movaps_xmm_xmm,
     movaps_xmm_mem,
     movaps_mem_xmm,
+    vmovdqu_xmm_xmm,
+    vmovdqu_xmm_mem,
+    vmovdqu_mem_xmm,
+    vmovdqa_xmm_xmm,
+    vmovdqa_xmm_mem,
+    vmovdqa_mem_xmm,
+    vmovups_xmm_xmm,
+    vmovups_xmm_mem,
+    vmovups_mem_xmm,
+    vmovaps_xmm_xmm,
+    vmovaps_xmm_mem,
+    vmovaps_mem_xmm,
+    vmovupd_xmm_xmm,
+    vmovupd_xmm_mem,
+    vmovupd_mem_xmm,
+    vmovapd_xmm_xmm,
+    vmovapd_xmm_mem,
+    vmovapd_mem_xmm,
+    vmovss_xmm_mem,
+    vmovss_mem_xmm,
+    vmovsd_xmm_mem,
+    vmovsd_mem_xmm,
+    vmovdqu_ymm_ymm,
+    vmovdqu_ymm_mem,
+    vmovdqu_mem_ymm,
+    vmovdqa_ymm_ymm,
+    vmovdqa_ymm_mem,
+    vmovdqa_mem_ymm,
+    vmovups_ymm_ymm,
+    vmovups_ymm_mem,
+    vmovups_mem_ymm,
+    vmovaps_ymm_ymm,
+    vmovaps_ymm_mem,
+    vmovaps_mem_ymm,
+    vmovupd_ymm_ymm,
+    vmovupd_ymm_mem,
+    vmovupd_mem_ymm,
+    vmovapd_ymm_ymm,
+    vmovapd_ymm_mem,
+    vmovapd_mem_ymm,
+    vzeroupper,
+    vcvtsi2ss_xmm_reg,
+    vcvtsi2ss_xmm_mem,
+    vcvtsi2sd_xmm_reg,
+    vcvtsi2sd_xmm_mem,
     // conditional / unconditional jumps
     jmp_rel8,
     jcc_rel8,
@@ -329,45 +386,14 @@ pub const Op = enum(u16) {
     hlt,
 };
 
-pub const CpuidResult = struct {
-    eax: u32 = 0,
-    ebx: u32 = 0,
-    ecx: u32 = 0,
-    edx: u32 = 0,
-};
+pub const CpuidResult = capabilities.CpuidResult;
 
 pub fn emulatedCpuid(leaf: u32, subleaf: u32) CpuidResult {
-    return switch (leaf) {
-        0 => .{
-            .eax = 7,
-            .ebx = 0x756E_6547, // "Genu"
-            .edx = 0x4965_6E69, // "ineI"
-            .ecx = 0x6C65_746E, // "ntel"
-        },
-        1 => .{
-            .eax = 0x0003_06C3,
-            .ebx = 0x0008_0000,
-            .ecx = (@as(u32, 1) << 0) | (@as(u32, 1) << 1) | (@as(u32, 1) << 9) |
-                (@as(u32, 1) << 13) | (@as(u32, 1) << 19) | (@as(u32, 1) << 20) |
-                (@as(u32, 1) << 22) | (@as(u32, 1) << 23) | (@as(u32, 1) << 25) |
-                (@as(u32, 1) << 26) | (@as(u32, 1) << 27) | (@as(u32, 1) << 28),
-            .edx = (@as(u32, 1) << 0) | (@as(u32, 1) << 4) | (@as(u32, 1) << 5) |
-                (@as(u32, 1) << 8) | (@as(u32, 1) << 11) | (@as(u32, 1) << 15) |
-                (@as(u32, 1) << 19) | (@as(u32, 1) << 23) | (@as(u32, 1) << 24) |
-                (@as(u32, 1) << 25) | (@as(u32, 1) << 26),
-        },
-        7 => if (subleaf == 0) .{ .eax = 0 } else .{},
-        0x8000_0000 => .{ .eax = 0x8000_0008 },
-        0x8000_0002 => .{ .eax = 0x6573_6F52, .ebx = 0x2065_7474, .ecx = 0x7472_6956, .edx = 0x206C_6175 },
-        0x8000_0003 => .{ .eax = 0x2D36_3878, .ebx = 0x4320_3436, .ecx = 0x2020_5550, .edx = 0x2020_2020 },
-        0x8000_0004 => .{},
-        0x8000_0008 => .{ .eax = 0x0000_3030 },
-        else => .{},
-    };
+    return capabilities.cpuid(.xenia, leaf, subleaf);
 }
 
 pub fn emulatedXcr0() u64 {
-    return 0x7; // x87, XMM, and YMM state enabled.
+    return capabilities.xcr0(.xenia);
 }
 
 test "emulated CPUID exposes a coherent AVX baseline" {
