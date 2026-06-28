@@ -22,6 +22,235 @@ pub const FixResult = struct {
     }
 };
 
+fn appendDepoisonFixes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
+) !void {
+    _ = cpp_mode;
+    const statement_attr = "[[maybe_unused]] ";
+    const statement_comment = "/* rosette-c-fix: maybe_unused */ ";
+
+    const repeated_marker = "/* rosette-c-fix: maybe_unused */ /* rosette-c-fix: maybe_unused */";
+    while (std.mem.indexOf(u8, source, repeated_marker)) |idx| {
+        if (editOverlaps(edits.items, idx, idx + repeated_marker.len)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = idx + repeated_marker.len,
+            .replacement = try allocator.dupe(u8, "/* rosette-c-fix: maybe_unused */"),
+        });
+    }
+
+    const mixed_marker = "[[maybe_unused]] /* rosette-c-fix: maybe_unused */";
+    while (std.mem.indexOf(u8, source, mixed_marker)) |idx| {
+        if (editOverlaps(edits.items, idx, idx + mixed_marker.len)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = idx + mixed_marker.len,
+            .replacement = try allocator.dupe(u8, "/* rosette-c-fix: maybe_unused */"),
+        });
+    }
+
+    const poisoned_dirhandle = "std::unique_ptr<DIR, int (*)reinterpret_cast<DIR*>(>)";
+    while (std.mem.indexOf(u8, source, poisoned_dirhandle)) |idx| {
+        if (editOverlaps(edits.items, idx, idx + poisoned_dirhandle.len)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = idx + poisoned_dirhandle.len,
+            .replacement = try allocator.dupe(u8, "std::unique_ptr<DIR, int (*)(DIR*)>"),
+        });
+    }
+
+    const poisoned_readdir = "while ((auto ent = readdir(dir)))";
+    while (std.mem.indexOf(u8, source, poisoned_readdir)) |idx| {
+        if (editOverlaps(edits.items, idx, idx + poisoned_readdir.len)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = idx + poisoned_readdir.len,
+            .replacement = try allocator.dupe(u8, "while (auto ent = readdir(dir))"),
+        });
+    }
+
+    const poisoned_const_attr = "const [[maybe_unused]] int";
+    while (std.mem.indexOf(u8, source, poisoned_const_attr)) |idx| {
+        if (editOverlaps(edits.items, idx, idx + poisoned_const_attr.len)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = idx + poisoned_const_attr.len,
+            .replacement = try allocator.dupe(u8, "const int"),
+        });
+    }
+
+    const poisoned_param_u8 = "/* rosette-c-fix: maybe_unused */ uint8_t";
+    while (std.mem.indexOf(u8, source, poisoned_param_u8)) |idx| {
+        if (editOverlaps(edits.items, idx, idx + poisoned_param_u8.len)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = idx + poisoned_param_u8.len,
+            .replacement = try allocator.dupe(u8, "uint8_t"),
+        });
+    }
+
+    const poisoned_param_const_u8 = "/* rosette-c-fix: maybe_unused */ const uint8_t";
+    while (std.mem.indexOf(u8, source, poisoned_param_const_u8)) |idx| {
+        if (editOverlaps(edits.items, idx, idx + poisoned_param_const_u8.len)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = idx + poisoned_param_const_u8.len,
+            .replacement = try allocator.dupe(u8, "const uint8_t"),
+        });
+    }
+
+    const poisoned_static_cast_prefix = "/* rosette-c-fix: maybe_unused */ const int av_aes_size= static_cast<int>(sizeof(";
+    while (std.mem.indexOf(u8, source, poisoned_static_cast_prefix)) |idx| {
+        const start = idx;
+        const suffix_start = idx + poisoned_static_cast_prefix.len;
+        const tail = source[suffix_start..];
+        const close_rel = std.mem.indexOf(u8, tail, "))") orelse break;
+        const close_idx = suffix_start + close_rel + 2;
+        const inner = source[suffix_start .. suffix_start + close_rel];
+        const replacement = try std.fmt.allocPrint(allocator, "/* rosette-c-fix: maybe_unused */ const int av_aes_size= (int)sizeof({s})", .{inner});
+        if (editOverlaps(edits.items, start, close_idx)) break;
+        try edits.append(allocator, .{
+            .start = start,
+            .end = close_idx,
+            .replacement = replacement,
+        });
+    }
+
+    const poisoned_static_cast_generic = "/* rosette-c-fix: maybe_unused */ const int ";
+    while (std.mem.indexOf(u8, source, poisoned_static_cast_generic)) |idx| {
+        const cast_rel = std.mem.indexOf(u8, source[idx..], "= static_cast<int>(sizeof(") orelse break;
+        const cast_start = idx + cast_rel + "= static_cast<int>(sizeof(".len;
+        const tail = source[cast_start..];
+        const close_rel = std.mem.indexOf(u8, tail, "))") orelse break;
+        const inner = source[cast_start .. cast_start + close_rel];
+        const prefix = source[idx .. idx + cast_rel + 2];
+        const replacement = try std.fmt.allocPrint(allocator, "{s}(int)sizeof({s})", .{ prefix, inner });
+        const end = cast_start + close_rel + 2;
+        if (editOverlaps(edits.items, idx, end)) break;
+        try edits.append(allocator, .{
+            .start = idx,
+            .end = end,
+            .replacement = replacement,
+        });
+    }
+
+    const include_sentinel_poison = "\n, 0};";
+    while (std.mem.indexOf(u8, source, include_sentinel_poison)) |idx| {
+        const line_start = idx + 1;
+        var scan = idx;
+        var saw_include = false;
+        while (scan > 0) {
+            const prev_nl = std.mem.lastIndexOfScalar(u8, source[0..scan], '\n') orelse 0;
+            const candidate_start = if (prev_nl == 0) 0 else prev_nl + 1;
+            const candidate = trimLine(source[candidate_start..scan]);
+            if (candidate.len == 0) {
+                if (candidate_start == 0) break;
+                scan = candidate_start - 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, candidate, "#include ")) {
+                saw_include = true;
+            }
+            break;
+        }
+        if (!saw_include) break;
+        if (editOverlaps(edits.items, line_start, line_start + ", 0".len)) break;
+        try edits.append(allocator, .{
+            .start = line_start,
+            .end = line_start + ", 0".len,
+            .replacement = try allocator.dupe(u8, ""),
+        });
+    }
+
+    var pos: usize = 0;
+    while (nextLine(source, pos)) |line| {
+        pos = line.next;
+        const trimmed = trimLine(line.text);
+        if (trimmed.len == 0) continue;
+
+        const marker = if (std.mem.startsWith(u8, trimmed, statement_attr)) statement_attr else if (std.mem.startsWith(u8, trimmed, statement_comment)) statement_comment else continue;
+        const after = trimmed[marker.len..];
+        if (after.len == 0) continue;
+
+        const is_statement_assignment = std.mem.indexOfScalar(u8, after, '=') != null and
+            (std.mem.indexOfScalar(u8, after, '[') != null or
+             std.mem.indexOfScalar(u8, after, '.') != null or
+             std.mem.indexOf(u8, after, "->") != null or
+             std.mem.indexOf(u8, after, "++") != null or
+             std.mem.indexOf(u8, after, "--") != null or
+             std.mem.indexOf(u8, after, "|=") != null or
+             std.mem.indexOf(u8, after, "+=") != null or
+             std.mem.indexOf(u8, after, "-=") != null or
+             std.mem.indexOf(u8, after, "*=") != null or
+             std.mem.indexOf(u8, after, "/=") != null or
+             std.mem.indexOf(u8, after, "%=") != null or
+             std.mem.indexOf(u8, after, "BITS(") != null or
+             std.mem.indexOf(u8, after, "NEEDBITS(") != null or
+             std.mem.indexOf(u8, after, "DROPBITS(") != null);
+        if (!is_statement_assignment) continue;
+
+        const rel = std.mem.indexOf(u8, line.text, marker) orelse continue;
+        const start = line.start + rel;
+        const end = start + marker.len;
+        if (editOverlaps(edits.items, start, end)) continue;
+        try edits.append(allocator, .{
+            .start = start,
+            .end = end,
+            .replacement = try allocator.dupe(u8, ""),
+        });
+    }
+}
+
+fn appendBracketAttributeFixes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const Token,
+    edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
+) !void {
+    if (cpp_mode) return;
+    const marker = "/* rosette-c-fix: maybe_unused */";
+
+    var i: usize = 0;
+    while (i + 4 < tokens.len) : (i += 1) {
+        if (tokens[i].kind != .lbracket or tokens[i + 1].kind != .lbracket) continue;
+        if (tokens[i + 2].kind != .identifier) continue;
+        if (tokens[i + 3].kind != .rbracket or tokens[i + 4].kind != .rbracket) continue;
+
+        const attr_name = source[tokens[i + 2].start..tokens[i + 2].end];
+        var replace_end = tokens[i + 4].end;
+        if (replace_end <= source.len) {
+            const tail = source[replace_end..];
+            const trimmed = std.mem.trim(u8, tail, " \t\r\n");
+            if (std.mem.startsWith(u8, trimmed, marker)) {
+                replace_end = source.len - trimmed.len + marker.len;
+            }
+        }
+        if (std.mem.eql(u8, attr_name, "maybe_unused")) {
+            try edits.append(allocator, .{
+                .start = tokens[i].start,
+                .end = replace_end,
+                .replacement = try allocator.dupe(u8, marker),
+            });
+            i += 4;
+            continue;
+        }
+
+        // Conservative C-mode fallback: preserve parseability by stripping unknown
+        // bracket attributes rather than relying on the compiler to accept C++11
+        // attributes in .c translation units.
+        try edits.append(allocator, .{
+            .start = tokens[i].start,
+            .end = replace_end,
+            .replacement = try std.fmt.allocPrint(allocator, "/* rosette-c-fix stripped [[{s}]] */", .{attr_name}),
+        });
+        i += 4;
+    }
+}
+
 fn isCompoundType(kind: Token.Kind) bool {
     return switch (kind) {
         .keyword_int,
@@ -299,15 +528,20 @@ pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_m
     }
     const warning = false;
 
+    try appendDepoisonFixes(allocator, source, &edits, cpp_mode);
+    if (cpp_mode) {
+        return .{ .edits = edits, .warning = warning };
+    }
+    try appendBracketAttributeFixes(allocator, source, tokens, &edits, cpp_mode);
     try appendTrivialMacIncludeCollapses(allocator, source, &edits);
     try appendLocalAngleIncludeQuotes(allocator, source, &edits);
-    try appendVoidSuppressorElisions(allocator, source, &edits);
+    try appendVoidSuppressorElisions(allocator, source, &edits, cpp_mode);
     try appendStaticCastVoidUnwrap(allocator, source, tokens, &edits);
     try appendFmtPointerCasts(allocator, source, tokens, &edits);
-    try appendUnusedLocalAnnotations(allocator, source, &edits);
-    try appendUnusedVarDeclarations(allocator, source, tokens, &edits);
-    try appendUnusedSetLocalAnnotations(allocator, source, &edits);
-    try appendUnusedConstAnnotations(allocator, source, &edits);
+    try appendUnusedLocalAnnotations(allocator, source, &edits, cpp_mode);
+    try appendUnusedVarDeclarations(allocator, source, tokens, &edits, cpp_mode);
+    try appendUnusedSetLocalAnnotations(allocator, source, &edits, cpp_mode);
+    try appendUnusedConstAnnotations(allocator, source, &edits, cpp_mode);
     try appendParenthesesEquality(allocator, source, tokens, &edits);
     try appendSwitchDefaultClauses(allocator, source, tokens, &edits);
     try appendMissingFieldInitializers(allocator, source, tokens, &edits);
@@ -496,14 +730,51 @@ fn skipInitializerToDelim(tokens: []const Token, start: usize) usize {
 }
 
 fn hasMaybeUnusedPrefix(tokens: []const Token, type_start: usize, source: []const u8) bool {
-    if (type_start < 5) return false;
-    if (tokens[type_start - 5].kind != .lbracket) return false;
-    if (tokens[type_start - 4].kind != .lbracket) return false;
-    if (tokens[type_start - 3].kind != .identifier) return false;
-    if (!std.mem.eql(u8, source[tokens[type_start - 3].start..tokens[type_start - 3].end], "maybe_unused")) return false;
-    if (tokens[type_start - 2].kind != .rbracket) return false;
-    if (tokens[type_start - 1].kind != .rbracket) return false;
-    return true;
+    const marker = "/* rosette-c-fix: maybe_unused */";
+    if (type_start >= 5 and
+        tokens[type_start - 5].kind == .lbracket and
+        tokens[type_start - 4].kind == .lbracket and
+        tokens[type_start - 3].kind == .identifier and
+        std.mem.eql(u8, source[tokens[type_start - 3].start..tokens[type_start - 3].end], "maybe_unused") and
+        tokens[type_start - 2].kind == .rbracket and
+        tokens[type_start - 1].kind == .rbracket)
+    {
+        return true;
+    }
+
+    const type_start_byte = tokens[type_start].start;
+    if (type_start_byte <= source.len) {
+        const prefix = source[0..type_start_byte];
+        const trimmed = std.mem.trim(u8, prefix, " \t\r\n");
+        return std.mem.endsWith(u8, trimmed, marker);
+    }
+    return false;
+}
+
+fn isPreprocessorToken(kind: Token.Kind) bool {
+    return switch (kind) {
+        .hash,
+        .pp_if,
+        .pp_ifdef,
+        .pp_ifndef,
+        .pp_elif,
+        .pp_else,
+        .pp_endif,
+        .pp_define,
+        .pp_undef,
+        .pp_include,
+        => true,
+        else => false,
+    };
+}
+
+fn rangeContainsPreprocessor(tokens: []const Token, start: usize, end: usize) bool {
+    if (start >= tokens.len or end >= tokens.len or end < start) return false;
+    var i = start;
+    while (i <= end and i < tokens.len) : (i += 1) {
+        if (isPreprocessorToken(tokens[i].kind)) return true;
+    }
+    return false;
 }
 
 fn appendUnusedVarDeclarations(
@@ -511,7 +782,9 @@ fn appendUnusedVarDeclarations(
     source: []const u8,
     tokens: []const Token,
     edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
 ) !void {
+    if (cpp_mode) return;
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
         if (!isCompoundType(tokens[i].kind) and !isIdentifierToken(tokens[i].kind)) continue;
@@ -603,7 +876,7 @@ fn appendUnusedVarDeclarations(
             try edits.append(allocator, .{
                 .start = tokens[i].start,
                 .end = tokens[i].start,
-                .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+                .replacement = try allocator.dupe(u8, if (cpp_mode) "[[maybe_unused]] " else "/* rosette-c-fix: maybe_unused */ "),
             });
         }
     }
@@ -768,6 +1041,8 @@ fn appendUndefinedReinterpretCast(
 fn editOverlaps(edits: []const Edit, start: usize, end: usize) bool {
     for (edits) |edit| {
         if (start < edit.end and edit.start < end) return true;
+        // Also detect zero-width insertions at the exact start position
+        if (edit.start == start and edit.end == start and start < end) return true;
     }
     return false;
 }
@@ -1038,7 +1313,8 @@ fn identifierAppearsAfter(source: []const u8, start: usize, name: []const u8) bo
 fn unusedLocalDeclarationName(line: []const u8) ?[]const u8 {
     const trimmed = trimLine(line);
     if (trimmed.len == 0 or trimmed[0] == '#') return null;
-    if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) return null;
+    if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]") or
+        std.mem.startsWith(u8, trimmed, "/* rosette-c-fix:")) return null;
     if (std.mem.startsWith(u8, trimmed, "if ") or
         std.mem.startsWith(u8, trimmed, "if(") or
         std.mem.startsWith(u8, trimmed, "for ") or
@@ -1109,6 +1385,7 @@ fn voidSuppressorName(line: []const u8) ?[]const u8 {
 fn isDeclarationPrefixReject(trimmed: []const u8) bool {
     if (trimmed.len == 0 or trimmed[0] == '#') return true;
     if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) return true;
+    if (hasMaybeUnusedBlockComment(trimmed)) return true;
     return std.mem.startsWith(u8, trimmed, "if ") or
         std.mem.startsWith(u8, trimmed, "if(") or
         std.mem.startsWith(u8, trimmed, "for ") or
@@ -1129,7 +1406,12 @@ fn isDeclarationPrefixReject(trimmed: []const u8) bool {
         std.mem.startsWith(u8, trimmed, "template") or
         std.mem.startsWith(u8, trimmed, "static_assert") or
         std.mem.startsWith(u8, trimmed, "}") or
-        std.mem.indexOf(u8, trimmed, "[[maybe_unused]]") != null;
+        std.mem.indexOf(u8, trimmed, "[[maybe_unused]]") != null or
+        hasMaybeUnusedBlockComment(trimmed);
+}
+
+fn hasMaybeUnusedBlockComment(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "/* rosette-c-fix:") != null;
 }
 
 fn localDeclarationInsertOffset(line: []const u8, name: []const u8) ?usize {
@@ -1256,7 +1538,8 @@ fn maybeUnusedInsertOffsetForName(source: []const u8, before: usize, name: []con
 fn hasMaybeUnusedInsertion(edits: []const Edit, offset: usize) bool {
     for (edits) |edit| {
         if (edit.start == offset and edit.end == offset and
-            std.mem.eql(u8, edit.replacement, "[[maybe_unused]] "))
+            (std.mem.eql(u8, edit.replacement, "[[maybe_unused]] ") or
+             std.mem.indexOf(u8, edit.replacement, "/* rosette-c-fix:") != null))
         {
             return true;
         }
@@ -1270,6 +1553,7 @@ fn appendMaybeUnusedAnnotationForName(
     before: usize,
     name: []const u8,
     edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
 ) !void {
     const insert = maybeUnusedInsertOffsetForName(source, before, name) orelse return;
     if (hasMaybeUnusedInsertion(edits.items, insert)) return;
@@ -1277,7 +1561,7 @@ fn appendMaybeUnusedAnnotationForName(
     try edits.append(allocator, .{
         .start = insert,
         .end = insert,
-        .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+        .replacement = try allocator.dupe(u8, if (cpp_mode) "[[maybe_unused]] " else "/* rosette-c-fix: maybe_unused */ "),
     });
 }
 
@@ -1297,7 +1581,9 @@ fn appendUnusedLocalAnnotations(
     allocator: std.mem.Allocator,
     source: []const u8,
     edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
 ) !void {
+    if (cpp_mode) return;
     var pos: usize = 0;
     while (nextLine(source, pos)) |line| {
         pos = line.next;
@@ -1314,7 +1600,7 @@ fn appendUnusedLocalAnnotations(
         try edits.append(allocator, .{
             .start = line.start + indent_len,
             .end = line.start + indent_len,
-            .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+            .replacement = try allocator.dupe(u8, if (cpp_mode) "[[maybe_unused]] " else "/* rosette-c-fix: maybe_unused */ "),
         });
     }
 }
@@ -1635,6 +1921,7 @@ fn appendVoidSuppressorElisions(
     allocator: std.mem.Allocator,
     source: []const u8,
     edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
 ) !void {
     var pos: usize = 0;
     while (nextLine(source, pos)) |line| {
@@ -1667,7 +1954,7 @@ fn appendVoidSuppressorElisions(
                 if (block_end) |end| {
                     if (!editOverlaps(edits.items, line.start, end)) {
                         for (names.items) |name| {
-                            try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits);
+                            try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits, cpp_mode);
                         }
                         try edits.append(allocator, .{
                             .start = line.start,
@@ -1683,7 +1970,7 @@ fn appendVoidSuppressorElisions(
 
         if (voidSuppressorName(line.text)) |name| {
             if (!editOverlaps(edits.items, line.start, line.next)) {
-                try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits);
+                try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits, cpp_mode);
                 try edits.append(allocator, .{
                     .start = line.start,
                     .end = line.next,
@@ -1700,7 +1987,9 @@ fn appendUnusedSetLocalAnnotations(
     allocator: std.mem.Allocator,
     source: []const u8,
     edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
 ) !void {
+    if (cpp_mode) return;
     var pos: usize = 0;
     while (nextLine(source, pos)) |line| {
         pos = line.next;
@@ -1745,7 +2034,7 @@ fn appendUnusedSetLocalAnnotations(
 
         if (identifierAppearsAfter(source, line.next, name)) continue;
 
-        try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits);
+        try appendMaybeUnusedAnnotationForName(allocator, source, line.start, name, edits, cpp_mode);
     }
 }
 
@@ -1817,7 +2106,9 @@ fn appendUnusedConstAnnotations(
     allocator: std.mem.Allocator,
     source: []const u8,
     edits: *std.ArrayList(Edit),
+    cpp_mode: bool,
 ) !void {
+    if (cpp_mode) return;
     var pos: usize = 0;
     while (nextLine(source, pos)) |line| {
         pos = line.next;
@@ -1834,7 +2125,8 @@ fn appendUnusedConstAnnotations(
         const after_ok = after_idx >= trimmed.len or !isIdentChar(trimmed[after_idx]);
         if (!before_ok or !after_ok) continue;
 
-        if (std.mem.startsWith(u8, trimmed, "[[maybe_unused]]")) continue;
+        const prefix_marker = if (cpp_mode) "[[maybe_unused]]" else "/* rosette-c-fix:";
+        if (std.mem.startsWith(u8, trimmed, prefix_marker)) continue;
 
         const name = unusedLocalDeclarationName(line.text) orelse continue;
         if (identifierAppearsAfter(source, line.next, name)) continue;
@@ -1847,7 +2139,7 @@ fn appendUnusedConstAnnotations(
         try edits.append(allocator, .{
             .start = line.start + indent_len,
             .end = line.start + indent_len,
-            .replacement = try allocator.dupe(u8, "[[maybe_unused]] "),
+            .replacement = try allocator.dupe(u8, if (cpp_mode) "[[maybe_unused]] " else "/* rosette-c-fix: maybe_unused */ "),
         });
     }
 }
@@ -1867,6 +2159,7 @@ fn appendParenthesesEquality(
 
         const close = findMatchingClose(tokens, i + 1);
         if (close >= tokens.len or close <= i + 2) continue;
+        if (rangeContainsPreprocessor(tokens, i + 1, close)) continue;
 
         if (hasTopLevelAssign(tokens, i + 2, close)) {
             try edits.append(allocator, .{
@@ -2140,6 +2433,8 @@ fn appendMissingFieldInitializers(
         const field_count = struct_map.get(type_name) orelse continue;
         if (field_count == 0) continue;
 
+        if (hasArrayDeclaratorBeforeEq(tokens, i)) continue;
+
         if (hasDesignatedInitializers(tokens, init_start, init_end)) continue;
 
         const init_count = countTopLevelCommas(tokens, init_start, init_end);
@@ -2250,6 +2545,30 @@ fn findArraySize(tokens: []const Token, eq_pos: usize, source: []const u8) ?usiz
     return null;
 }
 
+fn hasArrayDeclaratorBeforeEq(tokens: []const Token, eq_pos: usize) bool {
+    if (eq_pos == 0) return false;
+    var j = eq_pos;
+    var depth: u32 = 0;
+    while (j > 0) {
+        j -= 1;
+        switch (tokens[j].kind) {
+            .rparen, .rbrace => depth += 1,
+            .lparen, .lbrace => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .semicolon, .comma => {
+                if (depth == 0) return false;
+            },
+            .rbracket => {
+                if (depth == 0) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn appendMissingBraces(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -2273,6 +2592,8 @@ fn appendMissingBraces(
         const type_name = findStructTypeName(tokens, i, source, struct_map) orelse continue;
         const field_count = struct_map.get(type_name) orelse continue;
         if (field_count == 0) continue;
+
+        if (!hasArrayDeclaratorBeforeEq(tokens, i)) continue;
 
         const array_size = findArraySize(tokens, i, source) orelse continue;
         if (array_size == 0) continue;
@@ -2421,6 +2742,7 @@ fn appendLogicalOpParentheses(
                     .pipe_pipe => {
                         if (close_depth == 0) {
                             const left = tokens[j + 1].start;
+                            if (rangeContainsPreprocessor(tokens, j + 1, k)) break;
                             if (editOverlaps(edits.items, left, tokens[k].start)) break;
                             try edits.append(allocator, .{ .start = left, .end = left, .replacement = try allocator.dupe(u8, "(") });
                             try edits.append(allocator, .{ .start = tokens[k].start, .end = tokens[k].start, .replacement = try allocator.dupe(u8, ")") });
@@ -2493,6 +2815,7 @@ fn appendLogicalOpParentheses(
                             if (tokens[end].kind == .rparen or tokens[end].kind == .rbrace or tokens[end].kind == .rbracket) end -= 1;
                             if (left <= i + 1) left = i + 1;
                             if (end < left or end >= tokens.len) break;
+                            if (rangeContainsPreprocessor(tokens, left, end)) break;
                             if (editOverlaps(edits.items, tokens[left].start, tokens[end - 1].end)) break;
                             try edits.append(allocator, .{ .start = tokens[left].start, .end = tokens[left].start, .replacement = try allocator.dupe(u8, "(") });
                             try edits.append(allocator, .{ .start = tokens[end].end, .end = tokens[end].end, .replacement = try allocator.dupe(u8, ")") });
@@ -2793,7 +3116,7 @@ test "annotate unused single line local declaration" {
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] auto arena") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/* rosette-c-fix: maybe_unused */ auto arena") != null);
 }
 
 test "do not annotate used local declaration" {
@@ -2825,7 +3148,7 @@ test "local used only in non-apple branch gets maybe_unused annotation" {
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] int x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/* rosette-c-fix: maybe_unused */ int x") != null);
 }
 
 test "local used in apple branch gets no maybe_unused annotation" {
@@ -2871,7 +3194,7 @@ test "unused but set local gets maybe_unused annotation" {
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] int x;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/* rosette-c-fix: maybe_unused */ int x;") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "(void)x") == null);
 }
 
@@ -2887,7 +3210,7 @@ test "standalone void suppressor becomes maybe_unused local annotation" {
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] int x;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/* rosette-c-fix: maybe_unused */ int x;") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "(void)x") == null);
 }
 
@@ -2904,7 +3227,7 @@ test "apple-only void suppressor block becomes maybe_unused parameter annotation
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "void f([[maybe_unused]] int dfn)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "void f(/* rosette-c-fix: maybe_unused */ int dfn)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "(void)dfn") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "#ifdef __APPLE__") == null);
 }
@@ -3122,7 +3445,7 @@ test "unused file-scope const gets maybe_unused" {
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] const int FOO") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/* rosette-c-fix: maybe_unused */ const int FOO") != null);
 }
 
 test "used file-scope const gets no annotation" {
@@ -3146,7 +3469,7 @@ test "static const at file scope gets maybe_unused" {
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "[[maybe_unused]] static const int BAZ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/* rosette-c-fix: maybe_unused */ static const int BAZ") != null);
 }
 
 test "extern const at file scope skipped" {
