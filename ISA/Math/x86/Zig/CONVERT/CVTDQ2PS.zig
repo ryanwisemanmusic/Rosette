@@ -1,0 +1,35 @@
+const core = @import("../../../core.zig");
+const proofs = @import("../../../proofs.zig");
+
+pub const meta = core.InstructionMathMeta{
+    .name = "CVTDQ2PS",
+    .family = "CONVERT",
+    .path = "CONVERT/CVTDQ2PS.inc",
+    .source_table_path = "CONVERT/CVTDQ2PS.inc",
+    .target_isa = .x86,
+    .operation = .documented_contract,
+    .register_model = .documented_contract,
+    .flag_model = .documented_contract,
+};
+
+pub const proof_cases = [_]proofs.ProofCase{
+    .{ .documented_contract = .{ .name = "CVTDQ2PS", .path = "CONVERT/CVTDQ2PS.inc", .encoding_count = 6, .source_path_len = 20 } },
+    .{ .documented_contract = .{ .name = "CVTDQ2PS", .path = "CONVERT/CVTDQ2PS.inc", .encoding_count = 6, .source_path_len = 20 } },
+};
+
+pub const proof_report = proofs.ProofReport{
+    .meta = meta,
+    .cases = proof_cases[0..],
+};
+
+pub fn proofReport() proofs.ProofReport {
+    return proof_report;
+}
+
+pub fn verifyProofs() !void {
+    try proofs.verifyReport(proofReport());
+}
+
+test "x86 CVTDQ2PS documented-contract proofs match table metadata" {
+    try verifyProofs();
+}
