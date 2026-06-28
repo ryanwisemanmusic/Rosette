@@ -565,6 +565,14 @@ const scatter_vscatterdps = @import("SCATTER/vscatterdps.zig");
 const scatter_vscatterdpd = @import("SCATTER/vscatterdpd.zig");
 const scatter_vscatterqps = @import("SCATTER/vscatterqps.zig");
 const scatter_vscatterqpd = @import("SCATTER/vscatterqpd.zig");
+const gather_vgatherdpd = @import("GATHER/vgatherdpd.zig");
+const gather_vgatherqpd = @import("GATHER/vgatherqpd.zig");
+const gather_vgatherdps = @import("GATHER/vgatherdps.zig");
+const gather_vgatherqps = @import("GATHER/vgatherqps.zig");
+const gather_vpgatherdd = @import("GATHER/vpgatherdd.zig");
+const gather_vpgatherdq = @import("GATHER/vpgatherdq.zig");
+const gather_vpgatherqd = @import("GATHER/vpgatherqd.zig");
+const gather_vpgatherqq = @import("GATHER/vpgatherqq.zig");
 const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
 const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
 const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
@@ -1146,6 +1154,14 @@ pub const specs = blk: {
         spec(scatter_vscatterdpd.meta),
         spec(scatter_vscatterqps.meta),
         spec(scatter_vscatterqpd.meta),
+        spec(gather_vgatherdpd.meta),
+        spec(gather_vgatherqpd.meta),
+        spec(gather_vgatherdps.meta),
+        spec(gather_vgatherqps.meta),
+        spec(gather_vpgatherdd.meta),
+        spec(gather_vpgatherdq.meta),
+        spec(gather_vpgatherqd.meta),
+        spec(gather_vpgatherqq.meta),
         spec(square_root_fsqrt.meta),
         spec(square_root_sqrtpd.meta),
         spec(square_root_sqrtps.meta),
@@ -1739,6 +1755,14 @@ pub const proof_reports = [_]proofs.ProofReport{
     scatter_vscatterdpd.proof_report,
     scatter_vscatterqps.proof_report,
     scatter_vscatterqpd.proof_report,
+    gather_vgatherdpd.proof_report,
+    gather_vgatherqpd.proof_report,
+    gather_vgatherdps.proof_report,
+    gather_vgatherqps.proof_report,
+    gather_vpgatherdd.proof_report,
+    gather_vpgatherdq.proof_report,
+    gather_vpgatherqd.proof_report,
+    gather_vpgatherqq.proof_report,
     square_root_fsqrt.proof_report,
     square_root_sqrtpd.proof_report,
     square_root_sqrtps.proof_report,
@@ -1835,7 +1859,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 484), tableCount());
+    try std.testing.expectEqual(@as(usize, 492), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
