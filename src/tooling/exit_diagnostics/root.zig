@@ -11,6 +11,8 @@ pub const TerminationReason = enum(u8) {
     divide_by_zero = 7,
     decode_failed = 8,
     unresolved_import_result = 9,
+    invalid_control_flow_target = 10,
+    cxx_exception = 11,
 };
 
 pub const TerminalRegs = struct {
@@ -140,6 +142,8 @@ pub fn reasonLabel(reason: TerminationReason) []const u8 {
         .divide_by_zero => "divide-by-zero",
         .decode_failed => "decoder returned null",
         .unresolved_import_result => "guest result depends on unresolved Mach-O imports",
+        .invalid_control_flow_target => "control flow entered non-executable memory",
+        .cxx_exception => "guest raised a C++ exception without an available unwinder",
     };
 }
 
