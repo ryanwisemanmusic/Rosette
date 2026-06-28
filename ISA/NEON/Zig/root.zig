@@ -564,6 +564,14 @@ const scatter_vscatterdps = @import("SCATTER/vscatterdps.zig");
 const scatter_vscatterdpd = @import("SCATTER/vscatterdpd.zig");
 const scatter_vscatterqps = @import("SCATTER/vscatterqps.zig");
 const scatter_vscatterqpd = @import("SCATTER/vscatterqpd.zig");
+const gather_vgatherdpd = @import("GATHER/vgatherdpd.zig");
+const gather_vgatherqpd = @import("GATHER/vgatherqpd.zig");
+const gather_vgatherdps = @import("GATHER/vgatherdps.zig");
+const gather_vgatherqps = @import("GATHER/vgatherqps.zig");
+const gather_vpgatherdd = @import("GATHER/vpgatherdd.zig");
+const gather_vpgatherdq = @import("GATHER/vpgatherdq.zig");
+const gather_vpgatherqd = @import("GATHER/vpgatherqd.zig");
+const gather_vpgatherqq = @import("GATHER/vpgatherqq.zig");
 const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
 const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
 const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
@@ -1216,6 +1224,14 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(scatter_vscatterdpd.family, scatter_vscatterdpd.path, scatter_vscatterdpd.source),
     mirror(scatter_vscatterqps.family, scatter_vscatterqps.path, scatter_vscatterqps.source),
     mirror(scatter_vscatterqpd.family, scatter_vscatterqpd.path, scatter_vscatterqpd.source),
+    mirror(gather_vgatherdpd.family, gather_vgatherdpd.path, gather_vgatherdpd.source),
+    mirror(gather_vgatherqpd.family, gather_vgatherqpd.path, gather_vgatherqpd.source),
+    mirror(gather_vgatherdps.family, gather_vgatherdps.path, gather_vgatherdps.source),
+    mirror(gather_vgatherqps.family, gather_vgatherqps.path, gather_vgatherqps.source),
+    mirror(gather_vpgatherdd.family, gather_vpgatherdd.path, gather_vpgatherdd.source),
+    mirror(gather_vpgatherdq.family, gather_vpgatherdq.path, gather_vpgatherdq.source),
+    mirror(gather_vpgatherqd.family, gather_vpgatherqd.path, gather_vpgatherqd.source),
+    mirror(gather_vpgatherqq.family, gather_vpgatherqq.path, gather_vpgatherqq.source),
     mirror(square_root_fsqrt.family, square_root_fsqrt.path, square_root_fsqrt.source),
     mirror(square_root_sqrtpd.family, square_root_sqrtpd.path, square_root_sqrtpd.source),
     mirror(square_root_sqrtps.family, square_root_sqrtps.path, square_root_sqrtps.source),
