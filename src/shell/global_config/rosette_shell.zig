@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const alignment = @import("entrypoint_alignment");
 const process_guard = @import("entrypoint_kernel_process_guard");
 const project_includes = @import("compat_source_include_compat");
 const pid_manager = @import("pid_manager.zig");
@@ -203,6 +204,10 @@ pub fn main(init: std.process.Init) !void {
         try runCompilerSanitizer(init.io, allocator, args[2..]);
         return;
     }
+    if (std.mem.eql(u8, args[1], "alignment")) {
+        if (args.len < 3) return usage(args[0]);
+        std.process.exit(try runAlignmentDiagnostics(init, allocator, args[2..]));
+    }
     if (std.mem.eql(u8, args[1], "recipe-shell")) {
         try runRecipeShell(init, allocator, args[2..]);
         return;
@@ -237,6 +242,7 @@ fn usage(exe_name: []const u8) void {
         \\  {s} run-elf <x86-64-elf-path> [args...]
         \\  {s} tool <tool-name> [tool-args...]
         \\  {s} compiler-sanitize <compiler> [compiler-args...]
+        \\  {s} alignment [--strict] [--pointer-alignment=N] <linker-log>
         \\  {s} recipe-shell [sh-args...]
         \\  {s} is-elf64 <path>
         \\
@@ -252,7 +258,36 @@ fn usage(exe_name: []const u8) void {
         \\  abort_on_fallback = false
         \\  abort_on_unsupported = false
         \\
-    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+    , .{ exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name, exe_name });
+}
+
+fn runAlignmentDiagnostics(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !u8 {
+    var strict = false;
+    var pointer_alignment: usize = @sizeOf(usize);
+    var path: ?[]const u8 = null;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--strict")) {
+            strict = true;
+        } else if (std.mem.startsWith(u8, arg, "--pointer-alignment=")) {
+            pointer_alignment = std.fmt.parseUnsigned(usize, arg["--pointer-alignment=".len..], 10) catch {
+                std.debug.print("rosette-shell: invalid pointer alignment: {s}\n", .{arg});
+                return 64;
+            };
+        } else if (path == null) {
+            path = arg;
+        } else {
+            std.debug.print("rosette-shell: alignment accepts one linker log path\n", .{});
+            return 64;
+        }
+    }
+    const log_path = path orelse {
+        std.debug.print("rosette-shell: alignment requires a linker log path\n", .{});
+        return 64;
+    };
+    return alignment.diagnoseFile(init.io, allocator, log_path, pointer_alignment, strict) catch |err| {
+        std.debug.print("rosette-shell: alignment diagnostics failed for {s}: {s}\n", .{ log_path, @errorName(err) });
+        return 1;
+    };
 }
 
 fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8) !void {
@@ -460,10 +495,15 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
             return err;
         };
         std.debug.print("[INSTALL] Step 11a: Installing rosette-c-fix binary\n", .{});
-        copyRosetteCFix(init, allocator, source_root, rosette_c_fix_path) catch |err| {
+        const c_fix_installed = copyRosetteCFix(init, allocator, source_root, rosette_c_fix_path) catch |err| blk: {
             std.debug.print("[INSTALL] WARNING: Failed to install rosette-c-fix: {s}\n", .{@errorName(err)});
+            break :blk false;
         };
-        std.debug.print("[INSTALL] Installed rosette-c-fix: {s}\n", .{rosette_c_fix_path});
+        if (c_fix_installed) {
+            std.debug.print("[INSTALL] Installed rosette-c-fix: {s}\n", .{rosette_c_fix_path});
+        } else {
+            std.debug.print("[INSTALL] rosette-c-fix unavailable; compiler sanitization will skip its source pass\n", .{});
+        }
     }
 
     std.debug.print("[INSTALL] Step 12: Building shell snippet\n", .{});
@@ -3544,7 +3584,13 @@ fn runZigCompilerWithCompatibility(
 fn runCompilerSanitizer(io: std.Io, allocator: std.mem.Allocator, compiler_argv: []const []const u8) !void {
     if (compiler_argv.len == 0) return error.EmptyArgv;
 
-    // Scan for C/C++/ObjC source files and run rosette-c-fix on each
+    var rewritten_args = try allocator.alloc([]const u8, compiler_argv.len - 1);
+    defer allocator.free(rewritten_args);
+    @memcpy(rewritten_args, compiler_argv[1..]);
+
+    // Stage source files into a temporary Rosette-owned directory, sanitize the
+    // staged copies, and rewrite compiler argv to point at the staged paths so
+    // the original project sources are never mutated in place.
     {
         const fix_bin_env = std.c.getenv("ROSETTE_C_FIX_BIN");
         const rosette_dir_env = std.c.getenv("HOME");
@@ -3557,7 +3603,13 @@ fn runCompilerSanitizer(io: std.Io, allocator: std.mem.Allocator, compiler_argv:
             const enable_env = std.c.getenv("ROSETTE_C_FIX_ENABLE");
             const enable = if (enable_env) |env| std.mem.span(env) else "auto";
             if (!std.mem.eql(u8, enable, "0")) {
-                for (compiler_argv[1..]) |arg| {
+                const tmp_root = getenvSlice("TMPDIR") orelse "/tmp";
+                var stage_dir_buf: [256]u8 = undefined;
+                const stage_dir = try std.fmt.bufPrint(&stage_dir_buf, "{s}/rosette-compiler-sanitize-{d}", .{ tmp_root, std.c.getpid() });
+                const stage_dir_z = try allocator.dupeZ(u8, stage_dir);
+                _ = c.mkdir(stage_dir_z.ptr, 0o755);
+
+                for (rewritten_args, 0..) |arg, idx| {
                     const is_source = std.mem.endsWith(u8, arg, ".c") or
                         std.mem.endsWith(u8, arg, ".cc") or
                         std.mem.endsWith(u8, arg, ".cpp") or
@@ -3565,8 +3617,20 @@ fn runCompilerSanitizer(io: std.Io, allocator: std.mem.Allocator, compiler_argv:
                         std.mem.endsWith(u8, arg, ".m") or
                         std.mem.endsWith(u8, arg, ".mm");
                     if (is_source) {
-                        const fix_argv = [_][]const u8{ fix_bin, "--in-place", arg };
-                        _ = runArgvResult(io, &fix_argv) catch {};
+                        const source_abs = absolutePath(allocator, arg) catch try allocator.dupe(u8, arg);
+                        const base_name = std.fs.path.basename(source_abs);
+                        const staged_path = try std.fs.path.join(allocator, &.{ stage_dir, base_name });
+                        const copy_argv = [_][]const u8{ "/bin/cp", "-f", source_abs, staged_path };
+                        _ = try runArgvResult(io, &copy_argv);
+                        const is_cpp = std.mem.endsWith(u8, arg, ".cc") or
+                            std.mem.endsWith(u8, arg, ".cpp") or
+                            std.mem.endsWith(u8, arg, ".cxx") or
+                            std.mem.endsWith(u8, arg, ".mm");
+                        if (!is_cpp) {
+                            const fix_argv = [_][]const u8{ fix_bin, "--in-place", staged_path };
+                            _ = runArgvResult(io, &fix_argv) catch {};
+                        }
+                        rewritten_args[idx] = staged_path;
                     }
                 }
             }
@@ -3576,7 +3640,7 @@ fn runCompilerSanitizer(io: std.Io, allocator: std.mem.Allocator, compiler_argv:
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, compiler_argv[0]);
-    try appendSanitizedCompilerArgs(io, &argv, allocator, compiler_argv[1..], compilerArgsTargetX86(compiler_argv[1..]), false);
+    try appendSanitizedCompilerArgs(io, &argv, allocator, rewritten_args, compilerArgsTargetX86(rewritten_args), false);
     try execArgvReplace(allocator, argv.items);
 }
 
@@ -4614,9 +4678,10 @@ fn copyCompatRouter(init: std.process.Init, allocator: std.mem.Allocator, source
     std.debug.print("rosette-shell: warning: rosette-router binary not found; build with 'make compat-router-build' first\n", .{});
 }
 
-fn copyRosetteCFix(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8, dest_path: []const u8) !void {
+fn copyRosetteCFix(init: std.process.Init, allocator: std.mem.Allocator, source_root: []const u8, dest_path: []const u8) !bool {
     const candidates = [_][]const u8{
         try std.fs.path.join(allocator, &.{ source_root, "zig-out", "bin", "rosette-c-fix" }),
+        try std.fs.path.join(allocator, &.{ source_root, "build", "zig-out", "bin", "rosette-c-fix" }),
         try std.fs.path.join(allocator, &.{ source_root, "..", "..", "MacOS", "rosette-c-fix" }),
         try std.fs.path.join(allocator, &.{ source_root, "rosette-c-fix" }),
     };
@@ -4625,10 +4690,11 @@ fn copyRosetteCFix(init: std.process.Init, allocator: std.mem.Allocator, source_
         if (fileExists(allocator, candidate) and canExecute(allocator, candidate)) {
             try copyFile(init, allocator, candidate, dest_path, "rosette-c-fix");
             _ = chmodPath(allocator, dest_path, 0o755) catch {};
-            return;
+            return true;
         }
     }
     std.debug.print("rosette-shell: warning: rosette-c-fix binary not found; build with 'zig build' first\n", .{});
+    return false;
 }
 
 fn copyFile(init: std.process.Init, allocator: std.mem.Allocator, source_path: []const u8, dest_path: []const u8, label: []const u8) !void {
