@@ -6,6 +6,7 @@ const x64_interpreter = @import("x64_interpreter");
 const macho_runtime = @import("macho_runtime");
 const exit_diagnostics = @import("exit_diagnostics");
 const macho_metadata = @import("metadata.zig");
+const compat_runtime = @import("compat_runtime.zig");
 
 const log = std.log.scoped(.macho);
 
@@ -80,8 +81,12 @@ pub const MachOState = struct {
     mem: []u8,
     mem_base: u64,
     mem_size: u64,
+    heap_next: u64,
     regs: Regs = .{},
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    cpu_profile: x64_decoder.capabilities.Profile = .xenia,
+    compat: compat_runtime.Runtime = .{},
     terminated: bool = false,
     exit_code: u64 = 0,
     faulted: bool = false,
@@ -173,6 +178,7 @@ pub const MachOState = struct {
             .mem = mem,
             .mem_base = image_base,
             .mem_size = final_mem_size,
+            .heap_next = image_end,
             .data = binary_data,
             .segments = try allocator.dupe(MachSegment, state.segments),
             .metadata = metadata,
@@ -197,6 +203,14 @@ pub const MachOState = struct {
         const off = vaddr - self.mem_base;
         if (off >= self.mem_size) return null;
         return off;
+    }
+
+    fn isExecutableAddress(self: *const MachOState, address: u64) bool {
+        for (self.segments) |segment| {
+            if (segment.initprot & 0x04 == 0) continue;
+            if (address >= segment.vmaddr and address < segment.vmaddr + segment.vmsize) return true;
+        }
+        return false;
     }
 
     pub fn read8(self: *const MachOState, vaddr: u64) u8 {
@@ -301,6 +315,19 @@ pub const MachOState = struct {
         const count_usize: usize = @intCast(count);
         if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
         return self.mem[off_usize .. off_usize + count_usize];
+    }
+
+    pub fn guestAlloc(self: *MachOState, requested_size: u64, alignment: u64) ?u64 {
+        const size = @max(requested_size, 1);
+        const mask = alignment - 1;
+        const start = (self.heap_next + mask) & ~mask;
+        const end = std.math.add(u64, start, size) catch return null;
+        const stack_floor = self.mem_base + self.mem_size -| self.stack_size;
+        if (end > stack_floor) return null;
+        const storage = self.guestMemory(start, size) orelse return null;
+        @memset(storage, 0);
+        self.heap_next = end;
+        return start;
     }
 
     fn guestCString(self: *const MachOState, addr: u64, max_len: usize) ?[]const u8 {
@@ -502,7 +529,9 @@ pub const MachOState = struct {
                         },
                         .terminated => |exit_code| {
                             self.exit_code = exit_code;
-                            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
+                            if (exit_diagnostics.reasonFromValue(self.termination_reason) == .unknown) {
+                                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
+                            }
                             self.terminated = true;
                             std.debug.print("  [handled terminal import] {s}({d})\n", .{ imported.name, exit_code });
                         },
@@ -538,6 +567,193 @@ pub const MachOState = struct {
     fn handleImport(self: *MachOState, name: []const u8) ImportHandlerResult {
         if (std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) {
             return .{ .terminated = self.regs.rdi & 0xFF };
+        }
+
+        if (std.mem.eql(u8, name, "_objc_getClass")) {
+            const class_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
+            const handle = self.compat.classNamed(class_name);
+            std.debug.print("    [objc] class {s} -> 0x{x}\n", .{ class_name, handle });
+            return .{ .handled = handle };
+        }
+        if (std.mem.eql(u8, name, "_sel_registerName")) {
+            const selector_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
+            const handle = self.compat.selectorNamed(selector_name);
+            std.debug.print("    [objc] selector {s} -> 0x{x}\n", .{ selector_name, handle });
+            return .{ .handled = handle };
+        }
+        if (std.mem.eql(u8, name, "_objc_msgSend")) {
+            const result = self.compat.sendMessage(self.regs.rdi, self.regs.rsi);
+            std.debug.print(
+                "    [objc] msgSend receiver=0x{x} selector={s} -> 0x{x} modeled={}\n",
+                .{ self.regs.rdi, result.selector_name, result.value, result.modeled },
+            );
+            return if (result.modeled) .{ .handled = result.value } else .{ .unsupported = result.value };
+        }
+
+        if (std.mem.eql(u8, name, "_pthread_self")) {
+            return .{ .handled = self.compat.currentThreadHandle() };
+        }
+        if (std.mem.eql(u8, name, "_pthread_equal")) {
+            return .{ .handled = @intFromBool(self.regs.rdi == self.regs.rsi) };
+        }
+        if (std.mem.eql(u8, name, "_pthread_main_np")) {
+            return .{ .handled = 1 };
+        }
+        if (std.mem.eql(u8, name, "_pthread_threadid_np")) {
+            if (self.regs.rsi != 0) self.write64(self.regs.rsi, 1);
+            return .{ .handled = 0 };
+        }
+
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm") != null) {
+            const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
+            std.debug.print(
+                "    [libc++] basic_string::__init(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
+                .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, ok },
+            );
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc") != null) {
+            const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
+            std.debug.print(
+                "    [libc++] basic_string::assign(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
+                .{ self.regs.rdi, self.regs.rsi, source.len, ok },
+            );
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc") != null) {
+            const value = [_]u8{@truncate(self.regs.rsi)};
+            const ok = compat_runtime.initLibcppStringLiteral(self, self.regs.rdi, &value);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm") != null) {
+            const ok = compat_runtime.appendLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_") != null or
+            std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_") != null)
+        {
+            const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "__ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EEPKS6_RKS9_") != null) {
+            const left = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const ok = compat_runtime.concatCStringAndLibcppString(self, self.regs.rdi, self.regs.rsi, left.len, self.regs.rdx);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev") != null or
+            std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev") != null)
+        {
+            const ok = compat_runtime.destroyLibcppString(self, self.regs.rdi);
+            return if (ok) .{ .handled = 0 } else .{ .unsupported = 0 };
+        }
+
+        if (std.mem.eql(u8, name, "___cxa_guard_acquire")) {
+            const result = compat_runtime.cxaGuardAcquire(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
+            return .{ .handled = result };
+        }
+        if (std.mem.eql(u8, name, "___cxa_guard_release")) {
+            return if (compat_runtime.cxaGuardRelease(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "___cxa_guard_abort")) {
+            return if (compat_runtime.cxaGuardAbort(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "___cxa_atexit")) {
+            const registered = self.compat.registerAtexit(self.regs.rdi, self.regs.rsi, self.regs.rdx);
+            std.debug.print(
+                "    [c++] __cxa_atexit(function=0x{x}, argument=0x{x}, dso=0x{x}) -> {}\n",
+                .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, registered },
+            );
+            return .{ .handled = if (registered) 0 else 1 };
+        }
+
+        if (std.mem.eql(u8, name, "__ZNSt3__16localeC1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeC2Ev")) {
+            const ok = self.compat.initLocale(self, self.regs.rdi, null);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__16localeC1ERKS0_") or std.mem.eql(u8, name, "__ZNSt3__16localeC2ERKS0_")) {
+            const ok = self.compat.initLocale(self, self.regs.rdi, self.regs.rsi);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__16localeD1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeD2Ev")) {
+            return if (self.compat.destroyLocale(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNKSt3__16locale9use_facetERNS0_2idE")) {
+            const return_address = self.read64(self.regs.rsp);
+            const caller_name = if (self.metadata.nearestSymbol(return_address)) |caller| caller.name else "";
+            const kind: compat_runtime.LocaleFacetKind = if (std.mem.indexOf(u8, caller_name, "ctype") != null)
+                .ctype
+            else if (std.mem.indexOf(u8, caller_name, "collate") != null)
+                .collate
+            else
+                .generic;
+            const key = self.regs.rsi ^ (@as(u64, @intFromEnum(kind)) << 56);
+            const facet = self.compat.localeFacet(self, key, kind) orelse return .{ .unsupported = 0 };
+            std.debug.print("    [libc++] locale::use_facet caller={s} kind={s} -> 0x{x}\n", .{ caller_name, @tagName(kind), facet });
+            return .{ .handled = facet };
+        }
+        if (std.mem.eql(u8, name, "__ZNKSt3__16locale4nameEv")) {
+            const ok = compat_runtime.initLibcppStringLiteral(self, self.regs.rdi, "C");
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__115__get_classnameEPKcb")) {
+            const class_name = self.guestCString(self.regs.rdi, 64) orelse return .{ .unsupported = 0 };
+            const mask = compat_runtime.libcppRegexClassMask(class_name, self.regs.rsi != 0);
+            std.debug.print("    [libc++] regex class {s} ignore_case={} -> mask=0x{x}\n", .{ class_name, self.regs.rsi != 0, mask });
+            return .{ .handled = mask };
+        }
+        if (std.mem.eql(u8, name, "___cxa_allocate_exception")) {
+            const allocation = self.guestAlloc(self.regs.rdi +| 64, 16) orelse return .{ .unsupported = 0 };
+            return .{ .handled = allocation + 64 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt20bad_array_new_lengthC1Ev")) {
+            return .{ .handled = self.regs.rdi };
+        }
+        if (std.mem.eql(u8, name, "___cxa_throw")) {
+            const type_symbol = if (self.metadata.nearestSymbol(self.regs.rsi)) |symbol| symbol else null;
+            const destructor_symbol = if (self.metadata.nearestSymbol(self.regs.rdx)) |symbol| symbol else null;
+            std.debug.print(
+                "macho-processor: guest raised C++ exception object=0x{x} type_info=0x{x} destructor=0x{x}\n",
+                .{ self.regs.rdi, self.regs.rsi, self.regs.rdx },
+            );
+            if (type_symbol) |symbol| {
+                std.debug.print("macho-processor: C++ exception type: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
+            }
+            if (destructor_symbol) |symbol| {
+                std.debug.print("macho-processor: C++ exception destructor: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
+            }
+            if (compat_runtime.libcppStringView(self, self.regs.rdi + 8)) |message_view| {
+                if (message_view.length != 0 and message_view.length <= 4096) {
+                    if (self.guestMemoryConst(message_view.address, message_view.length)) |message| {
+                        var printable = true;
+                        for (message) |byte| {
+                            if (byte < 0x20 or byte > 0x7E) {
+                                printable = false;
+                                break;
+                            }
+                        }
+                        if (printable) std.debug.print("macho-processor: C++ exception message: {s}\n", .{message});
+                    }
+                }
+            }
+            self.faulted = true;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
+            return .{ .terminated = 127 };
+        }
+
+        if (std.mem.eql(u8, name, "__Znwm") or std.mem.eql(u8, name, "__Znam") or
+            std.mem.endsWith(u8, name, "_malloc"))
+        {
+            return .{ .handled = self.guestAlloc(self.regs.rdi, 16) orelse 0 };
+        }
+        if (std.mem.endsWith(u8, name, "_calloc")) {
+            const size = std.math.mul(u64, self.regs.rdi, self.regs.rsi) catch return .{ .handled = 0 };
+            return .{ .handled = self.guestAlloc(size, 16) orelse 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZdlPv") or std.mem.eql(u8, name, "__ZdaPv") or
+            std.mem.endsWith(u8, name, "_free"))
+        {
+            return .{ .handled = 0 };
         }
 
         if (std.mem.endsWith(u8, name, "_memset")) {
@@ -624,11 +840,76 @@ pub const MachOState = struct {
             return .{ .handled = self.handleGtkInitCheck() };
         }
 
+        if (std.mem.endsWith(u8, name, "_gtk_message_dialog_new")) {
+            std.debug.print("    [import] _gtk_message_dialog_new compatibility shim → fake widget\n", .{});
+            return .{ .handled = 1 };
+        }
+
+        if (std.mem.endsWith(u8, name, "_gtk_dialog_get_type")) {
+            std.debug.print("    [import] _gtk_dialog_get_type compatibility shim → G_TYPE_DIALOG\n", .{});
+            return .{ .handled = 1 };
+        }
+
+        if (std.mem.endsWith(u8, name, "_g_type_check_instance_cast")) {
+            std.debug.print("    [import] _g_type_check_instance_cast compatibility shim → passthrough\n", .{});
+            return .{ .handled = self.regs.rdi };
+        }
+
+        if (std.mem.endsWith(u8, name, "_gtk_dialog_run")) {
+            std.debug.print("    [import] _gtk_dialog_run compatibility shim → no-op\n", .{});
+            return .{ .handled = 0 };
+        }
+
+        if (std.mem.endsWith(u8, name, "_gtk_widget_destroy")) {
+            std.debug.print("    [import] _gtk_widget_destroy compatibility shim → no-op\n", .{});
+            return .{ .handled = 0 };
+        }
+
         if (std.mem.endsWith(u8, name, "_localtime") or std.mem.endsWith(u8, name, "_strftime")) {
             return .{ .handled = 0 };
         }
 
         return .{ .unsupported = 0 };
+    }
+
+    fn handleDirectImportCall(self: *MachOState, imported: macho_metadata.ImportedSymbol) void {
+        const return_address = self.read64(self.regs.rsp);
+        switch (self.handleImport(imported.name)) {
+            .handled => |result| {
+                self.regs.rax = result;
+                std.debug.print(
+                    "  [handled direct import] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
+                    .{ imported.name, imported.dylib, imported.stub_address, return_address, result },
+                );
+            },
+            .unsupported => |result| {
+                self.regs.rax = result;
+                self.recordUnresolvedImport(imported, return_address, result);
+                std.debug.print(
+                    "  [unresolved direct import #{d}] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
+                    .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, return_address, result },
+                );
+            },
+            .terminated => |exit_code| {
+                self.exit_code = exit_code;
+                if (exit_diagnostics.reasonFromValue(self.termination_reason) == .unknown) {
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
+                }
+                self.terminated = true;
+                std.debug.print("  [handled terminal direct import] {s}({d})\n", .{ imported.name, exit_code });
+                return;
+            },
+        }
+
+        if (return_address != 0 and self.isExecutableAddress(return_address)) {
+            _ = self.pop();
+            self.regs.rip = return_address;
+        } else {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+            self.terminated = true;
+        }
     }
 
     fn recordUnresolvedImport(
@@ -1040,8 +1321,21 @@ pub const MachOState = struct {
     }
 
     fn step(self: *MachOState) bool {
+        if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
         if (self.handleStubHelperTransition()) {
             return !self.terminated;
+        }
+        if (!self.isExecutableAddress(self.regs.rip)) {
+            std.debug.print(
+                "macho-processor: invalid control-flow target rip=0x{x}; address is outside executable Mach-O segments\n",
+                .{self.regs.rip},
+            );
+            self.dumpRecentTrace();
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            self.terminated = true;
+            return false;
         }
         const decoded = self.decodeAt() orelse {
             const rip = self.regs.rip;
@@ -1062,6 +1356,17 @@ pub const MachOState = struct {
             const mem_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
             const rip = self.regs.rip;
             std.debug.print("macho-processor: invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}\n", .{ rip, mem_off, mem_bytes });
+            if (x64_decoder.capabilities.classifyRequirement(mem_bytes)) |requirement| {
+                std.debug.print(
+                    "macho-processor: ISA requirement: {s} encoding requires {s}; virtual profile={s}, advertised={}\n",
+                    .{
+                        @tagName(requirement.encoding),
+                        x64_decoder.capabilities.featureLabel(requirement.feature),
+                        self.cpu_profile.label(),
+                        x64_decoder.capabilities.supports(self.cpu_profile, requirement.feature),
+                    },
+                );
+            }
             if (self.fileOffsetForVaddr(rip)) |file_off| {
                 const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
                 const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
@@ -1098,6 +1403,56 @@ pub const MachOState = struct {
             self.regs.rip +%= decoded.len;
         }
         return !self.terminated;
+    }
+
+    fn handleSyntheticRuntimeThunk(self: *MachOState) bool {
+        const thunk = compat_runtime.syntheticThunk(self.regs.rip) orelse return false;
+        const source_begin = self.regs.rsi;
+        const source_end = self.regs.rdx;
+
+        switch (thunk) {
+            .ctype_toupper_char => self.regs.rax = std.ascii.toUpper(@as(u8, @truncate(self.regs.rsi))),
+            .ctype_tolower_char => self.regs.rax = std.ascii.toLower(@as(u8, @truncate(self.regs.rsi))),
+            .ctype_toupper_range, .ctype_tolower_range => {
+                if (source_end < source_begin) {
+                    self.regs.rax = source_begin;
+                } else if (self.guestMemory(source_begin, source_end - source_begin)) |bytes| {
+                    for (bytes) |*byte| {
+                        byte.* = if (thunk == .ctype_toupper_range) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
+                    }
+                    self.regs.rax = source_end;
+                } else {
+                    self.regs.rax = source_begin;
+                }
+            },
+            .ctype_widen_char, .ctype_narrow_char => self.regs.rax = self.regs.rsi & 0xFF,
+            .ctype_widen_range => {
+                const count = source_end -| source_begin;
+                const source = self.guestMemoryConst(source_begin, count);
+                const destination = self.guestMemory(self.regs.rcx, count);
+                if (source != null and destination != null) std.mem.copyForwards(u8, destination.?, source.?);
+                self.regs.rax = source_end;
+            },
+            .ctype_narrow_range => {
+                const count = source_end -| source_begin;
+                const source = self.guestMemoryConst(source_begin, count);
+                const destination = self.guestMemory(self.regs.r8, count);
+                if (source != null and destination != null) std.mem.copyForwards(u8, destination.?, source.?);
+                self.regs.rax = source_end;
+            },
+        }
+
+        const return_address = self.pop();
+        std.debug.print("    [synthetic runtime] {s} -> rax=0x{x} return=0x{x}\n", .{ @tagName(thunk), self.regs.rax, return_address });
+        if (return_address == 0) {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            self.terminated = true;
+        } else {
+            self.regs.rip = return_address;
+        }
+        return true;
     }
 
     pub fn run(self: *MachOState) void {
@@ -1152,15 +1507,17 @@ pub const MachOState = struct {
                 .r14 = self.regs.r14,
                 .r15 = self.regs.r15,
             },
-            .execution_authoritative = self.unresolved_import_count == 0,
+            .execution_authoritative = !self.faulted and self.unresolved_import_count == 0,
         };
 
-        if (self.metadata.nearestSymbol(self.regs.rip)) |symbol| {
-            report.terminal_symbol = .{
-                .address = symbol.address,
-                .symbol = symbol.name,
-                .symbol_offset = symbol.offset,
-            };
+        if (self.isExecutableAddress(self.regs.rip)) {
+            if (self.metadata.nearestSymbol(self.regs.rip)) |symbol| {
+                report.terminal_symbol = .{
+                    .address = symbol.address,
+                    .symbol = symbol.name,
+                    .symbol_offset = symbol.offset,
+                };
+            }
         }
 
         const import_trace_count: usize = if (self.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else self.import_trace_index;
@@ -1272,6 +1629,52 @@ pub const MachOState = struct {
                 self.setReg(d.dst_reg, .bits64, self.regVal(d.src_reg, .bits64));
             },
 
+            .add_accum_imm => self.executeAddRegImm(d, d.size),
+            .or_accum_imm => {
+                const result = self.regVal(.al_ax_eax_rax, d.size) | d.imm;
+                self.setReg(.al_ax_eax_rax, d.size, result);
+                self.setFlagsLogic(result, d.size);
+            },
+            .adc_accum_imm => {
+                const input = self.regVal(.al_ax_eax_rax, d.size);
+                const carry: u64 = @intFromBool((self.regs.rflags & RFL_CF) != 0);
+                const addend = d.imm +% carry;
+                const result = input +% addend;
+                self.setReg(.al_ax_eax_rax, d.size, result);
+                self.setFlagsAdd(input, addend, result, d.size);
+            },
+            .sbb_accum_imm => {
+                const input = self.regVal(.al_ax_eax_rax, d.size);
+                const carry: u64 = @intFromBool((self.regs.rflags & RFL_CF) != 0);
+                const subtrahend = d.imm +% carry;
+                const result = input -% subtrahend;
+                self.setReg(.al_ax_eax_rax, d.size, result);
+                self.setFlagsSub(input, subtrahend, result, d.size);
+            },
+            .and_accum_imm => {
+                const result = self.regVal(.al_ax_eax_rax, d.size) & d.imm;
+                self.setReg(.al_ax_eax_rax, d.size, result);
+                self.setFlagsLogic(result, d.size);
+            },
+            .sub_accum_imm => self.executeSubRegImm(d, d.size),
+            .xor_accum_imm => {
+                const result = self.regVal(.al_ax_eax_rax, d.size) ^ d.imm;
+                self.setReg(.al_ax_eax_rax, d.size, result);
+                self.setFlagsLogic(result, d.size);
+            },
+            .cmp_accum_imm => {
+                const input = self.regVal(.al_ax_eax_rax, d.size);
+                self.setFlagsSub(input, d.imm, input -% d.imm, d.size);
+            },
+
+            .add_reg8_reg8, .add_reg16_reg16, .add_reg32_reg32, .add_reg64_reg64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_reg8) + @intFromEnum(Size.bits8));
+                const a = self.regVal(d.dst_reg, sz);
+                const b = self.regVal(d.src_reg, sz);
+                const r = a +% b;
+                self.setReg(d.dst_reg, sz, r);
+                self.setFlagsAdd(a, b, r, sz);
+            },
             .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_mem8) + @intFromEnum(Size.bits8));
                 const a = self.regVal(d.dst_reg, sz);
@@ -1621,15 +2024,33 @@ pub const MachOState = struct {
                 self.regs.rip = ret_addr;
             },
 
-            .jmp_rel8, .jmp_reg64 => {
+            .jmp_rel8 => {
                 self.logControlFlow("jmp", self.regs.rip, d.addr, d.len, null);
                 self.regs.rip = d.addr;
             },
-            .jmp_mem64 => {
-                self.pending_import_stub_rip = if (self.metadata.importAtStub(self.regs.rip) != null) self.regs.rip else null;
-                const target = self.readMemVal(d.addr, .bits64);
-                self.logControlFlow("jmp_mem64", self.regs.rip, target, d.len, null);
+            .jmp_reg64 => {
+                const target = self.regVal(d.dst_reg, .bits64);
+                self.logControlFlow("jmp_reg64", self.regs.rip, target, d.len, null);
                 self.regs.rip = target;
+            },
+            .jmp_mem64 => {
+                const target = self.readMemVal(d.addr, .bits64);
+                if (target == 0) {
+                    if (self.metadata.importAtStub(self.regs.rip)) |imported| {
+                        self.pending_import_stub_rip = null;
+                        self.handleDirectImportCall(imported);
+                    } else {
+                        self.logControlFlow("jmp_mem64_null", self.regs.rip, target, d.len, null);
+                        self.faulted = true;
+                        self.exit_code = 127;
+                        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+                        self.terminated = true;
+                    }
+                } else {
+                    self.pending_import_stub_rip = if (self.metadata.importAtStub(self.regs.rip) != null) self.regs.rip else null;
+                    self.logControlFlow("jmp_mem64", self.regs.rip, target, d.len, null);
+                    self.regs.rip = target;
+                }
             },
 
             .jcc_rel8, .jcc_rel32 => {
@@ -1718,18 +2139,65 @@ pub const MachOState = struct {
                 self.regs.rdx = @truncate(r >> 64);
             },
 
+            .div_reg16 => {
+                const divisor: u16 = @truncate(self.regVal(d.dst_reg, .bits16));
+                if (divisor == 0) return self.raiseDivideError();
+                const dividend = (@as(u32, @truncate(self.regs.rdx)) << 16) | @as(u16, @truncate(self.regs.rax));
+                const quotient = dividend / divisor;
+                if (quotient > std.math.maxInt(u16)) return self.raiseDivideError();
+                self.setReg(.al_ax_eax_rax, .bits16, quotient);
+                self.setReg(.dl_dx_edx_rdx, .bits16, dividend % divisor);
+            },
+            .div_reg32 => {
+                const divisor: u32 = @truncate(self.regVal(d.dst_reg, .bits32));
+                if (divisor == 0) return self.raiseDivideError();
+                const dividend = (@as(u64, @truncate(self.regs.rdx)) << 32) | @as(u32, @truncate(self.regs.rax));
+                const quotient = dividend / divisor;
+                if (quotient > std.math.maxInt(u32)) return self.raiseDivideError();
+                self.setReg(.al_ax_eax_rax, .bits32, quotient);
+                self.setReg(.dl_dx_edx_rdx, .bits32, dividend % divisor);
+            },
             .div_reg64 => {
                 const divisor = self.regVal(d.dst_reg, .bits64);
-                if (divisor == 0) {
-                    self.faulted = true;
-                    self.terminated = true;
-                    self.exit_code = 136;
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.divide_by_zero);
-                    return;
-                }
+                if (divisor == 0) return self.raiseDivideError();
                 const dividend = (@as(u128, self.regs.rdx) << 64) | self.regs.rax;
-                self.regs.rax = @truncate(dividend / divisor);
+                const quotient = dividend / divisor;
+                if (quotient > std.math.maxInt(u64)) return self.raiseDivideError();
+                self.regs.rax = @truncate(quotient);
                 self.regs.rdx = @truncate(dividend % divisor);
+            },
+            .idiv_reg16 => {
+                const divisor: i16 = @bitCast(@as(u16, @truncate(self.regVal(d.dst_reg, .bits16))));
+                if (divisor == 0) return self.raiseDivideError();
+                const dividend_bits = (@as(u32, @truncate(self.regs.rdx)) << 16) | @as(u16, @truncate(self.regs.rax));
+                const dividend: i32 = @bitCast(dividend_bits);
+                const quotient = @divTrunc(dividend, @as(i32, divisor));
+                if (quotient < std.math.minInt(i16) or quotient > std.math.maxInt(i16)) return self.raiseDivideError();
+                const remainder = @rem(dividend, @as(i32, divisor));
+                self.setReg(.al_ax_eax_rax, .bits16, @as(u16, @bitCast(@as(i16, @intCast(quotient)))));
+                self.setReg(.dl_dx_edx_rdx, .bits16, @as(u16, @bitCast(@as(i16, @intCast(remainder)))));
+            },
+            .idiv_reg32 => {
+                const divisor: i32 = @bitCast(@as(u32, @truncate(self.regVal(d.dst_reg, .bits32))));
+                if (divisor == 0) return self.raiseDivideError();
+                const dividend_bits = (@as(u64, @truncate(self.regs.rdx)) << 32) | @as(u32, @truncate(self.regs.rax));
+                const dividend: i64 = @bitCast(dividend_bits);
+                const quotient = @divTrunc(dividend, @as(i64, divisor));
+                if (quotient < std.math.minInt(i32) or quotient > std.math.maxInt(i32)) return self.raiseDivideError();
+                const remainder = @rem(dividend, @as(i64, divisor));
+                self.setReg(.al_ax_eax_rax, .bits32, @as(u32, @bitCast(@as(i32, @intCast(quotient)))));
+                self.setReg(.dl_dx_edx_rdx, .bits32, @as(u32, @bitCast(@as(i32, @intCast(remainder)))));
+            },
+            .idiv_reg64 => {
+                const divisor: i64 = @bitCast(self.regVal(d.dst_reg, .bits64));
+                if (divisor == 0) return self.raiseDivideError();
+                const dividend_bits = (@as(u128, self.regs.rdx) << 64) | self.regs.rax;
+                const dividend: i128 = @bitCast(dividend_bits);
+                const quotient = @divTrunc(dividend, @as(i128, divisor));
+                if (quotient < std.math.minInt(i64) or quotient > std.math.maxInt(i64)) return self.raiseDivideError();
+                const remainder = @rem(dividend, @as(i128, divisor));
+                self.regs.rax = @bitCast(@as(i64, @intCast(quotient)));
+                self.regs.rdx = @bitCast(@as(i64, @intCast(remainder)));
             },
 
             .imul_reg64_reg64, .imul_reg32_reg32 => {
@@ -1890,20 +2358,91 @@ pub const MachOState = struct {
                 self.writeMemVal(d.addr, .bits64, b);
                 self.setReg(d.src_reg, .bits64, a);
             },
+            .xadd_mem32_reg32, .xadd_mem64_reg64 => {
+                const sz: Size = if (d.op == .xadd_mem64_reg64) .bits64 else .bits32;
+                const old_mem = self.readMemVal(d.addr, sz);
+                const old_reg = self.regVal(d.src_reg, sz);
+                const result = old_mem +% old_reg;
+                self.writeMemVal(d.addr, sz, result);
+                self.setReg(d.src_reg, sz, old_mem);
+                self.setFlagsAdd(old_mem, old_reg, result, sz);
+            },
 
             .xorps_xmm_xmm => {
                 const dst = d.xmm_dst;
                 const src = d.xmm_src;
                 for (&self.xmm[dst], self.xmm[src]) |*d8, s8| d8.* = d8.* ^ s8;
             },
-            .movaps_xmm_xmm => {
+            .movups_xmm_xmm, .movaps_xmm_xmm => {
                 self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
             },
-            .movaps_xmm_mem => {
+            .movups_xmm_mem, .movaps_xmm_mem => {
                 self.xmm[d.xmm_dst] = self.readMem128(d.addr);
             },
-            .movaps_mem_xmm => {
-                self.writeMem128(d.addr, self.xmm[d.xmm_dst]);
+            .movups_mem_xmm, .movaps_mem_xmm => {
+                self.writeMem128(d.addr, self.xmm[d.xmm_src]);
+            },
+            .vmovdqu_xmm_xmm, .vmovdqa_xmm_xmm, .vmovups_xmm_xmm, .vmovaps_xmm_xmm, .vmovupd_xmm_xmm, .vmovapd_xmm_xmm => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            },
+            .vmovdqu_xmm_mem, .vmovdqa_xmm_mem, .vmovups_xmm_mem, .vmovaps_xmm_mem, .vmovupd_xmm_mem, .vmovapd_xmm_mem => {
+                self.xmm[d.xmm_dst] = self.readMem128(d.addr);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            },
+            .vmovdqu_mem_xmm, .vmovdqa_mem_xmm, .vmovups_mem_xmm, .vmovaps_mem_xmm, .vmovupd_mem_xmm, .vmovapd_mem_xmm => {
+                self.writeMem128(d.addr, self.xmm[d.xmm_src]);
+            },
+            .vmovdqu_ymm_ymm, .vmovdqa_ymm_ymm, .vmovups_ymm_ymm, .vmovaps_ymm_ymm, .vmovupd_ymm_ymm, .vmovapd_ymm_ymm => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                self.ymm_hi[d.xmm_dst] = self.ymm_hi[d.xmm_src];
+            },
+            .vmovdqu_ymm_mem, .vmovdqa_ymm_mem, .vmovups_ymm_mem, .vmovaps_ymm_mem, .vmovupd_ymm_mem, .vmovapd_ymm_mem => {
+                self.xmm[d.xmm_dst] = self.readMem128(d.addr);
+                self.ymm_hi[d.xmm_dst] = self.readMem128(d.addr + 16);
+            },
+            .vmovdqu_mem_ymm, .vmovdqa_mem_ymm, .vmovups_mem_ymm, .vmovaps_mem_ymm, .vmovupd_mem_ymm, .vmovapd_mem_ymm => {
+                self.writeMem128(d.addr, self.xmm[d.xmm_src]);
+                self.writeMem128(d.addr + 16, self.ymm_hi[d.xmm_src]);
+            },
+            .vmovss_xmm_mem => {
+                @memset(&self.xmm[d.xmm_dst], 0);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @truncate(self.readMemVal(d.addr, .bits32)), .little);
+            },
+            .vmovss_mem_xmm => {
+                self.writeMemVal(d.addr, .bits32, std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little));
+            },
+            .vmovsd_xmm_mem => {
+                @memset(&self.xmm[d.xmm_dst], 0);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], self.readMemVal(d.addr, .bits64), .little);
+            },
+            .vmovsd_mem_xmm => {
+                self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
+            },
+            .vzeroupper => {
+                for (&self.ymm_hi) |*upper| @memset(upper, 0);
+            },
+            .vcvtsi2ss_xmm_reg, .vcvtsi2ss_xmm_mem => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                const integer: i64 = if (d.size == .bits64)
+                    @bitCast(if (d.op == .vcvtsi2ss_xmm_reg) self.regVal(d.src_reg, .bits64) else self.readMemVal(d.addr, .bits64))
+                else
+                    @as(i32, @bitCast(@as(u32, @truncate(if (d.op == .vcvtsi2ss_xmm_reg) self.regVal(d.src_reg, .bits32) else self.readMemVal(d.addr, .bits32)))));
+                const converted: f32 = @floatFromInt(integer);
+                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(converted), .little);
+            },
+            .vcvtsi2sd_xmm_reg, .vcvtsi2sd_xmm_mem => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                const integer: i64 = if (d.size == .bits64)
+                    @bitCast(if (d.op == .vcvtsi2sd_xmm_reg) self.regVal(d.src_reg, .bits64) else self.readMemVal(d.addr, .bits64))
+                else
+                    @as(i32, @bitCast(@as(u32, @truncate(if (d.op == .vcvtsi2sd_xmm_reg) self.regVal(d.src_reg, .bits32) else self.readMemVal(d.addr, .bits32)))));
+                const converted: f64 = @floatFromInt(integer);
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
             },
 
             .syscall => {
@@ -1920,7 +2459,7 @@ pub const MachOState = struct {
             .cpuid => {
                 const leaf: u32 = @truncate(self.regs.rax);
                 const subleaf: u32 = @truncate(self.regs.rcx);
-                const result = x64_decoder.emulatedCpuid(leaf, subleaf);
+                const result = x64_decoder.capabilities.cpuid(self.cpu_profile, leaf, subleaf);
                 log.info(
                     "cpuid: leaf=0x{x} subleaf=0x{x} -> eax=0x{x} ebx=0x{x} ecx=0x{x} edx=0x{x}",
                     .{ leaf, subleaf, result.eax, result.ebx, result.ecx, result.edx },
@@ -1932,7 +2471,11 @@ pub const MachOState = struct {
             },
 
             .xgetbv => {
-                const xcr0 = if (@as(u32, @truncate(self.regs.rcx)) == 0) x64_decoder.emulatedXcr0() else 0;
+                const xcr0 = if (@as(u32, @truncate(self.regs.rcx)) == 0)
+                    x64_decoder.capabilities.xcr0(self.cpu_profile)
+                else
+                    0;
+                log.info("xgetbv: xcr=0x{x} -> xcr0=0x{x} profile={s}", .{ self.regs.rcx, xcr0, self.cpu_profile.label() });
                 self.setReg(.al_ax_eax_rax, .bits32, @truncate(xcr0));
                 self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(xcr0 >> 32));
             },
@@ -1958,6 +2501,13 @@ pub const MachOState = struct {
         const r = a +% d.imm;
         self.setReg(d.dst_reg, sz, r);
         self.setFlagsAdd(a, d.imm, r, sz);
+    }
+
+    fn raiseDivideError(self: *MachOState) void {
+        self.faulted = true;
+        self.terminated = true;
+        self.exit_code = 136;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.divide_by_zero);
     }
 
     fn executeSubRegImm(self: *MachOState, d: DecodedInsn, sz: Size) void {
@@ -2132,6 +2682,18 @@ pub const MachORunOptions = struct {
     trace: bool = false,
 };
 
+fn selectedCpuProfile() x64_decoder.capabilities.Profile {
+    const raw = std.c.getenv("ROSETTE_X64_CPU_PROFILE") orelse return .xenia;
+    const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+    return x64_decoder.capabilities.parseProfile(value) orelse {
+        std.debug.print(
+            "macho-processor: unknown ROSETTE_X64_CPU_PROFILE={s}; using xenia\n",
+            .{value},
+        );
+        return .xenia;
+    };
+}
+
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
     const file_data = try std.Io.Dir.cwd().readFileAlloc(io, options.path, allocator, .unlimited);
     defer allocator.free(file_data);
@@ -2143,6 +2705,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
 
     var state = try MachOState.init(allocator, slice);
     defer state.deinit();
+    state.cpu_profile = selectedCpuProfile();
 
     var temp_state = try macho.load(allocator, slice);
     defer temp_state.deinit();
@@ -2166,6 +2729,17 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     std.debug.print("  dylibs:    {d}\n", .{state.metadata.dylibs.len});
     std.debug.print("  imports:   {d}\n", .{state.metadata.imports.len});
     std.debug.print("  initializers: {d}\n", .{state.metadata.initializer_count});
+    std.debug.print("  x64 cpu profile: {s}\n", .{state.cpu_profile.label()});
+    std.debug.print(
+        "  advertised ISA: SSE4.2={} AVX={} AVX2={} AVX-512F={} XCR0=0x{x}\n",
+        .{
+            x64_decoder.capabilities.supports(state.cpu_profile, .sse42),
+            x64_decoder.capabilities.supports(state.cpu_profile, .avx),
+            x64_decoder.capabilities.supports(state.cpu_profile, .avx2),
+            x64_decoder.capabilities.supports(state.cpu_profile, .avx512f),
+            x64_decoder.capabilities.xcr0(state.cpu_profile),
+        },
+    );
     if (state.metadata.nearestSymbol(state.entry_point_vaddr)) |entry_symbol| {
         std.debug.print("  entry_symbol: {s}+0x{x}\n", .{ entry_symbol.name, entry_symbol.offset });
     }
@@ -2260,6 +2834,11 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             0x67 => {
                 pos += 1;
             },
+            0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65 => {
+                // Legacy segment overrides are still accepted in 64-bit mode
+                // and are commonly used in compiler-generated long NOPs.
+                pos += 1;
+            },
             0xF0 => {
                 has_f0 = true;
                 pos += 1;
@@ -2294,6 +2873,13 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
 
     const opcode = bytes[pos];
 
+    if (opcode == 0xC4) {
+        return decodeVex3(bytes, pos);
+    }
+    if (opcode == 0xC5) {
+        return decodeVex2(bytes, pos);
+    }
+
     if (opcode == 0x0F) {
         pos += 1;
         if (pos >= bytes.len) return .{};
@@ -2319,6 +2905,24 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             const reg_num: u8 = opcode - 0x58;
             d.dst_reg = mapReg(reg_num, rex_b);
             d.len = @as(u8, @intCast(pos + 1));
+        },
+
+        0x63 => {
+            if (!rex_w or pos + 1 >= bytes.len) return .{};
+            var movsxd = DecodedInsn{ .size = .bits64 };
+            var modrm_pos = pos + 1;
+            const is_mem = bytes[modrm_pos] < 0xC0;
+            const rm = readModRM(&movsxd, bytes, &modrm_pos, rex_r, rex_x, rex_b, .bits32);
+            movsxd.dst_reg = rm.reg;
+            if (is_mem) {
+                movsxd.op = .movsxd_reg64_mem32;
+                movsxd.addr = rm.addr;
+            } else {
+                movsxd.op = .movsxd_reg64_reg32;
+                movsxd.src_reg = @enumFromInt(rm.addr);
+            }
+            movsxd.len = @intCast(modrm_pos);
+            return movsxd;
         },
 
         0x68, 0x6A => {
@@ -2487,57 +3091,14 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             d.len = @as(u8, @intCast(pos + 1));
         },
 
-        0x0D => {
-            if (pos + 5 > bytes.len) return .{};
-            d.op = .or_reg8_reg8;
-            const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
-            d.dst_reg = mapReg(0, rex_b);
-            d.imm = switch (sz) {
-                .bits8 => bytes[pos + 1],
-                .bits16 => std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .little),
-                else => std.mem.readInt(u32, bytes[pos + 1 ..][0..4], .little),
-            };
-            d.len = if (sz == .bits8) 2 else if (sz == .bits16) 3 else 5;
-        },
-
-        0x25 => {
-            if (pos + 5 > bytes.len) return .{};
-            d.op = .and_reg8_imm8;
-            const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
-            d.dst_reg = mapReg(0, rex_b);
-            d.imm = switch (sz) {
-                .bits8 => bytes[pos + 1],
-                .bits16 => std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .little),
-                else => std.mem.readInt(u32, bytes[pos + 1 ..][0..4], .little),
-            };
-            d.len = if (sz == .bits8) 2 else if (sz == .bits16) 3 else 5;
-        },
-
-        0x35 => {
-            if (pos + 5 > bytes.len) return .{};
-            d.op = .xor_reg8_reg8;
-            const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
-            d.dst_reg = mapReg(0, rex_b);
-            d.imm = switch (sz) {
-                .bits8 => bytes[pos + 1],
-                .bits16 => std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .little),
-                else => std.mem.readInt(u32, bytes[pos + 1 ..][0..4], .little),
-            };
-            d.len = if (sz == .bits8) 2 else if (sz == .bits16) 3 else 5;
-        },
-
-        0x3D => {
-            if (pos + 5 > bytes.len) return .{};
-            d.op = .cmp_reg8_imm8;
-            const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
-            d.dst_reg = mapReg(0, rex_b);
-            d.imm = switch (sz) {
-                .bits8 => bytes[pos + 1],
-                .bits16 => std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .little),
-                else => std.mem.readInt(u32, bytes[pos + 1 ..][0..4], .little),
-            };
-            d.len = if (sz == .bits8) 2 else if (sz == .bits16) 3 else 5;
-        },
+        0x05 => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .add_accum_imm),
+        0x0D => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .or_accum_imm),
+        0x15 => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .adc_accum_imm),
+        0x1D => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .sbb_accum_imm),
+        0x25 => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .and_accum_imm),
+        0x2D => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .sub_accum_imm),
+        0x35 => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .xor_accum_imm),
+        0x3D => return decodeAccumulatorImmediate(bytes, pos, rex_w, has_66, .cmp_accum_imm),
 
         0x8C => {
             d.op = .nop;
@@ -2710,6 +3271,202 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
     return d;
 }
 
+fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
+    if (start_pos + 3 > bytes.len) return .{};
+
+    const vex = bytes[start_pos + 1];
+    const opcode = bytes[start_pos + 2];
+    const rex_r = (vex & 0x80) == 0;
+    const vector_256 = (vex & 0x04) != 0;
+    const prefix = vex & 0x03;
+
+    if ((vex & 0x78) != 0x78) return .{};
+    if (opcode == 0x77 and !vector_256 and prefix == 0) {
+        return .{ .op = .vzeroupper, .len = @intCast(start_pos + 3) };
+    }
+    if (start_pos + 3 >= bytes.len) return .{};
+
+    var d = DecodedInsn{};
+    var pos = start_pos + 3;
+    const modrm = bytes[pos];
+    const is_mem = modrm < 0xC0;
+    const rm = readModRM(&d, bytes, &pos, rex_r, false, false, .bits64);
+
+    const is_load = switch (opcode) {
+        0x6F, 0x10, 0x28 => true,
+        0x7F, 0x11, 0x29 => false,
+        else => return .{},
+    };
+
+    const family: enum { dqu, dqa, ups, aps, upd, apd, ss, sd } = switch (opcode) {
+        0x6F, 0x7F => switch (prefix) {
+            1 => .dqa,
+            2 => .dqu,
+            else => return .{},
+        },
+        0x10, 0x11 => switch (prefix) {
+            0 => .ups,
+            1 => .upd,
+            2 => .ss,
+            3 => .sd,
+            else => unreachable,
+        },
+        0x28, 0x29 => switch (prefix) {
+            0 => .aps,
+            1 => .apd,
+            else => return .{},
+        },
+        else => unreachable,
+    };
+
+    if ((family == .ss or family == .sd) and !is_mem) return .{};
+    if ((family == .ss or family == .sd) and vector_256) return .{};
+
+    if (is_load) {
+        d.xmm_dst = @intFromEnum(rm.reg);
+        if (is_mem) {
+            d.addr = rm.addr;
+            d.op = if (vector_256) switch (family) {
+                .dqu => .vmovdqu_ymm_mem,
+                .dqa => .vmovdqa_ymm_mem,
+                .ups => .vmovups_ymm_mem,
+                .aps => .vmovaps_ymm_mem,
+                .upd => .vmovupd_ymm_mem,
+                .apd => .vmovapd_ymm_mem,
+                .ss, .sd => unreachable,
+            } else switch (family) {
+                .dqu => .vmovdqu_xmm_mem,
+                .dqa => .vmovdqa_xmm_mem,
+                .ups => .vmovups_xmm_mem,
+                .aps => .vmovaps_xmm_mem,
+                .upd => .vmovupd_xmm_mem,
+                .apd => .vmovapd_xmm_mem,
+                .ss => .vmovss_xmm_mem,
+                .sd => .vmovsd_xmm_mem,
+            };
+        } else {
+            d.xmm_src = @intCast(rm.addr);
+            d.op = if (vector_256) switch (family) {
+                .dqu => .vmovdqu_ymm_ymm,
+                .dqa => .vmovdqa_ymm_ymm,
+                .ups => .vmovups_ymm_ymm,
+                .aps => .vmovaps_ymm_ymm,
+                .upd => .vmovupd_ymm_ymm,
+                .apd => .vmovapd_ymm_ymm,
+                .ss, .sd => unreachable,
+            } else switch (family) {
+                .dqu => .vmovdqu_xmm_xmm,
+                .dqa => .vmovdqa_xmm_xmm,
+                .ups => .vmovups_xmm_xmm,
+                .aps => .vmovaps_xmm_xmm,
+                .upd => .vmovupd_xmm_xmm,
+                .apd => .vmovapd_xmm_xmm,
+                .ss, .sd => unreachable,
+            };
+        }
+    } else {
+        d.xmm_src = @intFromEnum(rm.reg);
+        if (is_mem) {
+            d.addr = rm.addr;
+            d.op = if (vector_256) switch (family) {
+                .dqu => .vmovdqu_mem_ymm,
+                .dqa => .vmovdqa_mem_ymm,
+                .ups => .vmovups_mem_ymm,
+                .aps => .vmovaps_mem_ymm,
+                .upd => .vmovupd_mem_ymm,
+                .apd => .vmovapd_mem_ymm,
+                .ss, .sd => unreachable,
+            } else switch (family) {
+                .dqu => .vmovdqu_mem_xmm,
+                .dqa => .vmovdqa_mem_xmm,
+                .ups => .vmovups_mem_xmm,
+                .aps => .vmovaps_mem_xmm,
+                .upd => .vmovupd_mem_xmm,
+                .apd => .vmovapd_mem_xmm,
+                .ss => .vmovss_mem_xmm,
+                .sd => .vmovsd_mem_xmm,
+            };
+        } else {
+            d.xmm_dst = @intCast(rm.addr);
+            d.op = if (vector_256) switch (family) {
+                .dqu => .vmovdqu_ymm_ymm,
+                .dqa => .vmovdqa_ymm_ymm,
+                .ups => .vmovups_ymm_ymm,
+                .aps => .vmovaps_ymm_ymm,
+                .upd => .vmovupd_ymm_ymm,
+                .apd => .vmovapd_ymm_ymm,
+                .ss, .sd => unreachable,
+            } else switch (family) {
+                .dqu => .vmovdqu_xmm_xmm,
+                .dqa => .vmovdqa_xmm_xmm,
+                .ups => .vmovups_xmm_xmm,
+                .aps => .vmovaps_xmm_xmm,
+                .upd => .vmovupd_xmm_xmm,
+                .apd => .vmovapd_xmm_xmm,
+                .ss, .sd => unreachable,
+            };
+        }
+    }
+
+    d.len = @intCast(pos);
+    return d;
+}
+
+fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
+    if (start_pos + 5 > bytes.len) return .{};
+    const vex_map = bytes[start_pos + 1];
+    const vex_control = bytes[start_pos + 2];
+    const opcode = bytes[start_pos + 3];
+    if (vex_map & 0x1F != 1 or opcode != 0x2A) return .{};
+
+    const rex_r = (vex_map & 0x80) == 0;
+    const rex_x = (vex_map & 0x40) == 0;
+    const rex_b = (vex_map & 0x20) == 0;
+    const rex_w = (vex_control & 0x80) != 0;
+    const vector_256 = (vex_control & 0x04) != 0;
+    const prefix = vex_control & 0x03;
+    if (vector_256 or (prefix != 2 and prefix != 3)) return .{};
+
+    var decoded = DecodedInsn{ .size = if (rex_w) .bits64 else .bits32 };
+    var pos = start_pos + 4;
+    const is_mem = bytes[pos] < 0xC0;
+    const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, decoded.size);
+    decoded.xmm_dst = @intFromEnum(rm.reg);
+    decoded.xmm_src = @as(u8, @truncate((~vex_control >> 3) & 0x0F));
+    if (is_mem) {
+        decoded.addr = rm.addr;
+        decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_mem else .vcvtsi2sd_xmm_mem;
+    } else {
+        decoded.src_reg = @enumFromInt(rm.addr);
+        decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_reg else .vcvtsi2sd_xmm_reg;
+    }
+    decoded.len = @intCast(pos);
+    return decoded;
+}
+
+fn decodeAccumulatorImmediate(bytes: []const u8, opcode_pos: usize, rex_w: bool, has_66: bool, op: Op) DecodedInsn {
+    const size: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    const immediate_size: usize = if (size == .bits16) 2 else 4;
+    if (opcode_pos + 1 + immediate_size > bytes.len) return .{};
+
+    var decoded = DecodedInsn{
+        .op = op,
+        .size = size,
+        .dst_reg = .al_ax_eax_rax,
+        .len = @intCast(opcode_pos + 1 + immediate_size),
+    };
+    if (size == .bits16) {
+        decoded.imm = std.mem.readInt(u16, bytes[opcode_pos + 1 ..][0..2], .little);
+    } else {
+        const immediate = std.mem.readInt(u32, bytes[opcode_pos + 1 ..][0..4], .little);
+        decoded.imm = if (size == .bits64)
+            @bitCast(@as(i64, @as(i32, @bitCast(immediate))))
+        else
+            immediate;
+    }
+    return decoded;
+}
+
 fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_f2: bool, has_f3: bool, _: u8) DecodedInsn {
     var d = DecodedInsn{};
     d.size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
@@ -2724,7 +3481,8 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
     }
 
     if (opcode2 == 0x1F) {
-        while (pos.* < bytes.len and bytes[pos.*] == 0x1F) pos.* += 1;
+        if (pos.* >= bytes.len) return .{};
+        _ = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits32);
         d.op = .nop;
         d.len = @as(u8, @intCast(pos.*));
         return d;
@@ -3322,18 +4080,26 @@ fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
     const modrm = bytes[pos];
-    _ = modrm;
+    if (((modrm >> 3) & 7) != 0) return .{};
+    const is_mem = modrm < 0xC0;
 
     if (opcode == 0xC6) {
         const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, .bits8);
         if (pos >= bytes.len) return .{};
-        d.op = .mov_mem8_imm8;
-        d.addr = rm.addr;
+        d.size = .bits8;
+        if (is_mem) {
+            d.op = .mov_mem8_imm8;
+            d.addr = rm.addr;
+        } else {
+            d.op = .mov_reg_imm;
+            d.dst_reg = @enumFromInt(rm.addr);
+        }
         d.imm = bytes[pos];
         pos += 1;
     } else {
         const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
         const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+        d.size = sz;
         if (sz == .bits16) {
             if (pos + 2 > bytes.len) return .{};
             d.op = .mov_mem16_imm16;
@@ -3342,7 +4108,8 @@ fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
         } else if (sz == .bits64) {
             if (pos + 4 > bytes.len) return .{};
             d.op = .mov_mem64_imm32;
-            d.imm = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+            const imm32 = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+            d.imm = @bitCast(@as(i64, @as(i32, @bitCast(imm32))));
             pos += 4;
         } else {
             if (pos + 4 > bytes.len) return .{};
@@ -3350,7 +4117,12 @@ fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
             d.imm = std.mem.readInt(u32, bytes[pos..][0..4], .little);
             pos += 4;
         }
-        d.addr = rm.addr;
+        if (is_mem) {
+            d.addr = rm.addr;
+        } else {
+            d.op = .mov_reg_imm;
+            d.dst_reg = @enumFromInt(rm.addr);
+        }
     }
 
     d.len = @as(u8, @intCast(pos));
@@ -3367,6 +4139,21 @@ fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, r
     const is_mem = modrm < 0xC0;
     const sz: Size = if (opcode == 0xF6) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+
+    if (group == 6 and !is_mem and sz != .bits8) {
+        d.op = @enumFromInt(@intFromEnum(Op.div_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+        d.size = sz;
+        d.dst_reg = @enumFromInt(rm.addr);
+        d.len = @intCast(pos);
+        return d;
+    }
+    if (group == 7 and !is_mem and sz != .bits8) {
+        d.op = @enumFromInt(@intFromEnum(Op.idiv_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+        d.size = sz;
+        d.dst_reg = @enumFromInt(rm.addr);
+        d.len = @intCast(pos);
+        return d;
+    }
 
     if (group != 0 and group != 1) {
         d.op = .invalid;
@@ -3748,6 +4535,7 @@ fn decodeXadd(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex
     if (pos >= bytes.len) return .{};
     const modrm = bytes[pos];
     const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    d.size = sz;
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
@@ -3795,24 +4583,36 @@ fn decodeSetcc(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, re
 fn decodeMovupsMovss(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_f2: bool, has_f3: bool, opcode2: u8) DecodedInsn {
     _ = rex_w;
     _ = has_66;
-    _ = has_f2;
-    _ = has_f3;
-    _ = opcode2;
-    _ = rex_r;
-    _ = rex_x;
-    _ = rex_b;
     var d = DecodedInsn{};
-    d.op = .nop;
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
     const modrm = bytes[pos];
-    if (modrm < 0xC0) {
-        pos += 1;
-        if (modrm & 0x07 == 4) pos += 1;
-        const disp_size: u8 = if ((modrm >> 6) == 1) 1 else if ((modrm >> 6) == 2) 4 else 0;
-        pos += disp_size;
+    const is_mem = modrm < 0xC0;
+    const to_reg = opcode2 == 0x10;
+    const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+
+    // Scalar MOVSS/MOVSD need lane-preserving semantics. MOVUPS transfers the
+    // full register and is required by Xbyak's feature-mask bookkeeping.
+    if (has_f2 or has_f3) {
+        d.op = .nop;
+    } else if (to_reg) {
+        d.xmm_dst = @intFromEnum(rm.reg);
+        if (is_mem) {
+            d.op = .movups_xmm_mem;
+            d.addr = rm.addr;
+        } else {
+            d.op = .movups_xmm_xmm;
+            d.xmm_src = @intCast(rm.addr);
+        }
     } else {
-        pos += 1;
+        d.xmm_src = @intFromEnum(rm.reg);
+        if (is_mem) {
+            d.op = .movups_mem_xmm;
+            d.addr = rm.addr;
+        } else {
+            d.op = .movups_xmm_xmm;
+            d.xmm_dst = @intCast(rm.addr);
+        }
     }
     d.len = @as(u8, @intCast(pos));
     return d;
@@ -3831,18 +4631,22 @@ fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, r
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
 
     if (to_reg) {
+        d.xmm_dst = @intFromEnum(rm.reg);
         if (is_mem) {
             d.op = .movaps_xmm_mem;
             d.addr = rm.addr;
         } else {
             d.op = .movaps_xmm_xmm;
+            d.xmm_src = @intCast(rm.addr);
         }
     } else {
+        d.xmm_src = @intFromEnum(rm.reg);
         if (is_mem) {
             d.op = .movaps_mem_xmm;
             d.addr = rm.addr;
         } else {
             d.op = .movaps_xmm_xmm;
+            d.xmm_dst = @intCast(rm.addr);
         }
     }
 
@@ -3925,6 +4729,23 @@ test "decode accumulator TEST immediate forms" {
     try std.testing.expectEqual(@as(u8, 6), test_rax.len);
 }
 
+test "decode accumulator immediate arithmetic widths" {
+    const add_rax = decodeInsn(&[_]u8{ 0x48, 0x05, 0xAB, 0x00, 0x00, 0x00 });
+    try std.testing.expectEqual(Op.add_accum_imm, add_rax.op);
+    try std.testing.expectEqual(Size.bits64, add_rax.size);
+    try std.testing.expectEqual(@as(u64, 0xAB), add_rax.imm);
+    try std.testing.expectEqual(@as(u8, 6), add_rax.len);
+
+    const sub_ax = decodeInsn(&[_]u8{ 0x66, 0x2D, 0x34, 0x12 });
+    try std.testing.expectEqual(Op.sub_accum_imm, sub_ax.op);
+    try std.testing.expectEqual(Size.bits16, sub_ax.size);
+    try std.testing.expectEqual(@as(u64, 0x1234), sub_ax.imm);
+
+    const cmp_rax_negative = decodeInsn(&[_]u8{ 0x48, 0x3D, 0xFF, 0xFF, 0xFF, 0xFF });
+    try std.testing.expectEqual(Op.cmp_accum_imm, cmp_rax_negative.op);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), cmp_rax_negative.imm);
+}
+
 test "decode full near conditional jump range" {
     const jc = decodeInsn(&[_]u8{ 0x0F, 0x82, 0xA7, 0x01, 0x00, 0x00 });
     try std.testing.expectEqual(Op.jcc_rel32, jc.op);
@@ -3996,6 +4817,142 @@ test "decode non-W REX prefixes used by CPUID result copies" {
     try std.testing.expectEqual(RegId.r9b_r9w_r9d_r9, mov_mem_r9d.src_reg);
     try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, mov_mem_r9d.sib_base_reg);
     try std.testing.expectEqual(@as(u8, 3), mov_mem_r9d.len);
+}
+
+test "decode Xbyak unaligned feature-mask copy" {
+    const load = decodeInsn(&[_]u8{ 0x0F, 0x10, 0x00 });
+    try std.testing.expectEqual(Op.movups_xmm_mem, load.op);
+    try std.testing.expectEqual(@as(u8, 0), load.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 3), load.len);
+
+    const store = decodeInsn(&[_]u8{ 0x0F, 0x29, 0x45, 0xF0 });
+    try std.testing.expectEqual(Op.movaps_mem_xmm, store.op);
+    try std.testing.expectEqual(@as(u8, 0), store.xmm_src);
+    try std.testing.expectEqual(@as(u8, 4), store.len);
+}
+
+test "decode 128-bit VEX move families" {
+    const load_dqu = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x6F, 0x00 });
+    try std.testing.expectEqual(Op.vmovdqu_xmm_mem, load_dqu.op);
+    try std.testing.expectEqual(@as(u8, 0), load_dqu.xmm_dst);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, load_dqu.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 4), load_dqu.len);
+
+    const store_dqa = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x7F, 0x45, 0xF0 });
+    try std.testing.expectEqual(Op.vmovdqa_mem_xmm, store_dqa.op);
+    try std.testing.expectEqual(@as(u8, 0), store_dqa.xmm_src);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, store_dqa.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -16))), store_dqa.addr);
+    try std.testing.expectEqual(@as(u8, 5), store_dqa.len);
+
+    const register_ups = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x10, 0xCA });
+    try std.testing.expectEqual(Op.vmovups_xmm_xmm, register_ups.op);
+    try std.testing.expectEqual(@as(u8, 1), register_ups.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), register_ups.xmm_src);
+
+    const load_ss = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x10, 0x01 });
+    try std.testing.expectEqual(Op.vmovss_xmm_mem, load_ss.op);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, load_ss.sib_base_reg);
+
+    const store_ss = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x11, 0x00 });
+    try std.testing.expectEqual(Op.vmovss_mem_xmm, store_ss.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, store_ss.sib_base_reg);
+
+    const load_sd = decodeInsn(&[_]u8{ 0xC5, 0xFB, 0x10, 0x02 });
+    try std.testing.expectEqual(Op.vmovsd_xmm_mem, load_sd.op);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, load_sd.sib_base_reg);
+}
+
+test "decode 256-bit VEX packed moves" {
+    const decoded = decodeInsn(&[_]u8{ 0xC5, 0xFE, 0x6F, 0x00 });
+    try std.testing.expectEqual(Op.vmovdqu_ymm_mem, decoded.op);
+
+    const copy_state = decodeInsn(&[_]u8{ 0xC5, 0xFC, 0x10, 0x00 });
+    try std.testing.expectEqual(Op.vmovups_ymm_mem, copy_state.op);
+
+    const store_state = decodeInsn(&[_]u8{ 0xC5, 0xFC, 0x11, 0x07 });
+    try std.testing.expectEqual(Op.vmovups_mem_ymm, store_state.op);
+
+    const zero_upper = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x77 });
+    try std.testing.expectEqual(Op.vzeroupper, zero_upper.op);
+    try std.testing.expectEqual(@as(u8, 3), zero_upper.len);
+}
+
+test "decode three-byte VEX signed integer scalar conversions" {
+    const to_float = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xFA, 0x2A, 0xC0 });
+    try std.testing.expectEqual(Op.vcvtsi2ss_xmm_reg, to_float.op);
+    try std.testing.expectEqual(Size.bits64, to_float.size);
+    try std.testing.expectEqual(@as(u8, 0), to_float.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), to_float.xmm_src);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, to_float.src_reg);
+    try std.testing.expectEqual(@as(u8, 5), to_float.len);
+
+    const to_double = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x7B, 0x2A, 0x09 });
+    try std.testing.expectEqual(Op.vcvtsi2sd_xmm_mem, to_double.op);
+    try std.testing.expectEqual(Size.bits32, to_double.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, to_double.sib_base_reg);
+}
+
+test "decode MOVSXD from memory" {
+    const decoded = decodeInsn(&[_]u8{ 0x48, 0x63, 0x09 });
+    try std.testing.expectEqual(Op.movsxd_reg64_mem32, decoded.op);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 3), decoded.len);
+}
+
+test "decode signed 64-bit register division" {
+    const decoded = decodeInsn(&[_]u8{ 0x48, 0xF7, 0xF9 });
+    try std.testing.expectEqual(Op.idiv_reg64, decoded.op);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+    try std.testing.expectEqual(@as(u8, 3), decoded.len);
+}
+
+test "decode unsigned 64-bit register division" {
+    const decoded = decodeInsn(&[_]u8{ 0x48, 0xF7, 0xF1 });
+    try std.testing.expectEqual(Op.div_reg64, decoded.op);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+    try std.testing.expectEqual(@as(u8, 3), decoded.len);
+}
+
+test "decode signed and unsigned 32-bit register division" {
+    const signed = decodeInsn(&[_]u8{ 0xF7, 0xF9 });
+    try std.testing.expectEqual(Op.idiv_reg32, signed.op);
+    try std.testing.expectEqual(Size.bits32, signed.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, signed.dst_reg);
+
+    const unsigned = decodeInsn(&[_]u8{ 0xF7, 0xF1 });
+    try std.testing.expectEqual(Op.div_reg32, unsigned.op);
+    try std.testing.expectEqual(Size.bits32, unsigned.size);
+}
+
+test "decode compiler long NOP with segment override" {
+    const decoded = decodeInsn(&[_]u8{ 0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0, 0, 0, 0 });
+    try std.testing.expectEqual(Op.nop, decoded.op);
+    try std.testing.expectEqual(@as(u8, 11), decoded.len);
+}
+
+test "decode C6 and C7 register immediate forms" {
+    const byte_move = decodeInsn(&[_]u8{ 0x41, 0xC6, 0xC0, 0x7F });
+    try std.testing.expectEqual(Op.mov_reg_imm, byte_move.op);
+    try std.testing.expectEqual(Size.bits8, byte_move.size);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, byte_move.dst_reg);
+    try std.testing.expectEqual(@as(u64, 0x7F), byte_move.imm);
+
+    const max_unsigned = decodeInsn(&[_]u8{ 0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF });
+    try std.testing.expectEqual(Op.mov_reg_imm, max_unsigned.op);
+    try std.testing.expectEqual(Size.bits64, max_unsigned.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, max_unsigned.dst_reg);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), max_unsigned.imm);
+    try std.testing.expectEqual(@as(u8, 7), max_unsigned.len);
+}
+
+test "decode C7 memory immediate sign extends to 64 bits" {
+    const decoded = decodeInsn(&[_]u8{ 0x48, 0xC7, 0x00, 0xFF, 0xFF, 0xFF, 0xFF });
+    try std.testing.expectEqual(Op.mov_mem64_imm32, decoded.op);
+    try std.testing.expectEqual(Size.bits64, decoded.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), decoded.imm);
 }
 
 pub fn main(init: std.process.Init) !void {
