@@ -195,6 +195,18 @@ const conditional_vmaskmovps = @import("CONDITIONAL/VMASKMOVPS.zig");
 const conditional_vmaskmovpd = @import("CONDITIONAL/VMASKMOVPD.zig");
 const conditional_vpmaskmovd = @import("CONDITIONAL/VPMASKMOVD.zig");
 const conditional_vpmaskmovq = @import("CONDITIONAL/VPMASKMOVQ.zig");
+const compute_f2xm1 = @import("COMPUTE/f2xm1.zig");
+const compute_fyl2x = @import("COMPUTE/fyl2x.zig");
+const compute_fyl2xp1 = @import("COMPUTE/fyl2xp1.zig");
+const compute_psadbw = @import("COMPUTE/psadbw.zig");
+const compute_mpsadbw = @import("COMPUTE/mpsadbw.zig");
+const compute_rcpps = @import("COMPUTE/rcpps.zig");
+const compute_rcpss = @import("COMPUTE/rcpss.zig");
+const compute_rsqrtps = @import("COMPUTE/rsqrtps.zig");
+const compute_rsqrtss = @import("COMPUTE/rsqrtss.zig");
+const compute_sqrtsd = @import("COMPUTE/sqrtsd.zig");
+const compute_sqrtss = @import("COMPUTE/sqrtss.zig");
+const compute_vp2intersect = @import("COMPUTE/vp2intersect.zig");
 const convert_cbw = @import("CONVERT/CBW.zig");
 const convert_cwde = @import("CONVERT/CWDE.zig");
 const convert_cdqe = @import("CONVERT/CDQE.zig");
@@ -1075,6 +1087,18 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "XRELEASE",
     "NEG",
     "FRNDINT",
+    "F2XM1",
+    "FYL2X",
+    "FYL2XP1",
+    "MPSADBW",
+    "PSADBW",
+    "RCPPS",
+    "RCPSS",
+    "RSQRTPS",
+    "RSQRTSS",
+    "SQRTSD",
+    "SQRTSS",
+    "VP2INTERSECT",
 };
 
 pub const TableMetadata = struct {
@@ -1715,6 +1739,18 @@ pub const tables = [_]InstructionTable{
     entry(scan_scasw.family, scan_scasw.path, scan_scasw.source),
     entry(scan_scasd.family, scan_scasd.path, scan_scasd.source),
     entry(scan_scasq.family, scan_scasq.path, scan_scasq.source),
+    entry(compute_f2xm1.family, compute_f2xm1.path, compute_f2xm1.source),
+    entry(compute_fyl2x.family, compute_fyl2x.path, compute_fyl2x.source),
+    entry(compute_fyl2xp1.family, compute_fyl2xp1.path, compute_fyl2xp1.source),
+    entry(compute_psadbw.family, compute_psadbw.path, compute_psadbw.source),
+    entry(compute_mpsadbw.family, compute_mpsadbw.path, compute_mpsadbw.source),
+    entry(compute_rcpps.family, compute_rcpps.path, compute_rcpps.source),
+    entry(compute_rcpss.family, compute_rcpss.path, compute_rcpss.source),
+    entry(compute_rsqrtps.family, compute_rsqrtps.path, compute_rsqrtps.source),
+    entry(compute_rsqrtss.family, compute_rsqrtss.path, compute_rsqrtss.source),
+    entry(compute_sqrtsd.family, compute_sqrtsd.path, compute_sqrtsd.source),
+    entry(compute_sqrtss.family, compute_sqrtss.path, compute_sqrtss.source),
+    entry(compute_vp2intersect.family, compute_vp2intersect.path, compute_vp2intersect.source),
 };
 
 pub fn tableCount() usize {
@@ -1871,7 +1907,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 487), tableCount());
+    try std.testing.expectEqual(@as(usize, 499), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

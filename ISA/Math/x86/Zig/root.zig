@@ -197,6 +197,18 @@ const conditional_vmaskmovps = @import("CONDITIONAL/VMASKMOVPS.zig");
 const conditional_vmaskmovpd = @import("CONDITIONAL/VMASKMOVPD.zig");
 const conditional_vpmaskmovd = @import("CONDITIONAL/VPMASKMOVD.zig");
 const conditional_vpmaskmovq = @import("CONDITIONAL/VPMASKMOVQ.zig");
+const compute_f2xm1 = @import("COMPUTE/f2xm1.zig");
+const compute_fyl2x = @import("COMPUTE/fyl2x.zig");
+const compute_fyl2xp1 = @import("COMPUTE/fyl2xp1.zig");
+const compute_psadbw = @import("COMPUTE/psadbw.zig");
+const compute_mpsadbw = @import("COMPUTE/mpsadbw.zig");
+const compute_rcpps = @import("COMPUTE/rcpps.zig");
+const compute_rcpss = @import("COMPUTE/rcpss.zig");
+const compute_rsqrtps = @import("COMPUTE/rsqrtps.zig");
+const compute_rsqrtss = @import("COMPUTE/rsqrtss.zig");
+const compute_sqrtsd = @import("COMPUTE/sqrtsd.zig");
+const compute_sqrtss = @import("COMPUTE/sqrtss.zig");
+const compute_vp2intersect = @import("COMPUTE/vp2intersect.zig");
 const convert_cbw = @import("CONVERT/CBW.zig");
 const convert_cwde = @import("CONVERT/CWDE.zig");
 const convert_cdqe = @import("CONVERT/CDQE.zig");
@@ -1160,6 +1172,18 @@ pub const specs = blk: {
         spec(scan_scasw.meta),
         spec(scan_scasd.meta),
         spec(scan_scasq.meta),
+        spec(compute_f2xm1.meta),
+        spec(compute_fyl2x.meta),
+        spec(compute_fyl2xp1.meta),
+        spec(compute_psadbw.meta),
+        spec(compute_mpsadbw.meta),
+        spec(compute_rcpps.meta),
+        spec(compute_rcpss.meta),
+        spec(compute_rsqrtps.meta),
+        spec(compute_rsqrtss.meta),
+        spec(compute_sqrtsd.meta),
+        spec(compute_sqrtss.meta),
+        spec(compute_vp2intersect.meta),
     };
 };
 
@@ -1741,6 +1765,18 @@ pub const proof_reports = [_]proofs.ProofReport{
     scan_scasw.proof_report,
     scan_scasd.proof_report,
     scan_scasq.proof_report,
+    compute_f2xm1.proof_report,
+    compute_fyl2x.proof_report,
+    compute_fyl2xp1.proof_report,
+    compute_psadbw.proof_report,
+    compute_mpsadbw.proof_report,
+    compute_rcpps.proof_report,
+    compute_rcpss.proof_report,
+    compute_rsqrtps.proof_report,
+    compute_rsqrtss.proof_report,
+    compute_sqrtsd.proof_report,
+    compute_sqrtss.proof_report,
+    compute_vp2intersect.proof_report,
 };
 
 pub fn tableCount() usize {
@@ -1799,7 +1835,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 472), tableCount());
+    try std.testing.expectEqual(@as(usize, 484), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
