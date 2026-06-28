@@ -1352,6 +1352,8 @@ fn unusedLocalDeclarationName(line: []const u8) ?[]const u8 {
     while (start > 0 and isIdentChar(lhs[start - 1])) start -= 1;
     if (start == end) return null;
 
+    if (std.mem.indexOfScalar(u8, lhs[0..start], '[') != null) return null;
+
     const prefix = std.mem.trim(u8, lhs[0..start], " \t*&");
     if (prefix.len == 0) return null;
     return lhs[start..end];
