@@ -46,6 +46,8 @@ const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
 const interrupt_into = @import("INTERRUPT/INTO.zig");
+const interrupt_iret = @import("INTERRUPT/IRET.zig");
+const interrupt_sidt = @import("INTERRUPT/SIDT.zig");
 const jmp_ja = @import("JMP/JA.zig");
 const jmp_jae = @import("JMP/JAE.zig");
 const jmp_jb = @import("JMP/JB.zig");
@@ -647,6 +649,8 @@ pub const specs = blk: {
         spec(interrupt_int1.meta),
         spec(interrupt_int3.meta),
         spec(interrupt_into.meta),
+        spec(interrupt_iret.meta),
+        spec(interrupt_sidt.meta),
         spec(jmp_ja.meta),
         spec(jmp_jae.meta),
         spec(jmp_jb.meta),
@@ -1248,6 +1252,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     interrupt_int1.proof_report,
     interrupt_int3.proof_report,
     interrupt_into.proof_report,
+    interrupt_iret.proof_report,
+    interrupt_sidt.proof_report,
     jmp_ja.proof_report,
     jmp_jae.proof_report,
     jmp_jb.proof_report,

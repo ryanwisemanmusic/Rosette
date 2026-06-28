@@ -44,6 +44,8 @@ const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
 const interrupt_into = @import("INTERRUPT/INTO.zig");
+const interrupt_iret = @import("INTERRUPT/IRET.zig");
+const interrupt_sidt = @import("INTERRUPT/SIDT.zig");
 const jmp_ja = @import("JMP/JA.zig");
 const jmp_jae = @import("JMP/JAE.zig");
 const jmp_jb = @import("JMP/JB.zig");
@@ -716,6 +718,8 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(interrupt_int1.family, interrupt_int1.path, interrupt_int1.source),
     mirror(interrupt_int3.family, interrupt_int3.path, interrupt_int3.source),
     mirror(interrupt_into.family, interrupt_into.path, interrupt_into.source),
+    mirror(interrupt_iret.family, interrupt_iret.path, interrupt_iret.source),
+    mirror(interrupt_sidt.family, interrupt_sidt.path, interrupt_sidt.source),
     mirror(jmp_ja.family, jmp_ja.path, jmp_ja.source),
     mirror(jmp_jae.family, jmp_jae.path, jmp_jae.source),
     mirror(jmp_jb.family, jmp_jb.path, jmp_jb.source),
