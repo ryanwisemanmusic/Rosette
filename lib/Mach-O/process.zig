@@ -30,6 +30,8 @@ const TRACE_BUFFER_LEN: usize = 256;
 const IMPORT_TRACE_BUFFER_LEN: usize = 64;
 const STUB_ENTRY_SIZE: u64 = 10;
 const UNSUPPORTED_RUNTIME_EXIT_CODE: u64 = 125;
+const GUEST_FILE_BASE: u64 = 0xFFFF_FF10_0000_0000;
+const GUEST_FILE_MAX: usize = 32;
 
 const MachSegment = macho.MachSegment;
 
@@ -51,6 +53,26 @@ const ImportTraceEntry = struct {
     synthetic_result: u64 = 0,
     caller_symbol: []const u8 = "",
     caller_offset: u64 = 0,
+};
+
+const ImportHandlerResult = union(enum) {
+    handled: u64,
+    unsupported: u64,
+    terminated: u64,
+};
+
+const GuestFileKind = enum {
+    regular,
+    stdout,
+    stderr,
+};
+
+const GuestFile = struct {
+    active: bool = false,
+    fd: i32 = -1,
+    position: i64 = 0,
+    error_flag: bool = false,
+    kind: GuestFileKind = .regular,
 };
 
 pub const MachOState = struct {
@@ -85,6 +107,7 @@ pub const MachOState = struct {
     import_trace_index: usize = 0,
     import_trace_filled: bool = false,
     unresolved_import_count: u64 = 0,
+    guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
 
     pub fn init(allocator: std.mem.Allocator, binary_data: []const u8) !MachOState {
         var state = try macho.load(allocator, binary_data);
@@ -145,7 +168,7 @@ pub const MachOState = struct {
             }
         }
 
-        return MachOState{
+        var result = MachOState{
             .allocator = allocator,
             .mem = mem,
             .mem_base = image_base,
@@ -156,9 +179,14 @@ pub const MachOState = struct {
             .entry_point_vaddr = entry_vaddr,
             .stack_size = if (state.stack_size > 0) state.stack_size else STACK_SIZE,
         };
+        result.guest_files[0] = .{ .active = true, .fd = 0, .kind = .regular };
+        result.guest_files[1] = .{ .active = true, .fd = 1, .kind = .stdout };
+        result.guest_files[2] = .{ .active = true, .fd = 2, .kind = .stderr };
+        return result;
     }
 
     pub fn deinit(self: *MachOState) void {
+        self.closeGuestFiles();
         self.metadata.deinit();
         self.allocator.free(self.mem);
         self.allocator.free(self.segments);
@@ -273,6 +301,61 @@ pub const MachOState = struct {
         const count_usize: usize = @intCast(count);
         if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
         return self.mem[off_usize .. off_usize + count_usize];
+    }
+
+    fn guestCString(self: *const MachOState, addr: u64, max_len: usize) ?[]const u8 {
+        if (addr == 0) return null;
+        const off = self.addrToOffset(addr) orelse return null;
+        const off_usize: usize = @intCast(off);
+        if (off_usize >= self.mem.len) return null;
+        const available = self.mem[off_usize..@min(self.mem.len, off_usize + max_len)];
+        const end = std.mem.indexOfScalar(u8, available, 0) orelse return null;
+        return available[0..end];
+    }
+
+    fn guestWriteCString(self: *MachOState, addr: u64, bytes: []const u8) bool {
+        if (self.guestMemory(addr, bytes.len + 1)) |buf| {
+            @memcpy(buf[0..bytes.len], bytes);
+            buf[bytes.len] = 0;
+            return true;
+        }
+        return false;
+    }
+
+    fn allocGuestFile(self: *MachOState, fd: i32, kind: GuestFileKind) ?u64 {
+        for (&self.guest_files, 0..) |*file, idx| {
+            if (!file.active) {
+                file.* = .{
+                    .active = true,
+                    .fd = fd,
+                    .position = 0,
+                    .error_flag = false,
+                    .kind = kind,
+                };
+                return GUEST_FILE_BASE + idx;
+            }
+        }
+        return null;
+    }
+
+    fn guestFileFromHandle(self: *MachOState, handle: u64) ?*GuestFile {
+        if (handle < GUEST_FILE_BASE) return null;
+        const idx_u64 = handle - GUEST_FILE_BASE;
+        if (idx_u64 >= GUEST_FILE_MAX) return null;
+        const idx: usize = @intCast(idx_u64);
+        const file = &self.guest_files[idx];
+        if (!file.active) return null;
+        return file;
+    }
+
+    fn closeGuestFiles(self: *MachOState) void {
+        for (&self.guest_files) |*file| {
+            if (!file.active) continue;
+            if (file.kind == .regular and file.fd >= 0) {
+                _ = std.c.close(file.fd);
+            }
+            file.* = .{};
+        }
     }
 
     fn fileOffsetForVaddr(self: *const MachOState, vaddr: u64) ?u64 {
@@ -390,23 +473,44 @@ pub const MachOState = struct {
             self.regs.rax = 0;
             if (self.pending_import_stub_rip) |import_stub_rip| {
                 if (self.metadata.importAtStub(import_stub_rip)) |imported| {
-                    self.regs.rax = self.syntheticResultForImport(imported.name, synthetic_return);
-                    self.recordUnresolvedImport(imported, synthetic_return, self.regs.rax);
-                    if (self.metadata.nearestSymbol(synthetic_return)) |caller_sym| {
-                        std.debug.print(
-                            "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller={s}+0x{x} return=0x{x} → rax=0x{x}\n",
-                            .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, caller_sym.name, caller_sym.offset, synthetic_return, self.regs.rax },
-                        );
-                    } else {
-                        std.debug.print(
-                            "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller=0x{x} → rax=0x{x}\n",
-                            .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, synthetic_return, self.regs.rax },
-                        );
+                    switch (self.handleImport(imported.name)) {
+                        .handled => |result| {
+                            self.regs.rax = result;
+                            std.debug.print("  [handled import] {s} from {s}; stub=0x{x} return=0x{x} → rax=0x{x}\n", .{
+                                imported.name,
+                                imported.dylib,
+                                imported.stub_address,
+                                synthetic_return,
+                                result,
+                            });
+                        },
+                        .unsupported => |result| {
+                            self.regs.rax = result;
+                            self.recordUnresolvedImport(imported, synthetic_return, self.regs.rax);
+                            if (self.metadata.nearestSymbol(synthetic_return)) |caller_sym| {
+                                std.debug.print(
+                                    "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller={s}+0x{x} return=0x{x} → rax=0x{x}\n",
+                                    .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, caller_sym.name, caller_sym.offset, synthetic_return, self.regs.rax },
+                                );
+                            } else {
+                                std.debug.print(
+                                    "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller=0x{x} → rax=0x{x}\n",
+                                    .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, synthetic_return, self.regs.rax },
+                                );
+                            }
+                            self.dumpGuestStack();
+                        },
+                        .terminated => |exit_code| {
+                            self.exit_code = exit_code;
+                            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
+                            self.terminated = true;
+                            std.debug.print("  [handled terminal import] {s}({d})\n", .{ imported.name, exit_code });
+                        },
                     }
-                    self.dumpGuestStack();
                 }
             }
             self.pending_import_stub_rip = null;
+            if (self.terminated) return true;
             if (synthetic_return != 0 and self.addrToOffset(synthetic_return) != null) {
                 log.warn("stub-helper aggressive fallback: helper_rip=0x{x} slot=0x{x} entry_rip=0x{x} synthetic_return=0x{x}; simulating resolved helper return", .{ self.regs.rip, slot, entry_rip, synthetic_return });
                 _ = self.pop();
@@ -431,13 +535,10 @@ pub const MachOState = struct {
         return false;
     }
 
-    fn syntheticResultForImport(self: *MachOState, name: []const u8, _: u64) u64 {
-        // fopen should return non-null when possible so callers don't treat it
-        // as hard failure. fprintf should return a positive byte count.
-        // fclose returns 0 (success) => valid
-        // fputs returns non-negative => success
-        // gtk_init_check returns 1 => GTK available
-        // Unknown functions return 0
+    fn handleImport(self: *MachOState, name: []const u8) ImportHandlerResult {
+        if (std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) {
+            return .{ .terminated = self.regs.rdi & 0xFF };
+        }
 
         if (std.mem.endsWith(u8, name, "_memset")) {
             const dst = self.regs.rdi;
@@ -445,70 +546,89 @@ pub const MachOState = struct {
             const count = self.regs.rdx;
             if (self.guestMemory(dst, count)) |buf| {
                 @memset(buf, value);
-                std.debug.print(
-                    "    [stub] _memset(dst=0x{x}, value=0x{x}, count={d}) → returning dst\n",
-                    .{ dst, value, count },
-                );
-                return dst;
+                std.debug.print("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
             }
-            std.debug.print(
-                "    [stub] _memset(dst=0x{x}, value=0x{x}, count={d}) → guest memory unavailable, returning dst\n",
-                .{ dst, value, count },
-            );
-            return dst;
+            return .{ .handled = dst };
+        }
+
+        if (std.mem.endsWith(u8, name, "_memcpy") or std.mem.endsWith(u8, name, "_memmove")) {
+            const dst = self.regs.rdi;
+            const src = self.regs.rsi;
+            const count = self.regs.rdx;
+            const src_buf = self.guestMemoryConst(src, count) orelse return .{ .unsupported = 0 };
+            const dst_buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
+            std.mem.copyForwards(u8, dst_buf, src_buf);
+            return .{ .handled = dst };
+        }
+
+        if (std.mem.endsWith(u8, name, "_memcmp")) {
+            const lhs = self.guestMemoryConst(self.regs.rdi, self.regs.rdx) orelse return .{ .unsupported = 0 };
+            const rhs = self.guestMemoryConst(self.regs.rsi, self.regs.rdx) orelse return .{ .unsupported = 0 };
+            const cmp = std.mem.order(u8, lhs, rhs);
+            return .{ .handled = switch (cmp) {
+                .lt => @bitCast(@as(i64, -1)),
+                .eq => 0,
+                .gt => 1,
+            } };
+        }
+
+        if (std.mem.endsWith(u8, name, "_strlen")) {
+            const text = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .unsupported = 0 };
+            return .{ .handled = text.len };
         }
 
         if (std.mem.endsWith(u8, name, "_time")) {
-            const now: u64 = 1_719_000_000;
+            const now_i64: i64 = 1_719_000_000;
+            const now: u64 = @bitCast(now_i64);
             const out_ptr = self.regs.rdi;
             if (out_ptr != 0) {
                 if (self.guestMemory(out_ptr, 8)) |buf| {
                     std.mem.writeInt(u64, buf[0..8], now, .little);
                 }
             }
-            std.debug.print("    [stub] _time(ptr=0x{x}) → returning {d}\n", .{ out_ptr, now });
-            return now;
+            return .{ .handled = now };
         }
 
         if (std.mem.endsWith(u8, name, "_fopen")) {
-            std.debug.print("    [stub] _fopen → returning synthetic FILE* 0x1\n", .{});
-            return 1;
+            return .{ .handled = self.handleFopen() orelse 0 };
+        }
+        if (std.mem.endsWith(u8, name, "_fclose")) {
+            return .{ .handled = self.handleFclose() };
         }
         if (std.mem.endsWith(u8, name, "_fprintf")) {
-            std.debug.print("    [stub] _fprintf → returning 1 (simulated bytes written)\n", .{});
-            return 1;
+            return .{ .handled = self.handleFprintf() };
+        }
+        if (std.mem.endsWith(u8, name, "_fputs")) {
+            return .{ .handled = self.handleFputs() };
+        }
+        if (std.mem.endsWith(u8, name, "_fflush")) {
+            return .{ .handled = self.handleFflush() };
+        }
+        if (std.mem.endsWith(u8, name, "_ftell")) {
+            return .{ .handled = self.handleFtell() };
+        }
+        if (std.mem.endsWith(u8, name, "_fseek")) {
+            return .{ .handled = self.handleFseek() };
+        }
+        if (std.mem.endsWith(u8, name, "_ferror")) {
+            return .{ .handled = self.handleFerror() };
+        }
+        if (std.mem.endsWith(u8, name, "_printf")) {
+            return .{ .handled = self.handlePrintfLike(null) };
+        }
+        if (std.mem.endsWith(u8, name, "_putchar")) {
+            return .{ .handled = self.handlePutchar() };
         }
 
         if (std.mem.endsWith(u8, name, "_gtk_init_check")) {
-            std.debug.print("    [stub] _gtk_init_check → returning 1 (GTK available)\n", .{});
-            return 1;
+            return .{ .handled = self.handleGtkInitCheck() };
         }
-        if (std.mem.endsWith(u8, name, "_fputs") or
-            std.mem.endsWith(u8, name, "_fclose") or
-            std.mem.endsWith(u8, name, "_ftell") or
-            std.mem.endsWith(u8, name, "_fseek") or
-            std.mem.endsWith(u8, name, "_fflush") or
-            std.mem.endsWith(u8, name, "_ferror"))
-        {
-            std.debug.print("    [stub] {s} → returning 1 (success)\n", .{name});
-            return 1;
+
+        if (std.mem.endsWith(u8, name, "_localtime") or std.mem.endsWith(u8, name, "_strftime")) {
+            return .{ .handled = 0 };
         }
-        // For printf/puts returning 0 means "0 chars written" - valid POSIX return
-        if (std.mem.endsWith(u8, name, "_printf") or
-            std.mem.endsWith(u8, name, "_putchar"))
-        {
-            std.debug.print("    [stub] {s} → returning 0 (0 chars)\n", .{name});
-            return 0;
-        }
-        // For time/gettimeofday/etc return -1 (error) to indicate "not available"
-        if (std.mem.endsWith(u8, name, "_localtime") or
-            std.mem.endsWith(u8, name, "_strftime"))
-        {
-            std.debug.print("    [stub] {s} → returning 0 (NULL/error)\n", .{name});
-            return 0;
-        }
-        // For function calls returning pointers, 0 = NULL (caller handles)
-        return 0;
+
+        return .{ .unsupported = 0 };
     }
 
     fn recordUnresolvedImport(
@@ -532,6 +652,200 @@ pub const MachOState = struct {
         self.import_trace_index = (self.import_trace_index + 1) % IMPORT_TRACE_BUFFER_LEN;
         if (self.import_trace_index == 0) self.import_trace_filled = true;
         self.unresolved_import_count += 1;
+    }
+
+    fn hostWriteAll(self: *MachOState, file: *GuestFile, bytes: []const u8) bool {
+        _ = self;
+        if (file.fd < 0) return false;
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const rc = std.c.write(file.fd, bytes.ptr + written, bytes.len - written);
+            if (rc < 0) {
+                file.error_flag = true;
+                return false;
+            }
+            if (rc == 0) break;
+            written += @intCast(rc);
+        }
+        if (file.kind == .regular) file.position += @intCast(written);
+        return written == bytes.len;
+    }
+
+    fn handleFopen(self: *MachOState) ?u64 {
+        const path = self.guestCString(self.regs.rdi, 4096) orelse return null;
+        const mode = self.guestCString(self.regs.rsi, 32) orelse return null;
+        const flags = parseFopenFlags(mode) orelse return null;
+        var path_buf = std.ArrayList(u8).empty;
+        defer path_buf.deinit(self.allocator);
+        path_buf.appendSlice(self.allocator, path) catch return null;
+        path_buf.append(self.allocator, 0) catch return null;
+        const zpath: [*:0]const u8 = @ptrCast(path_buf.items.ptr);
+        const fd = std.c.open(zpath, @bitCast(@as(u32, @intCast(flags))), @as(c_int, 0o666));
+        if (fd < 0) return null;
+        return self.allocGuestFile(fd, .regular);
+    }
+
+    fn handleFclose(self: *MachOState) u64 {
+        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        if (file.kind == .regular and file.fd >= 0) {
+            if (std.c.close(file.fd) != 0) {
+                file.error_flag = true;
+                return @bitCast(@as(i64, -1));
+            }
+        }
+        file.* = .{};
+        return 0;
+    }
+
+    fn handleFputs(self: *MachOState) u64 {
+        const text = self.guestCString(self.regs.rdi, 1 << 20) orelse return @bitCast(@as(i64, -1));
+        const file = self.guestFileFromHandle(self.regs.rsi) orelse return @bitCast(@as(i64, -1));
+        if (!self.hostWriteAll(file, text)) return @bitCast(@as(i64, -1));
+        return @intCast(text.len);
+    }
+
+    fn handleFflush(self: *MachOState) u64 {
+        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        if (std.c.fsync(file.fd) != 0 and file.kind == .regular) {
+            file.error_flag = true;
+            return @bitCast(@as(i64, -1));
+        }
+        return 0;
+    }
+
+    fn handleFtell(self: *MachOState) u64 {
+        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        return @bitCast(file.position);
+    }
+
+    fn handleFseek(self: *MachOState) u64 {
+        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        const offset: i64 = @bitCast(self.regs.rsi);
+        const whence: i32 = @intCast(self.regs.rdx);
+        if (file.fd < 0) return @bitCast(@as(i64, -1));
+        const pos = std.c.lseek(file.fd, offset, whence);
+        if (pos < 0) {
+            file.error_flag = true;
+            return @bitCast(@as(i64, -1));
+        }
+        file.position = pos;
+        return 0;
+    }
+
+    fn handleFerror(self: *MachOState) u64 {
+        const file = self.guestFileFromHandle(self.regs.rdi) orelse return 1;
+        return if (file.error_flag) 1 else 0;
+    }
+
+    fn handleFprintf(self: *MachOState) u64 {
+        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        return self.handlePrintfLike(file);
+    }
+
+    fn handlePrintfLike(self: *MachOState, file_opt: ?*GuestFile) u64 {
+        const format = self.guestCString(self.regs.rsi, 1 << 20) orelse return @bitCast(@as(i64, -1));
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var output = std.ArrayList(u8).empty;
+        defer output.deinit(allocator);
+
+        var gp_index: usize = 2;
+        var stack_arg_addr = self.regs.rsp + 8;
+        var i: usize = 0;
+        while (i < format.len) : (i += 1) {
+            if (format[i] != '%') {
+                output.append(allocator, format[i]) catch return @bitCast(@as(i64, -1));
+                continue;
+            }
+            i += 1;
+            if (i >= format.len) break;
+            if (format[i] == '%') {
+                output.append(allocator, '%') catch return @bitCast(@as(i64, -1));
+                continue;
+            }
+
+            while (i < format.len and (format[i] == '-' or format[i] == '+' or format[i] == ' ' or format[i] == '#' or format[i] == '0')) : (i += 1) {}
+            while (i < format.len and std.ascii.isDigit(format[i])) : (i += 1) {}
+            if (i < format.len and format[i] == '.') {
+                i += 1;
+                while (i < format.len and std.ascii.isDigit(format[i])) : (i += 1) {}
+            }
+            var long_count: usize = 0;
+            while (i < format.len and format[i] == 'l') : (i += 1) long_count += 1;
+            if (i >= format.len) break;
+
+            const spec = format[i];
+            const arg = self.nextVarArg(&gp_index, &stack_arg_addr);
+            switch (spec) {
+                's' => {
+                    const text = self.guestCString(arg, 1 << 20) orelse "(null)";
+                    output.appendSlice(allocator, text) catch return @bitCast(@as(i64, -1));
+                },
+                'd', 'i' => {
+                    const val: i64 = @bitCast(arg);
+                    const rendered = std.fmt.allocPrint(allocator, "{}", .{val}) catch return @bitCast(@as(i64, -1));
+                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                'u' => {
+                    const rendered = std.fmt.allocPrint(allocator, "{}", .{arg}) catch return @bitCast(@as(i64, -1));
+                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                'x' => {
+                    const rendered = std.fmt.allocPrint(allocator, "{x}", .{arg}) catch return @bitCast(@as(i64, -1));
+                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                'X' => {
+                    const rendered = std.fmt.allocPrint(allocator, "{X}", .{arg}) catch return @bitCast(@as(i64, -1));
+                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                'p' => {
+                    const rendered = std.fmt.allocPrint(allocator, "0x{x}", .{arg}) catch return @bitCast(@as(i64, -1));
+                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                'c' => {
+                    output.append(allocator, @intCast(arg & 0xFF)) catch return @bitCast(@as(i64, -1));
+                },
+                'z' => {
+                    output.append(allocator, 'z') catch return @bitCast(@as(i64, -1));
+                },
+                else => {
+                    output.append(allocator, '%') catch return @bitCast(@as(i64, -1));
+                    output.append(allocator, spec) catch return @bitCast(@as(i64, -1));
+                },
+            }
+        }
+
+        const sink = file_opt orelse self.guestFileFromHandle(GUEST_FILE_BASE + 1).?;
+        if (!self.hostWriteAll(sink, output.items)) return @bitCast(@as(i64, -1));
+        return output.items.len;
+    }
+
+    fn handlePutchar(self: *MachOState) u64 {
+        const ch: u8 = @intCast(self.regs.rdi & 0xFF);
+        const sink = self.guestFileFromHandle(GUEST_FILE_BASE + 1) orelse return @bitCast(@as(i64, -1));
+        if (!self.hostWriteAll(sink, &[_]u8{ch})) return @bitCast(@as(i64, -1));
+        return ch;
+    }
+
+    fn handleGtkInitCheck(self: *MachOState) u64 {
+        const argc_ptr = self.regs.rdi;
+        const argv_ptr = self.regs.rsi;
+        _ = argc_ptr;
+        _ = argv_ptr;
+        std.debug.print("    [import] _gtk_init_check compatibility shim → success\n", .{});
+        return 1;
+    }
+
+    fn nextVarArg(self: *const MachOState, gp_index: *usize, stack_arg_addr: *u64) u64 {
+        const regs = [_]u64{ self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9 };
+        if (gp_index.* < regs.len) {
+            defer gp_index.* += 1;
+            return regs[gp_index.*];
+        }
+        const addr = stack_arg_addr.*;
+        stack_arg_addr.* += 8;
+        return self.read64(addr);
     }
 
     fn recordTrace(self: *MachOState, decoded: DecodedInsn) void {
@@ -637,6 +951,16 @@ pub const MachOState = struct {
             .bits32 => 0x8000_0000,
             .bits64 => 0x8000_0000_0000_0000,
         };
+    }
+
+    fn arithmeticShiftRight(value: u64, size: Size, count: u6) u64 {
+        const signed: i64 = switch (size) {
+            .bits8 => @as(i8, @bitCast(@as(u8, @truncate(value)))),
+            .bits16 => @as(i16, @bitCast(@as(u16, @truncate(value)))),
+            .bits32 => @as(i32, @bitCast(@as(u32, @truncate(value)))),
+            .bits64 => @bitCast(value),
+        };
+        return @as(u64, @bitCast(signed >> count)) & maskForSize(size);
     }
 
     fn setupInitialStack(self: *MachOState, args: []const []const u8) void {
@@ -981,6 +1305,22 @@ pub const MachOState = struct {
                 self.setReg(d.dst_reg, sz, r);
                 self.setFlagsSub(a, b, r, sz);
             },
+            .sub_reg8_mem8, .sub_reg16_mem16, .sub_reg32_mem32, .sub_reg64_mem64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_mem8) + @intFromEnum(Size.bits8));
+                const a = self.regVal(d.dst_reg, sz);
+                const b = self.readMemVal(d.addr, sz);
+                const r = a -% b;
+                self.setReg(d.dst_reg, sz, r);
+                self.setFlagsSub(a, b, r, sz);
+            },
+            .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_mem8_reg8) + @intFromEnum(Size.bits8));
+                const a = self.readMemVal(d.addr, sz);
+                const b = self.regVal(d.src_reg, sz);
+                const r = a -% b;
+                self.writeMemVal(d.addr, sz, r);
+                self.setFlagsSub(a, b, r, sz);
+            },
             .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_imm8) + @intFromEnum(Size.bits8));
                 self.executeSubRegImm(d, sz);
@@ -1026,12 +1366,21 @@ pub const MachOState = struct {
                 self.setReg(d.dst_reg, sz, r);
                 self.setFlagsLogic(r, sz);
             },
-            .and_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
+            .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.and_reg8_mem8) + @intFromEnum(Size.bits8));
+                const a = self.regVal(d.dst_reg, sz);
+                const b = self.readMemVal(d.addr, sz);
                 const r = a & b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsLogic(r, .bits8);
+                self.setReg(d.dst_reg, sz, r);
+                self.setFlagsLogic(r, sz);
+            },
+            .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.and_mem8_reg8) + @intFromEnum(Size.bits8));
+                const a = self.readMemVal(d.addr, sz);
+                const b = self.regVal(d.src_reg, sz);
+                const r = a & b;
+                self.writeMemVal(d.addr, sz, r);
+                self.setFlagsLogic(r, sz);
             },
             .and_reg8_imm8, .and_reg16_imm8, .and_reg32_imm8, .and_reg64_imm8 => self.executeAndRegImm(d),
             .and_reg16_imm32, .and_reg32_imm32, .and_reg64_imm32 => self.executeAndRegImm(d),
@@ -1052,6 +1401,14 @@ pub const MachOState = struct {
                 self.setReg(d.dst_reg, sz, r);
                 self.setFlagsLogic(r, sz);
             },
+            .or_mem8_reg8, .or_mem16_reg16, .or_mem32_reg32, .or_mem64_reg64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_mem8_reg8) + @intFromEnum(Size.bits8));
+                const a = self.readMemVal(d.addr, sz);
+                const b = self.regVal(d.src_reg, sz);
+                const r = a | b;
+                self.writeMemVal(d.addr, sz, r);
+                self.setFlagsLogic(r, sz);
+            },
             .or_reg8_imm8 => {
                 const a = self.regVal(d.dst_reg, .bits8);
                 const b = d.imm;
@@ -1068,12 +1425,21 @@ pub const MachOState = struct {
                 self.setReg(d.dst_reg, sz, r);
                 self.setFlagsLogic(r, sz);
             },
-            .xor_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
+            .xor_reg8_mem8, .xor_reg16_mem16, .xor_reg32_mem32, .xor_reg64_mem64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_reg8_mem8) + @intFromEnum(Size.bits8));
+                const a = self.regVal(d.dst_reg, sz);
+                const b = self.readMemVal(d.addr, sz);
                 const r = a ^ b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsLogic(r, .bits8);
+                self.setReg(d.dst_reg, sz, r);
+                self.setFlagsLogic(r, sz);
+            },
+            .xor_mem8_reg8, .xor_mem16_reg16, .xor_mem32_reg32, .xor_mem64_reg64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_mem8_reg8) + @intFromEnum(Size.bits8));
+                const a = self.readMemVal(d.addr, sz);
+                const b = self.regVal(d.src_reg, sz);
+                const r = a ^ b;
+                self.writeMemVal(d.addr, sz, r);
+                self.setFlagsLogic(r, sz);
             },
             .xor_reg8_imm8, .xor_reg16_imm8, .xor_reg32_imm8, .xor_reg64_imm8 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_reg8_imm8) + @intFromEnum(Size.bits8));
@@ -1130,6 +1496,14 @@ pub const MachOState = struct {
                 const b = self.regVal(d.src_reg, sz);
                 const r = a & b;
                 self.setFlagsLogic(r, sz);
+            },
+            .test_reg8_imm8, .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => {
+                const r = self.regVal(d.dst_reg, d.size) & d.imm;
+                self.setFlagsLogic(r, d.size);
+            },
+            .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => {
+                const r = self.readMemVal(d.addr, d.size) & d.imm;
+                self.setFlagsLogic(r, d.size);
             },
 
             .inc_mem8, .inc_mem16, .inc_mem32, .inc_mem64 => {
@@ -1274,6 +1648,22 @@ pub const MachOState = struct {
                 const r = (a & maskForSize(sz)) << @as(u6, @intCast(count));
                 if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
             },
+            .shr_reg_cl, .shr_mem_cl => {
+                const sz = d.size;
+                const is_mem = d.op == .shr_mem_cl;
+                const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
+                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+                const r = (a & maskForSize(sz)) >> @as(u6, @intCast(count));
+                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            },
+            .sar_reg_cl, .sar_mem_cl => {
+                const sz = d.size;
+                const is_mem = d.op == .sar_mem_cl;
+                const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
+                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+                const r = arithmeticShiftRight(a, sz, @intCast(count));
+                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            },
             .shr_reg_imm, .shr_mem_imm => {
                 const sz = d.size;
                 const is_mem = d.op == .shr_mem_imm;
@@ -1288,6 +1678,14 @@ pub const MachOState = struct {
                 const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
                 const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
                 const r = (a & maskForSize(sz)) << @as(u6, @intCast(count));
+                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
+            },
+            .sar_reg_imm, .sar_mem_imm => {
+                const sz = d.size;
+                const is_mem = d.op == .sar_mem_imm;
+                const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
+                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
+                const r = arithmeticShiftRight(a, sz, @intCast(count));
                 if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
             },
 
@@ -1366,22 +1764,34 @@ pub const MachOState = struct {
             },
 
             .movzx_reg32_mem8 => {
-                const val = self.readMemVal(d.addr, .bits8);
-                self.setReg(d.dst_reg, .bits32, val);
+                const val = if (d.is_reg_form)
+                    self.regVal(d.src_reg, .bits8)
+                else
+                    self.readMemVal(d.addr, .bits8);
+                self.setReg(d.dst_reg, d.size, val);
             },
             .movzx_reg32_mem16 => {
-                const val = self.readMemVal(d.addr, .bits16);
-                self.setReg(d.dst_reg, .bits32, val);
+                const val = if (d.is_reg_form)
+                    self.regVal(d.src_reg, .bits16)
+                else
+                    self.readMemVal(d.addr, .bits16);
+                self.setReg(d.dst_reg, d.size, val);
             },
             .movsx_reg32_mem8 => {
-                const val = self.readMemVal(d.addr, .bits8);
+                const val = if (d.is_reg_form)
+                    self.regVal(d.src_reg, .bits8)
+                else
+                    self.readMemVal(d.addr, .bits8);
                 const signed_val = @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(val)))))));
-                self.setReg(d.dst_reg, .bits32, signed_val);
+                self.setReg(d.dst_reg, d.size, signed_val);
             },
             .movsx_reg32_mem16 => {
-                const val = self.readMemVal(d.addr, .bits16);
+                const val = if (d.is_reg_form)
+                    self.regVal(d.src_reg, .bits16)
+                else
+                    self.readMemVal(d.addr, .bits16);
                 const signed_val = @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(val)))))));
-                self.setReg(d.dst_reg, .bits32, signed_val);
+                self.setReg(d.dst_reg, d.size, signed_val);
             },
             .movsxd_reg64_reg32 => {
                 const val = self.regVal(d.src_reg, .bits32);
@@ -1505,6 +1915,26 @@ pub const MachOState = struct {
                     self.regs.r8,
                     self.regs.r9,
                 );
+            },
+
+            .cpuid => {
+                const leaf: u32 = @truncate(self.regs.rax);
+                const subleaf: u32 = @truncate(self.regs.rcx);
+                const result = x64_decoder.emulatedCpuid(leaf, subleaf);
+                log.info(
+                    "cpuid: leaf=0x{x} subleaf=0x{x} -> eax=0x{x} ebx=0x{x} ecx=0x{x} edx=0x{x}",
+                    .{ leaf, subleaf, result.eax, result.ebx, result.ecx, result.edx },
+                );
+                self.setReg(.al_ax_eax_rax, .bits32, result.eax);
+                self.setReg(.bl_bx_ebx_rbx, .bits32, result.ebx);
+                self.setReg(.cl_cx_ecx_rcx, .bits32, result.ecx);
+                self.setReg(.dl_dx_edx_rdx, .bits32, result.edx);
+            },
+
+            .xgetbv => {
+                const xcr0 = if (@as(u32, @truncate(self.regs.rcx)) == 0) x64_decoder.emulatedXcr0() else 0;
+                self.setReg(.al_ax_eax_rax, .bits32, @truncate(xcr0));
+                self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(xcr0 >> 32));
             },
 
             .hlt => {
@@ -1675,6 +2105,22 @@ fn alignDown(value: u64, alignment: u64) u64 {
     return value & ~(alignment - 1);
 }
 
+fn parseFopenFlags(mode: []const u8) ?i32 {
+    if (mode.len == 0) return null;
+    var flags: i32 = 0;
+    switch (mode[0]) {
+        'r' => flags = 0x0000,
+        'w' => flags = 0x0001 | 0x0200 | 0x0400,
+        'a' => flags = 0x0001 | 0x0200 | 0x0008,
+        else => return null,
+    }
+    if (std.mem.indexOfScalar(u8, mode, '+') != null) {
+        flags &= ~@as(i32, 0x0003);
+        flags |= 0x0002;
+    }
+    return flags;
+}
+
 fn alignUp(value: u64, alignment: u64) !u64 {
     const mask = alignment - 1;
     return (try std.math.add(u64, value, mask)) & ~mask;
@@ -1826,7 +2272,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 has_f3 = true;
                 pos += 1;
             },
-            0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F => {
+            0x40...0x4F => {
                 rex = bytes[pos];
                 pos += 1;
             },
@@ -1948,6 +2394,14 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
 
         0x80...0x83 => {
             return decodeGroup1Imm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+        },
+
+        0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3 => {
+            return decodeGroup2Shift(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+        },
+
+        0xF6, 0xF7 => {
+            return decodeGroup3(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
         },
 
         0xB0...0xB7 => {
@@ -2090,6 +2544,39 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             d.len = @as(u8, @intCast(pos + 2));
         },
 
+        0xA8 => {
+            if (pos + 2 > bytes.len) return .{};
+            d.op = .test_reg8_imm8;
+            d.size = .bits8;
+            d.dst_reg = .al_ax_eax_rax;
+            d.imm = bytes[pos + 1];
+            d.len = @intCast(pos + 2);
+        },
+
+        0xA9 => {
+            const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+            const imm_len: usize = if (sz == .bits16) 2 else 4;
+            if (pos + 1 + imm_len > bytes.len) return .{};
+            d.op = switch (sz) {
+                .bits16 => .test_reg16_imm16,
+                .bits32 => .test_reg32_imm32,
+                .bits64 => .test_reg64_imm32,
+                .bits8 => unreachable,
+            };
+            d.size = sz;
+            d.dst_reg = .al_ax_eax_rax;
+            if (sz == .bits16) {
+                d.imm = std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .little);
+            } else {
+                const imm32 = std.mem.readInt(u32, bytes[pos + 1 ..][0..4], .little);
+                d.imm = if (sz == .bits64)
+                    @bitCast(@as(i64, @as(i32, @bitCast(imm32))))
+                else
+                    imm32;
+            }
+            d.len = @intCast(pos + 1 + imm_len);
+        },
+
         0xB8...0xBF => {
             d.op = .mov_reg_imm;
             d.dst_reg = mapReg(opcode - 0xB8, rex_b);
@@ -2119,57 +2606,65 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             if (pos + 2 > bytes.len) return .{};
             d.op = .or_reg8_imm8;
             d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
         0x14 => {
             if (pos + 2 > bytes.len) return .{};
             d.op = .adc_reg8_imm8;
-            d.dst_reg = mapReg(2, rex_b);
+            d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
         0x1C => {
             if (pos + 2 > bytes.len) return .{};
             d.op = .sbb_reg8_imm8;
-            d.dst_reg = mapReg(3, rex_b);
+            d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
         0x24 => {
             if (pos + 2 > bytes.len) return .{};
             d.op = .and_reg8_imm8;
-            d.dst_reg = mapReg(4, rex_b);
+            d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
         0x2C => {
             if (pos + 2 > bytes.len) return .{};
             d.op = .sub_reg8_imm8;
-            d.dst_reg = mapReg(5, rex_b);
+            d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
         0x34 => {
             if (pos + 2 > bytes.len) return .{};
             d.op = .xor_reg8_imm8;
-            d.dst_reg = mapReg(6, rex_b);
+            d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
         0x3C => {
             if (pos + 2 > bytes.len) return .{};
             d.op = .cmp_reg8_imm8;
-            d.dst_reg = mapReg(7, rex_b);
+            d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
         0x04 => {
             if (pos + 2 > bytes.len) return .{};
             d.op = .add_reg8_imm8;
             d.dst_reg = mapReg(0, rex_b);
+            d.size = .bits8;
             d.imm = bytes[pos + 1];
-            d.len = 2;
+            d.len = @intCast(pos + 2);
         },
 
         0x40...0x47 => {
@@ -2235,7 +2730,7 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
         return d;
     }
 
-    if (opcode2 >= 0x84 and opcode2 <= 0x8F) {
+    if (opcode2 >= 0x80 and opcode2 <= 0x8F) {
         d.op = .jcc_rel32;
         d.cond = mapJccCond32(opcode2);
         if (pos.* + 4 > bytes.len) return .{};
@@ -2247,41 +2742,48 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
     }
 
     if (opcode2 >= 0x90 and opcode2 <= 0x9F) {
-        return decodeSetcc(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeSetcc(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0xA2) {
-        d.op = .nop;
+        d.op = .cpuid;
+        d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
+    if (opcode2 == 0x01 and pos.* < bytes.len and bytes[pos.*] == 0xD0) {
+        pos.* += 1;
+        d.op = .xgetbv;
         d.len = @as(u8, @intCast(pos.*));
         return d;
     }
 
     if (opcode2 == 0xAF) {
-        return decodeImulTwoOp(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeImulTwoOp(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0xB0 or opcode2 == 0xB1) {
-        return decodeCmpxchg(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeCmpxchg(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0xB6 or opcode2 == 0xB7) {
-        return decodeMovzx(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeMovzx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0xBE or opcode2 == 0xBF) {
-        return decodeMovsx(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeMovsx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0xC1) {
-        return decodeXadd(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeXadd(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0x10 or opcode2 == 0x11) {
-        return decodeMovupsMovss(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, has_f2, has_f3, opcode2);
+        return decodeMovupsMovss(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, has_f2, has_f3, opcode2);
     }
 
     if (opcode2 == 0x28 or opcode2 == 0x29) {
-        return decodeMovaps(bytes, pos.*, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeMovaps(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0x2E or opcode2 == 0x2F) {
@@ -2540,42 +3042,57 @@ fn decodeArithRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
     var d = DecodedInsn{};
     var pos = start_pos + 1;
 
-    const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    const is_byte = (opcode & 0x01) == 0;
+    const sz: Size = if (is_byte) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
 
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
     const is_reg_reg = bytes[start_pos + 1] >= 0xC0;
     const is_mem_to_reg = (opcode & 0x02) != 0;
 
-    const op_map: [8]Op = .{
+    const reg_mem_ops: [8]Op = .{
         .add_reg8_mem8, .or_reg8_mem8,  .adc_reg8_mem8, .sbb_reg8_mem8,
         .and_reg8_mem8, .sub_reg8_mem8, .xor_reg8_mem8, .cmp_reg8_mem8,
     };
-    const op_map_rev: [8]Op = .{
-        .add_mem8_reg8, .or_mem8_reg8, .invalid, .invalid,
-        .and_mem8_reg8, .invalid,      .invalid, .cmp_mem8_reg8,
+    const mem_reg_ops: [8]Op = .{
+        .add_mem8_reg8, .or_mem8_reg8,  .invalid,       .invalid,
+        .and_mem8_reg8, .sub_mem8_reg8, .xor_mem8_reg8, .cmp_mem8_reg8,
+    };
+    const reg_reg_ops: [8]Op = .{
+        .add_reg8_reg8, .or_reg8_reg8,  .invalid,       .invalid,
+        .and_reg8_reg8, .sub_reg8_reg8, .xor_reg8_reg8, .cmp_reg8_reg8,
     };
 
-    if (is_reg_reg or is_mem_to_reg) {
-        const base_op = op_map[@intFromEnum(arith_type)];
-        const off = @intFromEnum(sz) - @intFromEnum(Size.bits8);
-        d.op = @enumFromInt(@intFromEnum(base_op) + off);
-    } else {
-        const base_op = op_map_rev[@intFromEnum(arith_type)];
-        const off = @intFromEnum(sz) - @intFromEnum(Size.bits8);
-        d.op = @enumFromInt(@intFromEnum(base_op) + off);
-    }
+    const base_op = if (is_reg_reg)
+        reg_reg_ops[@intFromEnum(arith_type)]
+    else if (is_mem_to_reg)
+        reg_mem_ops[@intFromEnum(arith_type)]
+    else
+        mem_reg_ops[@intFromEnum(arith_type)];
+    const off = @intFromEnum(sz) - @intFromEnum(Size.bits8);
+    d.op = if (base_op == .invalid)
+        .invalid
+    else
+        @enumFromInt(@intFromEnum(base_op) + off);
 
     if (is_reg_reg) {
-        d.dst_reg = rm.reg;
-        d.src_reg = @enumFromInt(rm.addr);
+        if (is_mem_to_reg) {
+            d.dst_reg = rm.reg;
+            d.src_reg = @enumFromInt(rm.addr);
+        } else {
+            d.dst_reg = @enumFromInt(rm.addr);
+            d.src_reg = rm.reg;
+        }
         d.is_reg_form = true;
-    } else {
+    } else if (is_mem_to_reg) {
         d.dst_reg = rm.reg;
         d.addr = rm.addr;
+    } else {
+        d.src_reg = rm.reg;
+        d.addr = rm.addr;
     }
+    d.size = sz;
     d.len = @as(u8, @intCast(pos));
 
-    if (d.op == .invalid) d.op = .invalid;
     return d;
 }
 
@@ -2740,6 +3257,66 @@ fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     return d;
 }
 
+fn decodeGroup2Shift(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
+    var d = DecodedInsn{};
+    var pos = start_pos + 1;
+    if (pos >= bytes.len) return .{};
+    const modrm = bytes[pos];
+    const group_op = (modrm >> 3) & 7;
+    const is_mem = modrm < 0xC0;
+    const is_byte = opcode == 0xC0 or opcode == 0xD0 or opcode == 0xD2;
+    const size: Size = if (is_byte) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    const uses_cl = opcode == 0xD2 or opcode == 0xD3;
+
+    if (group_op != 4 and group_op != 5 and group_op != 7) {
+        d.op = .invalid;
+        d.len = @intCast(pos + 1);
+        return d;
+    }
+    const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, size);
+    const count: u64 = if (opcode == 0xC0 or opcode == 0xC1) blk: {
+        if (pos >= bytes.len) return .{};
+        const immediate = bytes[pos];
+        pos += 1;
+        break :blk immediate;
+    } else if (uses_cl) 0 else 1;
+
+    if (uses_cl) {
+        d.op = if (is_mem)
+            switch (group_op) {
+                4 => .shl_mem_cl,
+                5 => .shr_mem_cl,
+                else => .sar_mem_cl,
+            }
+        else switch (group_op) {
+            4 => .shl_reg_cl,
+            5 => .shr_reg_cl,
+            else => .sar_reg_cl,
+        };
+    } else if (is_mem) {
+        d.op = switch (group_op) {
+            4 => .shl_mem_imm,
+            5 => .shr_mem_imm,
+            else => .sar_mem_imm,
+        };
+    } else {
+        d.op = switch (group_op) {
+            4 => .shl_reg_imm,
+            5 => .shr_reg_imm,
+            else => .sar_reg_imm,
+        };
+    }
+    d.size = size;
+    d.imm = count;
+    if (is_mem) {
+        d.addr = rm.addr;
+    } else {
+        d.dst_reg = @enumFromInt(rm.addr);
+    }
+    d.len = @intCast(pos);
+    return d;
+}
+
 fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
     var d = DecodedInsn{};
     var pos = start_pos + 1;
@@ -2777,6 +3354,49 @@ fn decodeMovMemImm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     }
 
     d.len = @as(u8, @intCast(pos));
+    return d;
+}
+
+fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8) DecodedInsn {
+    var d = DecodedInsn{};
+    var pos = start_pos + 1;
+    if (pos >= bytes.len) return .{};
+
+    const modrm = bytes[pos];
+    const group = (modrm >> 3) & 7;
+    const is_mem = modrm < 0xC0;
+    const sz: Size = if (opcode == 0xF6) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
+
+    if (group != 0 and group != 1) {
+        d.op = .invalid;
+        d.len = @intCast(pos);
+        return d;
+    }
+
+    const imm_len: usize = switch (sz) {
+        .bits8 => 1,
+        .bits16 => 2,
+        .bits32, .bits64 => 4,
+    };
+    if (pos + imm_len > bytes.len) return .{};
+    d.imm = switch (sz) {
+        .bits8 => bytes[pos],
+        .bits16 => std.mem.readInt(u16, bytes[pos..][0..2], .little),
+        .bits32 => std.mem.readInt(u32, bytes[pos..][0..4], .little),
+        .bits64 => @bitCast(@as(i64, @as(i32, @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little))))),
+    };
+    pos += imm_len;
+    const base_op: Op = if (is_mem) .test_mem8_imm8 else .test_reg8_imm8;
+    d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+    d.size = sz;
+    if (is_mem) {
+        d.addr = rm.addr;
+    } else {
+        d.dst_reg = @enumFromInt(rm.addr);
+        d.is_reg_form = true;
+    }
+    d.len = @intCast(pos);
     return d;
 }
 
@@ -3086,8 +3706,10 @@ fn decodeMovzx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, re
     } else {
         d.op = if (is_byte) .movzx_reg32_mem8 else .movzx_reg32_mem16;
         d.dst_reg = rm.reg;
-        d.addr = rm.addr;
+        d.src_reg = @enumFromInt(rm.addr);
+        d.is_reg_form = true;
     }
+    d.size = sz;
 
     d.len = @as(u8, @intCast(pos));
     return d;
@@ -3110,8 +3732,10 @@ fn decodeMovsx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, re
     } else {
         d.op = if (is_byte) .movsx_reg32_mem8 else .movsx_reg32_mem16;
         d.dst_reg = rm.reg;
-        d.addr = rm.addr;
+        d.src_reg = @enumFromInt(rm.addr);
+        d.is_reg_form = true;
     }
+    d.size = sz;
 
     d.len = @as(u8, @intCast(pos));
     return d;
@@ -3224,6 +3848,154 @@ fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, r
 
     d.len = @as(u8, @intCast(pos));
     return d;
+}
+
+test "decode Xbyak shl ecx immediate" {
+    const decoded = decodeInsn(&[_]u8{ 0xC1, 0xE1, 0x08 });
+    try std.testing.expectEqual(Op.shl_reg_imm, decoded.op);
+    try std.testing.expectEqual(Size.bits32, decoded.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+    try std.testing.expectEqual(@as(u64, 8), decoded.imm);
+    try std.testing.expectEqual(@as(u8, 3), decoded.len);
+}
+
+test "decode group two implicit and arithmetic shifts" {
+    const shr = decodeInsn(&[_]u8{ 0xD1, 0xE9 });
+    try std.testing.expectEqual(Op.shr_reg_imm, shr.op);
+    try std.testing.expectEqual(@as(u64, 1), shr.imm);
+    try std.testing.expectEqual(@as(u8, 2), shr.len);
+
+    const sar = decodeInsn(&[_]u8{ 0x48, 0xC1, 0xFE, 0x03 });
+    try std.testing.expectEqual(Op.sar_reg_imm, sar.op);
+    try std.testing.expectEqual(Size.bits64, sar.size);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, sar.dst_reg);
+    try std.testing.expectEqual(@as(u64, 3), sar.imm);
+    try std.testing.expectEqual(@as(u8, 4), sar.len);
+
+    const shr_cl = decodeInsn(&[_]u8{ 0xD3, 0xE8 });
+    try std.testing.expectEqual(Op.shr_reg_cl, shr_cl.op);
+    try std.testing.expectEqual(Size.bits32, shr_cl.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, shr_cl.dst_reg);
+    try std.testing.expectEqual(@as(u8, 2), shr_cl.len);
+
+    const sar_cl = decodeInsn(&[_]u8{ 0xD3, 0xF8 });
+    try std.testing.expectEqual(Op.sar_reg_cl, sar_cl.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, sar_cl.dst_reg);
+}
+
+test "decode register MOVZX without consuming the following instruction" {
+    const decoded = decodeInsn(&[_]u8{ 0x0F, 0xB6, 0xC0, 0x48, 0x83, 0xC4, 0x30 });
+    try std.testing.expectEqual(Op.movzx_reg32_mem8, decoded.op);
+    try std.testing.expectEqual(Size.bits32, decoded.size);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.src_reg);
+    try std.testing.expectEqual(@as(u8, 3), decoded.len);
+}
+
+test "decode MOVSX memory and accumulator byte immediate forms" {
+    const movsx = decodeInsn(&[_]u8{ 0x48, 0x0F, 0xBE, 0x48, 0x03 });
+    try std.testing.expectEqual(Op.movsx_reg32_mem8, movsx.op);
+    try std.testing.expectEqual(Size.bits64, movsx.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, movsx.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, movsx.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 3), movsx.addr);
+    try std.testing.expectEqual(@as(u8, 5), movsx.len);
+
+    const and_al = decodeInsn(&[_]u8{ 0x24, 0x01 });
+    try std.testing.expectEqual(Op.and_reg8_imm8, and_al.op);
+    try std.testing.expectEqual(Size.bits8, and_al.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, and_al.dst_reg);
+    try std.testing.expectEqual(@as(u64, 1), and_al.imm);
+    try std.testing.expectEqual(@as(u8, 2), and_al.len);
+}
+
+test "decode accumulator TEST immediate forms" {
+    const test_al = decodeInsn(&[_]u8{ 0xA8, 0x01 });
+    try std.testing.expectEqual(Op.test_reg8_imm8, test_al.op);
+    try std.testing.expectEqual(Size.bits8, test_al.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, test_al.dst_reg);
+    try std.testing.expectEqual(@as(u64, 1), test_al.imm);
+    try std.testing.expectEqual(@as(u8, 2), test_al.len);
+
+    const test_rax = decodeInsn(&[_]u8{ 0x48, 0xA9, 0x00, 0x00, 0x00, 0x80 });
+    try std.testing.expectEqual(Op.test_reg64_imm32, test_rax.op);
+    try std.testing.expectEqual(Size.bits64, test_rax.size);
+    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF_8000_0000), test_rax.imm);
+    try std.testing.expectEqual(@as(u8, 6), test_rax.len);
+}
+
+test "decode full near conditional jump range" {
+    const jc = decodeInsn(&[_]u8{ 0x0F, 0x82, 0xA7, 0x01, 0x00, 0x00 });
+    try std.testing.expectEqual(Op.jcc_rel32, jc.op);
+    try std.testing.expectEqual(Cond.b, jc.cond);
+    try std.testing.expectEqual(@as(u64, 0x1A7), jc.addr);
+    try std.testing.expect(jc.rip_relative);
+    try std.testing.expectEqual(@as(u8, 6), jc.len);
+}
+
+test "decode both directions of 64-bit AND memory operands" {
+    const load_and = decodeInsn(&[_]u8{ 0x48, 0x23, 0x08 });
+    try std.testing.expectEqual(Op.and_reg64_mem64, load_and.op);
+    try std.testing.expectEqual(Size.bits64, load_and.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, load_and.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, load_and.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 3), load_and.len);
+
+    const store_and = decodeInsn(&[_]u8{ 0x48, 0x21, 0x08 });
+    try std.testing.expectEqual(Op.and_mem64_reg64, store_and.op);
+    try std.testing.expectEqual(Size.bits64, store_and.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, store_and.src_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, store_and.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 3), store_and.len);
+}
+
+test "decode arithmetic byte width and operand direction" {
+    const xor_al = decodeInsn(&[_]u8{ 0x30, 0xC0 });
+    try std.testing.expectEqual(Op.xor_reg8_reg8, xor_al.op);
+    try std.testing.expectEqual(Size.bits8, xor_al.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, xor_al.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, xor_al.src_reg);
+
+    const sub_mem = decodeInsn(&[_]u8{ 0x29, 0x08 });
+    try std.testing.expectEqual(Op.sub_mem32_reg32, sub_mem.op);
+    try std.testing.expectEqual(Size.bits32, sub_mem.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, sub_mem.src_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, sub_mem.sib_base_reg);
+}
+
+test "decode group three TEST register immediate" {
+    const test_cl = decodeInsn(&[_]u8{ 0xF6, 0xC1, 0x01 });
+    try std.testing.expectEqual(Op.test_reg8_imm8, test_cl.op);
+    try std.testing.expectEqual(Size.bits8, test_cl.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, test_cl.dst_reg);
+    try std.testing.expectEqual(@as(u64, 1), test_cl.imm);
+    try std.testing.expectEqual(@as(u8, 3), test_cl.len);
+}
+
+test "decode CPUID and XGETBV" {
+    const cpuid = decodeInsn(&[_]u8{ 0x0F, 0xA2 });
+    try std.testing.expectEqual(Op.cpuid, cpuid.op);
+    try std.testing.expectEqual(@as(u8, 2), cpuid.len);
+
+    const xgetbv = decodeInsn(&[_]u8{ 0x0F, 0x01, 0xD0 });
+    try std.testing.expectEqual(Op.xgetbv, xgetbv.op);
+    try std.testing.expectEqual(@as(u8, 3), xgetbv.len);
+}
+
+test "decode non-W REX prefixes used by CPUID result copies" {
+    const mov_r9d_eax = decodeInsn(&[_]u8{ 0x41, 0x89, 0xC1 });
+    try std.testing.expectEqual(Op.mov_reg32_reg32, mov_r9d_eax.op);
+    try std.testing.expectEqual(Size.bits32, mov_r9d_eax.size);
+    try std.testing.expectEqual(RegId.r9b_r9w_r9d_r9, mov_r9d_eax.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, mov_r9d_eax.src_reg);
+    try std.testing.expectEqual(@as(u8, 3), mov_r9d_eax.len);
+
+    const mov_mem_r9d = decodeInsn(&[_]u8{ 0x45, 0x89, 0x08 });
+    try std.testing.expectEqual(Op.mov_mem32_reg32, mov_mem_r9d.op);
+    try std.testing.expectEqual(RegId.r9b_r9w_r9d_r9, mov_mem_r9d.src_reg);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, mov_mem_r9d.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 3), mov_mem_r9d.len);
 }
 
 pub fn main(init: std.process.Init) !void {
