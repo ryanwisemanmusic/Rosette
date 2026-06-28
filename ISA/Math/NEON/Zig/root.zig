@@ -297,6 +297,11 @@ const pop_popcnt = @import("POP/POPCNT.zig");
 const push_push = @import("PUSH/PUSH.zig");
 const push_pusha = @import("PUSH/PUSHA.zig");
 const push_pushad = @import("PUSH/PUSHAD.zig");
+const restore_frstore = @import("RESTORE/frstore.zig");
+const restore_fxrstore = @import("RESTORE/fxrstore.zig");
+const restore_rstore_ssp = @import("RESTORE/rstore_ssp.zig");
+const restore_xrstore = @import("RESTORE/xrstore.zig");
+const restore_xrstors = @import("RESTORE/xrstors.zig");
 const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
@@ -873,6 +878,11 @@ pub const specs = blk: {
         spec(push_push.meta),
         spec(push_pusha.meta),
         spec(push_pushad.meta),
+        spec(restore_frstore.meta),
+        spec(restore_fxrstore.meta),
+        spec(restore_rstore_ssp.meta),
+        spec(restore_xrstore.meta),
+        spec(restore_xrstors.meta),
         spec(rotate_rcl.meta),
         spec(rotate_rcr.meta),
         spec(rotate_rol.meta),
@@ -1449,6 +1459,11 @@ pub const proof_reports = [_]proofs.ProofReport{
     push_push.proof_report,
     push_pusha.proof_report,
     push_pushad.proof_report,
+    restore_frstore.proof_report,
+    restore_fxrstore.proof_report,
+    restore_rstore_ssp.proof_report,
+    restore_xrstore.proof_report,
+    restore_xrstors.proof_report,
     rotate_rcl.proof_report,
     rotate_rcr.proof_report,
     rotate_rol.proof_report,
