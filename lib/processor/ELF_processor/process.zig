@@ -971,6 +971,13 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, .bits64, r);
                 self.setFlagsSub(a, b, r, .bits64);
             },
+            .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64 => {
+                const a = self.readMemVal(d.addr, d.size);
+                const b = self.regVal(d.src_reg, d.size);
+                const r = a -% b;
+                self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsSub(a, b, r, d.size);
+            },
 
             // ── sub reg, reg ──
             .sub_reg8_reg8 => {
@@ -1068,12 +1075,12 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
-            .and_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
+            .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64 => {
+                const a = self.regVal(d.dst_reg, d.size);
+                const b = self.readMemVal(d.addr, d.size);
                 const r = a & b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsLogic(r, .bits8);
+                self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsLogic(r, d.size);
             },
             .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64 => {
                 const a = self.readMemVal(d.addr, d.size);
@@ -1138,11 +1145,18 @@ pub const ElfState = struct {
                 self.writeMemVal(d.addr, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
-            .xor_reg8_mem8 => {
+            .xor_reg8_mem8, .xor_reg16_mem16, .xor_reg32_mem32, .xor_reg64_mem64 => {
                 const a = self.regVal(d.dst_reg, d.size);
                 const b = self.readMemVal(d.addr, d.size);
                 const r = a ^ b;
                 self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsLogic(r, d.size);
+            },
+            .xor_mem8_reg8, .xor_mem16_reg16, .xor_mem32_reg32, .xor_mem64_reg64 => {
+                const a = self.readMemVal(d.addr, d.size);
+                const b = self.regVal(d.src_reg, d.size);
+                const r = a ^ b;
+                self.writeMemVal(d.addr, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
             .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
@@ -1178,6 +1192,34 @@ pub const ElfState = struct {
                 const r = self.shlValue(old, d.size, count);
                 self.writeMemVal(d.addr, d.size, r);
                 self.setFlagsShl(old, r, d.size, count);
+            },
+            .shr_reg_cl => {
+                const old = self.regVal(d.dst_reg, d.size);
+                const count = self.shlCount(d.size);
+                const r = self.shrValue(old, d.size, count);
+                self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsShr(old, r, d.size, count);
+            },
+            .shr_mem_cl => {
+                const old = self.readMemVal(d.addr, d.size);
+                const count = self.shlCount(d.size);
+                const r = self.shrValue(old, d.size, count);
+                self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsShr(old, r, d.size, count);
+            },
+            .sar_reg_cl => {
+                const old = self.regVal(d.dst_reg, d.size);
+                const count = self.shlCount(d.size);
+                const r = self.sarValue(old, d.size, count);
+                self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsSar(old, r, d.size, count);
+            },
+            .sar_mem_cl => {
+                const old = self.readMemVal(d.addr, d.size);
+                const count = self.shlCount(d.size);
+                const r = self.sarValue(old, d.size, count);
+                self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsSar(old, r, d.size, count);
             },
             .shl_reg_imm => {
                 const old = self.regVal(d.dst_reg, d.size);
@@ -1913,6 +1955,15 @@ pub const ElfState = struct {
                     self.xmm[d.xmm_dst][i] ^= self.xmm[d.xmm_src][i];
                 }
             },
+            .movups_xmm_xmm => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+            },
+            .movups_xmm_mem => {
+                self.xmm[d.xmm_dst] = self.readMem128(d.addr);
+            },
+            .movups_mem_xmm => {
+                self.writeMem128(d.addr, self.xmm[d.xmm_src]);
+            },
             .movaps_xmm_xmm => {
                 self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
             },
@@ -2098,6 +2149,72 @@ pub const ElfState = struct {
                 );
                 x64_guest_abi.diagnoseSyscall(self, syscall_number, syscall_fd, syscall_buf, syscall_count, self.regs.rax);
             },
+            .cpuid => {
+                const result = x64_decoder.emulatedCpuid(@truncate(self.regs.rax), @truncate(self.regs.rcx));
+                self.setReg(.al_ax_eax_rax, .bits32, result.eax);
+                self.setReg(.bl_bx_ebx_rbx, .bits32, result.ebx);
+                self.setReg(.cl_cx_ecx_rcx, .bits32, result.ecx);
+                self.setReg(.dl_dx_edx_rdx, .bits32, result.edx);
+            },
+            .xgetbv => {
+                const value = if (@as(u32, @truncate(self.regs.rcx)) == 0) x64_decoder.emulatedXcr0() else 0;
+                self.setReg(.al_ax_eax_rax, .bits32, @truncate(value));
+                self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(value >> 32));
+            },
+            .add_accum_imm,
+            .or_accum_imm,
+            .adc_accum_imm,
+            .sbb_accum_imm,
+            .and_accum_imm,
+            .sub_accum_imm,
+            .xor_accum_imm,
+            .cmp_accum_imm,
+            .vmovdqu_xmm_xmm,
+            .vmovdqu_xmm_mem,
+            .vmovdqu_mem_xmm,
+            .vmovdqa_xmm_xmm,
+            .vmovdqa_xmm_mem,
+            .vmovdqa_mem_xmm,
+            .vmovups_xmm_xmm,
+            .vmovups_xmm_mem,
+            .vmovups_mem_xmm,
+            .vmovaps_xmm_xmm,
+            .vmovaps_xmm_mem,
+            .vmovaps_mem_xmm,
+            .vmovupd_xmm_xmm,
+            .vmovupd_xmm_mem,
+            .vmovupd_mem_xmm,
+            .vmovapd_xmm_xmm,
+            .vmovapd_xmm_mem,
+            .vmovapd_mem_xmm,
+            .vmovss_xmm_mem,
+            .vmovss_mem_xmm,
+            .vmovsd_xmm_mem,
+            .vmovsd_mem_xmm,
+            .vmovdqu_ymm_ymm,
+            .vmovdqu_ymm_mem,
+            .vmovdqu_mem_ymm,
+            .vmovdqa_ymm_ymm,
+            .vmovdqa_ymm_mem,
+            .vmovdqa_mem_ymm,
+            .vmovups_ymm_ymm,
+            .vmovups_ymm_mem,
+            .vmovups_mem_ymm,
+            .vmovaps_ymm_ymm,
+            .vmovaps_ymm_mem,
+            .vmovaps_mem_ymm,
+            .vmovupd_ymm_ymm,
+            .vmovupd_ymm_mem,
+            .vmovupd_mem_ymm,
+            .vmovapd_ymm_ymm,
+            .vmovapd_ymm_mem,
+            .vmovapd_mem_ymm,
+            .vzeroupper,
+            .vcvtsi2ss_xmm_reg,
+            .vcvtsi2ss_xmm_mem,
+            .vcvtsi2sd_xmm_reg,
+            .vcvtsi2sd_xmm_mem,
+            => unreachable,
         }
 
         if (!self.terminated) {
@@ -3537,10 +3654,14 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                 else
                     @as(u64, std.mem.readInt(u32, bytes[pos..][0..4], .little));
                 pos += imm_len;
+                const stored_imm = if (size == .bits64)
+                    @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(imm)))))))
+                else
+                    imm;
                 return switch (size) {
-                    .bits16 => DecodedInsn{ .op = .mov_mem16_imm16, .size = size, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
-                    .bits32 => DecodedInsn{ .op = .mov_mem32_imm32, .size = size, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
-                    .bits64 => DecodedInsn{ .op = .mov_mem64_imm32, .size = size, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
+                    .bits16 => DecodedInsn{ .op = .mov_mem16_imm16, .size = size, .addr = mem.addr, .imm = stored_imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
+                    .bits32 => DecodedInsn{ .op = .mov_mem32_imm32, .size = size, .addr = mem.addr, .imm = stored_imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
+                    .bits64 => DecodedInsn{ .op = .mov_mem64_imm32, .size = size, .addr = mem.addr, .imm = stored_imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
                     else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
                 };
             }
@@ -4374,6 +4495,13 @@ test "decode and execute shr implicit one ecx" {
     try testing.expectEqual(@as(u64, 4), state.regs.rcx);
 }
 
+test "CS218 short backward jump consumes its displacement byte" {
+    const d = decodeInsn(&[_]u8{ 0xEB, 0xDF });
+    try testing.expectEqual(Op.jmp_rel8, d.op);
+    try testing.expectEqual(@as(u8, 2), d.len);
+    try testing.expectEqual(@as(u64, @bitCast(@as(i64, -33))), d.imm);
+}
+
 test "decode and execute sarq imm rsi" {
     const d = decodeInsn(&[_]u8{ 0x48, 0xC1, 0xFE, 0x03 });
     try testing.expectEqual(Op.sar_reg_imm, d.op);
@@ -4631,6 +4759,13 @@ test "decode 0x48 0xC7 0xC3 (mov rbx, imm32)" {
     const d = decodeInsn(&bytes);
     try testing.expectEqual(Op.mov_reg_imm, d.op);
     try testing.expectEqual(RegId.bl_bx_ebx_rbx, d.dst_reg);
+}
+
+test "decode 0x48 0xC7 memory immediate sign extends to 64 bits" {
+    const d = decodeInsn(&[_]u8{ 0x48, 0xC7, 0x00, 0xFF, 0xFF, 0xFF, 0xFF });
+    try testing.expectEqual(Op.mov_mem64_imm32, d.op);
+    try testing.expectEqual(Size.bits64, d.size);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), d.imm);
 }
 
 test "decode 0x66 0x99 (cwd)" {
