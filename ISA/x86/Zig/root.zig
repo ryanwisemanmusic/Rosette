@@ -294,6 +294,11 @@ const pop_popcnt = @import("POP/POPCNT.zig");
 const push_push = @import("PUSH/PUSH.zig");
 const push_pusha = @import("PUSH/PUSHA.zig");
 const push_pushad = @import("PUSH/PUSHAD.zig");
+const restore_frstore = @import("RESTORE/frstore.zig");
+const restore_fxrstore = @import("RESTORE/fxrstore.zig");
+const restore_rstore_ssp = @import("RESTORE/rstore_ssp.zig");
+const restore_xrstore = @import("RESTORE/xrstore.zig");
+const restore_xrstors = @import("RESTORE/xrstors.zig");
 const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
@@ -1429,6 +1434,11 @@ pub const tables = [_]InstructionTable{
     entry(push_push.family, push_push.path, push_push.source),
     entry(push_pusha.family, push_pusha.path, push_pusha.source),
     entry(push_pushad.family, push_pushad.path, push_pushad.source),
+    entry(restore_frstore.family, restore_frstore.path, restore_frstore.source),
+    entry(restore_fxrstore.family, restore_fxrstore.path, restore_fxrstore.source),
+    entry(restore_rstore_ssp.family, restore_rstore_ssp.path, restore_rstore_ssp.source),
+    entry(restore_xrstore.family, restore_xrstore.path, restore_xrstore.source),
+    entry(restore_xrstors.family, restore_xrstors.path, restore_xrstors.source),
     entry(rotate_rcl.family, rotate_rcl.path, rotate_rcl.source),
     entry(rotate_rcr.family, rotate_rcr.path, rotate_rcr.source),
     entry(rotate_rol.family, rotate_rol.path, rotate_rol.source),
