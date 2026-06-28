@@ -345,6 +345,7 @@ const cache_cldemote = @import("CACHE/CLDEMOTE.zig");
 const cache_clflush = @import("CACHE/CLFLUSH.zig");
 const cache_clflushopt = @import("CACHE/CLFLUSHOPT.zig");
 const cache_clwb = @import("CACHE/clwb.zig");
+const cpu_cpuid = @import("CPU/CPUID.zig");
 const sha_sha1msg1 = @import("SHA/SHA1MSG1.zig");
 const sha_sha1msg2 = @import("SHA/SHA1MSG2.zig");
 const sha_sha1nexte = @import("SHA/SHA1NEXTE.zig");
@@ -916,6 +917,7 @@ pub const specs = blk: {
         spec(cache_clflush.meta),
         spec(cache_clflushopt.meta),
         spec(cache_clwb.meta),
+        spec(cpu_cpuid.meta),
         spec(sha_sha1msg1.meta),
         spec(sha_sha1msg2.meta),
         spec(sha_sha1nexte.meta),
@@ -1491,6 +1493,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     cache_clflush.proof_report,
     cache_clflushopt.proof_report,
     cache_clwb.proof_report,
+    cpu_cpuid.proof_report,
     sha_sha1msg1.proof_report,
     sha_sha1msg2.proof_report,
     sha_sha1nexte.proof_report,

@@ -343,6 +343,7 @@ const cache_cldemote = @import("CACHE/CLDEMOTE.zig");
 const cache_clflush = @import("CACHE/CLFLUSH.zig");
 const cache_clflushopt = @import("CACHE/CLFLUSHOPT.zig");
 const cache_clwb = @import("CACHE/clwb.zig");
+const cpu_cpuid = @import("CPU/CPUID.zig");
 const sha_sha1msg1 = @import("SHA/SHA1MSG1.zig");
 const sha_sha1msg2 = @import("SHA/SHA1MSG2.zig");
 const sha_sha1nexte = @import("SHA/SHA1NEXTE.zig");
@@ -985,6 +986,7 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(cache_clflush.family, cache_clflush.path, cache_clflush.source),
     mirror(cache_clflushopt.family, cache_clflushopt.path, cache_clflushopt.source),
     mirror(cache_clwb.family, cache_clwb.path, cache_clwb.source),
+    mirror(cpu_cpuid.family, cpu_cpuid.path, cpu_cpuid.source),
     mirror(sha_sha1msg1.family, sha_sha1msg1.path, sha_sha1msg1.source),
     mirror(sha_sha1msg2.family, sha_sha1msg2.path, sha_sha1msg2.source),
     mirror(sha_sha1nexte.family, sha_sha1nexte.path, sha_sha1nexte.source),
