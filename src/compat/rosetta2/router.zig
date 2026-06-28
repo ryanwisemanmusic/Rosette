@@ -227,6 +227,13 @@ fn fallbackAfterRosetteMachOFailure(
 ) !?u8 {
     if (exit_code == 0) return null;
     if (decision.backend != .rosette_macho) return null;
+    if (!isMachOProcessorFailureStatus(exit_code)) {
+        std.debug.print(
+            "rosette-router: authoritative guest exit from Rosette Mach-O backend: status={d}; Apple fallback suppressed\n",
+            .{exit_code},
+        );
+        return null;
+    }
     if (!allowsFallbackAfterRosetteFailure(policy)) return null;
 
     std.debug.print("rosette-router: \x1b[33mEXIT BROADCAST\x1b[0m backend={s} exit_code={d}\n", .{ @tagName(decision.backend), exit_code });
@@ -241,6 +248,10 @@ fn fallbackAfterRosetteMachOFailure(
     printPlan(allocator, class, fallback_plan, if (policy.trace_enabled) trace_path else null);
     if (shouldAbortRoute(policy, fallback_plan.decision)) abortRoute(fallback_plan.decision);
     return try runArgv(init.io, fallback_plan.argv, fallback_plan.cwd, fallback_plan.decision.backend.label());
+}
+
+fn isMachOProcessorFailureStatus(exit_code: u8) bool {
+    return exit_code == 124 or exit_code == 125 or exit_code == 127;
 }
 
 fn allowsFallbackAfterRosetteFailure(policy: Policy) bool {
@@ -910,6 +921,14 @@ test "Mach-O status 125 identifies an incomplete dynamic runtime" {
     const plan = try appleRosetta2FallbackPlan(allocator, class, &.{}, 125);
     try std.testing.expectEqual(types.FallbackReason.macho_runtime_incomplete, plan.decision.reason);
     try std.testing.expect(std.mem.indexOf(u8, plan.decision.detail, "unresolved dynamic-library calls") != null);
+}
+
+test "Mach-O guest exits are not mistaken for processor failures" {
+    try std.testing.expect(!isMachOProcessorFailureStatus(1));
+    try std.testing.expect(!isMachOProcessorFailureStatus(2));
+    try std.testing.expect(isMachOProcessorFailureStatus(124));
+    try std.testing.expect(isMachOProcessorFailureStatus(125));
+    try std.testing.expect(isMachOProcessorFailureStatus(127));
 }
 
 test "script shim passes target separator before target args" {
