@@ -1,3 +1,4 @@
+const std = @import("std");
 const cpu_state = @import("cpu_state.zig");
 const flags = @import("flags.zig");
 
@@ -78,6 +79,11 @@ pub const Op = enum(u16) {
     sub_reg16_mem16,
     sub_reg32_mem32,
     sub_reg64_mem64,
+    // sub (r/m, reg) d=0
+    sub_mem8_reg8,
+    sub_mem16_reg16,
+    sub_mem32_reg32,
+    sub_mem64_reg64,
     // sub (reg, reg) mod=3
     sub_reg8_reg8,
     sub_reg16_reg16,
@@ -102,6 +108,9 @@ pub const Op = enum(u16) {
     and_reg32_reg32,
     and_reg64_reg64,
     and_reg8_mem8,
+    and_reg16_mem16,
+    and_reg32_mem32,
+    and_reg64_mem64,
     and_mem8_reg8,
     and_mem16_reg16,
     and_mem32_reg32,
@@ -138,6 +147,13 @@ pub const Op = enum(u16) {
     xor_reg32_reg32,
     xor_reg64_reg64,
     xor_reg8_mem8,
+    xor_reg16_mem16,
+    xor_reg32_mem32,
+    xor_reg64_mem64,
+    xor_mem8_reg8,
+    xor_mem16_reg16,
+    xor_mem32_reg32,
+    xor_mem64_reg64,
     xor_reg8_imm8,
     xor_reg16_imm8,
     xor_reg32_imm8,
@@ -145,6 +161,10 @@ pub const Op = enum(u16) {
     // shifts
     shl_reg_cl,
     shl_mem_cl,
+    shr_reg_cl,
+    shr_mem_cl,
+    sar_reg_cl,
+    sar_mem_cl,
     shl_reg_imm,
     shl_mem_imm,
     shr_reg_imm,
@@ -302,10 +322,64 @@ pub const Op = enum(u16) {
     jmp_reg64,
     // syscall
     syscall,
+    cpuid,
+    xgetbv,
     call_mem64,
     call_reg64,
     hlt,
 };
+
+pub const CpuidResult = struct {
+    eax: u32 = 0,
+    ebx: u32 = 0,
+    ecx: u32 = 0,
+    edx: u32 = 0,
+};
+
+pub fn emulatedCpuid(leaf: u32, subleaf: u32) CpuidResult {
+    return switch (leaf) {
+        0 => .{
+            .eax = 7,
+            .ebx = 0x756E_6547, // "Genu"
+            .edx = 0x4965_6E69, // "ineI"
+            .ecx = 0x6C65_746E, // "ntel"
+        },
+        1 => .{
+            .eax = 0x0003_06C3,
+            .ebx = 0x0008_0000,
+            .ecx = (@as(u32, 1) << 0) | (@as(u32, 1) << 1) | (@as(u32, 1) << 9) |
+                (@as(u32, 1) << 13) | (@as(u32, 1) << 19) | (@as(u32, 1) << 20) |
+                (@as(u32, 1) << 22) | (@as(u32, 1) << 23) | (@as(u32, 1) << 25) |
+                (@as(u32, 1) << 26) | (@as(u32, 1) << 27) | (@as(u32, 1) << 28),
+            .edx = (@as(u32, 1) << 0) | (@as(u32, 1) << 4) | (@as(u32, 1) << 5) |
+                (@as(u32, 1) << 8) | (@as(u32, 1) << 11) | (@as(u32, 1) << 15) |
+                (@as(u32, 1) << 19) | (@as(u32, 1) << 23) | (@as(u32, 1) << 24) |
+                (@as(u32, 1) << 25) | (@as(u32, 1) << 26),
+        },
+        7 => if (subleaf == 0) .{ .eax = 0 } else .{},
+        0x8000_0000 => .{ .eax = 0x8000_0008 },
+        0x8000_0002 => .{ .eax = 0x6573_6F52, .ebx = 0x2065_7474, .ecx = 0x7472_6956, .edx = 0x206C_6175 },
+        0x8000_0003 => .{ .eax = 0x2D36_3878, .ebx = 0x4320_3436, .ecx = 0x2020_5550, .edx = 0x2020_2020 },
+        0x8000_0004 => .{},
+        0x8000_0008 => .{ .eax = 0x0000_3030 },
+        else => .{},
+    };
+}
+
+pub fn emulatedXcr0() u64 {
+    return 0x7; // x87, XMM, and YMM state enabled.
+}
+
+test "emulated CPUID exposes a coherent AVX baseline" {
+    const leaf0 = emulatedCpuid(0, 0);
+    try std.testing.expectEqual(@as(u32, 7), leaf0.eax);
+    try std.testing.expectEqual(@as(u32, 0x756E_6547), leaf0.ebx);
+
+    const leaf1 = emulatedCpuid(1, 0);
+    try std.testing.expect(leaf1.ecx & (@as(u32, 1) << 27) != 0);
+    try std.testing.expect(leaf1.ecx & (@as(u32, 1) << 28) != 0);
+    try std.testing.expectEqual(@as(u64, 0x7), emulatedXcr0());
+}
 
 pub const DecodedInsn = struct {
     op: Op = .invalid,
