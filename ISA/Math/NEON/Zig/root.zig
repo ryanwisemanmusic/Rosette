@@ -218,6 +218,57 @@ const convert_cdqe = @import("CONVERT/CDQE.zig");
 const convert_cwd = @import("CONVERT/CWD.zig");
 const convert_cdq = @import("CONVERT/CDQ.zig");
 const convert_cqo = @import("CONVERT/CQO.zig");
+const convert_cvtdq2pd = @import("CONVERT/CVTDQ2PD.zig");
+const convert_cvtdq2ps = @import("CONVERT/CVTDQ2PS.zig");
+const convert_cvtpd2dq = @import("CONVERT/CVTPD2DQ.zig");
+const convert_cvtpd2pi = @import("CONVERT/CVTPD2PI.zig");
+const convert_cvtpd2ps = @import("CONVERT/CVTPD2PS.zig");
+const convert_cvtpi2pd = @import("CONVERT/CVTPI2PD.zig");
+const convert_cvtpi2ps = @import("CONVERT/CVTPI2PS.zig");
+const convert_cvtps2dq = @import("CONVERT/CVTPS2DQ.zig");
+const convert_cvtps2pd = @import("CONVERT/CVTPS2PD.zig");
+const convert_cvtps2pi = @import("CONVERT/CVTPS2PI.zig");
+const convert_cvtsd2si = @import("CONVERT/CVTSD2SI.zig");
+const convert_cvtsd2ss = @import("CONVERT/CVTSD2SS.zig");
+const convert_cvtsi2sd = @import("CONVERT/CVTSI2SD.zig");
+const convert_cvtsi2ss = @import("CONVERT/CVTSI2SS.zig");
+const convert_cvtss2sd = @import("CONVERT/CVTSS2SD.zig");
+const convert_cvtss2si = @import("CONVERT/CVTSS2SI.zig");
+const convert_cvttpd2dq = @import("CONVERT/CVTTPD2DQ.zig");
+const convert_cvttpd2pi = @import("CONVERT/CVTTPD2PI.zig");
+const convert_cvttps2dq = @import("CONVERT/CVTTPS2DQ.zig");
+const convert_cvttps2pi = @import("CONVERT/CVTTPS2PI.zig");
+const convert_cvttsd2si = @import("CONVERT/CVTTSD2SI.zig");
+const convert_cvttss2si = @import("CONVERT/CVTTSS2SI.zig");
+const convert_vcvtne2ps2bf16 = @import("CONVERT/VCVTNE2PS2BF16.zig");
+const convert_vcvtneps2bf16 = @import("CONVERT/VCVTNEPS2BF16.zig");
+const convert_vcvtpd2ph = @import("CONVERT/VCVTPD2PH.zig");
+const convert_vcvtpd2qq = @import("CONVERT/VCVTPD2QQ.zig");
+const convert_vcvtpd2udq = @import("CONVERT/VCVTPD2UDQ.zig");
+const convert_vcvtpd2uqq = @import("CONVERT/VCVTPD2UQQ.zig");
+const convert_vcvtph2dq = @import("CONVERT/VCVTPH2DQ.zig");
+const convert_vcvtph2pd = @import("CONVERT/VCVTPH2PD.zig");
+const convert_vcvtph2ps = @import("CONVERT/VCVTPH2PS.zig");
+const convert_vcvtph2psx = @import("CONVERT/VCVTPH2PSX.zig");
+const convert_vcvtph2qq = @import("CONVERT/VCVTPH2QQ.zig");
+const convert_vcvtph2udq = @import("CONVERT/VCVTPH2UDQ.zig");
+const convert_vcvtph2uqq = @import("CONVERT/VCVTPH2UQQ.zig");
+const convert_vcvtph2uw = @import("CONVERT/VCVTPH2UW.zig");
+const convert_vcvtph2w = @import("CONVERT/VCVTPH2W.zig");
+const convert_vcvtps2ph = @import("CONVERT/VCVTPS2PH.zig");
+const convert_vcvtps2phx = @import("CONVERT/VCVTPS2PHX.zig");
+const convert_vcvtps2qq = @import("CONVERT/VCVTPS2QQ.zig");
+const convert_vcvtps2udq = @import("CONVERT/VCVTPS2UDQ.zig");
+const convert_vcvtps2uqq = @import("CONVERT/VCVTPS2UQQ.zig");
+const convert_vcvtqq2pd = @import("CONVERT/VCVTQQ2PD.zig");
+const convert_vcvtqq2ph = @import("CONVERT/VCVTQQ2PH.zig");
+const convert_vcvtqq2ps = @import("CONVERT/VCVTQQ2PS.zig");
+const convert_vcvtsd2sh = @import("CONVERT/VCVTSD2SH.zig");
+const convert_vcvtsd2usi = @import("CONVERT/VCVTSD2USI.zig");
+const convert_vcvtsh2sd = @import("CONVERT/VCVTSH2SD.zig");
+const convert_vcvtsh2si = @import("CONVERT/VCVTSH2SI.zig");
+const convert_vcvtsh2ss = @import("CONVERT/VCVTSH2SS.zig");
+const convert_vcvtsh2usi = @import("CONVERT/VCVTSH2USI.zig");
 const halt_hlt = @import("HALT/HLT.zig");
 const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
@@ -809,6 +860,57 @@ pub const specs = blk: {
         spec(convert_cwd.meta),
         spec(convert_cdq.meta),
         spec(convert_cqo.meta),
+        spec(convert_cvtdq2pd.meta),
+        spec(convert_cvtdq2ps.meta),
+        spec(convert_cvtpd2dq.meta),
+        spec(convert_cvtpd2pi.meta),
+        spec(convert_cvtpd2ps.meta),
+        spec(convert_cvtpi2pd.meta),
+        spec(convert_cvtpi2ps.meta),
+        spec(convert_cvtps2dq.meta),
+        spec(convert_cvtps2pd.meta),
+        spec(convert_cvtps2pi.meta),
+        spec(convert_cvtsd2si.meta),
+        spec(convert_cvtsd2ss.meta),
+        spec(convert_cvtsi2sd.meta),
+        spec(convert_cvtsi2ss.meta),
+        spec(convert_cvtss2sd.meta),
+        spec(convert_cvtss2si.meta),
+        spec(convert_cvttpd2dq.meta),
+        spec(convert_cvttpd2pi.meta),
+        spec(convert_cvttps2dq.meta),
+        spec(convert_cvttps2pi.meta),
+        spec(convert_cvttsd2si.meta),
+        spec(convert_cvttss2si.meta),
+        spec(convert_vcvtne2ps2bf16.meta),
+        spec(convert_vcvtneps2bf16.meta),
+        spec(convert_vcvtpd2ph.meta),
+        spec(convert_vcvtpd2qq.meta),
+        spec(convert_vcvtpd2udq.meta),
+        spec(convert_vcvtpd2uqq.meta),
+        spec(convert_vcvtph2dq.meta),
+        spec(convert_vcvtph2pd.meta),
+        spec(convert_vcvtph2ps.meta),
+        spec(convert_vcvtph2psx.meta),
+        spec(convert_vcvtph2qq.meta),
+        spec(convert_vcvtph2udq.meta),
+        spec(convert_vcvtph2uqq.meta),
+        spec(convert_vcvtph2uw.meta),
+        spec(convert_vcvtph2w.meta),
+        spec(convert_vcvtps2ph.meta),
+        spec(convert_vcvtps2phx.meta),
+        spec(convert_vcvtps2qq.meta),
+        spec(convert_vcvtps2udq.meta),
+        spec(convert_vcvtps2uqq.meta),
+        spec(convert_vcvtqq2pd.meta),
+        spec(convert_vcvtqq2ph.meta),
+        spec(convert_vcvtqq2ps.meta),
+        spec(convert_vcvtsd2sh.meta),
+        spec(convert_vcvtsd2usi.meta),
+        spec(convert_vcvtsh2sd.meta),
+        spec(convert_vcvtsh2si.meta),
+        spec(convert_vcvtsh2ss.meta),
+        spec(convert_vcvtsh2usi.meta),
         spec(halt_hlt.meta),
         spec(loop_loop.meta),
         spec(loop_loope.meta),
@@ -1412,6 +1514,57 @@ pub const proof_reports = [_]proofs.ProofReport{
     convert_cwd.proof_report,
     convert_cdq.proof_report,
     convert_cqo.proof_report,
+    convert_cvtdq2pd.proof_report,
+    convert_cvtdq2ps.proof_report,
+    convert_cvtpd2dq.proof_report,
+    convert_cvtpd2pi.proof_report,
+    convert_cvtpd2ps.proof_report,
+    convert_cvtpi2pd.proof_report,
+    convert_cvtpi2ps.proof_report,
+    convert_cvtps2dq.proof_report,
+    convert_cvtps2pd.proof_report,
+    convert_cvtps2pi.proof_report,
+    convert_cvtsd2si.proof_report,
+    convert_cvtsd2ss.proof_report,
+    convert_cvtsi2sd.proof_report,
+    convert_cvtsi2ss.proof_report,
+    convert_cvtss2sd.proof_report,
+    convert_cvtss2si.proof_report,
+    convert_cvttpd2dq.proof_report,
+    convert_cvttpd2pi.proof_report,
+    convert_cvttps2dq.proof_report,
+    convert_cvttps2pi.proof_report,
+    convert_cvttsd2si.proof_report,
+    convert_cvttss2si.proof_report,
+    convert_vcvtne2ps2bf16.proof_report,
+    convert_vcvtneps2bf16.proof_report,
+    convert_vcvtpd2ph.proof_report,
+    convert_vcvtpd2qq.proof_report,
+    convert_vcvtpd2udq.proof_report,
+    convert_vcvtpd2uqq.proof_report,
+    convert_vcvtph2dq.proof_report,
+    convert_vcvtph2pd.proof_report,
+    convert_vcvtph2ps.proof_report,
+    convert_vcvtph2psx.proof_report,
+    convert_vcvtph2qq.proof_report,
+    convert_vcvtph2udq.proof_report,
+    convert_vcvtph2uqq.proof_report,
+    convert_vcvtph2uw.proof_report,
+    convert_vcvtph2w.proof_report,
+    convert_vcvtps2ph.proof_report,
+    convert_vcvtps2phx.proof_report,
+    convert_vcvtps2qq.proof_report,
+    convert_vcvtps2udq.proof_report,
+    convert_vcvtps2uqq.proof_report,
+    convert_vcvtqq2pd.proof_report,
+    convert_vcvtqq2ph.proof_report,
+    convert_vcvtqq2ps.proof_report,
+    convert_vcvtsd2sh.proof_report,
+    convert_vcvtsd2usi.proof_report,
+    convert_vcvtsh2sd.proof_report,
+    convert_vcvtsh2si.proof_report,
+    convert_vcvtsh2ss.proof_report,
+    convert_vcvtsh2usi.proof_report,
     halt_hlt.proof_report,
     loop_loop.proof_report,
     loop_loope.proof_report,
