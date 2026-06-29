@@ -195,6 +195,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const contract_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/Contract/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     runtime_abi_module.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     runtime_abi_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
 
@@ -331,6 +337,7 @@ pub fn build(b: *std.Build) void {
     macho_processor_mod.addImport("x64_interpreter", x64_interpreter_module);
     macho_processor_mod.addImport("macho_runtime", macho_runtime_module);
     macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+    macho_processor_mod.addImport("contract", contract_module);
     b.installArtifact(macho_processor);
 
     // Add WinForms native Cocoa bridge to the exe runner module
