@@ -88,6 +88,10 @@ const BoundImportThunk = struct {
     dylib: []const u8,
 };
 
+const InternalCompatibilityTargets = struct {
+    cxxopts_split_option_names: u64 = 0,
+};
+
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
     mem: []u8,
@@ -112,6 +116,12 @@ pub const MachOState = struct {
     next_guest_fd: u64 = 3,
     monotonic_nanoseconds: u64 = 1_000_000_000,
     ios_xalloc_next: u64 = 4,
+    verbose_trace: bool = false,
+    max_steps: u64 = 100_000_000,
+    guest_assertion_count: u64 = 0,
+    cxxopts_split_accelerations: u64 = 0,
+    internal_targets: InternalCompatibilityTargets = .{},
+    guest_errno_address: u64 = 0,
     trace_entries: [TRACE_BUFFER_LEN]TraceEntry = [_]TraceEntry{TraceEntry{}} ** TRACE_BUFFER_LEN,
     trace_index: usize = 0,
     trace_filled: bool = false,
@@ -203,6 +213,9 @@ pub const MachOState = struct {
         result.guest_files[0] = .{ .active = true, .fd = 0, .kind = .regular };
         result.guest_files[1] = .{ .active = true, .fd = 1, .kind = .stdout };
         result.guest_files[2] = .{ .active = true, .fd = 2, .kind = .stderr };
+        result.internal_targets.cxxopts_split_option_names = result.metadata.symbolAddressWithPrefix(
+            "__ZN7cxxopts6values11parser_tool18split_option_names",
+        ) orelse 0;
         result.applyDyldBindings() catch |err| {
             log.warn("dyld data binding setup failed: {s}", .{@errorName(err)});
         };
@@ -230,12 +243,25 @@ pub const MachOState = struct {
         errdefer thunks.deinit(self.allocator);
 
         var applied: usize = 0;
+        var stack_guard_address: u64 = 0;
         for (self.metadata.bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, "___stack_chk_guard")) {
+                if (stack_guard_address == 0) {
+                    stack_guard_address = self.guestAlloc(@sizeOf(u64), @alignOf(u64)) orelse continue;
+                    self.write64(stack_guard_address, 0x9E37_79B9_7F4A_7C15);
+                }
+                if (self.guestMemory(binding.address, @sizeOf(u64)) == null) continue;
+                self.write64(binding.address, stack_guard_address);
+                applied += 1;
+                continue;
+            }
             const section = self.metadata.sectionAtAddress(binding.address) orelse continue;
             if (!isCallableConstantBinding(section, binding.name, stubs.contains(binding.name))) continue;
             const destination = self.guestMemory(binding.address, @sizeOf(u64)) orelse continue;
+            const existing = std.mem.readInt(u64, destination[0..8], .little);
+            if (std.mem.eql(u8, binding.dylib, "weak-lookup") and existing != 0) continue;
             var target = stubs.get(binding.name) orelse blk: {
-                if (thunk_addresses.get(binding.name)) |existing| break :blk existing;
+                if (thunk_addresses.get(binding.name)) |existing_thunk| break :blk existing_thunk;
                 const thunk_address = BOUND_IMPORT_THUNK_BASE + @as(u64, @intCast(thunks.items.len)) * BOUND_IMPORT_THUNK_STRIDE;
                 try thunks.append(self.allocator, .{
                     .address = thunk_address,
@@ -478,6 +504,7 @@ pub const MachOState = struct {
     }
 
     fn logControlFlow(self: *const MachOState, kind: []const u8, from_rip: u64, to_rip: u64, decoded_len: u64, return_addr: ?u64) void {
+        if (!self.verbose_trace) return;
         if (return_addr) |ret_addr| {
             log.info("cf({s}): rip=0x{x} -> 0x{x} len={d} ret=0x{x} rsp=0x{x}", .{ kind, from_rip, to_rip, decoded_len, ret_addr, self.regs.rsp });
         } else {
@@ -562,7 +589,7 @@ pub const MachOState = struct {
         if (self.isStubPushJmpEntry(self.regs.rip)) |stub| {
             self.pending_stub_slot = stub.slot;
             self.pending_stub_entry_rip = self.regs.rip;
-            log.info("stub-entry: rip=0x{x} slot=0x{x} shared_helper=0x{x}", .{ self.regs.rip, stub.slot, stub.target });
+            if (self.verbose_trace) log.info("stub-entry: rip=0x{x} slot=0x{x} shared_helper=0x{x}", .{ self.regs.rip, stub.slot, stub.target });
             self.regs.rip = stub.target;
             return true;
         }
@@ -574,23 +601,24 @@ pub const MachOState = struct {
             if (self.findSharedHelperCluster(self.regs.rip)) |cluster| {
                 self.helper_cluster_start = cluster.start;
                 self.helper_cluster_end = cluster.end;
-                log.info("stub-helper cluster: helper_rip=0x{x} cluster=[0x{x}, 0x{x})", .{ self.regs.rip, cluster.start, cluster.end });
+                if (self.verbose_trace) log.info("stub-helper cluster: helper_rip=0x{x} cluster=[0x{x}, 0x{x})", .{ self.regs.rip, cluster.start, cluster.end });
             }
             self.pending_stub_slot = null;
             self.pending_stub_entry_rip = null;
-            self.regs.rax = 0;
             if (self.pending_import_stub_rip) |import_stub_rip| {
                 if (self.metadata.importAtStub(import_stub_rip)) |imported| {
                     switch (self.handleImport(imported.name)) {
                         .handled => |result| {
                             self.regs.rax = result;
-                            std.debug.print("  [handled import] {s} from {s}; stub=0x{x} return=0x{x} → rax=0x{x}\n", .{
-                                imported.name,
-                                imported.dylib,
-                                imported.stub_address,
-                                synthetic_return,
-                                result,
-                            });
+                            if (self.verbose_trace) {
+                                std.debug.print("  [handled import] {s} from {s}; stub=0x{x} return=0x{x} → rax=0x{x}\n", .{
+                                    imported.name,
+                                    imported.dylib,
+                                    imported.stub_address,
+                                    synthetic_return,
+                                    result,
+                                });
+                            }
                         },
                         .unsupported => |result| {
                             self.regs.rax = result;
@@ -622,7 +650,7 @@ pub const MachOState = struct {
             self.pending_import_stub_rip = null;
             if (self.terminated) return true;
             if (synthetic_return != 0 and self.addrToOffset(synthetic_return) != null) {
-                log.warn("stub-helper aggressive fallback: helper_rip=0x{x} slot=0x{x} entry_rip=0x{x} synthetic_return=0x{x}; simulating resolved helper return", .{ self.regs.rip, slot, entry_rip, synthetic_return });
+                if (self.verbose_trace) log.warn("stub-helper aggressive fallback: helper_rip=0x{x} slot=0x{x} entry_rip=0x{x} synthetic_return=0x{x}; simulating resolved helper return", .{ self.regs.rip, slot, entry_rip, synthetic_return });
                 _ = self.pop();
                 self.regs.rip = synthetic_return;
             } else {
@@ -684,6 +712,32 @@ pub const MachOState = struct {
             if (self.regs.rsi != 0) self.write64(self.regs.rsi, 1);
             return .{ .handled = 0 };
         }
+        if (std.mem.eql(u8, name, "_pthread_attr_init")) {
+            if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
+            return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "_pthread_attr_setstacksize") or
+            std.mem.eql(u8, name, "_pthread_attr_destroy"))
+        {
+            return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "_objc_autoreleasePoolPush")) {
+            return .{ .handled = self.compat.currentThreadHandle() };
+        }
+        if (std.mem.eql(u8, name, "_objc_autoreleasePoolPop")) {
+            return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "___assert_rtn")) {
+            self.guest_assertion_count += 1;
+            const function_name = self.guestCString(self.regs.rdi, 1024) orelse "<unknown>";
+            const file_name = self.guestCString(self.regs.rsi, 4096) orelse "<unknown>";
+            const expression = self.guestCString(self.regs.rcx, 4096) orelse "<unknown>";
+            std.debug.print(
+                "macho-processor: guest assertion #{d}: {s}:{d} {s}: {s}\n",
+                .{ self.guest_assertion_count, file_name, self.regs.rdx, function_name, expression },
+            );
+            return .{ .handled = 0 };
+        }
 
         if (std.mem.eql(u8, name, "_strcmp")) {
             const lhs = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .unsupported = 0 };
@@ -718,10 +772,43 @@ pub const MachOState = struct {
             destination[source.len] = 0;
             return .{ .handled = self.regs.rdi };
         }
+        if (std.mem.eql(u8, name, "_getenv")) {
+            const key = self.guestCString(self.regs.rdi, 256) orelse return .{ .handled = 0 };
+            const raw = if (std.mem.eql(u8, key, "HOME"))
+                std.c.getenv("HOME")
+            else if (std.mem.eql(u8, key, "XDG_DATA_HOME"))
+                std.c.getenv("XDG_DATA_HOME")
+            else if (std.mem.eql(u8, key, "TMPDIR"))
+                std.c.getenv("TMPDIR")
+            else if (std.mem.eql(u8, key, "USER"))
+                std.c.getenv("USER")
+            else if (std.mem.eql(u8, key, "PATH"))
+                std.c.getenv("PATH")
+            else
+                null;
+            const host_value = raw orelse return .{ .handled = 0 };
+            const value = std.mem.sliceTo(host_value, 0);
+            const allocation = self.guestAlloc(value.len + 1, 1) orelse return .{ .handled = 0 };
+            if (!self.guestWriteCString(allocation, value)) return .{ .handled = 0 };
+            return .{ .handled = allocation };
+        }
+        if (std.mem.eql(u8, name, "_getuid")) {
+            return .{ .handled = 501 };
+        }
+        if (std.mem.eql(u8, name, "_getpwuid_r")) {
+            if (self.regs.r8 != 0) self.write64(self.regs.r8, 0);
+            return .{ .handled = 2 };
+        }
+        if (std.mem.eql(u8, name, "___error")) {
+            if (self.guest_errno_address == 0) {
+                self.guest_errno_address = self.guestAlloc(@sizeOf(c_int), @alignOf(c_int)) orelse return .{ .unsupported = 0 };
+            }
+            return .{ .handled = self.guest_errno_address };
+        }
 
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm") != null) {
             const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
-            std.debug.print(
+            if (self.verbose_trace) std.debug.print(
                 "    [libc++] basic_string::__init(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, ok },
             );
@@ -730,7 +817,7 @@ pub const MachOState = struct {
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc") != null) {
             const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
             const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
-            std.debug.print(
+            if (self.verbose_trace) std.debug.print(
                 "    [libc++] basic_string::assign(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
                 .{ self.regs.rdi, self.regs.rsi, source.len, ok },
             );
@@ -749,6 +836,20 @@ pub const MachOState = struct {
             const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
             const ok = compat_runtime.appendLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
             return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm") != null) {
+            const inserted_size = self.read64(self.regs.rsp + 8);
+            const ok = compat_runtime.growLibcppString(
+                self,
+                self.regs.rdi,
+                self.regs.rsi,
+                self.regs.rdx,
+                self.regs.rcx,
+                self.regs.r8,
+                self.regs.r9,
+                inserted_size,
+            );
+            return if (ok) .{ .handled = 0 } else .{ .unsupported = 0 };
         }
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_") != null or
             std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_") != null)
@@ -771,6 +872,14 @@ pub const MachOState = struct {
             const ok = compat_runtime.destroyLibcppString(self, self.regs.rdi);
             return if (ok) .{ .handled = 0 } else .{ .unsupported = 0 };
         }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm") != null) {
+            const string = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
+            const bytes = self.guestMemoryConst(string.address, string.length) orelse return .{ .unsupported = 0 };
+            const start: usize = @intCast(@min(self.regs.rdx, string.length));
+            const needle: u8 = @truncate(self.regs.rsi);
+            const found = std.mem.indexOfScalarPos(u8, bytes, start, needle) orelse return .{ .handled = std.math.maxInt(u64) };
+            return .{ .handled = found };
+        }
 
         if (std.mem.eql(u8, name, "___cxa_guard_acquire")) {
             const result = compat_runtime.cxaGuardAcquire(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
@@ -784,7 +893,7 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "___cxa_atexit")) {
             const registered = self.compat.registerAtexit(self.regs.rdi, self.regs.rsi, self.regs.rdx);
-            std.debug.print(
+            if (self.verbose_trace) std.debug.print(
                 "    [c++] __cxa_atexit(function=0x{x}, argument=0x{x}, dso=0x{x}) -> {}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, registered },
             );
@@ -800,6 +909,10 @@ pub const MachOState = struct {
             const slot = self.ios_xalloc_next;
             self.ios_xalloc_next +%= 1;
             return .{ .handled = slot };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__16chrono12system_clock3nowEv")) {
+            const epoch_nanoseconds: u64 = 1_719_000_000 * 1_000_000_000;
+            return .{ .handled = epoch_nanoseconds + self.monotonic_nanoseconds };
         }
         if (std.mem.indexOf(u8, name, "recursive_mutexC1Ev") != null or
             std.mem.indexOf(u8, name, "recursive_mutexC2Ev") != null)
@@ -817,6 +930,21 @@ pub const MachOState = struct {
         if (std.mem.indexOf(u8, name, "recursive_mutex8try_lockEv") != null) {
             return .{ .handled = 1 };
         }
+        if (std.mem.eql(u8, name, "__ZNSt3__15mutex4lockEv") or
+            std.mem.eql(u8, name, "__ZNSt3__15mutex6unlockEv") or
+            std.mem.eql(u8, name, "__ZNSt3__15mutexD1Ev") or
+            std.mem.eql(u8, name, "__ZNSt3__15mutexD2Ev"))
+        {
+            return .{ .handled = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "condition_variable10notify_") != null or
+            std.mem.indexOf(u8, name, "condition_variable4wait") != null or
+            std.mem.indexOf(u8, name, "condition_variable15__do_timed_wait") != null or
+            std.mem.indexOf(u8, name, "condition_variableD1Ev") != null or
+            std.mem.indexOf(u8, name, "condition_variableD2Ev") != null)
+        {
+            return .{ .handled = 0 };
+        }
         if (std.mem.indexOf(u8, name, "__thread_structC1Ev") != null or
             std.mem.indexOf(u8, name, "__thread_structC2Ev") != null)
         {
@@ -827,6 +955,43 @@ pub const MachOState = struct {
             std.mem.indexOf(u8, name, "__ZNSt3__16threadD2Ev") != null)
         {
             return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path16__root_directoryEv")) {
+            const path = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
+            const bytes = self.guestMemoryConst(path.address, path.length) orelse return .{ .unsupported = 0 };
+            self.regs.rdx = @intFromBool(bytes.len != 0 and bytes[0] == '/');
+            return .{ .handled = path.address };
+        }
+        if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path10__filenameEv")) {
+            const path = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
+            const bytes = self.guestMemoryConst(path.address, path.length) orelse return .{ .unsupported = 0 };
+            const start = if (std.mem.lastIndexOfScalar(u8, bytes, '/')) |separator| separator + 1 else 0;
+            self.regs.rdx = bytes.len - start;
+            return .{ .handled = path.address + start };
+        }
+        if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path13__parent_pathEv")) {
+            const path = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
+            const bytes = self.guestMemoryConst(path.address, path.length) orelse return .{ .unsupported = 0 };
+            var end = bytes.len;
+            while (end > 1 and bytes[end - 1] == '/') end -= 1;
+            const parent_length = if (std.mem.lastIndexOfScalar(u8, bytes[0..end], '/')) |separator|
+                if (separator == 0) @as(usize, 1) else separator
+            else
+                0;
+            self.regs.rdx = parent_length;
+            return .{ .handled = path.address };
+        }
+
+        if (std.mem.eql(u8, name, "___dynamic_cast")) {
+            const return_address = self.read64(self.regs.rsp);
+            if (self.metadata.nearestSymbol(return_address)) |caller| {
+                if (std.mem.indexOf(u8, caller.name, "cxxopts") != null and
+                    std.mem.indexOf(u8, caller.name, "OptionValue2as") != null)
+                {
+                    return .{ .handled = self.regs.rdi };
+                }
+            }
+            return .{ .unsupported = 0 };
         }
 
         if (std.mem.eql(u8, name, "__ZNSt3__16localeC1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeC2Ev")) {
@@ -929,6 +1094,9 @@ pub const MachOState = struct {
         {
             return .{ .handled = 0 };
         }
+        if (std.mem.eql(u8, name, "____chkstk_darwin")) {
+            return .{ .handled = self.regs.rax };
+        }
 
         if (std.mem.endsWith(u8, name, "_memset")) {
             const dst = self.regs.rdi;
@@ -936,7 +1104,7 @@ pub const MachOState = struct {
             const count = self.regs.rdx;
             if (self.guestMemory(dst, count)) |buf| {
                 @memset(buf, value);
-                std.debug.print("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
+                if (self.verbose_trace) std.debug.print("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
             }
             return .{ .handled = dst };
         }
@@ -1013,6 +1181,28 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "_close")) {
             return .{ .handled = self.handleClose() };
+        }
+        if (std.mem.eql(u8, name, "_fstatat$INODE64") or std.mem.eql(u8, name, "_fstatat")) {
+            return .{ .handled = self.handleFstatat() };
+        }
+        if (std.mem.eql(u8, name, "_openat")) {
+            return .{ .handled = self.handleOpenat() };
+        }
+        if (std.mem.eql(u8, name, "_fstat$INODE64") or std.mem.eql(u8, name, "_fstat")) {
+            return .{ .handled = self.handleFstat() };
+        }
+        if (std.mem.eql(u8, name, "_opendir$INODE64") or std.mem.eql(u8, name, "_opendir")) {
+            return .{ .handled = self.handleOpendir() orelse 0 };
+        }
+        if (std.mem.eql(u8, name, "_dirfd")) {
+            const directory = self.guestFileFromHandle(self.regs.rdi) orelse return .{ .handled = @bitCast(@as(i64, -1)) };
+            return .{ .handled = if (directory.fd < 0) @bitCast(@as(i64, -1)) else @intCast(directory.fd) };
+        }
+        if (std.mem.eql(u8, name, "_closedir")) {
+            return .{ .handled = self.handleClosedir() };
+        }
+        if (std.mem.eql(u8, name, "_readdir$INODE64") or std.mem.eql(u8, name, "_readdir")) {
+            return .{ .handled = 0 };
         }
         if (std.mem.eql(u8, name, "_pthread_create")) {
             if (self.guestMemory(self.regs.rdi, @sizeOf(u64)) == null) return .{ .unsupported = 14 };
@@ -1095,10 +1285,12 @@ pub const MachOState = struct {
         switch (self.handleImport(imported.name)) {
             .handled => |result| {
                 self.regs.rax = result;
-                std.debug.print(
-                    "  [handled direct import] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
-                    .{ imported.name, imported.dylib, imported.stub_address, return_address, result },
-                );
+                if (self.verbose_trace) {
+                    std.debug.print(
+                        "  [handled direct import] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
+                        .{ imported.name, imported.dylib, imported.stub_address, return_address, result },
+                    );
+                }
             },
             .unsupported => |result| {
                 self.regs.rax = result;
@@ -1166,16 +1358,116 @@ pub const MachOState = struct {
             @as(c_int, @intCast(self.regs.rdx & 0xFFFF)),
         );
         if (host_fd < 0) return @bitCast(@as(i64, -1));
+        return self.registerGuestFd(host_fd) orelse @bitCast(@as(i64, -1));
+    }
 
+    fn registerGuestFd(self: *MachOState, host_fd: c_int) ?u64 {
         var guest_fd: usize = @intCast(@max(self.next_guest_fd, 3));
         while (guest_fd < self.guest_fds.len and self.guest_fds[guest_fd] >= 0) : (guest_fd += 1) {}
         if (guest_fd >= self.guest_fds.len) {
             _ = std.c.close(host_fd);
-            return @bitCast(@as(i64, -1));
+            return null;
         }
         self.guest_fds[guest_fd] = host_fd;
         self.next_guest_fd = guest_fd + 1;
         return guest_fd;
+    }
+
+    fn setGuestErrno(self: *MachOState, value: c_int) void {
+        if (self.guest_errno_address == 0) {
+            self.guest_errno_address = self.guestAlloc(@sizeOf(c_int), @alignOf(c_int)) orelse return;
+        }
+        const storage = self.guestMemory(self.guest_errno_address, @sizeOf(c_int)) orelse return;
+        std.mem.writeInt(c_int, storage[0..@sizeOf(c_int)], value, .little);
+    }
+
+    fn hostFd(self: *MachOState, guest_or_host_fd: u64) ?c_int {
+        if (guest_or_host_fd < self.guest_fds.len) {
+            const guest_fd: usize = @intCast(guest_or_host_fd);
+            if (self.guest_fds[guest_fd] >= 0) return self.guest_fds[guest_fd];
+        }
+        if (guest_or_host_fd > std.math.maxInt(c_int)) return null;
+        return @intCast(guest_or_host_fd);
+    }
+
+    fn handleFstatat(self: *MachOState) u64 {
+        const directory_fd = self.hostFd(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        const path = self.guestCString(self.regs.rsi, 4096) orelse return @bitCast(@as(i64, -1));
+        var path_buffer = std.ArrayList(u8).empty;
+        defer path_buffer.deinit(self.allocator);
+        path_buffer.appendSlice(self.allocator, path) catch return @bitCast(@as(i64, -1));
+        path_buffer.append(self.allocator, 0) catch return @bitCast(@as(i64, -1));
+        var host_stat: std.c.Stat = undefined;
+        const result = std.c.fstatat(
+            directory_fd,
+            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
+            &host_stat,
+            @truncate(self.regs.rcx),
+        );
+        if (result != 0) {
+            self.setGuestErrno(2);
+            return @bitCast(@as(i64, -1));
+        }
+        const destination = self.guestMemory(self.regs.rdx, @sizeOf(std.c.Stat)) orelse return @bitCast(@as(i64, -1));
+        @memcpy(destination, std.mem.asBytes(&host_stat));
+        return 0;
+    }
+
+    fn handleOpenat(self: *MachOState) u64 {
+        const directory_fd = self.hostFd(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        const path = self.guestCString(self.regs.rsi, 4096) orelse return @bitCast(@as(i64, -1));
+        var path_buffer = std.ArrayList(u8).empty;
+        defer path_buffer.deinit(self.allocator);
+        path_buffer.appendSlice(self.allocator, path) catch return @bitCast(@as(i64, -1));
+        path_buffer.append(self.allocator, 0) catch return @bitCast(@as(i64, -1));
+        const host_fd = std.c.openat(
+            directory_fd,
+            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
+            @bitCast(@as(u32, @truncate(self.regs.rdx))),
+            @as(c_int, @intCast(self.regs.rcx & 0xFFFF)),
+        );
+        if (host_fd < 0) {
+            self.setGuestErrno(2);
+            return @bitCast(@as(i64, -1));
+        }
+        return self.registerGuestFd(host_fd) orelse @bitCast(@as(i64, -1));
+    }
+
+    fn handleFstat(self: *MachOState) u64 {
+        const host_fd = self.hostFd(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        var host_stat: std.c.Stat = undefined;
+        if (std.c.fstat(host_fd, &host_stat) != 0) {
+            self.setGuestErrno(2);
+            return @bitCast(@as(i64, -1));
+        }
+        const destination = self.guestMemory(self.regs.rsi, @sizeOf(std.c.Stat)) orelse return @bitCast(@as(i64, -1));
+        @memcpy(destination, std.mem.asBytes(&host_stat));
+        return 0;
+    }
+
+    fn handleOpendir(self: *MachOState) ?u64 {
+        const path = self.guestCString(self.regs.rdi, 4096) orelse return null;
+        var path_buffer = std.ArrayList(u8).empty;
+        defer path_buffer.deinit(self.allocator);
+        path_buffer.appendSlice(self.allocator, path) catch return null;
+        path_buffer.append(self.allocator, 0) catch return null;
+        const host_fd = std.c.open(
+            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
+            std.c.O{ .DIRECTORY = true },
+            @as(c_int, 0),
+        );
+        if (host_fd < 0) return null;
+        return self.allocGuestFile(host_fd, .regular) orelse {
+            _ = std.c.close(host_fd);
+            return null;
+        };
+    }
+
+    fn handleClosedir(self: *MachOState) u64 {
+        const directory = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        if (directory.fd >= 0 and std.c.close(directory.fd) != 0) return @bitCast(@as(i64, -1));
+        directory.* = .{};
+        return 0;
     }
 
     fn handleWrite(self: *MachOState) u64 {
@@ -1616,6 +1908,72 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn handleInternalCompatibility(self: *MachOState) bool {
+        if (self.internal_targets.cxxopts_split_option_names != 0 and
+            self.regs.rip == self.internal_targets.cxxopts_split_option_names)
+        {
+            return self.handleCxxoptsSplitOptionNames();
+        }
+        return false;
+    }
+
+    fn handleCxxoptsSplitOptionNames(self: *MachOState) bool {
+        const output = self.regs.rdi;
+        const input = self.regs.rsi;
+        const view = compat_runtime.libcppStringView(self, input) orelse return false;
+        const bytes = self.guestMemoryConst(view.address, view.length) orelse return false;
+        if (bytes.len == 0 or self.guestMemory(output, 24) == null) return false;
+
+        var token_count: u64 = 1;
+        var token_start: usize = 0;
+        for (bytes, 0..) |byte, index| {
+            if (byte != ',') continue;
+            var end = index;
+            while (end > token_start and bytes[end - 1] == ' ') end -= 1;
+            while (token_start < end and bytes[token_start] == ' ') token_start += 1;
+            if (token_start == end) return false;
+            token_count += 1;
+            token_start = index + 1;
+        }
+        var final_end = bytes.len;
+        while (final_end > token_start and bytes[final_end - 1] == ' ') final_end -= 1;
+        while (token_start < final_end and bytes[token_start] == ' ') token_start += 1;
+        if (token_start == final_end) return false;
+
+        const storage_size = std.math.mul(u64, token_count, 24) catch return false;
+        const storage = self.guestAlloc(storage_size, 8) orelse return false;
+        @memset(self.guestMemory(output, 24).?, 0);
+
+        token_start = 0;
+        var token_index: u64 = 0;
+        var cursor: usize = 0;
+        while (cursor <= bytes.len) : (cursor += 1) {
+            if (cursor != bytes.len and bytes[cursor] != ',') continue;
+            var start = token_start;
+            var end = cursor;
+            while (start < end and bytes[start] == ' ') start += 1;
+            while (end > start and bytes[end - 1] == ' ') end -= 1;
+            const object = storage + token_index * 24;
+            if (!compat_runtime.initLibcppString(self, object, view.address + start, end - start)) return false;
+            token_index += 1;
+            token_start = cursor + 1;
+        }
+
+        self.write64(output, storage);
+        self.write64(output + 8, storage + storage_size);
+        self.write64(output + 16, storage + storage_size);
+        self.cxxopts_split_accelerations += 1;
+        if (self.cxxopts_split_accelerations == 1 or self.cxxopts_split_accelerations % 250 == 0) {
+            std.debug.print(
+                "macho-processor: cxxopts option-name fast path handled {d} call(s)\n",
+                .{self.cxxopts_split_accelerations},
+            );
+        }
+        self.regs.rax = output;
+        self.regs.rip = self.pop();
+        return true;
+    }
+
     fn decodeAt(self: *MachOState) ?DecodedInsn {
         const off = self.addrToOffset(self.regs.rip) orelse return null;
         const bytes = self.mem[off..];
@@ -1638,6 +1996,7 @@ pub const MachOState = struct {
     }
 
     fn step(self: *MachOState) bool {
+        if (self.handleInternalCompatibility()) return !self.terminated;
         if (self.handleBoundImportThunk()) return !self.terminated;
         if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
         if (self.handleStubHelperTransition()) {
@@ -1700,7 +2059,7 @@ pub const MachOState = struct {
             return false;
         }
         self.recordTrace(decoded);
-        log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
+        if (self.verbose_trace) log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
         if (self.shouldTraceRIP(self.regs.rip)) {
             const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
             const trace_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
@@ -1761,7 +2120,7 @@ pub const MachOState = struct {
         }
 
         const return_address = self.pop();
-        std.debug.print("    [synthetic runtime] {s} -> rax=0x{x} return=0x{x}\n", .{ @tagName(thunk), self.regs.rax, return_address });
+        if (self.verbose_trace) std.debug.print("    [synthetic runtime] {s} -> rax=0x{x} return=0x{x}\n", .{ @tagName(thunk), self.regs.rax, return_address });
         if (return_address == 0) {
             self.faulted = true;
             self.exit_code = 127;
@@ -1791,15 +2150,14 @@ pub const MachOState = struct {
 
     pub fn run(self: *MachOState) void {
         var steps: u64 = 0;
-        const max_steps: u64 = 5_000_000;
-        while (!self.terminated and steps < max_steps) : (steps += 1) {
+        while (!self.terminated and steps < self.max_steps) : (steps += 1) {
             if (steps % 500000 == 0) {
                 log.info("step {d}: rip=0x{x}, rax=0x{x}, rbx=0x{x}, rcx=0x{x}", .{ steps, self.regs.rip, self.regs.rax, self.regs.rbx, self.regs.rcx });
             }
             if (!self.step()) break;
         }
-        if (steps >= max_steps) {
-            log.warn("reached max steps ({d})", .{max_steps});
+        if (steps >= self.max_steps) {
+            log.warn("reached max steps ({d})", .{self.max_steps});
             self.faulted = true;
             self.exit_code = 124;
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.max_steps_reached);
@@ -2149,12 +2507,23 @@ pub const MachOState = struct {
                 self.writeMemVal(d.addr, sz, r);
                 self.setFlagsLogic(r, sz);
             },
-            .or_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = d.imm;
-                const r = a | b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsLogic(r, .bits8);
+            .or_reg8_imm8, .or_reg16_imm8, .or_reg32_imm8, .or_reg64_imm8 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_reg8_imm8) + @intFromEnum(Size.bits8));
+                const r = self.regVal(d.dst_reg, sz) | d.imm;
+                self.setReg(d.dst_reg, sz, r);
+                self.setFlagsLogic(r, sz);
+            },
+            .or_mem8_imm8,
+            .or_mem16_imm8,
+            .or_mem32_imm8,
+            .or_mem64_imm8,
+            .or_mem16_imm32,
+            .or_mem32_imm32,
+            .or_mem64_imm32,
+            => {
+                const r = self.readMemVal(d.addr, d.size) | d.imm;
+                self.writeMemVal(d.addr, d.size, r);
+                self.setFlagsLogic(r, d.size);
             },
 
             .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
@@ -2735,6 +3104,36 @@ pub const MachOState = struct {
             .movups_mem_xmm, .movaps_mem_xmm => {
                 self.writeMem128(d.addr, self.xmm[d.xmm_src]);
             },
+            .vmovd_xmm_reg32, .vmovd_xmm_mem32 => {
+                const value: u32 = @truncate(if (d.op == .vmovd_xmm_reg32)
+                    self.regVal(d.src_reg, .bits32)
+                else
+                    self.readMemVal(d.addr, .bits32));
+                @memset(&self.xmm[d.xmm_dst], 0);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
+            },
+            .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8 => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                const value: u8 = @truncate(if (d.op == .vpinsrb_xmm_xmm_reg32)
+                    self.regVal(d.src_reg, .bits32)
+                else
+                    self.readMemVal(d.addr, .bits8));
+                self.xmm[d.xmm_dst][@intCast(d.imm & 0x0F)] = value;
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            },
+            .vpshufb => {
+                const source_low = self.xmm[d.xmm_src];
+                const mask_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = shuffleBytes(source_low, mask_low);
+                if (d.vector_256) {
+                    const source_high = self.ymm_hi[d.xmm_src];
+                    const mask_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = shuffleBytes(source_high, mask_high);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
             .vmovdqu_xmm_xmm, .vmovdqa_xmm_xmm, .vmovups_xmm_xmm, .vmovaps_xmm_xmm, .vmovupd_xmm_xmm, .vmovapd_xmm_xmm => {
                 self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
@@ -3173,13 +3572,13 @@ pub const MachOState = struct {
 };
 
 fn nextPrime(n: u64) u64 {
-    if (n < 2) return 2;
+    if (n <= 2) return 2;
     var candidate = n;
     if (candidate % 2 == 0) candidate += 1;
     while (true) {
         var is_prime = true;
         var i: u64 = 3;
-        while (i * i <= candidate) {
+        while (i <= candidate / i) {
             if (candidate % i == 0) {
                 is_prime = false;
                 break;
@@ -3234,6 +3633,18 @@ fn selectedCpuProfile() x64_decoder.capabilities.Profile {
     };
 }
 
+fn environmentFlag(name: [*:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+fn environmentUnsigned(name: [*:0]const u8, fallback: u64) u64 {
+    const raw = std.c.getenv(name) orelse return fallback;
+    const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
+    return std.fmt.parseUnsigned(u64, value, 10) catch fallback;
+}
+
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
     const file_data = try std.Io.Dir.cwd().readFileAlloc(io, options.path, allocator, .unlimited);
     defer allocator.free(file_data);
@@ -3246,6 +3657,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     var state = try MachOState.init(allocator, slice);
     defer state.deinit();
     state.cpu_profile = selectedCpuProfile();
+    state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");
+    state.max_steps = environmentUnsigned("ROSETTE_MACHO_MAX_STEPS", state.max_steps);
 
     var temp_state = try macho.load(allocator, slice);
     defer temp_state.deinit();
@@ -3842,6 +4255,23 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
     if (start_pos + 3 >= bytes.len) return .{};
 
+    if (opcode == 0x6E and (vex & 0x78) == 0x78 and !vector_256 and prefix == 1) {
+        var decoded = DecodedInsn{ .size = .bits32 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        if (is_mem) {
+            decoded.op = .vmovd_xmm_mem32;
+            decoded.addr = rm.addr;
+        } else {
+            decoded.op = .vmovd_xmm_reg32;
+            decoded.src_reg = @enumFromInt(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or opcode == 0x5E) {
         if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
 
@@ -4061,6 +4491,14 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
 const VexArithmetic = enum { add, multiply, subtract, divide };
 const VexBitwise = enum { @"and", and_not, @"or", xor };
 
+fn shuffleBytes(source: [16]u8, mask: [16]u8) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    for (mask, 0..) |selector, index| {
+        if (selector & 0x80 == 0) result[index] = source[selector & 0x0F];
+    }
+    return result;
+}
+
 fn vexArithmeticForOp(op: Op) VexArithmetic {
     return switch (op) {
         .vaddss, .vaddsd, .vaddps, .vaddpd => .add,
@@ -4248,6 +4686,23 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode_map == 2 and opcode == 0x00 and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = .vpshufb;
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode_map == 3 and opcode >= 0x08 and opcode <= 0x0B and prefix == 1) {
         const is_scalar = opcode == 0x0A or opcode == 0x0B;
         if (is_scalar and vector_256) return .{};
@@ -4274,6 +4729,27 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x0B => .vroundsd,
             else => unreachable,
         };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 3 and opcode == 0x20 and prefix == 1 and !vector_256) {
+        var decoded = DecodedInsn{ .size = .bits8 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits8);
+        if (pos >= bytes.len) return .{};
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.op = .vpinsrb_xmm_xmm_mem8;
+            decoded.addr = rm.addr;
+        } else {
+            decoded.op = .vpinsrb_xmm_xmm_reg32;
+            decoded.src_reg = @enumFromInt(rm.addr);
+        }
+        decoded.imm = bytes[pos];
+        pos += 1;
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -4830,6 +5306,8 @@ fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
         if (opcode == 0x83) @as(u64, @bitCast(@as(i64, @as(i8, @bitCast(bytes[pos]))))) else bytes[pos]
     else if (imm_size == 2)
         std.mem.readInt(u16, bytes[pos..][0..2], .little)
+    else if (sz == .bits64)
+        @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little))))))
     else
         std.mem.readInt(u32, bytes[pos..][0..4], .little);
     pos += imm_size;
@@ -4842,6 +5320,26 @@ fn decodeGroup1Imm(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
     };
 
     if (is_mem) {
+        if (group_op == 1) {
+            d.op = if (is_byte_imm)
+                switch (base_sz) {
+                    .bits8 => .or_mem8_imm8,
+                    .bits16 => .or_mem16_imm8,
+                    .bits32 => .or_mem32_imm8,
+                    .bits64 => .or_mem64_imm8,
+                }
+            else switch (base_sz) {
+                .bits8 => .or_mem8_imm8,
+                .bits16 => .or_mem16_imm32,
+                .bits32 => .or_mem32_imm32,
+                .bits64 => .or_mem64_imm32,
+            };
+            d.addr = rm.addr;
+            d.imm = imm;
+            d.size = base_sz;
+            d.len = @intCast(pos);
+            return d;
+        }
         const mem_group_ops: [8]Op = .{
             .add_mem8_imm8, .invalid, .invalid, .invalid,
             .invalid,       .invalid, .invalid, .cmp_mem8_imm8,
@@ -5739,6 +6237,41 @@ test "decode 128-bit VEX move families" {
     try std.testing.expectEqual(RegId.dl_dx_edx_rdx, load_sd.sib_base_reg);
 }
 
+test "decode VEX dword move and byte insertion" {
+    const move_register = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x6E, 0xC0 });
+    try std.testing.expectEqual(Op.vmovd_xmm_reg32, move_register.op);
+    try std.testing.expectEqual(@as(u8, 0), move_register.xmm_dst);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, move_register.src_reg);
+    try std.testing.expectEqual(@as(u8, 4), move_register.len);
+
+    const move_memory = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x6E, 0x09 });
+    try std.testing.expectEqual(Op.vmovd_xmm_mem32, move_memory.op);
+    try std.testing.expectEqual(@as(u8, 1), move_memory.xmm_dst);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, move_memory.sib_base_reg);
+
+    const insert_register = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x20, 0xC0, 0x0F });
+    try std.testing.expectEqual(Op.vpinsrb_xmm_xmm_reg32, insert_register.op);
+    try std.testing.expectEqual(@as(u8, 0), insert_register.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), insert_register.xmm_src);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, insert_register.src_reg);
+    try std.testing.expectEqual(@as(u64, 15), insert_register.imm);
+    try std.testing.expectEqual(@as(u8, 6), insert_register.len);
+
+    const insert_memory = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x20, 0x00, 0x05 });
+    try std.testing.expectEqual(Op.vpinsrb_xmm_xmm_mem8, insert_memory.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, insert_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 5), insert_memory.imm);
+
+    const shuffle = decodeInsn(&[_]u8{ 0xC4, 0xE2, 0x79, 0x00, 0xC1 });
+    try std.testing.expectEqual(Op.vpshufb, shuffle.op);
+    try std.testing.expect(!shuffle.vector_256);
+    try std.testing.expectEqual(@as(u8, 0), shuffle.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), shuffle.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), shuffle.xmm_src2);
+    try std.testing.expect(shuffle.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), shuffle.len);
+}
+
 test "decode 256-bit VEX packed moves" {
     const decoded = decodeInsn(&[_]u8{ 0xC5, 0xFE, 0x6F, 0x00 });
     try std.testing.expectEqual(Op.vmovdqu_ymm_mem, decoded.op);
@@ -5969,6 +6502,23 @@ test "decode conditional moves without losing the ModRM byte" {
     try std.testing.expectEqual(RegId.al_ax_eax_rax, memory.dst_reg);
     try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, memory.sib_base_reg);
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 7), memory.addr);
+    try std.testing.expectEqual(@as(u8, 5), memory.len);
+}
+
+test "decode 64-bit OR register immediate without aliasing memory opcodes" {
+    const decoded = decodeInsn(&[_]u8{ 0x48, 0x83, 0xC9, 0x01 });
+    try std.testing.expectEqual(Op.or_reg64_imm8, decoded.op);
+    try std.testing.expectEqual(Size.bits64, decoded.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+    try std.testing.expectEqual(@as(u64, 1), decoded.imm);
+    try std.testing.expectEqual(@as(u8, 4), decoded.len);
+
+    const memory = decodeInsn(&[_]u8{ 0x48, 0x83, 0x49, 0x08, 0x01 });
+    try std.testing.expectEqual(Op.or_mem64_imm8, memory.op);
+    try std.testing.expectEqual(Size.bits64, memory.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 8), memory.addr);
+    try std.testing.expectEqual(@as(u64, 1), memory.imm);
     try std.testing.expectEqual(@as(u8, 5), memory.len);
 }
 

@@ -367,6 +367,47 @@ pub fn appendLibcppString(state: anytype, object: u64, source: u64, source_lengt
     return initLibcppString(state, object, temporary, total);
 }
 
+pub fn growLibcppString(
+    state: anytype,
+    object: u64,
+    old_capacity: u64,
+    capacity_delta: u64,
+    old_size: u64,
+    prefix_size: u64,
+    deleted_size: u64,
+    inserted_size: u64,
+) bool {
+    if (prefix_size > old_size or deleted_size > old_size - prefix_size) return false;
+    const current = libcppStringView(state, object) orelse return false;
+    if (current.length < old_size) return false;
+    const source = state.guestMemoryConst(current.address, old_size) orelse return false;
+
+    const requested = std.math.add(u64, old_capacity, capacity_delta) catch return false;
+    const doubled = std.math.mul(u64, old_capacity, 2) catch requested;
+    const recommended = @max(requested, doubled);
+    const allocation_size = (std.math.add(u64, recommended, 16) catch return false) & ~@as(u64, 15);
+    const allocation = state.guestAlloc(@max(allocation_size, 16), 16) orelse return false;
+    const destination = state.guestMemory(allocation, @max(allocation_size, 16)) orelse return false;
+
+    const prefix: usize = @intCast(prefix_size);
+    if (prefix != 0) @memcpy(destination[0..prefix], source[0..prefix]);
+    const suffix_size = old_size - prefix_size - deleted_size;
+    if (suffix_size != 0) {
+        const suffix_source: usize = @intCast(prefix_size + deleted_size);
+        const suffix_destination: usize = @intCast(prefix_size + inserted_size);
+        const suffix_length: usize = @intCast(suffix_size);
+        @memcpy(
+            destination[suffix_destination .. suffix_destination + suffix_length],
+            source[suffix_source .. suffix_source + suffix_length],
+        );
+    }
+
+    state.write64(object, allocation_size | 1);
+    state.write64(object + 8, old_size);
+    state.write64(object + 16, allocation);
+    return true;
+}
+
 pub fn concatCStringAndLibcppString(
     state: anytype,
     destination: u64,
@@ -561,4 +602,17 @@ test "libc++ string copy append and concatenation preserve contents" {
     try std.testing.expect(concatCStringAndLibcppString(&state, 136, 112, 7, 80));
     const concatenated = libcppStringView(&state, 136).?;
     try std.testing.expectEqualStrings("prefix hello world", state.guestMemoryConst(concatenated.address, concatenated.length).?);
+}
+
+test "libc++ string growth preserves prefix and shifted suffix" {
+    var state = TestState{};
+    @memcpy(state.mem[32..38], "abcdef");
+    try std.testing.expect(initLibcppString(&state, 0, 32, 6));
+    try std.testing.expect(growLibcppString(&state, 0, 22, 10, 6, 2, 2, 3));
+
+    const grown = libcppStringView(&state, 0).?;
+    try std.testing.expectEqual(@as(u64, 6), grown.length);
+    try std.testing.expectEqualStrings("ab", state.guestMemoryConst(grown.address, 2).?);
+    try std.testing.expectEqualStrings("ef", state.guestMemoryConst(grown.address + 5, 2).?);
+    try std.testing.expect(state.read64(0) & 1 != 0);
 }

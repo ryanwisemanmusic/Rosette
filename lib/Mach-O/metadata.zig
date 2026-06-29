@@ -261,6 +261,22 @@ pub const Metadata = struct {
         };
     }
 
+    pub fn symbolAddressWithPrefix(self: *const Metadata, prefix: []const u8) ?u64 {
+        const table = self.symtab orelse return null;
+        var index: u32 = 0;
+        while (index < table.symbol_count) : (index += 1) {
+            const entry_offset = @as(usize, table.symbol_offset) + @as(usize, index) * NLIST_64_SIZE;
+            if (entry_offset + NLIST_64_SIZE > self.data.len) break;
+            const symbol_type = self.data[entry_offset + 4];
+            if ((symbol_type & N_STAB) != 0 or (symbol_type & N_TYPE) != N_SECT) continue;
+            const name = self.symbolName(table, readU32(self.data, entry_offset)) orelse continue;
+            if (!std.mem.startsWith(u8, name, prefix)) continue;
+            const address = readU64(self.data, entry_offset + 8);
+            if (address != 0) return address;
+        }
+        return null;
+    }
+
     fn collectImports(self: *const Metadata) ![]ImportedSymbol {
         const table = self.symtab orelse return &.{};
         const dynamic = self.dysymtab orelse return &.{};
