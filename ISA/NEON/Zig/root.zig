@@ -150,6 +150,8 @@ const average_pavgw = @import("AVERAGE/PAVGW.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
 const bitwise_vpternlogd = @import("BITWISE/VPTERNLOGD.zig");
 const bitwise_vpternlogq = @import("BITWISE/VPTERNLOGQ.zig");
+const broadcast_vpbroadcastmb2q = @import("BROADCAST/VPBROADCASTMB2Q.zig");
+const broadcast_vpbroadcastmw2d = @import("BROADCAST/VPBROADCASTMW2D.zig");
 const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
 const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
 const concatenate_vpshldvd = @import("CONCATENATE/vpshldvd.zig");
@@ -881,6 +883,8 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(begin_xbegin.family, begin_xbegin.path, begin_xbegin.source),
     mirror(bitwise_vpternlogd.family, bitwise_vpternlogd.path, bitwise_vpternlogd.source),
     mirror(bitwise_vpternlogq.family, bitwise_vpternlogq.path, bitwise_vpternlogq.source),
+    mirror(broadcast_vpbroadcastmb2q.family, broadcast_vpbroadcastmb2q.path, broadcast_vpbroadcastmb2q.source),
+    mirror(broadcast_vpbroadcastmw2d.family, broadcast_vpbroadcastmw2d.path, broadcast_vpbroadcastmw2d.source),
     mirror(concatenate_vpshldd.family, concatenate_vpshldd.path, concatenate_vpshldd.source),
     mirror(concatenate_vpshldq.family, concatenate_vpshldq.path, concatenate_vpshldq.source),
     mirror(concatenate_vpshldvd.family, concatenate_vpshldvd.path, concatenate_vpshldvd.source),
