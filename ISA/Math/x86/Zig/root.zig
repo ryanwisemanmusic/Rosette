@@ -151,6 +151,8 @@ const average_pavgw = @import("AVERAGE/PAVGW.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
 const bitwise_vpternlogd = @import("BITWISE/VPTERNLOGD.zig");
 const bitwise_vpternlogq = @import("BITWISE/VPTERNLOGQ.zig");
+const broadcast_vpbroadcastmb2q = @import("BROADCAST/VPBROADCASTMB2Q.zig");
+const broadcast_vpbroadcastmw2d = @import("BROADCAST/VPBROADCASTMW2D.zig");
 const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
 const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
 const concatenate_vpshldvd = @import("CONCATENATE/vpshldvd.zig");
@@ -811,6 +813,8 @@ pub const specs = blk: {
         spec(begin_xbegin.meta),
         spec(bitwise_vpternlogd.meta),
         spec(bitwise_vpternlogq.meta),
+        spec(broadcast_vpbroadcastmb2q.meta),
+        spec(broadcast_vpbroadcastmw2d.meta),
         spec(concatenate_vpshldd.meta),
         spec(concatenate_vpshldq.meta),
         spec(concatenate_vpshldvd.meta),
@@ -1471,6 +1475,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     begin_xbegin.proof_report,
     bitwise_vpternlogd.proof_report,
     bitwise_vpternlogq.proof_report,
+    broadcast_vpbroadcastmb2q.proof_report,
+    broadcast_vpbroadcastmw2d.proof_report,
     concatenate_vpshldd.proof_report,
     concatenate_vpshldq.proof_report,
     concatenate_vpshldvd.proof_report,
