@@ -385,6 +385,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const contract_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/Contract/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const bridge_register_trace_module = b.createModule(.{
         .root_source_file = b.path("../src/bridge/register-tracing/runtime.zig"),
         .target = target,
@@ -623,6 +628,7 @@ pub fn build(b: *std.Build) void {
     zig_module.addImport("runtime_abi_handshake", runtime_abi_module);
     zig_module.addImport("svx", svx_module);
     zig_module.addImport("cleo", cleo_module);
+    zig_module.addImport("contract", contract_mod);
     zig_module.addImport("dos_scene", dos_scene_module);
     zig_module.addImport("dos_palette", dos_palette_module);
     zig_module.addImport("dos_renderer", dos_renderer_module);
@@ -706,6 +712,11 @@ pub fn build(b: *std.Build) void {
     {
         const cleo_test = b.addTest(.{ .root_module = cleo_module });
         check_step.dependOn(&cleo_test.step);
+    }
+
+    {
+        const contract_test = b.addTest(.{ .root_module = contract_mod });
+        check_step.dependOn(&contract_test.step);
     }
 
     {
