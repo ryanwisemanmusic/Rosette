@@ -1127,12 +1127,10 @@ pub const ElfState = struct {
                 self.writeMemVal(d.addr, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
-            .or_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = d.imm;
-                const r = a | b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsLogic(r, .bits8);
+            .or_reg8_imm8, .or_reg16_imm8, .or_reg32_imm8, .or_reg64_imm8 => {
+                const r = self.regVal(d.dst_reg, d.size) | d.imm;
+                self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsLogic(r, d.size);
             },
             .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8 => {
                 const a = self.readMemVal(d.addr, d.size);
@@ -2170,6 +2168,27 @@ pub const ElfState = struct {
                 self.setReg(.al_ax_eax_rax, .bits32, @truncate(value));
                 self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(value >> 32));
             },
+            .vmovd_xmm_reg32, .vmovd_xmm_mem32 => {
+                const value: u32 = @truncate(if (d.op == .vmovd_xmm_reg32)
+                    self.regVal(d.src_reg, .bits32)
+                else
+                    self.readMemVal(d.addr, .bits32));
+                @memset(&self.xmm[d.xmm_dst], 0);
+                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
+            },
+            .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8 => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                const value: u8 = @truncate(if (d.op == .vpinsrb_xmm_xmm_reg32)
+                    self.regVal(d.src_reg, .bits32)
+                else
+                    self.readMemVal(d.addr, .bits8));
+                self.xmm[d.xmm_dst][@intCast(d.imm & 0x0F)] = value;
+            },
+            .vpshufb => {
+                const source = self.xmm[d.xmm_src];
+                const mask = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = shuffleBytes(source, mask);
+            },
             .add_accum_imm,
             .or_accum_imm,
             .adc_accum_imm,
@@ -2532,6 +2551,14 @@ fn xmmRegIndex(code: u8, extended: bool) u8 {
 fn signExtendImm8(imm: u64) u64 {
     const signed: i8 = @bitCast(@as(u8, @truncate(imm)));
     return @as(u64, @bitCast(@as(i64, signed)));
+}
+
+fn shuffleBytes(source: [16]u8, mask: [16]u8) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    for (mask, 0..) |selector, index| {
+        if (selector & 0x80 == 0) result[index] = source[selector & 0x0F];
+    }
+    return result;
 }
 
 fn signExtendDisp32(raw: u32) u64 {
