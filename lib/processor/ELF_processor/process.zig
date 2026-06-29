@@ -696,6 +696,9 @@ pub const ElfState = struct {
         switch (d.op) {
             .invalid => unreachable,
             .nop => {},
+            .cmc => self.regs.rflags ^= RFL_CF,
+            .clc => self.regs.rflags &= ~RFL_CF,
+            .stc => self.regs.rflags |= RFL_CF,
 
             // ── mov reg, mem ──
             .mov_reg8_mem8 => {
@@ -1290,6 +1293,12 @@ pub const ElfState = struct {
                 const r = 0 -% a;
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsSub(0, a, r, d.size);
+            },
+            .not_reg8, .not_reg16, .not_reg32, .not_reg64 => {
+                self.setReg(d.dst_reg, d.size, ~self.regVal(d.dst_reg, d.size));
+            },
+            .not_mem8, .not_mem16, .not_mem32, .not_mem64 => {
+                self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
             },
 
             // ── cmp r/m, reg (opcode 0x39) ──
@@ -2214,6 +2223,40 @@ pub const ElfState = struct {
             .vcvtsi2ss_xmm_mem,
             .vcvtsi2sd_xmm_reg,
             .vcvtsi2sd_xmm_mem,
+            .vaddss,
+            .vaddsd,
+            .vaddps,
+            .vaddpd,
+            .vmulss,
+            .vmulsd,
+            .vmulps,
+            .vmulpd,
+            .vsubss,
+            .vsubsd,
+            .vsubps,
+            .vsubpd,
+            .vdivss,
+            .vdivsd,
+            .vdivps,
+            .vdivpd,
+            .vucomiss,
+            .vucomisd,
+            .vroundss,
+            .vroundsd,
+            .vroundps,
+            .vroundpd,
+            .vcvttss2si,
+            .vcvttsd2si,
+            .vcvtss2si,
+            .vcvtsd2si,
+            .vandps,
+            .vandpd,
+            .vandnps,
+            .vandnpd,
+            .vorps,
+            .vorpd,
+            .vxorps,
+            .vxorpd,
             => unreachable,
         }
 
@@ -2661,6 +2704,9 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
     const rex_w = rexW(rex);
 
     switch (opcode) {
+        0xF5 => return DecodedInsn{ .op = .cmc, .len = @intCast(pos) },
+        0xF8 => return DecodedInsn{ .op = .clc, .len = @intCast(pos) },
+        0xF9 => return DecodedInsn{ .op = .stc, .len = @intCast(pos) },
         0x00...0x03 => {
             // ADD r/m, r or ADD r, r/m
             if (pos >= bytes.len) return .{};
@@ -3819,6 +3865,18 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                             .bits64 => DecodedInsn{ .op = .test_mem64_imm32, .size = size, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
                         };
                     },
+                    2 => DecodedInsn{
+                        .op = @enumFromInt(@intFromEnum(Op.not_mem8) + @intFromEnum(size) - @intFromEnum(Size.bits8)),
+                        .size = size,
+                        .addr = mem.addr,
+                        .sib_has_index = mem.sib_has_index,
+                        .sib_index_reg = mem.sib_index_reg,
+                        .sib_scale = mem.sib_scale,
+                        .sib_has_base = mem.sib_has_base,
+                        .sib_base_reg = mem.sib_base_reg,
+                        .rip_relative = mem.rip_relative,
+                        .len = @intCast(pos),
+                    },
                     4 => switch (size) {
                         .bits8 => DecodedInsn{ .op = .mul_mem8, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
                         .bits16 => DecodedInsn{ .op = .mul_mem16, .size = size, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
@@ -3857,6 +3915,12 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                             .bits32 => DecodedInsn{ .op = .test_reg32_imm32, .size = size, .dst_reg = src_reg, .imm = imm, .len = @intCast(pos) },
                             .bits64 => DecodedInsn{ .op = .test_reg64_imm32, .size = size, .dst_reg = src_reg, .imm = imm, .len = @intCast(pos) },
                         };
+                    },
+                    2 => DecodedInsn{
+                        .op = @enumFromInt(@intFromEnum(Op.not_reg8) + @intFromEnum(size) - @intFromEnum(Size.bits8)),
+                        .size = size,
+                        .dst_reg = src_reg,
+                        .len = @intCast(pos),
                     },
                     3 => switch (size) {
                         .bits8 => DecodedInsn{ .op = .neg_reg8, .size = size, .dst_reg = src_reg, .len = @intCast(pos) },
