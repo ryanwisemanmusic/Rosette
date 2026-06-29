@@ -147,6 +147,8 @@ const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
 const align_valignd = @import("ALIGN/VALIGND.zig");
 const align_valignq = @import("ALIGN/VALIGNQ.zig");
+const average_pavgb = @import("AVERAGE/PAVGB.zig");
+const average_pavgw = @import("AVERAGE/PAVGW.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
 const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
 const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
@@ -803,6 +805,8 @@ pub const specs = blk: {
         spec(abort_xabort.meta),
         spec(align_valignd.meta),
         spec(align_valignq.meta),
+        spec(average_pavgb.meta),
+        spec(average_pavgw.meta),
         spec(begin_xbegin.meta),
         spec(concatenate_vpshldd.meta),
         spec(concatenate_vpshldq.meta),
@@ -1459,6 +1463,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     abort_xabort.proof_report,
     align_valignd.proof_report,
     align_valignq.proof_report,
+    average_pavgb.proof_report,
+    average_pavgw.proof_report,
     begin_xbegin.proof_report,
     concatenate_vpshldd.proof_report,
     concatenate_vpshldq.proof_report,
