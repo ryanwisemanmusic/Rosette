@@ -147,6 +147,8 @@ const align_valignq = @import("ALIGN/VALIGNQ.zig");
 const average_pavgb = @import("AVERAGE/PAVGB.zig");
 const average_pavgw = @import("AVERAGE/PAVGW.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
+const bitwise_vpternlogd = @import("BITWISE/VPTERNLOGD.zig");
+const bitwise_vpternlogq = @import("BITWISE/VPTERNLOGQ.zig");
 const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
 const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
 const concatenate_vpshldvd = @import("CONCATENATE/vpshldvd.zig");
@@ -1376,6 +1378,8 @@ pub const tables = [_]InstructionTable{
     entry(average_pavgb.family, average_pavgb.path, average_pavgb.source),
     entry(average_pavgw.family, average_pavgw.path, average_pavgw.source),
     entry(begin_xbegin.family, begin_xbegin.path, begin_xbegin.source),
+    entry(bitwise_vpternlogd.family, bitwise_vpternlogd.path, bitwise_vpternlogd.source),
+    entry(bitwise_vpternlogq.family, bitwise_vpternlogq.path, bitwise_vpternlogq.source),
     entry(concatenate_vpshldd.family, concatenate_vpshldd.path, concatenate_vpshldd.source),
     entry(concatenate_vpshldq.family, concatenate_vpshldq.path, concatenate_vpshldq.source),
     entry(concatenate_vpshldvd.family, concatenate_vpshldvd.path, concatenate_vpshldvd.source),
