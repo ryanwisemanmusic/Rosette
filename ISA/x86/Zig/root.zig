@@ -144,6 +144,8 @@ const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
 const align_valignd = @import("ALIGN/VALIGND.zig");
 const align_valignq = @import("ALIGN/VALIGNQ.zig");
+const average_pavgb = @import("AVERAGE/PAVGB.zig");
+const average_pavgw = @import("AVERAGE/PAVGW.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
 const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
 const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
@@ -1371,6 +1373,8 @@ pub const tables = [_]InstructionTable{
     entry(abort_xabort.family, abort_xabort.path, abort_xabort.source),
     entry(align_valignd.family, align_valignd.path, align_valignd.source),
     entry(align_valignq.family, align_valignq.path, align_valignq.source),
+    entry(average_pavgb.family, average_pavgb.path, average_pavgb.source),
+    entry(average_pavgw.family, average_pavgw.path, average_pavgw.source),
     entry(begin_xbegin.family, begin_xbegin.path, begin_xbegin.source),
     entry(concatenate_vpshldd.family, concatenate_vpshldd.path, concatenate_vpshldd.source),
     entry(concatenate_vpshldq.family, concatenate_vpshldq.path, concatenate_vpshldq.source),
