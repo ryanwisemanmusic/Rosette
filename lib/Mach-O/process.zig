@@ -18,6 +18,8 @@ const Op = x64_decoder.Op;
 const DecodedInsn = x64_decoder.DecodedInsn;
 
 const RFL_CF = x64_decoder.RFL_CF;
+const RFL_PF: u32 = 1 << 2;
+const RFL_AF: u32 = 1 << 4;
 const RFL_ZF = x64_decoder.RFL_ZF;
 const RFL_SF = x64_decoder.RFL_SF;
 const RFL_OF = x64_decoder.RFL_OF;
@@ -33,6 +35,10 @@ const STUB_ENTRY_SIZE: u64 = 10;
 const UNSUPPORTED_RUNTIME_EXIT_CODE: u64 = 125;
 const GUEST_FILE_BASE: u64 = 0xFFFF_FF10_0000_0000;
 const GUEST_FILE_MAX: usize = 32;
+const BOUND_IMPORT_THUNK_BASE: u64 = 0xFFFF_FC00_0000_0000;
+const BOUND_IMPORT_THUNK_STRIDE: u64 = 16;
+const INITIALIZER_RETURN_SENTINEL: u64 = 0xFFFF_FB00_0000_0000;
+const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 
 const MachSegment = macho.MachSegment;
 
@@ -76,6 +82,12 @@ const GuestFile = struct {
     kind: GuestFileKind = .regular,
 };
 
+const BoundImportThunk = struct {
+    address: u64,
+    name: []const u8,
+    dylib: []const u8,
+};
+
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
     mem: []u8,
@@ -96,8 +108,10 @@ pub const MachOState = struct {
     metadata: macho_metadata.Metadata,
     entry_point_vaddr: u64 = 0,
     stack_size: u64 = 0,
-    guest_fds: [16]i32 = .{0} ** 16,
+    guest_fds: [16]i32 = .{-1} ** 16,
     next_guest_fd: u64 = 3,
+    monotonic_nanoseconds: u64 = 1_000_000_000,
+    ios_xalloc_next: u64 = 4,
     trace_entries: [TRACE_BUFFER_LEN]TraceEntry = [_]TraceEntry{TraceEntry{}} ** TRACE_BUFFER_LEN,
     trace_index: usize = 0,
     trace_filled: bool = false,
@@ -113,6 +127,7 @@ pub const MachOState = struct {
     import_trace_filled: bool = false,
     unresolved_import_count: u64 = 0,
     guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
+    bound_import_thunks: []BoundImportThunk = &.{},
 
     pub fn init(allocator: std.mem.Allocator, binary_data: []const u8) !MachOState {
         var state = try macho.load(allocator, binary_data);
@@ -188,6 +203,9 @@ pub const MachOState = struct {
         result.guest_files[0] = .{ .active = true, .fd = 0, .kind = .regular };
         result.guest_files[1] = .{ .active = true, .fd = 1, .kind = .stdout };
         result.guest_files[2] = .{ .active = true, .fd = 2, .kind = .stderr };
+        result.applyDyldBindings() catch |err| {
+            log.warn("dyld data binding setup failed: {s}", .{@errorName(err)});
+        };
         return result;
     }
 
@@ -196,6 +214,69 @@ pub const MachOState = struct {
         self.metadata.deinit();
         self.allocator.free(self.mem);
         self.allocator.free(self.segments);
+        if (self.bound_import_thunks.len != 0) self.allocator.free(self.bound_import_thunks);
+    }
+
+    fn applyDyldBindings(self: *MachOState) !void {
+        var stubs = std.StringHashMap(u64).init(self.allocator);
+        defer stubs.deinit();
+        for (self.metadata.imports) |imported| {
+            try stubs.put(imported.name, imported.stub_address);
+        }
+
+        var thunk_addresses = std.StringHashMap(u64).init(self.allocator);
+        defer thunk_addresses.deinit();
+        var thunks: std.ArrayList(BoundImportThunk) = .empty;
+        errdefer thunks.deinit(self.allocator);
+
+        var applied: usize = 0;
+        for (self.metadata.bindings) |binding| {
+            const section = self.metadata.sectionAtAddress(binding.address) orelse continue;
+            if (!isCallableConstantBinding(section, binding.name, stubs.contains(binding.name))) continue;
+            const destination = self.guestMemory(binding.address, @sizeOf(u64)) orelse continue;
+            var target = stubs.get(binding.name) orelse blk: {
+                if (thunk_addresses.get(binding.name)) |existing| break :blk existing;
+                const thunk_address = BOUND_IMPORT_THUNK_BASE + @as(u64, @intCast(thunks.items.len)) * BOUND_IMPORT_THUNK_STRIDE;
+                try thunks.append(self.allocator, .{
+                    .address = thunk_address,
+                    .name = binding.name,
+                    .dylib = binding.dylib,
+                });
+                try thunk_addresses.put(binding.name, thunk_address);
+                break :blk thunk_address;
+            };
+            if (binding.addend > 0 and target < BOUND_IMPORT_THUNK_BASE) {
+                target +%= @intCast(binding.addend);
+            } else if (binding.addend < 0 and target < BOUND_IMPORT_THUNK_BASE) {
+                target -%= @intCast(-binding.addend);
+            }
+            std.mem.writeInt(u64, destination[0..8], target, .little);
+            applied += 1;
+        }
+
+        self.bound_import_thunks = try thunks.toOwnedSlice(self.allocator);
+        std.debug.print(
+            "macho-processor: applied {d} dyld data binding(s), created {d} synthetic import thunk(s)\n",
+            .{ applied, self.bound_import_thunks.len },
+        );
+    }
+
+    fn isCallableConstantBinding(
+        section: macho_metadata.Section,
+        symbol_name: []const u8,
+        has_import_stub: bool,
+    ) bool {
+        if (!std.mem.eql(u8, section.name, "__const")) return false;
+        if (has_import_stub) return true;
+        if (!std.mem.startsWith(u8, symbol_name, "__Z")) return false;
+
+        const abi_data_symbols = [_][]const u8{
+            "__ZGV", "__ZGR", "__ZTC", "__ZTI", "__ZTS", "__ZTT", "__ZTV",
+        };
+        for (abi_data_symbols) |prefix| {
+            if (std.mem.startsWith(u8, symbol_name, prefix)) return false;
+        }
+        return true;
     }
 
     pub fn addrToOffset(self: *const MachOState, vaddr: u64) ?u64 {
@@ -604,6 +685,40 @@ pub const MachOState = struct {
             return .{ .handled = 0 };
         }
 
+        if (std.mem.eql(u8, name, "_strcmp")) {
+            const lhs = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const rhs = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const ordering = std.mem.order(u8, lhs, rhs);
+            const result: i32 = switch (ordering) {
+                .lt => -1,
+                .eq => 0,
+                .gt => 1,
+            };
+            return .{ .handled = @as(u32, @bitCast(result)) };
+        }
+        if (std.mem.eql(u8, name, "_strcasecmp")) {
+            const lhs = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const rhs = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const shared = @min(lhs.len, rhs.len);
+            for (0..shared) |index| {
+                const left = std.ascii.toLower(lhs[index]);
+                const right = std.ascii.toLower(rhs[index]);
+                if (left != right) {
+                    const result: i32 = if (left < right) -1 else 1;
+                    return .{ .handled = @as(u32, @bitCast(result)) };
+                }
+            }
+            const result: i32 = if (lhs.len < rhs.len) -1 else if (lhs.len > rhs.len) 1 else 0;
+            return .{ .handled = @as(u32, @bitCast(result)) };
+        }
+        if (std.mem.eql(u8, name, "_strcpy")) {
+            const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const destination = self.guestMemory(self.regs.rdi, source.len + 1) orelse return .{ .unsupported = 0 };
+            @memcpy(destination[0..source.len], source);
+            destination[source.len] = 0;
+            return .{ .handled = self.regs.rdi };
+        }
+
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm") != null) {
             const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
             std.debug.print(
@@ -630,9 +745,18 @@ pub const MachOState = struct {
             const ok = compat_runtime.appendLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
             return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
         }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKc") != null) {
+            const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const ok = compat_runtime.appendLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_") != null or
             std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_") != null)
         {
+            const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_") != null) {
             const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
             return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
         }
@@ -665,6 +789,44 @@ pub const MachOState = struct {
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, registered },
             );
             return .{ .handled = if (registered) 0 else 1 };
+        }
+        if (std.mem.indexOf(u8, name, "__shared_weak_count14__release_weakEv") != null) {
+            return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__112__next_primeEm")) {
+            return .{ .handled = nextPrime(self.regs.rdi) };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__18ios_base6xallocEv")) {
+            const slot = self.ios_xalloc_next;
+            self.ios_xalloc_next +%= 1;
+            return .{ .handled = slot };
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutexC1Ev") != null or
+            std.mem.indexOf(u8, name, "recursive_mutexC2Ev") != null)
+        {
+            if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
+            return .{ .handled = self.regs.rdi };
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutex4lockEv") != null or
+            std.mem.indexOf(u8, name, "recursive_mutex6unlockEv") != null or
+            std.mem.indexOf(u8, name, "recursive_mutexD1Ev") != null or
+            std.mem.indexOf(u8, name, "recursive_mutexD2Ev") != null)
+        {
+            return .{ .handled = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutex8try_lockEv") != null) {
+            return .{ .handled = 1 };
+        }
+        if (std.mem.indexOf(u8, name, "__thread_structC1Ev") != null or
+            std.mem.indexOf(u8, name, "__thread_structC2Ev") != null)
+        {
+            if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
+            return .{ .handled = self.regs.rdi };
+        }
+        if (std.mem.indexOf(u8, name, "__ZNSt3__16threadD1Ev") != null or
+            std.mem.indexOf(u8, name, "__ZNSt3__16threadD2Ev") != null)
+        {
+            return .{ .handled = 0 };
         }
 
         if (std.mem.eql(u8, name, "__ZNSt3__16localeC1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeC2Ev")) {
@@ -746,6 +908,18 @@ pub const MachOState = struct {
         {
             return .{ .handled = self.guestAlloc(self.regs.rdi, 16) orelse 0 };
         }
+        if (std.mem.eql(u8, name, "_posix_memalign")) {
+            const output = self.regs.rdi;
+            const alignment = self.regs.rsi;
+            const size = self.regs.rdx;
+            if (alignment < @sizeOf(u64) or !std.math.isPowerOfTwo(alignment)) {
+                return .{ .handled = 22 };
+            }
+            if (self.guestMemory(output, @sizeOf(u64)) == null) return .{ .unsupported = 14 };
+            const allocation = self.guestAlloc(size, alignment) orelse return .{ .handled = 12 };
+            self.write64(output, allocation);
+            return .{ .handled = 0 };
+        }
         if (std.mem.endsWith(u8, name, "_calloc")) {
             const size = std.math.mul(u64, self.regs.rdi, self.regs.rsi) catch return .{ .handled = 0 };
             return .{ .handled = self.guestAlloc(size, 16) orelse 0 };
@@ -793,6 +967,32 @@ pub const MachOState = struct {
             return .{ .handled = text.len };
         }
 
+        if (std.mem.endsWith(u8, name, "_clock_getres")) {
+            if (self.regs.rsi != 0) {
+                if (self.guestMemory(self.regs.rsi, 16) == null) return .{ .unsupported = 14 };
+                self.write64(self.regs.rsi, 0);
+                self.write64(self.regs.rsi + 8, 1);
+            }
+            return .{ .handled = 0 };
+        }
+
+        if (std.mem.endsWith(u8, name, "_clock_gettime")) {
+            if (self.guestMemory(self.regs.rsi, 16) == null) return .{ .unsupported = 14 };
+            self.write64(self.regs.rsi, self.monotonic_nanoseconds / 1_000_000_000);
+            self.write64(self.regs.rsi + 8, self.monotonic_nanoseconds % 1_000_000_000);
+            self.monotonic_nanoseconds +%= 1_000_000;
+            return .{ .handled = 0 };
+        }
+
+        if (std.mem.endsWith(u8, name, "_gettimeofday")) {
+            if (self.guestMemory(self.regs.rdi, 16) == null) return .{ .unsupported = 14 };
+            const epoch_seconds: u64 = 1_719_000_000;
+            self.write64(self.regs.rdi, epoch_seconds + self.monotonic_nanoseconds / 1_000_000_000);
+            self.write64(self.regs.rdi + 8, (self.monotonic_nanoseconds % 1_000_000_000) / 1000);
+            self.monotonic_nanoseconds +%= 1_000_000;
+            return .{ .handled = 0 };
+        }
+
         if (std.mem.endsWith(u8, name, "_time")) {
             const now_i64: i64 = 1_719_000_000;
             const now: u64 = @bitCast(now_i64);
@@ -803,6 +1003,24 @@ pub const MachOState = struct {
                 }
             }
             return .{ .handled = now };
+        }
+
+        if (std.mem.eql(u8, name, "_open")) {
+            return .{ .handled = self.handleOpen() };
+        }
+        if (std.mem.eql(u8, name, "_write")) {
+            return .{ .handled = self.handleWrite() };
+        }
+        if (std.mem.eql(u8, name, "_close")) {
+            return .{ .handled = self.handleClose() };
+        }
+        if (std.mem.eql(u8, name, "_pthread_create")) {
+            if (self.guestMemory(self.regs.rdi, @sizeOf(u64)) == null) return .{ .unsupported = 14 };
+            self.write64(self.regs.rdi, self.compat.currentThreadHandle() + 1);
+            return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "_pthread_join") or std.mem.eql(u8, name, "_pthread_detach")) {
+            return .{ .handled = 0 };
         }
 
         if (std.mem.endsWith(u8, name, "_fopen")) {
@@ -933,6 +1151,48 @@ pub const MachOState = struct {
         self.import_trace_index = (self.import_trace_index + 1) % IMPORT_TRACE_BUFFER_LEN;
         if (self.import_trace_index == 0) self.import_trace_filled = true;
         self.unresolved_import_count += 1;
+    }
+
+    fn handleOpen(self: *MachOState) u64 {
+        const path = self.guestCString(self.regs.rdi, 4096) orelse return @bitCast(@as(i64, -1));
+        var path_buffer = std.ArrayList(u8).empty;
+        defer path_buffer.deinit(self.allocator);
+        path_buffer.appendSlice(self.allocator, path) catch return @bitCast(@as(i64, -1));
+        path_buffer.append(self.allocator, 0) catch return @bitCast(@as(i64, -1));
+
+        const host_fd = std.c.open(
+            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
+            @bitCast(@as(u32, @truncate(self.regs.rsi))),
+            @as(c_int, @intCast(self.regs.rdx & 0xFFFF)),
+        );
+        if (host_fd < 0) return @bitCast(@as(i64, -1));
+
+        var guest_fd: usize = @intCast(@max(self.next_guest_fd, 3));
+        while (guest_fd < self.guest_fds.len and self.guest_fds[guest_fd] >= 0) : (guest_fd += 1) {}
+        if (guest_fd >= self.guest_fds.len) {
+            _ = std.c.close(host_fd);
+            return @bitCast(@as(i64, -1));
+        }
+        self.guest_fds[guest_fd] = host_fd;
+        self.next_guest_fd = guest_fd + 1;
+        return guest_fd;
+    }
+
+    fn handleWrite(self: *MachOState) u64 {
+        const guest_fd: usize = @intCast(self.regs.rdi);
+        if (guest_fd >= self.guest_fds.len or self.guest_fds[guest_fd] < 0) return @bitCast(@as(i64, -1));
+        const bytes = self.guestMemoryConst(self.regs.rsi, self.regs.rdx) orelse return @bitCast(@as(i64, -1));
+        const written = std.c.write(self.guest_fds[guest_fd], bytes.ptr, bytes.len);
+        return if (written < 0) @bitCast(@as(i64, -1)) else @intCast(written);
+    }
+
+    fn handleClose(self: *MachOState) u64 {
+        const guest_fd: usize = @intCast(self.regs.rdi);
+        if (guest_fd >= self.guest_fds.len or self.guest_fds[guest_fd] < 0) return @bitCast(@as(i64, -1));
+        const result = std.c.close(self.guest_fds[guest_fd]);
+        self.guest_fds[guest_fd] = -1;
+        if (guest_fd < self.next_guest_fd) self.next_guest_fd = @max(guest_fd, 3);
+        return if (result == 0) 0 else @bitCast(@as(i64, -1));
     }
 
     fn hostWriteAll(self: *MachOState, file: *GuestFile, bytes: []const u8) bool {
@@ -1299,6 +1559,63 @@ pub const MachOState = struct {
         self.regs.rip = self.entry_point_vaddr;
     }
 
+    fn runInitializers(self: *MachOState) bool {
+        if (self.metadata.initializer_addresses.len == 0) return true;
+
+        const launch_regs = self.regs;
+        for (self.metadata.initializer_addresses, 0..) |address, index| {
+            if (!self.isExecutableAddress(address)) {
+                std.debug.print(
+                    "macho-processor: initializer [{d}/{d}] has invalid target 0x{x}\n",
+                    .{ index + 1, self.metadata.initializer_addresses.len, address },
+                );
+                self.faulted = true;
+                self.exit_code = 127;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+                self.terminated = true;
+                return false;
+            }
+
+            self.regs = launch_regs;
+            self.push(INITIALIZER_RETURN_SENTINEL);
+            self.regs.rip = address;
+
+            var steps: u64 = 0;
+            while (!self.terminated and self.regs.rip != INITIALIZER_RETURN_SENTINEL and steps < INITIALIZER_STEP_LIMIT) : (steps += 1) {
+                if (!self.step()) break;
+            }
+            if (self.terminated) {
+                const symbol = self.metadata.nearestSymbol(address);
+                std.debug.print(
+                    "macho-processor: initializer [{d}/{d}] failed at {s}+0x{x}\n",
+                    .{ index + 1, self.metadata.initializer_addresses.len, if (symbol) |item| item.name else "<unknown>", if (symbol) |item| item.offset else address },
+                );
+                return false;
+            }
+            if (self.regs.rip != INITIALIZER_RETURN_SENTINEL) {
+                const symbol = self.metadata.nearestSymbol(address);
+                std.debug.print(
+                    "macho-processor: initializer [{d}/{d}] exceeded {d} steps at {s}+0x{x}\n",
+                    .{ index + 1, self.metadata.initializer_addresses.len, INITIALIZER_STEP_LIMIT, if (symbol) |item| item.name else "<unknown>", if (symbol) |item| item.offset else address },
+                );
+                self.faulted = true;
+                self.exit_code = 124;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.max_steps_reached);
+                self.terminated = true;
+                return false;
+            }
+            if ((index + 1) % 50 == 0 or index + 1 == self.metadata.initializer_addresses.len) {
+                std.debug.print(
+                    "macho-processor: completed initializer {d}/{d}\n",
+                    .{ index + 1, self.metadata.initializer_addresses.len },
+                );
+            }
+        }
+
+        self.regs = launch_regs;
+        return true;
+    }
+
     fn decodeAt(self: *MachOState) ?DecodedInsn {
         const off = self.addrToOffset(self.regs.rip) orelse return null;
         const bytes = self.mem[off..];
@@ -1321,6 +1638,7 @@ pub const MachOState = struct {
     }
 
     fn step(self: *MachOState) bool {
+        if (self.handleBoundImportThunk()) return !self.terminated;
         if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
         if (self.handleStubHelperTransition()) {
             return !self.terminated;
@@ -1455,6 +1773,22 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn handleBoundImportThunk(self: *MachOState) bool {
+        if (self.regs.rip < BOUND_IMPORT_THUNK_BASE) return false;
+        for (self.bound_import_thunks) |thunk| {
+            if (thunk.address != self.regs.rip) continue;
+            self.handleDirectImportCall(.{
+                .name = thunk.name,
+                .dylib = thunk.dylib,
+                .stub_address = thunk.address,
+                .lazy_pointer_address = 0,
+                .symbol_index = 0,
+            });
+            return true;
+        }
+        return false;
+    }
+
     pub fn run(self: *MachOState) void {
         var steps: u64 = 0;
         const max_steps: u64 = 5_000_000;
@@ -1572,6 +1906,9 @@ pub const MachOState = struct {
         switch (d.op) {
             .invalid => unreachable,
             .nop => {},
+            .cmc => self.regs.rflags ^= RFL_CF,
+            .clc => self.regs.rflags &= ~RFL_CF,
+            .stc => self.regs.rflags |= RFL_CF,
 
             .mov_reg8_mem8 => {
                 self.setReg(d.dst_reg, .bits8, self.readMemVal(d.addr, .bits8));
@@ -1946,6 +2283,12 @@ pub const MachOState = struct {
                 self.setFlagsLogic(r, sz);
                 self.setFlag(RFL_CF, a != 0);
             },
+            .not_reg8, .not_reg16, .not_reg32, .not_reg64 => {
+                self.setReg(d.dst_reg, d.size, ~self.regVal(d.dst_reg, d.size));
+            },
+            .not_mem8, .not_mem16, .not_mem32, .not_mem64 => {
+                self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
+            },
 
             .push_reg => {
                 self.push(self.regVal(d.dst_reg, .bits64));
@@ -2115,6 +2458,8 @@ pub const MachOState = struct {
                 const b = self.regVal(d.dst_reg, .bits8);
                 const r = a * b;
                 self.setReg(.al_ax_eax_rax, .bits16, r);
+                self.setFlag(RFL_CF, r >> 8 != 0);
+                self.setFlag(RFL_OF, r >> 8 != 0);
             },
             .mul_reg16 => {
                 const a = self.regVal(.al_ax_eax_rax, .bits16);
@@ -2122,6 +2467,8 @@ pub const MachOState = struct {
                 const r: u32 = @as(u32, @truncate(a)) * @as(u32, @truncate(b));
                 self.setReg(.al_ax_eax_rax, .bits16, @truncate(r));
                 self.setReg(.dl_dx_edx_rdx, .bits16, @truncate(r >> 16));
+                self.setFlag(RFL_CF, r >> 16 != 0);
+                self.setFlag(RFL_OF, r >> 16 != 0);
             },
             .mul_reg32 => {
                 const a = self.regVal(.al_ax_eax_rax, .bits32);
@@ -2129,6 +2476,8 @@ pub const MachOState = struct {
                 const r: u64 = @as(u64, a) * @as(u64, b);
                 self.setReg(.al_ax_eax_rax, .bits32, @truncate(r));
                 self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(r >> 32));
+                self.setFlag(RFL_CF, r >> 32 != 0);
+                self.setFlag(RFL_OF, r >> 32 != 0);
             },
             .mul_reg64 => {
                 const a = self.regs.rax;
@@ -2137,10 +2486,12 @@ pub const MachOState = struct {
                 const r = @as(u128, a) * @as(u128, b);
                 self.regs.rax = @truncate(r);
                 self.regs.rdx = @truncate(r >> 64);
+                self.setFlag(RFL_CF, self.regs.rdx != 0);
+                self.setFlag(RFL_OF, self.regs.rdx != 0);
             },
 
-            .div_reg16 => {
-                const divisor: u16 = @truncate(self.regVal(d.dst_reg, .bits16));
+            .div_mem16, .div_reg16 => {
+                const divisor: u16 = @truncate(if (d.op == .div_mem16) self.readMemVal(d.addr, .bits16) else self.regVal(d.dst_reg, .bits16));
                 if (divisor == 0) return self.raiseDivideError();
                 const dividend = (@as(u32, @truncate(self.regs.rdx)) << 16) | @as(u16, @truncate(self.regs.rax));
                 const quotient = dividend / divisor;
@@ -2148,8 +2499,8 @@ pub const MachOState = struct {
                 self.setReg(.al_ax_eax_rax, .bits16, quotient);
                 self.setReg(.dl_dx_edx_rdx, .bits16, dividend % divisor);
             },
-            .div_reg32 => {
-                const divisor: u32 = @truncate(self.regVal(d.dst_reg, .bits32));
+            .div_mem32, .div_reg32 => {
+                const divisor: u32 = @truncate(if (d.op == .div_mem32) self.readMemVal(d.addr, .bits32) else self.regVal(d.dst_reg, .bits32));
                 if (divisor == 0) return self.raiseDivideError();
                 const dividend = (@as(u64, @truncate(self.regs.rdx)) << 32) | @as(u32, @truncate(self.regs.rax));
                 const quotient = dividend / divisor;
@@ -2157,8 +2508,8 @@ pub const MachOState = struct {
                 self.setReg(.al_ax_eax_rax, .bits32, quotient);
                 self.setReg(.dl_dx_edx_rdx, .bits32, dividend % divisor);
             },
-            .div_reg64 => {
-                const divisor = self.regVal(d.dst_reg, .bits64);
+            .div_mem64, .div_reg64 => {
+                const divisor = if (d.op == .div_mem64) self.readMemVal(d.addr, .bits64) else self.regVal(d.dst_reg, .bits64);
                 if (divisor == 0) return self.raiseDivideError();
                 const dividend = (@as(u128, self.regs.rdx) << 64) | self.regs.rax;
                 const quotient = dividend / divisor;
@@ -2166,8 +2517,9 @@ pub const MachOState = struct {
                 self.regs.rax = @truncate(quotient);
                 self.regs.rdx = @truncate(dividend % divisor);
             },
-            .idiv_reg16 => {
-                const divisor: i16 = @bitCast(@as(u16, @truncate(self.regVal(d.dst_reg, .bits16))));
+            .idiv_mem16, .idiv_reg16 => {
+                const raw_divisor = if (d.op == .idiv_mem16) self.readMemVal(d.addr, .bits16) else self.regVal(d.dst_reg, .bits16);
+                const divisor: i16 = @bitCast(@as(u16, @truncate(raw_divisor)));
                 if (divisor == 0) return self.raiseDivideError();
                 const dividend_bits = (@as(u32, @truncate(self.regs.rdx)) << 16) | @as(u16, @truncate(self.regs.rax));
                 const dividend: i32 = @bitCast(dividend_bits);
@@ -2177,8 +2529,9 @@ pub const MachOState = struct {
                 self.setReg(.al_ax_eax_rax, .bits16, @as(u16, @bitCast(@as(i16, @intCast(quotient)))));
                 self.setReg(.dl_dx_edx_rdx, .bits16, @as(u16, @bitCast(@as(i16, @intCast(remainder)))));
             },
-            .idiv_reg32 => {
-                const divisor: i32 = @bitCast(@as(u32, @truncate(self.regVal(d.dst_reg, .bits32))));
+            .idiv_mem32, .idiv_reg32 => {
+                const raw_divisor = if (d.op == .idiv_mem32) self.readMemVal(d.addr, .bits32) else self.regVal(d.dst_reg, .bits32);
+                const divisor: i32 = @bitCast(@as(u32, @truncate(raw_divisor)));
                 if (divisor == 0) return self.raiseDivideError();
                 const dividend_bits = (@as(u64, @truncate(self.regs.rdx)) << 32) | @as(u32, @truncate(self.regs.rax));
                 const dividend: i64 = @bitCast(dividend_bits);
@@ -2188,8 +2541,9 @@ pub const MachOState = struct {
                 self.setReg(.al_ax_eax_rax, .bits32, @as(u32, @bitCast(@as(i32, @intCast(quotient)))));
                 self.setReg(.dl_dx_edx_rdx, .bits32, @as(u32, @bitCast(@as(i32, @intCast(remainder)))));
             },
-            .idiv_reg64 => {
-                const divisor: i64 = @bitCast(self.regVal(d.dst_reg, .bits64));
+            .idiv_mem64, .idiv_reg64 => {
+                const raw_divisor = if (d.op == .idiv_mem64) self.readMemVal(d.addr, .bits64) else self.regVal(d.dst_reg, .bits64);
+                const divisor: i64 = @bitCast(raw_divisor);
                 if (divisor == 0) return self.raiseDivideError();
                 const dividend_bits = (@as(u128, self.regs.rdx) << 64) | self.regs.rax;
                 const dividend: i128 = @bitCast(dividend_bits);
@@ -2199,7 +2553,6 @@ pub const MachOState = struct {
                 self.regs.rax = @bitCast(@as(i64, @intCast(quotient)));
                 self.regs.rdx = @bitCast(@as(i64, @intCast(remainder)));
             },
-
             .imul_reg64_reg64, .imul_reg32_reg32 => {
                 const sz = if (d.op == .imul_reg64_reg64) Size.bits64 else Size.bits32;
                 const a = self.regVal(d.dst_reg, sz);
@@ -2444,6 +2797,93 @@ pub const MachOState = struct {
                 const converted: f64 = @floatFromInt(integer);
                 std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
             },
+            .vaddss, .vmulss, .vsubss, .vdivss => {
+                self.executeVexScalarF32(d, vexArithmeticForOp(d.op));
+            },
+            .vaddsd, .vmulsd, .vsubsd, .vdivsd => {
+                self.executeVexScalarF64(d, vexArithmeticForOp(d.op));
+            },
+            .vaddps, .vmulps, .vsubps, .vdivps => {
+                self.executeVexPackedF32(d, vexArithmeticForOp(d.op));
+            },
+            .vaddpd, .vmulpd, .vsubpd, .vdivpd => {
+                self.executeVexPackedF64(d, vexArithmeticForOp(d.op));
+            },
+            .vucomiss => {
+                const lhs: f32 = @bitCast(std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little));
+                const rhs_bits = if (d.is_reg_form)
+                    std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
+                else
+                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
+                self.setVexComparisonFlags(lhs, @as(f32, @bitCast(rhs_bits)));
+            },
+            .vucomisd => {
+                const lhs: f64 = @bitCast(std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
+                const rhs_bits = if (d.is_reg_form)
+                    std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
+                else
+                    self.readMemVal(d.addr, .bits64);
+                self.setVexComparisonFlags(lhs, @as(f64, @bitCast(rhs_bits)));
+            },
+            .vroundss => {
+                const source1 = self.xmm[d.xmm_src];
+                const source2_bits = if (d.is_reg_form)
+                    std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
+                else
+                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
+                self.xmm[d.xmm_dst] = source1;
+                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(roundVexFloat(f32, @bitCast(source2_bits), @truncate(d.imm))), .little);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            },
+            .vroundsd => {
+                const source1 = self.xmm[d.xmm_src];
+                const source2_bits = if (d.is_reg_form)
+                    std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
+                else
+                    self.readMemVal(d.addr, .bits64);
+                self.xmm[d.xmm_dst] = source1;
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(roundVexFloat(f64, @bitCast(source2_bits), @truncate(d.imm))), .little);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            },
+            .vroundps => {
+                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = roundVexPackedF32(source_low, @truncate(d.imm));
+                if (d.vector_256) {
+                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = roundVexPackedF32(source_high, @truncate(d.imm));
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vroundpd => {
+                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = roundVexPackedF64(source_low, @truncate(d.imm));
+                if (d.vector_256) {
+                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = roundVexPackedF64(source_high, @truncate(d.imm));
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vcvttss2si, .vcvtss2si => {
+                const source_bits = if (d.is_reg_form)
+                    std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little)
+                else
+                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
+                const source: f32 = @bitCast(source_bits);
+                self.setReg(d.dst_reg, d.size, convertVexFloatToSigned(f32, source, d.size, d.op == .vcvttss2si));
+            },
+            .vcvttsd2si, .vcvtsd2si => {
+                const source_bits = if (d.is_reg_form)
+                    std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little)
+                else
+                    self.readMemVal(d.addr, .bits64);
+                const source: f64 = @bitCast(source_bits);
+                self.setReg(d.dst_reg, d.size, convertVexFloatToSigned(f64, source, d.size, d.op == .vcvttsd2si));
+            },
+            .vandps, .vandpd, .vandnps, .vandnpd, .vorps, .vorpd, .vxorps, .vxorpd => {
+                self.executeVexBitwise(d, vexBitwiseForOp(d.op));
+            },
 
             .syscall => {
                 self.dispatchMacOSSyscall(
@@ -2493,6 +2933,87 @@ pub const MachOState = struct {
                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unimplemented_instruction);
                 self.terminated = true;
             },
+        }
+    }
+
+    fn executeVexScalarF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        const source1 = self.xmm[d.xmm_src];
+        const source2_bits = if (d.is_reg_form)
+            std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
+        else
+            @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
+        const source1_value: f32 = @bitCast(std.mem.readInt(u32, source1[0..4], .little));
+        const source2_value: f32 = @bitCast(source2_bits);
+
+        self.xmm[d.xmm_dst] = source1;
+        std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(applyVexArithmetic(f32, source1_value, source2_value, operation)), .little);
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+
+    fn executeVexScalarF64(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        const source1 = self.xmm[d.xmm_src];
+        const source2_bits = if (d.is_reg_form)
+            std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
+        else
+            self.readMemVal(d.addr, .bits64);
+        const source1_value: f64 = @bitCast(std.mem.readInt(u64, source1[0..8], .little));
+        const source2_value: f64 = @bitCast(source2_bits);
+
+        self.xmm[d.xmm_dst] = source1;
+        std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(applyVexArithmetic(f64, source1_value, source2_value, operation)), .little);
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+
+    fn executeVexPackedF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        const source1_low = self.xmm[d.xmm_src];
+        const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+        self.xmm[d.xmm_dst] = applyVexPackedF32(source1_low, source2_low, operation);
+
+        if (d.vector_256) {
+            const source1_high = self.ymm_hi[d.xmm_src];
+            const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+            self.ymm_hi[d.xmm_dst] = applyVexPackedF32(source1_high, source2_high, operation);
+        } else {
+            @memset(&self.ymm_hi[d.xmm_dst], 0);
+        }
+    }
+
+    fn executeVexPackedF64(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        const source1_low = self.xmm[d.xmm_src];
+        const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+        self.xmm[d.xmm_dst] = applyVexPackedF64(source1_low, source2_low, operation);
+
+        if (d.vector_256) {
+            const source1_high = self.ymm_hi[d.xmm_src];
+            const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+            self.ymm_hi[d.xmm_dst] = applyVexPackedF64(source1_high, source2_high, operation);
+        } else {
+            @memset(&self.ymm_hi[d.xmm_dst], 0);
+        }
+    }
+
+    fn setVexComparisonFlags(self: *MachOState, lhs: anytype, rhs: @TypeOf(lhs)) void {
+        self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
+        if (std.math.isNan(lhs) or std.math.isNan(rhs)) {
+            self.regs.rflags |= RFL_ZF | RFL_PF | RFL_CF;
+        } else if (lhs < rhs) {
+            self.regs.rflags |= RFL_CF;
+        } else if (lhs == rhs) {
+            self.regs.rflags |= RFL_ZF;
+        }
+    }
+
+    fn executeVexBitwise(self: *MachOState, d: DecodedInsn, operation: VexBitwise) void {
+        const source1_low = self.xmm[d.xmm_src];
+        const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+        self.xmm[d.xmm_dst] = applyVexBitwise(source1_low, source2_low, operation);
+
+        if (d.vector_256) {
+            const source1_high = self.ymm_hi[d.xmm_src];
+            const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+            self.ymm_hi[d.xmm_dst] = applyVexBitwise(source1_high, source2_high, operation);
+        } else {
+            @memset(&self.ymm_hi[d.xmm_dst], 0);
         }
     }
 
@@ -2651,6 +3172,25 @@ pub const MachOState = struct {
     }
 };
 
+fn nextPrime(n: u64) u64 {
+    if (n < 2) return 2;
+    var candidate = n;
+    if (candidate % 2 == 0) candidate += 1;
+    while (true) {
+        var is_prime = true;
+        var i: u64 = 3;
+        while (i * i <= candidate) {
+            if (candidate % i == 0) {
+                is_prime = false;
+                break;
+            }
+            i += 2;
+        }
+        if (is_prime) return candidate;
+        candidate += 2;
+    }
+}
+
 fn alignDown(value: u64, alignment: u64) u64 {
     return value & ~(alignment - 1);
 }
@@ -2767,6 +3307,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.guest_fds[2] = 2;
 
     state.setupMachOState(options.path, options.args);
+
+    std.debug.print("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
+    if (!state.runInitializers()) {
+        std.debug.print("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
+        return state.exit_code;
+    }
 
     std.debug.print("macho-processor: starting execution at 0x{x}, rsp=0x{x}\n", .{ state.regs.rip, state.regs.rsp });
 
@@ -2890,6 +3436,17 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
     if (opcode == 0x90) {
         d.op = .nop;
         d.len = @as(u8, @intCast(pos + 1));
+        return d;
+    }
+
+    if (opcode == 0xF5 or opcode == 0xF8 or opcode == 0xF9) {
+        d.op = switch (opcode) {
+            0xF5 => .cmc,
+            0xF8 => .clc,
+            0xF9 => .stc,
+            else => unreachable,
+        };
+        d.len = @intCast(pos + 1);
         return d;
     }
 
@@ -3280,11 +3837,100 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     const vector_256 = (vex & 0x04) != 0;
     const prefix = vex & 0x03;
 
-    if ((vex & 0x78) != 0x78) return .{};
-    if (opcode == 0x77 and !vector_256 and prefix == 0) {
+    if (opcode == 0x77 and (vex & 0x78) == 0x78 and !vector_256 and prefix == 0) {
         return .{ .op = .vzeroupper, .len = @intCast(start_pos + 3) };
     }
     if (start_pos + 3 >= bytes.len) return .{};
+
+    if (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or opcode == 0x5E) {
+        if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
+
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var arithmetic_pos = start_pos + 3;
+        const is_mem = bytes[arithmetic_pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &arithmetic_pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x58 => switch (prefix) {
+                0 => .vaddps,
+                1 => .vaddpd,
+                2 => .vaddss,
+                3 => .vaddsd,
+                else => unreachable,
+            },
+            0x59 => switch (prefix) {
+                0 => .vmulps,
+                1 => .vmulpd,
+                2 => .vmulss,
+                3 => .vmulsd,
+                else => unreachable,
+            },
+            0x5C => switch (prefix) {
+                0 => .vsubps,
+                1 => .vsubpd,
+                2 => .vsubss,
+                3 => .vsubsd,
+                else => unreachable,
+            },
+            0x5E => switch (prefix) {
+                0 => .vdivps,
+                1 => .vdivpd,
+                2 => .vdivss,
+                3 => .vdivsd,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        decoded.len = @intCast(arithmetic_pos);
+        return decoded;
+    }
+
+    if (opcode >= 0x54 and opcode <= 0x57 and (prefix == 0 or prefix == 1)) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var bitwise_pos = start_pos + 3;
+        const is_mem = bytes[bitwise_pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &bitwise_pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x54 => if (prefix == 0) .vandps else .vandpd,
+            0x55 => if (prefix == 0) .vandnps else .vandnpd,
+            0x56 => if (prefix == 0) .vorps else .vorpd,
+            0x57 => if (prefix == 0) .vxorps else .vxorpd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(bitwise_pos);
+        return decoded;
+    }
+
+    if ((opcode == 0x2E or opcode == 0x2F) and (vex & 0x78) == 0x78 and !vector_256 and (prefix == 0 or prefix == 1)) {
+        var decoded = DecodedInsn{};
+        var compare_pos = start_pos + 3;
+        const is_mem = bytes[compare_pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &compare_pos, rex_r, false, false, .bits64);
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = if (prefix == 0) .vucomiss else .vucomisd;
+        decoded.len = @intCast(compare_pos);
+        return decoded;
+    }
+
+    if ((vex & 0x78) != 0x78) return .{};
 
     var d = DecodedInsn{};
     var pos = start_pos + 3;
@@ -3412,36 +4058,227 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     return d;
 }
 
+const VexArithmetic = enum { add, multiply, subtract, divide };
+const VexBitwise = enum { @"and", and_not, @"or", xor };
+
+fn vexArithmeticForOp(op: Op) VexArithmetic {
+    return switch (op) {
+        .vaddss, .vaddsd, .vaddps, .vaddpd => .add,
+        .vmulss, .vmulsd, .vmulps, .vmulpd => .multiply,
+        .vsubss, .vsubsd, .vsubps, .vsubpd => .subtract,
+        .vdivss, .vdivsd, .vdivps, .vdivpd => .divide,
+        else => unreachable,
+    };
+}
+
+fn applyVexArithmetic(comptime Float: type, lhs: Float, rhs: Float, operation: VexArithmetic) Float {
+    return switch (operation) {
+        .add => lhs + rhs,
+        .multiply => lhs * rhs,
+        .subtract => lhs - rhs,
+        .divide => lhs / rhs,
+    };
+}
+
+fn vexBitwiseForOp(op: Op) VexBitwise {
+    return switch (op) {
+        .vandps, .vandpd => .@"and",
+        .vandnps, .vandnpd => .and_not,
+        .vorps, .vorpd => .@"or",
+        .vxorps, .vxorpd => .xor,
+        else => unreachable,
+    };
+}
+
+fn applyVexBitwise(lhs: [16]u8, rhs: [16]u8, operation: VexBitwise) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (&result, lhs, rhs) |*destination, left, right| {
+        destination.* = switch (operation) {
+            .@"and" => left & right,
+            .and_not => ~left & right,
+            .@"or" => left | right,
+            .xor => left ^ right,
+        };
+    }
+    return result;
+}
+
+fn applyVexPackedF32(lhs: [16]u8, rhs: [16]u8, operation: VexArithmetic) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const lhs_value: f32 = @bitCast(std.mem.readInt(u32, lhs[offset..][0..4], .little));
+        const rhs_value: f32 = @bitCast(std.mem.readInt(u32, rhs[offset..][0..4], .little));
+        std.mem.writeInt(u32, result[offset..][0..4], @bitCast(applyVexArithmetic(f32, lhs_value, rhs_value, operation)), .little);
+    }
+    return result;
+}
+
+fn applyVexPackedF64(lhs: [16]u8, rhs: [16]u8, operation: VexArithmetic) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..2) |lane| {
+        const offset = lane * 8;
+        const lhs_value: f64 = @bitCast(std.mem.readInt(u64, lhs[offset..][0..8], .little));
+        const rhs_value: f64 = @bitCast(std.mem.readInt(u64, rhs[offset..][0..8], .little));
+        std.mem.writeInt(u64, result[offset..][0..8], @bitCast(applyVexArithmetic(f64, lhs_value, rhs_value, operation)), .little);
+    }
+    return result;
+}
+
+fn roundVexFloat(comptime Float: type, value: Float, immediate: u8) Float {
+    if (std.math.isNan(value) or std.math.isInf(value)) return value;
+    const mode: u2 = if (immediate & 0x04 != 0) 0 else @truncate(immediate);
+    return switch (mode) {
+        0 => roundNearestEven(Float, value),
+        1 => @floor(value),
+        2 => @ceil(value),
+        3 => @trunc(value),
+    };
+}
+
+fn roundNearestEven(comptime Float: type, value: Float) Float {
+    const lower = @floor(value);
+    const fraction = value - lower;
+    const half: Float = 0.5;
+    if (fraction < half) return lower;
+    if (fraction > half) return lower + 1.0;
+    return if (@mod(lower, 2.0) == 0.0) lower else lower + 1.0;
+}
+
+fn roundVexPackedF32(source: [16]u8, immediate: u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const value: f32 = @bitCast(std.mem.readInt(u32, source[offset..][0..4], .little));
+        std.mem.writeInt(u32, result[offset..][0..4], @bitCast(roundVexFloat(f32, value, immediate)), .little);
+    }
+    return result;
+}
+
+fn roundVexPackedF64(source: [16]u8, immediate: u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..2) |lane| {
+        const offset = lane * 8;
+        const value: f64 = @bitCast(std.mem.readInt(u64, source[offset..][0..8], .little));
+        std.mem.writeInt(u64, result[offset..][0..8], @bitCast(roundVexFloat(f64, value, immediate)), .little);
+    }
+    return result;
+}
+
+fn convertVexFloatToSigned(comptime Float: type, value: Float, size: Size, truncate: bool) u64 {
+    const rounded = if (truncate) @trunc(value) else roundNearestEven(Float, value);
+    if (std.math.isNan(rounded)) return integerIndefinite(size);
+
+    return switch (size) {
+        .bits32 => blk: {
+            const minimum: Float = -2147483648.0;
+            const maximum_exclusive: Float = 2147483648.0;
+            if (rounded < minimum or rounded >= maximum_exclusive) break :blk integerIndefinite(size);
+            const signed: i32 = @intFromFloat(rounded);
+            break :blk @as(u32, @bitCast(signed));
+        },
+        .bits64 => blk: {
+            const minimum: Float = -9223372036854775808.0;
+            const maximum_exclusive: Float = 9223372036854775808.0;
+            if (rounded < minimum or rounded >= maximum_exclusive) break :blk integerIndefinite(size);
+            const signed: i64 = @intFromFloat(rounded);
+            break :blk @bitCast(signed);
+        },
+        else => unreachable,
+    };
+}
+
+fn integerIndefinite(size: Size) u64 {
+    return if (size == .bits64) @as(u64, 1) << 63 else @as(u64, 1) << 31;
+}
+
 fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     if (start_pos + 5 > bytes.len) return .{};
     const vex_map = bytes[start_pos + 1];
     const vex_control = bytes[start_pos + 2];
     const opcode = bytes[start_pos + 3];
-    if (vex_map & 0x1F != 1 or opcode != 0x2A) return .{};
-
+    const opcode_map = vex_map & 0x1F;
     const rex_r = (vex_map & 0x80) == 0;
     const rex_x = (vex_map & 0x40) == 0;
     const rex_b = (vex_map & 0x20) == 0;
     const rex_w = (vex_control & 0x80) != 0;
     const vector_256 = (vex_control & 0x04) != 0;
     const prefix = vex_control & 0x03;
-    if (vector_256 or (prefix != 2 and prefix != 3)) return .{};
 
-    var decoded = DecodedInsn{ .size = if (rex_w) .bits64 else .bits32 };
-    var pos = start_pos + 4;
-    const is_mem = bytes[pos] < 0xC0;
-    const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, decoded.size);
-    decoded.xmm_dst = @intFromEnum(rm.reg);
-    decoded.xmm_src = @as(u8, @truncate((~vex_control >> 3) & 0x0F));
-    if (is_mem) {
-        decoded.addr = rm.addr;
-        decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_mem else .vcvtsi2sd_xmm_mem;
-    } else {
-        decoded.src_reg = @enumFromInt(rm.addr);
-        decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_reg else .vcvtsi2sd_xmm_reg;
+    if (opcode_map == 1 and opcode == 0x2A) {
+        if (vector_256 or (prefix != 2 and prefix != 3)) return .{};
+
+        var decoded = DecodedInsn{ .size = if (rex_w) .bits64 else .bits32 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, decoded.size);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @as(u8, @truncate((~vex_control >> 3) & 0x0F));
+        if (is_mem) {
+            decoded.addr = rm.addr;
+            decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_mem else .vcvtsi2sd_xmm_mem;
+        } else {
+            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_reg else .vcvtsi2sd_xmm_reg;
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
     }
-    decoded.len = @intCast(pos);
-    return decoded;
+
+    if (opcode_map == 1 and (opcode == 0x2C or opcode == 0x2D)) {
+        if (vector_256 or (prefix != 2 and prefix != 3) or (vex_control & 0x78) != 0x78) return .{};
+
+        var decoded = DecodedInsn{ .size = if (rex_w) .bits64 else .bits32 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, decoded.size);
+        decoded.dst_reg = rm.reg;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src = @intCast(rm.addr);
+        }
+        decoded.op = if (opcode == 0x2C)
+            if (prefix == 2) .vcvttss2si else .vcvttsd2si
+        else if (prefix == 2)
+            .vcvtss2si
+        else
+            .vcvtsd2si;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 3 and opcode >= 0x08 and opcode <= 0x0B and prefix == 1) {
+        const is_scalar = opcode == 0x0A or opcode == 0x0B;
+        if (is_scalar and vector_256) return .{};
+        if (!is_scalar and (vex_control & 0x78) != 0x78) return .{};
+
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        if (pos >= bytes.len) return .{};
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.op = switch (opcode) {
+            0x08 => .vroundps,
+            0x09 => .vroundpd,
+            0x0A => .vroundss,
+            0x0B => .vroundsd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    return .{};
 }
 
 fn decodeAccumulatorImmediate(bytes: []const u8, opcode_pos: usize, rex_w: bool, has_66: bool, op: Op) DecodedInsn {
@@ -3485,6 +4322,22 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
         _ = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits32);
         d.op = .nop;
         d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
+    if (opcode2 >= 0x40 and opcode2 <= 0x4F) {
+        if (pos.* >= bytes.len) return .{};
+        const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, d.size);
+        d.dst_reg = rm.reg;
+        d.cond = @enumFromInt(@as(u4, @truncate(opcode2 & 0x0F)));
+        if (d.is_reg_form) {
+            d.op = .cmovcc_reg_reg;
+            d.src_reg = @enumFromInt(rm.addr);
+        } else {
+            d.op = .cmovcc_reg_mem;
+            d.addr = rm.addr;
+        }
+        d.len = @intCast(pos.*);
         return d;
     }
 
@@ -4140,17 +4993,40 @@ fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, r
     const sz: Size = if (opcode == 0xF6) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
-    if (group == 6 and !is_mem and sz != .bits8) {
-        d.op = @enumFromInt(@intFromEnum(Op.div_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+    if (group == 2) {
+        const base_op: Op = if (is_mem) .not_mem8 else .not_reg8;
+        d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+        d.size = sz;
+        if (is_mem) {
+            d.addr = rm.addr;
+        } else {
+            d.dst_reg = @enumFromInt(rm.addr);
+        }
+        d.len = @intCast(pos);
+        return d;
+    }
+
+    if (group == 4 and !is_mem) {
+        d.op = @enumFromInt(@intFromEnum(Op.mul_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
         d.dst_reg = @enumFromInt(rm.addr);
         d.len = @intCast(pos);
         return d;
     }
-    if (group == 7 and !is_mem and sz != .bits8) {
-        d.op = @enumFromInt(@intFromEnum(Op.idiv_reg8) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+
+    if (group == 6 and sz != .bits8) {
+        const base_op: Op = if (is_mem) .div_mem8 else .div_reg8;
+        d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
-        d.dst_reg = @enumFromInt(rm.addr);
+        if (is_mem) d.addr = rm.addr else d.dst_reg = @enumFromInt(rm.addr);
+        d.len = @intCast(pos);
+        return d;
+    }
+    if (group == 7 and sz != .bits8) {
+        const base_op: Op = if (is_mem) .idiv_mem8 else .idiv_reg8;
+        d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+        d.size = sz;
+        if (is_mem) d.addr = rm.addr else d.dst_reg = @enumFromInt(rm.addr);
         d.len = @intCast(pos);
         return d;
     }
@@ -4893,6 +5769,109 @@ test "decode three-byte VEX signed integer scalar conversions" {
     try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, to_double.sib_base_reg);
 }
 
+test "decode VEX scalar and packed arithmetic" {
+    const boundary = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x58, 0xC0 });
+    try std.testing.expectEqual(Op.vaddss, boundary.op);
+    try std.testing.expectEqual(@as(u8, 0), boundary.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), boundary.xmm_src);
+    try std.testing.expectEqual(@as(u8, 0), boundary.xmm_src2);
+    try std.testing.expect(boundary.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), boundary.len);
+
+    const packed_256 = decodeInsn(&[_]u8{ 0xC5, 0xEC, 0x59, 0xCB });
+    try std.testing.expectEqual(Op.vmulps, packed_256.op);
+    try std.testing.expectEqual(@as(u8, 1), packed_256.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), packed_256.xmm_src);
+    try std.testing.expectEqual(@as(u8, 3), packed_256.xmm_src2);
+    try std.testing.expect(packed_256.vector_256);
+
+    const scalar_memory = decodeInsn(&[_]u8{ 0xC5, 0xEB, 0x5E, 0x08 });
+    try std.testing.expectEqual(Op.vdivsd, scalar_memory.op);
+    try std.testing.expectEqual(@as(u8, 1), scalar_memory.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), scalar_memory.xmm_src);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, scalar_memory.sib_base_reg);
+    try std.testing.expect(!scalar_memory.is_reg_form);
+}
+
+test "decode VEX bitwise vector operations" {
+    const zero = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x57, 0xC0 });
+    try std.testing.expectEqual(Op.vxorps, zero.op);
+    try std.testing.expectEqual(@as(u8, 0), zero.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), zero.xmm_src);
+    try std.testing.expectEqual(@as(u8, 0), zero.xmm_src2);
+    try std.testing.expect(!zero.vector_256);
+
+    const and_not_256 = decodeInsn(&[_]u8{ 0xC5, 0xED, 0x55, 0x08 });
+    try std.testing.expectEqual(Op.vandnpd, and_not_256.op);
+    try std.testing.expectEqual(@as(u8, 1), and_not_256.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), and_not_256.xmm_src);
+    try std.testing.expect(and_not_256.vector_256);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, and_not_256.sib_base_reg);
+}
+
+test "decode VEX unordered scalar comparisons" {
+    const single = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x2E, 0xC1 });
+    try std.testing.expectEqual(Op.vucomiss, single.op);
+    try std.testing.expectEqual(@as(u8, 0), single.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), single.xmm_src2);
+    try std.testing.expect(single.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), single.len);
+
+    const double_memory = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x2F, 0x08 });
+    try std.testing.expectEqual(Op.vucomisd, double_memory.op);
+    try std.testing.expectEqual(@as(u8, 1), double_memory.xmm_src);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, double_memory.sib_base_reg);
+    try std.testing.expect(!double_memory.is_reg_form);
+}
+
+test "decode VEX scalar and packed rounding" {
+    const ceiling = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x0A, 0xC1, 0x0A });
+    try std.testing.expectEqual(Op.vroundss, ceiling.op);
+    try std.testing.expectEqual(@as(u8, 0), ceiling.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), ceiling.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), ceiling.xmm_src2);
+    try std.testing.expectEqual(@as(u64, 0x0A), ceiling.imm);
+    try std.testing.expectEqual(@as(u8, 6), ceiling.len);
+
+    const packed_round = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x7D, 0x08, 0x00, 0x03 });
+    try std.testing.expectEqual(Op.vroundps, packed_round.op);
+    try std.testing.expect(packed_round.vector_256);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, packed_round.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 3), packed_round.imm);
+}
+
+test "VEX rounding modes include ties-to-even" {
+    try std.testing.expectEqual(@as(f32, 2.0), roundVexFloat(f32, 2.5, 0));
+    try std.testing.expectEqual(@as(f32, 4.0), roundVexFloat(f32, 3.5, 0));
+    try std.testing.expectEqual(@as(f32, -3.0), roundVexFloat(f32, -2.1, 1));
+    try std.testing.expectEqual(@as(f32, -2.0), roundVexFloat(f32, -2.1, 2));
+    try std.testing.expectEqual(@as(f32, -2.0), roundVexFloat(f32, -2.9, 3));
+}
+
+test "decode VEX scalar float to signed integer conversions" {
+    const truncate_to_64 = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xFA, 0x2C, 0xC1 });
+    try std.testing.expectEqual(Op.vcvttss2si, truncate_to_64.op);
+    try std.testing.expectEqual(Size.bits64, truncate_to_64.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, truncate_to_64.dst_reg);
+    try std.testing.expectEqual(@as(u8, 1), truncate_to_64.xmm_src);
+    try std.testing.expect(truncate_to_64.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), truncate_to_64.len);
+
+    const round_double_memory = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x7B, 0x2D, 0x08 });
+    try std.testing.expectEqual(Op.vcvtsd2si, round_double_memory.op);
+    try std.testing.expectEqual(Size.bits32, round_double_memory.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, round_double_memory.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, round_double_memory.sib_base_reg);
+}
+
+test "VEX float to signed conversion handles rounding and overflow" {
+    try std.testing.expectEqual(@as(u64, 3), convertVexFloatToSigned(f32, 3.9, .bits64, true));
+    try std.testing.expectEqual(@as(u64, 4), convertVexFloatToSigned(f32, 3.5, .bits64, false));
+    try std.testing.expectEqual(@as(u64, 2), convertVexFloatToSigned(f32, 2.5, .bits64, false));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000), convertVexFloatToSigned(f64, std.math.nan(f64), .bits32, true));
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), convertVexFloatToSigned(f64, 1.0e30, .bits64, true));
+}
+
 test "decode MOVSXD from memory" {
     const decoded = decodeInsn(&[_]u8{ 0x48, 0x63, 0x09 });
     try std.testing.expectEqual(Op.movsxd_reg64_mem32, decoded.op);
@@ -4924,6 +5903,97 @@ test "decode signed and unsigned 32-bit register division" {
     const unsigned = decodeInsn(&[_]u8{ 0xF7, 0xF1 });
     try std.testing.expectEqual(Op.div_reg32, unsigned.op);
     try std.testing.expectEqual(Size.bits32, unsigned.size);
+}
+
+test "decode signed and unsigned memory division" {
+    const unsigned = decodeInsn(&[_]u8{ 0x48, 0xF7, 0x75, 0xF8 });
+    try std.testing.expectEqual(Op.div_mem64, unsigned.op);
+    try std.testing.expectEqual(Size.bits64, unsigned.size);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, unsigned.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 7), unsigned.addr);
+    try std.testing.expectEqual(@as(u8, 4), unsigned.len);
+
+    const signed = decodeInsn(&[_]u8{ 0xF7, 0x7B, 0x10 });
+    try std.testing.expectEqual(Op.idiv_mem32, signed.op);
+    try std.testing.expectEqual(Size.bits32, signed.size);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, signed.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x10), signed.addr);
+    try std.testing.expectEqual(@as(u8, 3), signed.len);
+}
+
+test "decode group three NOT register and memory forms" {
+    const register = decodeInsn(&[_]u8{ 0xF6, 0xD1 });
+    try std.testing.expectEqual(Op.not_reg8, register.op);
+    try std.testing.expectEqual(Size.bits8, register.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, register.dst_reg);
+    try std.testing.expectEqual(@as(u8, 2), register.len);
+
+    const memory = decodeInsn(&[_]u8{ 0x48, 0xF7, 0x55, 0xF8 });
+    try std.testing.expectEqual(Op.not_mem64, memory.op);
+    try std.testing.expectEqual(Size.bits64, memory.size);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -8))), memory.addr);
+}
+
+test "decode group three unsigned multiply register widths" {
+    const multiply64 = decodeInsn(&[_]u8{ 0x48, 0xF7, 0xE1 });
+    try std.testing.expectEqual(Op.mul_reg64, multiply64.op);
+    try std.testing.expectEqual(Size.bits64, multiply64.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, multiply64.dst_reg);
+    try std.testing.expectEqual(@as(u8, 3), multiply64.len);
+
+    const multiply8 = decodeInsn(&[_]u8{ 0xF6, 0xE2 });
+    try std.testing.expectEqual(Op.mul_reg8, multiply8.op);
+    try std.testing.expectEqual(Size.bits8, multiply8.size);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, multiply8.dst_reg);
+}
+
+test "decode carry flag control instructions" {
+    try std.testing.expectEqual(Op.cmc, decodeInsn(&[_]u8{0xF5}).op);
+    try std.testing.expectEqual(Op.clc, decodeInsn(&[_]u8{0xF8}).op);
+    try std.testing.expectEqual(Op.stc, decodeInsn(&[_]u8{0xF9}).op);
+}
+
+test "decode conditional moves without losing the ModRM byte" {
+    const register = decodeInsn(&[_]u8{ 0x0F, 0x42, 0xC1 });
+    try std.testing.expectEqual(Op.cmovcc_reg_reg, register.op);
+    try std.testing.expectEqual(Cond.b, register.cond);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, register.dst_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, register.src_reg);
+    try std.testing.expectEqual(@as(u8, 3), register.len);
+
+    const memory = decodeInsn(&[_]u8{ 0x48, 0x0F, 0x45, 0x45, 0xF8 });
+    try std.testing.expectEqual(Op.cmovcc_reg_mem, memory.op);
+    try std.testing.expectEqual(Cond.ne, memory.cond);
+    try std.testing.expectEqual(Size.bits64, memory.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, memory.dst_reg);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 7), memory.addr);
+    try std.testing.expectEqual(@as(u8, 5), memory.len);
+}
+
+test "dyld data bindings only materialize callable constant slots" {
+    const constant_section = macho_metadata.Section{
+        .name = "__const",
+        .segment_name = "__DATA_CONST",
+        .address = 0x1000,
+        .size = 0x100,
+        .file_offset = 0,
+        .flags = 0,
+        .indirect_symbol_start = 0,
+        .stub_size = 0,
+    };
+    var got_section = constant_section;
+    got_section.name = "__got";
+
+    try std.testing.expect(MachOState.isCallableConstantBinding(
+        constant_section,
+        "__ZNKSt3__123__match_any_but_newlineIcE6__execERNS_7__stateIcEE",
+        false,
+    ));
+    try std.testing.expect(MachOState.isCallableConstantBinding(constant_section, "_strcmp", true));
+    try std.testing.expect(!MachOState.isCallableConstantBinding(constant_section, "__ZTVN10__cxxabiv117__class_type_infoE", false));
+    try std.testing.expect(!MachOState.isCallableConstantBinding(got_section, "_strcmp", true));
 }
 
 test "decode compiler long NOP with segment override" {
