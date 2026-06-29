@@ -476,6 +476,13 @@ pub const FileIoContracts = struct {
                 },
             },
             Contract{
+                .name = "ftruncate",
+                .description = "Resize an open file",
+                .kind = .posix_file_io,
+                .strategy = .forward_to_host,
+                .matches = &.{MatchPattern{ .exact = "_ftruncate" }},
+            },
+            Contract{
                 .name = "opendir",
                 .description = "Open a directory",
                 .kind = .posix_file_io,
