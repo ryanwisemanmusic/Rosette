@@ -1051,6 +1051,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("x64_interpreter", x64_interpreter_mod);
         macho_processor_mod.addImport("macho_runtime", macho_runtime_mod);
         macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        macho_processor_mod.addImport("contract", contract_mod);
         const macho_processor = b.addExecutable(.{
             .name = "macho_processor",
             .root_module = macho_processor_mod,
@@ -1067,6 +1068,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("x64_interpreter", x64_interpreter_mod);
         macho_processor_test_mod.addImport("macho_runtime", macho_runtime_mod);
         macho_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        macho_processor_test_mod.addImport("contract", contract_mod);
         const macho_processor_test = b.addTest(.{ .root_module = macho_processor_test_mod });
         check_step.dependOn(&macho_processor_test.step);
     }
