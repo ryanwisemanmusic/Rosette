@@ -15,6 +15,11 @@ const MACH_HEADER_64_SIZE: usize = 32;
 const SEGMENT_COMMAND_64_SIZE: usize = 72;
 const SECTION_64_SIZE: usize = 80;
 const NLIST_64_SIZE: usize = 16;
+const POINTER_SIZE: u64 = @sizeOf(u64);
+
+const BIND_OPCODE_MASK: u8 = 0xF0;
+const BIND_IMMEDIATE_MASK: u8 = 0x0F;
+const BIND_TYPE_POINTER: u8 = 1;
 
 pub const Section = struct {
     name: []const u8,
@@ -35,6 +40,13 @@ pub const ImportedSymbol = struct {
     symbol_index: u32,
 };
 
+pub const DataBinding = struct {
+    address: u64,
+    name: []const u8,
+    dylib: []const u8,
+    addend: i64,
+};
+
 pub const SymbolMatch = struct {
     name: []const u8,
     address: u64,
@@ -53,15 +65,28 @@ const Dysymtab = struct {
     indirect_symbol_count: u32,
 };
 
+const DyldInfo = struct {
+    bind_offset: u32,
+    bind_size: u32,
+    weak_bind_offset: u32,
+    weak_bind_size: u32,
+    lazy_bind_offset: u32,
+    lazy_bind_size: u32,
+};
+
 pub const Metadata = struct {
     allocator: std.mem.Allocator,
     data: []const u8,
     sections: []Section,
+    segment_addresses: []u64,
     dylibs: [][]const u8,
     imports: []ImportedSymbol,
+    bindings: []DataBinding,
     initializer_count: usize,
+    initializer_addresses: []u64,
     symtab: ?Symtab,
     dysymtab: ?Dysymtab,
+    dyld_info: ?DyldInfo,
 
     pub fn init(allocator: std.mem.Allocator, data: []const u8) !Metadata {
         if (data.len < MACH_HEADER_64_SIZE) return error.TruncatedMachO;
@@ -71,9 +96,12 @@ pub const Metadata = struct {
         errdefer sections.deinit(allocator);
         var dylibs: std.ArrayList([]const u8) = .empty;
         errdefer dylibs.deinit(allocator);
+        var segment_addresses: std.ArrayList(u64) = .empty;
+        errdefer segment_addresses.deinit(allocator);
 
         var symtab: ?Symtab = null;
         var dysymtab: ?Dysymtab = null;
+        var dyld_info: ?DyldInfo = null;
         var initializer_count: usize = 0;
         const command_count = readU32(data, 16);
         const command_bytes = readU32(data, 20);
@@ -89,6 +117,7 @@ pub const Metadata = struct {
             switch (command) {
                 macho.LC_SEGMENT_64 => {
                     if (command_size >= SEGMENT_COMMAND_64_SIZE) {
+                        try segment_addresses.append(allocator, readU64(data, command_offset + 24));
                         const section_count = readU32(data, command_offset + 64);
                         var section_offset = command_offset + SEGMENT_COMMAND_64_SIZE;
                         var section_index: u32 = 0;
@@ -142,7 +171,18 @@ pub const Metadata = struct {
                         }
                     }
                 },
-                LC_DYLD_INFO_ONLY => {},
+                LC_DYLD_INFO_ONLY => {
+                    if (command_size >= 48) {
+                        dyld_info = .{
+                            .bind_offset = readU32(data, command_offset + 16),
+                            .bind_size = readU32(data, command_offset + 20),
+                            .weak_bind_offset = readU32(data, command_offset + 24),
+                            .weak_bind_size = readU32(data, command_offset + 28),
+                            .lazy_bind_offset = readU32(data, command_offset + 32),
+                            .lazy_bind_size = readU32(data, command_offset + 36),
+                        };
+                    }
+                },
                 else => {},
             }
             command_offset += command_size;
@@ -152,27 +192,45 @@ pub const Metadata = struct {
             .allocator = allocator,
             .data = data,
             .sections = try sections.toOwnedSlice(allocator),
+            .segment_addresses = try segment_addresses.toOwnedSlice(allocator),
             .dylibs = try dylibs.toOwnedSlice(allocator),
             .imports = &.{},
+            .bindings = &.{},
             .initializer_count = initializer_count,
+            .initializer_addresses = &.{},
             .symtab = symtab,
             .dysymtab = dysymtab,
+            .dyld_info = dyld_info,
         };
         errdefer metadata.deinit();
         metadata.imports = try metadata.collectImports();
+        metadata.bindings = try metadata.collectBindings();
+        metadata.initializer_addresses = try metadata.collectInitializers();
         return metadata;
     }
 
     pub fn deinit(self: *Metadata) void {
         self.allocator.free(self.sections);
+        self.allocator.free(self.segment_addresses);
         self.allocator.free(self.dylibs);
         if (self.imports.len != 0) self.allocator.free(self.imports);
+        if (self.bindings.len != 0) self.allocator.free(self.bindings);
+        if (self.initializer_addresses.len != 0) self.allocator.free(self.initializer_addresses);
         self.* = undefined;
     }
 
     pub fn importAtStub(self: *const Metadata, address: u64) ?ImportedSymbol {
         for (self.imports) |imported| {
             if (imported.stub_address == address) return imported;
+        }
+        return null;
+    }
+
+    pub fn sectionAtAddress(self: *const Metadata, address: u64) ?Section {
+        for (self.sections) |section| {
+            if (address >= section.address and address - section.address < section.size) {
+                return section;
+            }
         }
         return null;
     }
@@ -238,6 +296,136 @@ pub const Metadata = struct {
         return imports.toOwnedSlice(self.allocator);
     }
 
+    fn collectBindings(self: *const Metadata) ![]DataBinding {
+        const info = self.dyld_info orelse return &.{};
+        var bindings: std.ArrayList(DataBinding) = .empty;
+        errdefer bindings.deinit(self.allocator);
+
+        try self.collectBindingStream(&bindings, info.bind_offset, info.bind_size, false, 0);
+        try self.collectBindingStream(&bindings, info.weak_bind_offset, info.weak_bind_size, false, 0xFF);
+        return bindings.toOwnedSlice(self.allocator);
+    }
+
+    fn collectInitializers(self: *const Metadata) ![]u64 {
+        var initializers: std.ArrayList(u64) = .empty;
+        errdefer initializers.deinit(self.allocator);
+
+        for (self.sections) |section| {
+            if (!std.mem.eql(u8, section.name, "__mod_init_func")) continue;
+            const count = section.size / POINTER_SIZE;
+            var index: u64 = 0;
+            while (index < count) : (index += 1) {
+                const file_offset = @as(u64, section.file_offset) + index * POINTER_SIZE;
+                if (file_offset > self.data.len) break;
+                const offset: usize = @intCast(file_offset);
+                if (self.data.len - offset < @sizeOf(u64)) break;
+                const address = readU64(self.data, offset);
+                if (address != 0) try initializers.append(self.allocator, address);
+            }
+        }
+        return initializers.toOwnedSlice(self.allocator);
+    }
+
+    fn collectBindingStream(
+        self: *const Metadata,
+        bindings: *std.ArrayList(DataBinding),
+        stream_offset: u32,
+        stream_size: u32,
+        lazy: bool,
+        default_ordinal: u8,
+    ) !void {
+        if (stream_size == 0) return;
+        const start: usize = stream_offset;
+        const size: usize = stream_size;
+        if (start > self.data.len or size > self.data.len - start) return;
+        const stream = self.data[start .. start + size];
+
+        var position: usize = 0;
+        var segment_index: usize = 0;
+        var address: u64 = 0;
+        var symbol: []const u8 = "";
+        var ordinal = default_ordinal;
+        var bind_type: u8 = BIND_TYPE_POINTER;
+        var addend: i64 = 0;
+
+        while (position < stream.len) {
+            const byte = stream[position];
+            position += 1;
+            const opcode = byte & BIND_OPCODE_MASK;
+            const immediate = byte & BIND_IMMEDIATE_MASK;
+
+            switch (opcode) {
+                0x00 => {
+                    if (!lazy) break;
+                    segment_index = 0;
+                    address = 0;
+                    symbol = "";
+                    ordinal = default_ordinal;
+                    bind_type = BIND_TYPE_POINTER;
+                    addend = 0;
+                },
+                0x10 => ordinal = immediate,
+                0x20 => ordinal = @truncate(readUleb(stream, &position) orelse return),
+                0x30 => ordinal = if (immediate == 0) 0 else immediate | 0xF0,
+                0x40 => {
+                    const symbol_start = position;
+                    const symbol_length = std.mem.indexOfScalar(u8, stream[symbol_start..], 0) orelse return;
+                    symbol = stream[symbol_start .. symbol_start + symbol_length];
+                    position = symbol_start + symbol_length + 1;
+                },
+                0x50 => bind_type = immediate,
+                0x60 => addend = readSleb(stream, &position) orelse return,
+                0x70 => {
+                    segment_index = immediate;
+                    const offset = readUleb(stream, &position) orelse return;
+                    if (segment_index >= self.segment_addresses.len) return;
+                    address = self.segment_addresses[segment_index] +% offset;
+                },
+                0x80 => address +%= readUleb(stream, &position) orelse return,
+                0x90 => {
+                    try self.appendBinding(bindings, address, symbol, ordinal, bind_type, addend);
+                    address +%= POINTER_SIZE;
+                },
+                0xA0 => {
+                    try self.appendBinding(bindings, address, symbol, ordinal, bind_type, addend);
+                    address +%= POINTER_SIZE +% (readUleb(stream, &position) orelse return);
+                },
+                0xB0 => {
+                    try self.appendBinding(bindings, address, symbol, ordinal, bind_type, addend);
+                    address +%= POINTER_SIZE +% @as(u64, immediate) * POINTER_SIZE;
+                },
+                0xC0 => {
+                    const count = readUleb(stream, &position) orelse return;
+                    const skip = readUleb(stream, &position) orelse return;
+                    var index: u64 = 0;
+                    while (index < count) : (index += 1) {
+                        try self.appendBinding(bindings, address, symbol, ordinal, bind_type, addend);
+                        address +%= POINTER_SIZE +% skip;
+                    }
+                },
+                else => return,
+            }
+        }
+    }
+
+    fn appendBinding(
+        self: *const Metadata,
+        bindings: *std.ArrayList(DataBinding),
+        address: u64,
+        symbol: []const u8,
+        ordinal: u8,
+        bind_type: u8,
+        addend: i64,
+    ) !void {
+        if (bind_type != BIND_TYPE_POINTER or symbol.len == 0 or address == 0) return;
+        try bindings.append(self.allocator, .{
+            .address = address,
+            .name = symbol,
+            .dylib = self.dylibForOrdinal(ordinal),
+            .addend = addend,
+        });
+    }
+
     fn symbolName(self: *const Metadata, table: Symtab, string_index: u32) ?[]const u8 {
         if (string_index >= table.string_size) return null;
         const start = @as(usize, table.string_offset) + string_index;
@@ -283,6 +471,43 @@ fn readU64(data: []const u8, offset: usize) u64 {
     return std.mem.readInt(u64, data[offset..][0..8], .little);
 }
 
+fn readUleb(data: []const u8, position: *usize) ?u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (position.* < data.len) {
+        const byte = data[position.*];
+        position.* += 1;
+        const payload = byte & 0x7F;
+        if (shift >= 63 and payload > 1) return null;
+        result |= @as(u64, payload) << shift;
+        if (byte & 0x80 == 0) return result;
+        if (shift > 56) return null;
+        shift += 7;
+    }
+    return null;
+}
+
+fn readSleb(data: []const u8, position: *usize) ?i64 {
+    var result: u64 = 0;
+    var shift: u7 = 0;
+    var byte: u8 = 0;
+    while (position.* < data.len) {
+        byte = data[position.*];
+        position.* += 1;
+        const payload = byte & 0x7F;
+        if (shift >= 63 and payload != 0 and payload != 0x7F) return null;
+        result |= @as(u64, payload) << @intCast(shift);
+        shift += 7;
+        if (byte & 0x80 == 0) break;
+        if (shift >= 64) return null;
+    } else return null;
+
+    if (shift < 64 and byte & 0x40 != 0) {
+        result |= ~@as(u64, 0) << @intCast(shift);
+    }
+    return @bitCast(result);
+}
+
 test "metadata maps indirect stubs to imported symbols" {
     const allocator = std.testing.allocator;
     var data = [_]u8{0} ** 512;
@@ -326,4 +551,61 @@ test "metadata maps indirect stubs to imported symbols" {
     try std.testing.expectEqual(@as(usize, 1), metadata.imports.len);
     try std.testing.expectEqualStrings("_test_call", metadata.imports[0].name);
     try std.testing.expectEqual(@as(u64, 0x1000), metadata.imports[0].stub_address);
+}
+
+test "metadata decodes classic dyld data bindings" {
+    const allocator = std.testing.allocator;
+    var data = [_]u8{0} ** 256;
+    std.mem.writeInt(u32, data[0..4], macho.MH_MAGIC_64, .little);
+    std.mem.writeInt(u32, data[16..20], 2, .little);
+    std.mem.writeInt(u32, data[20..24], 72 + 48, .little);
+
+    var offset: usize = MACH_HEADER_64_SIZE;
+    std.mem.writeInt(u32, data[offset..][0..4], macho.LC_SEGMENT_64, .little);
+    std.mem.writeInt(u32, data[offset + 4 ..][0..4], 72, .little);
+    std.mem.writeInt(u64, data[offset + 24 ..][0..8], 0x1000, .little);
+
+    offset += 72;
+    std.mem.writeInt(u32, data[offset..][0..4], LC_DYLD_INFO_ONLY, .little);
+    std.mem.writeInt(u32, data[offset + 4 ..][0..4], 48, .little);
+    std.mem.writeInt(u32, data[offset + 16 ..][0..4], 200, .little);
+    std.mem.writeInt(u32, data[offset + 20 ..][0..4], 14, .little);
+
+    const bind_stream = [_]u8{ 0x11, 0x40, '_', 'v', 'i', 'r', 't', 'u', 'a', 'l', 0, 0x51, 0x70, 0x30, 0x90, 0x00 };
+    @memcpy(data[200..][0..bind_stream.len], &bind_stream);
+    std.mem.writeInt(u32, data[offset + 20 ..][0..4], bind_stream.len, .little);
+
+    var metadata = try Metadata.init(allocator, &data);
+    defer metadata.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metadata.bindings.len);
+    try std.testing.expectEqualStrings("_virtual", metadata.bindings[0].name);
+    try std.testing.expectEqual(@as(u64, 0x1030), metadata.bindings[0].address);
+    try std.testing.expectEqual(@as(i64, 0), metadata.bindings[0].addend);
+}
+
+test "metadata collects mod init function addresses" {
+    const allocator = std.testing.allocator;
+    var data = [_]u8{0} ** 256;
+    std.mem.writeInt(u32, data[0..4], macho.MH_MAGIC_64, .little);
+    std.mem.writeInt(u32, data[16..20], 1, .little);
+    std.mem.writeInt(u32, data[20..24], SEGMENT_COMMAND_64_SIZE + SECTION_64_SIZE, .little);
+
+    const command_offset = MACH_HEADER_64_SIZE;
+    std.mem.writeInt(u32, data[command_offset..][0..4], macho.LC_SEGMENT_64, .little);
+    std.mem.writeInt(u32, data[command_offset + 4 ..][0..4], SEGMENT_COMMAND_64_SIZE + SECTION_64_SIZE, .little);
+    std.mem.writeInt(u64, data[command_offset + 24 ..][0..8], 0x1000, .little);
+    std.mem.writeInt(u32, data[command_offset + 64 ..][0..4], 1, .little);
+
+    const section_offset = command_offset + SEGMENT_COMMAND_64_SIZE;
+    @memcpy(data[section_offset..][0..15], "__mod_init_func");
+    @memcpy(data[section_offset + 16 ..][0..12], "__DATA_CONST");
+    std.mem.writeInt(u64, data[section_offset + 32 ..][0..8], 0x2000, .little);
+    std.mem.writeInt(u64, data[section_offset + 40 ..][0..8], @sizeOf(u64), .little);
+    std.mem.writeInt(u32, data[section_offset + 48 ..][0..4], 224, .little);
+    std.mem.writeInt(u64, data[224..232], 0x1234_5678, .little);
+
+    var metadata = try Metadata.init(allocator, &data);
+    defer metadata.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metadata.initializer_count);
+    try std.testing.expectEqualSlices(u64, &.{0x1234_5678}, metadata.initializer_addresses);
 }
