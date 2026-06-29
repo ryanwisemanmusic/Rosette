@@ -1036,6 +1036,11 @@ pub fn build(b: *std.Build) void {
 
     // Mach-O processor (x86_64 macOS binary loader/diagnostic backend)
     {
+        const macho_compat_runtime_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/Mach-O/compat_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         const macho_runtime_mod = b.createModule(.{
             .root_source_file = b.path("../src/x64-ASM/macho_runtime.zig"),
             .target = target,
@@ -1052,6 +1057,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("macho_runtime", macho_runtime_mod);
         macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_processor_mod.addImport("contract", contract_mod);
+        macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         const macho_processor = b.addExecutable(.{
             .name = "macho_processor",
             .root_module = macho_processor_mod,
@@ -1069,6 +1075,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("macho_runtime", macho_runtime_mod);
         macho_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_processor_test_mod.addImport("contract", contract_mod);
+        macho_processor_test_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         const macho_processor_test = b.addTest(.{ .root_module = macho_processor_test_mod });
         check_step.dependOn(&macho_processor_test.step);
     }
