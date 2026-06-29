@@ -323,6 +323,11 @@ pub fn build(b: *std.Build) void {
     compat_router_mod.addImport("exit_diagnostics", exit_diagnostics_module);
     b.installArtifact(compat_router);
 
+    const macho_compat_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/Mach-O/compat_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const macho_processor_mod = b.createModule(.{
         .root_source_file = b.path("../../lib/Mach-O/main.zig"),
         .target = target,
@@ -338,6 +343,7 @@ pub fn build(b: *std.Build) void {
     macho_processor_mod.addImport("macho_runtime", macho_runtime_module);
     macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
     macho_processor_mod.addImport("contract", contract_module);
+    macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_module);
     b.installArtifact(macho_processor);
 
     // Add WinForms native Cocoa bridge to the exe runner module
