@@ -194,7 +194,7 @@ elf-processor-build:
 
 macho-processor-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics -lc -Mroot="$(MACHO_PROCESSOR_SRC)" -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(MACHO_PROCESSOR_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract -lc -Mroot="$(MACHO_PROCESSOR_SRC)" -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -femit-bin="$(MACHO_PROCESSOR_BIN)"
 
 elf-processor-dylib:
 	@mkdir -p zig-out/lib
@@ -229,6 +229,11 @@ shell-helper-build: c-fix-build assembler-runner-build elf-processor-build macho
 shell: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" install "$(ROOT_DIR)"
 
+# Please for the life of me, utilize this command on the regular
+# If you are reading through this Makefile, and wonder what commands
+# I use most, this is one of the biggest go-to.
+# It enables you to update your global shell if you are trying to debug
+# something
 shell-update: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" update "$(ROOT_DIR)"
 
