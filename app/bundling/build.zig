@@ -1,8 +1,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const is_macos = if (b.standardTargetOptionsQueryOnly(.{}).os_tag) |t| t == .macos else @import("builtin").target.os.tag == .macos;
     const target = b.standardTargetOptions(.{});
+    const is_macos = target.result.os.tag == .macos;
     const optimize = b.standardOptimizeOption(.{});
 
     const bundle_step = b.step("bundle", "Build Rosette.app bundle");
@@ -22,14 +22,20 @@ pub fn build(b: *std.Build) void {
         &[_][]const u8{ "-std=c11", "-include", "shims/macos/compiler_compat.h" }
     else
         &[_][]const u8{"-std=c11"};
-    helper_mod.addCSourceFile(.{
-        .file = b.path("../../src/graphics/common/debug_runtime.c"),
-        .flags = arch_flags,
-    });
-    helper_mod.addCSourceFile(.{
-        .file = b.path("../../src/graphics/CLI/window_main.c"),
-        .flags = arch_flags,
-    });
+    helper_mod.addObjectFile(compileCObject(
+        b,
+        target,
+        b.path("../../src/graphics/common/debug_runtime.c"),
+        "debug_runtime.o",
+        arch_flags,
+    ));
+    helper_mod.addObjectFile(compileCObject(
+        b,
+        target,
+        b.path("../../src/graphics/CLI/window_main.c"),
+        "window_main_cli.o",
+        arch_flags,
+    ));
     const app_bundle_parser_mod = b.createModule(.{
         .root_source_file = b.path("../../src/tooling/app_parser/bundle_parser.zig"),
         .target = target,
@@ -62,6 +68,11 @@ pub fn build(b: *std.Build) void {
     });
     const entrypoint_code_text_segment_module = b.createModule(.{
         .root_source_file = b.path("../../src/entrypoint/code-text-segment/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const entrypoint_alignment_module = b.createModule(.{
+        .root_source_file = b.path("../../src/entrypoint/alignment/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -163,6 +174,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const x64_decoder_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/decoder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const x64_interpreter_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/interpreter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const macho_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../../src/x64-ASM/macho_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const exit_diagnostics_module = b.createModule(.{
+        .root_source_file = b.path("../../src/tooling/exit_diagnostics/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     runtime_abi_module.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     runtime_abi_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
@@ -254,6 +285,7 @@ pub fn build(b: *std.Build) void {
         .root_module = shell_helper_mod,
     });
     shell_helper_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
+    shell_helper_mod.addImport("entrypoint_alignment", entrypoint_alignment_module);
     shell_helper_mod.addImport("compat_source_include_compat", compat_source_include_module);
     shell_helper_mod.addImport("compat_third_party_include_compat", compat_third_party_include_module);
     b.installArtifact(shell_helper);
@@ -282,6 +314,7 @@ pub fn build(b: *std.Build) void {
         .root_module = compat_router_mod,
     });
     compat_router_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
+    compat_router_mod.addImport("exit_diagnostics", exit_diagnostics_module);
     b.installArtifact(compat_router);
 
     const macho_processor_mod = b.createModule(.{
@@ -294,6 +327,10 @@ pub fn build(b: *std.Build) void {
         .name = "macho_processor",
         .root_module = macho_processor_mod,
     });
+    macho_processor_mod.addImport("x64_decoder", x64_decoder_module);
+    macho_processor_mod.addImport("x64_interpreter", x64_interpreter_module);
+    macho_processor_mod.addImport("macho_runtime", macho_runtime_module);
+    macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
     b.installArtifact(macho_processor);
 
     // Add WinForms native Cocoa bridge to the exe runner module
@@ -329,13 +366,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    app_mod.addCSourceFile(.{
-        .file = b.path("src/RosetteApp.m"),
-        .flags = if (is_macos)
+    app_mod.addObjectFile(compileCObject(
+        b,
+        target,
+        b.path("src/RosetteApp.m"),
+        "RosetteApp.o",
+        if (is_macos)
             &[_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra", "-include", "shims/macos/compiler_compat.h" }
         else
             &[_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra" },
-    });
+    ));
     app_mod.linkFramework("Cocoa", .{});
 
     const app_exe = b.addExecutable(.{
@@ -544,4 +584,24 @@ pub fn build(b: *std.Build) void {
         "PkgInfo",
     );
     bundle_step.dependOn(&pkg_info_install.step);
+}
+
+fn compileCObject(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    source: std.Build.LazyPath,
+    output_name: []const u8,
+    flags: []const []const u8,
+) std.Build.LazyPath {
+    const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc" });
+    if (!target.query.isNative()) {
+        compile.addArg("-target");
+        compile.addArg(target.result.zigTriple(b.allocator) catch @panic("OOM"));
+    }
+    compile.addArgs(flags);
+    compile.addPrefixedDirectoryArg("-I", b.path("../../include"));
+    compile.addArg("-c");
+    compile.addFileArg(source);
+    compile.addArg("-o");
+    return compile.addOutputFileArg(output_name);
 }
