@@ -367,6 +367,39 @@ pub fn appendLibcppString(state: anytype, object: u64, source: u64, source_lengt
     return initLibcppString(state, object, temporary, total);
 }
 
+pub fn pushBackLibcppString(state: anytype, object: u64, character: u8) bool {
+    const current = libcppStringView(state, object) orelse return false;
+    const new_length = std.math.add(u64, current.length, 1) catch return false;
+    const object_bytes = state.guestMemory(object, 24) orelse return false;
+
+    if (object_bytes[0] & 1 == 0 and new_length < 23) {
+        const old_length: usize = @intCast(current.length);
+        object_bytes[1 + old_length] = character;
+        object_bytes[1 + old_length + 1] = 0;
+        object_bytes[0] = @intCast(new_length << 1);
+        return true;
+    }
+
+    if (object_bytes[0] & 1 != 0) {
+        const allocation_size = state.read64(object) & ~@as(u64, 1);
+        if (new_length < allocation_size) {
+            const data = state.guestMemory(current.address, allocation_size) orelse return false;
+            data[@intCast(current.length)] = character;
+            data[@intCast(new_length)] = 0;
+            state.write64(object + 8, new_length);
+            return true;
+        }
+    }
+
+    const temporary = state.guestAlloc(new_length, 1) orelse return false;
+    const destination = state.guestMemory(temporary, new_length) orelse return false;
+    const source = state.guestMemoryConst(current.address, current.length) orelse return false;
+    const old_length: usize = @intCast(current.length);
+    @memcpy(destination[0..old_length], source);
+    destination[old_length] = character;
+    return initLibcppString(state, object, temporary, new_length);
+}
+
 pub fn growLibcppString(
     state: anytype,
     object: u64,
@@ -602,6 +635,32 @@ test "libc++ string copy append and concatenation preserve contents" {
     try std.testing.expect(concatCStringAndLibcppString(&state, 136, 112, 7, 80));
     const concatenated = libcppStringView(&state, 136).?;
     try std.testing.expectEqualStrings("prefix hello world", state.guestMemoryConst(concatenated.address, concatenated.length).?);
+}
+
+test "libc++ string push_back preserves short and long representations" {
+    var state = TestState{};
+    @memcpy(state.mem[32..37], "hello");
+    try std.testing.expect(initLibcppString(&state, 0, 32, 5));
+    try std.testing.expect(pushBackLibcppString(&state, 0, '!'));
+    var view = libcppStringView(&state, 0).?;
+    try std.testing.expectEqualStrings("hello!", state.guestMemoryConst(view.address, view.length).?);
+    try std.testing.expect(state.mem[0] & 1 == 0);
+
+    @memset(state.mem[64..86], 'x');
+    try std.testing.expect(initLibcppString(&state, 96, 64, 22));
+    try std.testing.expect(pushBackLibcppString(&state, 96, 'y'));
+    view = libcppStringView(&state, 96).?;
+    try std.testing.expectEqual(@as(u64, 23), view.length);
+    try std.testing.expect(state.mem[96] & 1 != 0);
+    try std.testing.expectEqual(@as(u8, 'y'), state.guestMemoryConst(view.address + 22, 1).?[0]);
+
+    const allocation = view.address;
+    try std.testing.expect(pushBackLibcppString(&state, 96, 'z'));
+    view = libcppStringView(&state, 96).?;
+    try std.testing.expectEqual(allocation, view.address);
+    try std.testing.expectEqual(@as(u64, 24), view.length);
+    try std.testing.expectEqualStrings("yz", state.guestMemoryConst(view.address + 22, 2).?);
+    try std.testing.expectEqual(@as(u8, 0), state.guestMemoryConst(view.address + view.length, 1).?[0]);
 }
 
 test "libc++ string growth preserves prefix and shifted suffix" {
