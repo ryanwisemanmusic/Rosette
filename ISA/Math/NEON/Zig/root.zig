@@ -145,6 +145,8 @@ const load_vpexpandq = @import("LOAD/VPEXPANDQ.zig");
 const load_xresldtrk = @import("LOAD/XRESLDTRK.zig");
 const load_xsusldtrk = @import("LOAD/XSUSLDTRK.zig");
 const abort_xabort = @import("ABORT/XABORT.zig");
+const align_valignd = @import("ALIGN/VALIGND.zig");
+const align_valignq = @import("ALIGN/VALIGNQ.zig");
 const begin_xbegin = @import("BEGIN/XBEGIN.zig");
 const concatenate_vpshldd = @import("CONCATENATE/vpshldd.zig");
 const concatenate_vpshldq = @import("CONCATENATE/vpshldq.zig");
@@ -799,6 +801,8 @@ pub const specs = blk: {
         spec(load_xresldtrk.meta),
         spec(load_xsusldtrk.meta),
         spec(abort_xabort.meta),
+        spec(align_valignd.meta),
+        spec(align_valignq.meta),
         spec(begin_xbegin.meta),
         spec(concatenate_vpshldd.meta),
         spec(concatenate_vpshldq.meta),
@@ -1453,6 +1457,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     load_xresldtrk.proof_report,
     load_xsusldtrk.proof_report,
     abort_xabort.proof_report,
+    align_valignd.proof_report,
+    align_valignq.proof_report,
     begin_xbegin.proof_report,
     concatenate_vpshldd.proof_report,
     concatenate_vpshldq.proof_report,
