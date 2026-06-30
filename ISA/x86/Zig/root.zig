@@ -611,6 +611,8 @@ const encode_encodekey128 = @import("ENCODE/encodekey128.zig");
 const galois_gf2p8affineinvqb = @import("GALOIS/gf2p8affineinvqb.zig");
 const galois_gf2p8affineqb = @import("GALOIS/gf2p8affineqb.zig");
 const galois_gf2p8mulb = @import("GALOIS/gf2p8mulb.zig");
+const initialize_finit = @import("INITIALIZE/FINIT.zig");
+const initialize_fninit = @import("INITIALIZE/FNINIT.zig");
 const invalidate_invd = @import("INVALIDATE/invd.zig");
 const invalidate_invlpg = @import("INVALIDATE/invlpg.zig");
 const invalidate_invpcid = @import("INVALIDATE/invpcid.zig");
@@ -1833,6 +1835,8 @@ pub const tables = [_]InstructionTable{
     entry(galois_gf2p8affineinvqb.family, galois_gf2p8affineinvqb.path, galois_gf2p8affineinvqb.source),
     entry(galois_gf2p8affineqb.family, galois_gf2p8affineqb.path, galois_gf2p8affineqb.source),
     entry(galois_gf2p8mulb.family, galois_gf2p8mulb.path, galois_gf2p8mulb.source),
+    entry(initialize_finit.family, initialize_finit.path, initialize_finit.source),
+    entry(initialize_fninit.family, initialize_fninit.path, initialize_fninit.source),
     entry(invalidate_invd.family, invalidate_invd.path, invalidate_invd.source),
     entry(invalidate_invlpg.family, invalidate_invlpg.path, invalidate_invlpg.source),
     entry(invalidate_invpcid.family, invalidate_invpcid.path, invalidate_invpcid.source),
