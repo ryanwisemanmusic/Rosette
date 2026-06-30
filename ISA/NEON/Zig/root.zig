@@ -613,6 +613,14 @@ const logical_nand_vptestnmb = @import("LOGICAL_NAND/VPTESTNMB.zig");
 const logical_nand_vptestnmw = @import("LOGICAL_NAND/VPTESTNMW.zig");
 const logical_nand_vptestnmd = @import("LOGICAL_NAND/VPTESTNMD.zig");
 const logical_nand_vptestnmq = @import("LOGICAL_NAND/VPTESTNMQ.zig");
+const logical_or_korw = @import("LOGICAL_OR/KORW.zig");
+const logical_or_korb = @import("LOGICAL_OR/KORB.zig");
+const logical_or_korq = @import("LOGICAL_OR/KORQ.zig");
+const logical_or_kord = @import("LOGICAL_OR/KORD.zig");
+const logical_or_por = @import("LOGICAL_OR/POR.zig");
+const logical_or_vpor = @import("LOGICAL_OR/VPOR.zig");
+const logical_or_vpord = @import("LOGICAL_OR/VPORD.zig");
+const logical_or_vporq = @import("LOGICAL_OR/VPORQ.zig");
 const logical_xnor_kxnorw = @import("LOGICAL_XNOR/KXNORW.zig");
 const logical_xnor_kxnorb = @import("LOGICAL_XNOR/KXNORB.zig");
 const logical_xnor_kxnorq = @import("LOGICAL_XNOR/KXNORQ.zig");
@@ -1354,6 +1362,14 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(logical_nand_vptestnmw.family, logical_nand_vptestnmw.path, logical_nand_vptestnmw.source),
     mirror(logical_nand_vptestnmd.family, logical_nand_vptestnmd.path, logical_nand_vptestnmd.source),
     mirror(logical_nand_vptestnmq.family, logical_nand_vptestnmq.path, logical_nand_vptestnmq.source),
+    mirror(logical_or_korw.family, logical_or_korw.path, logical_or_korw.source),
+    mirror(logical_or_korb.family, logical_or_korb.path, logical_or_korb.source),
+    mirror(logical_or_korq.family, logical_or_korq.path, logical_or_korq.source),
+    mirror(logical_or_kord.family, logical_or_kord.path, logical_or_kord.source),
+    mirror(logical_or_por.family, logical_or_por.path, logical_or_por.source),
+    mirror(logical_or_vpor.family, logical_or_vpor.path, logical_or_vpor.source),
+    mirror(logical_or_vpord.family, logical_or_vpord.path, logical_or_vpord.source),
+    mirror(logical_or_vporq.family, logical_or_vporq.path, logical_or_vporq.source),
     mirror(logical_xnor_kxnorw.family, logical_xnor_kxnorw.path, logical_xnor_kxnorw.source),
     mirror(logical_xnor_kxnorb.family, logical_xnor_kxnorb.path, logical_xnor_kxnorb.source),
     mirror(logical_xnor_kxnorq.family, logical_xnor_kxnorq.path, logical_xnor_kxnorq.source),
