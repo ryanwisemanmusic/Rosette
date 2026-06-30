@@ -281,6 +281,7 @@ const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
 const loop_pause = @import("LOOP/PAUSE.zig");
+const memory_mfence = @import("MEMORY/MFENCE.zig");
 const mov_mov = @import("MOV/MOV.zig");
 const mov_movapd = @import("MOV/MOVAPD.zig");
 const mov_movaps = @import("MOV/MOVAPS.zig");
@@ -940,6 +941,7 @@ pub const specs = blk: {
         spec(loop_loope.meta),
         spec(loop_loopne.meta),
         spec(loop_pause.meta),
+        spec(memory_mfence.meta),
         spec(mov_mov.meta),
         spec(mov_movapd.meta),
         spec(mov_movaps.meta),
@@ -1611,6 +1613,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     loop_loope.proof_report,
     loop_loopne.proof_report,
     loop_pause.proof_report,
+    memory_mfence.proof_report,
     mov_mov.proof_report,
     mov_movapd.proof_report,
     mov_movaps.proof_report,
