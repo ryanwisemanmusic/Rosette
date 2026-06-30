@@ -646,6 +646,8 @@ const get_xgetbv = @import("GET/XGETBV.zig");
 const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
 const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
 const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
+const table_xlat = @import("TABLE/XLAT.zig");
+const table_xlatb = @import("TABLE/XLATB.zig");
 const trig_fcos = @import("TRIG/fcos.zig");
 const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
@@ -1377,6 +1379,8 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(square_root_fsqrt.family, square_root_fsqrt.path, square_root_fsqrt.source),
     mirror(square_root_sqrtpd.family, square_root_sqrtpd.path, square_root_sqrtpd.source),
     mirror(square_root_sqrtps.family, square_root_sqrtps.path, square_root_sqrtps.source),
+    mirror(table_xlat.family, table_xlat.path, table_xlat.source),
+    mirror(table_xlatb.family, table_xlatb.path, table_xlatb.source),
     mirror(trig_fcos.family, trig_fcos.path, trig_fcos.source),
     mirror(trig_fsin.family, trig_fsin.path, trig_fsin.source),
     mirror(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),

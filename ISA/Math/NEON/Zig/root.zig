@@ -648,6 +648,8 @@ const get_xgetbv = @import("GET/XGETBV.zig");
 const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
 const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
 const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
+const table_xlat = @import("TABLE/XLAT.zig");
+const table_xlatb = @import("TABLE/XLATB.zig");
 const trig_fcos = @import("TRIG/fcos.zig");
 const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
@@ -1308,6 +1310,8 @@ pub const specs = blk: {
         spec(square_root_fsqrt.meta),
         spec(square_root_sqrtpd.meta),
         spec(square_root_sqrtps.meta),
+        spec(table_xlat.meta),
+        spec(table_xlatb.meta),
         spec(trig_fcos.meta),
         spec(trig_fsin.meta),
         spec(trig_fsincos.meta),
@@ -1980,6 +1984,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     square_root_fsqrt.proof_report,
     square_root_sqrtpd.proof_report,
     square_root_sqrtps.proof_report,
+    table_xlat.proof_report,
+    table_xlatb.proof_report,
     trig_fcos.proof_report,
     trig_fsin.proof_report,
     trig_fsincos.proof_report,
