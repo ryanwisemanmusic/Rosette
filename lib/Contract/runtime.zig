@@ -910,6 +910,18 @@ pub const CxxContracts = struct {
                 .returns = .{ .passthrough_arg = 0 },
             },
             Contract{
+                .name = "basic_string_init_fill",
+                .description = "libc++ basic_string::__init(size, char)",
+                .kind = .cxx_string,
+                .strategy = .custom_handler,
+                .matches = &.{MatchPattern{ .exact = "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc" }},
+                .params = &.{
+                    .{ .index = 0, .is_ptr = true, .label = "this" },
+                    .{ .index = 1, .label = "length" },
+                    .{ .index = 2, .label = "value" },
+                },
+            },
+            Contract{
                 .name = "basic_string_assign_cstring",
                 .description = "libc++ basic_string::assign from C string",
                 .kind = .cxx_string,
