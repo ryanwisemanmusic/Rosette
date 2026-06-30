@@ -619,6 +619,8 @@ const encode_encodekey128 = @import("ENCODE/encodekey128.zig");
 const galois_gf2p8affineinvqb = @import("GALOIS/gf2p8affineinvqb.zig");
 const galois_gf2p8affineqb = @import("GALOIS/gf2p8affineqb.zig");
 const galois_gf2p8mulb = @import("GALOIS/gf2p8mulb.zig");
+const inc_dec_fdecstp = @import("INC_DEC/FDECSTP.zig");
+const inc_dec_fincstp = @import("INC_DEC/FINCSTP.zig");
 const initialize_finit = @import("INITIALIZE/FINIT.zig");
 const initialize_fninit = @import("INITIALIZE/FNINIT.zig");
 const invalidate_invd = @import("INVALIDATE/invd.zig");
@@ -1354,6 +1356,8 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(galois_gf2p8affineinvqb.family, galois_gf2p8affineinvqb.path, galois_gf2p8affineinvqb.source),
     mirror(galois_gf2p8affineqb.family, galois_gf2p8affineqb.path, galois_gf2p8affineqb.source),
     mirror(galois_gf2p8mulb.family, galois_gf2p8mulb.path, galois_gf2p8mulb.source),
+    mirror(inc_dec_fdecstp.family, inc_dec_fdecstp.path, inc_dec_fdecstp.source),
+    mirror(inc_dec_fincstp.family, inc_dec_fincstp.path, inc_dec_fincstp.source),
     mirror(initialize_finit.family, initialize_finit.path, initialize_finit.source),
     mirror(initialize_fninit.family, initialize_fninit.path, initialize_fninit.source),
     mirror(invalidate_invd.family, invalidate_invd.path, invalidate_invd.source),

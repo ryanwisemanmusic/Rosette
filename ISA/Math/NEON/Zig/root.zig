@@ -621,6 +621,8 @@ const encode_encodekey128 = @import("ENCODE/encodekey128.zig");
 const galois_gf2p8affineinvqb = @import("GALOIS/gf2p8affineinvqb.zig");
 const galois_gf2p8affineqb = @import("GALOIS/gf2p8affineqb.zig");
 const galois_gf2p8mulb = @import("GALOIS/gf2p8mulb.zig");
+const inc_dec_fdecstp = @import("INC_DEC/FDECSTP.zig");
+const inc_dec_fincstp = @import("INC_DEC/FINCSTP.zig");
 const initialize_finit = @import("INITIALIZE/FINIT.zig");
 const initialize_fninit = @import("INITIALIZE/FNINIT.zig");
 const invalidate_invd = @import("INVALIDATE/invd.zig");
@@ -1285,6 +1287,8 @@ pub const specs = blk: {
         spec(galois_gf2p8affineinvqb.meta),
         spec(galois_gf2p8affineqb.meta),
         spec(galois_gf2p8mulb.meta),
+        spec(inc_dec_fdecstp.meta),
+        spec(inc_dec_fincstp.meta),
         spec(initialize_finit.meta),
         spec(initialize_fninit.meta),
         spec(invalidate_invd.meta),
@@ -1961,6 +1965,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     galois_gf2p8affineinvqb.proof_report,
     galois_gf2p8affineqb.proof_report,
     galois_gf2p8mulb.proof_report,
+    inc_dec_fdecstp.proof_report,
+    inc_dec_fincstp.proof_report,
     initialize_finit.proof_report,
     initialize_fninit.proof_report,
     invalidate_invd.proof_report,
