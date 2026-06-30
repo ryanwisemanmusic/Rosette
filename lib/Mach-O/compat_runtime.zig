@@ -332,6 +332,26 @@ pub fn initLibcppStringLiteral(state: anytype, object: u64, value: []const u8) b
     return true;
 }
 
+pub fn initLibcppStringFromSlice(state: anytype, object: u64, value: []const u8) bool {
+    const object_bytes = state.guestMemory(object, 24) orelse return false;
+    @memset(object_bytes, 0);
+    if (value.len < 23) {
+        object_bytes[0] = @intCast(value.len << 1);
+        @memcpy(object_bytes[1 .. 1 + value.len], value);
+        object_bytes[1 + value.len] = 0;
+        return true;
+    }
+    const capacity = (std.math.add(u64, value.len, 16) catch return false) & ~@as(u64, 15);
+    const allocation = state.guestAlloc(capacity, 16) orelse return false;
+    const storage = state.guestMemory(allocation, capacity) orelse return false;
+    @memcpy(storage[0..value.len], value);
+    storage[value.len] = 0;
+    state.write64(object, capacity | 1);
+    state.write64(object + 8, value.len);
+    state.write64(object + 16, allocation);
+    return true;
+}
+
 pub fn initLibcppStringFill(state: anytype, object: u64, length: u64, value: u8) bool {
     if (length > std.math.maxInt(usize)) return false;
     const object_bytes = state.guestMemory(object, 24) orelse return false;
