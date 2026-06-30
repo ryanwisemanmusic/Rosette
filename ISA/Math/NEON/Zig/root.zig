@@ -576,6 +576,7 @@ const change_fchs = @import("CHANGE/FCHS.zig");
 const complement_cmc = @import("COMPLEMENT/CMC.zig");
 const decimal_daa = @import("DECIMAL/DAA.zig");
 const decimal_das = @import("DECIMAL/DAS.zig");
+const dep_pdep = @import("DEP/PDEP.zig");
 const empty_emms = @import("EMPTY/EMMS.zig");
 const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
@@ -1226,6 +1227,7 @@ pub const specs = blk: {
         spec(complement_cmc.meta),
         spec(decimal_daa.meta),
         spec(decimal_das.meta),
+        spec(dep_pdep.meta),
         spec(empty_emms.meta),
         spec(end_xend.meta),
         spec(examine_fxam.meta),
@@ -1888,6 +1890,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     complement_cmc.proof_report,
     decimal_daa.proof_report,
     decimal_das.proof_report,
+    dep_pdep.proof_report,
     empty_emms.proof_report,
     end_xend.proof_report,
     examine_fxam.proof_report,

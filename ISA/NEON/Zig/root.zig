@@ -574,6 +574,7 @@ const change_fchs = @import("CHANGE/FCHS.zig");
 const complement_cmc = @import("COMPLEMENT/CMC.zig");
 const decimal_daa = @import("DECIMAL/DAA.zig");
 const decimal_das = @import("DECIMAL/DAS.zig");
+const dep_pdep = @import("DEP/PDEP.zig");
 const empty_emms = @import("EMPTY/EMMS.zig");
 const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
@@ -1295,6 +1296,7 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(complement_cmc.family, complement_cmc.path, complement_cmc.source),
     mirror(decimal_daa.family, decimal_daa.path, decimal_daa.source),
     mirror(decimal_das.family, decimal_das.path, decimal_das.source),
+    mirror(dep_pdep.family, dep_pdep.path, dep_pdep.source),
     mirror(empty_emms.family, empty_emms.path, empty_emms.source),
     mirror(end_xend.family, end_xend.path, end_xend.source),
     mirror(examine_fxam.family, examine_fxam.path, examine_fxam.source),
