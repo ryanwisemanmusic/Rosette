@@ -398,6 +398,9 @@ const sub_subsd = @import("SUB/SUBSD.zig");
 const sub_subss = @import("SUB/SUBSS.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
+const undef_ud0 = @import("UNDEF/UD0.zig");
+const undef_ud1 = @import("UNDEF/UD1.zig");
+const undef_ud2 = @import("UNDEF/UD2.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
@@ -1083,6 +1086,9 @@ pub const specs = blk: {
         spec(sub_subss.meta),
         spec(test_test.meta),
         spec(test_testui.meta),
+        spec(undef_ud0.meta),
+        spec(undef_ud1.meta),
+        spec(undef_ud2.meta),
         spec(verify_verr.meta),
         spec(verify_verw.meta),
         spec(xor_xor.meta),
@@ -1780,6 +1786,9 @@ pub const proof_reports = [_]proofs.ProofReport{
     sub_subss.proof_report,
     test_test.proof_report,
     test_testui.proof_report,
+    undef_ud0.proof_report,
+    undef_ud1.proof_report,
+    undef_ud2.proof_report,
     verify_verr.proof_report,
     verify_verw.proof_report,
     xor_xor.proof_report,

@@ -396,6 +396,9 @@ const sub_subsd = @import("SUB/SUBSD.zig");
 const sub_subss = @import("SUB/SUBSS.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
+const undef_ud0 = @import("UNDEF/UD0.zig");
+const undef_ud1 = @import("UNDEF/UD1.zig");
+const undef_ud2 = @import("UNDEF/UD2.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
@@ -1152,6 +1155,9 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(sub_subss.family, sub_subss.path, sub_subss.source),
     mirror(test_test.family, test_test.path, test_test.source),
     mirror(test_testui.family, test_testui.path, test_testui.source),
+    mirror(undef_ud0.family, undef_ud0.path, undef_ud0.source),
+    mirror(undef_ud1.family, undef_ud1.path, undef_ud1.source),
+    mirror(undef_ud2.family, undef_ud2.path, undef_ud2.source),
     mirror(verify_verr.family, verify_verr.path, verify_verr.source),
     mirror(verify_verw.family, verify_verw.path, verify_verw.source),
     mirror(xor_xor.family, xor_xor.path, xor_xor.source),
