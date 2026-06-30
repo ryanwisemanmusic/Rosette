@@ -645,6 +645,8 @@ const get_xgetbv = @import("GET/XGETBV.zig");
 const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
 const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
 const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
+const table_xlat = @import("TABLE/XLAT.zig");
+const table_xlatb = @import("TABLE/XLATB.zig");
 const trig_fcos = @import("TRIG/fcos.zig");
 const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
@@ -1874,6 +1876,8 @@ pub const tables = [_]InstructionTable{
     entry(square_root_fsqrt.family, square_root_fsqrt.path, square_root_fsqrt.source),
     entry(square_root_sqrtpd.family, square_root_sqrtpd.path, square_root_sqrtpd.source),
     entry(square_root_sqrtps.family, square_root_sqrtps.path, square_root_sqrtps.source),
+    entry(table_xlat.family, table_xlat.path, table_xlat.source),
+    entry(table_xlatb.family, table_xlatb.path, table_xlatb.source),
     entry(trig_fcos.family, trig_fcos.path, trig_fcos.source),
     entry(trig_fsin.family, trig_fsin.path, trig_fsin.source),
     entry(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),
