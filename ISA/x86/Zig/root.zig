@@ -608,6 +608,10 @@ const extr_pext = @import("EXTR/pext.zig");
 const lock_lock = @import("LOCK/lock.zig");
 const lock_xacquire = @import("LOCK/xacquire.zig");
 const lock_xrelease = @import("LOCK/xrelease.zig");
+const logical_nand_vptestnmb = @import("LOGICAL_NAND/VPTESTNMB.zig");
+const logical_nand_vptestnmw = @import("LOGICAL_NAND/VPTESTNMW.zig");
+const logical_nand_vptestnmd = @import("LOGICAL_NAND/VPTESTNMD.zig");
+const logical_nand_vptestnmq = @import("LOGICAL_NAND/VPTESTNMQ.zig");
 const logical_xnor_kxnorw = @import("LOGICAL_XNOR/KXNORW.zig");
 const logical_xnor_kxnorb = @import("LOGICAL_XNOR/KXNORB.zig");
 const logical_xnor_kxnorq = @import("LOGICAL_XNOR/KXNORQ.zig");
@@ -1843,6 +1847,10 @@ pub const tables = [_]InstructionTable{
     entry(lock_lock.family, lock_lock.path, lock_lock.source),
     entry(lock_xacquire.family, lock_xacquire.path, lock_xacquire.source),
     entry(lock_xrelease.family, lock_xrelease.path, lock_xrelease.source),
+    entry(logical_nand_vptestnmb.family, logical_nand_vptestnmb.path, logical_nand_vptestnmb.source),
+    entry(logical_nand_vptestnmw.family, logical_nand_vptestnmw.path, logical_nand_vptestnmw.source),
+    entry(logical_nand_vptestnmd.family, logical_nand_vptestnmd.path, logical_nand_vptestnmd.source),
+    entry(logical_nand_vptestnmq.family, logical_nand_vptestnmq.path, logical_nand_vptestnmq.source),
     entry(logical_xnor_kxnorw.family, logical_xnor_kxnorw.path, logical_xnor_kxnorw.source),
     entry(logical_xnor_kxnorb.family, logical_xnor_kxnorb.path, logical_xnor_kxnorb.source),
     entry(logical_xnor_kxnorq.family, logical_xnor_kxnorq.path, logical_xnor_kxnorq.source),

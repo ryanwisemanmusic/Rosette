@@ -610,6 +610,10 @@ const extr_pext = @import("EXTR/pext.zig");
 const lock_lock = @import("LOCK/lock.zig");
 const lock_xacquire = @import("LOCK/xacquire.zig");
 const lock_xrelease = @import("LOCK/xrelease.zig");
+const logical_nand_vptestnmb = @import("LOGICAL_NAND/VPTESTNMB.zig");
+const logical_nand_vptestnmw = @import("LOGICAL_NAND/VPTESTNMW.zig");
+const logical_nand_vptestnmd = @import("LOGICAL_NAND/VPTESTNMD.zig");
+const logical_nand_vptestnmq = @import("LOGICAL_NAND/VPTESTNMQ.zig");
 const logical_xnor_kxnorw = @import("LOGICAL_XNOR/KXNORW.zig");
 const logical_xnor_kxnorb = @import("LOGICAL_XNOR/KXNORB.zig");
 const logical_xnor_kxnorq = @import("LOGICAL_XNOR/KXNORQ.zig");
@@ -1276,6 +1280,10 @@ pub const specs = blk: {
         spec(lock_lock.meta),
         spec(lock_xacquire.meta),
         spec(lock_xrelease.meta),
+        spec(logical_nand_vptestnmb.meta),
+        spec(logical_nand_vptestnmw.meta),
+        spec(logical_nand_vptestnmd.meta),
+        spec(logical_nand_vptestnmq.meta),
         spec(logical_xnor_kxnorw.meta),
         spec(logical_xnor_kxnorb.meta),
         spec(logical_xnor_kxnorq.meta),
@@ -1954,6 +1962,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     lock_lock.proof_report,
     lock_xacquire.proof_report,
     lock_xrelease.proof_report,
+    logical_nand_vptestnmb.proof_report,
+    logical_nand_vptestnmw.proof_report,
+    logical_nand_vptestnmd.proof_report,
+    logical_nand_vptestnmq.proof_report,
     logical_xnor_kxnorw.proof_report,
     logical_xnor_kxnorb.proof_report,
     logical_xnor_kxnorq.proof_report,
