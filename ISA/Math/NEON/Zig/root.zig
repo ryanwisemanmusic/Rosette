@@ -582,6 +582,7 @@ const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
 const expand_vpexpandb = @import("EXPAND/vpexpandb.zig");
 const expand_vpexpandw = @import("EXPAND/vpexpandw.zig");
+const free_ffree = @import("FREE/FFREE.zig");
 const partial_fpatan = @import("PARTIAL/FPATAN.zig");
 const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
@@ -1233,6 +1234,7 @@ pub const specs = blk: {
         spec(examine_fxam.meta),
         spec(expand_vpexpandb.meta),
         spec(expand_vpexpandw.meta),
+        spec(free_ffree.meta),
         spec(partial_fpatan.meta),
         spec(partial_fprem.meta),
         spec(partial_fprem1.meta),
@@ -1896,6 +1898,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     examine_fxam.proof_report,
     expand_vpexpandb.proof_report,
     expand_vpexpandw.proof_report,
+    free_ffree.proof_report,
     partial_fpatan.proof_report,
     partial_fprem.proof_report,
     partial_fprem1.proof_report,
