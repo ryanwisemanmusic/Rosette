@@ -395,6 +395,9 @@ const sub_subsd = @import("SUB/SUBSD.zig");
 const sub_subss = @import("SUB/SUBSS.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
+const undef_ud0 = @import("UNDEF/UD0.zig");
+const undef_ud1 = @import("UNDEF/UD1.zig");
+const undef_ud2 = @import("UNDEF/UD2.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
@@ -1651,6 +1654,9 @@ pub const tables = [_]InstructionTable{
     entry(sub_subss.family, sub_subss.path, sub_subss.source),
     entry(test_test.family, test_test.path, test_test.source),
     entry(test_testui.family, test_testui.path, test_testui.source),
+    entry(undef_ud0.family, undef_ud0.path, undef_ud0.source),
+    entry(undef_ud1.family, undef_ud1.path, undef_ud1.source),
+    entry(undef_ud2.family, undef_ud2.path, undef_ud2.source),
     entry(xor_xor.family, xor_xor.path, xor_xor.source),
     entry(xor_xorpd.family, xor_xorpd.path, xor_xorpd.source),
     entry(xor_xorps.family, xor_xorps.path, xor_xorps.source),
