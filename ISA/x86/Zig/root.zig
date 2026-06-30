@@ -579,6 +579,7 @@ const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
 const expand_vpexpandb = @import("EXPAND/VPEXPANDB.zig");
 const expand_vpexpandw = @import("EXPAND/VPEXPANDW.zig");
+const free_ffree = @import("FREE/FFREE.zig");
 const partial_fpatan = @import("PARTIAL/FPATAN.zig");
 const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
@@ -1799,6 +1800,7 @@ pub const tables = [_]InstructionTable{
     entry(examine_fxam.family, examine_fxam.path, examine_fxam.source),
     entry(expand_vpexpandb.family, expand_vpexpandb.path, expand_vpexpandb.source),
     entry(expand_vpexpandw.family, expand_vpexpandw.path, expand_vpexpandw.source),
+    entry(free_ffree.family, free_ffree.path, free_ffree.source),
     entry(partial_fpatan.family, partial_fpatan.path, partial_fpatan.source),
     entry(partial_fprem.family, partial_fprem.path, partial_fprem.source),
     entry(partial_fprem1.family, partial_fprem1.path, partial_fprem1.source),
