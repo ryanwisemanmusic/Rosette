@@ -605,6 +605,10 @@ const extr_pext = @import("EXTR/pext.zig");
 const lock_lock = @import("LOCK/lock.zig");
 const lock_xacquire = @import("LOCK/xacquire.zig");
 const lock_xrelease = @import("LOCK/xrelease.zig");
+const logical_xnor_kxnorw = @import("LOGICAL_XNOR/KXNORW.zig");
+const logical_xnor_kxnorb = @import("LOGICAL_XNOR/KXNORB.zig");
+const logical_xnor_kxnorq = @import("LOGICAL_XNOR/KXNORQ.zig");
+const logical_xnor_kxnord = @import("LOGICAL_XNOR/KXNORD.zig");
 const neg_neg = @import("NEG/neg.zig");
 const round_frndint = @import("ROUND/frndint.zig");
 const encode_encodekey128 = @import("ENCODE/encodekey128.zig");
@@ -1829,6 +1833,10 @@ pub const tables = [_]InstructionTable{
     entry(lock_lock.family, lock_lock.path, lock_lock.source),
     entry(lock_xacquire.family, lock_xacquire.path, lock_xacquire.source),
     entry(lock_xrelease.family, lock_xrelease.path, lock_xrelease.source),
+    entry(logical_xnor_kxnorw.family, logical_xnor_kxnorw.path, logical_xnor_kxnorw.source),
+    entry(logical_xnor_kxnorb.family, logical_xnor_kxnorb.path, logical_xnor_kxnorb.source),
+    entry(logical_xnor_kxnorq.family, logical_xnor_kxnorq.path, logical_xnor_kxnorq.source),
+    entry(logical_xnor_kxnord.family, logical_xnor_kxnord.path, logical_xnor_kxnord.source),
     entry(neg_neg.family, neg_neg.path, neg_neg.source),
     entry(round_frndint.family, round_frndint.path, round_frndint.source),
     entry(encode_encodekey128.family, encode_encodekey128.path, encode_encodekey128.source),

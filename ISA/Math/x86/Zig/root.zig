@@ -607,6 +607,10 @@ const extr_pext = @import("EXTR/pext.zig");
 const lock_lock = @import("LOCK/lock.zig");
 const lock_xacquire = @import("LOCK/xacquire.zig");
 const lock_xrelease = @import("LOCK/xrelease.zig");
+const logical_xnor_kxnorw = @import("LOGICAL_XNOR/KXNORW.zig");
+const logical_xnor_kxnorb = @import("LOGICAL_XNOR/KXNORB.zig");
+const logical_xnor_kxnorq = @import("LOGICAL_XNOR/KXNORQ.zig");
+const logical_xnor_kxnord = @import("LOGICAL_XNOR/KXNORD.zig");
 const neg_neg = @import("NEG/neg.zig");
 const round_frndint = @import("ROUND/frndint.zig");
 const encode_encodekey128 = @import("ENCODE/encodekey128.zig");
@@ -1262,6 +1266,10 @@ pub const specs = blk: {
         spec(lock_lock.meta),
         spec(lock_xacquire.meta),
         spec(lock_xrelease.meta),
+        spec(logical_xnor_kxnorw.meta),
+        spec(logical_xnor_kxnorb.meta),
+        spec(logical_xnor_kxnorq.meta),
+        spec(logical_xnor_kxnord.meta),
         spec(neg_neg.meta),
         spec(round_frndint.meta),
         spec(encode_encodekey128.meta),
@@ -1929,6 +1937,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     lock_lock.proof_report,
     lock_xacquire.proof_report,
     lock_xrelease.proof_report,
+    logical_xnor_kxnorw.proof_report,
+    logical_xnor_kxnorb.proof_report,
+    logical_xnor_kxnorq.proof_report,
+    logical_xnor_kxnord.proof_report,
     neg_neg.proof_report,
     round_frndint.proof_report,
     encode_encodekey128.proof_report,
