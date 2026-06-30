@@ -9,6 +9,8 @@ pub const Outcome = enum {
 
 pub const Provider = enum {
     contract,
+    dynamic_library,
+    smart_stub,
     legacy_shim,
     none,
 };
@@ -48,6 +50,7 @@ pub const Effects = struct {
 pub const ContractId = enum {
     libcxx_match_any_but_newline_char,
     libcxx_basic_string_push_back_char,
+    libcxx_basic_string_init_fill,
 };
 
 pub const Contract = struct {
@@ -80,6 +83,14 @@ pub const basic_string_push_back_char = Contract{
     .effects = .{ .return_convention = .void, .writes_guest_memory = true },
 };
 
+pub const basic_string_init_fill = Contract{
+    .id = .libcxx_basic_string_init_fill,
+    .canonical_symbol = "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc",
+    .domain = .libcxx,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void, .writes_guest_memory = true },
+};
+
 pub fn normalizeSymbol(symbol: []const u8) []const u8 {
     var normalized = symbol;
     if (normalized.len != 0 and normalized[0] == '_') normalized = normalized[1..];
@@ -97,6 +108,9 @@ pub fn contractFor(symbol: []const u8) ?Contract {
     if (std.mem.eql(u8, normalized, basic_string_push_back_char.canonical_symbol)) {
         return basic_string_push_back_char;
     }
+    if (std.mem.eql(u8, normalized, basic_string_init_fill.canonical_symbol)) {
+        return basic_string_init_fill;
+    }
     return null;
 }
 
@@ -108,6 +122,10 @@ pub fn dispatchContract(state: anytype, symbol: []const u8) ?ContractDispatch {
         else
             .failed,
         .libcxx_basic_string_push_back_char => if (compat_runtime.pushBackLibcppString(state, state.regs.rdi, @truncate(state.regs.rsi)))
+            .handled_void
+        else
+            .failed,
+        .libcxx_basic_string_init_fill => if (compat_runtime.initLibcppStringFill(state, state.regs.rdi, state.regs.rsi, @truncate(state.regs.rdx)))
             .handled_void
         else
             .failed,
@@ -159,6 +177,8 @@ pub const Engine = struct {
     unresolved_calls: u64 = 0,
     terminated_calls: u64 = 0,
     contract_calls: u64 = 0,
+    dynamic_library_calls: u64 = 0,
+    smart_stub_calls: u64 = 0,
     legacy_shim_calls: u64 = 0,
     verified_calls: u64 = 0,
     modeled_calls: u64 = 0,
@@ -195,6 +215,8 @@ pub const Engine = struct {
         }
         switch (provider) {
             .contract => self.contract_calls += 1,
+            .dynamic_library => self.dynamic_library_calls += 1,
+            .smart_stub => self.smart_stub_calls += 1,
             .legacy_shim => self.legacy_shim_calls += 1,
             .none => {},
         }
@@ -239,7 +261,7 @@ pub const Engine = struct {
 
     pub fn logSummary(self: *const Engine) void {
         std.debug.print(
-            "macho-processor: import resolution summary: calls={d} resolved={d} unresolved={d} terminated={d} symbols={d} contract={d} shim={d} verified={d} modeled={d}",
+            "macho-processor: import resolution summary: calls={d} resolved={d} unresolved={d} terminated={d} symbols={d} contract={d} dynamic={d} smart_stub={d} shim={d} verified={d} modeled={d}",
             .{
                 self.total_calls,
                 self.resolved_calls,
@@ -247,6 +269,8 @@ pub const Engine = struct {
                 self.terminated_calls,
                 self.entries.items.len,
                 self.contract_calls,
+                self.dynamic_library_calls,
+                self.smart_stub_calls,
                 self.legacy_shim_calls,
                 self.verified_calls,
                 self.modeled_calls,
@@ -335,6 +359,7 @@ test "symbol normalization and contract lookup" {
     try std.testing.expectEqual(Domain.libcxx, classifyDomain("__ZNSt3__15mutex4lockEv"));
     try std.testing.expectEqual(ContractId.libcxx_match_any_but_newline_char, contractFor("__ZNKSt3__123__match_any_but_newlineIcE6__execERNS_7__stateIcEE").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_string_push_back_char, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc").?.id);
+    try std.testing.expectEqual(ContractId.libcxx_basic_string_init_fill, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc").?.id);
 }
 
 test "import audit separates resolved and unresolved calls" {
