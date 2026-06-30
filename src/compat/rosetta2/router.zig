@@ -287,7 +287,7 @@ fn appleRosetta2FallbackPlan(
             .backend = .apple_rosetta2,
             .reason = if (exit_code == 125) .macho_runtime_incomplete else .rosette_backend_pending,
             .detail = if (exit_code == 125)
-                try allocator.dupe(u8, "Rosette Mach-O diagnostics found unresolved dynamic-library calls; falling back to Apple Rosetta 2 for authoritative execution")
+                try allocator.dupe(u8, "Rosette Mach-O execution stopped on an unsupported runtime capability; inspect the preceding attribution diagnostics before fallback")
             else
                 try std.fmt.allocPrint(
                     allocator,
@@ -906,7 +906,7 @@ test "Apple Rosetta fallback plan strips or overrides DYLD interposer" {
             std.mem.eql(u8, plan.argv[arch_idx - 1], "DYLD_INSERT_LIBRARIES")));
 }
 
-test "Mach-O status 125 identifies an incomplete dynamic runtime" {
+test "Mach-O status 125 identifies an incomplete runtime without guessing the cause" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -920,7 +920,7 @@ test "Mach-O status 125 identifies an incomplete dynamic runtime" {
     };
     const plan = try appleRosetta2FallbackPlan(allocator, class, &.{}, 125);
     try std.testing.expectEqual(types.FallbackReason.macho_runtime_incomplete, plan.decision.reason);
-    try std.testing.expect(std.mem.indexOf(u8, plan.decision.detail, "unresolved dynamic-library calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.decision.detail, "unsupported runtime capability") != null);
 }
 
 test "Mach-O guest exits are not mistaken for processor failures" {
