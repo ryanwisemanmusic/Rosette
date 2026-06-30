@@ -577,6 +577,8 @@ const complement_cmc = @import("COMPLEMENT/CMC.zig");
 const decimal_daa = @import("DECIMAL/DAA.zig");
 const decimal_das = @import("DECIMAL/DAS.zig");
 const dep_pdep = @import("DEP/PDEP.zig");
+const detect_vpconflictd = @import("DETECT/VPCONFLICTD.zig");
+const detect_vpconflictq = @import("DETECT/VPCONFLICTQ.zig");
 const empty_emms = @import("EMPTY/EMMS.zig");
 const end_xend = @import("END/XEND.zig");
 const examine_fxam = @import("EXAMINE/FXAM.zig");
@@ -1239,6 +1241,8 @@ pub const specs = blk: {
         spec(decimal_daa.meta),
         spec(decimal_das.meta),
         spec(dep_pdep.meta),
+        spec(detect_vpconflictd.meta),
+        spec(detect_vpconflictq.meta),
         spec(empty_emms.meta),
         spec(end_xend.meta),
         spec(examine_fxam.meta),
@@ -1913,6 +1917,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     decimal_daa.proof_report,
     decimal_das.proof_report,
     dep_pdep.proof_report,
+    detect_vpconflictd.proof_report,
+    detect_vpconflictq.proof_report,
     empty_emms.proof_report,
     end_xend.proof_report,
     examine_fxam.proof_report,
