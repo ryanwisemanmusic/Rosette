@@ -280,6 +280,7 @@ const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
 const loop_pause = @import("LOOP/PAUSE.zig");
+const memory_mfence = @import("MEMORY/MFENCE.zig");
 const mov_mov = @import("MOV/MOV.zig");
 const mov_movapd = @import("MOV/MOVAPD.zig");
 const mov_movaps = @import("MOV/MOVAPS.zig");
@@ -1010,6 +1011,7 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(loop_loope.family, loop_loope.path, loop_loope.source),
     mirror(loop_loopne.family, loop_loopne.path, loop_loopne.source),
     mirror(loop_pause.family, loop_pause.path, loop_pause.source),
+    mirror(memory_mfence.family, memory_mfence.path, memory_mfence.source),
     mirror(mov_mov.family, mov_mov.path, mov_mov.source),
     mirror(mov_movapd.family, mov_movapd.path, mov_movapd.source),
     mirror(mov_movaps.family, mov_movaps.path, mov_movaps.source),
