@@ -79,6 +79,10 @@ const jmp_jpo = @import("JMP/JPO.zig");
 const jmp_jrcxz = @import("JMP/JRCXZ.zig");
 const jmp_js = @import("JMP/JS.zig");
 const jmp_jz = @import("JMP/JZ.zig");
+const kortest_kortestw = @import("KORTEST/KORTESTW.zig");
+const kortest_kortestb = @import("KORTEST/KORTESTB.zig");
+const kortest_kortestq = @import("KORTEST/KORTESTQ.zig");
+const kortest_kortestd = @import("KORTEST/KORTESTD.zig");
 const load_lahf = @import("LOAD/LAHF.zig");
 const load_lar = @import("LOAD/LAR.zig");
 const load_lddqu = @import("LOAD/LDDQU.zig");
@@ -1338,6 +1342,10 @@ pub const tables = [_]InstructionTable{
     entry(jmp_jrcxz.family, jmp_jrcxz.path, jmp_jrcxz.source),
     entry(jmp_js.family, jmp_js.path, jmp_js.source),
     entry(jmp_jz.family, jmp_jz.path, jmp_jz.source),
+    entry(kortest_kortestw.family, kortest_kortestw.path, kortest_kortestw.source),
+    entry(kortest_kortestb.family, kortest_kortestb.path, kortest_kortestb.source),
+    entry(kortest_kortestq.family, kortest_kortestq.path, kortest_kortestq.source),
+    entry(kortest_kortestd.family, kortest_kortestd.path, kortest_kortestd.source),
     entry(load_lahf.family, load_lahf.path, load_lahf.source),
     entry(load_lar.family, load_lar.path, load_lar.source),
     entry(load_lddqu.family, load_lddqu.path, load_lddqu.source),

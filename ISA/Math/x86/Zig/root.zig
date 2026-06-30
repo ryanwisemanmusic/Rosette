@@ -81,6 +81,10 @@ const jmp_jpo = @import("JMP/JPO.zig");
 const jmp_jrcxz = @import("JMP/JRCXZ.zig");
 const jmp_js = @import("JMP/JS.zig");
 const jmp_jz = @import("JMP/JZ.zig");
+const kortest_kortestw = @import("KORTEST/KORTESTW.zig");
+const kortest_kortestb = @import("KORTEST/KORTESTB.zig");
+const kortest_kortestq = @import("KORTEST/KORTESTQ.zig");
+const kortest_kortestd = @import("KORTEST/KORTESTD.zig");
 const load_lahf = @import("LOAD/LAHF.zig");
 const load_lar = @import("LOAD/LAR.zig");
 const load_lddqu = @import("LOAD/LDDQU.zig");
@@ -771,6 +775,10 @@ pub const specs = blk: {
         spec(jmp_jrcxz.meta),
         spec(jmp_js.meta),
         spec(jmp_jz.meta),
+        spec(kortest_kortestw.meta),
+        spec(kortest_kortestb.meta),
+        spec(kortest_kortestq.meta),
+        spec(kortest_kortestd.meta),
         spec(load_lahf.meta),
         spec(load_lar.meta),
         spec(load_lddqu.meta),
@@ -1461,6 +1469,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     jmp_jrcxz.proof_report,
     jmp_js.proof_report,
     jmp_jz.proof_report,
+    kortest_kortestw.proof_report,
+    kortest_kortestb.proof_report,
+    kortest_kortestq.proof_report,
+    kortest_kortestd.proof_report,
     load_lahf.proof_report,
     load_lar.proof_report,
     load_lddqu.proof_report,
