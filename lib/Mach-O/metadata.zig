@@ -10,6 +10,7 @@ const INDIRECT_SYMBOL_ABS: u32 = 0x4000_0000;
 const N_STAB: u8 = 0xe0;
 const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
+const N_WEAK_REF: u16 = 0x0040;
 
 const MACH_HEADER_64_SIZE: usize = 32;
 const SEGMENT_COMMAND_64_SIZE: usize = 72;
@@ -38,6 +39,7 @@ pub const ImportedSymbol = struct {
     stub_address: u64,
     lazy_pointer_address: u64,
     symbol_index: u32,
+    weak: bool = false,
 };
 
 pub const DataBinding = struct {
@@ -306,6 +308,7 @@ pub const Metadata = struct {
                     .stub_address = section.address + stub_index * section.stub_size,
                     .lazy_pointer_address = 0,
                     .symbol_index = symbol_index,
+                    .weak = isWeakReference(description),
                 });
             }
         }
@@ -477,6 +480,16 @@ fn terminatedString(data: []const u8, start: usize, limit: usize) []const u8 {
 
 fn readU16(data: []const u8, offset: usize) u16 {
     return std.mem.readInt(u16, data[offset..][0..2], .little);
+}
+
+fn isWeakReference(description: u16) bool {
+    return description & N_WEAK_REF != 0;
+}
+
+test "Mach-O weak references use the n_desc N_WEAK_REF bit" {
+    try std.testing.expect(isWeakReference(0x0040));
+    try std.testing.expect(isWeakReference(0x0240));
+    try std.testing.expect(!isWeakReference(0x0200));
 }
 
 fn readU32(data: []const u8, offset: usize) u32 {

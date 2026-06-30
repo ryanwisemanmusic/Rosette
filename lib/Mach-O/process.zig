@@ -10,6 +10,8 @@ const compat_runtime = @import("macho_compat_runtime");
 const import_resolution = @import("resolution/import_engine.zig");
 const initialization_resolution = @import("resolution/initialization_engine.zig");
 const memory_transaction = @import("resolution/memory_transaction.zig");
+const dynamic_library_forwarder = @import("resolution/dynamic_library_forwarder.zig");
+const smart_stub_generator = @import("resolution/smart_stub_generator.zig");
 const contract = @import("contract");
 
 const log = std.log.scoped(.macho);
@@ -145,8 +147,13 @@ pub const MachOState = struct {
     internal_targets: InternalCompatibilityTargets = .{},
     guest_errno_address: u64 = 0,
     strict_initializers: bool = false,
+    strict_imports: bool = false,
     import_resolver: import_resolution.Engine,
     initializer_resolver: initialization_resolution.Engine,
+    dynamic_forwarder: dynamic_library_forwarder.Forwarder = .{},
+    smart_stubs: smart_stub_generator.Generator = .{},
+    import_provider_override: ?import_resolution.Provider = null,
+    import_confidence_override: ?import_resolution.Confidence = null,
     initializer_memory: memory_transaction.Journal,
     initializer_checkpoint: ?InitializerCheckpoint = null,
     trace_entries: [TRACE_BUFFER_LEN]TraceEntry = [_]TraceEntry{TraceEntry{}} ** TRACE_BUFFER_LEN,
@@ -257,6 +264,7 @@ pub const MachOState = struct {
         self.closeGuestFiles();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
+        self.dynamic_forwarder.deinit();
         self.initializer_memory.deinit();
         self.metadata.deinit();
         self.allocator.free(self.mem);
@@ -655,7 +663,7 @@ pub const MachOState = struct {
             self.pending_stub_entry_rip = null;
             if (self.pending_import_stub_rip) |import_stub_rip| {
                 if (self.metadata.importAtStub(import_stub_rip)) |imported| {
-                    switch (self.handleImport(imported.name)) {
+                    switch (self.handleImport(imported)) {
                         .handled => |result| {
                             self.regs.rax = result;
                             if (self.verbose_trace) {
@@ -691,6 +699,7 @@ pub const MachOState = struct {
                                 );
                             }
                             self.dumpGuestStack();
+                            if (self.strict_imports) self.terminateForUnresolvedImport();
                         },
                         .terminated => |exit_code| {
                             self.exit_code = exit_code;
@@ -729,13 +738,16 @@ pub const MachOState = struct {
         return false;
     }
 
-    fn handleImport(self: *MachOState, name: []const u8) ImportHandlerResult {
+    fn handleImport(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
+        const name = imported.name;
         const return_address = self.read64(self.regs.rsp);
         const caller = if (self.metadata.nearestSymbol(return_address)) |symbol| symbol.name else "<unknown>";
         const active_initializer = self.initializer_resolver.current();
         const phase: import_resolution.Phase = if (active_initializer != null) .initializer else .execution;
         const owner = if (active_initializer) |initializer| initializer.symbol else "<main>";
-        const result = self.handleImportImpl(name);
+        self.import_provider_override = null;
+        self.import_confidence_override = null;
+        const result = self.handleImportImpl(imported);
 
         const exact_contract = import_resolution.contractFor(name);
         const declared_contract = contract.resolveFromAllFamilies(name);
@@ -744,7 +756,7 @@ pub const MachOState = struct {
             .unsupported => .unresolved,
             .terminated => .terminated,
         };
-        const provider: import_resolution.Provider = if (exact_contract != null)
+        const inferred_provider: import_resolution.Provider = if (exact_contract != null)
             .contract
         else switch (result) {
             .unsupported => .none,
@@ -756,22 +768,34 @@ pub const MachOState = struct {
             else
                 .legacy_shim,
         };
-        const confidence: import_resolution.Confidence = if (exact_contract != null)
+        const inferred_confidence: import_resolution.Confidence = if (exact_contract != null)
             .verified
         else if (outcome == .unresolved)
             .unknown
         else
             .modeled;
+        const provider = self.import_provider_override orelse inferred_provider;
+        const confidence = self.import_confidence_override orelse inferred_confidence;
         self.import_resolver.record(name, caller, owner, phase, outcome, provider, confidence);
         return result;
     }
 
-    fn handleImportImpl(self: *MachOState, name: []const u8) ImportHandlerResult {
+    fn handleImportImpl(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
+        const name = imported.name;
         if (import_resolution.dispatchContract(self, name)) |resolution| {
             return switch (resolution) {
                 .handled => |value| .{ .handled = value },
                 .handled_void => .handled_void,
                 .failed => .{ .unsupported = 0 },
+            };
+        }
+
+        if (self.dynamic_forwarder.forward(self, imported.dylib, name)) |resolution| {
+            self.import_provider_override = .dynamic_library;
+            self.import_confidence_override = .verified;
+            return switch (resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
             };
         }
 
@@ -1327,13 +1351,31 @@ pub const MachOState = struct {
             return .{ .handled = self.regs.rdi };
         }
 
+        if (self.smart_stubs.resolve(name, imported.weak, self.regs.rdi)) |generated| {
+            self.import_provider_override = .smart_stub;
+            self.import_confidence_override = switch (generated.confidence) {
+                .verified => .verified,
+                .modeled => .modeled,
+            };
+            if (self.verbose_trace) {
+                std.debug.print(
+                    "    [smart stub] {s} reason={s} confidence={s}\n",
+                    .{ name, @tagName(generated.reason), @tagName(generated.confidence) },
+                );
+            }
+            return switch (generated.resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
+            };
+        }
+
         if (self.verbose_trace) std.debug.print("    [import] (unhandled) {s}\n", .{name});
         return .{ .unsupported = 0 };
     }
 
     fn handleDirectImportCall(self: *MachOState, imported: macho_metadata.ImportedSymbol) void {
         const return_address = self.read64(self.regs.rsp);
-        switch (self.handleImport(imported.name)) {
+        switch (self.handleImport(imported)) {
             .handled => |result| {
                 self.regs.rax = result;
                 if (self.verbose_trace) {
@@ -1358,6 +1400,10 @@ pub const MachOState = struct {
                     "  [unresolved direct import #{d}] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
                     .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, return_address, result },
                 );
+                if (self.strict_imports) {
+                    self.terminateForUnresolvedImport();
+                    return;
+                }
             },
             .terminated => |exit_code| {
                 self.exit_code = exit_code;
@@ -1402,6 +1448,12 @@ pub const MachOState = struct {
         self.import_trace_index = (self.import_trace_index + 1) % IMPORT_TRACE_BUFFER_LEN;
         if (self.import_trace_index == 0) self.import_trace_filled = true;
         self.unresolved_import_count += 1;
+    }
+
+    fn terminateForUnresolvedImport(self: *MachOState) void {
+        self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+        self.terminated = true;
     }
 
     fn handleOpen(self: *MachOState) u64 {
@@ -3933,6 +3985,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.strict_initializers = environmentFlag("ROSETTE_MACHO_STRICT_INITIALIZERS");
+    state.strict_imports = environmentFlag("ROSETTE_MACHO_STRICT_IMPORTS");
     state.max_steps = environmentUnsigned("ROSETTE_MACHO_MAX_STEPS", state.max_steps);
 
     var temp_state = try macho.load(allocator, slice);
@@ -3958,6 +4011,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     std.debug.print("  imports:   {d}\n", .{state.metadata.imports.len});
     std.debug.print("  initializers: {d}\n", .{state.metadata.initializer_count});
     std.debug.print("  strict initializers: {}\n", .{state.strict_initializers});
+    std.debug.print("  strict imports: {}\n", .{state.strict_imports});
     std.debug.print("  x64 cpu profile: {s}\n", .{state.cpu_profile.label()});
     std.debug.print(
         "  advertised ISA: SSE4.2={} AVX={} AVX2={} AVX-512F={} XCR0=0x{x}\n",
@@ -4002,6 +4056,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.initializer_resolver.logSummary();
     if (!initializers_ok) {
         state.import_resolver.logSummary();
+        state.dynamic_forwarder.logSummary();
+        state.smart_stubs.logSummary();
         std.debug.print("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
         return state.exit_code;
     }
@@ -4012,6 +4068,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
 
     std.debug.print("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
     state.import_resolver.logSummary();
+    state.dynamic_forwarder.logSummary();
+    state.smart_stubs.logSummary();
 
     if (state.unresolved_import_count != 0) {
         const end = if (state.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else state.import_trace_index;

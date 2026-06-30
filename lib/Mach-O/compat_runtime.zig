@@ -332,6 +332,32 @@ pub fn initLibcppStringLiteral(state: anytype, object: u64, value: []const u8) b
     return true;
 }
 
+pub fn initLibcppStringFill(state: anytype, object: u64, length: u64, value: u8) bool {
+    if (length > std.math.maxInt(usize)) return false;
+    const object_bytes = state.guestMemory(object, 24) orelse return false;
+    @memset(object_bytes, 0);
+
+    if (length < 23) {
+        object_bytes[0] = @intCast(length << 1);
+        const len: usize = @intCast(length);
+        @memset(object_bytes[1 .. 1 + len], value);
+        object_bytes[1 + len] = 0;
+        return true;
+    }
+
+    const capacity = std.math.add(u64, length, 16) catch return false;
+    const allocation_size = capacity & ~@as(u64, 15);
+    const data = state.guestAlloc(allocation_size, 16) orelse return false;
+    const data_bytes = state.guestMemory(data, allocation_size) orelse return false;
+    const len: usize = @intCast(length);
+    @memset(data_bytes[0..len], value);
+    data_bytes[len] = 0;
+    state.write64(object, allocation_size | 1);
+    state.write64(object + 8, length);
+    state.write64(object + 16, data);
+    return true;
+}
+
 pub const LibcppStringView = struct {
     address: u64,
     length: u64,
@@ -660,6 +686,22 @@ test "libc++ string push_back preserves short and long representations" {
     try std.testing.expectEqual(allocation, view.address);
     try std.testing.expectEqual(@as(u64, 24), view.length);
     try std.testing.expectEqualStrings("yz", state.guestMemoryConst(view.address + 22, 2).?);
+    try std.testing.expectEqual(@as(u8, 0), state.guestMemoryConst(view.address + view.length, 1).?[0]);
+}
+
+test "libc++ fill initialization preserves short and long layouts" {
+    var state = TestState{};
+    try std.testing.expect(initLibcppStringFill(&state, 0, 5, '3'));
+    var view = libcppStringView(&state, 0).?;
+    try std.testing.expectEqualStrings("33333", state.guestMemoryConst(view.address, view.length).?);
+    try std.testing.expect(state.mem[0] & 1 == 0);
+    try std.testing.expectEqual(@as(u8, 0), state.mem[6]);
+
+    try std.testing.expect(initLibcppStringFill(&state, 64, 32, 'x'));
+    view = libcppStringView(&state, 64).?;
+    try std.testing.expectEqual(@as(u64, 32), view.length);
+    try std.testing.expect(state.mem[64] & 1 != 0);
+    try std.testing.expectEqualSlices(u8, &([_]u8{'x'} ** 32), state.guestMemoryConst(view.address, view.length).?);
     try std.testing.expectEqual(@as(u8, 0), state.guestMemoryConst(view.address + view.length, 1).?[0]);
 }
 
