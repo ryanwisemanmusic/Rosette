@@ -375,6 +375,9 @@ const pop_popcnt = @import("POP/POPCNT.zig");
 const push_push = @import("PUSH/PUSH.zig");
 const push_pusha = @import("PUSH/PUSHA.zig");
 const push_pushad = @import("PUSH/PUSHAD.zig");
+const push_pushf = @import("PUSH/PUSHF.zig");
+const push_pushfd = @import("PUSH/PUSHFD.zig");
+const push_pushfq = @import("PUSH/PUSHFQ.zig");
 const restore_frstore = @import("RESTORE/frstore.zig");
 const restore_fxrstore = @import("RESTORE/fxrstore.zig");
 const restore_rstore_ssp = @import("RESTORE/rstore_ssp.zig");
@@ -1057,6 +1060,9 @@ pub const specs = blk: {
         spec(push_push.meta),
         spec(push_pusha.meta),
         spec(push_pushad.meta),
+        spec(push_pushf.meta),
+        spec(push_pushfd.meta),
+        spec(push_pushfq.meta),
         spec(restore_frstore.meta),
         spec(restore_fxrstore.meta),
         spec(restore_rstore_ssp.meta),
@@ -1751,6 +1757,9 @@ pub const proof_reports = [_]proofs.ProofReport{
     push_push.proof_report,
     push_pusha.proof_report,
     push_pushad.proof_report,
+    push_pushf.proof_report,
+    push_pushfd.proof_report,
+    push_pushfq.proof_report,
     restore_frstore.proof_report,
     restore_fxrstore.proof_report,
     restore_rstore_ssp.proof_report,
