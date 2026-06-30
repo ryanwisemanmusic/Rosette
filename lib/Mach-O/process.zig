@@ -18,6 +18,7 @@ const memory_management_forwarder = @import("resolution/memory_management_forwar
 const launch_argument_accelerator = @import("resolution/launch_argument_accelerator.zig");
 const startup_observer = @import("resolution/startup_observer.zig");
 const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
+const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
 const contract = @import("contract");
 
 const log = std.log.scoped(.macho);
@@ -176,6 +177,7 @@ pub const MachOState = struct {
     initializer_resolver: initialization_resolution.Engine,
     dynamic_forwarder: dynamic_library_forwarder.Forwarder = .{},
     fs_forwarder: fs_io_forwarder.Forwarder,
+    libcxx_filesystem: libcpp_filesystem.Bridge = .{},
     memory_forwarder: memory_management_forwarder.Manager,
     smart_stubs: smart_stub_generator.Generator = .{},
     cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
@@ -963,6 +965,15 @@ pub const MachOState = struct {
                 .handled => |value| .{ .handled = value },
                 .handled_void => .handled_void,
                 .failed => .{ .unsupported = 0 },
+            };
+        }
+
+        if (self.libcxx_filesystem.dispatch(self, &self.fs_forwarder, name)) |resolution| {
+            self.import_provider_override = .libcpp_filesystem;
+            self.import_confidence_override = .verified;
+            return switch (resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
             };
         }
 
@@ -4539,6 +4550,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.import_resolver.logSummary();
         state.dynamic_forwarder.logSummary();
         state.fs_forwarder.logSummary();
+        state.libcxx_filesystem.logSummary();
         state.memory_forwarder.logSummary();
         state.launch_options.logSummary();
         state.startup.logSummary();
@@ -4556,6 +4568,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.import_resolver.logSummary();
     state.dynamic_forwarder.logSummary();
     state.fs_forwarder.logSummary();
+    state.libcxx_filesystem.logSummary();
     state.memory_forwarder.logSummary();
     state.launch_options.logSummary();
     state.startup.logSummary();

@@ -33,6 +33,12 @@ pub const Forwarder = struct {
         std.debug.print("macho-processor: fs forwarding storage root: {s}\n", .{storage_root});
     }
 
+    pub fn resolveHostPath(self: *Forwarder, guest_path: []const u8, temporary: []u8) ?[]const u8 {
+        const translation = self.translator.translate(guest_path, temporary) orelse return null;
+        if (translation.translated.len == 0) return null;
+        return translation.translated;
+    }
+
     pub fn open(self: *Forwarder, state: anytype) u64 {
         self.open_count += 1;
         const path = state.guestCString(state.regs.rdi, 4096) orelse return @bitCast(@as(i64, -1));
