@@ -614,6 +614,14 @@ const logical_nand_vptestnmb = @import("LOGICAL_NAND/VPTESTNMB.zig");
 const logical_nand_vptestnmw = @import("LOGICAL_NAND/VPTESTNMW.zig");
 const logical_nand_vptestnmd = @import("LOGICAL_NAND/VPTESTNMD.zig");
 const logical_nand_vptestnmq = @import("LOGICAL_NAND/VPTESTNMQ.zig");
+const logical_or_korw = @import("LOGICAL_OR/KORW.zig");
+const logical_or_korb = @import("LOGICAL_OR/KORB.zig");
+const logical_or_korq = @import("LOGICAL_OR/KORQ.zig");
+const logical_or_kord = @import("LOGICAL_OR/KORD.zig");
+const logical_or_por = @import("LOGICAL_OR/POR.zig");
+const logical_or_vpor = @import("LOGICAL_OR/VPOR.zig");
+const logical_or_vpord = @import("LOGICAL_OR/VPORD.zig");
+const logical_or_vporq = @import("LOGICAL_OR/VPORQ.zig");
 const logical_xnor_kxnorw = @import("LOGICAL_XNOR/KXNORW.zig");
 const logical_xnor_kxnorb = @import("LOGICAL_XNOR/KXNORB.zig");
 const logical_xnor_kxnorq = @import("LOGICAL_XNOR/KXNORQ.zig");
@@ -1284,6 +1292,14 @@ pub const specs = blk: {
         spec(logical_nand_vptestnmw.meta),
         spec(logical_nand_vptestnmd.meta),
         spec(logical_nand_vptestnmq.meta),
+        spec(logical_or_korw.meta),
+        spec(logical_or_korb.meta),
+        spec(logical_or_korq.meta),
+        spec(logical_or_kord.meta),
+        spec(logical_or_por.meta),
+        spec(logical_or_vpor.meta),
+        spec(logical_or_vpord.meta),
+        spec(logical_or_vporq.meta),
         spec(logical_xnor_kxnorw.meta),
         spec(logical_xnor_kxnorb.meta),
         spec(logical_xnor_kxnorq.meta),
@@ -1966,6 +1982,14 @@ pub const proof_reports = [_]proofs.ProofReport{
     logical_nand_vptestnmw.proof_report,
     logical_nand_vptestnmd.proof_report,
     logical_nand_vptestnmq.proof_report,
+    logical_or_korw.proof_report,
+    logical_or_korb.proof_report,
+    logical_or_korq.proof_report,
+    logical_or_kord.proof_report,
+    logical_or_por.proof_report,
+    logical_or_vpor.proof_report,
+    logical_or_vpord.proof_report,
+    logical_or_vporq.proof_report,
     logical_xnor_kxnorw.proof_report,
     logical_xnor_kxnorb.proof_report,
     logical_xnor_kxnorq.proof_report,
