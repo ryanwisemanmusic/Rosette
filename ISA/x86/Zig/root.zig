@@ -372,6 +372,9 @@ const pop_popcnt = @import("POP/POPCNT.zig");
 const push_push = @import("PUSH/PUSH.zig");
 const push_pusha = @import("PUSH/PUSHA.zig");
 const push_pushad = @import("PUSH/PUSHAD.zig");
+const push_pushf = @import("PUSH/PUSHF.zig");
+const push_pushfd = @import("PUSH/PUSHFD.zig");
+const push_pushfq = @import("PUSH/PUSHFQ.zig");
 const restore_frstore = @import("RESTORE/frstore.zig");
 const restore_fxrstore = @import("RESTORE/fxrstore.zig");
 const restore_rstore_ssp = @import("RESTORE/rstore_ssp.zig");
@@ -1625,6 +1628,9 @@ pub const tables = [_]InstructionTable{
     entry(push_push.family, push_push.path, push_push.source),
     entry(push_pusha.family, push_pusha.path, push_pusha.source),
     entry(push_pushad.family, push_pushad.path, push_pushad.source),
+    entry(push_pushf.family, push_pushf.path, push_pushf.source),
+    entry(push_pushfd.family, push_pushfd.path, push_pushfd.source),
+    entry(push_pushfq.family, push_pushfq.path, push_pushfq.source),
     entry(restore_frstore.family, restore_frstore.path, restore_frstore.source),
     entry(restore_fxrstore.family, restore_fxrstore.path, restore_fxrstore.source),
     entry(restore_rstore_ssp.family, restore_rstore_ssp.path, restore_rstore_ssp.source),
