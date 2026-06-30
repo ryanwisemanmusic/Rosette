@@ -637,6 +637,7 @@ const gather_vpgatherdd = @import("GATHER/vpgatherdd.zig");
 const gather_vpgatherdq = @import("GATHER/vpgatherdq.zig");
 const gather_vpgatherqd = @import("GATHER/vpgatherqd.zig");
 const gather_vpgatherqq = @import("GATHER/vpgatherqq.zig");
+const get_xgetbv = @import("GET/XGETBV.zig");
 const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
 const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
 const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
@@ -1289,6 +1290,7 @@ pub const specs = blk: {
         spec(gather_vpgatherdq.meta),
         spec(gather_vpgatherqd.meta),
         spec(gather_vpgatherqq.meta),
+        spec(get_xgetbv.meta),
         spec(square_root_fsqrt.meta),
         spec(square_root_sqrtpd.meta),
         spec(square_root_sqrtps.meta),
@@ -1953,6 +1955,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     gather_vpgatherdq.proof_report,
     gather_vpgatherqd.proof_report,
     gather_vpgatherqq.proof_report,
+    get_xgetbv.proof_report,
     square_root_fsqrt.proof_report,
     square_root_sqrtpd.proof_report,
     square_root_sqrtps.proof_report,

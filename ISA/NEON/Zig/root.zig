@@ -635,6 +635,7 @@ const gather_vpgatherdd = @import("GATHER/vpgatherdd.zig");
 const gather_vpgatherdq = @import("GATHER/vpgatherdq.zig");
 const gather_vpgatherqd = @import("GATHER/vpgatherqd.zig");
 const gather_vpgatherqq = @import("GATHER/vpgatherqq.zig");
+const get_xgetbv = @import("GET/XGETBV.zig");
 const square_root_fsqrt = @import("SQUARE_ROOT/fsqrt.zig");
 const square_root_sqrtpd = @import("SQUARE_ROOT/sqrtpd.zig");
 const square_root_sqrtps = @import("SQUARE_ROOT/sqrtps.zig");
@@ -1358,6 +1359,7 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(gather_vpgatherdq.family, gather_vpgatherdq.path, gather_vpgatherdq.source),
     mirror(gather_vpgatherqd.family, gather_vpgatherqd.path, gather_vpgatherqd.source),
     mirror(gather_vpgatherqq.family, gather_vpgatherqq.path, gather_vpgatherqq.source),
+    mirror(get_xgetbv.family, get_xgetbv.path, get_xgetbv.source),
     mirror(square_root_fsqrt.family, square_root_fsqrt.path, square_root_fsqrt.source),
     mirror(square_root_sqrtpd.family, square_root_sqrtpd.path, square_root_sqrtpd.source),
     mirror(square_root_sqrtps.family, square_root_sqrtps.path, square_root_sqrtps.source),
