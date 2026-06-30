@@ -279,6 +279,51 @@ pub const Metadata = struct {
         return null;
     }
 
+    pub fn symbolAddressesMatching(
+        self: *const Metadata,
+        prefix: []const u8,
+        fragment: []const u8,
+        output: []u64,
+    ) usize {
+        const table = self.symtab orelse return 0;
+        var found: usize = 0;
+        var index: u32 = 0;
+        while (index < table.symbol_count and found < output.len) : (index += 1) {
+            const entry_offset = @as(usize, table.symbol_offset) + @as(usize, index) * NLIST_64_SIZE;
+            if (entry_offset + NLIST_64_SIZE > self.data.len) break;
+            const symbol_type = self.data[entry_offset + 4];
+            if ((symbol_type & N_STAB) != 0 or (symbol_type & N_TYPE) != N_SECT) continue;
+            const name = self.symbolName(table, readU32(self.data, entry_offset)) orelse continue;
+            if (!std.mem.startsWith(u8, name, prefix) or std.mem.indexOf(u8, name, fragment) == null) continue;
+            const address = readU64(self.data, entry_offset + 8);
+            if (address == 0) continue;
+            output[found] = address;
+            found += 1;
+        }
+        return found;
+    }
+
+    pub fn sectionNamed(self: *const Metadata, segment_name: []const u8, section_name: []const u8) ?Section {
+        for (self.sections) |section| {
+            if (std.mem.eql(u8, section.segment_name, segment_name) and
+                std.mem.eql(u8, section.name, section_name)) return section;
+        }
+        return null;
+    }
+
+    pub fn sectionBytes(self: *const Metadata, section: Section) ?[]const u8 {
+        const start: usize = @intCast(section.file_offset);
+        const size: usize = @intCast(section.size);
+        if (start > self.data.len or size > self.data.len - start) return null;
+        return self.data[start .. start + size];
+    }
+
+    pub fn imageBase(self: *const Metadata) u64 {
+        var base: u64 = std.math.maxInt(u64);
+        for (self.segment_addresses) |address| base = @min(base, address);
+        return if (base == std.math.maxInt(u64)) 0 else base;
+    }
+
     fn collectImports(self: *const Metadata) ![]ImportedSymbol {
         const table = self.symtab orelse return &.{};
         const dynamic = self.dysymtab orelse return &.{};

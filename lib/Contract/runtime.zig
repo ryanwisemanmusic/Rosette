@@ -220,9 +220,9 @@ pub const PosixContracts = struct {
             },
             Contract{
                 .name = "free",
-                .description = "Free allocated memory (no-op in guest)",
+                .description = "Release memory through the guest heap manager",
                 .kind = .generic_allocator,
-                .strategy = .stub,
+                .strategy = .forward_to_host,
                 .matches = &.{
                     MatchPattern{ .exact = "__ZdlPv" },
                     MatchPattern{ .exact = "__ZdaPv" },
@@ -508,9 +508,9 @@ pub const FileIoContracts = struct {
             },
             Contract{
                 .name = "readdir",
-                .description = "Read directory entry (stub)",
+                .description = "Read a directory entry into guest memory",
                 .kind = .posix_file_io,
-                .strategy = .stub,
+                .strategy = .forward_to_host,
                 .matches = &.{
                     MatchPattern{ .exact = "_readdir$INODE64" },
                     MatchPattern{ .exact = "_readdir" },
@@ -550,6 +550,13 @@ pub const StdioContracts = struct {
                 .kind = .libc_stdio,
                 .strategy = .forward_to_host,
                 .matches = &.{MatchPattern{ .suffix = "_fputs" }},
+            },
+            Contract{
+                .name = "fwrite",
+                .description = "Write elements to file stream",
+                .kind = .libc_stdio,
+                .strategy = .forward_to_host,
+                .matches = &.{MatchPattern{ .suffix = "_fwrite" }},
             },
             Contract{
                 .name = "fflush",
@@ -724,7 +731,7 @@ pub const CxxContracts = struct {
                 .name = "__cxa_throw",
                 .description = "Throw a C++ exception",
                 .kind = .cxx_exception,
-                .strategy = .terminate,
+                .strategy = .custom_handler,
                 .matches = &.{MatchPattern{ .exact = "___cxa_throw" }},
             },
             Contract{
@@ -734,6 +741,50 @@ pub const CxxContracts = struct {
                 .strategy = .forward_to_host,
                 .matches = &.{MatchPattern{ .exact = "___cxa_allocate_exception" }},
                 .returns = .{ .result_is_ptr = true },
+            },
+            Contract{
+                .name = "__cxa_begin_catch",
+                .description = "Enter an Itanium C++ ABI catch handler",
+                .kind = .cxx_exception,
+                .strategy = .custom_handler,
+                .matches = &.{MatchPattern{ .exact = "___cxa_begin_catch" }},
+                .returns = .{ .result_is_ptr = true },
+            },
+            Contract{
+                .name = "__cxa_end_catch",
+                .description = "Leave the active Itanium C++ ABI catch handler",
+                .kind = .cxx_exception,
+                .strategy = .custom_handler,
+                .matches = &.{MatchPattern{ .exact = "___cxa_end_catch" }},
+            },
+            Contract{
+                .name = "__cxa_get_exception_ptr",
+                .description = "Resolve an Itanium exception header to its guest object",
+                .kind = .cxx_exception,
+                .strategy = .custom_handler,
+                .matches = &.{MatchPattern{ .exact = "___cxa_get_exception_ptr" }},
+                .returns = .{ .result_is_ptr = true },
+            },
+            Contract{
+                .name = "__cxa_free_exception",
+                .description = "Release an Itanium exception allocation from the guest heap",
+                .kind = .cxx_exception,
+                .strategy = .custom_handler,
+                .matches = &.{MatchPattern{ .exact = "___cxa_free_exception" }},
+            },
+            Contract{
+                .name = "__cxa_rethrow",
+                .description = "Resume unwinding the active Itanium C++ exception",
+                .kind = .cxx_exception,
+                .strategy = .custom_handler,
+                .matches = &.{MatchPattern{ .exact = "___cxa_rethrow" }},
+            },
+            Contract{
+                .name = "_Unwind_Resume",
+                .description = "Resume phase-two Itanium stack unwinding",
+                .kind = .cxx_exception,
+                .strategy = .custom_handler,
+                .matches = &.{MatchPattern{ .exact = "__Unwind_Resume" }},
             },
             Contract{
                 .name = "__next_prime",
@@ -1103,6 +1154,13 @@ test "dispatchContract returns null for forward_to_host" {
     });
     const result = dispatchContract(&registry, "_open", 0);
     try std.testing.expect(result == null);
+}
+
+test "__cxa_throw is reserved for the stateful exception handler" {
+    const resolved = resolveFromAllFamilies("___cxa_throw");
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqual(ResolutionStrategy.custom_handler, resolved.?.strategy);
+    try std.testing.expect(dispatchFromAllFamilies("___cxa_throw", 0x47c9560) == null);
 }
 
 test "dispatchContract returns null for unknown symbol" {

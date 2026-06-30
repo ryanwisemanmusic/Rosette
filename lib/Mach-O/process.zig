@@ -12,6 +12,12 @@ const initialization_resolution = @import("resolution/initialization_engine.zig"
 const memory_transaction = @import("resolution/memory_transaction.zig");
 const dynamic_library_forwarder = @import("resolution/dynamic_library_forwarder.zig");
 const smart_stub_generator = @import("resolution/smart_stub_generator.zig");
+const cxx_exception_diagnostics = @import("resolution/cxx_exception_diagnostics.zig");
+const fs_io_forwarder = @import("resolution/fs_io_forwarder.zig");
+const memory_management_forwarder = @import("resolution/memory_management_forwarder.zig");
+const launch_argument_accelerator = @import("resolution/launch_argument_accelerator.zig");
+const startup_observer = @import("resolution/startup_observer.zig");
+const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
 const contract = @import("contract");
 
 const log = std.log.scoped(.macho);
@@ -45,6 +51,7 @@ const BOUND_IMPORT_THUNK_BASE: u64 = 0xFFFF_FC00_0000_0000;
 const BOUND_IMPORT_THUNK_STRIDE: u64 = 16;
 const INITIALIZER_RETURN_SENTINEL: u64 = 0xFFFF_FB00_0000_0000;
 const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
+const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 
 const MachSegment = macho.MachSegment;
 
@@ -103,6 +110,13 @@ const BoundImportThunk = struct {
 
 const InternalCompatibilityTargets = struct {
     cxxopts_split_option_names: u64 = 0,
+    parse_launch_arguments: u64 = 0,
+    initialize_logging: u64 = 0,
+    cvar_add_to_launch_options: [32]u64 = [_]u64{0} ** 32,
+    cvar_add_to_launch_options_count: usize = 0,
+    guest_log_get_thread_buffer: u64 = 0,
+    guest_log_append_formatted: u64 = 0,
+    guest_log_append_view: u64 = 0,
 };
 
 const InitializerCheckpoint = struct {
@@ -144,14 +158,29 @@ pub const MachOState = struct {
     guest_assertion_count: u64 = 0,
     initializer_abort_requested: bool = false,
     cxxopts_split_accelerations: u64 = 0,
+    positional_options_captured: bool = false,
+    executed_steps: u64 = 0,
     internal_targets: InternalCompatibilityTargets = .{},
+    launch_options: launch_argument_accelerator.Filter = .{},
+    startup: startup_observer.Observer = .{},
     guest_errno_address: u64 = 0,
+    guest_stdin_pointer_address: u64 = 0,
+    guest_stdout_pointer_address: u64 = 0,
+    guest_stderr_pointer_address: u64 = 0,
+    guest_log_buffer_address: u64 = 0,
+    guest_log_mirror_fd: i32 = -1,
+    guest_log_line_count: u64 = 0,
     strict_initializers: bool = false,
     strict_imports: bool = false,
     import_resolver: import_resolution.Engine,
     initializer_resolver: initialization_resolution.Engine,
     dynamic_forwarder: dynamic_library_forwarder.Forwarder = .{},
+    fs_forwarder: fs_io_forwarder.Forwarder,
+    memory_forwarder: memory_management_forwarder.Manager,
     smart_stubs: smart_stub_generator.Generator = .{},
+    cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
+    unwinder: itanium_unwinder.Engine = .{},
+    last_unwind_inspection: ?itanium_unwinder.Inspection = null,
     import_provider_override: ?import_resolution.Provider = null,
     import_confidence_override: ?import_resolution.Confidence = null,
     initializer_memory: memory_transaction.Journal,
@@ -247,6 +276,8 @@ pub const MachOState = struct {
             .import_resolver = import_resolution.Engine.init(allocator),
             .initializer_resolver = initialization_resolution.Engine.init(allocator, initializer_count),
             .initializer_memory = memory_transaction.Journal.init(allocator, PAGE_SIZE),
+            .fs_forwarder = fs_io_forwarder.Forwarder.init(allocator),
+            .memory_forwarder = memory_management_forwarder.Manager.init(allocator),
         };
         result.guest_files[0] = .{ .active = true, .fd = 0, .kind = .regular };
         result.guest_files[1] = .{ .active = true, .fd = 1, .kind = .stdout };
@@ -254,6 +285,27 @@ pub const MachOState = struct {
         result.internal_targets.cxxopts_split_option_names = result.metadata.symbolAddressWithPrefix(
             "__ZN7cxxopts6values11parser_tool18split_option_names",
         ) orelse 0;
+        result.internal_targets.parse_launch_arguments = result.metadata.symbolAddressWithPrefix(
+            "__ZN4cvar20ParseLaunchArguments",
+        ) orelse 0;
+        result.internal_targets.initialize_logging = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe17InitializeLogging",
+        ) orelse 0;
+        result.internal_targets.cvar_add_to_launch_options_count = result.metadata.symbolAddressesMatching(
+            "__ZN4cvar",
+            "AddToLaunchOptions",
+            &result.internal_targets.cvar_add_to_launch_options,
+        );
+        result.internal_targets.guest_log_get_thread_buffer = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe7logging8internal15GetThreadBufferEv",
+        ) orelse 0;
+        result.internal_targets.guest_log_append_formatted = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe7logging8internal13AppendLogLineENS_8LogLevelEcm",
+        ) orelse 0;
+        result.internal_targets.guest_log_append_view = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe7logging13AppendLogLineENS_8LogLevelEc",
+        ) orelse 0;
+        result.unwinder.configure(&result.metadata);
         result.applyDyldBindings() catch |err| {
             log.warn("dyld data binding setup failed: {s}", .{@errorName(err)});
         };
@@ -265,7 +317,10 @@ pub const MachOState = struct {
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
         self.dynamic_forwarder.deinit();
+        self.fs_forwarder.deinit();
+        self.memory_forwarder.deinit();
         self.initializer_memory.deinit();
+        if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
         self.metadata.deinit();
         self.allocator.free(self.mem);
         self.allocator.free(self.segments);
@@ -287,6 +342,16 @@ pub const MachOState = struct {
         var applied: usize = 0;
         var stack_guard_address: u64 = 0;
         for (self.metadata.bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, "___stdinp") or
+                std.mem.eql(u8, binding.name, "___stdoutp") or
+                std.mem.eql(u8, binding.name, "___stderrp"))
+            {
+                const pointer_address = self.standardStreamPointer(binding.name) orelse continue;
+                if (self.guestMemory(binding.address, @sizeOf(u64)) == null) continue;
+                self.write64(binding.address, pointer_address);
+                applied += 1;
+                continue;
+            }
             if (std.mem.eql(u8, binding.name, "___stack_chk_guard")) {
                 if (stack_guard_address == 0) {
                     stack_guard_address = self.guestAlloc(@sizeOf(u64), @alignOf(u64)) orelse continue;
@@ -360,6 +425,16 @@ pub const MachOState = struct {
             if (address >= segment.vmaddr and address < segment.vmaddr + segment.vmsize) return true;
         }
         return false;
+    }
+
+    fn diagnosticSymbol(self: *const MachOState, address: u64) ?exit_diagnostics.SymbolizedAddress {
+        if (address == 0) return null;
+        const symbol = self.metadata.nearestSymbol(address) orelse return null;
+        return .{
+            .address = address,
+            .symbol = symbol.name,
+            .symbol_offset = symbol.offset,
+        };
     }
 
     pub fn read8(self: *const MachOState, vaddr: u64) u8 {
@@ -493,7 +568,19 @@ pub const MachOState = struct {
         return start;
     }
 
-    fn guestCString(self: *const MachOState, addr: u64, max_len: usize) ?[]const u8 {
+    pub fn guestHeapAllocate(self: *MachOState, size: u64, alignment: u64) ?u64 {
+        return self.memory_forwarder.allocate(self, size, alignment);
+    }
+
+    pub fn guestHeapRelease(self: *MachOState, address: u64) void {
+        self.memory_forwarder.release(address);
+    }
+
+    pub fn guestHeapContains(self: *const MachOState, address: u64) bool {
+        return self.memory_forwarder.allocationSize(address) != null;
+    }
+
+    pub fn guestCString(self: *const MachOState, addr: u64, max_len: usize) ?[]const u8 {
         if (addr == 0) return null;
         const off = self.addrToOffset(addr) orelse return null;
         const off_usize: usize = @intCast(off);
@@ -503,6 +590,21 @@ pub const MachOState = struct {
         return available[0..end];
     }
 
+    fn cxxExceptionTypeName(self: *const MachOState, type_info_address: u64) ?[]const u8 {
+        const name_address = self.read64(type_info_address +| 8);
+        return self.guestCString(name_address, 4096);
+    }
+
+    fn cxxExceptionMessage(self: *const MachOState, object_address: u64) ?[]const u8 {
+        const message_view = compat_runtime.libcppStringView(self, object_address +| 8) orelse return null;
+        if (message_view.length == 0 or message_view.length > 4096) return null;
+        const message = self.guestMemoryConst(message_view.address, message_view.length) orelse return null;
+        for (message) |byte| {
+            if (byte < 0x20 or byte > 0x7E) return null;
+        }
+        return message;
+    }
+
     fn guestWriteCString(self: *MachOState, addr: u64, bytes: []const u8) bool {
         if (self.guestMemory(addr, bytes.len + 1)) |buf| {
             @memcpy(buf[0..bytes.len], bytes);
@@ -510,6 +612,80 @@ pub const MachOState = struct {
             return true;
         }
         return false;
+    }
+
+    fn standardStreamPointer(self: *MachOState, symbol_name: []const u8) ?u64 {
+        const stream: struct { slot: *u64, handle: u64 } = if (std.mem.eql(u8, symbol_name, "___stdinp"))
+            .{ .slot = &self.guest_stdin_pointer_address, .handle = GUEST_FILE_BASE }
+        else if (std.mem.eql(u8, symbol_name, "___stdoutp"))
+            .{ .slot = &self.guest_stdout_pointer_address, .handle = GUEST_FILE_BASE + 1 }
+        else if (std.mem.eql(u8, symbol_name, "___stderrp"))
+            .{ .slot = &self.guest_stderr_pointer_address, .handle = GUEST_FILE_BASE + 2 }
+        else
+            return null;
+        if (stream.slot.* == 0) {
+            stream.slot.* = self.guestAlloc(@sizeOf(u64), @alignOf(u64)) orelse return null;
+            self.write64(stream.slot.*, stream.handle);
+        }
+        return stream.slot.*;
+    }
+
+    fn configureGuestLogMirror(self: *MachOState, args: []const []const u8) void {
+        const prefix = "--log_file=";
+        for (args) |arg| {
+            if (!std.mem.startsWith(u8, arg, prefix) or arg.len == prefix.len) continue;
+            const path = arg[prefix.len..];
+            const path_z = self.allocator.dupeZ(u8, path) catch return;
+            defer self.allocator.free(path_z);
+            const flags = parseFopenFlags("a") orelse return;
+            const fd = std.c.open(
+                path_z.ptr,
+                @bitCast(@as(u32, @intCast(flags))),
+                @as(c_int, 0o666),
+            );
+            if (fd < 0) {
+                std.debug.print("macho-processor: guest log mirror could not open {s}\n", .{path});
+                return;
+            }
+            if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
+            self.guest_log_mirror_fd = fd;
+            std.debug.print("macho-processor: guest log mirror: {s}\n", .{path});
+            return;
+        }
+    }
+
+    fn hostWriteFdAll(fd: i32, bytes: []const u8) bool {
+        if (fd < 0) return false;
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const result = std.c.write(fd, bytes.ptr + written, bytes.len - written);
+            if (result <= 0) return false;
+            written += @intCast(result);
+        }
+        return true;
+    }
+
+    fn emitGuestLog(self: *MachOState, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
+        const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
+        const message = self.guestMemoryConst(address, length) orelse return false;
+        const raw_char: u8 = @truncate(prefix_char_raw);
+        const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
+        var prefix_buffer: [32]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buffer, "[xenia] {c}> ", .{prefix_char}) catch return false;
+
+        _ = hostWriteFdAll(1, prefix);
+        _ = hostWriteFdAll(1, message);
+        if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(1, "\n");
+
+        if (self.guest_log_mirror_fd >= 0) {
+            _ = hostWriteFdAll(self.guest_log_mirror_fd, prefix);
+            _ = hostWriteFdAll(self.guest_log_mirror_fd, message);
+            if (message.len == 0 or message[message.len - 1] != '\n') {
+                _ = hostWriteFdAll(self.guest_log_mirror_fd, "\n");
+            }
+        }
+        self.guest_log_line_count +|= 1;
+        return true;
     }
 
     fn allocGuestFile(self: *MachOState, fd: i32, kind: GuestFileKind) ?u64 {
@@ -1140,48 +1316,107 @@ pub const MachOState = struct {
             return .{ .handled = mask };
         }
         if (std.mem.eql(u8, name, "___cxa_allocate_exception")) {
-            const allocation = self.guestAlloc(self.regs.rdi +| 64, 16) orelse return .{ .unsupported = 0 };
-            return .{ .handled = allocation + 64 };
+            const object_size = self.regs.rdi;
+            const allocation = self.memory_forwarder.allocate(self, object_size +| 64, 16) orelse return .{ .unsupported = 0 };
+            const object_address = allocation + 64;
+            self.cxx_exceptions.recordAllocation(allocation, object_address, object_size, self.read64(self.regs.rsp));
+            return .{ .handled = object_address };
+        }
+        if (std.mem.eql(u8, name, "___cxa_begin_catch")) {
+            const object_address = self.cxx_exceptions.beginCatch(self.regs.rdi);
+            std.debug.print("macho-processor: __cxa_begin_catch object=0x{x}\n", .{object_address});
+            return .{ .handled = object_address };
+        }
+        if (std.mem.eql(u8, name, "___cxa_end_catch")) {
+            const object_address = self.cxx_exceptions.endCatch();
+            if (object_address) |object| std.debug.print("macho-processor: __cxa_end_catch object=0x{x}\n", .{object});
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "___cxa_get_exception_ptr")) {
+            return .{ .handled = self.cxx_exceptions.exceptionPointer(self.regs.rdi) };
+        }
+        if (std.mem.eql(u8, name, "___cxa_free_exception")) {
+            if (self.cxx_exceptions.freeException(self.regs.rdi)) |allocation| {
+                self.memory_forwarder.release(allocation.storage_address);
+            }
+            return .handled_void;
         }
         if (std.mem.eql(u8, name, "__ZNSt20bad_array_new_lengthC1Ev")) {
             return .{ .handled = self.regs.rdi };
         }
         if (std.mem.eql(u8, name, "___cxa_throw")) {
-            const type_symbol = if (self.metadata.nearestSymbol(self.regs.rsi)) |symbol| symbol else null;
-            const destructor_symbol = if (self.metadata.nearestSymbol(self.regs.rdx)) |symbol| symbol else null;
+            const thrown = self.cxx_exceptions.recordThrow(
+                self.regs.rdi,
+                self.regs.rsi,
+                self.regs.rdx,
+                self.read64(self.regs.rsp),
+            );
             std.debug.print(
                 "macho-processor: guest raised C++ exception object=0x{x} type_info=0x{x} destructor=0x{x}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx },
             );
-            if (type_symbol) |symbol| {
+            if (self.cxxExceptionTypeName(thrown.type_info_address)) |type_name| {
+                std.debug.print("macho-processor: C++ exception ABI type name: {s}\n", .{type_name});
+            }
+            if (self.metadata.nearestSymbol(thrown.type_info_address)) |symbol| {
                 std.debug.print("macho-processor: C++ exception type: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
             }
-            if (destructor_symbol) |symbol| {
+            if (self.metadata.nearestSymbol(thrown.destructor_address)) |symbol| {
                 std.debug.print("macho-processor: C++ exception destructor: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
             }
-            if (compat_runtime.libcppStringView(self, self.regs.rdi + 8)) |message_view| {
-                if (message_view.length != 0 and message_view.length <= 4096) {
-                    if (self.guestMemoryConst(message_view.address, message_view.length)) |message| {
-                        var printable = true;
-                        for (message) |byte| {
-                            if (byte < 0x20 or byte > 0x7E) {
-                                printable = false;
-                                break;
-                            }
-                        }
-                        if (printable) std.debug.print("macho-processor: C++ exception message: {s}\n", .{message});
-                    }
+            if (self.diagnosticSymbol(thrown.caller_address)) |throw_site| {
+                std.debug.print("macho-processor: C++ exception throw site: {s}+0x{x} (0x{x})\n", .{
+                    throw_site.symbol,
+                    throw_site.symbol_offset,
+                    throw_site.address,
+                });
+            }
+            if (thrown.allocation) |allocation| {
+                if (self.diagnosticSymbol(allocation.caller_address)) |allocation_site| {
+                    std.debug.print("macho-processor: C++ exception allocation site: {s}+0x{x} (size={d})\n", .{
+                        allocation_site.symbol,
+                        allocation_site.symbol_offset,
+                        allocation.object_size,
+                    });
                 }
             }
-            self.faulted = true;
+            if (self.cxxExceptionMessage(thrown.object_address)) |message| {
+                std.debug.print("macho-processor: C++ exception message: {s}\n", .{message});
+            }
+            const inspection = self.unwinder.inspectThrow(self, thrown.type_info_address);
+            self.last_unwind_inspection = inspection;
+            if (inspection.handler != null) {
+                std.debug.print("macho-processor: stopping after verified phase-1 catch discovery because phase-2 register restoration is not yet safe\n", .{});
+            } else {
+                std.debug.print("macho-processor: stopping after Itanium phase-1 found no matching catch handler\n", .{});
+            }
+            self.dumpGuestStack();
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
-            return .{ .terminated = 127 };
+            return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+        }
+        if (std.mem.eql(u8, name, "___cxa_rethrow") or std.mem.eql(u8, name, "__Unwind_Resume")) {
+            const object_address = self.cxx_exceptions.recordRethrow() orelse self.regs.rdi;
+            const type_info = if (self.cxx_exceptions.last_throw) |thrown| thrown.type_info_address else 0;
+            std.debug.print("macho-processor: guest requested exception resume object=0x{x}\n", .{object_address});
+            self.last_unwind_inspection = self.unwinder.inspectThrow(self, type_info);
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
+            return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         }
 
         if (std.mem.eql(u8, name, "__Znwm") or std.mem.eql(u8, name, "__Znam") or
             std.mem.endsWith(u8, name, "_malloc"))
         {
-            return .{ .handled = self.guestAlloc(self.regs.rdi, 16) orelse 0 };
+            return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZdlPv") or std.mem.eql(u8, name, "__ZdaPv") or
+            std.mem.eql(u8, name, "__ZdlPvm") or std.mem.eql(u8, name, "__ZdaPvm") or
+            std.mem.endsWith(u8, name, "_free"))
+        {
+            self.memory_forwarder.release(self.regs.rdi);
+            return .handled_void;
+        }
+        if (std.mem.endsWith(u8, name, "_realloc")) {
+            return .{ .handled = self.memory_forwarder.reallocate(self, self.regs.rdi, self.regs.rsi) orelse 0 };
         }
         if (std.mem.eql(u8, name, "_posix_memalign")) {
             const output = self.regs.rdi;
@@ -1191,13 +1426,17 @@ pub const MachOState = struct {
                 return .{ .handled = 22 };
             }
             if (self.guestMemory(output, @sizeOf(u64)) == null) return .{ .unsupported = 14 };
-            const allocation = self.guestAlloc(size, alignment) orelse return .{ .handled = 12 };
+            const allocation = self.memory_forwarder.allocate(self, size, alignment) orelse return .{ .handled = 12 };
             self.write64(output, allocation);
             return .{ .handled = 0 };
         }
+        if (std.mem.eql(u8, name, "_aligned_alloc")) {
+            const alignment = self.regs.rdi;
+            if (!std.math.isPowerOfTwo(alignment) or self.regs.rsi % alignment != 0) return .{ .handled = 0 };
+            return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rsi, alignment) orelse 0 };
+        }
         if (std.mem.endsWith(u8, name, "_calloc")) {
-            const size = std.math.mul(u64, self.regs.rdi, self.regs.rsi) catch return .{ .handled = 0 };
-            return .{ .handled = self.guestAlloc(size, 16) orelse 0 };
+            return .{ .handled = self.memory_forwarder.allocateZeroed(self, self.regs.rdi, self.regs.rsi) orelse 0 };
         }
         if (std.mem.eql(u8, name, "____chkstk_darwin")) {
             return .{ .handled = self.regs.rax };
@@ -1279,35 +1518,109 @@ pub const MachOState = struct {
         }
 
         if (std.mem.eql(u8, name, "_open")) {
-            return .{ .handled = self.handleOpen() };
+            return .{ .handled = self.fs_forwarder.open(self) };
         }
         if (std.mem.eql(u8, name, "_write")) {
-            return .{ .handled = self.handleWrite() };
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.write(self))) };
         }
         if (std.mem.eql(u8, name, "_close")) {
-            return .{ .handled = self.handleClose() };
+            return .{ .handled = self.fs_forwarder.close(self) };
         }
         if (std.mem.eql(u8, name, "_fstatat$INODE64") or std.mem.eql(u8, name, "_fstatat")) {
-            return .{ .handled = self.handleFstatat() };
+            return .{ .handled = self.fs_forwarder.fstatat(self) };
         }
         if (std.mem.eql(u8, name, "_openat")) {
-            return .{ .handled = self.handleOpenat() };
+            return .{ .handled = self.fs_forwarder.openat(self) };
         }
         if (std.mem.eql(u8, name, "_fstat$INODE64") or std.mem.eql(u8, name, "_fstat")) {
-            return .{ .handled = self.handleFstat() };
+            return .{ .handled = self.fs_forwarder.fstat(self) };
         }
         if (std.mem.eql(u8, name, "_ftruncate")) {
-            return .{ .handled = self.handleFtruncate() };
+            return .{ .handled = self.fs_forwarder.ftruncate(self) };
         }
         if (std.mem.eql(u8, name, "_opendir$INODE64") or std.mem.eql(u8, name, "_opendir")) {
-            return .{ .handled = self.handleOpendir() orelse 0 };
+            return .{ .handled = self.fs_forwarder.opendir(self) };
         }
         if (std.mem.eql(u8, name, "_dirfd")) {
-            const directory = self.guestFileFromHandle(self.regs.rdi) orelse return .{ .handled = @bitCast(@as(i64, -1)) };
-            return .{ .handled = if (directory.fd < 0) @bitCast(@as(i64, -1)) else @intCast(directory.fd) };
+            return .{ .handled = self.fs_forwarder.dirfd(self) };
         }
         if (std.mem.eql(u8, name, "_closedir")) {
-            return .{ .handled = self.handleClosedir() };
+            return .{ .handled = self.fs_forwarder.closedir(self) };
+        }
+        if (std.mem.eql(u8, name, "_readdir$INODE64") or std.mem.eql(u8, name, "_readdir")) {
+            return .{ .handled = self.fs_forwarder.readdir(self) };
+        }
+        if (std.mem.eql(u8, name, "_read")) {
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.read(self))) };
+        }
+        if (std.mem.eql(u8, name, "_readv")) {
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readv(self))) };
+        }
+        if (std.mem.eql(u8, name, "_writev")) {
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.writev(self))) };
+        }
+        if (std.mem.eql(u8, name, "_pread$INODE64") or std.mem.eql(u8, name, "_pread")) {
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.pread(self))) };
+        }
+        if (std.mem.eql(u8, name, "_pwrite$INODE64") or std.mem.eql(u8, name, "_pwrite")) {
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.pwrite(self))) };
+        }
+        if (std.mem.eql(u8, name, "_lseek$INODE64") or std.mem.eql(u8, name, "_lseek")) {
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.lseek(self))) };
+        }
+        if (std.mem.eql(u8, name, "_stat$INODE64") or std.mem.eql(u8, name, "_stat")) {
+            return .{ .handled = self.fs_forwarder.stat(self) };
+        }
+        if (std.mem.eql(u8, name, "_lstat$INODE64") or std.mem.eql(u8, name, "_lstat")) {
+            return .{ .handled = self.fs_forwarder.lstat(self) };
+        }
+        if (std.mem.eql(u8, name, "_access") or std.mem.eql(u8, name, "_access$INODE64")) {
+            return .{ .handled = self.fs_forwarder.access(self) };
+        }
+        if (std.mem.eql(u8, name, "_realpath$INODE64") or std.mem.eql(u8, name, "_realpath")) {
+            return .{ .handled = self.fs_forwarder.realpath(self) };
+        }
+        if (std.mem.eql(u8, name, "_getcwd")) {
+            return .{ .handled = self.fs_forwarder.getcwd(self) };
+        }
+        if (std.mem.eql(u8, name, "_chdir")) {
+            return .{ .handled = self.fs_forwarder.chdir(self) };
+        }
+        if (std.mem.eql(u8, name, "_readlink$INODE64") or std.mem.eql(u8, name, "_readlink")) {
+            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readlink(self))) };
+        }
+        if (std.mem.eql(u8, name, "_dup")) {
+            return .{ .handled = self.fs_forwarder.dup(self) };
+        }
+        if (std.mem.eql(u8, name, "_dup2")) {
+            return .{ .handled = self.fs_forwarder.dup2(self) };
+        }
+        if (std.mem.eql(u8, name, "_fcntl")) {
+            return .{ .handled = self.fs_forwarder.fcntl(self) };
+        }
+        if (std.mem.eql(u8, name, "_pipe")) {
+            return .{ .handled = self.fs_forwarder.pipe(self) };
+        }
+        if (std.mem.eql(u8, name, "_mkdir") or std.mem.eql(u8, name, "_mkdir$INODE64")) {
+            return .{ .handled = self.fs_forwarder.mkdir(self) };
+        }
+        if (std.mem.eql(u8, name, "_unlink") or std.mem.eql(u8, name, "_unlink$INODE64")) {
+            return .{ .handled = self.fs_forwarder.unlink(self) };
+        }
+        if (std.mem.eql(u8, name, "_rename") or std.mem.eql(u8, name, "_rename$INODE64")) {
+            return .{ .handled = self.fs_forwarder.rename(self) };
+        }
+        if (std.mem.eql(u8, name, "_symlink") or std.mem.eql(u8, name, "_symlink$INODE64")) {
+            return .{ .handled = self.fs_forwarder.symlink(self) };
+        }
+        if (std.mem.eql(u8, name, "_mmap")) {
+            return .{ .handled = self.fs_forwarder.mmap(self) };
+        }
+        if (std.mem.eql(u8, name, "_munmap")) {
+            return .{ .handled = self.fs_forwarder.munmap(self) };
+        }
+        if (std.mem.eql(u8, name, "_mprotect")) {
+            return .{ .handled = self.fs_forwarder.mprotect(self) };
         }
         if (std.mem.eql(u8, name, "_pthread_create")) {
             if (self.guestMemory(self.regs.rdi, @sizeOf(u64)) == null) return .{ .unsupported = 14 };
@@ -1327,6 +1640,9 @@ pub const MachOState = struct {
         if (std.mem.endsWith(u8, name, "_fputs")) {
             return .{ .handled = self.handleFputs() };
         }
+        if (std.mem.endsWith(u8, name, "_fwrite")) {
+            return .{ .handled = self.handleFwrite() };
+        }
         if (std.mem.endsWith(u8, name, "_fflush")) {
             return .{ .handled = self.handleFflush() };
         }
@@ -1340,7 +1656,8 @@ pub const MachOState = struct {
             return .{ .handled = self.handleFerror() };
         }
         if (std.mem.endsWith(u8, name, "_printf")) {
-            return .{ .handled = self.handlePrintfLike(null) };
+            const arguments = [_]u64{ self.regs.rsi, self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9 };
+            return .{ .handled = self.handlePrintfLike(null, self.regs.rdi, &arguments) };
         }
         if (std.mem.endsWith(u8, name, "_putchar")) {
             return .{ .handled = self.handlePutchar() };
@@ -1658,7 +1975,19 @@ pub const MachOState = struct {
         return @intCast(text.len);
     }
 
+    fn handleFwrite(self: *MachOState) u64 {
+        const element_size = self.regs.rsi;
+        const element_count = self.regs.rdx;
+        if (element_size == 0 or element_count == 0) return 0;
+        const byte_count = std.math.mul(u64, element_size, element_count) catch return 0;
+        const bytes = self.guestMemoryConst(self.regs.rdi, byte_count) orelse return 0;
+        const file = self.guestFileFromHandle(self.regs.rcx) orelse return 0;
+        if (!self.hostWriteAll(file, bytes)) return 0;
+        return element_count;
+    }
+
     fn handleFflush(self: *MachOState) u64 {
+        if (self.regs.rdi == 0) return 0;
         const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
         if (std.c.fsync(file.fd) != 0 and file.kind == .regular) {
             file.error_flag = true;
@@ -1693,18 +2022,19 @@ pub const MachOState = struct {
 
     fn handleFprintf(self: *MachOState) u64 {
         const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        return self.handlePrintfLike(file);
+        const arguments = [_]u64{ self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9 };
+        return self.handlePrintfLike(file, self.regs.rsi, &arguments);
     }
 
-    fn handlePrintfLike(self: *MachOState, file_opt: ?*GuestFile) u64 {
-        const format = self.guestCString(self.regs.rsi, 1 << 20) orelse return @bitCast(@as(i64, -1));
+    fn handlePrintfLike(self: *MachOState, file_opt: ?*GuestFile, format_address: u64, arguments: []const u64) u64 {
+        const format = self.guestCString(format_address, 1 << 20) orelse return @bitCast(@as(i64, -1));
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         var output = std.ArrayList(u8).empty;
         defer output.deinit(allocator);
 
-        var gp_index: usize = 2;
+        var gp_index: usize = 0;
         var stack_arg_addr = self.regs.rsp + 8;
         var i: usize = 0;
         while (i < format.len) : (i += 1) {
@@ -1725,12 +2055,14 @@ pub const MachOState = struct {
                 i += 1;
                 while (i < format.len and std.ascii.isDigit(format[i])) : (i += 1) {}
             }
-            var long_count: usize = 0;
-            while (i < format.len and format[i] == 'l') : (i += 1) long_count += 1;
+            while (i < format.len and
+                (format[i] == 'l' or format[i] == 'h' or format[i] == 'z' or
+                    format[i] == 't' or format[i] == 'j' or format[i] == 'L')) : (i += 1)
+            {}
             if (i >= format.len) break;
 
             const spec = format[i];
-            const arg = self.nextVarArg(&gp_index, &stack_arg_addr);
+            const arg = self.nextVarArg(arguments, &gp_index, &stack_arg_addr);
             switch (spec) {
                 's' => {
                     const text = self.guestCString(arg, 1 << 20) orelse "(null)";
@@ -1760,9 +2092,6 @@ pub const MachOState = struct {
                 'c' => {
                     output.append(allocator, @intCast(arg & 0xFF)) catch return @bitCast(@as(i64, -1));
                 },
-                'z' => {
-                    output.append(allocator, 'z') catch return @bitCast(@as(i64, -1));
-                },
                 else => {
                     output.append(allocator, '%') catch return @bitCast(@as(i64, -1));
                     output.append(allocator, spec) catch return @bitCast(@as(i64, -1));
@@ -1791,11 +2120,10 @@ pub const MachOState = struct {
         return 1;
     }
 
-    fn nextVarArg(self: *const MachOState, gp_index: *usize, stack_arg_addr: *u64) u64 {
-        const regs = [_]u64{ self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9 };
-        if (gp_index.* < regs.len) {
+    fn nextVarArg(self: *const MachOState, arguments: []const u64, gp_index: *usize, stack_arg_addr: *u64) u64 {
+        if (gp_index.* < arguments.len) {
             defer gp_index.* += 1;
-            return regs[gp_index.*];
+            return arguments[gp_index.*];
         }
         const addr = stack_arg_addr.*;
         stack_arg_addr.* += 8;
@@ -1961,6 +2289,21 @@ pub const MachOState = struct {
     }
 
     fn setupMachOState(self: *MachOState, path: []const u8, args: []const []const u8) void {
+        self.configureGuestLogMirror(args);
+        self.launch_options.configure(args);
+        var argument_index: usize = 0;
+        while (argument_index < args.len) : (argument_index += 1) {
+            const argument = args[argument_index];
+            if (std.mem.eql(u8, argument, "--storage_root") and argument_index + 1 < args.len) {
+                self.fs_forwarder.configurePaths(args[argument_index + 1]);
+                break;
+            }
+            const prefix = "--storage_root=";
+            if (std.mem.startsWith(u8, argument, prefix)) {
+                self.fs_forwarder.configurePaths(argument[prefix.len..]);
+                break;
+            }
+        }
         var full_args = std.ArrayList([]const u8).empty;
         defer full_args.deinit(self.allocator);
         full_args.append(self.allocator, path) catch {};
@@ -2234,10 +2577,94 @@ pub const MachOState = struct {
     }
 
     fn handleInternalCompatibility(self: *MachOState) bool {
+        if (self.internal_targets.parse_launch_arguments != 0 and
+            self.regs.rip == self.internal_targets.parse_launch_arguments)
+        {
+            self.startup.enter(.launch_arguments, self.executed_steps);
+            self.capturePositionalLaunchOptions();
+        }
+        if (self.internal_targets.initialize_logging != 0 and
+            self.regs.rip == self.internal_targets.initialize_logging)
+        {
+            self.startup.enter(.logging, self.executed_steps);
+        }
+        if (self.handleGuestLogBridge()) return true;
+        for (self.internal_targets.cvar_add_to_launch_options[0..self.internal_targets.cvar_add_to_launch_options_count]) |target| {
+            if (self.regs.rip != target) continue;
+            const view = compat_runtime.libcppStringView(self, self.regs.rdi + 8) orelse return false;
+            const name = self.guestMemoryConst(view.address, view.length) orelse return false;
+            if (self.launch_options.shouldRegister(name)) return false;
+            if (self.launch_options.registrations_skipped == 1 or
+                self.launch_options.registrations_skipped % 100 == 0)
+            {
+                std.debug.print(
+                    "macho-processor: launch option fast path skipped {d} unused registration(s); latest={s}\n",
+                    .{ self.launch_options.registrations_skipped, name },
+                );
+            }
+            self.regs.rip = self.pop();
+            return true;
+        }
         if (self.internal_targets.cxxopts_split_option_names != 0 and
             self.regs.rip == self.internal_targets.cxxopts_split_option_names)
         {
             return self.handleCxxoptsSplitOptionNames();
+        }
+        return false;
+    }
+
+    fn capturePositionalLaunchOptions(self: *MachOState) void {
+        if (self.positional_options_captured) return;
+        self.positional_options_captured = true;
+
+        const vector = self.regs.r8;
+        const begin = self.read64(vector);
+        const end = self.read64(vector + 8);
+        if (begin == 0 or end < begin or (end - begin) % 24 != 0) {
+            std.debug.print("macho-processor: launch option acceleration could not decode positional option vector at 0x{x}\n", .{vector});
+            return;
+        }
+        const count = @min((end - begin) / 24, launch_argument_accelerator.MAX_REQUESTED_OPTIONS);
+        for (0..@as(usize, @intCast(count))) |index| {
+            const object = begin + index * 24;
+            const view = compat_runtime.libcppStringView(self, object) orelse continue;
+            const name = self.guestMemoryConst(view.address, view.length) orelse continue;
+            self.launch_options.request(name);
+            std.debug.print("macho-processor: launch option acceleration retained positional option: {s}\n", .{name});
+        }
+    }
+
+    fn handleGuestLogBridge(self: *MachOState) bool {
+        if (self.internal_targets.guest_log_get_thread_buffer != 0 and
+            self.regs.rip == self.internal_targets.guest_log_get_thread_buffer)
+        {
+            if (self.guest_log_buffer_address == 0) {
+                self.guest_log_buffer_address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return false;
+                std.debug.print(
+                    "macho-processor: synchronous Xenia log bridge enabled at buffer=0x{x}\n",
+                    .{self.guest_log_buffer_address},
+                );
+            }
+            self.regs.rax = self.guest_log_buffer_address;
+            self.regs.rdx = GUEST_LOG_BUFFER_SIZE;
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if (self.internal_targets.guest_log_append_formatted != 0 and
+            self.regs.rip == self.internal_targets.guest_log_append_formatted)
+        {
+            if (self.guest_log_buffer_address != 0) {
+                _ = self.emitGuestLog(self.regs.rsi, self.guest_log_buffer_address, self.regs.rdx);
+            }
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if (self.internal_targets.guest_log_append_view != 0 and
+            self.regs.rip == self.internal_targets.guest_log_append_view)
+        {
+            _ = self.emitGuestLog(self.regs.rsi, self.regs.rdx, self.regs.rcx);
+            self.regs.rip = self.pop();
+            return true;
         }
         return false;
     }
@@ -2476,8 +2903,26 @@ pub const MachOState = struct {
     pub fn run(self: *MachOState) void {
         var steps: u64 = 0;
         while (!self.terminated and steps < self.max_steps) : (steps += 1) {
+            self.executed_steps = steps;
             if (steps % 500000 == 0) {
-                log.info("step {d}: rip=0x{x}, rax=0x{x}, rbx=0x{x}, rcx=0x{x}", .{ steps, self.regs.rip, self.regs.rax, self.regs.rbx, self.regs.rcx });
+                const symbol = self.metadata.nearestSymbol(self.regs.rip);
+                const heap_summary = self.memory_forwarder.summary();
+                self.startup.checkpoint(.{
+                    .step = steps,
+                    .rip = self.regs.rip,
+                    .symbol = if (symbol) |resolved| resolved.name else "<unknown>",
+                    .symbol_offset = if (symbol) |resolved| resolved.offset else 0,
+                    .heap_next = self.heap_next,
+                    .import_calls = self.import_resolver.total_calls,
+                    .fs_open = self.fs_forwarder.open_count,
+                    .fs_read = self.fs_forwarder.read_count,
+                    .fs_write = self.fs_forwarder.write_count,
+                    .heap_allocations = heap_summary.allocations,
+                    .heap_live = heap_summary.live_allocations,
+                    .options_seen = self.launch_options.registrations_seen,
+                    .options_kept = self.launch_options.registrations_kept,
+                    .options_skipped = self.launch_options.registrations_skipped,
+                });
             }
             if (!self.step()) break;
         }
@@ -2501,6 +2946,11 @@ pub const MachOState = struct {
 
     fn logExitDiagnostics(self: *const MachOState) void {
         const reason: exit_diagnostics.TerminationReason = exit_diagnostics.reasonFromValue(self.termination_reason);
+        const attribution = exit_diagnostics.attribute(.{
+            .reason = reason,
+            .faulted = self.faulted,
+            .unresolved_import_calls = self.unresolved_import_count,
+        });
         var report = exit_diagnostics.ExitReport{
             .exit_code = self.exit_code,
             .reason = reason,
@@ -2524,7 +2974,9 @@ pub const MachOState = struct {
                 .r14 = self.regs.r14,
                 .r15 = self.regs.r15,
             },
-            .execution_authoritative = !self.faulted and self.unresolved_import_count == 0,
+            .unresolved_import_calls = self.unresolved_import_count,
+            .attribution = attribution,
+            .execution_authoritative = attribution.authority == .authoritative,
         };
 
         if (self.isExecutableAddress(self.regs.rip)) {
@@ -2535,6 +2987,34 @@ pub const MachOState = struct {
                     .symbol_offset = symbol.offset,
                 };
             }
+        }
+
+        if (self.cxx_exceptions.last_throw) |thrown| {
+            var exception_report = exit_diagnostics.CxxExceptionReport{
+                .object_address = thrown.object_address,
+                .type_info_address = thrown.type_info_address,
+                .type_name = self.cxxExceptionTypeName(thrown.type_info_address) orelse "",
+                .type_symbol = self.diagnosticSymbol(thrown.type_info_address),
+                .destructor_address = thrown.destructor_address,
+                .destructor_symbol = self.diagnosticSymbol(thrown.destructor_address),
+                .throw_site = self.diagnosticSymbol(thrown.caller_address),
+                .message = self.cxxExceptionMessage(thrown.object_address) orelse "",
+            };
+            if (thrown.allocation) |allocation| {
+                exception_report.allocation_matched = true;
+                exception_report.allocation_size = allocation.object_size;
+                exception_report.allocation_site = self.diagnosticSymbol(allocation.caller_address);
+            }
+            if (self.last_unwind_inspection) |inspection| {
+                exception_report.unwinder_available = inspection.metadata_frames != 0;
+                exception_report.unwind_frames = inspection.frame_count;
+                if (inspection.handler) |handler| {
+                    exception_report.handler_found = true;
+                    exception_report.handler_address = handler.landing_pad;
+                }
+            }
+            report.cxx_exception = exception_report;
+            report.detail = "Rosette completed Itanium phase-one frame and catch inspection; phase-two landing-pad context installation remains conservative.";
         }
 
         const import_trace_count: usize = if (self.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else self.import_trace_index;
@@ -4050,6 +4530,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.guest_fds[2] = 2;
 
     state.setupMachOState(options.path, options.args);
+    state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
 
     std.debug.print("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
     const initializers_ok = state.runInitializers();
@@ -4057,6 +4538,11 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     if (!initializers_ok) {
         state.import_resolver.logSummary();
         state.dynamic_forwarder.logSummary();
+        state.fs_forwarder.logSummary();
+        state.memory_forwarder.logSummary();
+        state.launch_options.logSummary();
+        state.startup.logSummary();
+        state.unwinder.logSummary();
         state.smart_stubs.logSummary();
         std.debug.print("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
         return state.exit_code;
@@ -4069,7 +4555,19 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     std.debug.print("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
     state.import_resolver.logSummary();
     state.dynamic_forwarder.logSummary();
+    state.fs_forwarder.logSummary();
+    state.memory_forwarder.logSummary();
+    state.launch_options.logSummary();
+    state.startup.logSummary();
     state.smart_stubs.logSummary();
+    state.cxx_exceptions.logSummary();
+    state.unwinder.logSummary();
+    if (state.guest_log_line_count != 0) {
+        std.debug.print(
+            "macho-processor: synchronous guest log bridge: mirrored_lines={d}\n",
+            .{state.guest_log_line_count},
+        );
+    }
 
     if (state.unresolved_import_count != 0) {
         const end = if (state.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else state.import_trace_index;
