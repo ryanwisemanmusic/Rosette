@@ -84,6 +84,7 @@ const ImportTraceEntry = struct {
 const ImportHandlerResult = union(enum) {
     handled: u64,
     handled_void,
+    control_transferred,
     unsupported: u64,
     terminated: u64,
 };
@@ -620,6 +621,10 @@ pub const MachOState = struct {
     }
 
     fn cxxExceptionMessage(self: *const MachOState, object_address: u64) ?[]const u8 {
+        const runtime_error_message = self.read64(object_address +| 8);
+        if (self.guestCString(runtime_error_message, 4096)) |message| {
+            if (message.len != 0) return message;
+        }
         const message_view = compat_runtime.libcppStringView(self, object_address +| 8) orelse return null;
         if (message_view.length == 0 or message_view.length > 4096) return null;
         const message = self.guestMemoryConst(message_view.address, message_view.length) orelse return null;
@@ -884,6 +889,16 @@ pub const MachOState = struct {
                                 );
                             }
                         },
+                        .control_transferred => {
+                            self.pending_import_stub_rip = null;
+                            if (self.verbose_trace) {
+                                std.debug.print(
+                                    "  [handled control transfer] {s} from {s}; landing_pad=0x{x}\n",
+                                    .{ imported.name, imported.dylib, self.regs.rip },
+                                );
+                            }
+                            return true;
+                        },
                         .unsupported => |result| {
                             self.regs.rax = result;
                             self.recordUnresolvedImport(imported, synthetic_return, self.regs.rax);
@@ -952,7 +967,7 @@ pub const MachOState = struct {
         const exact_contract = import_resolution.contractFor(name);
         const declared_contract = contract.resolveFromAllFamilies(name);
         const outcome: import_resolution.Outcome = switch (result) {
-            .handled, .handled_void => .resolved,
+            .handled, .handled_void, .control_transferred => .resolved,
             .unsupported => .unresolved,
             .terminated => .terminated,
         };
@@ -1341,7 +1356,6 @@ pub const MachOState = struct {
                 .generic;
             const key = self.regs.rsi ^ (@as(u64, @intFromEnum(kind)) << 56);
             const facet = self.compat.localeFacet(self, key, kind) orelse return .{ .unsupported = 0 };
-            std.debug.print("    [libc++] locale::use_facet caller={s} kind={s} -> 0x{x}\n", .{ caller_name, @tagName(kind), facet });
             return .{ .handled = facet };
         }
         if (std.mem.eql(u8, name, "__ZNKSt3__16locale4nameEv")) {
@@ -1351,7 +1365,6 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "__ZNSt3__115__get_classnameEPKcb")) {
             const class_name = self.guestCString(self.regs.rdi, 64) orelse return .{ .unsupported = 0 };
             const mask = compat_runtime.libcppRegexClassMask(class_name, self.regs.rsi != 0);
-            std.debug.print("    [libc++] regex class {s} ignore_case={} -> mask=0x{x}\n", .{ class_name, self.regs.rsi != 0, mask });
             return .{ .handled = mask };
         }
         if (std.mem.eql(u8, name, "___cxa_allocate_exception")) {
@@ -1422,10 +1435,18 @@ pub const MachOState = struct {
             if (self.cxxExceptionMessage(thrown.object_address)) |message| {
                 std.debug.print("macho-processor: C++ exception message: {s}\n", .{message});
             }
-            const inspection = self.unwinder.inspectThrow(self, thrown.type_info_address);
+            var inspection = self.unwinder.inspectThrow(self, thrown.type_info_address);
+            const exception_header = if (thrown.allocation) |allocation|
+                allocation.storage_address
+            else
+                thrown.object_address;
+            if (self.unwinder.installPhaseTwo(self, &inspection, exception_header)) {
+                self.last_unwind_inspection = inspection;
+                return .control_transferred;
+            }
             self.last_unwind_inspection = inspection;
             if (inspection.handler != null) {
-                std.debug.print("macho-processor: stopping after verified phase-1 catch discovery because phase-2 register restoration is not yet safe\n", .{});
+                std.debug.print("macho-processor: stopping after verified phase-1 catch discovery because this frame layout is not phase-2 safe\n", .{});
             } else {
                 std.debug.print("macho-processor: stopping after Itanium phase-1 found no matching catch handler\n", .{});
             }
@@ -1433,10 +1454,16 @@ pub const MachOState = struct {
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         }
-        if (std.mem.eql(u8, name, "___cxa_rethrow") or std.mem.eql(u8, name, "__Unwind_Resume")) {
+        if (std.mem.eql(u8, name, "__Unwind_Resume")) {
+            if (self.unwinder.resumePhaseTwo(self)) return .control_transferred;
+            std.debug.print("macho-processor: guest requested exception resume without an active phase-2 cleanup chain\n", .{});
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
+            return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+        }
+        if (std.mem.eql(u8, name, "___cxa_rethrow")) {
             const object_address = self.cxx_exceptions.recordRethrow() orelse self.regs.rdi;
             const type_info = if (self.cxx_exceptions.last_throw) |thrown| thrown.type_info_address else 0;
-            std.debug.print("macho-processor: guest requested exception resume object=0x{x}\n", .{object_address});
+            std.debug.print("macho-processor: guest rethrew exception object=0x{x}\n", .{object_address});
             self.last_unwind_inspection = self.unwinder.inspectThrow(self, type_info);
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
@@ -1742,6 +1769,15 @@ pub const MachOState = struct {
                         .{ imported.name, imported.dylib, imported.stub_address, return_address },
                     );
                 }
+            },
+            .control_transferred => {
+                if (self.verbose_trace) {
+                    std.debug.print(
+                        "  [handled direct control transfer] {s} from {s}; landing_pad=0x{x}\n",
+                        .{ imported.name, imported.dylib, self.regs.rip },
+                    );
+                }
+                return;
             },
             .unsupported => |result| {
                 self.regs.rax = result;
@@ -3074,9 +3110,13 @@ pub const MachOState = struct {
                     exception_report.handler_found = true;
                     exception_report.handler_address = handler.landing_pad;
                 }
+                exception_report.phase_two_supported = inspection.phase_two_supported;
             }
             report.cxx_exception = exception_report;
-            report.detail = "Rosette completed Itanium phase-one frame and catch inspection; phase-two landing-pad context installation remains conservative.";
+            report.detail = if (exception_report.phase_two_supported)
+                "Rosette installed a verified Itanium phase-two landing-pad context before the later diagnostic stop."
+            else
+                "Rosette completed Itanium phase-one frame and catch inspection; this frame was not safe for phase-two context installation.";
         }
 
         const import_trace_count: usize = if (self.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else self.import_trace_index;

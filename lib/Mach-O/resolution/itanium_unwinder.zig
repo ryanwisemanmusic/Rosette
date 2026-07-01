@@ -14,14 +14,17 @@ pub const Frame = struct {
     encoding: u32 = 0,
     mode: compact_unwind.Mode = .unknown,
     lsda_address: u64 = 0,
+    cleanup_landing_pad: u64 = 0,
 };
 
 pub const Handler = struct {
     landing_pad: u64,
+    selector: i64,
     frame_index: usize,
     function_start: u64,
     frame_pointer: u64,
     stack_pointer: u64,
+    mode: compact_unwind.Mode,
     catch_all: bool,
 };
 
@@ -31,22 +34,36 @@ pub const Inspection = struct {
     metadata_frames: usize = 0,
     handler: ?Handler = null,
     frame_chain_valid: bool = true,
+    phase_two_supported: bool = false,
+    phase_two_installed: bool = false,
 };
 
 pub const Engine = struct {
+    const ActivePhaseTwo = struct {
+        inspection: Inspection,
+        exception_header: u64,
+        next_frame: usize,
+    };
+
     compact: ?compact_unwind.Index = null,
+    active_phase_two: ?ActivePhaseTwo = null,
     inspections: u64 = 0,
     frames_walked: u64 = 0,
     handlers_found: u64 = 0,
+    phase_two_attempts: u64 = 0,
+    phase_two_installs: u64 = 0,
+    cleanup_installs: u64 = 0,
+    resume_calls: u64 = 0,
 
     pub fn configure(self: *Engine, metadata: anytype) void {
         const section = metadata.sectionNamed("__TEXT", "__unwind_info") orelse return;
         const bytes = metadata.sectionBytes(section) orelse return;
-        self.compact = compact_unwind.Index.init(bytes, section.address, metadata.imageBase());
+        const image_base = unwindImageBase(metadata);
+        self.compact = compact_unwind.Index.init(bytes, section.address, image_base);
         if (self.compact != null) {
             std.debug.print(
-                "macho-processor: Itanium unwind engine indexed __unwind_info: address=0x{x} size={d}\n",
-                .{ section.address, section.size },
+                "macho-processor: Itanium unwind engine indexed __unwind_info: address=0x{x} size={d} image_base=0x{x}\n",
+                .{ section.address, section.size, image_base },
             );
         }
     }
@@ -72,16 +89,22 @@ pub const Engine = struct {
                     frame.mode = info.mode;
                     frame.lsda_address = info.lsda_address;
                     result.metadata_frames += 1;
-                    if (result.handler == null and info.lsda_address != 0) {
-                        if (findHandler(state, info, instruction -| 1, type_info_address)) |landing| {
-                            result.handler = .{
-                                .landing_pad = landing.address,
-                                .frame_index = frame_index,
-                                .function_start = info.function_start,
-                                .frame_pointer = frame_pointer,
-                                .stack_pointer = stack_pointer,
-                                .catch_all = landing.catch_all,
-                            };
+                    if (info.lsda_address != 0) {
+                        if (findLandingPad(state, info, instruction -| 1, type_info_address)) |landing| {
+                            if (landing.handles_exception and result.handler == null) {
+                                result.handler = .{
+                                    .landing_pad = landing.address,
+                                    .selector = landing.selector,
+                                    .frame_index = frame_index,
+                                    .function_start = info.function_start,
+                                    .frame_pointer = frame_pointer,
+                                    .stack_pointer = stack_pointer,
+                                    .mode = info.mode,
+                                    .catch_all = landing.catch_all,
+                                };
+                            } else if (!landing.handles_exception) {
+                                frame.cleanup_landing_pad = landing.address;
+                            }
                         }
                     }
                 }
@@ -107,11 +130,42 @@ pub const Engine = struct {
         return result;
     }
 
+    pub fn installPhaseTwo(
+        self: *Engine,
+        state: anytype,
+        inspection: *Inspection,
+        exception_header: u64,
+    ) bool {
+        self.phase_two_attempts +|= 1;
+        if (inspection.handler == null) return false;
+        if (exception_header == 0) return false;
+
+        inspection.phase_two_supported = true;
+        self.active_phase_two = .{
+            .inspection = inspection.*,
+            .exception_header = exception_header,
+            .next_frame = 0,
+        };
+        if (!self.installNextPhaseTwoTarget(state)) {
+            self.active_phase_two = null;
+            inspection.phase_two_supported = false;
+            return false;
+        }
+        inspection.phase_two_installed = true;
+        return true;
+    }
+
+    pub fn resumePhaseTwo(self: *Engine, state: anytype) bool {
+        if (self.active_phase_two == null) return false;
+        self.resume_calls +|= 1;
+        return self.installNextPhaseTwoTarget(state);
+    }
+
     pub fn logSummary(self: *const Engine) void {
         if (self.inspections == 0 and self.compact == null) return;
         std.debug.print(
-            "macho-processor: Itanium unwind summary: metadata={} inspections={d} frames={d} handlers={d}\n",
-            .{ self.compact != null, self.inspections, self.frames_walked, self.handlers_found },
+            "macho-processor: Itanium unwind summary: metadata={} inspections={d} frames={d} handlers={d} phase_two={d}/{d} cleanups={d} resumes={d}\n",
+            .{ self.compact != null, self.inspections, self.frames_walked, self.handlers_found, self.phase_two_installs, self.phase_two_attempts, self.cleanup_installs, self.resume_calls },
         );
     }
 
@@ -125,33 +179,71 @@ pub const Engine = struct {
             const symbol = state.metadata.nearestSymbol(frame.instruction -| 1);
             if (symbol) |resolved| {
                 std.debug.print(
-                    "  unwind[{d}] {s}+0x{x} rbp=0x{x} mode={s} lsda=0x{x}\n",
-                    .{ index, resolved.name, resolved.offset, frame.frame_pointer, @tagName(frame.mode), frame.lsda_address },
+                    "  unwind[{d}] {s}+0x{x} rbp=0x{x} mode={s} lsda=0x{x} cleanup=0x{x}\n",
+                    .{ index, resolved.name, resolved.offset, frame.frame_pointer, @tagName(frame.mode), frame.lsda_address, frame.cleanup_landing_pad },
                 );
             } else {
                 std.debug.print(
-                    "  unwind[{d}] ip=0x{x} rbp=0x{x} mode={s} lsda=0x{x}\n",
-                    .{ index, frame.instruction, frame.frame_pointer, @tagName(frame.mode), frame.lsda_address },
+                    "  unwind[{d}] ip=0x{x} rbp=0x{x} mode={s} lsda=0x{x} cleanup=0x{x}\n",
+                    .{ index, frame.instruction, frame.frame_pointer, @tagName(frame.mode), frame.lsda_address, frame.cleanup_landing_pad },
                 );
             }
         }
         if (inspection.handler) |handler| {
             std.debug.print(
-                "macho-processor: Itanium phase-1 handler candidate: frame={d} landing_pad=0x{x} catch_all={} (phase-2 context install deferred)\n",
-                .{ handler.frame_index, handler.landing_pad, handler.catch_all },
+                "macho-processor: Itanium phase-1 handler candidate: frame={d} landing_pad=0x{x} selector={d} catch_all={}\n",
+                .{ handler.frame_index, handler.landing_pad, handler.selector, handler.catch_all },
             );
         } else {
             std.debug.print("macho-processor: Itanium phase-1 found no matching catch handler\n", .{});
         }
     }
+
+    fn installNextPhaseTwoTarget(self: *Engine, state: anytype) bool {
+        const active = if (self.active_phase_two) |*phase_two| phase_two else return false;
+        const handler = active.inspection.handler orelse return false;
+        while (active.next_frame < handler.frame_index) {
+            const index = active.next_frame;
+            active.next_frame += 1;
+            const frame = active.inspection.frames[index];
+            if (frame.cleanup_landing_pad == 0) continue;
+            if (!installContext(state, frame, frame.cleanup_landing_pad, 0, active.exception_header)) return false;
+            self.cleanup_installs +|= 1;
+            std.debug.print(
+                "macho-processor: Itanium phase-2 cleanup installed: frame={d} landing_pad=0x{x} exception=0x{x}\n",
+                .{ index, frame.cleanup_landing_pad, active.exception_header },
+            );
+            return true;
+        }
+
+        const handler_frame = active.inspection.frames[handler.frame_index];
+        if (!installContext(state, handler_frame, handler.landing_pad, handler.selector, active.exception_header)) return false;
+        self.phase_two_installs +|= 1;
+        std.debug.print(
+            "macho-processor: Itanium phase-2 handler installed: frame={d} landing_pad=0x{x} selector={d} rbp=0x{x} rsp=0x{x} exception=0x{x}\n",
+            .{ handler.frame_index, handler.landing_pad, handler.selector, state.regs.rbp, state.regs.rsp, active.exception_header },
+        );
+        self.active_phase_two = null;
+        return true;
+    }
 };
+
+fn unwindImageBase(metadata: anytype) u64 {
+    const text = metadata.sectionNamed("__TEXT", "__text");
+    return if (text) |text_section|
+        text_section.address -| text_section.file_offset
+    else
+        metadata.imageBase();
+}
 
 const LandingPad = struct {
     address: u64,
+    selector: i64,
     catch_all: bool,
+    handles_exception: bool,
 };
 
-fn findHandler(state: anytype, frame: compact_unwind.FrameInfo, instruction: u64, thrown_type: u64) ?LandingPad {
+fn findLandingPad(state: anytype, frame: compact_unwind.FrameInfo, instruction: u64, thrown_type: u64) ?LandingPad {
     const data = state.guestMemoryConst(frame.lsda_address, 4096) orelse return null;
     var position: usize = 0;
     const lp_encoding = readByte(data, &position) orelse return null;
@@ -181,9 +273,19 @@ fn findHandler(state: anytype, frame: compact_unwind.FrameInfo, instruction: u64
         const landing_offset = readEncoded(state, data, frame.lsda_address, &position, call_site_encoding) orelse return null;
         const action = readUleb(data, &position) orelse return null;
         if (instruction_offset < start or instruction_offset >= start +| length) continue;
-        if (landing_offset == 0 or action == 0 or type_encoding == DW_EH_PE_OMIT) return null;
+        if (landing_offset == 0) return null;
+        if (action == 0) {
+            return .{
+                .address = lp_start + landing_offset,
+                .selector = 0,
+                .catch_all = false,
+                .handles_exception = false,
+            };
+        }
+        if (type_encoding == DW_EH_PE_OMIT) return null;
 
         var action_position = std.math.add(usize, action_table, @as(usize, @intCast(action - 1))) catch return null;
+        var has_cleanup = false;
         while (action_position < data.len) {
             var cursor = action_position;
             const type_filter = readSleb(data, &cursor) orelse return null;
@@ -196,18 +298,65 @@ fn findHandler(state: anytype, frame: compact_unwind.FrameInfo, instruction: u64
                     var catch_type = readEncoded(state, data, frame.lsda_address, &type_position, type_encoding) orelse return null;
                     if ((type_encoding & DW_EH_PE_INDIRECT) != 0 and catch_type != 0) catch_type = state.read64(catch_type);
                     if (catch_type == 0 or catch_type == thrown_type) {
-                        return .{ .address = lp_start + landing_offset, .catch_all = catch_type == 0 };
+                        return .{
+                            .address = lp_start + landing_offset,
+                            .selector = type_filter,
+                            .catch_all = catch_type == 0,
+                            .handles_exception = true,
+                        };
                     }
                 }
+            } else if (type_filter == 0) {
+                has_cleanup = true;
             }
             if (next == 0) break;
             const next_position = @as(i64, @intCast(cursor)) + next;
             if (next_position < 0 or next_position >= data.len) return null;
             action_position = @intCast(next_position);
         }
-        return null;
+        return if (has_cleanup) .{
+            .address = lp_start + landing_offset,
+            .selector = 0,
+            .catch_all = false,
+            .handles_exception = false,
+        } else null;
     }
     return null;
+}
+
+fn installContext(state: anytype, frame: Frame, landing_pad: u64, selector: i64, exception_header: u64) bool {
+    if (frame.mode != .rbp_frame or frame.frame_pointer == 0) return false;
+    const prologue = state.guestMemoryConst(frame.function_start, 16) orelse return false;
+    const stack_allocation = rbpStackAllocation(prologue) orelse return false;
+    const restored_rsp = frame.frame_pointer -| stack_allocation;
+    if (restored_rsp == 0 or state.guestMemoryConst(restored_rsp, @max(stack_allocation, 1)) == null) return false;
+
+    state.regs.rbp = frame.frame_pointer;
+    state.regs.rsp = restored_rsp;
+    state.regs.rax = exception_header;
+    state.regs.rdx = @bitCast(selector);
+    state.regs.rip = landing_pad;
+    return true;
+}
+
+fn rbpStackAllocation(prologue: []const u8) ?u64 {
+    if (prologue.len < 4 or !std.mem.eql(u8, prologue[0..4], &.{ 0x55, 0x48, 0x89, 0xE5 })) return null;
+    if (prologue.len >= 11 and std.mem.eql(u8, prologue[4..7], &.{ 0x48, 0x81, 0xEC })) {
+        if (isCalleeSavePush(prologue[11..])) return null;
+        return std.mem.readInt(u32, prologue[7..11], .little);
+    }
+    if (prologue.len >= 8 and std.mem.eql(u8, prologue[4..7], &.{ 0x48, 0x83, 0xEC })) {
+        if (isCalleeSavePush(prologue[8..])) return null;
+        return prologue[7];
+    }
+    if (isCalleeSavePush(prologue[4..])) return null;
+    return 0;
+}
+
+fn isCalleeSavePush(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    return bytes[0] == 0x53 or bytes[0] == 0x56 or bytes[0] == 0x57 or
+        (bytes.len >= 2 and bytes[0] == 0x41 and bytes[1] >= 0x54 and bytes[1] <= 0x57);
 }
 
 fn readEncoded(state: anytype, data: []const u8, base_address: u64, position: *usize, encoding: u8) ?u64 {
@@ -286,4 +435,74 @@ fn readSleb(data: []const u8, position: *usize) ?i64 {
     if ((byte & 0x80) != 0) return null;
     if (shift < 64 and (byte & 0x40) != 0) value |= @as(u64, std.math.maxInt(u64)) << @as(u6, @intCast(shift));
     return @bitCast(value);
+}
+
+test "phase two accepts canonical rbp stack frames" {
+    const wide = [_]u8{ 0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x40, 0x01, 0x00, 0x00 };
+    const narrow = [_]u8{ 0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20 };
+    const unsupported = [_]u8{ 0x53, 0x48, 0x83, 0xEC, 0x20 };
+    const saved_register = [_]u8{ 0x55, 0x48, 0x89, 0xE5, 0x53, 0x48, 0x83, 0xEC, 0x20 };
+
+    try std.testing.expectEqual(@as(?u64, 0x140), rbpStackAllocation(&wide));
+    try std.testing.expectEqual(@as(?u64, 0x20), rbpStackAllocation(&narrow));
+    try std.testing.expectEqual(@as(?u64, null), rbpStackAllocation(&unsupported));
+    try std.testing.expectEqual(@as(?u64, null), rbpStackAllocation(&saved_register));
+}
+
+test "LSDA inspection distinguishes cleanup and typed catch landing pads" {
+    const FakeState = struct {
+        data: []const u8,
+
+        fn guestMemoryConst(self: @This(), address: u64, count: u64) ?[]const u8 {
+            if (address != 0x2000) return null;
+            return self.data[0..@min(self.data.len, @as(usize, @intCast(count)))];
+        }
+
+        fn read64(_: @This(), _: u64) u64 {
+            return 0;
+        }
+    };
+    const frame = compact_unwind.FrameInfo{
+        .function_start = 0x1000,
+        .function_end = 0x1100,
+        .encoding = 0x5100_0000,
+        .mode = .rbp_frame,
+        .lsda_address = 0x2000,
+    };
+
+    const cleanup_lsda = [_]u8{ 0xFF, 0xFF, 0x01, 0x04, 0x00, 0x10, 0x20, 0x00 };
+    const cleanup = findLandingPad(FakeState{ .data = &cleanup_lsda }, frame, 0x1005, 0x3000).?;
+    try std.testing.expect(!cleanup.handles_exception);
+    try std.testing.expectEqual(@as(u64, 0x1020), cleanup.address);
+
+    var catch_lsda = [_]u8{
+        0xFF, 0x00, 0x10, 0x01, 0x04, 0x00, 0x10, 0x20, 0x01, 0x01, 0x00,
+        0x00, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    const handler = findLandingPad(FakeState{ .data = &catch_lsda }, frame, 0x1005, 0x3000).?;
+    try std.testing.expect(handler.handles_exception);
+    try std.testing.expectEqual(@as(i64, 1), handler.selector);
+    try std.testing.expectEqual(@as(u64, 0x1020), handler.address);
+}
+
+test "unwind offsets use the mapped TEXT base instead of PAGEZERO" {
+    const FakeMetadata = struct {
+        const Section = struct {
+            address: u64,
+            file_offset: u32,
+        };
+
+        fn sectionNamed(_: @This(), segment: []const u8, section: []const u8) ?Section {
+            if (std.mem.eql(u8, segment, "__TEXT") and std.mem.eql(u8, section, "__text")) {
+                return .{ .address = 0xF2C0, .file_offset = 0xB2C0 };
+            }
+            return null;
+        }
+
+        fn imageBase(_: @This()) u64 {
+            return 0;
+        }
+    };
+
+    try std.testing.expectEqual(@as(u64, 0x4000), unwindImageBase(FakeMetadata{}));
 }

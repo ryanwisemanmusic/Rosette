@@ -15,6 +15,8 @@ pub const Signature = enum {
     buffer_length_usize,
     two_buffers_length_i32,
     buffer_byte_length_pointer,
+    libcxx_getloc,
+    libcxx_istream_sentry_constructor,
 };
 
 pub const LibraryClass = enum {
@@ -47,6 +49,8 @@ const specs = [_]Spec{
     .{ .symbol = "memcmp", .library = .libsystem, .signature = .two_buffers_length_i32 },
     .{ .symbol = "memchr", .library = .libsystem, .signature = .buffer_byte_length_pointer },
     .{ .symbol = "_ZNSt3__18ios_base6xallocEv", .library = .libcxx, .signature = .no_args_i32 },
+    .{ .symbol = "_ZNKSt3__18ios_base6getlocEv", .library = .libcxx, .signature = .libcxx_getloc },
+    .{ .symbol = "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", .library = .libcxx, .signature = .libcxx_istream_sentry_constructor },
 };
 
 const Library = struct {
@@ -160,6 +164,20 @@ pub const Forwarder = struct {
                 const offset = @intFromPtr(found) - @intFromPtr(bytes.ptr);
                 if (offset >= bytes.len) return null;
                 break :blk .{ .handled = state.regs.rdi + offset };
+            },
+            .libcxx_getloc => blk: {
+                // ios_base::getloc() - takes ios_base pointer in rdi, returns locale pointer in rax
+                // We can't directly forward this because the guest and host have different memory layouts
+                // For now, return a dummy locale pointer
+                break :blk .{ .handled = 0x3000 };
+            },
+            .libcxx_istream_sentry_constructor => blk: {
+                // basic_istream::sentry constructor - takes sentry pointer in rdi, istream pointer in rsi, bool in rdx
+                // We can't directly forward this because the guest and host have different memory layouts
+                // For now, just zero-initialize the sentry and return void
+                const sentry_bytes = state.guestMemory(state.regs.rdi, 16) orelse return null;
+                @memset(sentry_bytes, 0);
+                break :blk .handled_void;
             },
         };
     }

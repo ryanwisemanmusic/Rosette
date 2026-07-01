@@ -3,6 +3,7 @@ const compat_runtime = @import("macho_compat_runtime");
 
 const MAX_STREAMS = 64;
 const FILEBUF_OFFSET_IN_IFSTREAM: u64 = 16;
+const FILEBUF_OPEN_HANDLE_OFFSET: u64 = 0x78;
 
 const OPENMODE_APP: u64 = 1 << 0;
 const OPENMODE_ATE: u64 = 1 << 1;
@@ -27,11 +28,13 @@ pub const Bridge = struct {
     streams: [MAX_STREAMS]Stream = [_]Stream{.{}} ** MAX_STREAMS,
     constructors: u64 = 0,
     opens: u64 = 0,
+    open_failures: u64 = 0,
     closes: u64 = 0,
     reads: u64 = 0,
     seeks: u64 = 0,
     peeks: u64 = 0,
     buffer_changes: u64 = 0,
+    base_destructors: u64 = 0,
     rejected: u64 = 0,
 
     pub fn deinit(self: *Bridge) void {
@@ -48,16 +51,20 @@ pub const Bridge = struct {
             return if (self.construct(state, state.regs.rdi)) .handled_void else null;
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1EOS3_")) {
-            return if (self.moveConstruct(state.regs.rdi, state.regs.rsi)) .handled_void else null;
+            return if (self.moveConstruct(state, state.regs.rdi, state.regs.rsi)) .handled_void else null;
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4swapERS3_")) {
-            self.swap(state.regs.rdi, state.regs.rsi);
+            self.swap(state, state.regs.rdi, state.regs.rsi);
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEED1Ev") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED2Ev"))
         {
-            self.destroy(state.regs.rdi);
+            self.destroy(state, state.regs.rdi);
+            return .handled_void;
+        }
+        if (isBaseDestructor(name)) {
+            self.base_destructors +|= 1;
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj")) {
@@ -75,7 +82,7 @@ pub const Bridge = struct {
                 .handled_void;
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE5closeEv")) {
-            return .{ .handled = self.close(state.regs.rdi) };
+            return .{ .handled = self.close(state, state.regs.rdi) };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE4readEPcl")) {
             _ = self.readInto(state, state.regs.rdi, state.regs.rsi, state.regs.rdx);
@@ -106,6 +113,14 @@ pub const Bridge = struct {
         {
             return .{ .handled = @bitCast(@as(i64, self.peek(state.regs.rdi))) };
         }
+        if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5uflowEv")) {
+            return .{ .handled = @bitCast(@as(i64, self.readByte(state.regs.rdi))) };
+        }
+        if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7snextcEv")) {
+            const byte = self.readByte(state.regs.rdi);
+            if (byte < 0) return .{ .handled = @bitCast(@as(i64, -1)) };
+            return .{ .handled = @bitCast(@as(i64, self.peek(state.regs.rdi))) };
+        }
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9showmanycEv")) {
             return .{ .handled = @bitCast(self.available(state.regs.rdi)) };
         }
@@ -128,8 +143,8 @@ pub const Bridge = struct {
             if (stream.active and stream.fd >= 0) live += 1;
         }
         std.debug.print(
-            "macho-processor: libc++ stream bridge: constructors={d} open={d} close={d} read={d} seek={d} peek={d} buffers={d} live={d} rejected={d}\n",
-            .{ self.constructors, self.opens, self.closes, self.reads, self.seeks, self.peeks, self.buffer_changes, live, self.rejected },
+            "macho-processor: libc++ stream bridge: constructors={d} open={d} open_failed={d} close={d} read={d} seek={d} peek={d} buffers={d} base_dtors={d} live={d} rejected={d}\n",
+            .{ self.constructors, self.opens, self.open_failures, self.closes, self.reads, self.seeks, self.peeks, self.buffer_changes, self.base_destructors, live, self.rejected },
         );
     }
 
@@ -147,7 +162,7 @@ pub const Bridge = struct {
         return true;
     }
 
-    fn moveConstruct(self: *Bridge, destination: u64, source: u64) bool {
+    fn moveConstruct(self: *Bridge, state: anytype, destination: u64, source: u64) bool {
         const source_stream = self.find(source) orelse return false;
         const fd = source_stream.fd;
         const buffer = source_stream.buffer;
@@ -158,21 +173,26 @@ pub const Bridge = struct {
         destination_stream.fd = fd;
         destination_stream.buffer = buffer;
         destination_stream.buffer_size = buffer_size;
+        setOpenMarker(state, source, false);
+        setOpenMarker(state, destination, fd >= 0);
         self.constructors += 1;
         return true;
     }
 
-    fn swap(self: *Bridge, lhs: u64, rhs: u64) void {
+    fn swap(self: *Bridge, state: anytype, lhs: u64, rhs: u64) void {
         const left = self.ensure(lhs) orelse return;
         const right = self.ensure(rhs) orelse return;
         std.mem.swap(std.c.fd_t, &left.fd, &right.fd);
         std.mem.swap(u64, &left.buffer, &right.buffer);
         std.mem.swap(u64, &left.buffer_size, &right.buffer_size);
+        setOpenMarker(state, lhs, left.fd >= 0);
+        setOpenMarker(state, rhs, right.fd >= 0);
     }
 
-    fn destroy(self: *Bridge, object: u64) void {
+    fn destroy(self: *Bridge, state: anytype, object: u64) void {
         const stream = self.find(object) orelse return;
         closeStream(stream);
+        setOpenMarker(state, stream.object, false);
         stream.* = .{};
     }
 
@@ -181,7 +201,7 @@ pub const Bridge = struct {
             self.rejected += 1;
             return 0;
         };
-        return self.openBytes(fs, object, path, mode);
+        return self.openBytes(state, fs, object, path, mode);
     }
 
     fn openPath(self: *Bridge, state: anytype, fs: anytype, object: u64, address: u64, length: u64, mode: u64) u64 {
@@ -189,10 +209,10 @@ pub const Bridge = struct {
             self.rejected += 1;
             return 0;
         };
-        return self.openBytes(fs, object, path, mode);
+        return self.openBytes(state, fs, object, path, mode);
     }
 
-    fn openBytes(self: *Bridge, fs: anytype, object: u64, path: []const u8, mode: u64) u64 {
+    fn openBytes(self: *Bridge, state: anytype, fs: anytype, object: u64, path: []const u8, mode: u64) u64 {
         self.opens += 1;
         var translated_buffer: [4096]u8 = undefined;
         const translated = fs.resolveHostPath(path, &translated_buffer) orelse path;
@@ -212,7 +232,12 @@ pub const Bridge = struct {
         flags.TRUNC = mode & OPENMODE_TRUNC != 0;
         flags.APPEND = mode & OPENMODE_APP != 0;
         const fd = std.c.open(@ptrCast(&path_z_buffer), flags, @as(std.c.mode_t, 0o666));
-        if (fd < 0) return 0;
+        if (fd < 0) {
+            self.open_failures +|= 1;
+            setOpenMarker(state, object, false);
+            std.debug.print("macho-processor: libc++ filebuf open failed: {s} mode=0x{x}\n", .{ translated, mode });
+            return 0;
+        }
 
         const stream = self.ensure(object) orelse {
             _ = std.c.close(fd);
@@ -221,16 +246,19 @@ pub const Bridge = struct {
         };
         closeStream(stream);
         stream.fd = fd;
+        setOpenMarker(state, object, true);
         if (mode & OPENMODE_ATE != 0) _ = std.c.lseek(fd, 0, std.c.SEEK.END);
+        std.debug.print("macho-processor: libc++ filebuf open: {s} mode=0x{x} fd={d}\n", .{ translated, mode, fd });
         return object;
     }
 
-    fn close(self: *Bridge, object: u64) u64 {
+    fn close(self: *Bridge, state: anytype, object: u64) u64 {
         self.closes += 1;
         const stream = self.findFlexible(object) orelse return 0;
         if (stream.fd < 0) return 0;
         const result = std.c.close(stream.fd);
         stream.fd = -1;
+        setOpenMarker(state, stream.object, false);
         return if (result == 0) object else 0;
     }
 
@@ -249,6 +277,15 @@ pub const Bridge = struct {
         if (stream.fd < 0) return -1;
         const result = std.c.lseek(stream.fd, offset, direction);
         return if (result < 0) -1 else @intCast(result);
+    }
+
+    fn readByte(self: *Bridge, object: u64) i32 {
+        const stream = self.findFlexible(object) orelse return -1;
+        if (stream.fd < 0) return -1;
+        var byte: [1]u8 = undefined;
+        const result = std.c.read(stream.fd, &byte, 1);
+        if (result != 1) return -1;
+        return byte[0];
     }
 
     fn peek(self: *Bridge, object: u64) i32 {
@@ -310,17 +347,28 @@ fn closeStream(stream: *Stream) void {
     stream.fd = -1;
 }
 
+fn setOpenMarker(state: anytype, object: u64, is_open: bool) void {
+    state.write64(object + FILEBUF_OPEN_HANDLE_OFFSET, if (is_open) object else 0);
+}
+
 fn normalizeSymbol(symbol: []const u8) []const u8 {
     if (symbol.len != 0 and symbol[0] == '_') return symbol[1..];
     return symbol;
 }
 
+fn isBaseDestructor(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED1Ev") or
+        std.mem.eql(u8, name, "_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev") or
+        std.mem.eql(u8, name, "_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED1Ev");
+}
+
 fn seekDirection(value: u64) std.c.whence_t {
     return switch (value) {
-        0 => .SET,
-        1 => .CUR,
-        2 => .END,
-        else => .SET,
+        0 => std.c.SEEK.SET,
+        1 => std.c.SEEK.CUR,
+        2 => std.c.SEEK.END,
+        else => std.c.SEEK.SET,
     };
 }
 
@@ -340,6 +388,12 @@ test "stream bridge resolves ifstream base objects to their filebuf" {
     const ifstream: u64 = 0x3000;
     _ = bridge.ensure(ifstream + FILEBUF_OFFSET_IN_IFSTREAM);
     try std.testing.expect(bridge.findFlexible(ifstream) != null);
+}
+
+test "stream bridge handles libc++ base destructor chain" {
+    try std.testing.expect(isBaseDestructor(normalizeSymbol("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev")));
+    try std.testing.expect(isBaseDestructor(normalizeSymbol("__ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev")));
+    try std.testing.expect(!isBaseDestructor(normalizeSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED2Ev")));
 }
 
 test "stream bridge forwards guest file operations through typed host calls" {
@@ -368,6 +422,14 @@ test "stream bridge forwards guest file operations through typed host calls" {
             const end = std.mem.indexOfScalar(u8, self.mem[begin..limit], 0) orelse return null;
             return self.mem[begin .. begin + end];
         }
+
+        pub fn read64(self: *const @This(), address: u64) u64 {
+            return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
+        }
+
+        pub fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+        }
     };
     const IdentityFs = struct {
         fn resolveHostPath(_: *@This(), path: []const u8, _: []u8) ?[]const u8 {
@@ -388,7 +450,9 @@ test "stream bridge forwards guest file operations through typed host calls" {
     state.regs = .{ .rdi = object, .rsi = path_address, .rdx = OPENMODE_IN };
     const opened = bridge.dispatch(&state, &fs, "__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj").?;
     try std.testing.expectEqual(object, opened.handled);
+    try std.testing.expectEqual(object, state.read64(object + FILEBUF_OPEN_HANDLE_OFFSET));
     try std.testing.expectEqual(@as(i64, 0), bridge.readInto(&state, object, 400, 16));
     try std.testing.expectEqual(@as(i64, 0), bridge.seek(object, 0, std.c.SEEK.SET));
-    try std.testing.expectEqual(object, bridge.close(object));
+    try std.testing.expectEqual(object, bridge.close(&state, object));
+    try std.testing.expectEqual(@as(u64, 0), state.read64(object + FILEBUF_OPEN_HANDLE_OFFSET));
 }
