@@ -19,6 +19,7 @@ pub const Signature = enum {
 
 pub const LibraryClass = enum {
     libsystem,
+    libcxx,
 };
 
 pub const Spec = struct {
@@ -45,6 +46,7 @@ const specs = [_]Spec{
     .{ .symbol = "strncmp", .library = .libsystem, .signature = .two_buffers_length_i32 },
     .{ .symbol = "memcmp", .library = .libsystem, .signature = .two_buffers_length_i32 },
     .{ .symbol = "memchr", .library = .libsystem, .signature = .buffer_byte_length_pointer },
+    .{ .symbol = "_ZNSt3__18ios_base6xallocEv", .library = .libcxx, .signature = .no_args_i32 },
 };
 
 const Library = struct {
@@ -178,6 +180,7 @@ fn specFor(symbol: []const u8) ?Spec {
 fn libraryMatches(class: LibraryClass, dylib: []const u8) bool {
     return switch (class) {
         .libsystem => std.mem.indexOf(u8, dylib, "libSystem") != null,
+        .libcxx => std.mem.indexOf(u8, dylib, "libc++.1.dylib") != null,
     };
 }
 
@@ -192,8 +195,10 @@ test "forwarding registry only admits typed libSystem functions" {
     try std.testing.expectEqual(Signature.no_args_i32, specFor("getpid").?.signature);
     try std.testing.expect(specFor("objc_msgSend") == null);
     try std.testing.expect(specFor("_ZNSt3__16localeD1Ev") == null);
+    try std.testing.expectEqual(LibraryClass.libcxx, specFor("_ZNSt3__18ios_base6xallocEv").?.library);
     try std.testing.expect(libraryMatches(.libsystem, "/usr/lib/libSystem.B.dylib"));
     try std.testing.expect(!libraryMatches(.libsystem, "/usr/lib/libc++.1.dylib"));
+    try std.testing.expect(libraryMatches(.libcxx, "/usr/lib/libc++.1.dylib"));
 }
 
 test "forwarder invokes an allowlisted host symbol" {

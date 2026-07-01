@@ -19,6 +19,7 @@ const launch_argument_accelerator = @import("resolution/launch_argument_accelera
 const startup_observer = @import("resolution/startup_observer.zig");
 const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
 const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
+const libcpp_stream_bridge = @import("resolution/libcpp_stream_bridge.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
 const contract = @import("contract");
@@ -123,6 +124,7 @@ const InternalCompatibilityTargets = struct {
     guest_log_get_thread_buffer: u64 = 0,
     guest_log_append_formatted: u64 = 0,
     guest_log_append_view: u64 = 0,
+    libcxx_basic_streambuf_pubsetbuf: u64 = 0,
 };
 
 const InitializerCheckpoint = struct {
@@ -183,6 +185,7 @@ pub const MachOState = struct {
     dynamic_forwarder: dynamic_library_forwarder.Forwarder = .{},
     fs_forwarder: fs_io_forwarder.Forwarder,
     libcxx_filesystem: libcpp_filesystem.Bridge = .{},
+    libcxx_streams: libcpp_stream_bridge.Bridge = .{},
     logging: logging_runtime.Engine = .{},
     pthreads: pthread_runtime.Runtime = .{},
     memory_forwarder: memory_management_forwarder.Manager,
@@ -317,6 +320,9 @@ pub const MachOState = struct {
         result.internal_targets.guest_log_append_view = result.metadata.symbolAddressWithPrefix(
             "__ZN2xe7logging13AppendLogLineENS_8LogLevelEc",
         ) orelse 0;
+        result.internal_targets.libcxx_basic_streambuf_pubsetbuf = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9pubsetbuf",
+        ) orelse 0;
         result.logging.configure(
             result.internal_targets.guest_log_get_thread_buffer != 0,
             result.internal_targets.guest_log_append_formatted != 0,
@@ -331,6 +337,7 @@ pub const MachOState = struct {
 
     pub fn deinit(self: *MachOState) void {
         self.closeGuestFiles();
+        self.libcxx_streams.deinit();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
         self.dynamic_forwarder.deinit();
@@ -975,6 +982,14 @@ pub const MachOState = struct {
 
     fn handleImportImpl(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
         const name = imported.name;
+        if (self.libcxx_streams.dispatch(self, &self.fs_forwarder, name)) |resolution| {
+            self.import_provider_override = .libcpp_stream;
+            self.import_confidence_override = .modeled;
+            return switch (resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
+            };
+        }
         if (import_resolution.dispatchContract(self, name)) |resolution| {
             return switch (resolution) {
                 .handled => |value| .{ .handled = value },
@@ -2644,6 +2659,13 @@ pub const MachOState = struct {
         {
             return self.handleCxxoptsSplitOptionNames();
         }
+        if (self.internal_targets.libcxx_basic_streambuf_pubsetbuf != 0 and
+            self.regs.rip == self.internal_targets.libcxx_basic_streambuf_pubsetbuf)
+        {
+            self.regs.rax = self.libcxx_streams.handlePubsetbuf(self.regs.rdi, self.regs.rsi, self.regs.rdx);
+            self.regs.rip = self.pop();
+            return true;
+        }
         return false;
     }
 
@@ -3553,17 +3575,33 @@ pub const MachOState = struct {
                 const from_rip = self.regs.rip;
                 const target = self.regVal(d.dst_reg, .bits64);
                 const return_addr = self.regs.rip + d.len;
-                self.push(return_addr);
-                self.regs.rip = target;
-                self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
+                if (target == 0) {
+                    self.logControlFlow("call_reg64_null", from_rip, target, d.len, return_addr);
+                    self.faulted = true;
+                    self.exit_code = 127;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+                    self.terminated = true;
+                } else {
+                    self.push(return_addr);
+                    self.regs.rip = target;
+                    self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
+                }
             },
             .call_mem64 => {
                 const from_rip = self.regs.rip;
                 const target = self.readMemVal(d.addr, .bits64);
                 const return_addr = self.regs.rip + d.len;
-                self.push(return_addr);
-                self.regs.rip = target;
-                self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
+                if (target == 0) {
+                    self.logControlFlow("call_mem64_null", from_rip, target, d.len, return_addr);
+                    self.faulted = true;
+                    self.exit_code = 127;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+                    self.terminated = true;
+                } else {
+                    self.push(return_addr);
+                    self.regs.rip = target;
+                    self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
+                }
             },
 
             .ret => {
@@ -3587,8 +3625,16 @@ pub const MachOState = struct {
             },
             .jmp_reg64 => {
                 const target = self.regVal(d.dst_reg, .bits64);
-                self.logControlFlow("jmp_reg64", self.regs.rip, target, d.len, null);
-                self.regs.rip = target;
+                if (target == 0) {
+                    self.logControlFlow("jmp_reg64_null", self.regs.rip, target, d.len, null);
+                    self.faulted = true;
+                    self.exit_code = 127;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+                    self.terminated = true;
+                } else {
+                    self.logControlFlow("jmp_reg64", self.regs.rip, target, d.len, null);
+                    self.regs.rip = target;
+                }
             },
             .jmp_mem64 => {
                 const target = self.readMemVal(d.addr, .bits64);
@@ -4612,6 +4658,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.dynamic_forwarder.logSummary();
         state.fs_forwarder.logSummary();
         state.libcxx_filesystem.logSummary();
+        state.libcxx_streams.logSummary();
         state.logging.logSummary();
         state.pthreads.logSummary();
         state.memory_forwarder.logSummary();
@@ -4632,6 +4679,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.dynamic_forwarder.logSummary();
     state.fs_forwarder.logSummary();
     state.libcxx_filesystem.logSummary();
+    state.libcxx_streams.logSummary();
     state.logging.logSummary();
     state.pthreads.logSummary();
     state.memory_forwarder.logSummary();
