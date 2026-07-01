@@ -21,6 +21,68 @@ pub const evalCond = flags.evalCond;
 pub const regVal = cpu_state.regVal;
 pub const setReg = cpu_state.setReg;
 
+pub const BitScanKind = enum { bsf, bsr, tzcnt, lzcnt };
+
+pub const BitScanResult = struct {
+    value: u64,
+    write_destination: bool,
+    zero_flag: bool,
+    carry_flag: ?bool,
+};
+
+pub fn bitScan(size: OperandSize, kind: BitScanKind, raw_source: u64) BitScanResult {
+    const width: u7 = switch (size) {
+        .bits8 => 8,
+        .bits16 => 16,
+        .bits32 => 32,
+        .bits64 => 64,
+    };
+    const mask: u64 = switch (size) {
+        .bits8 => 0xFF,
+        .bits16 => 0xFFFF,
+        .bits32 => 0xFFFF_FFFF,
+        .bits64 => 0xFFFF_FFFF_FFFF_FFFF,
+    };
+    const source = raw_source & mask;
+
+    return switch (kind) {
+        .bsf => if (source == 0)
+            .{ .value = 0, .write_destination = false, .zero_flag = true, .carry_flag = null }
+        else
+            .{ .value = @ctz(source), .write_destination = true, .zero_flag = false, .carry_flag = null },
+        .bsr => if (source == 0)
+            .{ .value = 0, .write_destination = false, .zero_flag = true, .carry_flag = null }
+        else
+            .{ .value = 63 - @clz(source), .write_destination = true, .zero_flag = false, .carry_flag = null },
+        .tzcnt => blk: {
+            const value: u64 = if (source == 0) width else @ctz(source);
+            break :blk .{
+                .value = value,
+                .write_destination = true,
+                .zero_flag = value == 0,
+                .carry_flag = source == 0,
+            };
+        },
+        .lzcnt => blk: {
+            const value: u64 = if (source == 0) width else width - 1 - (63 - @clz(source));
+            break :blk .{
+                .value = value,
+                .write_destination = true,
+                .zero_flag = value == 0,
+                .carry_flag = source == 0,
+            };
+        },
+    };
+}
+
+pub fn byteSwap(size: OperandSize, value: u64) u64 {
+    return switch (size) {
+        .bits32 => @byteSwap(@as(u32, @truncate(value))),
+        .bits64 => @byteSwap(value),
+        .bits8, .bits16 => unreachable,
+    };
+}
+
 pub const Op = enum(u16) {
     invalid,
     nop,
@@ -186,6 +248,16 @@ pub const Op = enum(u16) {
     shr_mem_imm,
     sar_reg_imm,
     sar_mem_imm,
+    // bit scans and zero counts
+    bsf_reg_reg,
+    bsf_reg_mem,
+    bsr_reg_reg,
+    bsr_reg_mem,
+    tzcnt_reg_reg,
+    tzcnt_reg_mem,
+    lzcnt_reg_reg,
+    lzcnt_reg_mem,
+    bswap_reg,
     // test
     test_reg8_reg8,
     test_reg16_reg16,
@@ -458,6 +530,11 @@ test "emulated CPUID exposes a coherent AVX baseline" {
     try std.testing.expect(leaf1.ecx & (@as(u32, 1) << 27) != 0);
     try std.testing.expect(leaf1.ecx & (@as(u32, 1) << 28) != 0);
     try std.testing.expectEqual(@as(u64, 0x7), emulatedXcr0());
+}
+
+test "shared byte swap preserves operand width" {
+    try std.testing.expectEqual(@as(u64, 0x7856_3412), byteSwap(.bits32, 0x1234_5678));
+    try std.testing.expectEqual(@as(u64, 0xEFCD_AB89_6745_2301), byteSwap(.bits64, 0x0123_4567_89AB_CDEF));
 }
 
 pub const DecodedInsn = struct {

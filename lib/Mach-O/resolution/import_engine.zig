@@ -11,6 +11,7 @@ pub const Provider = enum {
     contract,
     dynamic_library,
     libcpp_filesystem,
+    pthread_runtime,
     smart_stub,
     legacy_shim,
     none,
@@ -180,6 +181,7 @@ pub const Engine = struct {
     contract_calls: u64 = 0,
     dynamic_library_calls: u64 = 0,
     libcpp_filesystem_calls: u64 = 0,
+    pthread_runtime_calls: u64 = 0,
     smart_stub_calls: u64 = 0,
     legacy_shim_calls: u64 = 0,
     verified_calls: u64 = 0,
@@ -219,6 +221,7 @@ pub const Engine = struct {
             .contract => self.contract_calls += 1,
             .dynamic_library => self.dynamic_library_calls += 1,
             .libcpp_filesystem => self.libcpp_filesystem_calls += 1,
+            .pthread_runtime => self.pthread_runtime_calls += 1,
             .smart_stub => self.smart_stub_calls += 1,
             .legacy_shim => self.legacy_shim_calls += 1,
             .none => {},
@@ -264,7 +267,7 @@ pub const Engine = struct {
 
     pub fn logSummary(self: *const Engine) void {
         std.debug.print(
-            "macho-processor: import resolution summary: calls={d} resolved={d} unresolved={d} terminated={d} symbols={d} contract={d} dynamic={d} libcxx_fs={d} smart_stub={d} shim={d} verified={d} modeled={d}",
+            "macho-processor: import resolution summary: calls={d} resolved={d} unresolved={d} terminated={d} symbols={d} contract={d} dynamic={d} libcxx_fs={d} pthread={d} smart_stub={d} shim={d} verified={d} modeled={d}",
             .{
                 self.total_calls,
                 self.resolved_calls,
@@ -274,6 +277,7 @@ pub const Engine = struct {
                 self.contract_calls,
                 self.dynamic_library_calls,
                 self.libcpp_filesystem_calls,
+                self.pthread_runtime_calls,
                 self.smart_stub_calls,
                 self.legacy_shim_calls,
                 self.verified_calls,

@@ -19,6 +19,8 @@ const launch_argument_accelerator = @import("resolution/launch_argument_accelera
 const startup_observer = @import("resolution/startup_observer.zig");
 const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
 const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
+const logging_runtime = @import("resolution/logging_runtime.zig");
+const pthread_runtime = @import("resolution/pthread_runtime.zig");
 const contract = @import("contract");
 
 const log = std.log.scoped(.macho);
@@ -29,6 +31,8 @@ const RegId = x64_decoder.RegId;
 const Cond = x64_decoder.Condition;
 const Op = x64_decoder.Op;
 const DecodedInsn = x64_decoder.DecodedInsn;
+const BitScanKind = x64_decoder.BitScanKind;
+const bitScan = x64_decoder.bitScan;
 
 const RFL_CF = x64_decoder.RFL_CF;
 const RFL_PF: u32 = 1 << 2;
@@ -113,6 +117,7 @@ const InternalCompatibilityTargets = struct {
     cxxopts_split_option_names: u64 = 0,
     parse_launch_arguments: u64 = 0,
     initialize_logging: u64 = 0,
+    shutdown_logging: u64 = 0,
     cvar_add_to_launch_options: [32]u64 = [_]u64{0} ** 32,
     cvar_add_to_launch_options_count: usize = 0,
     guest_log_get_thread_buffer: u64 = 0,
@@ -178,6 +183,8 @@ pub const MachOState = struct {
     dynamic_forwarder: dynamic_library_forwarder.Forwarder = .{},
     fs_forwarder: fs_io_forwarder.Forwarder,
     libcxx_filesystem: libcpp_filesystem.Bridge = .{},
+    logging: logging_runtime.Engine = .{},
+    pthreads: pthread_runtime.Runtime = .{},
     memory_forwarder: memory_management_forwarder.Manager,
     smart_stubs: smart_stub_generator.Generator = .{},
     cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
@@ -293,6 +300,9 @@ pub const MachOState = struct {
         result.internal_targets.initialize_logging = result.metadata.symbolAddressWithPrefix(
             "__ZN2xe17InitializeLogging",
         ) orelse 0;
+        result.internal_targets.shutdown_logging = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe15ShutdownLoggingEv",
+        ) orelse 0;
         result.internal_targets.cvar_add_to_launch_options_count = result.metadata.symbolAddressesMatching(
             "__ZN4cvar",
             "AddToLaunchOptions",
@@ -307,6 +317,11 @@ pub const MachOState = struct {
         result.internal_targets.guest_log_append_view = result.metadata.symbolAddressWithPrefix(
             "__ZN2xe7logging13AppendLogLineENS_8LogLevelEc",
         ) orelse 0;
+        result.logging.configure(
+            result.internal_targets.guest_log_get_thread_buffer != 0,
+            result.internal_targets.guest_log_append_formatted != 0,
+            result.internal_targets.guest_log_append_view != 0,
+        );
         result.unwinder.configure(&result.metadata);
         result.applyDyldBindings() catch |err| {
             log.warn("dyld data binding setup failed: {s}", .{@errorName(err)});
@@ -977,6 +992,15 @@ pub const MachOState = struct {
             };
         }
 
+        if (self.pthreads.dispatch(self, name)) |resolution| {
+            self.import_provider_override = .pthread_runtime;
+            self.import_confidence_override = .modeled;
+            return switch (resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
+            };
+        }
+
         if (self.dynamic_forwarder.forward(self, imported.dylib, name)) |resolution| {
             self.import_provider_override = .dynamic_library;
             self.import_confidence_override = .verified;
@@ -1039,17 +1063,6 @@ pub const MachOState = struct {
             return if (result.modeled) .{ .handled = result.value } else .{ .unsupported = result.value };
         }
 
-        if (std.mem.eql(u8, name, "_pthread_equal")) {
-            return .{ .handled = @intFromBool(self.regs.rdi == self.regs.rsi) };
-        }
-        if (std.mem.eql(u8, name, "_pthread_threadid_np")) {
-            if (self.regs.rsi != 0) self.write64(self.regs.rsi, 1);
-            return .{ .handled = 0 };
-        }
-        if (std.mem.eql(u8, name, "_pthread_attr_init")) {
-            if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
-            return .{ .handled = 0 };
-        }
         if (std.mem.eql(u8, name, "_objc_autoreleasePoolPush")) {
             return .{ .handled = self.compat.currentThreadHandle() };
         }
@@ -1633,12 +1646,6 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "_mprotect")) {
             return .{ .handled = self.fs_forwarder.mprotect(self) };
         }
-        if (std.mem.eql(u8, name, "_pthread_create")) {
-            if (self.guestMemory(self.regs.rdi, @sizeOf(u64)) == null) return .{ .unsupported = 14 };
-            self.write64(self.regs.rdi, self.compat.currentThreadHandle() + 1);
-            return .{ .handled = 0 };
-        }
-
         if (std.mem.endsWith(u8, name, "_fopen")) {
             return .{ .handled = self.handleFopen() orelse 0 };
         }
@@ -2598,6 +2605,22 @@ pub const MachOState = struct {
             self.regs.rip == self.internal_targets.initialize_logging)
         {
             self.startup.enter(.logging, self.executed_steps);
+            const app_name = self.guestMemoryConst(self.regs.rdi, @min(self.regs.rsi, 1024)) orelse "";
+            if (self.logging.initialize(app_name)) {
+                if (self.guest_log_buffer_address == 0) {
+                    self.guest_log_buffer_address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return false;
+                }
+                self.regs.rip = self.pop();
+                self.startup.enter(.logging_ready, self.executed_steps);
+                return true;
+            }
+        }
+        if (self.internal_targets.shutdown_logging != 0 and
+            self.regs.rip == self.internal_targets.shutdown_logging and
+            self.logging.shutdown())
+        {
+            self.regs.rip = self.pop();
+            return true;
         }
         if (self.handleGuestLogBridge()) return true;
         for (self.internal_targets.cvar_add_to_launch_options[0..self.internal_targets.cvar_add_to_launch_options_count]) |target| {
@@ -2664,16 +2687,19 @@ pub const MachOState = struct {
         if (self.internal_targets.guest_log_append_formatted != 0 and
             self.regs.rip == self.internal_targets.guest_log_append_formatted)
         {
+            var emitted = false;
             if (self.guest_log_buffer_address != 0) {
-                _ = self.emitGuestLog(self.regs.rsi, self.guest_log_buffer_address, self.regs.rdx);
+                emitted = self.emitGuestLog(self.regs.rsi, self.guest_log_buffer_address, self.regs.rdx);
             }
+            self.logging.recordEmission(self.regs.rdx, emitted);
             self.regs.rip = self.pop();
             return true;
         }
         if (self.internal_targets.guest_log_append_view != 0 and
             self.regs.rip == self.internal_targets.guest_log_append_view)
         {
-            _ = self.emitGuestLog(self.regs.rsi, self.regs.rdx, self.regs.rcx);
+            const emitted = self.emitGuestLog(self.regs.rsi, self.regs.rdx, self.regs.rcx);
+            self.logging.recordEmission(self.regs.rcx, emitted);
             self.regs.rip = self.pop();
             return true;
         }
@@ -2933,6 +2959,9 @@ pub const MachOState = struct {
                     .options_seen = self.launch_options.registrations_seen,
                     .options_kept = self.launch_options.registrations_kept,
                     .options_skipped = self.launch_options.registrations_skipped,
+                    .logging_lines = self.logging.emitted_lines,
+                    .pthread_created = self.pthreads.created_threads,
+                    .pthread_waits_collapsed = self.pthreads.collapsed_waits,
                 });
             }
             if (!self.step()) break;
@@ -3589,6 +3618,18 @@ pub const MachOState = struct {
                 }
             },
 
+            .bsf_reg_reg,
+            .bsf_reg_mem,
+            .bsr_reg_reg,
+            .bsr_reg_mem,
+            .tzcnt_reg_reg,
+            .tzcnt_reg_mem,
+            .lzcnt_reg_reg,
+            .lzcnt_reg_mem,
+            => self.executeBitScan(d),
+
+            .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
+
             .shl_reg_cl, .shl_mem_cl => {
                 const sz = d.size;
                 const is_mem = d.op == .shl_mem_cl;
@@ -4151,6 +4192,26 @@ pub const MachOState = struct {
         }
     }
 
+    fn executeBitScan(self: *MachOState, d: DecodedInsn) void {
+        const is_memory = switch (d.op) {
+            .bsf_reg_mem, .bsr_reg_mem, .tzcnt_reg_mem, .lzcnt_reg_mem => true,
+            else => false,
+        };
+        const kind: BitScanKind = switch (d.op) {
+            .bsf_reg_reg, .bsf_reg_mem => .bsf,
+            .bsr_reg_reg, .bsr_reg_mem => .bsr,
+            .tzcnt_reg_reg, .tzcnt_reg_mem => .tzcnt,
+            .lzcnt_reg_reg, .lzcnt_reg_mem => .lzcnt,
+            else => unreachable,
+        };
+        const source = if (is_memory) self.readMemVal(d.addr, d.size) else self.regVal(d.src_reg, d.size);
+        const result = bitScan(d.size, kind, source);
+
+        if (result.write_destination) self.setReg(d.dst_reg, d.size, result.value);
+        self.setFlag(RFL_ZF, result.zero_flag);
+        if (result.carry_flag) |carry| self.setFlag(RFL_CF, carry);
+    }
+
     fn executeVexScalarF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
         const source1 = self.xmm[d.xmm_src];
         const source2_bits = if (d.is_reg_form)
@@ -4551,6 +4612,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.dynamic_forwarder.logSummary();
         state.fs_forwarder.logSummary();
         state.libcxx_filesystem.logSummary();
+        state.logging.logSummary();
+        state.pthreads.logSummary();
         state.memory_forwarder.logSummary();
         state.launch_options.logSummary();
         state.startup.logSummary();
@@ -4569,6 +4632,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.dynamic_forwarder.logSummary();
     state.fs_forwarder.logSummary();
     state.libcxx_filesystem.logSummary();
+    state.logging.logSummary();
+    state.pthreads.logSummary();
     state.memory_forwarder.logSummary();
     state.launch_options.logSummary();
     state.startup.logSummary();
@@ -5339,7 +5404,6 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
 
 const VexArithmetic = enum { add, multiply, subtract, divide };
 const VexBitwise = enum { @"and", and_not, @"or", xor };
-
 fn shuffleBytes(source: [16]u8, mask: [16]u8) [16]u8 {
     var result = [_]u8{0} ** 16;
     for (mask, 0..) |selector, index| {
@@ -5706,12 +5770,46 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
         return decodeMovzx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
+    if (opcode2 == 0xBC or opcode2 == 0xBD) {
+        if (pos.* >= bytes.len) return .{};
+        const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, d.size);
+        d.dst_reg = rm.reg;
+        if (d.is_reg_form) {
+            d.src_reg = @enumFromInt(rm.addr);
+            d.op = if (has_f3)
+                if (opcode2 == 0xBC) .tzcnt_reg_reg else .lzcnt_reg_reg
+            else if (opcode2 == 0xBC)
+                .bsf_reg_reg
+            else
+                .bsr_reg_reg;
+        } else {
+            d.addr = rm.addr;
+            d.op = if (has_f3)
+                if (opcode2 == 0xBC) .tzcnt_reg_mem else .lzcnt_reg_mem
+            else if (opcode2 == 0xBC)
+                .bsf_reg_mem
+            else
+                .bsr_reg_mem;
+        }
+        d.len = @intCast(pos.*);
+        return d;
+    }
+
     if (opcode2 == 0xBE or opcode2 == 0xBF) {
         return decodeMovsx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
     if (opcode2 == 0xC1) {
         return decodeXadd(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+    }
+
+    if (opcode2 >= 0xC8 and opcode2 <= 0xCF) {
+        if (has_66) return .{};
+        d.op = .bswap_reg;
+        d.size = if (rex_w) .bits64 else .bits32;
+        d.dst_reg = mapReg(opcode2 - 0xC8, rex_b);
+        d.len = @intCast(pos.*);
+        return d;
     }
 
     if (opcode2 == 0x10 or opcode2 == 0x11) {
@@ -5816,9 +5914,7 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
         return d;
     }
 
-    d.op = .nop;
-    d.len = @as(u8, @intCast(pos.*));
-    return d;
+    return .{};
 }
 
 fn decodeThreeByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_f2: bool, has_f3: bool, opcode: u8) DecodedInsn {
@@ -7334,6 +7430,70 @@ test "decode carry flag control instructions" {
     try std.testing.expectEqual(Op.cmc, decodeInsn(&[_]u8{0xF5}).op);
     try std.testing.expectEqual(Op.clc, decodeInsn(&[_]u8{0xF8}).op);
     try std.testing.expectEqual(Op.stc, decodeInsn(&[_]u8{0xF9}).op);
+}
+
+test "decode bit scan and count instructions without losing ModRM" {
+    const fmt_bsr = decodeInsn(&[_]u8{ 0x48, 0x0F, 0xBD, 0xC0 });
+    try std.testing.expectEqual(Op.bsr_reg_reg, fmt_bsr.op);
+    try std.testing.expectEqual(Size.bits64, fmt_bsr.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, fmt_bsr.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, fmt_bsr.src_reg);
+    try std.testing.expectEqual(@as(u8, 4), fmt_bsr.len);
+
+    const memory_bsf = decodeInsn(&[_]u8{ 0x0F, 0xBC, 0x48, 0x08 });
+    try std.testing.expectEqual(Op.bsf_reg_mem, memory_bsf.op);
+    try std.testing.expectEqual(Size.bits32, memory_bsf.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, memory_bsf.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, memory_bsf.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 8), memory_bsf.addr);
+    try std.testing.expectEqual(@as(u8, 4), memory_bsf.len);
+
+    const lzcnt = decodeInsn(&[_]u8{ 0xF3, 0x48, 0x0F, 0xBD, 0xC3 });
+    try std.testing.expectEqual(Op.lzcnt_reg_reg, lzcnt.op);
+    try std.testing.expectEqual(Size.bits64, lzcnt.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, lzcnt.dst_reg);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, lzcnt.src_reg);
+    try std.testing.expectEqual(@as(u8, 5), lzcnt.len);
+}
+
+test "decode BSWAP register family" {
+    const initializer_bswap = decodeInsn(&[_]u8{ 0x0F, 0xC8 });
+    try std.testing.expectEqual(Op.bswap_reg, initializer_bswap.op);
+    try std.testing.expectEqual(Size.bits32, initializer_bswap.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, initializer_bswap.dst_reg);
+    try std.testing.expectEqual(@as(u8, 2), initializer_bswap.len);
+
+    const extended_bswap = decodeInsn(&[_]u8{ 0x49, 0x0F, 0xCF });
+    try std.testing.expectEqual(Op.bswap_reg, extended_bswap.op);
+    try std.testing.expectEqual(Size.bits64, extended_bswap.size);
+    try std.testing.expectEqual(RegId.r15b_r15w_r15d_r15, extended_bswap.dst_reg);
+    try std.testing.expectEqual(@as(u8, 3), extended_bswap.len);
+}
+
+test "bit scan and count semantics cover zero and operand width" {
+    const bsr = bitScan(.bits64, .bsr, 0x8000_0000_0000_0000);
+    try std.testing.expectEqual(@as(u64, 63), bsr.value);
+    try std.testing.expect(bsr.write_destination);
+    try std.testing.expect(!bsr.zero_flag);
+    try std.testing.expectEqual(@as(?bool, null), bsr.carry_flag);
+
+    const empty_bsf = bitScan(.bits32, .bsf, 0);
+    try std.testing.expect(!empty_bsf.write_destination);
+    try std.testing.expect(empty_bsf.zero_flag);
+
+    const empty_tzcnt = bitScan(.bits16, .tzcnt, 0);
+    try std.testing.expectEqual(@as(u64, 16), empty_tzcnt.value);
+    try std.testing.expectEqual(@as(?bool, true), empty_tzcnt.carry_flag);
+
+    const lzcnt = bitScan(.bits32, .lzcnt, 0x0000_0100);
+    try std.testing.expectEqual(@as(u64, 23), lzcnt.value);
+    try std.testing.expectEqual(@as(?bool, false), lzcnt.carry_flag);
+}
+
+test "unknown two-byte opcode is rejected at its real boundary" {
+    const decoded = decodeInsn(&[_]u8{ 0x0F, 0xFF, 0xC0 });
+    try std.testing.expectEqual(Op.invalid, decoded.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded.len);
 }
 
 test "decode conditional moves without losing the ModRM byte" {

@@ -39,6 +39,7 @@ pub const RegId = x64_decoder.RegId;
 pub const Cond = x64_decoder.Condition;
 pub const Op = x64_decoder.Op;
 pub const DecodedInsn = x64_decoder.DecodedInsn;
+const BitScanKind = x64_decoder.BitScanKind;
 
 // ─── ELF state ───
 
@@ -692,6 +693,26 @@ pub const ElfState = struct {
         return x64_decoder.evalCond(rflags, cond);
     }
 
+    fn executeBitScan(self: *ElfState, d: DecodedInsn) void {
+        const is_memory = switch (d.op) {
+            .bsf_reg_mem, .bsr_reg_mem, .tzcnt_reg_mem, .lzcnt_reg_mem => true,
+            else => false,
+        };
+        const kind: BitScanKind = switch (d.op) {
+            .bsf_reg_reg, .bsf_reg_mem => .bsf,
+            .bsr_reg_reg, .bsr_reg_mem => .bsr,
+            .tzcnt_reg_reg, .tzcnt_reg_mem => .tzcnt,
+            .lzcnt_reg_reg, .lzcnt_reg_mem => .lzcnt,
+            else => unreachable,
+        };
+        const source = if (is_memory) self.readMemVal(d.addr, d.size) else self.regVal(d.src_reg, d.size);
+        const result = x64_decoder.bitScan(d.size, kind, source);
+
+        if (result.write_destination) self.setReg(d.dst_reg, d.size, result.value);
+        self.setFlag(RFL_ZF, result.zero_flag);
+        if (result.carry_flag) |carry| self.setFlag(RFL_CF, carry);
+    }
+
     pub fn execute(self: *ElfState, d: DecodedInsn) void {
         switch (d.op) {
             .invalid => unreachable,
@@ -1180,6 +1201,16 @@ pub const ElfState = struct {
                 self.setReg(d.dst_reg, d.size, r);
                 self.setFlagsLogic(r, d.size);
             },
+            .bsf_reg_reg,
+            .bsf_reg_mem,
+            .bsr_reg_reg,
+            .bsr_reg_mem,
+            .tzcnt_reg_reg,
+            .tzcnt_reg_mem,
+            .lzcnt_reg_reg,
+            .lzcnt_reg_mem,
+            => self.executeBitScan(d),
+            .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
             .shl_reg_cl => {
                 const old = self.regVal(d.dst_reg, d.size);
                 const count = self.shlCount(d.size);
@@ -2694,6 +2725,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
     var rex: u8 = 0;
     var has_66: bool = false;
     var has_0x67: bool = false;
+    var has_f3: bool = false;
 
     // Parse prefixes
     while (pos < bytes.len and pos < 15) {
@@ -2714,6 +2746,9 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
         } else if (b == 0xF0) {
             // LOCK prefix. The ELF runner is single-threaded, so accept it and
             // let the memory operation execute normally.
+            pos += 1;
+        } else if (b == 0xF3) {
+            has_f3 = true;
             pos += 1;
         } else if (hasRexPrefix(b)) {
             rex = b;
@@ -4115,6 +4150,51 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                         else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
                     };
                 },
+                0xBC, 0xBD => {
+                    // BSF/BSR and their F3-prefixed TZCNT/LZCNT forms.
+                    if (pos >= bytes.len) return .{};
+                    const modrm = bytes[pos];
+                    pos += 1;
+                    const mod_v = modrm >> 6;
+                    const reg = (modrm >> 3) & 7;
+                    const rm = modrm & 7;
+                    const size: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+                    const dst_reg = modRmReg(reg, rex);
+                    const register_op: Op = if (has_f3)
+                        if (op2 == 0xBC) .tzcnt_reg_reg else .lzcnt_reg_reg
+                    else if (op2 == 0xBC)
+                        .bsf_reg_reg
+                    else
+                        .bsr_reg_reg;
+                    const memory_op: Op = if (has_f3)
+                        if (op2 == 0xBC) .tzcnt_reg_mem else .lzcnt_reg_mem
+                    else if (op2 == 0xBC)
+                        .bsf_reg_mem
+                    else
+                        .bsr_reg_mem;
+
+                    if (mod_v == 3) {
+                        return DecodedInsn{
+                            .op = register_op,
+                            .size = size,
+                            .dst_reg = dst_reg,
+                            .src_reg = modRmRm(rm, rex),
+                            .len = @intCast(pos),
+                        };
+                    }
+
+                    const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return DecodedInsn{ .op = memory_op, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) };
+                },
+                0xC8...0xCF => {
+                    if (has_66) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return DecodedInsn{
+                        .op = .bswap_reg,
+                        .size = if (rex_w) .bits64 else .bits32,
+                        .dst_reg = regId(op2 - 0xC8, rexB(rex)),
+                        .len = @intCast(pos),
+                    };
+                },
                 0x57 => {
                     // XORPS xmm, xmm/m128. Register form is used as a fast
                     // zeroing idiom: xorps xmm0, xmm0.
@@ -4825,6 +4905,41 @@ test "decode and execute xorps zero then movaps store" {
     });
     const stored = state.readMem128(MEM_BASE);
     try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), stored[0..]);
+}
+
+test "decode and execute shared bit scan instructions" {
+    const bsr = decodeInsn(&[_]u8{ 0x48, 0x0F, 0xBD, 0xC0 });
+    try testing.expectEqual(Op.bsr_reg_reg, bsr.op);
+    try testing.expectEqual(Size.bits64, bsr.size);
+    try testing.expectEqual(RegId.al_ax_eax_rax, bsr.dst_reg);
+    try testing.expectEqual(RegId.al_ax_eax_rax, bsr.src_reg);
+    try testing.expectEqual(@as(u8, 4), bsr.len);
+
+    const lzcnt = decodeInsn(&[_]u8{ 0xF3, 0x48, 0x0F, 0xBD, 0xC3 });
+    try testing.expectEqual(Op.lzcnt_reg_reg, lzcnt.op);
+    try testing.expectEqual(RegId.bl_bx_ebx_rbx, lzcnt.src_reg);
+    try testing.expectEqual(@as(u8, 5), lzcnt.len);
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.regs.rax = 0x8000_0000_0000_0000;
+    state.execute(bsr);
+    try testing.expectEqual(@as(u64, 63), state.regs.rax);
+    try testing.expect((state.regs.rflags & RFL_ZF) == 0);
+}
+
+test "decode and execute shared byte swap" {
+    const decoded = decodeInsn(&[_]u8{ 0x0F, 0xC8 });
+    try testing.expectEqual(Op.bswap_reg, decoded.op);
+    try testing.expectEqual(Size.bits32, decoded.size);
+    try testing.expectEqual(RegId.al_ax_eax_rax, decoded.dst_reg);
+    try testing.expectEqual(@as(u8, 2), decoded.len);
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.regs.rax = 0xFFFF_FFFF_1234_5678;
+    state.execute(decoded);
+    try testing.expectEqual(@as(u64, 0x7856_3412), state.regs.rax);
 }
 
 test "decode 0x48 0x63 0xDB (movsxd rbx, ebx)" {

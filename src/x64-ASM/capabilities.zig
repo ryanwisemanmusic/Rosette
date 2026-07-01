@@ -108,10 +108,14 @@ pub fn classifyRequirement(bytes: []const u8) ?Requirement {
     if (bytes.len == 0) return null;
     var pos: usize = 0;
     var prefix_66 = false;
+    var prefix_f2 = false;
+    var prefix_f3 = false;
     while (pos < bytes.len) : (pos += 1) {
         switch (bytes[pos]) {
             0x66 => prefix_66 = true,
-            0x40...0x4F, 0x67, 0xF0, 0xF2, 0xF3 => {},
+            0xF2 => prefix_f2 = true,
+            0xF3 => prefix_f3 = true,
+            0x40...0x4F, 0x67, 0xF0 => {},
             else => break,
         }
     }
@@ -119,9 +123,33 @@ pub fn classifyRequirement(bytes: []const u8) ?Requirement {
     return switch (bytes[pos]) {
         0x62 => .{ .encoding = .evex, .feature = .avx512f },
         0xC4, 0xC5 => .{ .encoding = .vex, .feature = .avx },
-        0x0F => .{ .encoding = .legacy, .feature = if (prefix_66) .sse2 else .sse },
+        0x0F => classifyLegacySimd(bytes, pos + 1, prefix_66, prefix_f2, prefix_f3),
         else => null,
     };
+}
+
+fn classifyLegacySimd(bytes: []const u8, opcode_pos: usize, prefix_66: bool, prefix_f2: bool, prefix_f3: bool) ?Requirement {
+    if (opcode_pos >= bytes.len) return null;
+    const opcode = bytes[opcode_pos];
+
+    if (opcode == 0x38) return .{ .encoding = .legacy, .feature = .ssse3 };
+    if (opcode == 0x3A) return .{ .encoding = .legacy, .feature = .sse41 };
+
+    const scalar_or_packed = switch (opcode) {
+        0x10...0x17, 0x28...0x2F, 0x50...0x5F, 0xAE, 0xC2...0xC6 => true,
+        0x60...0x76, 0x7C...0x7F, 0xD0...0xFE => prefix_66 or prefix_f2 or prefix_f3,
+        else => false,
+    };
+    if (!scalar_or_packed) return null;
+
+    const feature: Feature = if ((prefix_f2 or prefix_f3) and
+        (opcode == 0x12 or opcode == 0x16 or opcode == 0x7C or opcode == 0x7D or opcode == 0xD0))
+        .sse3
+    else if (prefix_66 or prefix_f2)
+        .sse2
+    else
+        .sse;
+    return .{ .encoding = .legacy, .feature = feature };
 }
 
 test "profiles expose coherent AVX and AVX-512 state" {
@@ -137,4 +165,11 @@ test "profiles expose coherent AVX and AVX-512 state" {
 test "classify VEX and EVEX instruction families" {
     try std.testing.expectEqual(Feature.avx, classifyRequirement(&.{ 0xC5, 0xF8, 0x57, 0xC0 }).?.feature);
     try std.testing.expectEqual(Feature.avx512f, classifyRequirement(&.{ 0x62, 0xF1, 0x7C, 0x48 }).?.feature);
+}
+
+test "legacy classifier distinguishes scalar integer opcodes from SIMD" {
+    try std.testing.expect(classifyRequirement(&.{ 0x0F, 0xC8 }) == null);
+    try std.testing.expect(classifyRequirement(&.{ 0x48, 0x0F, 0xBD, 0xC0 }) == null);
+    try std.testing.expectEqual(Feature.sse, classifyRequirement(&.{ 0x0F, 0x57, 0xC0 }).?.feature);
+    try std.testing.expectEqual(Feature.sse2, classifyRequirement(&.{ 0x66, 0x0F, 0xEF, 0xC0 }).?.feature);
 }
