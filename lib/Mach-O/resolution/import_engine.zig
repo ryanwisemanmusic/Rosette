@@ -53,6 +53,9 @@ pub const ContractId = enum {
     libcxx_match_any_but_newline_char,
     libcxx_basic_string_push_back_char,
     libcxx_basic_string_init_fill,
+    libcxx_basic_string_reserve,
+    libcxx_ios_base_init,
+    libcxx_basic_filebuf_constructor,
 };
 
 pub const Contract = struct {
@@ -93,6 +96,30 @@ pub const basic_string_init_fill = Contract{
     .effects = .{ .return_convention = .void, .writes_guest_memory = true },
 };
 
+pub const basic_string_reserve = Contract{
+    .id = .libcxx_basic_string_reserve,
+    .canonical_symbol = "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm",
+    .domain = .libcxx,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void, .writes_guest_memory = true },
+};
+
+pub const ios_base_init = Contract{
+    .id = .libcxx_ios_base_init,
+    .canonical_symbol = "_ZNSt3__18ios_base4initEPv",
+    .domain = .libcxx,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void, .writes_guest_memory = true },
+};
+
+pub const basic_filebuf_constructor = Contract{
+    .id = .libcxx_basic_filebuf_constructor,
+    .canonical_symbol = "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev",
+    .domain = .libcxx,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void, .writes_guest_memory = true },
+};
+
 pub fn normalizeSymbol(symbol: []const u8) []const u8 {
     var normalized = symbol;
     if (normalized.len != 0 and normalized[0] == '_') normalized = normalized[1..];
@@ -113,6 +140,15 @@ pub fn contractFor(symbol: []const u8) ?Contract {
     if (std.mem.eql(u8, normalized, basic_string_init_fill.canonical_symbol)) {
         return basic_string_init_fill;
     }
+    if (std.mem.eql(u8, normalized, basic_string_reserve.canonical_symbol)) {
+        return basic_string_reserve;
+    }
+    if (std.mem.eql(u8, normalized, ios_base_init.canonical_symbol)) {
+        return ios_base_init;
+    }
+    if (std.mem.eql(u8, normalized, basic_filebuf_constructor.canonical_symbol)) {
+        return basic_filebuf_constructor;
+    }
     return null;
 }
 
@@ -128,6 +164,18 @@ pub fn dispatchContract(state: anytype, symbol: []const u8) ?ContractDispatch {
         else
             .failed,
         .libcxx_basic_string_init_fill => if (compat_runtime.initLibcppStringFill(state, state.regs.rdi, state.regs.rsi, @truncate(state.regs.rdx)))
+            .handled_void
+        else
+            .failed,
+        .libcxx_basic_string_reserve => if (executeBasicStringReserve(state, state.regs.rdi, state.regs.rsi))
+            .handled_void
+        else
+            .failed,
+        .libcxx_ios_base_init => if (executeIosBaseInit(state, state.regs.rdi, state.regs.rsi))
+            .handled_void
+        else
+            .failed,
+        .libcxx_basic_filebuf_constructor => if (executeBasicFilebufConstructor(state, state.regs.rdi))
             .handled_void
         else
             .failed,
@@ -336,6 +384,69 @@ pub fn executeMatchAnyButNewlineChar(state: anytype, matcher: u64, regex_state: 
     return true;
 }
 
+pub fn executeBasicStringReserve(state: anytype, object: u64, new_capacity: u64) bool {
+    const object_bytes = state.guestMemory(object, 24) orelse return false;
+    
+    // Small string optimization - if it's already using SSO and new capacity fits in SSO, do nothing
+    if (object_bytes[0] & 1 == 0) {
+        // Currently using SSO (small string optimization)
+        const current_length = object_bytes[0] >> 1;
+        if (new_capacity <= 22) {
+            // Already fits in SSO, no action needed
+            return true;
+        }
+        // Need to allocate - copy current content to heap
+        const capacity = (std.math.add(u64, new_capacity, 16) catch return false) & ~@as(u64, 15);
+        const allocation = state.guestAlloc(capacity, 16) orelse return false;
+        const storage = state.guestMemory(allocation, capacity) orelse return false;
+        const len: usize = @intCast(current_length);
+        @memcpy(storage[0..len], object_bytes[1..1 + len]);
+        storage[len] = 0;
+        state.write64(object, capacity | 1);
+        state.write64(object + 8, current_length);
+        state.write64(object + 16, allocation);
+        return true;
+    }
+    
+    // Already using heap allocation
+    const current_capacity = state.read64(object) & ~@as(u64, 1);
+    if (new_capacity <= current_capacity) {
+        // Already have enough capacity
+        return true;
+    }
+    
+    // Need to reallocate with larger capacity
+    const current_length = state.read64(object + 8);
+    const current_data = state.read64(object + 16);
+    const capacity = (std.math.add(u64, new_capacity, 16) catch return false) & ~@as(u64, 15);
+    const allocation = state.guestAlloc(capacity, 16) orelse return false;
+    const storage = state.guestMemory(allocation, capacity) orelse return false;
+    const current_bytes = state.guestMemoryConst(current_data, current_length) orelse return false;
+    const len: usize = @intCast(current_length);
+    @memcpy(storage[0..len], current_bytes);
+    storage[len] = 0;
+    state.write64(object, capacity | 1);
+    state.write64(object + 16, allocation);
+    return true;
+}
+
+pub fn executeIosBaseInit(state: anytype, object: u64, streambuf: u64) bool {
+    // ios_base::init initializes the ios_base object with a stream buffer
+    // For our purposes, we just need to store the streambuf pointer
+    const object_bytes = state.guestMemory(object, 32) orelse return false;
+    @memset(object_bytes, 0);
+    state.write64(object, streambuf);
+    return true;
+}
+
+pub fn executeBasicFilebufConstructor(state: anytype, object: u64) bool {
+    // basic_filebuf constructor initializes the file buffer object
+    // For our purposes, we just need to zero it out
+    const object_bytes = state.guestMemory(object, 128) orelse return false;
+    @memset(object_bytes, 0);
+    return true;
+}
+
 const TestState = struct {
     mem: [256]u8 = [_]u8{0} ** 256,
 
@@ -368,6 +479,9 @@ test "symbol normalization and contract lookup" {
     try std.testing.expectEqual(ContractId.libcxx_match_any_but_newline_char, contractFor("__ZNKSt3__123__match_any_but_newlineIcE6__execERNS_7__stateIcEE").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_string_push_back_char, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_string_init_fill, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc").?.id);
+    try std.testing.expectEqual(ContractId.libcxx_basic_string_reserve, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm").?.id);
+    try std.testing.expectEqual(ContractId.libcxx_ios_base_init, contractFor("__ZNSt3__18ios_base4initEPv").?.id);
+    try std.testing.expectEqual(ContractId.libcxx_basic_filebuf_constructor, contractFor("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev").?.id);
 }
 
 test "import audit separates resolved and unresolved calls" {
