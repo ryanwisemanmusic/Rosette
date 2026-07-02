@@ -401,6 +401,9 @@ const test_testui = @import("TEST/TESTUI.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
 const undef_ud1 = @import("UNDEF/UD1.zig");
 const undef_ud2 = @import("UNDEF/UD2.zig");
+const unordered_ucomisd = @import("UNORDERED/UCOMISD.zig");
+const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
+const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
@@ -1089,6 +1092,9 @@ pub const specs = blk: {
         spec(undef_ud0.meta),
         spec(undef_ud1.meta),
         spec(undef_ud2.meta),
+        spec(unordered_ucomisd.meta),
+        spec(unordered_ucomiss.meta),
+        spec(unordered_vucomish.meta),
         spec(verify_verr.meta),
         spec(verify_verw.meta),
         spec(xor_xor.meta),
@@ -1789,6 +1795,9 @@ pub const proof_reports = [_]proofs.ProofReport{
     undef_ud0.proof_report,
     undef_ud1.proof_report,
     undef_ud2.proof_report,
+    unordered_ucomisd.proof_report,
+    unordered_ucomiss.proof_report,
+    unordered_vucomish.proof_report,
     verify_verr.proof_report,
     verify_verw.proof_report,
     xor_xor.proof_report,

@@ -399,6 +399,9 @@ const test_testui = @import("TEST/TESTUI.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
 const undef_ud1 = @import("UNDEF/UD1.zig");
 const undef_ud2 = @import("UNDEF/UD2.zig");
+const unordered_ucomisd = @import("UNORDERED/UCOMISD.zig");
+const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
+const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
@@ -1158,6 +1161,9 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(undef_ud0.family, undef_ud0.path, undef_ud0.source),
     mirror(undef_ud1.family, undef_ud1.path, undef_ud1.source),
     mirror(undef_ud2.family, undef_ud2.path, undef_ud2.source),
+    mirror(unordered_ucomisd.family, unordered_ucomisd.path, unordered_ucomisd.source),
+    mirror(unordered_ucomiss.family, unordered_ucomiss.path, unordered_ucomiss.source),
+    mirror(unordered_vucomish.family, unordered_vucomish.path, unordered_vucomish.source),
     mirror(verify_verr.family, verify_verr.path, verify_verr.source),
     mirror(verify_verw.family, verify_verw.path, verify_verw.source),
     mirror(xor_xor.family, xor_xor.path, xor_xor.source),
