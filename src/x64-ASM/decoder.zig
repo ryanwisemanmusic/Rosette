@@ -14,6 +14,7 @@ pub const RFL_SF = flags.RFL_SF;
 pub const RFL_OF = flags.RFL_OF;
 
 pub const applySub = flags.applySub;
+pub const applySbb = flags.applySbb;
 pub const applyAdd = flags.applyAdd;
 pub const applyIncDec = flags.applyIncDec;
 pub const applyLogic = flags.applyLogic;
@@ -456,6 +457,17 @@ pub const Op = enum(u16) {
     vmovss_mem_xmm,
     vmovsd_xmm_mem,
     vmovsd_mem_xmm,
+    vmovlps_xmm_xmm_mem64,
+    vmovlps_mem64_xmm,
+    vmovlpd_xmm_xmm_mem64,
+    vmovlpd_mem64_xmm,
+    vmovhps_xmm_xmm_mem64,
+    vmovhps_mem64_xmm,
+    vmovhpd_xmm_xmm_mem64,
+    vmovhpd_mem64_xmm,
+    vmovshdup,
+    vmovsldup,
+    vmovddup,
     vmovdqu_ymm_ymm,
     vmovdqu_ymm_mem,
     vmovdqu_mem_ymm,

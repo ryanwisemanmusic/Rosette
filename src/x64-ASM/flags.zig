@@ -64,6 +64,20 @@ pub fn applySub(rflags: *u32, a: u64, b: u64, result: u64, size: OperandSize) vo
     setOrClear(rflags, RFL_ZF, r == 0);
 }
 
+pub fn applySbb(rflags: *u32, a: u64, b: u64, carry: bool, result: u64, size: OperandSize) void {
+    const mask = maskForSize(size);
+    const sign = signBitForSize(size);
+    const a_masked = a & mask;
+    const b_masked = b & mask;
+    const r = result & mask;
+    const subtrahend = @as(u128, b_masked) + @intFromBool(carry);
+
+    setOrClear(rflags, RFL_CF, @as(u128, a_masked) < subtrahend);
+    setOrClear(rflags, RFL_OF, ((a_masked ^ b_masked) & (a_masked ^ r) & sign) != 0);
+    setOrClear(rflags, RFL_SF, (r & sign) != 0);
+    setOrClear(rflags, RFL_ZF, r == 0);
+}
+
 pub fn applyAdd(rflags: *u32, a: u64, b: u64, result: u64, size: OperandSize) void {
     const mask = maskForSize(size);
     const sign = signBitForSize(size);
@@ -144,4 +158,13 @@ test "signed less-than compare is width-aware for 32-bit negatives" {
     try std.testing.expect((rflags & RFL_OF) == 0);
     try std.testing.expect(evalCond(rflags, .l));
     try std.testing.expect(!evalCond(rflags, .ge));
+}
+
+test "SBB preserves a borrow when source plus carry crosses the operand width" {
+    var rflags: u32 = RFL_CF;
+    const result = @as(u8, 0) -% @as(u8, 0xFF) -% 1;
+    applySbb(&rflags, 0, 0xFF, true, result, .bits8);
+    try std.testing.expectEqual(@as(u8, 0), result);
+    try std.testing.expect((rflags & RFL_CF) != 0);
+    try std.testing.expect((rflags & RFL_ZF) != 0);
 }

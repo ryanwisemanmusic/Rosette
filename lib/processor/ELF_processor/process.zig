@@ -1068,11 +1068,10 @@ pub const ElfState = struct {
             .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => {
                 const a = self.regVal(d.dst_reg, d.size);
                 const b = self.regVal(d.src_reg, d.size);
-                const carry: u64 = if ((self.regs.rflags & RFL_CF) != 0) 1 else 0;
-                const subtrahend = (b +% carry) & maskForSize(d.size);
-                const r = a -% subtrahend;
+                const carry = (self.regs.rflags & RFL_CF) != 0;
+                const r = a -% b -% @intFromBool(carry);
                 self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsSub(a, subtrahend, r, d.size);
+                x64_decoder.applySbb(&self.regs.rflags, a, b, carry, r, d.size);
             },
 
             // ── sub r/m8, imm8 (0x80 /5) ──
@@ -2314,6 +2313,17 @@ pub const ElfState = struct {
             .vmovss_mem_xmm,
             .vmovsd_xmm_mem,
             .vmovsd_mem_xmm,
+            .vmovlps_xmm_xmm_mem64,
+            .vmovlps_mem64_xmm,
+            .vmovlpd_xmm_xmm_mem64,
+            .vmovlpd_mem64_xmm,
+            .vmovhps_xmm_xmm_mem64,
+            .vmovhps_mem64_xmm,
+            .vmovhpd_xmm_xmm_mem64,
+            .vmovhpd_mem64_xmm,
+            .vmovshdup,
+            .vmovsldup,
+            .vmovddup,
             .vmovdqu_ymm_ymm,
             .vmovdqu_ymm_mem,
             .vmovdqu_mem_ymm,

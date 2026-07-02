@@ -1563,6 +1563,7 @@ pub const MachOState = struct {
         }
 
         if (std.mem.eql(u8, name, "__Znwm") or std.mem.eql(u8, name, "__Znam") or
+            std.mem.eql(u8, name, "__ZnwmRKSt9nothrow_t") or
             std.mem.endsWith(u8, name, "_malloc"))
         {
             return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 };
@@ -1610,6 +1611,15 @@ pub const MachOState = struct {
                 if (self.verbose_trace) std.debug.print("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
             }
             return .{ .handled = dst };
+        }
+        if (std.mem.eql(u8, name, "___bzero")) {
+            const dst = self.regs.rdi;
+            const count = self.regs.rsi;
+            if (self.guestMemory(dst, count)) |buf| {
+                @memset(buf, 0);
+                if (self.verbose_trace) std.debug.print("    [import] _bzero(dst=0x{x}, count={d})\n", .{ dst, count });
+            }
+            return .handled_void;
         }
 
         if (std.mem.endsWith(u8, name, "_memcpy") or std.mem.endsWith(u8, name, "_memmove")) {
@@ -1674,6 +1684,9 @@ pub const MachOState = struct {
                 }
             }
             return .{ .handled = now };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__16chrono12steady_clock3nowEv")) {
+            return .{ .handled = self.monotonic_nanoseconds };
         }
 
         if (std.mem.eql(u8, name, "_open")) {
@@ -1865,6 +1878,25 @@ pub const MachOState = struct {
                 .handled => |value| .{ .handled = value },
                 .handled_void => .handled_void,
             };
+        }
+
+        if (std.mem.eql(u8, name, "___sincosf_stret")) {
+            const angle: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
+            const sin_val: f32 = @sin(angle);
+            const cos_val: f32 = @cos(angle);
+            if (self.guestMemory(self.regs.rdi, 8)) |buf| {
+                std.mem.writeInt(u32, buf[0..4], @bitCast(sin_val), .little);
+                std.mem.writeInt(u32, buf[4..8], @bitCast(cos_val), .little);
+                if (self.verbose_trace) std.debug.print("    [import] ___sincosf_stret(angle={d}) -> sin={d} cos={d} ptr=0x{x}\n", .{ angle, sin_val, cos_val, self.regs.rdi });
+            }
+            return .{ .handled = self.regs.rdi };
+        }
+        if (std.mem.eql(u8, name, "_cosf")) {
+            const angle: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
+            const result: f32 = @cos(angle);
+            std.mem.writeInt(u32, self.xmm[0][0..4], @bitCast(result), .little);
+            if (self.verbose_trace) std.debug.print("    [import] _cosf(angle={d}) -> {d}\n", .{ angle, result });
+            return .{ .handled = 0 };
         }
 
         if (self.verbose_trace) std.debug.print("    [import] (unhandled) {s}\n", .{name});
@@ -3552,6 +3584,15 @@ pub const MachOState = struct {
                 self.writeMemVal(d.addr, sz, r);
                 self.setFlagsSub(a, b, r, sz);
             },
+            .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sbb_reg8_reg8) + @intFromEnum(Size.bits8));
+                const a = self.regVal(d.dst_reg, sz);
+                const b = self.regVal(d.src_reg, sz);
+                const carry = (self.regs.rflags & RFL_CF) != 0;
+                const r = a -% b -% @intFromBool(carry);
+                self.setReg(d.dst_reg, sz, r);
+                x64_decoder.applySbb(&self.regs.rflags, a, b, carry, r, sz);
+            },
             .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_imm8) + @intFromEnum(Size.bits8));
                 self.executeSubRegImm(d, sz);
@@ -4428,6 +4469,32 @@ pub const MachOState = struct {
             },
             .vmovsd_mem_xmm => {
                 self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
+            },
+            .vmovlps_xmm_xmm_mem64, .vmovlpd_xmm_xmm_mem64 => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], self.readMemVal(d.addr, .bits64), .little);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            },
+            .vmovlps_mem64_xmm, .vmovlpd_mem64_xmm => {
+                self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
+            },
+            .vmovhps_xmm_xmm_mem64, .vmovhpd_xmm_xmm_mem64 => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][8..16], self.readMemVal(d.addr, .bits64), .little);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            },
+            .vmovhps_mem64_xmm, .vmovhpd_mem64_xmm => {
+                self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][8..16], .little));
+            },
+            .vmovshdup, .vmovsldup, .vmovddup => {
+                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = duplicateVectorElements(d.op, source_low);
+                if (d.vector_256) {
+                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = duplicateVectorElements(d.op, source_high);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
             },
             .vzeroupper => {
                 for (&self.ymm_hi) |*upper| @memset(upper, 0);
@@ -5322,6 +5389,9 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
         0x08...0x0B => {
             return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .@"or");
         },
+        0x18...0x1B => {
+            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .sbb);
+        },
         0x20...0x23 => {
             return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .@"and");
         },
@@ -5654,6 +5724,34 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.addr = rm.addr;
         } else {
             decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if ((opcode == 0x12 or opcode == 0x13 or opcode == 0x16 or opcode == 0x17) and
+        !vector_256 and (prefix == 0 or prefix == 1))
+    {
+        return decodeVexHalfMove(bytes, start_pos + 3, opcode, prefix, vex, rex_r, false, false);
+    }
+
+    if ((opcode == 0x16 and prefix == 2) or (opcode == 0x12 and (prefix == 2 or prefix == 3))) {
+        return decodeVexDuplicateMove(bytes, start_pos + 3, opcode, prefix, vex, rex_r, false, false, vector_256);
+    }
+
+    if (opcode == 0x2A and !vector_256 and (prefix == 2 or prefix == 3)) {
+        var decoded = DecodedInsn{ .size = .bits32 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+            decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_mem else .vcvtsi2sd_xmm_mem;
+        } else {
+            decoded.src_reg = @enumFromInt(rm.addr);
+            decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_reg else .vcvtsi2sd_xmm_reg;
         }
         decoded.len = @intCast(pos);
         return decoded;
@@ -6040,6 +6138,19 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     const vector_256 = (vex_control & 0x04) != 0;
     const prefix = vex_control & 0x03;
 
+    if (opcode_map == 1 and
+        (opcode == 0x12 or opcode == 0x13 or opcode == 0x16 or opcode == 0x17) and
+        !vector_256 and (prefix == 0 or prefix == 1))
+    {
+        return decodeVexHalfMove(bytes, start_pos + 4, opcode, prefix, vex_control, rex_r, rex_x, rex_b);
+    }
+
+    if (opcode_map == 1 and
+        ((opcode == 0x16 and prefix == 2) or (opcode == 0x12 and (prefix == 2 or prefix == 3))))
+    {
+        return decodeVexDuplicateMove(bytes, start_pos + 4, opcode, prefix, vex_control, rex_r, rex_x, rex_b, vector_256);
+    }
+
     if (opcode_map == 1 and opcode == 0x76 and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 4;
@@ -6200,6 +6311,95 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     return .{};
+}
+
+fn decodeVexHalfMove(
+    bytes: []const u8,
+    modrm_pos: usize,
+    opcode: u8,
+    prefix: u8,
+    vex_control: u8,
+    rex_r: bool,
+    rex_x: bool,
+    rex_b: bool,
+) DecodedInsn {
+    if (modrm_pos >= bytes.len or bytes[modrm_pos] >= 0xC0) return .{};
+
+    const is_load = opcode == 0x12 or opcode == 0x16;
+    if (!is_load and (vex_control & 0x78) != 0x78) return .{};
+
+    var decoded = DecodedInsn{};
+    var pos = modrm_pos;
+    const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+    decoded.addr = rm.addr;
+    if (is_load) {
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+    } else {
+        decoded.xmm_src = @intFromEnum(rm.reg);
+    }
+    decoded.op = switch (opcode) {
+        0x12 => if (prefix == 0) .vmovlps_xmm_xmm_mem64 else .vmovlpd_xmm_xmm_mem64,
+        0x13 => if (prefix == 0) .vmovlps_mem64_xmm else .vmovlpd_mem64_xmm,
+        0x16 => if (prefix == 0) .vmovhps_xmm_xmm_mem64 else .vmovhpd_xmm_xmm_mem64,
+        0x17 => if (prefix == 0) .vmovhps_mem64_xmm else .vmovhpd_mem64_xmm,
+        else => unreachable,
+    };
+    decoded.len = @intCast(pos);
+    return decoded;
+}
+
+fn decodeVexDuplicateMove(
+    bytes: []const u8,
+    modrm_pos: usize,
+    opcode: u8,
+    prefix: u8,
+    vex_control: u8,
+    rex_r: bool,
+    rex_x: bool,
+    rex_b: bool,
+    vector_256: bool,
+) DecodedInsn {
+    if (modrm_pos >= bytes.len or (vex_control & 0x78) != 0x78) return .{};
+
+    var decoded = DecodedInsn{ .vector_256 = vector_256 };
+    var pos = modrm_pos;
+    const is_mem = bytes[pos] < 0xC0;
+    const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+    decoded.xmm_dst = @intFromEnum(rm.reg);
+    decoded.is_reg_form = !is_mem;
+    if (is_mem) {
+        decoded.addr = rm.addr;
+    } else {
+        decoded.xmm_src = @intCast(rm.addr);
+    }
+    decoded.op = if (opcode == 0x16) .vmovshdup else if (prefix == 2) .vmovsldup else .vmovddup;
+    decoded.len = @intCast(pos);
+    return decoded;
+}
+
+fn duplicateVectorElements(op: Op, source: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    switch (op) {
+        .vmovshdup => {
+            result[0..4].* = source[4..8].*;
+            result[4..8].* = source[4..8].*;
+            result[8..12].* = source[12..16].*;
+            result[12..16].* = source[12..16].*;
+        },
+        .vmovsldup => {
+            result[0..4].* = source[0..4].*;
+            result[4..8].* = source[0..4].*;
+            result[8..12].* = source[8..12].*;
+            result[12..16].* = source[8..12].*;
+        },
+        .vmovddup => {
+            result[0..8].* = source[0..8].*;
+            result[8..16].* = source[0..8].*;
+        },
+        else => unreachable,
+    }
+    return result;
 }
 
 fn decodeAccumulatorImmediate(bytes: []const u8, opcode_pos: usize, rex_w: bool, has_66: bool, op: Op) DecodedInsn {
@@ -6622,11 +6822,13 @@ fn decodeArithRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
         .and_mem8_reg8, .sub_mem8_reg8, .xor_mem8_reg8, .cmp_mem8_reg8,
     };
     const reg_reg_ops: [8]Op = .{
-        .add_reg8_reg8, .or_reg8_reg8,  .invalid,       .invalid,
+        .add_reg8_reg8, .or_reg8_reg8,  .invalid,       .sbb_reg8_reg8,
         .and_reg8_reg8, .sub_reg8_reg8, .xor_reg8_reg8, .cmp_reg8_reg8,
     };
 
-    const base_op = if (is_reg_reg)
+    const base_op = if (arith_type == .sbb and !is_reg_reg and (!is_mem_to_reg or sz != .bits8))
+        .invalid
+    else if (is_reg_reg)
         reg_reg_ops[@intFromEnum(arith_type)]
     else if (is_mem_to_reg)
         reg_mem_ops[@intFromEnum(arith_type)]
@@ -7675,6 +7877,21 @@ test "decode arithmetic byte width and operand direction" {
     try std.testing.expectEqual(RegId.al_ax_eax_rax, sub_mem.sib_base_reg);
 }
 
+test "decode SBB register forms used for borrow masks" {
+    const failing = decodeInsn(&[_]u8{ 0x19, 0xC9 });
+    try std.testing.expectEqual(Op.sbb_reg32_reg32, failing.op);
+    try std.testing.expectEqual(Size.bits32, failing.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, failing.dst_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, failing.src_reg);
+    try std.testing.expectEqual(@as(u8, 2), failing.len);
+
+    const reverse_64 = decodeInsn(&[_]u8{ 0x48, 0x1B, 0xC8 });
+    try std.testing.expectEqual(Op.sbb_reg64_reg64, reverse_64.op);
+    try std.testing.expectEqual(Size.bits64, reverse_64.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, reverse_64.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, reverse_64.src_reg);
+}
+
 test "decode group three TEST register immediate" {
     const test_cl = decodeInsn(&[_]u8{ 0xF6, 0xC1, 0x01 });
     try std.testing.expectEqual(Op.test_reg8_imm8, test_cl.op);
@@ -7807,6 +8024,48 @@ test "decode VEX qword moves between XMM general registers and memory" {
     try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -8))), store_memory.addr);
 }
 
+test "decode VEX low and high packed half moves" {
+    const failing_store = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x13, 0x85, 0xD8, 0xFD, 0xFF, 0xFF });
+    try std.testing.expectEqual(Op.vmovlpd_mem64_xmm, failing_store.op);
+    try std.testing.expectEqual(@as(u8, 0), failing_store.xmm_src);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, failing_store.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -0x228))), failing_store.addr);
+    try std.testing.expectEqual(@as(u8, 8), failing_store.len);
+
+    const low_load = decodeInsn(&[_]u8{ 0xC5, 0xE8, 0x12, 0x08 });
+    try std.testing.expectEqual(Op.vmovlps_xmm_xmm_mem64, low_load.op);
+    try std.testing.expectEqual(@as(u8, 1), low_load.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), low_load.xmm_src);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, low_load.sib_base_reg);
+
+    const high_store = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x17, 0x4D, 0xF8 });
+    try std.testing.expectEqual(Op.vmovhpd_mem64_xmm, high_store.op);
+    try std.testing.expectEqual(@as(u8, 1), high_store.xmm_src);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, high_store.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -8))), high_store.addr);
+}
+
+test "decode and execute VEX duplicate moves" {
+    const failing = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x16, 0xC0 });
+    try std.testing.expectEqual(Op.vmovshdup, failing.op);
+    try std.testing.expectEqual(@as(u8, 0), failing.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), failing.xmm_src);
+    try std.testing.expect(failing.is_reg_form);
+    try std.testing.expect(!failing.vector_256);
+    try std.testing.expectEqual(@as(u8, 4), failing.len);
+
+    const low_memory = decodeInsn(&[_]u8{ 0xC5, 0xFE, 0x12, 0x4D, 0xE0 });
+    try std.testing.expectEqual(Op.vmovsldup, low_memory.op);
+    try std.testing.expectEqual(@as(u8, 1), low_memory.xmm_dst);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, low_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -0x20))), low_memory.addr);
+    try std.testing.expect(low_memory.vector_256);
+    try std.testing.expect(!low_memory.is_reg_form);
+
+    const doubles = duplicateVectorElements(.vmovddup, .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7 }, &doubles);
+}
+
 test "decode 256-bit VEX packed moves" {
     const decoded = decodeInsn(&[_]u8{ 0xC5, 0xFE, 0x6F, 0x00 });
     try std.testing.expectEqual(Op.vmovdqu_ymm_mem, decoded.op);
@@ -7822,7 +8081,23 @@ test "decode 256-bit VEX packed moves" {
     try std.testing.expectEqual(@as(u8, 3), zero_upper.len);
 }
 
-test "decode three-byte VEX signed integer scalar conversions" {
+test "decode VEX signed integer scalar conversions" {
+    const failing_memory = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x2A, 0x45, 0xE8 });
+    try std.testing.expectEqual(Op.vcvtsi2ss_xmm_mem, failing_memory.op);
+    try std.testing.expectEqual(Size.bits32, failing_memory.size);
+    try std.testing.expectEqual(@as(u8, 0), failing_memory.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), failing_memory.xmm_src);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, failing_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -0x18))), failing_memory.addr);
+    try std.testing.expectEqual(@as(u8, 5), failing_memory.len);
+
+    const two_byte_register = decodeInsn(&[_]u8{ 0xC5, 0xEB, 0x2A, 0xC9 });
+    try std.testing.expectEqual(Op.vcvtsi2sd_xmm_reg, two_byte_register.op);
+    try std.testing.expectEqual(Size.bits32, two_byte_register.size);
+    try std.testing.expectEqual(@as(u8, 1), two_byte_register.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), two_byte_register.xmm_src);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, two_byte_register.src_reg);
+
     const to_float = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xFA, 0x2A, 0xC0 });
     try std.testing.expectEqual(Op.vcvtsi2ss_xmm_reg, to_float.op);
     try std.testing.expectEqual(Size.bits64, to_float.size);
