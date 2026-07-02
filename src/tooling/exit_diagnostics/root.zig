@@ -84,6 +84,23 @@ pub const DependencyCall = struct {
     synthetic_result: u64 = 0,
 };
 
+pub const ControlTransferFailure = struct {
+    kind: []const u8 = "",
+    instruction_address: u64 = 0,
+    operand_address: u64 = 0,
+    target_address: u64 = 0,
+    return_address: u64 = 0,
+    caller_symbol: []const u8 = "",
+    caller_offset: u64 = 0,
+    target_symbol: []const u8 = "",
+    target_offset: u64 = 0,
+    operand_mapped: bool = false,
+    target_mapped: bool = false,
+    target_executable: bool = false,
+    candidate_import: []const u8 = "",
+    candidate_image: []const u8 = "",
+};
+
 pub const CxxExceptionReport = struct {
     object_address: u64,
     allocation_size: u64 = 0,
@@ -112,6 +129,7 @@ pub const ExitReport = struct {
     last_instructions: []const TraceEntry = &.{},
     terminal_symbol: ?SymbolizedAddress = null,
     dependency_calls: []const DependencyCall = &.{},
+    control_transfer_failure: ?ControlTransferFailure = null,
     unresolved_import_calls: u64 = 0,
     attribution: ?Attribution = null,
     cxx_exception: ?CxxExceptionReport = null,
@@ -200,6 +218,32 @@ pub fn logExitReport(report: ExitReport) void {
                     .{ i, call.symbol, call.image, call.return_address, call.stub_address, call.synthetic_result },
                 );
             }
+        }
+    }
+
+    if (report.control_transfer_failure) |failure| {
+        std.debug.print("  \x1b[33mcontrol-transfer failure:\x1b[0m\n", .{});
+        std.debug.print(
+            "    kind={s} instruction=0x{x} operand=0x{x} target=0x{x} return=0x{x}\n",
+            .{ failure.kind, failure.instruction_address, failure.operand_address, failure.target_address, failure.return_address },
+        );
+        if (failure.caller_symbol.len != 0) {
+            std.debug.print("    caller={s}+0x{x}\n", .{ failure.caller_symbol, failure.caller_offset });
+        }
+        if (failure.target_symbol.len != 0) {
+            std.debug.print("    nearest target={s}+0x{x}\n", .{ failure.target_symbol, failure.target_offset });
+        }
+        std.debug.print(
+            "    operand_mapped={} target_mapped={} target_executable={}\n",
+            .{ failure.operand_mapped, failure.target_mapped, failure.target_executable },
+        );
+        if (failure.candidate_import.len != 0) {
+            std.debug.print(
+                "    candidate import={s} from {s}\n",
+                .{ failure.candidate_import, failure.candidate_image },
+            );
+        } else {
+            std.debug.print("    candidate import=<none; this is not a known Mach-O import slot>\n", .{});
         }
     }
 
@@ -341,6 +385,13 @@ pub fn reasonFromValue(val: u8) TerminationReason {
     return @enumFromInt(val);
 }
 
+pub fn normalizeReason(reason: TerminationReason, unresolved_import_calls: u64) TerminationReason {
+    if (reason == .unresolved_import_result and unresolved_import_calls == 0) {
+        return .invalid_control_flow_target;
+    }
+    return reason;
+}
+
 test "C++ exception stop is attributed to missing Rosette unwinding" {
     const result = attribute(.{ .reason = .cxx_exception, .faulted = false });
     try std.testing.expectEqual(StopOwner.rosette_runtime, result.owner);
@@ -361,4 +412,15 @@ test "unresolved dependency overrides an apparent guest exit" {
     });
     try std.testing.expectEqual(StopOwner.rosette_runtime, result.owner);
     try std.testing.expectEqual(ResultAuthority.diagnostic_only, result.authority);
+}
+
+test "unresolved import reason requires a concrete dependency record" {
+    try std.testing.expectEqual(
+        TerminationReason.invalid_control_flow_target,
+        normalizeReason(.unresolved_import_result, 0),
+    );
+    try std.testing.expectEqual(
+        TerminationReason.unresolved_import_result,
+        normalizeReason(.unresolved_import_result, 1),
+    );
 }
