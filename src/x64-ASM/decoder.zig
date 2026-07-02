@@ -433,6 +433,7 @@ pub const Op = enum(u16) {
     vpinsrb_xmm_xmm_reg32,
     vpinsrb_xmm_xmm_mem8,
     vpshufb,
+    vpcmpeqd,
     vmovdqu_xmm_xmm,
     vmovdqu_xmm_mem,
     vmovdqu_mem_xmm,

@@ -2371,6 +2371,7 @@ pub const ElfState = struct {
             .vorpd,
             .vxorps,
             .vxorpd,
+            .vpcmpeqd,
             => unreachable,
         }
 

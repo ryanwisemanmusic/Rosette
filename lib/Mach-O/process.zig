@@ -4380,6 +4380,16 @@ pub const MachOState = struct {
                     @memset(&self.ymm_hi[d.xmm_dst], 0);
                 }
             },
+            .vpcmpeqd => {
+                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = compareEqualDwords(self.xmm[d.xmm_src], rhs_low);
+                if (d.vector_256) {
+                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = compareEqualDwords(self.ymm_hi[d.xmm_src], rhs_high);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
             .vmovdqu_xmm_xmm, .vmovdqa_xmm_xmm, .vmovups_xmm_xmm, .vmovaps_xmm_xmm, .vmovupd_xmm_xmm, .vmovapd_xmm_xmm => {
                 self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
@@ -5631,6 +5641,24 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode == 0x76 and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.op = .vpcmpeqd;
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or opcode == 0x5E) {
         if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
 
@@ -5857,6 +5885,17 @@ fn shuffleBytes(source: [16]u8, mask: [16]u8) [16]u8 {
     return result;
 }
 
+fn compareEqualDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const left = std.mem.readInt(u32, lhs[offset..][0..4], .little);
+        const right = std.mem.readInt(u32, rhs[offset..][0..4], .little);
+        std.mem.writeInt(u32, result[offset..][0..4], if (left == right) std.math.maxInt(u32) else 0, .little);
+    }
+    return result;
+}
+
 fn vexArithmeticForOp(op: Op) VexArithmetic {
     return switch (op) {
         .vaddss, .vaddsd, .vaddps, .vaddpd => .add,
@@ -6000,6 +6039,24 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     const rex_w = (vex_control & 0x80) != 0;
     const vector_256 = (vex_control & 0x04) != 0;
     const prefix = vex_control & 0x03;
+
+    if (opcode_map == 1 and opcode == 0x76 and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = .vpcmpeqd;
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
 
     if (opcode_map == 1 and (opcode == 0x6E or opcode == 0x7E)) {
         if (!rex_w or vector_256 or prefix != 1 or (vex_control & 0x78) != 0x78) return .{};
@@ -7818,6 +7875,45 @@ test "decode VEX bitwise vector operations" {
     try std.testing.expectEqual(@as(u8, 2), and_not_256.xmm_src);
     try std.testing.expect(and_not_256.vector_256);
     try std.testing.expectEqual(RegId.al_ax_eax_rax, and_not_256.sib_base_reg);
+}
+
+test "decode VPCMPEQD register memory and extended-register forms" {
+    const failing = decodeInsn(&[_]u8{ 0xC5, 0xFD, 0x76, 0xC0 });
+    try std.testing.expectEqual(Op.vpcmpeqd, failing.op);
+    try std.testing.expect(failing.vector_256);
+    try std.testing.expect(failing.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), failing.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), failing.xmm_src);
+    try std.testing.expectEqual(@as(u8, 0), failing.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), failing.len);
+
+    const memory = decodeInsn(&[_]u8{ 0xC5, 0xED, 0x76, 0x08 });
+    try std.testing.expectEqual(Op.vpcmpeqd, memory.op);
+    try std.testing.expect(memory.vector_256);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 1), memory.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), memory.xmm_src);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, memory.sib_base_reg);
+
+    const extended = decodeInsn(&[_]u8{ 0xC4, 0x41, 0x6D, 0x76, 0xC8 });
+    try std.testing.expectEqual(Op.vpcmpeqd, extended.op);
+    try std.testing.expectEqual(@as(u8, 9), extended.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), extended.xmm_src);
+    try std.testing.expectEqual(@as(u8, 8), extended.xmm_src2);
+}
+
+test "VPCMPEQD compares independent dword lanes" {
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, lhs[0..4], 7, .little);
+    std.mem.writeInt(u32, rhs[0..4], 7, .little);
+    std.mem.writeInt(u32, lhs[4..8], 9, .little);
+    std.mem.writeInt(u32, rhs[4..8], 10, .little);
+    const result = compareEqualDwords(lhs, rhs);
+    try std.testing.expectEqual(std.math.maxInt(u32), std.mem.readInt(u32, result[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, result[4..8], .little));
+    try std.testing.expectEqual(std.math.maxInt(u32), std.mem.readInt(u32, result[8..12], .little));
+    try std.testing.expectEqual(std.math.maxInt(u32), std.mem.readInt(u32, result[12..16], .little));
 }
 
 test "decode VEX unordered scalar comparisons" {
