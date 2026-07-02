@@ -638,6 +638,39 @@ pub const ElfState = struct {
         return @as(u6, @intCast(imm & mask));
     }
 
+    fn executeRotate(self: *ElfState, d: DecodedInsn) void {
+        const is_mem = switch (d.op) {
+            .rol_mem_cl, .ror_mem_cl, .rol_mem_imm, .ror_mem_imm => true,
+            else => false,
+        };
+        const rotate_left = switch (d.op) {
+            .rol_reg_cl, .rol_mem_cl, .rol_reg_imm, .rol_mem_imm => true,
+            else => false,
+        };
+        const uses_cl = switch (d.op) {
+            .rol_reg_cl, .rol_mem_cl, .ror_reg_cl, .ror_mem_cl => true,
+            else => false,
+        };
+        const raw_count = if (uses_cl) self.regVal(.cl_cx_ecx_rcx, .bits8) else d.imm;
+        const width: u64 = bitWidth(d.size);
+        const count: u6 = @intCast((raw_count & @as(u64, if (d.size == .bits64) 0x3F else 0x1F)) % width);
+        if (count == 0) return;
+        const mask = maskForSize(d.size);
+        const old = (if (is_mem) self.readMemVal(d.addr, d.size) else self.regVal(d.dst_reg, d.size)) & mask;
+        const inverse: u6 = @intCast(width - count);
+        const result = if (rotate_left) ((old << count) | (old >> inverse)) & mask else ((old >> count) | (old << inverse)) & mask;
+        if (is_mem) self.writeMemVal(d.addr, d.size, result) else self.setReg(d.dst_reg, d.size, result);
+        if (rotate_left) {
+            const carry = (result & 1) != 0;
+            self.setFlag(RFL_CF, carry);
+            if (count == 1) self.setFlag(RFL_OF, ((result & signBitForSize(d.size)) != 0) != carry);
+        } else {
+            const carry = (result & signBitForSize(d.size)) != 0;
+            self.setFlag(RFL_CF, carry);
+            if (count == 1) self.setFlag(RFL_OF, carry != ((result & (signBitForSize(d.size) >> 1)) != 0));
+        }
+    }
+
     fn shrValue(self: *ElfState, input: u64, size: Size, count: u6) u64 {
         _ = self;
         const mask = maskForSize(size);
@@ -1211,6 +1244,15 @@ pub const ElfState = struct {
             .lzcnt_reg_mem,
             => self.executeBitScan(d),
             .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
+            .rol_reg_cl,
+            .rol_mem_cl,
+            .ror_reg_cl,
+            .ror_mem_cl,
+            .rol_reg_imm,
+            .rol_mem_imm,
+            .ror_reg_imm,
+            .ror_mem_imm,
+            => self.executeRotate(d),
             .shl_reg_cl => {
                 const old = self.regVal(d.dst_reg, d.size);
                 const count = self.shlCount(d.size);
@@ -1321,6 +1363,12 @@ pub const ElfState = struct {
                 const a = self.regVal(d.dst_reg, d.size);
                 const r = 0 -% a;
                 self.setReg(d.dst_reg, d.size, r);
+                self.setFlagsSub(0, a, r, d.size);
+            },
+            .neg_mem8, .neg_mem16, .neg_mem32, .neg_mem64 => {
+                const a = self.readMemVal(d.addr, d.size);
+                const r = 0 -% a;
+                self.writeMemVal(d.addr, d.size, r);
                 self.setFlagsSub(0, a, r, d.size);
             },
             .not_reg8, .not_reg16, .not_reg32, .not_reg64 => {
@@ -2206,6 +2254,22 @@ pub const ElfState = struct {
                     self.readMemVal(d.addr, .bits32));
                 @memset(&self.xmm[d.xmm_dst], 0);
                 std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
+            },
+            .vmovq_xmm_reg64, .vmovq_xmm_mem64 => {
+                const value = if (d.op == .vmovq_xmm_reg64)
+                    self.regVal(d.src_reg, .bits64)
+                else
+                    self.readMemVal(d.addr, .bits64);
+                @memset(&self.xmm[d.xmm_dst], 0);
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], value, .little);
+            },
+            .vmovq_reg64_xmm, .vmovq_mem64_xmm => {
+                const value = std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little);
+                if (d.op == .vmovq_reg64_xmm) {
+                    self.setReg(d.dst_reg, .bits64, value);
+                } else {
+                    self.writeMemVal(d.addr, .bits64, value);
+                }
             },
             .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8 => {
                 self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
@@ -3929,6 +3993,18 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     },
                     2 => DecodedInsn{
                         .op = @enumFromInt(@intFromEnum(Op.not_mem8) + @intFromEnum(size) - @intFromEnum(Size.bits8)),
+                        .size = size,
+                        .addr = mem.addr,
+                        .sib_has_index = mem.sib_has_index,
+                        .sib_index_reg = mem.sib_index_reg,
+                        .sib_scale = mem.sib_scale,
+                        .sib_has_base = mem.sib_has_base,
+                        .sib_base_reg = mem.sib_base_reg,
+                        .rip_relative = mem.rip_relative,
+                        .len = @intCast(pos),
+                    },
+                    3 => DecodedInsn{
+                        .op = @enumFromInt(@intFromEnum(Op.neg_mem8) + @intFromEnum(size) - @intFromEnum(Size.bits8)),
                         .size = size,
                         .addr = mem.addr,
                         .sib_has_index = mem.sib_has_index,
