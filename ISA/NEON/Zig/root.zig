@@ -708,6 +708,9 @@ const scan_scasb = @import("SCAN/scasb.zig");
 const scan_scasw = @import("SCAN/scasw.zig");
 const scan_scasd = @import("SCAN/scasd.zig");
 const scan_scasq = @import("SCAN/scasq.zig");
+const zero_tilezero = @import("ZERO/TILEZERO.zig");
+const zero_vzeroall = @import("ZERO/VZEROALL.zig");
+const zero_vzeroupper = @import("ZERO/VZEROUPPER.zig");
 
 pub const LoweringKind = enum {
     arm64_scalar,
@@ -1490,6 +1493,9 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(compute_sqrtsd.family, compute_sqrtsd.path, compute_sqrtsd.source),
     mirror(compute_sqrtss.family, compute_sqrtss.path, compute_sqrtss.source),
     mirror(compute_vp2intersect.family, compute_vp2intersect.path, compute_vp2intersect.source),
+    mirror(zero_tilezero.family, zero_tilezero.path, zero_tilezero.source),
+    mirror(zero_vzeroall.family, zero_vzeroall.path, zero_vzeroall.source),
+    mirror(zero_vzeroupper.family, zero_vzeroupper.path, zero_vzeroupper.source),
 };
 
 pub fn tableCount() usize {

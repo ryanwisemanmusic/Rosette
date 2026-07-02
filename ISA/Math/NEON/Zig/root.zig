@@ -710,6 +710,9 @@ const scan_scasb = @import("SCAN/scasb.zig");
 const scan_scasw = @import("SCAN/scasw.zig");
 const scan_scasd = @import("SCAN/scasd.zig");
 const scan_scasq = @import("SCAN/scasq.zig");
+const zero_tilezero = @import("ZERO/TILEZERO.zig");
+const zero_vzeroall = @import("ZERO/VZEROALL.zig");
+const zero_vzeroupper = @import("ZERO/VZEROUPPER.zig");
 
 pub const specs = blk: {
     @setEvalBranchQuota(5000);
@@ -1421,6 +1424,9 @@ pub const specs = blk: {
         spec(compute_sqrtsd.meta),
         spec(compute_sqrtss.meta),
         spec(compute_vp2intersect.meta),
+        spec(zero_tilezero.meta),
+        spec(zero_vzeroall.meta),
+        spec(zero_vzeroupper.meta),
     };
 };
 
@@ -2132,6 +2138,9 @@ pub const proof_reports = [_]proofs.ProofReport{
     compute_sqrtsd.proof_report,
     compute_sqrtss.proof_report,
     compute_vp2intersect.proof_report,
+    zero_tilezero.proof_report,
+    zero_vzeroall.proof_report,
+    zero_vzeroupper.proof_report,
 };
 
 pub fn tableCount() usize {
