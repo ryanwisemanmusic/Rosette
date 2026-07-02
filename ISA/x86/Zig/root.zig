@@ -398,6 +398,9 @@ const test_testui = @import("TEST/TESTUI.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
 const undef_ud1 = @import("UNDEF/UD1.zig");
 const undef_ud2 = @import("UNDEF/UD2.zig");
+const unordered_ucomisd = @import("UNORDERED/UCOMISD.zig");
+const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
+const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const xor_xor = @import("XOR/XOR.zig");
@@ -1657,6 +1660,9 @@ pub const tables = [_]InstructionTable{
     entry(undef_ud0.family, undef_ud0.path, undef_ud0.source),
     entry(undef_ud1.family, undef_ud1.path, undef_ud1.source),
     entry(undef_ud2.family, undef_ud2.path, undef_ud2.source),
+    entry(unordered_ucomisd.family, unordered_ucomisd.path, unordered_ucomisd.source),
+    entry(unordered_ucomiss.family, unordered_ucomiss.path, unordered_ucomiss.source),
+    entry(unordered_vucomish.family, unordered_vucomish.path, unordered_vucomish.source),
     entry(xor_xor.family, xor_xor.path, xor_xor.source),
     entry(xor_xorpd.family, xor_xorpd.path, xor_xorpd.source),
     entry(xor_xorps.family, xor_xorps.path, xor_xorps.source),
