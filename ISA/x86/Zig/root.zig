@@ -707,6 +707,9 @@ const scan_scasb = @import("SCAN/scasb.zig");
 const scan_scasw = @import("SCAN/scasw.zig");
 const scan_scasd = @import("SCAN/scasd.zig");
 const scan_scasq = @import("SCAN/scasq.zig");
+const zero_tilezero = @import("ZERO/TILEZERO.zig");
+const zero_vzeroall = @import("ZERO/VZEROALL.zig");
+const zero_vzeroupper = @import("ZERO/VZEROUPPER.zig");
 
 pub const documented_reference_mnemonics = [_][]const u8{
     "AAA",
@@ -1987,6 +1990,9 @@ pub const tables = [_]InstructionTable{
     entry(compute_sqrtsd.family, compute_sqrtsd.path, compute_sqrtsd.source),
     entry(compute_sqrtss.family, compute_sqrtss.path, compute_sqrtss.source),
     entry(compute_vp2intersect.family, compute_vp2intersect.path, compute_vp2intersect.source),
+    entry(zero_tilezero.family, zero_tilezero.path, zero_tilezero.source),
+    entry(zero_vzeroall.family, zero_vzeroall.path, zero_vzeroall.source),
+    entry(zero_vzeroupper.family, zero_vzeroupper.path, zero_vzeroupper.source),
 };
 
 pub fn tableCount() usize {
@@ -2143,7 +2149,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 560), tableCount());
+    try std.testing.expectEqual(@as(usize, 563), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
