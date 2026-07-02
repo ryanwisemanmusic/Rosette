@@ -5,6 +5,7 @@ pub const Phase = enum {
     launch_arguments,
     logging,
     logging_ready,
+    configuration,
 };
 
 pub const Snapshot = struct {
@@ -25,6 +26,8 @@ pub const Snapshot = struct {
     logging_lines: u64,
     pthread_created: u64,
     pthread_waits_collapsed: u64,
+    diagnostic_text_runs: u64 = 0,
+    diagnostic_text_lines: u64 = 0,
 };
 
 pub const Observer = struct {
@@ -52,15 +55,15 @@ pub const Observer = struct {
             self.same_symbol_checkpoints = 1;
         }
         std.debug.print(
-            "info(macho): startup phase={s} step={d} at {s}+0x{x} rip=0x{x} heap=0x{x} imports={d} fs(open/read/write)={d}/{d}/{d} guest-heap(alloc/live)={d}/{d} options(seen/kept/skipped)={d}/{d}/{d} logging(lines)={d} pthread(created/waits-collapsed)={d}/{d} same-symbol={d}\n",
+            "info(macho): startup phase={s} step={d} at {s}+0x{x} rip=0x{x} heap=0x{x} imports={d} fs(open/read/write)={d}/{d}/{d} guest-heap(alloc/live)={d}/{d} options(seen/kept/skipped)={d}/{d}/{d} logging(lines)={d} pthread(created/waits-collapsed)={d}/{d} text-dump(runs/lines)={d}/{d} same-symbol={d}\n",
             .{
-                @tagName(self.phase),         snapshot.step,             snapshot.symbol,
-                snapshot.symbol_offset,       snapshot.rip,              snapshot.heap_next,
-                snapshot.import_calls,        snapshot.fs_open,          snapshot.fs_read,
-                snapshot.fs_write,            snapshot.heap_allocations, snapshot.heap_live,
-                snapshot.options_seen,        snapshot.options_kept,     snapshot.options_skipped,
-                snapshot.logging_lines,       snapshot.pthread_created,  snapshot.pthread_waits_collapsed,
-                self.same_symbol_checkpoints,
+                @tagName(self.phase),          snapshot.step,                  snapshot.symbol,
+                snapshot.symbol_offset,        snapshot.rip,                   snapshot.heap_next,
+                snapshot.import_calls,         snapshot.fs_open,               snapshot.fs_read,
+                snapshot.fs_write,             snapshot.heap_allocations,      snapshot.heap_live,
+                snapshot.options_seen,         snapshot.options_kept,          snapshot.options_skipped,
+                snapshot.logging_lines,        snapshot.pthread_created,       snapshot.pthread_waits_collapsed,
+                snapshot.diagnostic_text_runs, snapshot.diagnostic_text_lines, self.same_symbol_checkpoints,
             },
         );
     }

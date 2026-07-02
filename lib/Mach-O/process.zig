@@ -18,10 +18,12 @@ const memory_management_forwarder = @import("resolution/memory_management_forwar
 const launch_argument_accelerator = @import("resolution/launch_argument_accelerator.zig");
 const startup_observer = @import("resolution/startup_observer.zig");
 const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
+const itanium_dynamic_cast = @import("resolution/itanium_dynamic_cast.zig");
 const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
 const libcpp_stream_bridge = @import("resolution/libcpp_stream_bridge.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
+const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
 const contract = @import("contract");
 
 const log = std.log.scoped(.macho);
@@ -58,6 +60,8 @@ const BOUND_IMPORT_THUNK_STRIDE: u64 = 16;
 const INITIALIZER_RETURN_SENTINEL: u64 = 0xFFFF_FB00_0000_0000;
 const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
+const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 16;
+const DECODE_CACHE_HASH_SHIFT: u6 = 48;
 
 const MachSegment = macho.MachSegment;
 
@@ -79,6 +83,20 @@ const ImportTraceEntry = struct {
     synthetic_result: u64 = 0,
     caller_symbol: []const u8 = "",
     caller_offset: u64 = 0,
+};
+
+const ControlTransferContext = struct {
+    kind: []const u8,
+    instruction_address: u64,
+    operand_address: u64 = 0,
+    target_address: u64,
+    return_address: u64 = 0,
+};
+
+const DecodeCacheEntry = struct {
+    rip: u64 = std.math.maxInt(u64),
+    code_generation: u64 = 0,
+    decoded: DecodedInsn = .{},
 };
 
 const ImportHandlerResult = union(enum) {
@@ -126,6 +144,7 @@ const InternalCompatibilityTargets = struct {
     guest_log_append_formatted: u64 = 0,
     guest_log_append_view: u64 = 0,
     libcxx_basic_streambuf_pubsetbuf: u64 = 0,
+    print_config_to_log: u64 = 0,
 };
 
 const InitializerCheckpoint = struct {
@@ -189,10 +208,12 @@ pub const MachOState = struct {
     libcxx_streams: libcpp_stream_bridge.Bridge = .{},
     logging: logging_runtime.Engine = .{},
     pthreads: pthread_runtime.Runtime = .{},
+    diagnostic_text: diagnostic_text_accelerator.Engine = .{},
     memory_forwarder: memory_management_forwarder.Manager,
     smart_stubs: smart_stub_generator.Generator = .{},
     cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
     unwinder: itanium_unwinder.Engine = .{},
+    dynamic_casts: itanium_dynamic_cast.Engine = .{},
     last_unwind_inspection: ?itanium_unwinder.Inspection = null,
     import_provider_override: ?import_resolution.Provider = null,
     import_confidence_override: ?import_resolution.Confidence = null,
@@ -212,8 +233,17 @@ pub const MachOState = struct {
     import_trace_index: usize = 0,
     import_trace_filled: bool = false,
     unresolved_import_count: u64 = 0,
+    pending_control_transfer: ?ControlTransferContext = null,
+    terminal_control_transfer: ?exit_diagnostics.ControlTransferFailure = null,
     guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
     bound_import_thunks: []BoundImportThunk = &.{},
+    decode_cache: []DecodeCacheEntry,
+    decode_cache_hits: u64 = 0,
+    decode_cache_misses: u64 = 0,
+    code_generation: u64 = 1,
+    mapped_min: u64,
+    executable_min: u64,
+    executable_max: u64,
 
     pub fn init(allocator: std.mem.Allocator, binary_data: []const u8) !MachOState {
         var state = try macho.load(allocator, binary_data);
@@ -223,12 +253,20 @@ pub const MachOState = struct {
 
         var min_vaddr: u64 = std.math.maxInt(u64);
         var max_vaddr: u64 = 0;
+        var mapped_min: u64 = std.math.maxInt(u64);
+        var executable_min: u64 = std.math.maxInt(u64);
+        var executable_max: u64 = 0;
 
         for (state.segments) |seg| {
             if (seg.vmsize == 0) continue;
             if (seg.vmaddr < min_vaddr) min_vaddr = seg.vmaddr;
             const seg_end = try std.math.add(u64, seg.vmaddr, seg.vmsize);
             if (seg_end > max_vaddr) max_vaddr = seg_end;
+            if (seg.initprot != 0) mapped_min = @min(mapped_min, seg.vmaddr);
+            if (seg.initprot & 0x04 != 0) {
+                executable_min = @min(executable_min, seg.vmaddr);
+                executable_max = @max(executable_max, seg_end);
+            }
         }
 
         if (min_vaddr == std.math.maxInt(u64)) return error.NoLoadableSegments;
@@ -275,6 +313,8 @@ pub const MachOState = struct {
         }
 
         const initializer_count = metadata.initializer_addresses.len;
+        const decode_cache = try allocator.alloc(DecodeCacheEntry, DECODE_CACHE_ENTRY_COUNT);
+        @memset(decode_cache, .{});
         var result = MachOState{
             .allocator = allocator,
             .mem = mem,
@@ -291,6 +331,10 @@ pub const MachOState = struct {
             .initializer_memory = memory_transaction.Journal.init(allocator, PAGE_SIZE),
             .fs_forwarder = fs_io_forwarder.Forwarder.init(allocator),
             .memory_forwarder = memory_management_forwarder.Manager.init(allocator),
+            .decode_cache = decode_cache,
+            .mapped_min = mapped_min,
+            .executable_min = executable_min,
+            .executable_max = executable_max,
         };
         result.guest_files[0] = .{ .active = true, .fd = 0, .kind = .regular };
         result.guest_files[1] = .{ .active = true, .fd = 1, .kind = .stdout };
@@ -324,6 +368,9 @@ pub const MachOState = struct {
         result.internal_targets.libcxx_basic_streambuf_pubsetbuf = result.metadata.symbolAddressWithPrefix(
             "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9pubsetbuf",
         ) orelse 0;
+        result.internal_targets.print_config_to_log = result.metadata.symbolAddressWithPrefix(
+            "__ZN6config16PrintConfigToLog",
+        ) orelse 0;
         result.logging.configure(
             result.internal_targets.guest_log_get_thread_buffer != 0,
             result.internal_targets.guest_log_append_formatted != 0,
@@ -345,6 +392,7 @@ pub const MachOState = struct {
         self.fs_forwarder.deinit();
         self.memory_forwarder.deinit();
         self.initializer_memory.deinit();
+        self.allocator.free(self.decode_cache);
         if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
         self.metadata.deinit();
         self.allocator.free(self.mem);
@@ -365,6 +413,7 @@ pub const MachOState = struct {
         errdefer thunks.deinit(self.allocator);
 
         var applied: usize = 0;
+        var callable_got_bindings: usize = 0;
         var stack_guard_address: u64 = 0;
         for (self.metadata.bindings) |binding| {
             if (std.mem.eql(u8, binding.name, "___stdinp") or
@@ -392,7 +441,9 @@ pub const MachOState = struct {
             const destination = self.guestMemory(binding.address, @sizeOf(u64)) orelse continue;
             const existing = std.mem.readInt(u64, destination[0..8], .little);
             if (std.mem.eql(u8, binding.dylib, "weak-lookup") and existing != 0) continue;
-            var target = stubs.get(binding.name) orelse blk: {
+            const force_bound_thunk = bindingRequiresBoundThunk(section);
+            var target = if (!force_bound_thunk) stubs.get(binding.name) orelse 0 else 0;
+            if (target == 0) target = blk: {
                 if (thunk_addresses.get(binding.name)) |existing_thunk| break :blk existing_thunk;
                 const thunk_address = BOUND_IMPORT_THUNK_BASE + @as(u64, @intCast(thunks.items.len)) * BOUND_IMPORT_THUNK_STRIDE;
                 try thunks.append(self.allocator, .{
@@ -410,12 +461,13 @@ pub const MachOState = struct {
             }
             std.mem.writeInt(u64, destination[0..8], target, .little);
             applied += 1;
+            if (std.mem.eql(u8, section.name, "__got")) callable_got_bindings += 1;
         }
 
         self.bound_import_thunks = try thunks.toOwnedSlice(self.allocator);
         std.debug.print(
-            "macho-processor: applied {d} dyld data binding(s), created {d} synthetic import thunk(s)\n",
-            .{ applied, self.bound_import_thunks.len },
+            "macho-processor: applied {d} dyld data binding(s), including {d} callable GOT pointer(s); created {d} synthetic import thunk(s)\n",
+            .{ applied, callable_got_bindings, self.bound_import_thunks.len },
         );
     }
 
@@ -424,6 +476,7 @@ pub const MachOState = struct {
         symbol_name: []const u8,
         has_import_stub: bool,
     ) bool {
+        if (std.mem.eql(u8, section.name, "__got")) return has_import_stub;
         if (!std.mem.eql(u8, section.name, "__const")) return false;
         if (has_import_stub) return true;
         if (!std.mem.startsWith(u8, symbol_name, "__Z")) return false;
@@ -437,11 +490,12 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn bindingRequiresBoundThunk(section: macho_metadata.Section) bool {
+        return std.mem.eql(u8, section.name, "__got");
+    }
+
     pub fn addrToOffset(self: *const MachOState, vaddr: u64) ?u64 {
-        if (vaddr < self.mem_base) return null;
-        const off = vaddr - self.mem_base;
-        if (off >= self.mem_size) return null;
-        return off;
+        return mappedOffset(self.mem_base, self.mem_size, self.mapped_min, vaddr);
     }
 
     fn isExecutableAddress(self: *const MachOState, address: u64) bool {
@@ -489,6 +543,7 @@ pub const MachOState = struct {
         const off = self.addrToOffset(vaddr) orelse return;
         if (off < self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 1);
+            self.noteGuestWrite(vaddr, 1);
             self.mem[off] = val;
         }
     }
@@ -497,6 +552,7 @@ pub const MachOState = struct {
         const off = self.addrToOffset(vaddr) orelse return;
         if (off + 2 <= self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 2);
+            self.noteGuestWrite(vaddr, 2);
             std.mem.writeInt(u16, self.mem[off..][0..2], val, .little);
         }
     }
@@ -505,6 +561,7 @@ pub const MachOState = struct {
         const off = self.addrToOffset(vaddr) orelse return;
         if (off + 4 <= self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 4);
+            self.noteGuestWrite(vaddr, 4);
             std.mem.writeInt(u32, self.mem[off..][0..4], val, .little);
         }
     }
@@ -513,6 +570,7 @@ pub const MachOState = struct {
         const off = self.addrToOffset(vaddr) orelse return;
         if (off + 8 <= self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 8);
+            self.noteGuestWrite(vaddr, 8);
             std.mem.writeInt(u64, self.mem[off..][0..8], val, .little);
         }
     }
@@ -558,6 +616,7 @@ pub const MachOState = struct {
         const off = self.addrToOffset(addr) orelse return;
         if (off + 16 > self.mem.len) return;
         self.initializer_memory.capture(self.mem, @intCast(off), 16);
+        self.noteGuestWrite(addr, 16);
         @memcpy(self.mem[off..][0..16], value[0..]);
     }
 
@@ -568,7 +627,17 @@ pub const MachOState = struct {
         const count_usize: usize = @intCast(count);
         if (off_usize > self.mem.len or count_usize > self.mem.len - off_usize) return null;
         self.initializer_memory.capture(self.mem, off_usize, count_usize);
+        self.noteGuestWrite(addr, count);
         return self.mem[off_usize .. off_usize + count_usize];
+    }
+
+    fn noteGuestWrite(self: *MachOState, address: u64, count: u64) void {
+        if (count == 0 or self.executable_min == std.math.maxInt(u64)) return;
+        const end = address +| count;
+        if (address < self.executable_max and end > self.executable_min) {
+            self.code_generation +%= 1;
+            if (self.code_generation == 0) self.code_generation = 1;
+        }
     }
 
     pub fn guestMemoryConst(self: *const MachOState, addr: u64, count: u64) ?[]const u8 {
@@ -1210,6 +1279,11 @@ pub const MachOState = struct {
             const ok = compat_runtime.appendLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
             return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
         }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKc") != null) {
+            const source = self.guestCString(self.regs.rdx, 1 << 20) orelse return .{ .unsupported = 0 };
+            const ok = compat_runtime.insertLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx, source.len);
+            return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm") != null) {
             const inserted_size = self.read64(self.regs.rsp + 8);
             const ok = compat_runtime.growLibcppString(
@@ -1228,6 +1302,12 @@ pub const MachOState = struct {
             std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC2ERKS5_") != null)
         {
             const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
+            if (!ok) {
+                std.debug.print(
+                    "macho-processor: libc++ string copy rejected: destination=0x{x} source=0x{x} destination_mapped={} source_mapped={}\n",
+                    .{ self.regs.rdi, self.regs.rsi, self.guestMemoryConst(self.regs.rdi, 24) != null, self.guestMemoryConst(self.regs.rsi, 24) != null },
+                );
+            }
             return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
         }
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_") != null) {
@@ -1323,6 +1403,15 @@ pub const MachOState = struct {
         }
 
         if (std.mem.eql(u8, name, "___dynamic_cast")) {
+            if (self.dynamic_casts.resolve(
+                self,
+                self.regs.rdi,
+                self.regs.rsi,
+                self.regs.rdx,
+                self.regs.rcx,
+            )) |resolution| {
+                return .{ .handled = resolution.address };
+            }
             const return_address = self.read64(self.regs.rsp);
             if (self.metadata.nearestSymbol(return_address)) |caller| {
                 if (std.mem.indexOf(u8, caller.name, "cxxopts") != null and
@@ -1331,7 +1420,11 @@ pub const MachOState = struct {
                     return .{ .handled = self.regs.rdi };
                 }
             }
-            return .{ .unsupported = 0 };
+            std.debug.print(
+                "macho-processor: __dynamic_cast metadata unresolved: source=0x{x} source_type=0x{x} destination_type=0x{x} hint={d}; returning null\n",
+                .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, @as(i64, @bitCast(self.regs.rcx)) },
+            );
+            return .{ .handled = 0 };
         }
 
         if (std.mem.eql(u8, name, "__ZNSt3__16localeC1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeC2Ev")) {
@@ -1723,6 +1816,34 @@ pub const MachOState = struct {
             return .{ .handled = self.handlePutchar() };
         }
 
+        if (std.mem.eql(u8, name, "_sysctlbyname")) {
+            const sysctl_name = self.guestCString(self.regs.rdi, 256) orelse return .{ .unsupported = 0 };
+            if (std.mem.startsWith(u8, sysctl_name, "hw.optional.")) {
+                if (self.regs.rsi != 0 and self.regs.rdx != 0) {
+                    const old_len_ptr = self.guestMemory(self.regs.rdx, @sizeOf(u64)) orelse return .{ .unsupported = 0 };
+                    const old_len = std.mem.readInt(u64, old_len_ptr[0..8], .little);
+                    std.mem.writeInt(u64, old_len_ptr[0..8], @sizeOf(u32), .little);
+                    if (old_len >= @sizeOf(u32) and self.regs.rsi != 0) {
+                        const old_buf = self.guestMemory(self.regs.rsi, @sizeOf(u32)) orelse return .{ .unsupported = 0 };
+                        std.mem.writeInt(u32, old_buf[0..4], 0, .little);
+                    }
+                }
+                return .{ .handled = 0 };
+            }
+            return .{ .handled = @bitCast(@as(i64, -1)) };
+        }
+        if (std.mem.eql(u8, name, "_sigaction")) {
+            return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "_setjmp")) {
+            const env_bytes = self.guestMemory(self.regs.rdi, @sizeOf(u64) * 4) orelse return .{ .unsupported = 0 };
+            std.mem.writeInt(u64, env_bytes[0..8], self.regs.rsp, .little);
+            std.mem.writeInt(u64, env_bytes[8..16], self.regs.rbx, .little);
+            std.mem.writeInt(u64, env_bytes[16..24], self.regs.rbp, .little);
+            std.mem.writeInt(u64, env_bytes[24..32], self.regs.rip, .little);
+            return .{ .handled = 0 };
+        }
+
         if (std.mem.endsWith(u8, name, "_g_type_check_instance_cast")) {
             std.debug.print("    [import] _g_type_check_instance_cast compatibility shim → passthrough\n", .{});
             return .{ .handled = self.regs.rdi };
@@ -1839,6 +1960,53 @@ pub const MachOState = struct {
     fn terminateForUnresolvedImport(self: *MachOState) void {
         self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
+        self.terminated = true;
+    }
+
+    fn terminateForInvalidControlTransfer(self: *MachOState, context: ControlTransferContext) void {
+        var failure = exit_diagnostics.ControlTransferFailure{
+            .kind = context.kind,
+            .instruction_address = context.instruction_address,
+            .operand_address = context.operand_address,
+            .target_address = context.target_address,
+            .return_address = context.return_address,
+            .operand_mapped = context.operand_address != 0 and self.addrToOffset(context.operand_address) != null,
+            .target_mapped = self.addrToOffset(context.target_address) != null,
+            .target_executable = self.isExecutableAddress(context.target_address),
+        };
+        if (self.metadata.nearestSymbol(context.instruction_address)) |caller| {
+            failure.caller_symbol = caller.name;
+            failure.caller_offset = caller.offset;
+        }
+        if (self.metadata.nearestSymbol(context.target_address)) |target| {
+            failure.target_symbol = target.name;
+            failure.target_offset = target.offset;
+        }
+        for (self.metadata.imports) |imported| {
+            if (imported.stub_address == context.instruction_address or
+                (context.operand_address != 0 and imported.lazy_pointer_address == context.operand_address))
+            {
+                failure.candidate_import = imported.name;
+                failure.candidate_image = imported.dylib;
+                break;
+            }
+        }
+        self.pending_control_transfer = null;
+        self.terminal_control_transfer = failure;
+        std.debug.print(
+            "macho-processor: invalid control transfer: kind={s} instruction=0x{x} operand=0x{x} target=0x{x} return=0x{x} candidate_import={s}\n",
+            .{
+                failure.kind,
+                failure.instruction_address,
+                failure.operand_address,
+                failure.target_address,
+                failure.return_address,
+                if (failure.candidate_import.len != 0) failure.candidate_import else "<none>",
+            },
+        );
+        self.faulted = true;
+        self.exit_code = 127;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
         self.terminated = true;
     }
 
@@ -2518,6 +2686,11 @@ pub const MachOState = struct {
         }
         if (self.terminated) {
             const final_abi = self.initializerAbi();
+            std.debug.print(
+                "macho-processor: initializer [{d}/{d}] terminated at rip=0x{x} reason={s} exit_code=0x{x}\n",
+                .{ index + 1, self.metadata.initializer_addresses.len, self.regs.rip, @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)), self.exit_code },
+            );
+            self.dumpRecentTrace();
             _ = self.rollbackInitializerTransaction();
             self.initializer_resolver.fail(
                 .terminated,
@@ -2534,6 +2707,11 @@ pub const MachOState = struct {
         }
         if (self.regs.rip != INITIALIZER_RETURN_SENTINEL) {
             const final_abi = self.initializerAbi();
+            std.debug.print(
+                "macho-processor: initializer [{d}/{d}] exceeded {d} steps at {s}+0x{x}; terminal_rip=0x{x}\n",
+                .{ index + 1, self.metadata.initializer_addresses.len, INITIALIZER_STEP_LIMIT, symbol_name, if (nearest_symbol) |item| item.offset else address, self.regs.rip },
+            );
+            self.dumpRecentTrace();
             _ = self.rollbackInitializerTransaction();
             self.initializer_resolver.fail(
                 .step_limit,
@@ -2541,10 +2719,6 @@ pub const MachOState = struct {
                 final_abi,
                 self.unresolved_import_count,
                 self.guest_assertion_count,
-            );
-            std.debug.print(
-                "macho-processor: initializer [{d}/{d}] exceeded {d} steps at {s}+0x{x}\n",
-                .{ index + 1, self.metadata.initializer_addresses.len, INITIALIZER_STEP_LIMIT, symbol_name, if (nearest_symbol) |item| item.offset else address },
             );
             self.faulted = true;
             self.exit_code = 124;
@@ -2702,6 +2876,17 @@ pub const MachOState = struct {
             self.regs.rip = self.pop();
             return true;
         }
+        if (self.internal_targets.print_config_to_log != 0 and
+            self.regs.rip == self.internal_targets.print_config_to_log)
+        {
+            self.startup.enter(.configuration, self.executed_steps);
+            if (self.diagnostic_text.buildConfigDump(self, &self.fs_forwarder, self.regs.rdi)) |dump| {
+                const emitted = self.emitGuestLog('i', dump.address, dump.length);
+                self.logging.recordEmission(dump.length, emitted);
+                self.regs.rip = self.pop();
+                return true;
+            }
+        }
         return false;
     }
 
@@ -2823,8 +3008,22 @@ pub const MachOState = struct {
 
     fn decodeAt(self: *MachOState) ?DecodedInsn {
         const off = self.addrToOffset(self.regs.rip) orelse return null;
-        const bytes = self.mem[off..];
-        var d = decodeInsn(bytes);
+        const cache_hash = self.regs.rip *% 0x9E37_79B9_7F4A_7C15;
+        const cache_index: usize = @intCast(cache_hash >> DECODE_CACHE_HASH_SHIFT);
+        const entry = &self.decode_cache[cache_index];
+        var d: DecodedInsn = if (entry.rip == self.regs.rip and entry.code_generation == self.code_generation) blk: {
+            self.decode_cache_hits += 1;
+            break :blk entry.decoded;
+        } else blk: {
+            self.decode_cache_misses += 1;
+            const decoded = decodeInsn(self.mem[off..]);
+            entry.* = .{
+                .rip = self.regs.rip,
+                .code_generation = self.code_generation,
+                .decoded = decoded,
+            };
+            break :blk decoded;
+        };
 
         const addr_size: Size = if (d.has_0x67) .bits32 else .bits64;
         if (d.sib_has_index) {
@@ -2850,6 +3049,11 @@ pub const MachOState = struct {
             return !self.terminated;
         }
         if (!self.isExecutableAddress(self.regs.rip)) {
+            if (self.pending_control_transfer) |context| {
+                self.terminateForInvalidControlTransfer(context);
+                self.dumpRecentTrace();
+                return false;
+            }
             std.debug.print(
                 "macho-processor: invalid control-flow target rip=0x{x}; address is outside executable Mach-O segments\n",
                 .{self.regs.rip},
@@ -2861,6 +3065,7 @@ pub const MachOState = struct {
             self.terminated = true;
             return false;
         }
+        self.pending_control_transfer = null;
         const decoded = self.decodeAt() orelse {
             const rip = self.regs.rip;
             std.debug.print("macho-processor: decode failed at rip=0x{x}\n", .{rip});
@@ -3020,6 +3225,8 @@ pub const MachOState = struct {
                     .logging_lines = self.logging.emitted_lines,
                     .pthread_created = self.pthreads.created_threads,
                     .pthread_waits_collapsed = self.pthreads.collapsed_waits,
+                    .diagnostic_text_runs = self.diagnostic_text.accelerations,
+                    .diagnostic_text_lines = self.diagnostic_text.lines_retained,
                 });
             }
             if (!self.step()) break;
@@ -3037,9 +3244,27 @@ pub const MachOState = struct {
                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
             }
         }
+        const recorded_reason = exit_diagnostics.reasonFromValue(self.termination_reason);
+        const normalized_reason = exit_diagnostics.normalizeReason(recorded_reason, self.unresolved_import_count);
+        if (normalized_reason != recorded_reason) {
+            std.debug.print(
+                "macho-processor: diagnostics invariant repaired: reason={s} but unresolved_imports=0; reclassified={s}\n",
+                .{ @tagName(recorded_reason), @tagName(normalized_reason) },
+            );
+            self.termination_reason = @intFromEnum(normalized_reason);
+        }
         if (self.terminated and (self.exit_code != 0 or self.unresolved_import_count != 0)) {
             self.logExitDiagnostics();
         }
+    }
+
+    fn logDecodeCacheSummary(self: *const MachOState) void {
+        const total = self.decode_cache_hits + self.decode_cache_misses;
+        const hit_percent = if (total == 0) 0 else self.decode_cache_hits * 100 / total;
+        std.debug.print(
+            "macho-processor: decode cache: entries={d} hits={d} misses={d} hit_rate={d}% code_generation={d}\n",
+            .{ self.decode_cache.len, self.decode_cache_hits, self.decode_cache_misses, hit_percent, self.code_generation },
+        );
     }
 
     fn logExitDiagnostics(self: *const MachOState) void {
@@ -3075,6 +3300,7 @@ pub const MachOState = struct {
             .unresolved_import_calls = self.unresolved_import_count,
             .attribution = attribution,
             .execution_authoritative = attribution.authority == .authoritative,
+            .control_transfer_failure = self.terminal_control_transfer,
         };
 
         if (self.isExecutableAddress(self.regs.rip)) {
@@ -3556,8 +3782,14 @@ pub const MachOState = struct {
                 const a = self.regVal(d.dst_reg, sz);
                 const r = (~a +% 1) & maskForSize(sz);
                 self.setReg(d.dst_reg, sz, r);
-                self.setFlagsLogic(r, sz);
-                self.setFlag(RFL_CF, a != 0);
+                self.setFlagsSub(0, a, r, sz);
+            },
+            .neg_mem8, .neg_mem16, .neg_mem32, .neg_mem64 => {
+                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.neg_mem8) + @intFromEnum(Size.bits8));
+                const a = self.readMemVal(d.addr, sz);
+                const r = (~a +% 1) & maskForSize(sz);
+                self.writeMemVal(d.addr, sz, r);
+                self.setFlagsSub(0, a, r, sz);
             },
             .not_reg8, .not_reg16, .not_reg32, .not_reg64 => {
                 self.setReg(d.dst_reg, d.size, ~self.regVal(d.dst_reg, d.size));
@@ -3605,11 +3837,18 @@ pub const MachOState = struct {
             },
 
             .call_rel32 => {
+                const from_rip = self.regs.rip;
                 const target = d.addr;
                 const return_addr = self.regs.rip + d.len;
+                self.pending_control_transfer = .{
+                    .kind = "call_rel32",
+                    .instruction_address = from_rip,
+                    .target_address = target,
+                    .return_address = return_addr,
+                };
                 self.push(return_addr);
                 self.regs.rip = target;
-                self.logControlFlow("call_rel32", self.regs.rip - d.len, target, d.len, return_addr);
+                self.logControlFlow("call_rel32", from_rip, target, d.len, return_addr);
             },
             .call_reg64 => {
                 const from_rip = self.regs.rip;
@@ -3617,11 +3856,19 @@ pub const MachOState = struct {
                 const return_addr = self.regs.rip + d.len;
                 if (target == 0) {
                     self.logControlFlow("call_reg64_null", from_rip, target, d.len, return_addr);
-                    self.faulted = true;
-                    self.exit_code = 127;
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
-                    self.terminated = true;
+                    self.terminateForInvalidControlTransfer(.{
+                        .kind = "call_reg64_null",
+                        .instruction_address = from_rip,
+                        .target_address = target,
+                        .return_address = return_addr,
+                    });
                 } else {
+                    self.pending_control_transfer = .{
+                        .kind = "call_reg64",
+                        .instruction_address = from_rip,
+                        .target_address = target,
+                        .return_address = return_addr,
+                    };
                     self.push(return_addr);
                     self.regs.rip = target;
                     self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
@@ -3633,11 +3880,21 @@ pub const MachOState = struct {
                 const return_addr = self.regs.rip + d.len;
                 if (target == 0) {
                     self.logControlFlow("call_mem64_null", from_rip, target, d.len, return_addr);
-                    self.faulted = true;
-                    self.exit_code = 127;
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
-                    self.terminated = true;
+                    self.terminateForInvalidControlTransfer(.{
+                        .kind = "call_mem64_null",
+                        .instruction_address = from_rip,
+                        .operand_address = d.addr,
+                        .target_address = target,
+                        .return_address = return_addr,
+                    });
                 } else {
+                    self.pending_control_transfer = .{
+                        .kind = "call_mem64",
+                        .instruction_address = from_rip,
+                        .operand_address = d.addr,
+                        .target_address = target,
+                        .return_address = return_addr,
+                    };
                     self.push(return_addr);
                     self.regs.rip = target;
                     self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
@@ -3660,6 +3917,11 @@ pub const MachOState = struct {
             },
 
             .jmp_rel8 => {
+                self.pending_control_transfer = .{
+                    .kind = "jmp_rel8",
+                    .instruction_address = self.regs.rip,
+                    .target_address = d.addr,
+                };
                 self.logControlFlow("jmp", self.regs.rip, d.addr, d.len, null);
                 self.regs.rip = d.addr;
             },
@@ -3667,11 +3929,17 @@ pub const MachOState = struct {
                 const target = self.regVal(d.dst_reg, .bits64);
                 if (target == 0) {
                     self.logControlFlow("jmp_reg64_null", self.regs.rip, target, d.len, null);
-                    self.faulted = true;
-                    self.exit_code = 127;
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
-                    self.terminated = true;
+                    self.terminateForInvalidControlTransfer(.{
+                        .kind = "jmp_reg64_null",
+                        .instruction_address = self.regs.rip,
+                        .target_address = target,
+                    });
                 } else {
+                    self.pending_control_transfer = .{
+                        .kind = "jmp_reg64",
+                        .instruction_address = self.regs.rip,
+                        .target_address = target,
+                    };
                     self.logControlFlow("jmp_reg64", self.regs.rip, target, d.len, null);
                     self.regs.rip = target;
                 }
@@ -3684,13 +3952,21 @@ pub const MachOState = struct {
                         self.handleDirectImportCall(imported);
                     } else {
                         self.logControlFlow("jmp_mem64_null", self.regs.rip, target, d.len, null);
-                        self.faulted = true;
-                        self.exit_code = 127;
-                        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
-                        self.terminated = true;
+                        self.terminateForInvalidControlTransfer(.{
+                            .kind = "jmp_mem64_null",
+                            .instruction_address = self.regs.rip,
+                            .operand_address = d.addr,
+                            .target_address = target,
+                        });
                     }
                 } else {
                     self.pending_import_stub_rip = if (self.metadata.importAtStub(self.regs.rip) != null) self.regs.rip else null;
+                    self.pending_control_transfer = .{
+                        .kind = "jmp_mem64",
+                        .instruction_address = self.regs.rip,
+                        .operand_address = d.addr,
+                        .target_address = target,
+                    };
                     self.logControlFlow("jmp_mem64", self.regs.rip, target, d.len, null);
                     self.regs.rip = target;
                 }
@@ -3715,6 +3991,16 @@ pub const MachOState = struct {
             => self.executeBitScan(d),
 
             .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
+
+            .rol_reg_cl,
+            .rol_mem_cl,
+            .ror_reg_cl,
+            .ror_mem_cl,
+            .rol_reg_imm,
+            .rol_mem_imm,
+            .ror_reg_imm,
+            .ror_mem_imm,
+            => self.executeRotate(d),
 
             .shl_reg_cl, .shl_mem_cl => {
                 const sz = d.size;
@@ -4056,6 +4342,23 @@ pub const MachOState = struct {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
                 std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
             },
+            .vmovq_xmm_reg64, .vmovq_xmm_mem64 => {
+                const value = if (d.op == .vmovq_xmm_reg64)
+                    self.regVal(d.src_reg, .bits64)
+                else
+                    self.readMemVal(d.addr, .bits64);
+                @memset(&self.xmm[d.xmm_dst], 0);
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], value, .little);
+            },
+            .vmovq_reg64_xmm, .vmovq_mem64_xmm => {
+                const value = std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little);
+                if (d.op == .vmovq_reg64_xmm) {
+                    self.setReg(d.dst_reg, .bits64, value);
+                } else {
+                    self.writeMemVal(d.addr, .bits64, value);
+                }
+            },
             .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8 => {
                 self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
                 const value: u8 = @truncate(if (d.op == .vpinsrb_xmm_xmm_reg32)
@@ -4296,6 +4599,48 @@ pub const MachOState = struct {
         if (result.write_destination) self.setReg(d.dst_reg, d.size, result.value);
         self.setFlag(RFL_ZF, result.zero_flag);
         if (result.carry_flag) |carry| self.setFlag(RFL_CF, carry);
+    }
+
+    fn executeRotate(self: *MachOState, d: DecodedInsn) void {
+        const is_mem = switch (d.op) {
+            .rol_mem_cl, .ror_mem_cl, .rol_mem_imm, .ror_mem_imm => true,
+            else => false,
+        };
+        const rotate_left = switch (d.op) {
+            .rol_reg_cl, .rol_mem_cl, .rol_reg_imm, .rol_mem_imm => true,
+            else => false,
+        };
+        const uses_cl = switch (d.op) {
+            .rol_reg_cl, .rol_mem_cl, .ror_reg_cl, .ror_mem_cl => true,
+            else => false,
+        };
+        const raw_count = if (uses_cl) self.regVal(.cl_cx_ecx_rcx, .bits8) else d.imm;
+        const masked_count = raw_count & @as(u64, if (d.size == .bits64) 0x3F else 0x1F);
+        const width: u64 = bitWidth(d.size);
+        const count: u6 = @intCast(masked_count % width);
+        if (count == 0) return;
+
+        const mask = maskForSize(d.size);
+        const old = (if (is_mem) self.readMemVal(d.addr, d.size) else self.regVal(d.dst_reg, d.size)) & mask;
+        const inverse: u6 = @intCast(width - count);
+        const result = if (rotate_left)
+            ((old << count) | (old >> inverse)) & mask
+        else
+            ((old >> count) | (old << inverse)) & mask;
+
+        if (is_mem) self.writeMemVal(d.addr, d.size, result) else self.setReg(d.dst_reg, d.size, result);
+        if (rotate_left) {
+            const carry = (result & 1) != 0;
+            self.setFlag(RFL_CF, carry);
+            if (count == 1) self.setFlag(RFL_OF, ((result & signBitForSize(d.size)) != 0) != carry);
+        } else {
+            const carry = (result & signBitForSize(d.size)) != 0;
+            self.setFlag(RFL_CF, carry);
+            if (count == 1) {
+                const next_sign = (result & (signBitForSize(d.size) >> 1)) != 0;
+                self.setFlag(RFL_OF, carry != next_sign);
+            }
+        }
     }
 
     fn executeVexScalarF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
@@ -4557,6 +4902,12 @@ fn alignDown(value: u64, alignment: u64) u64 {
     return value & ~(alignment - 1);
 }
 
+fn mappedOffset(mem_base: u64, mem_size: u64, mapped_min: u64, address: u64) ?u64 {
+    if (address < mapped_min or address < mem_base) return null;
+    const offset = address - mem_base;
+    return if (offset < mem_size) offset else null;
+}
+
 fn parseFopenFlags(mode: []const u8) ?i32 {
     if (mode.len == 0) return null;
     var flags: i32 = 0;
@@ -4705,7 +5056,10 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.launch_options.logSummary();
         state.startup.logSummary();
         state.unwinder.logSummary();
+        state.dynamic_casts.logSummary();
+        state.diagnostic_text.logSummary();
         state.smart_stubs.logSummary();
+        state.logDecodeCacheSummary();
         std.debug.print("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
         return state.exit_code;
     }
@@ -4715,6 +5069,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.run();
 
     std.debug.print("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
+    state.logDecodeCacheSummary();
     state.import_resolver.logSummary();
     state.dynamic_forwarder.logSummary();
     state.fs_forwarder.logSummary();
@@ -4728,6 +5083,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.smart_stubs.logSummary();
     state.cxx_exceptions.logSummary();
     state.unwinder.logSummary();
+    state.dynamic_casts.logSummary();
+    state.diagnostic_text.logSummary();
     if (state.guest_log_line_count != 0) {
         std.debug.print(
             "macho-processor: synchronous guest log bridge: mirrored_lines={d}\n",
@@ -5644,6 +6001,36 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     const vector_256 = (vex_control & 0x04) != 0;
     const prefix = vex_control & 0x03;
 
+    if (opcode_map == 1 and (opcode == 0x6E or opcode == 0x7E)) {
+        if (!rex_w or vector_256 or prefix != 1 or (vex_control & 0x78) != 0x78) return .{};
+
+        var decoded = DecodedInsn{ .size = .bits64 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        if (opcode == 0x6E) {
+            decoded.xmm_dst = @intFromEnum(rm.reg);
+            if (is_mem) {
+                decoded.op = .vmovq_xmm_mem64;
+                decoded.addr = rm.addr;
+            } else {
+                decoded.op = .vmovq_xmm_reg64;
+                decoded.src_reg = @enumFromInt(rm.addr);
+            }
+        } else {
+            decoded.xmm_src = @intFromEnum(rm.reg);
+            if (is_mem) {
+                decoded.op = .vmovq_mem64_xmm;
+                decoded.addr = rm.addr;
+            } else {
+                decoded.op = .vmovq_reg64_xmm;
+                decoded.dst_reg = @enumFromInt(rm.addr);
+            }
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode_map == 1 and opcode == 0x2A) {
         if (vector_256 or (prefix != 2 and prefix != 3)) return .{};
 
@@ -6410,7 +6797,7 @@ fn decodeGroup2Shift(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
     const size: Size = if (is_byte) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     const uses_cl = opcode == 0xD2 or opcode == 0xD3;
 
-    if (group_op != 4 and group_op != 5 and group_op != 7) {
+    if (group_op != 0 and group_op != 1 and group_op != 4 and group_op != 5 and group_op != 7) {
         d.op = .invalid;
         d.len = @intCast(pos + 1);
         return d;
@@ -6426,23 +6813,31 @@ fn decodeGroup2Shift(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
     if (uses_cl) {
         d.op = if (is_mem)
             switch (group_op) {
+                0 => .rol_mem_cl,
+                1 => .ror_mem_cl,
                 4 => .shl_mem_cl,
                 5 => .shr_mem_cl,
                 else => .sar_mem_cl,
             }
         else switch (group_op) {
+            0 => .rol_reg_cl,
+            1 => .ror_reg_cl,
             4 => .shl_reg_cl,
             5 => .shr_reg_cl,
             else => .sar_reg_cl,
         };
     } else if (is_mem) {
         d.op = switch (group_op) {
+            0 => .rol_mem_imm,
+            1 => .ror_mem_imm,
             4 => .shl_mem_imm,
             5 => .shr_mem_imm,
             else => .sar_mem_imm,
         };
     } else {
         d.op = switch (group_op) {
+            0 => .rol_reg_imm,
+            1 => .ror_reg_imm,
             4 => .shl_reg_imm,
             5 => .shr_reg_imm,
             else => .sar_reg_imm,
@@ -6526,6 +6921,19 @@ fn decodeGroup3(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, r
 
     if (group == 2) {
         const base_op: Op = if (is_mem) .not_mem8 else .not_reg8;
+        d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
+        d.size = sz;
+        if (is_mem) {
+            d.addr = rm.addr;
+        } else {
+            d.dst_reg = @enumFromInt(rm.addr);
+        }
+        d.len = @intCast(pos);
+        return d;
+    }
+
+    if (group == 3) {
+        const base_op: Op = if (is_mem) .neg_mem8 else .neg_reg8;
         d.op = @enumFromInt(@intFromEnum(base_op) + @intFromEnum(sz) - @intFromEnum(Size.bits8));
         d.size = sz;
         if (is_mem) {
@@ -7094,6 +7502,24 @@ test "decode group two implicit and arithmetic shifts" {
     try std.testing.expectEqual(RegId.al_ax_eax_rax, sar_cl.dst_reg);
 }
 
+test "decode group two rotate forms" {
+    const fmt_ror = decodeInsn(&[_]u8{ 0xD3, 0xC8 });
+    try std.testing.expectEqual(Op.ror_reg_cl, fmt_ror.op);
+    try std.testing.expectEqual(Size.bits32, fmt_ror.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, fmt_ror.dst_reg);
+    try std.testing.expectEqual(@as(u8, 2), fmt_ror.len);
+
+    const rol_byte_memory = decodeInsn(&[_]u8{ 0xC0, 0x07, 0x03 });
+    try std.testing.expectEqual(Op.rol_mem_imm, rol_byte_memory.op);
+    try std.testing.expectEqual(Size.bits8, rol_byte_memory.size);
+    try std.testing.expectEqual(@as(u64, 3), rol_byte_memory.imm);
+
+    const ror_rax = decodeInsn(&[_]u8{ 0x48, 0xD1, 0xC8 });
+    try std.testing.expectEqual(Op.ror_reg_imm, ror_rax.op);
+    try std.testing.expectEqual(Size.bits64, ror_rax.size);
+    try std.testing.expectEqual(@as(u64, 1), ror_rax.imm);
+}
+
 test "decode register MOVZX without consuming the following instruction" {
     const decoded = decodeInsn(&[_]u8{ 0x0F, 0xB6, 0xC0, 0x48, 0x83, 0xC4, 0x30 });
     try std.testing.expectEqual(Op.movzx_reg32_mem8, decoded.op);
@@ -7305,6 +7731,25 @@ test "decode VEX dword move and byte insertion" {
     try std.testing.expectEqual(@as(u8, 5), shuffle.len);
 }
 
+test "decode VEX qword moves between XMM general registers and memory" {
+    const failing_signbit_move = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x7E, 0xC0 });
+    try std.testing.expectEqual(Op.vmovq_reg64_xmm, failing_signbit_move.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, failing_signbit_move.dst_reg);
+    try std.testing.expectEqual(@as(u8, 0), failing_signbit_move.xmm_src);
+    try std.testing.expectEqual(@as(u8, 5), failing_signbit_move.len);
+
+    const load_register = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x6E, 0xC8 });
+    try std.testing.expectEqual(Op.vmovq_xmm_reg64, load_register.op);
+    try std.testing.expectEqual(@as(u8, 1), load_register.xmm_dst);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, load_register.src_reg);
+
+    const store_memory = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x7E, 0x45, 0xF8 });
+    try std.testing.expectEqual(Op.vmovq_mem64_xmm, store_memory.op);
+    try std.testing.expectEqual(@as(u8, 0), store_memory.xmm_src);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, store_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -8))), store_memory.addr);
+}
+
 test "decode 256-bit VEX packed moves" {
     const decoded = decodeInsn(&[_]u8{ 0xC5, 0xFE, 0x6F, 0x00 });
     try std.testing.expectEqual(Op.vmovdqu_ymm_mem, decoded.op);
@@ -7501,6 +7946,20 @@ test "decode group three NOT register and memory forms" {
     try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -8))), memory.addr);
 }
 
+test "decode group three NEG register and memory forms" {
+    const failing_neg_cl = decodeInsn(&[_]u8{ 0xF6, 0xD9 });
+    try std.testing.expectEqual(Op.neg_reg8, failing_neg_cl.op);
+    try std.testing.expectEqual(Size.bits8, failing_neg_cl.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, failing_neg_cl.dst_reg);
+    try std.testing.expectEqual(@as(u8, 2), failing_neg_cl.len);
+
+    const neg_qword_memory = decodeInsn(&[_]u8{ 0x48, 0xF7, 0x5D, 0xF8 });
+    try std.testing.expectEqual(Op.neg_mem64, neg_qword_memory.op);
+    try std.testing.expectEqual(Size.bits64, neg_qword_memory.size);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, neg_qword_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -8))), neg_qword_memory.addr);
+}
+
 test "decode group three unsigned multiply register widths" {
     const multiply64 = decodeInsn(&[_]u8{ 0x48, 0xF7, 0xE1 });
     try std.testing.expectEqual(Op.mul_reg64, multiply64.op);
@@ -7619,7 +8078,7 @@ test "decode 64-bit OR register immediate without aliasing memory opcodes" {
     try std.testing.expectEqual(@as(u8, 5), memory.len);
 }
 
-test "dyld data bindings only materialize callable constant slots" {
+test "dyld data bindings materialize callable constant and GOT slots" {
     const constant_section = macho_metadata.Section{
         .name = "__const",
         .segment_name = "__DATA_CONST",
@@ -7640,7 +8099,16 @@ test "dyld data bindings only materialize callable constant slots" {
     ));
     try std.testing.expect(MachOState.isCallableConstantBinding(constant_section, "_strcmp", true));
     try std.testing.expect(!MachOState.isCallableConstantBinding(constant_section, "__ZTVN10__cxxabiv117__class_type_infoE", false));
-    try std.testing.expect(!MachOState.isCallableConstantBinding(got_section, "_strcmp", true));
+    try std.testing.expect(MachOState.isCallableConstantBinding(got_section, "_strcmp", true));
+    try std.testing.expect(!MachOState.isCallableConstantBinding(got_section, "___stack_chk_guard", false));
+    try std.testing.expect(MachOState.bindingRequiresBoundThunk(got_section));
+    try std.testing.expect(!MachOState.bindingRequiresBoundThunk(constant_section));
+}
+
+test "Mach-O PAGEZERO is excluded from guest memory" {
+    try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0));
+    try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0x30));
+    try std.testing.expectEqual(@as(?u64, 0x4000), mappedOffset(0, 0x2000_0000, 0x4000, 0x4000));
 }
 
 test "decode compiler long NOP with segment override" {
@@ -7687,5 +8155,9 @@ pub fn main(init: std.process.Init) !void {
         .path = args[1],
         .args = args[2..],
     });
-    std.process.exit(@intCast(exit_code));
+    const process_status: u8 = if (exit_code <= std.math.maxInt(u8)) @intCast(exit_code) else UNSUPPORTED_RUNTIME_EXIT_CODE;
+    if (process_status != exit_code) {
+        std.debug.print("macho-processor: normalized non-status exit value 0x{x} to {d}\n", .{ exit_code, process_status });
+    }
+    std.process.exit(process_status);
 }

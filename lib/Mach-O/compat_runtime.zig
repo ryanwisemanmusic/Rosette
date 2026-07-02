@@ -487,6 +487,27 @@ pub fn growLibcppString(
     return true;
 }
 
+pub fn insertLibcppString(state: anytype, object: u64, position: u64, source: u64, source_length: u64) bool {
+    const current = libcppStringView(state, object) orelse return false;
+    if (position > current.length) return false;
+
+    const total = std.math.add(u64, current.length, source_length) catch return false;
+    const temporary = state.guestAlloc(@max(total, 1), 1) orelse return false;
+    const temporary_bytes = state.guestMemory(temporary, total) orelse return false;
+    const current_bytes = state.guestMemoryConst(current.address, current.length) orelse return false;
+    const source_bytes = state.guestMemoryConst(source, source_length) orelse return false;
+
+    const pos: usize = @intCast(position);
+    const current_len: usize = @intCast(current.length);
+    const source_len: usize = @intCast(source_length);
+
+    @memcpy(temporary_bytes[0..pos], current_bytes[0..pos]);
+    @memcpy(temporary_bytes[pos .. pos + source_len], source_bytes);
+    @memcpy(temporary_bytes[pos + source_len .. pos + source_len + current_len - pos], current_bytes[pos..current_len]);
+
+    return initLibcppString(state, object, temporary, total);
+}
+
 pub fn concatCStringAndLibcppString(
     state: anytype,
     destination: u64,
