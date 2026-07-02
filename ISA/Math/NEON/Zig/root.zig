@@ -86,6 +86,10 @@ const kortest_kortestw = @import("KORTEST/KORTESTW.zig");
 const kortest_kortestb = @import("KORTEST/KORTESTB.zig");
 const kortest_kortestq = @import("KORTEST/KORTESTQ.zig");
 const kortest_kortestd = @import("KORTEST/KORTESTD.zig");
+const kxor_kxorw = @import("KXOR/KXORW.zig");
+const kxor_kxorb = @import("KXOR/KXORB.zig");
+const kxor_kxorq = @import("KXOR/KXORQ.zig");
+const kxor_kxord = @import("KXOR/KXORD.zig");
 const load_lahf = @import("LOAD/LAHF.zig");
 const load_lar = @import("LOAD/LAR.zig");
 const load_lddqu = @import("LOAD/LDDQU.zig");
@@ -609,6 +613,10 @@ const prefetch_prefetcht0 = @import("PREFETCH/prefetcht0.zig");
 const prefetch_prefetcht1 = @import("PREFETCH/prefetcht1.zig");
 const prefetch_prefetcht2 = @import("PREFETCH/prefetcht2.zig");
 const prefetch_prefetchnta = @import("PREFETCH/prefetchnta.zig");
+const pxor_pxor = @import("PXOR/PXOR.zig");
+const pxor_vpxor = @import("PXOR/VPXOR.zig");
+const pxor_vpxord = @import("PXOR/VPXORD.zig");
+const pxor_vpxorq = @import("PXOR/VPXORQ.zig");
 const release_tilerelease = @import("RELEASE/tilerelease.zig");
 const reset_hreset = @import("RESET/hreset.zig");
 const resume_rsm = @import("RESUME/rsm.zig");
@@ -789,6 +797,10 @@ pub const specs = blk: {
         spec(kortest_kortestb.meta),
         spec(kortest_kortestq.meta),
         spec(kortest_kortestd.meta),
+        spec(kxor_kxorw.meta),
+        spec(kxor_kxorb.meta),
+        spec(kxor_kxorq.meta),
+        spec(kxor_kxord.meta),
         spec(load_lahf.meta),
         spec(load_lar.meta),
         spec(load_lddqu.meta),
@@ -1300,6 +1312,10 @@ pub const specs = blk: {
         spec(prefetch_prefetcht1.meta),
         spec(prefetch_prefetcht2.meta),
         spec(prefetch_prefetchnta.meta),
+        spec(pxor_pxor.meta),
+        spec(pxor_vpxor.meta),
+        spec(pxor_vpxord.meta),
+        spec(pxor_vpxorq.meta),
         spec(release_tilerelease.meta),
         spec(reset_hreset.meta),
         spec(resume_rsm.meta),
@@ -1492,6 +1508,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     kortest_kortestb.proof_report,
     kortest_kortestq.proof_report,
     kortest_kortestd.proof_report,
+    kxor_kxorw.proof_report,
+    kxor_kxorb.proof_report,
+    kxor_kxorq.proof_report,
+    kxor_kxord.proof_report,
     load_lahf.proof_report,
     load_lar.proof_report,
     load_lddqu.proof_report,
@@ -2003,6 +2023,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     prefetch_prefetcht1.proof_report,
     prefetch_prefetcht2.proof_report,
     prefetch_prefetchnta.proof_report,
+    pxor_pxor.proof_report,
+    pxor_vpxor.proof_report,
+    pxor_vpxord.proof_report,
+    pxor_vpxorq.proof_report,
     release_tilerelease.proof_report,
     reset_hreset.proof_report,
     resume_rsm.proof_report,

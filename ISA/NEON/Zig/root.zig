@@ -84,6 +84,10 @@ const kortest_kortestw = @import("KORTEST/KORTESTW.zig");
 const kortest_kortestb = @import("KORTEST/KORTESTB.zig");
 const kortest_kortestq = @import("KORTEST/KORTESTQ.zig");
 const kortest_kortestd = @import("KORTEST/KORTESTD.zig");
+const kxor_kxorw = @import("KXOR/KXORW.zig");
+const kxor_kxorb = @import("KXOR/KXORB.zig");
+const kxor_kxorq = @import("KXOR/KXORQ.zig");
+const kxor_kxord = @import("KXOR/KXORD.zig");
 const load_lahf = @import("LOAD/LAHF.zig");
 const load_lar = @import("LOAD/LAR.zig");
 const load_lddqu = @import("LOAD/LDDQU.zig");
@@ -607,6 +611,10 @@ const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
 const prefetch_prefetcht1 = @import("PREFETCH/PREFETCHT1.zig");
 const prefetch_prefetcht2 = @import("PREFETCH/PREFETCHT2.zig");
 const prefetch_prefetchnta = @import("PREFETCH/PREFETCHNTA.zig");
+const pxor_pxor = @import("PXOR/PXOR.zig");
+const pxor_vpxor = @import("PXOR/VPXOR.zig");
+const pxor_vpxord = @import("PXOR/VPXORD.zig");
+const pxor_vpxorq = @import("PXOR/VPXORQ.zig");
 const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
 const reset_hreset = @import("RESET/HRESET.zig");
 const resume_rsm = @import("RESUME/RSM.zig");
@@ -858,6 +866,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(kortest_kortestb.family, kortest_kortestb.path, kortest_kortestb.source),
     mirror(kortest_kortestq.family, kortest_kortestq.path, kortest_kortestq.source),
     mirror(kortest_kortestd.family, kortest_kortestd.path, kortest_kortestd.source),
+    mirror(kxor_kxorw.family, kxor_kxorw.path, kxor_kxorw.source),
+    mirror(kxor_kxorb.family, kxor_kxorb.path, kxor_kxorb.source),
+    mirror(kxor_kxorq.family, kxor_kxorq.path, kxor_kxorq.source),
+    mirror(kxor_kxord.family, kxor_kxord.path, kxor_kxord.source),
     mirror(load_lahf.family, load_lahf.path, load_lahf.source),
     mirror(load_lar.family, load_lar.path, load_lar.source),
     mirror(load_lddqu.family, load_lddqu.path, load_lddqu.source),
@@ -1369,6 +1381,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(prefetch_prefetcht1.family, prefetch_prefetcht1.path, prefetch_prefetcht1.source),
     mirror(prefetch_prefetcht2.family, prefetch_prefetcht2.path, prefetch_prefetcht2.source),
     mirror(prefetch_prefetchnta.family, prefetch_prefetchnta.path, prefetch_prefetchnta.source),
+    mirror(pxor_pxor.family, pxor_pxor.path, pxor_pxor.source),
+    mirror(pxor_vpxor.family, pxor_vpxor.path, pxor_vpxor.source),
+    mirror(pxor_vpxord.family, pxor_vpxord.path, pxor_vpxord.source),
+    mirror(pxor_vpxorq.family, pxor_vpxorq.path, pxor_vpxorq.source),
     mirror(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
     mirror(reset_hreset.family, reset_hreset.path, reset_hreset.source),
     mirror(resume_rsm.family, resume_rsm.path, resume_rsm.source),
