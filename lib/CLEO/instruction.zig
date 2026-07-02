@@ -14,6 +14,14 @@ pub fn binary(comptime bits: usize, meta: types.InstructionMeta, lhs: wide.Wide(
     return ops.executeBinary(bits, meta, lhs, rhs, features);
 }
 
+pub fn unary(comptime bits: usize, meta: types.InstructionMeta, src: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    return ops.executeUnary(bits, meta, src, features);
+}
+
+pub fn unaryMasked(comptime bits: usize, meta: types.InstructionMeta, merge: wide.Wide(bits), src: wide.Wide(bits), mask: u64, mode: wide.MaskMode, features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    return ops.executeUnaryMasked(bits, meta, merge, src, mask, mode, features);
+}
+
 pub fn binaryImmediate(comptime bits: usize, meta: types.InstructionMeta, lhs: wide.Wide(bits), rhs: wide.Wide(bits), immediate: u8, features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
     return ops.executeBinaryImmediate(bits, meta, lhs, rhs, immediate, features);
 }

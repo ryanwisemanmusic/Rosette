@@ -10,9 +10,14 @@ pub const VAES = @import("VAES/root.zig");
 pub const SYSTEM = @import("SYSTEM/root.zig");
 
 pub const metas = [_]types.InstructionMeta{
+    AVX.ADDPD.meta,
     AVX.ADDPS.meta,
     AVX.ADDSUBPD.meta,
     AVX.ADDSUBPS.meta,
+    AVX.ANDNPD.meta,
+    AVX.ANDNPS.meta,
+    AVX.ANDPD.meta,
+    AVX.ANDPS.meta,
     AVX.BLENDPD.meta,
     AVX.BLENDPS.meta,
     AVX.BLENDVPD.meta,
@@ -36,6 +41,12 @@ pub const metas = [_]types.InstructionMeta{
     AVX.MOVSLDUP.meta,
     AVX.MOVUPD.meta,
     AVX.MOVUPS.meta,
+    AVX.ORPD.meta,
+    AVX.ORPS.meta,
+    AVX.SQRTPD.meta,
+    AVX.SQRTPS.meta,
+    AVX.SUBPD.meta,
+    AVX.SUBPS.meta,
     AVX.VMOVAPD.meta,
     AVX.VMOVAPS.meta,
     AVX.VMOVDDUP.meta,
@@ -49,6 +60,8 @@ pub const metas = [_]types.InstructionMeta{
     AVX.VMOVUPS.meta,
     AVX.SHUFPD.meta,
     AVX.SHUFPS.meta,
+    AVX.XORPD.meta,
+    AVX.XORPS.meta,
     AVX2.MOVDQA.meta,
     AVX2.MOVDQU.meta,
     AVX2.MOVNTDQ.meta,
@@ -69,7 +82,9 @@ pub const metas = [_]types.InstructionMeta{
     AVX2.VMOVDQU.meta,
     AVX2.VMOVNTDQ.meta,
     AVX2.VMOVNTDQA.meta,
+    AVX2.VPOR.meta,
     AVX512F.ADDPD.meta,
+    AVX512F.ADDPS.meta,
     AVX512F.CMPPD.meta,
     AVX512F.CMPPS.meta,
     AVX512F.DIVPD.meta,
@@ -86,10 +101,14 @@ pub const metas = [_]types.InstructionMeta{
     AVX512F.PMINUQ.meta,
     AVX512F.SHUFPD.meta,
     AVX512F.SHUFPS.meta,
+    AVX512F.SQRTPD.meta,
+    AVX512F.SQRTPS.meta,
     AVX512F.VMOVDQA32.meta,
     AVX512F.VMOVDQA64.meta,
     AVX512F.VMOVDQU32.meta,
     AVX512F.VMOVDQU64.meta,
+    AVX512F.VPORD.meta,
+    AVX512F.VPORQ.meta,
     AVX512F.SUBPD.meta,
     AVX512F.SUBPS.meta,
     AVX512DQ.ORPD.meta,
@@ -174,7 +193,7 @@ pub fn validateRuntimeAbi(runtime_abi: anytype) void {
 }
 
 test "CLEO registry covers current wide ISA tables" {
-    try std.testing.expectEqual(@as(usize, 108), tableCount());
+    try std.testing.expectEqual(@as(usize, 127), tableCount());
     try validateAll();
     const features = types.FeatureSet.cleoEmulated();
     try std.testing.expectEqual(tableCount(), completedCount(features));

@@ -18,6 +18,7 @@ pub const VMOVDQA = @import("VMOVDQA.zig");
 pub const VMOVDQU = @import("VMOVDQU.zig");
 pub const VMOVNTDQ = @import("VMOVNTDQ.zig");
 pub const VMOVNTDQA = @import("VMOVNTDQA.zig");
+pub const VPOR = @import("VPOR.zig");
 
 const types = @import("../types.zig");
 
@@ -42,6 +43,7 @@ pub const metas = [_]types.InstructionMeta{
     VMOVDQU.meta,
     VMOVNTDQ.meta,
     VMOVNTDQA.meta,
+    VPOR.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {

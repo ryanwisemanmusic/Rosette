@@ -1,4 +1,5 @@
 pub const ADDPD = @import("ADDPD.zig");
+pub const ADDPS = @import("ADDPS.zig");
 pub const CMPPD = @import("CMPPD.zig");
 pub const CMPPS = @import("CMPPS.zig");
 pub const DIVPD = @import("DIVPD.zig");
@@ -15,10 +16,14 @@ pub const PMINUD = @import("PMINUD.zig");
 pub const PMINUQ = @import("PMINUQ.zig");
 pub const SHUFPD = @import("SHUFPD.zig");
 pub const SHUFPS = @import("SHUFPS.zig");
+pub const SQRTPD = @import("SQRTPD.zig");
+pub const SQRTPS = @import("SQRTPS.zig");
 pub const VMOVDQA32 = @import("VMOVDQA32.zig");
 pub const VMOVDQA64 = @import("VMOVDQA64.zig");
 pub const VMOVDQU32 = @import("VMOVDQU32.zig");
 pub const VMOVDQU64 = @import("VMOVDQU64.zig");
+pub const VPORD = @import("VPORD.zig");
+pub const VPORQ = @import("VPORQ.zig");
 pub const SUBPD = @import("SUBPD.zig");
 pub const SUBPS = @import("SUBPS.zig");
 
@@ -26,6 +31,7 @@ const types = @import("../types.zig");
 
 pub const metas = [_]types.InstructionMeta{
     ADDPD.meta,
+    ADDPS.meta,
     CMPPD.meta,
     CMPPS.meta,
     DIVPD.meta,
@@ -42,10 +48,14 @@ pub const metas = [_]types.InstructionMeta{
     PMINUQ.meta,
     SHUFPD.meta,
     SHUFPS.meta,
+    SQRTPD.meta,
+    SQRTPS.meta,
     VMOVDQA32.meta,
     VMOVDQA64.meta,
     VMOVDQU32.meta,
     VMOVDQU64.meta,
+    VPORD.meta,
+    VPORQ.meta,
     SUBPD.meta,
     SUBPS.meta,
 };

@@ -1,6 +1,11 @@
+pub const ADDPD = @import("ADDPD.zig");
 pub const ADDPS = @import("ADDPS.zig");
 pub const ADDSUBPD = @import("ADDSUBPD.zig");
 pub const ADDSUBPS = @import("ADDSUBPS.zig");
+pub const ANDNPD = @import("ANDNPD.zig");
+pub const ANDNPS = @import("ANDNPS.zig");
+pub const ANDPD = @import("ANDPD.zig");
+pub const ANDPS = @import("ANDPS.zig");
 pub const BLENDPD = @import("BLENDPD.zig");
 pub const BLENDPS = @import("BLENDPS.zig");
 pub const BLENDVPD = @import("BLENDVPD.zig");
@@ -24,6 +29,12 @@ pub const MOVSHDUP = @import("MOVSHDUP.zig");
 pub const MOVSLDUP = @import("MOVSLDUP.zig");
 pub const MOVUPD = @import("MOVUPD.zig");
 pub const MOVUPS = @import("MOVUPS.zig");
+pub const ORPD = @import("ORPD.zig");
+pub const ORPS = @import("ORPS.zig");
+pub const SQRTPD = @import("SQRTPD.zig");
+pub const SQRTPS = @import("SQRTPS.zig");
+pub const SUBPD = @import("SUBPD.zig");
+pub const SUBPS = @import("SUBPS.zig");
 pub const VMOVAPD = @import("VMOVAPD.zig");
 pub const VMOVAPS = @import("VMOVAPS.zig");
 pub const VMOVDDUP = @import("VMOVDDUP.zig");
@@ -37,13 +48,20 @@ pub const VMOVUPD = @import("VMOVUPD.zig");
 pub const VMOVUPS = @import("VMOVUPS.zig");
 pub const SHUFPD = @import("SHUFPD.zig");
 pub const SHUFPS = @import("SHUFPS.zig");
+pub const XORPD = @import("XORPD.zig");
+pub const XORPS = @import("XORPS.zig");
 
 const types = @import("../types.zig");
 
 pub const metas = [_]types.InstructionMeta{
+    ADDPD.meta,
     ADDPS.meta,
     ADDSUBPD.meta,
     ADDSUBPS.meta,
+    ANDNPD.meta,
+    ANDNPS.meta,
+    ANDPD.meta,
+    ANDPS.meta,
     BLENDPD.meta,
     BLENDPS.meta,
     BLENDVPD.meta,
@@ -67,6 +85,12 @@ pub const metas = [_]types.InstructionMeta{
     MOVSLDUP.meta,
     MOVUPD.meta,
     MOVUPS.meta,
+    ORPD.meta,
+    ORPS.meta,
+    SQRTPD.meta,
+    SQRTPS.meta,
+    SUBPD.meta,
+    SUBPS.meta,
     VMOVAPD.meta,
     VMOVAPS.meta,
     VMOVDDUP.meta,
@@ -80,6 +104,8 @@ pub const metas = [_]types.InstructionMeta{
     VMOVUPS.meta,
     SHUFPD.meta,
     SHUFPS.meta,
+    XORPD.meta,
+    XORPS.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {

@@ -16,6 +16,10 @@ pub const BinaryOp = enum {
     addsub,
 };
 
+pub const UnaryOp = enum {
+    sqrt,
+};
+
 pub const MaskMode = enum {
     merge,
     zero,
@@ -141,6 +145,25 @@ fn applyBinaryScalar(comptime T: type, lhs: T, rhs: T, comptime op: BinaryOp, la
         else
             (if (@typeInfo(T) == .float) lhs + rhs else lhs +% rhs),
     };
+}
+
+fn applyUnaryScalar(comptime T: type, value: T, comptime op: UnaryOp) T {
+    return switch (op) {
+        .sqrt => if (@typeInfo(T) == .float) @sqrt(value) else @compileError("CLEO sqrt requires float lanes"),
+    };
+}
+
+pub fn mapUnary(comptime bits: usize, comptime T: type, src: Wide(bits), comptime op: UnaryOp) Wide(bits) {
+    const lanes = comptime laneCount(bits, T);
+    const input = toArray(bits, T, src);
+    var out: [lanes]T = undefined;
+    for (0..lanes) |lane| out[lane] = applyUnaryScalar(T, input[lane], op);
+    return fromArray(bits, T, out);
+}
+
+pub fn mapUnaryMasked(comptime bits: usize, comptime T: type, merge: Wide(bits), src: Wide(bits), mask: u64, mode: MaskMode, comptime op: UnaryOp) Wide(bits) {
+    const computed = mapUnary(bits, T, src, op);
+    return applyLaneMask(bits, T, merge, computed, mask, mode);
 }
 
 pub fn mapBinary(comptime bits: usize, comptime T: type, lhs: Wide(bits), rhs: Wide(bits), comptime op: BinaryOp) Wide(bits) {
@@ -485,6 +508,12 @@ test "CLEO applies AES rounds per 128-bit block" {
     const lanes = toArray(256, u8, out);
     try std.testing.expectEqual(@as(u8, 0x63), lanes[0]);
     try std.testing.expectEqual(@as(u8, 0x63), lanes[16]);
+}
+
+test "CLEO computes square roots lane-wise" {
+    const src = fromArray(256, f32, .{ 4, 9, 16, 25, 36, 49, 64, 81 });
+    const out = mapUnary(256, f32, src, .sqrt);
+    try std.testing.expectEqual([_]f32{ 2, 3, 4, 5, 6, 7, 8, 9 }, toArray(256, f32, out));
 }
 
 test "CLEO shuffles packed double lanes and applies AVX512 masks" {

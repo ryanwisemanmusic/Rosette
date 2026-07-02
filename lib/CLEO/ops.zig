@@ -1,6 +1,29 @@
 const types = @import("types.zig");
 const wide = @import("wide.zig");
 
+pub fn executeUnary(comptime bits: usize, meta: types.InstructionMeta, src: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    try types.validateMeta(meta);
+    try types.requireFeature(meta, features);
+    try types.requireWidth(meta, bits);
+    return switch (meta.operation) {
+        .sqrt_ps => wide.mapUnary(bits, f32, src, .sqrt),
+        .sqrt_pd => wide.mapUnary(bits, f64, src, .sqrt),
+        else => types.SafetyError.UnsupportedInstructionWidth,
+    };
+}
+
+pub fn executeUnaryMasked(comptime bits: usize, meta: types.InstructionMeta, merge: wide.Wide(bits), src: wide.Wide(bits), mask: u64, mode: wide.MaskMode, features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    try types.validateMeta(meta);
+    try types.requireFeature(meta, features);
+    try types.requireWidth(meta, bits);
+    if (!meta.supports_masking) return types.SafetyError.UnsupportedInstructionWidth;
+    return switch (meta.operation) {
+        .sqrt_ps => wide.mapUnaryMasked(bits, f32, merge, src, mask, mode, .sqrt),
+        .sqrt_pd => wide.mapUnaryMasked(bits, f64, merge, src, mask, mode, .sqrt),
+        else => types.SafetyError.UnsupportedInstructionWidth,
+    };
+}
+
 pub fn executeBinary(comptime bits: usize, meta: types.InstructionMeta, lhs: wide.Wide(bits), rhs: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
     try types.validateMeta(meta);
     try types.requireFeature(meta, features);

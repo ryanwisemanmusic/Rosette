@@ -142,6 +142,8 @@ pub const Operation = enum {
     andn_pd,
     cmp_ps,
     cmp_pd,
+    sqrt_ps,
+    sqrt_pd,
     blend_ps,
     blend_pd,
     blendv_ps,
