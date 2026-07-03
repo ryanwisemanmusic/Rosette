@@ -399,6 +399,15 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const rotate_rorx = @import("ROTATE/RORX.zig");
+const rotate_vprold = @import("ROTATE/VPROLD.zig");
+const rotate_vprolvd = @import("ROTATE/VPROLVD.zig");
+const rotate_vprolq = @import("ROTATE/VPROLQ.zig");
+const rotate_vprolvq = @import("ROTATE/VPROLVQ.zig");
+const rotate_vprord = @import("ROTATE/VPRORD.zig");
+const rotate_vprorvd = @import("ROTATE/VPRORVD.zig");
+const rotate_vprorq = @import("ROTATE/VPRORQ.zig");
+const rotate_vprorvq = @import("ROTATE/VPRORVQ.zig");
 const save_fsave = @import("SAVE/FSAVE.zig");
 const save_fxsave = @import("SAVE/FXSAVE.zig");
 const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
@@ -1119,6 +1128,15 @@ pub const specs = blk: {
         spec(rotate_rcr.meta),
         spec(rotate_rol.meta),
         spec(rotate_ror.meta),
+        spec(rotate_rorx.meta),
+        spec(rotate_vprold.meta),
+        spec(rotate_vprolvd.meta),
+        spec(rotate_vprolq.meta),
+        spec(rotate_vprolvq.meta),
+        spec(rotate_vprord.meta),
+        spec(rotate_vprorvd.meta),
+        spec(rotate_vprorq.meta),
+        spec(rotate_vprorvq.meta),
         spec(save_fsave.meta),
         spec(save_fxsave.meta),
         spec(save_saveprevssp.meta),
@@ -1851,6 +1869,15 @@ pub const proof_reports = [_]proofs.ProofReport{
     rotate_rcr.proof_report,
     rotate_rol.proof_report,
     rotate_ror.proof_report,
+    rotate_rorx.proof_report,
+    rotate_vprold.proof_report,
+    rotate_vprolvd.proof_report,
+    rotate_vprolq.proof_report,
+    rotate_vprolvq.proof_report,
+    rotate_vprord.proof_report,
+    rotate_vprorvd.proof_report,
+    rotate_vprorq.proof_report,
+    rotate_vprorvq.proof_report,
     save_fsave.proof_report,
     save_fxsave.proof_report,
     save_saveprevssp.proof_report,

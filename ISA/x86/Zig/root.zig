@@ -397,6 +397,15 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const rotate_rorx = @import("ROTATE/RORX.zig");
+const rotate_vprold = @import("ROTATE/VPROLD.zig");
+const rotate_vprolvd = @import("ROTATE/VPROLVD.zig");
+const rotate_vprolq = @import("ROTATE/VPROLQ.zig");
+const rotate_vprolvq = @import("ROTATE/VPROLVQ.zig");
+const rotate_vprord = @import("ROTATE/VPRORD.zig");
+const rotate_vprorvd = @import("ROTATE/VPRORVD.zig");
+const rotate_vprorq = @import("ROTATE/VPRORQ.zig");
+const rotate_vprorvq = @import("ROTATE/VPRORVQ.zig");
 const save_fsave = @import("SAVE/FSAVE.zig");
 const save_fxsave = @import("SAVE/FXSAVE.zig");
 const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
@@ -984,6 +993,15 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "RET",
     "ROL",
     "ROR",
+    "RORX",
+    "VPROLD",
+    "VPROLVD",
+    "VPROLQ",
+    "VPROLVQ",
+    "VPRORD",
+    "VPRORVD",
+    "VPRORQ",
+    "VPRORVQ",
     "SUB",
     "SUBPD",
     "SUBPS",
@@ -1693,6 +1711,15 @@ pub const tables = [_]InstructionTable{
     entry(rotate_rcr.family, rotate_rcr.path, rotate_rcr.source),
     entry(rotate_rol.family, rotate_rol.path, rotate_rol.source),
     entry(rotate_ror.family, rotate_ror.path, rotate_ror.source),
+    entry(rotate_rorx.family, rotate_rorx.path, rotate_rorx.source),
+    entry(rotate_vprold.family, rotate_vprold.path, rotate_vprold.source),
+    entry(rotate_vprolvd.family, rotate_vprolvd.path, rotate_vprolvd.source),
+    entry(rotate_vprolq.family, rotate_vprolq.path, rotate_vprolq.source),
+    entry(rotate_vprolvq.family, rotate_vprolvq.path, rotate_vprolvq.source),
+    entry(rotate_vprord.family, rotate_vprord.path, rotate_vprord.source),
+    entry(rotate_vprorvd.family, rotate_vprorvd.path, rotate_vprorvd.source),
+    entry(rotate_vprorq.family, rotate_vprorq.path, rotate_vprorq.source),
+    entry(rotate_vprorvq.family, rotate_vprorvq.path, rotate_vprorvq.source),
     entry(save_fsave.family, save_fsave.path, save_fsave.source),
     entry(save_fxsave.family, save_fxsave.path, save_fxsave.source),
     entry(save_saveprevssp.family, save_saveprevssp.path, save_saveprevssp.source),
