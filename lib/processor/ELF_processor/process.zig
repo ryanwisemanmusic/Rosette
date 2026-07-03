@@ -572,6 +572,58 @@ pub const ElfState = struct {
         if (evaluated.writeback) self.setReg(d.dst_reg, d.size, evaluated.value);
     }
 
+    fn executeHighwayMemoryBinary(
+        self: *ElfState,
+        d: DecodedInsn,
+        op: x64_decoder.highway.BinaryOp,
+        direction: x64_decoder.highway.MemoryDirection,
+    ) void {
+        const width: x64_decoder.highway.Width = switch (d.size) {
+            .bits8 => .bits8,
+            .bits16 => .bits16,
+            .bits32 => .bits32,
+            .bits64 => .bits64,
+        };
+        const access: x64_decoder.highway.MemoryAccess = if (direction == .register_to_memory and op != .cmp and op != .test_bits) .write else .read;
+        const check = x64_decoder.highway.validateRange(0, self.mem.len, d.addr, width, access, true);
+        if (!check.allowed()) {
+            self.faulted = true;
+            self.terminated = true;
+            self.exit_code = 127;
+            return;
+        }
+        const reg = if (direction == .memory_to_register) d.dst_reg else d.src_reg;
+        const evaluated = x64_decoder.highway.evaluateMemory(op, width, self.regVal(reg, d.size), self.readMemVal(d.addr, d.size), direction, self.regs.rflags);
+        self.regs.rflags = evaluated.rflags;
+        if (evaluated.write_register) self.setReg(reg, d.size, evaluated.value);
+        if (evaluated.write_memory) self.writeMemVal(d.addr, d.size, evaluated.value);
+    }
+
+    fn executeHighwayImmediate(self: *ElfState, d: DecodedInsn, op: x64_decoder.highway.BinaryOp, memory: bool, immediate: u64) void {
+        const width: x64_decoder.highway.Width = switch (d.size) {
+            .bits8 => .bits8,
+            .bits16 => .bits16,
+            .bits32 => .bits32,
+            .bits64 => .bits64,
+        };
+        if (memory) {
+            const access: x64_decoder.highway.MemoryAccess = if (op == .cmp or op == .test_bits) .read else .write;
+            const check = x64_decoder.highway.validateRange(0, self.mem.len, d.addr, width, access, true);
+            if (!check.allowed()) {
+                self.faulted = true;
+                self.terminated = true;
+                self.exit_code = 127;
+                return;
+            }
+        }
+        const lhs = if (memory) self.readMemVal(d.addr, d.size) else self.regVal(d.dst_reg, d.size);
+        const evaluated = x64_decoder.highway.evaluate(op, width, lhs, immediate, self.regs.rflags);
+        self.regs.rflags = evaluated.rflags;
+        if (evaluated.writeback) {
+            if (memory) self.writeMemVal(d.addr, d.size, evaluated.value) else self.setReg(d.dst_reg, d.size, evaluated.value);
+        }
+    }
+
     fn setFlag(self: *ElfState, flag: u32, enabled: bool) void {
         if (enabled) {
             self.regs.rflags |= flag;
@@ -861,317 +913,77 @@ pub const ElfState = struct {
             },
 
             // ── add reg, mem (d=1) ──
-            .add_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsAdd(a, b, r, .bits8);
-            },
-            .add_reg16_mem16 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const b = self.readMemVal(d.addr, .bits16);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits16, r);
-                self.setFlagsAdd(a, b, r, .bits16);
-            },
-            .add_reg32_mem32 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const b = self.readMemVal(d.addr, .bits32);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits32, r);
-                self.setFlagsAdd(a, b, r, .bits32);
-            },
-            .add_reg64_mem64 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const b = self.readMemVal(d.addr, .bits64);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits64, r);
-                self.setFlagsAdd(a, b, r, .bits64);
-            },
+            .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64 => self.executeHighwayMemoryBinary(d, .add, .memory_to_register),
 
             // ── add r/m, reg (d=0) ──
-            .add_mem8_reg8 => {
-                const a = self.readMemVal(d.addr, .bits8);
-                const b = self.regVal(d.src_reg, .bits8);
-                const r = a +% b;
-                self.writeMemVal(d.addr, .bits8, r);
-                self.setFlagsAdd(a, b, r, .bits8);
-            },
-            .add_mem16_reg16 => {
-                const a = self.readMemVal(d.addr, .bits16);
-                const b = self.regVal(d.src_reg, .bits16);
-                const r = a +% b;
-                self.writeMemVal(d.addr, .bits16, r);
-                self.setFlagsAdd(a, b, r, .bits16);
-            },
-            .add_mem32_reg32 => {
-                const a = self.readMemVal(d.addr, .bits32);
-                const b = self.regVal(d.src_reg, .bits32);
-                const r = a +% b;
-                self.writeMemVal(d.addr, .bits32, r);
-                self.setFlagsAdd(a, b, r, .bits32);
-            },
-            .add_mem64_reg64 => {
-                const a = self.readMemVal(d.addr, .bits64);
-                const b = self.regVal(d.src_reg, .bits64);
-                const r = a +% b;
-                self.writeMemVal(d.addr, .bits64, r);
-                self.setFlagsAdd(a, b, r, .bits64);
-            },
+            .add_mem8_reg8, .add_mem16_reg16, .add_mem32_reg32, .add_mem64_reg64 => self.executeHighwayMemoryBinary(d, .add, .register_to_memory),
 
             // ── add reg, reg ──
             .add_reg8_reg8, .add_reg16_reg16, .add_reg32_reg32, .add_reg64_reg64 => self.executeHighwayRegisterBinary(d, .add),
             .add_reg8_imm8, .add_reg16_imm8, .add_reg32_imm8, .add_reg64_imm8 => {
-                const a = self.regVal(d.dst_reg, d.size);
                 const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
-                const r = a +% imm;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsAdd(a, imm, r, d.size);
+                self.executeHighwayImmediate(d, .add, false, imm);
             },
-            .adc_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = d.imm;
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a +% b +% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
-            .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
-                const carry: u64 = if ((self.regs.rflags & RFL_CF) != 0) 1 else 0;
-                const operand = imm +% carry;
-                const r = a +% operand;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsAdd(a, operand, r, d.size);
-            },
-            .adc_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a +% b +% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
-            .sbb_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a -% b -% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
+            .adc_reg8_imm8, .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8 => self.executeHighwayImmediate(d, .adc, false, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
+            .adc_reg8_mem8 => self.executeHighwayMemoryBinary(d, .adc, .memory_to_register),
+            .sbb_reg8_mem8 => self.executeHighwayMemoryBinary(d, .sbb, .memory_to_register),
             .add_reg16_imm32, .add_reg32_imm32, .add_reg64_imm32 => {
-                const a = self.regVal(d.dst_reg, d.size);
                 const imm = testImmForSize(d.imm, d.size);
-                const r = a +% imm;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsAdd(a, imm, r, d.size);
+                self.executeHighwayImmediate(d, .add, false, imm);
             },
-            .add_mem8_imm8 => {
-                const a = self.readMemVal(d.addr, .bits8);
-                const imm = d.imm & 0xFF;
-                const r = a +% imm;
-                self.writeMemVal(d.addr, .bits8, r);
-                self.setFlagsAdd(a, imm, r, .bits8);
-            },
-            .add_mem16_imm8, .add_mem32_imm8, .add_mem64_imm8 => {
-                const a = self.readMemVal(d.addr, d.size);
-                const imm = signExtendImm8(d.imm);
-                const r = a +% imm;
-                self.writeMemVal(d.addr, d.size, r);
-                self.setFlagsAdd(a, imm, r, d.size);
-            },
+            .add_mem8_imm8, .add_mem16_imm8, .add_mem32_imm8, .add_mem64_imm8 => self.executeHighwayImmediate(d, .add, true, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
 
             // ── sub reg, mem ──
-            .sub_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsSub(a, b, r, .bits8);
-            },
-            .sub_reg16_mem16 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const b = self.readMemVal(d.addr, .bits16);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits16, r);
-                self.setFlagsSub(a, b, r, .bits16);
-            },
-            .sub_reg32_mem32 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const b = self.readMemVal(d.addr, .bits32);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits32, r);
-                self.setFlagsSub(a, b, r, .bits32);
-            },
-            .sub_reg64_mem64 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const b = self.readMemVal(d.addr, .bits64);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits64, r);
-                self.setFlagsSub(a, b, r, .bits64);
-            },
-            .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64 => {
-                const a = self.readMemVal(d.addr, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const r = a -% b;
-                self.writeMemVal(d.addr, d.size, r);
-                self.setFlagsSub(a, b, r, d.size);
-            },
+            .sub_reg8_mem8, .sub_reg16_mem16, .sub_reg32_mem32, .sub_reg64_mem64 => self.executeHighwayMemoryBinary(d, .sub, .memory_to_register),
+            .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64 => self.executeHighwayMemoryBinary(d, .sub, .register_to_memory),
 
             // ── sub reg, reg ──
             .sub_reg8_reg8, .sub_reg16_reg16, .sub_reg32_reg32, .sub_reg64_reg64 => self.executeHighwayRegisterBinary(d, .sub),
             .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => self.executeHighwayRegisterBinary(d, .sbb),
 
             // ── sub r/m8, imm8 (0x80 /5) ──
-            .sub_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const r = a -% d.imm;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsSub(a, d.imm, r, .bits8);
-            },
-            .sbb_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = d.imm;
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a -% b -% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
-            .sub_reg16_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const imm = signExtendImm8(d.imm);
-                const r = a -% imm;
-                self.setReg(d.dst_reg, .bits16, r);
-                self.setFlagsSub(a, imm, r, .bits16);
-            },
-            .sub_reg32_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const imm = signExtendImm8(d.imm);
-                const r = a -% imm;
-                self.setReg(d.dst_reg, .bits32, r);
-                self.setFlagsSub(a, imm, r, .bits32);
-            },
-            .sub_reg64_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const imm = signExtendImm8(d.imm);
-                const r = a -% imm;
-                self.setReg(d.dst_reg, .bits64, r);
-                self.setFlagsSub(a, imm, r, .bits64);
-            },
-            .sub_mem8_imm8 => {
-                const a = self.readMemVal(d.addr, .bits8);
-                const r = a -% d.imm;
-                self.writeMemVal(d.addr, .bits8, r);
-                self.setFlagsSub(a, d.imm, r, .bits8);
-            },
-            .sub_reg16_imm32, .sub_reg32_imm32, .sub_reg64_imm32 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const r = a -% d.imm;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsSub(a, d.imm, r, d.size);
-            },
+            .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 => self.executeHighwayImmediate(d, .sub, false, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
+            .sbb_reg8_imm8 => self.executeHighwayImmediate(d, .sbb, false, d.imm & 0xFF),
+            .sub_mem8_imm8 => self.executeHighwayImmediate(d, .sub, true, d.imm & 0xFF),
+            .sub_reg16_imm32, .sub_reg32_imm32, .sub_reg64_imm32 => self.executeHighwayImmediate(d, .sub, false, testImmForSize(d.imm, d.size)),
 
             // ── logical register/imm operations ──
             .and_reg8_reg8, .and_reg16_reg16, .and_reg32_reg32, .and_reg64_reg64 => {
                 self.executeHighwayRegisterBinary(d, .bit_and);
             },
             .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const b = self.readMemVal(d.addr, d.size);
-                const r = a & b;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayMemoryBinary(d, .bit_and, .memory_to_register);
             },
             .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64 => {
-                const a = self.readMemVal(d.addr, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const r = a & b;
-                self.writeMemVal(d.addr, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayMemoryBinary(d, .bit_and, .register_to_memory);
             },
             .and_reg8_imm8, .and_reg16_imm8, .and_reg32_imm8, .and_reg64_imm8 => {
-                const a = self.regVal(d.dst_reg, d.size);
                 const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
-                const r = a & imm;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayImmediate(d, .bit_and, false, imm);
             },
-            .and_reg16_imm32, .and_reg32_imm32, .and_reg64_imm32 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const imm = testImmForSize(d.imm, d.size);
-                const r = a & imm;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
-            },
+            .and_reg16_imm32, .and_reg32_imm32, .and_reg64_imm32 => self.executeHighwayImmediate(d, .bit_and, false, testImmForSize(d.imm, d.size)),
             .or_reg8_reg8, .or_reg16_reg16, .or_reg32_reg32, .or_reg64_reg64 => {
                 self.executeHighwayRegisterBinary(d, .bit_or);
             },
             .or_reg8_mem8, .or_reg16_mem16, .or_reg32_mem32, .or_reg64_mem64 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const b = self.readMemVal(d.addr, d.size);
-                const r = a | b;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayMemoryBinary(d, .bit_or, .memory_to_register);
             },
             .or_mem8_reg8, .or_mem16_reg16, .or_mem32_reg32, .or_mem64_reg64 => {
-                const a = self.readMemVal(d.addr, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const r = a | b;
-                self.writeMemVal(d.addr, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayMemoryBinary(d, .bit_or, .register_to_memory);
             },
-            .or_reg8_imm8, .or_reg16_imm8, .or_reg32_imm8, .or_reg64_imm8 => {
-                const r = self.regVal(d.dst_reg, d.size) | d.imm;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
-            },
-            .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8 => {
-                const a = self.readMemVal(d.addr, d.size);
-                const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
-                const r = a | imm;
-                self.writeMemVal(d.addr, d.size, r);
-                self.setFlagsLogic(r, d.size);
-            },
-            .or_mem16_imm32, .or_mem32_imm32, .or_mem64_imm32 => {
-                const a = self.readMemVal(d.addr, d.size);
-                const imm = testImmForSize(d.imm, d.size);
-                const r = a | imm;
-                self.writeMemVal(d.addr, d.size, r);
-                self.setFlagsLogic(r, d.size);
-            },
+            .or_reg8_imm8, .or_reg16_imm8, .or_reg32_imm8, .or_reg64_imm8 => self.executeHighwayImmediate(d, .bit_or, false, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
+            .or_mem8_imm8, .or_mem16_imm8, .or_mem32_imm8, .or_mem64_imm8 => self.executeHighwayImmediate(d, .bit_or, true, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
+            .or_mem16_imm32, .or_mem32_imm32, .or_mem64_imm32 => self.executeHighwayImmediate(d, .bit_or, true, testImmForSize(d.imm, d.size)),
             .xor_reg8_mem8, .xor_reg16_mem16, .xor_reg32_mem32, .xor_reg64_mem64 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const b = self.readMemVal(d.addr, d.size);
-                const r = a ^ b;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayMemoryBinary(d, .bit_xor, .memory_to_register);
             },
             .xor_mem8_reg8, .xor_mem16_reg16, .xor_mem32_reg32, .xor_mem64_reg64 => {
-                const a = self.readMemVal(d.addr, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const r = a ^ b;
-                self.writeMemVal(d.addr, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayMemoryBinary(d, .bit_xor, .register_to_memory);
             },
             .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
                 self.executeHighwayRegisterBinary(d, .bit_xor);
             },
-            .xor_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const r = a ^ (d.imm & 0xFF);
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsLogic(r, .bits8);
-            },
-            .xor_reg16_imm8, .xor_reg32_imm8, .xor_reg64_imm8 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const imm = signExtendImm8(d.imm);
-                const r = a ^ imm;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
-            },
+            .xor_reg8_imm8, .xor_reg16_imm8, .xor_reg32_imm8, .xor_reg64_imm8 => self.executeHighwayImmediate(d, .bit_xor, false, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
             .bsf_reg_reg,
             .bsf_reg_mem,
             .bsr_reg_reg,
@@ -1279,23 +1091,10 @@ pub const ElfState = struct {
                 self.executeHighwayRegisterBinary(d, .test_bits);
             },
             .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64 => {
-                const r = self.readMemVal(d.addr, d.size) & self.regVal(d.src_reg, d.size);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayMemoryBinary(d, .test_bits, .register_to_memory);
             },
-            .test_reg8_imm8 => {
-                const r = self.regVal(d.dst_reg, .bits8) & (d.imm & 0xFF);
-                self.setFlagsLogic(r, .bits8);
-            },
-            .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => {
-                const imm = testImmForSize(d.imm, d.size);
-                const r = self.regVal(d.dst_reg, d.size) & imm;
-                self.setFlagsLogic(r, d.size);
-            },
-            .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => {
-                const imm = testImmForSize(d.imm, d.size);
-                const r = self.readMemVal(d.addr, d.size) & imm;
-                self.setFlagsLogic(r, d.size);
-            },
+            .test_reg8_imm8, .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => self.executeHighwayImmediate(d, .test_bits, false, testImmForSize(d.imm, d.size)),
+            .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => self.executeHighwayImmediate(d, .test_bits, true, testImmForSize(d.imm, d.size)),
             .neg_reg8, .neg_reg16, .neg_reg32, .neg_reg64 => {
                 const a = self.regVal(d.dst_reg, d.size);
                 const r = 0 -% a;
@@ -1316,99 +1115,17 @@ pub const ElfState = struct {
             },
 
             // ── cmp r/m, reg (opcode 0x39) ──
-            .cmp_mem8_reg8 => {
-                const a = self.readMemVal(d.addr, .bits8);
-                const b = self.regVal(d.src_reg, .bits8);
-                self.setFlagsSub(a, b, a -% b, .bits8);
-            },
-            .cmp_mem16_reg16 => {
-                const a = self.readMemVal(d.addr, .bits16);
-                const b = self.regVal(d.src_reg, .bits16);
-                self.setFlagsSub(a, b, a -% b, .bits16);
-            },
-            .cmp_mem32_reg32 => {
-                const a = self.readMemVal(d.addr, .bits32);
-                const b = self.regVal(d.src_reg, .bits32);
-                self.setFlagsSub(a, b, a -% b, .bits32);
-            },
-            .cmp_mem64_reg64 => {
-                const a = self.readMemVal(d.addr, .bits64);
-                const b = self.regVal(d.src_reg, .bits64);
-                self.setFlagsSub(a, b, a -% b, .bits64);
-            },
+            .cmp_mem8_reg8, .cmp_mem16_reg16, .cmp_mem32_reg32, .cmp_mem64_reg64 => self.executeHighwayMemoryBinary(d, .cmp, .register_to_memory),
 
             // ── cmp reg, reg (opcode 0x39, mod=3) ──
             .cmp_reg8_reg8, .cmp_reg16_reg16, .cmp_reg32_reg32, .cmp_reg64_reg64 => self.executeHighwayRegisterBinary(d, .cmp),
 
             // ── cmp reg, r/m (0x3A/0x3B, d=1) ──
-            .cmp_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
-                self.setFlagsSub(a, b, a -% b, .bits8);
-            },
-            .cmp_reg16_mem16 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const b = self.readMemVal(d.addr, .bits16);
-                self.setFlagsSub(a, b, a -% b, .bits16);
-            },
-            .cmp_reg32_mem32 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const b = self.readMemVal(d.addr, .bits32);
-                self.setFlagsSub(a, b, a -% b, .bits32);
-            },
-            .cmp_reg64_mem64 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const b = self.readMemVal(d.addr, .bits64);
-                self.setFlagsSub(a, b, a -% b, .bits64);
-            },
+            .cmp_reg8_mem8, .cmp_reg16_mem16, .cmp_reg32_mem32, .cmp_reg64_mem64 => self.executeHighwayMemoryBinary(d, .cmp, .memory_to_register),
 
             // ── cmp r/m, imm8 (0x83 /7) ──
-            .cmp_mem8_imm8 => {
-                const a = self.readMemVal(d.addr, .bits8);
-                const imm = d.imm & 0xFF;
-                self.setFlagsSub(a, imm, a -% imm, .bits8);
-            },
-            .cmp_mem16_imm8 => {
-                const a = self.readMemVal(d.addr, .bits16);
-                const imm_sext = @as(i16, @as(i8, @bitCast(@as(u8, @truncate(d.imm)))));
-                const imm = @as(u16, @bitCast(imm_sext));
-                self.setFlagsSub(a, imm, a -% imm, .bits16);
-            },
-            .cmp_mem32_imm8 => {
-                const a = self.readMemVal(d.addr, .bits32);
-                const imm_sext = @as(i32, @as(i8, @bitCast(@as(u8, @truncate(d.imm)))));
-                const imm = @as(u32, @bitCast(imm_sext));
-                self.setFlagsSub(a, imm, a -% imm, .bits32);
-            },
-            .cmp_mem64_imm8 => {
-                const a = self.readMemVal(d.addr, .bits64);
-                const imm_sext = @as(i64, @as(i8, @bitCast(@as(u8, @truncate(d.imm)))));
-                const imm = @as(u64, @bitCast(imm_sext));
-                self.setFlagsSub(a, imm, a -% imm, .bits64);
-            },
-            .cmp_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const imm = d.imm & 0xFF;
-                self.setFlagsSub(a, imm, a -% imm, .bits8);
-            },
-            .cmp_reg16_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const imm_sext = @as(i16, @as(i8, @bitCast(@as(u8, @truncate(d.imm)))));
-                const imm = @as(u16, @bitCast(imm_sext));
-                self.setFlagsSub(a, imm, a -% imm, .bits16);
-            },
-            .cmp_reg32_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const imm_sext = @as(i32, @as(i8, @bitCast(@as(u8, @truncate(d.imm)))));
-                const imm = @as(u32, @bitCast(imm_sext));
-                self.setFlagsSub(a, imm, a -% imm, .bits32);
-            },
-            .cmp_reg64_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const imm_sext = @as(i64, @as(i8, @bitCast(@as(u8, @truncate(d.imm)))));
-                const imm = @as(u64, @bitCast(imm_sext));
-                self.setFlagsSub(a, imm, a -% imm, .bits64);
-            },
+            .cmp_mem8_imm8, .cmp_mem16_imm8, .cmp_mem32_imm8, .cmp_mem64_imm8 => self.executeHighwayImmediate(d, .cmp, true, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
+            .cmp_reg8_imm8, .cmp_reg16_imm8, .cmp_reg32_imm8, .cmp_reg64_imm8 => self.executeHighwayImmediate(d, .cmp, false, if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm)),
 
             // ── inc/dec memory ──
             .inc_mem8 => {
@@ -2032,10 +1749,10 @@ pub const ElfState = struct {
 
             // ── Stack and calls ──
             .call_rel32 => {
-                const next_rip = self.regs.rip + d.len;
                 const rel = @as(i64, @bitCast(d.imm));
-                const target = @as(i64, @bitCast(self.regs.rip)) + @as(i64, d.len) + rel;
-                const target_rip = @as(u64, @bitCast(target));
+                const transfer = x64_decoder.highway.relativeControl(.call, self.regs.rip, d.len, rel, true);
+                const next_rip = transfer.return_address.?;
+                const target_rip = transfer.target;
                 if (x64_linux_runtime.tryLocalFunctionShim(self, target_rip, next_rip)) {
                     return;
                 }
@@ -2097,8 +1814,7 @@ pub const ElfState = struct {
 
             // ── Jump short rel8 ──
             .jmp_rel8 => {
-                const target = @as(i64, @bitCast(self.regs.rip)) + d.len + @as(i64, @bitCast(d.imm));
-                self.regs.rip = @as(u64, @bitCast(target));
+                self.regs.rip = x64_decoder.highway.relativeControl(.jump, self.regs.rip, d.len, @bitCast(d.imm), true).target;
                 return;
             },
             .jmp_mem64, .jmp_reg64 => {
@@ -2122,16 +1838,16 @@ pub const ElfState = struct {
 
             // ── Conditional jump rel8 ──
             .jcc_rel8 => {
-                if (evalCond(self.regs.rflags, d.cond)) {
-                    const target = @as(i64, @bitCast(self.regs.rip)) + d.len + @as(i64, @bitCast(d.imm));
-                    self.regs.rip = @as(u64, @bitCast(target));
+                const taken = evalCond(self.regs.rflags, d.cond);
+                if (taken) {
+                    self.regs.rip = x64_decoder.highway.relativeControl(.conditional_jump, self.regs.rip, d.len, @bitCast(d.imm), taken).target;
                     return;
                 }
             },
             .jcc_rel32 => {
-                if (evalCond(self.regs.rflags, d.cond)) {
-                    const target = @as(i64, @bitCast(self.regs.rip)) + d.len + @as(i64, @bitCast(d.imm));
-                    self.regs.rip = @as(u64, @bitCast(target));
+                const taken = evalCond(self.regs.rflags, d.cond);
+                if (taken) {
+                    self.regs.rip = x64_decoder.highway.relativeControl(.conditional_jump, self.regs.rip, d.len, @bitCast(d.imm), taken).target;
                     return;
                 }
             },
@@ -2139,6 +1855,13 @@ pub const ElfState = struct {
             // ── Syscall ──
             .syscall => {
                 const syscall_number = self.regs.rax;
+                const boundary = x64_decoder.highway.systemBoundary(.elf64, .syscall, syscall_number, "");
+                if (boundary.disposition != .forward) {
+                    self.faulted = true;
+                    self.terminated = true;
+                    self.exit_code = 126;
+                    return;
+                }
                 const syscall_fd = self.regs.rdi;
                 const syscall_buf = self.regs.rsi;
                 const syscall_count = self.regs.rdx;
