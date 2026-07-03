@@ -286,6 +286,20 @@ const convert_vcvtsh2sd = @import("CONVERT/VCVTSH2SD.zig");
 const convert_vcvtsh2si = @import("CONVERT/VCVTSH2SI.zig");
 const convert_vcvtsh2ss = @import("CONVERT/VCVTSH2SS.zig");
 const convert_vcvtsh2usi = @import("CONVERT/VCVTSH2USI.zig");
+const convert_vgetexppd = @import("CONVERT/VGETEXPPD.zig");
+const convert_vgetexpph = @import("CONVERT/VGETEXPPH.zig");
+const convert_vgetexpps = @import("CONVERT/VGETEXPPS.zig");
+const convert_vgetexpsd = @import("CONVERT/VGETEXPSD.zig");
+const convert_vgetexpsh = @import("CONVERT/VGETEXPSH.zig");
+const convert_vgetexpss = @import("CONVERT/VGETEXPSS.zig");
+const convert_vpmovb2m = @import("CONVERT/VPMOVB2M.zig");
+const convert_vpmovw2m = @import("CONVERT/VPMOVW2M.zig");
+const convert_vpmovd2m = @import("CONVERT/VPMOVD2M.zig");
+const convert_vpmovq2m = @import("CONVERT/VPMOVQ2M.zig");
+const convert_vpmovm2b = @import("CONVERT/VPMOVM2B.zig");
+const convert_vpmovm2w = @import("CONVERT/VPMOVM2W.zig");
+const convert_vpmovm2d = @import("CONVERT/VPMOVM2D.zig");
+const convert_vpmovm2q = @import("CONVERT/VPMOVM2Q.zig");
 const halt_hlt = @import("HALT/HLT.zig");
 const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
@@ -1665,6 +1679,20 @@ pub const tables = [_]InstructionTable{
     entry(convert_vcvtsh2si.family, convert_vcvtsh2si.path, convert_vcvtsh2si.source),
     entry(convert_vcvtsh2ss.family, convert_vcvtsh2ss.path, convert_vcvtsh2ss.source),
     entry(convert_vcvtsh2usi.family, convert_vcvtsh2usi.path, convert_vcvtsh2usi.source),
+    entry(convert_vgetexppd.family, convert_vgetexppd.path, convert_vgetexppd.source),
+    entry(convert_vgetexpph.family, convert_vgetexpph.path, convert_vgetexpph.source),
+    entry(convert_vgetexpps.family, convert_vgetexpps.path, convert_vgetexpps.source),
+    entry(convert_vgetexpsd.family, convert_vgetexpsd.path, convert_vgetexpsd.source),
+    entry(convert_vgetexpsh.family, convert_vgetexpsh.path, convert_vgetexpsh.source),
+    entry(convert_vgetexpss.family, convert_vgetexpss.path, convert_vgetexpss.source),
+    entry(convert_vpmovb2m.family, convert_vpmovb2m.path, convert_vpmovb2m.source),
+    entry(convert_vpmovw2m.family, convert_vpmovw2m.path, convert_vpmovw2m.source),
+    entry(convert_vpmovd2m.family, convert_vpmovd2m.path, convert_vpmovd2m.source),
+    entry(convert_vpmovq2m.family, convert_vpmovq2m.path, convert_vpmovq2m.source),
+    entry(convert_vpmovm2b.family, convert_vpmovm2b.path, convert_vpmovm2b.source),
+    entry(convert_vpmovm2w.family, convert_vpmovm2w.path, convert_vpmovm2w.source),
+    entry(convert_vpmovm2d.family, convert_vpmovm2d.path, convert_vpmovm2d.source),
+    entry(convert_vpmovm2q.family, convert_vpmovm2q.path, convert_vpmovm2q.source),
     entry(halt_hlt.family, halt_hlt.path, halt_hlt.source),
     entry(loop_loop.family, loop_loop.path, loop_loop.source),
     entry(loop_loope.family, loop_loope.path, loop_loope.source),
@@ -2302,7 +2330,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 605), tableCount());
+    try std.testing.expectEqual(@as(usize, 619), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
