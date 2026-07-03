@@ -721,6 +721,13 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const write_ptwrite = @import("WRITE/PTWRITE.zig");
+const write_wbinvd = @import("WRITE/WBINVD.zig");
+const write_wbnoinvd = @import("WRITE/WBNOINVD.zig");
+const write_wrfsbase = @import("WRITE/WRFSBASE.zig");
+const write_wrgsbase = @import("WRITE/WRGSBASE.zig");
+const write_wrmsr = @import("WRITE/WRMSR.zig");
+const write_wrpkru = @import("WRITE/WRPKRU.zig");
 const absolute_fabs = @import("ABSOLUTE/fabs.zig");
 const absolute_pabsb = @import("ABSOLUTE/pabsb.zig");
 const absolute_pabsd = @import("ABSOLUTE/pabsd.zig");
@@ -1272,6 +1279,13 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "SQRTSD",
     "SQRTSS",
     "VP2INTERSECT",
+    "PTWRITE",
+    "WBINVD",
+    "WBNOINVD",
+    "WRFSBASE",
+    "WRGSBASE",
+    "WRMSR",
+    "WRPKRU",
 };
 
 pub const TableMetadata = struct {
@@ -2038,6 +2052,13 @@ pub const tables = [_]InstructionTable{
     entry(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),
     entry(wait_wait.family, wait_wait.path, wait_wait.source),
     entry(wait_mwait.family, wait_mwait.path, wait_mwait.source),
+    entry(write_ptwrite.family, write_ptwrite.path, write_ptwrite.source),
+    entry(write_wbinvd.family, write_wbinvd.path, write_wbinvd.source),
+    entry(write_wbnoinvd.family, write_wbnoinvd.path, write_wbnoinvd.source),
+    entry(write_wrfsbase.family, write_wrfsbase.path, write_wrfsbase.source),
+    entry(write_wrgsbase.family, write_wrgsbase.path, write_wrgsbase.source),
+    entry(write_wrmsr.family, write_wrmsr.path, write_wrmsr.source),
+    entry(write_wrpkru.family, write_wrpkru.path, write_wrpkru.source),
     entry(absolute_fabs.family, absolute_fabs.path, absolute_fabs.source),
     entry(absolute_pabsb.family, absolute_pabsb.path, absolute_pabsb.source),
     entry(absolute_pabsd.family, absolute_pabsd.path, absolute_pabsd.source),
@@ -2227,7 +2248,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 575), tableCount());
+    try std.testing.expectEqual(@as(usize, 587), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
