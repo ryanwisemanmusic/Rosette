@@ -289,6 +289,20 @@ const convert_vcvtsh2sd = @import("CONVERT/VCVTSH2SD.zig");
 const convert_vcvtsh2si = @import("CONVERT/VCVTSH2SI.zig");
 const convert_vcvtsh2ss = @import("CONVERT/VCVTSH2SS.zig");
 const convert_vcvtsh2usi = @import("CONVERT/VCVTSH2USI.zig");
+const convert_vgetexppd = @import("CONVERT/VGETEXPPD.zig");
+const convert_vgetexpph = @import("CONVERT/VGETEXPPH.zig");
+const convert_vgetexpps = @import("CONVERT/VGETEXPPS.zig");
+const convert_vgetexpsd = @import("CONVERT/VGETEXPSD.zig");
+const convert_vgetexpsh = @import("CONVERT/VGETEXPSH.zig");
+const convert_vgetexpss = @import("CONVERT/VGETEXPSS.zig");
+const convert_vpmovb2m = @import("CONVERT/VPMOVB2M.zig");
+const convert_vpmovw2m = @import("CONVERT/VPMOVW2M.zig");
+const convert_vpmovd2m = @import("CONVERT/VPMOVD2M.zig");
+const convert_vpmovq2m = @import("CONVERT/VPMOVQ2M.zig");
+const convert_vpmovm2b = @import("CONVERT/VPMOVM2B.zig");
+const convert_vpmovm2w = @import("CONVERT/VPMOVM2W.zig");
+const convert_vpmovm2d = @import("CONVERT/VPMOVM2D.zig");
+const convert_vpmovm2q = @import("CONVERT/VPMOVM2Q.zig");
 const halt_hlt = @import("HALT/HLT.zig");
 const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
@@ -1048,6 +1062,20 @@ pub const specs = blk: {
         spec(convert_vcvtsh2si.meta),
         spec(convert_vcvtsh2ss.meta),
         spec(convert_vcvtsh2usi.meta),
+        spec(convert_vgetexppd.meta),
+        spec(convert_vgetexpph.meta),
+        spec(convert_vgetexpps.meta),
+        spec(convert_vgetexpsd.meta),
+        spec(convert_vgetexpsh.meta),
+        spec(convert_vgetexpss.meta),
+        spec(convert_vpmovb2m.meta),
+        spec(convert_vpmovw2m.meta),
+        spec(convert_vpmovd2m.meta),
+        spec(convert_vpmovq2m.meta),
+        spec(convert_vpmovm2b.meta),
+        spec(convert_vpmovm2w.meta),
+        spec(convert_vpmovm2d.meta),
+        spec(convert_vpmovm2q.meta),
         spec(halt_hlt.meta),
         spec(loop_loop.meta),
         spec(loop_loope.meta),
@@ -1819,6 +1847,20 @@ pub const proof_reports = [_]proofs.ProofReport{
     convert_vcvtsh2si.proof_report,
     convert_vcvtsh2ss.proof_report,
     convert_vcvtsh2usi.proof_report,
+    convert_vgetexppd.proof_report,
+    convert_vgetexpph.proof_report,
+    convert_vgetexpps.proof_report,
+    convert_vgetexpsd.proof_report,
+    convert_vgetexpsh.proof_report,
+    convert_vgetexpss.proof_report,
+    convert_vpmovb2m.proof_report,
+    convert_vpmovw2m.proof_report,
+    convert_vpmovd2m.proof_report,
+    convert_vpmovq2m.proof_report,
+    convert_vpmovm2b.proof_report,
+    convert_vpmovm2w.proof_report,
+    convert_vpmovm2d.proof_report,
+    convert_vpmovm2q.proof_report,
     halt_hlt.proof_report,
     loop_loop.proof_report,
     loop_loope.proof_report,

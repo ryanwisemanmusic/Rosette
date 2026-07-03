@@ -287,6 +287,20 @@ const convert_vcvtsh2sd = @import("CONVERT/VCVTSH2SD.zig");
 const convert_vcvtsh2si = @import("CONVERT/VCVTSH2SI.zig");
 const convert_vcvtsh2ss = @import("CONVERT/VCVTSH2SS.zig");
 const convert_vcvtsh2usi = @import("CONVERT/VCVTSH2USI.zig");
+const convert_vgetexppd = @import("CONVERT/VGETEXPPD.zig");
+const convert_vgetexpph = @import("CONVERT/VGETEXPPH.zig");
+const convert_vgetexpps = @import("CONVERT/VGETEXPPS.zig");
+const convert_vgetexpsd = @import("CONVERT/VGETEXPSD.zig");
+const convert_vgetexpsh = @import("CONVERT/VGETEXPSH.zig");
+const convert_vgetexpss = @import("CONVERT/VGETEXPSS.zig");
+const convert_vpmovb2m = @import("CONVERT/VPMOVB2M.zig");
+const convert_vpmovw2m = @import("CONVERT/VPMOVW2M.zig");
+const convert_vpmovd2m = @import("CONVERT/VPMOVD2M.zig");
+const convert_vpmovq2m = @import("CONVERT/VPMOVQ2M.zig");
+const convert_vpmovm2b = @import("CONVERT/VPMOVM2B.zig");
+const convert_vpmovm2w = @import("CONVERT/VPMOVM2W.zig");
+const convert_vpmovm2d = @import("CONVERT/VPMOVM2D.zig");
+const convert_vpmovm2q = @import("CONVERT/VPMOVM2Q.zig");
 const halt_hlt = @import("HALT/HLT.zig");
 const loop_loop = @import("LOOP/LOOP.zig");
 const loop_loope = @import("LOOP/LOOPE.zig");
@@ -1117,6 +1131,20 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(convert_vcvtsh2si.family, convert_vcvtsh2si.path, convert_vcvtsh2si.source),
     mirror(convert_vcvtsh2ss.family, convert_vcvtsh2ss.path, convert_vcvtsh2ss.source),
     mirror(convert_vcvtsh2usi.family, convert_vcvtsh2usi.path, convert_vcvtsh2usi.source),
+    mirror(convert_vgetexppd.family, convert_vgetexppd.path, convert_vgetexppd.source),
+    mirror(convert_vgetexpph.family, convert_vgetexpph.path, convert_vgetexpph.source),
+    mirror(convert_vgetexpps.family, convert_vgetexpps.path, convert_vgetexpps.source),
+    mirror(convert_vgetexpsd.family, convert_vgetexpsd.path, convert_vgetexpsd.source),
+    mirror(convert_vgetexpsh.family, convert_vgetexpsh.path, convert_vgetexpsh.source),
+    mirror(convert_vgetexpss.family, convert_vgetexpss.path, convert_vgetexpss.source),
+    mirror(convert_vpmovb2m.family, convert_vpmovb2m.path, convert_vpmovb2m.source),
+    mirror(convert_vpmovw2m.family, convert_vpmovw2m.path, convert_vpmovw2m.source),
+    mirror(convert_vpmovd2m.family, convert_vpmovd2m.path, convert_vpmovd2m.source),
+    mirror(convert_vpmovq2m.family, convert_vpmovq2m.path, convert_vpmovq2m.source),
+    mirror(convert_vpmovm2b.family, convert_vpmovm2b.path, convert_vpmovm2b.source),
+    mirror(convert_vpmovm2w.family, convert_vpmovm2w.path, convert_vpmovm2w.source),
+    mirror(convert_vpmovm2d.family, convert_vpmovm2d.path, convert_vpmovm2d.source),
+    mirror(convert_vpmovm2q.family, convert_vpmovm2q.path, convert_vpmovm2q.source),
     mirror(halt_hlt.family, halt_hlt.path, halt_hlt.source),
     mirror(loop_loop.family, loop_loop.path, loop_loop.source),
     mirror(loop_loope.family, loop_loope.path, loop_loope.source),
