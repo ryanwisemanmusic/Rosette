@@ -390,6 +390,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    cleo_module.addImport("isa_highway", isa_highway_module);
     const contract_mod = b.createModule(.{
         .root_source_file = b.path("../lib/Contract/root.zig"),
         .target = target,
@@ -597,6 +598,7 @@ pub fn build(b: *std.Build) void {
     x86_asm_module.addImport("runtime_abi_handshake", runtime_abi_module);
     x86_asm_module.addImport("abort_trap_taxonomy", abort_trap_taxonomy_module);
     x86_asm_module.addImport("isa_registry", isa_module);
+    x86_asm_module.addImport("isa_highway", isa_highway_module);
     x86_asm_module.addImport("entrypoint_code_text_segment", entrypoint_code_text_segment_module);
     x86_asm_module.addImport("bridge_register_tracing", bridge_register_trace_module);
     x86_asm_module.addImport("bridge_memory", bridge_memory_module);
