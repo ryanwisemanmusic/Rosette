@@ -198,6 +198,7 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
         .mov_reg_imm => ex.regs.set(decoded.register.?, decoded.immediate),
         .binary => switch (decoded.operand.?) {
             .reg => |rm_register| {
+                if (decoded.locked) return stopRawUnsupported(ex, start_eip, decoded, "LOCK requires a writable memory destination");
                 const to_reg = (decoded.opcode & 0x02) != 0;
                 if (decoded.width == .bits8) {
                     const dst = if (to_reg) decoded.byte_register.? else decoded.byte_rm_register.?;
@@ -219,7 +220,16 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
                 const address = memory.resolve(&ex.regs) orelse
                     return stopRawUnsupported(ex, start_eip, decoded, "shared memory transaction address overflowed PE32");
                 const direction: highway.MemoryDirection = if ((decoded.opcode & 0x02) != 0) .memory_to_register else .register_to_memory;
-                const access: highway.MemoryAccess = if (direction == .register_to_memory and decoded.binary_op.? != .cmp and decoded.binary_op.? != .test_bits) .write else .read;
+                if (decoded.locked and (direction != .register_to_memory or decoded.binary_op.? == .cmp or decoded.binary_op.? == .test_bits))
+                    return stopRawUnsupported(ex, start_eip, decoded, "LOCK requires a read-modify-write operation");
+                const access: highway.MemoryAccess = if (decoded.locked)
+                    .atomic_read_modify_write
+                else if (direction == .register_to_memory and decoded.binary_op.? != .cmp and decoded.binary_op.? != .test_bits)
+                    .write
+                else
+                    .read;
+                const atomic = highway.validateAtomic(address, decoded.width, decoded.locked);
+                if (!atomic.allowed()) return stopRawUnsupported(ex, start_eip, decoded, @tagName(atomic.fault.?));
                 const range = highway.validateRange(ex.mem.base, ex.mem.data.len, address, decoded.width, access, true);
                 if (!range.allowed()) return stopRawUnsupported(ex, start_eip, decoded, @tagName(range.fault.?));
                 const register_value = if (decoded.width == .bits8)
@@ -227,6 +237,7 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
                 else
                     readRegisterWidth(&ex.regs, decoded.register.?, decoded.width);
                 const memory_value = readMemoryWidth(&ex.mem, address, decoded.width);
+                var transaction = highway.beginAtomic(address, decoded.width, .sequential, decoded.locked, memory_value);
                 const evaluated = highway.evaluateMemory(decoded.binary_op.?, decoded.width, register_value, memory_value, direction, ex.regs.flags.raw());
                 ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
                 if (evaluated.write_register) {
@@ -235,7 +246,10 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
                     else
                         writeRegisterWidth(&ex.regs, decoded.register.?, decoded.width, evaluated.value);
                 }
-                if (evaluated.write_memory) writeMemoryWidth(&ex.mem, address, decoded.width, evaluated.value);
+                if (evaluated.write_memory) {
+                    writeMemoryWidth(&ex.mem, address, decoded.width, evaluated.value);
+                    highway.commitAtomic(&transaction, evaluated.value);
+                }
             },
         },
         .binary_immediate => switch (decoded.operand.?) {
@@ -258,13 +272,19 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
                     return stopRawUnsupported(ex, start_eip, decoded, "immediate memory transaction address overflowed PE32");
                 const check = highway.validateAtomic(address, decoded.width, decoded.locked);
                 if (!check.allowed()) return stopRawUnsupported(ex, start_eip, decoded, @tagName(check.fault.?));
+                if (decoded.locked and (decoded.binary_op.? == .cmp or decoded.binary_op.? == .test_bits))
+                    return stopRawUnsupported(ex, start_eip, decoded, "LOCK requires a read-modify-write operation");
                 const access: highway.MemoryAccess = if (decoded.locked) .atomic_read_modify_write else .write;
                 const range = highway.validateRange(ex.mem.base, ex.mem.data.len, address, decoded.width, access, true);
                 if (!range.allowed()) return stopRawUnsupported(ex, start_eip, decoded, @tagName(range.fault.?));
                 const lhs = readMemoryWidth(&ex.mem, address, decoded.width);
+                var transaction = highway.beginAtomic(address, decoded.width, .sequential, decoded.locked, lhs);
                 const evaluated = highway.evaluate(decoded.binary_op.?, decoded.width, lhs, decoded.immediate, ex.regs.flags.raw());
                 ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
-                if (evaluated.writeback) writeMemoryWidth(&ex.mem, address, decoded.width, evaluated.value);
+                if (evaluated.writeback) {
+                    writeMemoryWidth(&ex.mem, address, decoded.width, evaluated.value);
+                    highway.commitAtomic(&transaction, evaluated.value);
+                }
             },
         },
         .group5_inc => switch (decoded.operand.?) {

@@ -13,6 +13,10 @@ pub const TerminationReason = enum(u8) {
     unresolved_import_result = 9,
     invalid_control_flow_target = 10,
     cxx_exception = 11,
+    memory_access_violation = 12,
+    runtime_invariant_failure = 13,
+    initializer_transaction_failure = 14,
+    system_policy_rejected = 15,
 };
 
 pub const StopOwner = enum {
@@ -66,6 +70,49 @@ pub const TraceEntry = struct {
     rax: u64 = 0,
     rcx: u64 = 0,
     rdx: u64 = 0,
+};
+
+pub const TerminalInstruction = struct {
+    address: u64 = 0,
+    op: []const u8 = "",
+    length: u8 = 0,
+    bytes: [16]u8 = [_]u8{0} ** 16,
+    byte_count: u8 = 0,
+};
+
+pub const StackEntry = struct {
+    slot_address: u64 = 0,
+    value: u64 = 0,
+    symbol: []const u8 = "",
+    symbol_offset: u64 = 0,
+};
+
+pub const MemoryAccessFailure = struct {
+    instruction_address: u64 = 0,
+    instruction: []const u8 = "",
+    address: u64 = 0,
+    bytes: u8 = 0,
+    access: []const u8 = "",
+    fault: []const u8 = "",
+    mapped: bool = false,
+};
+
+pub const MemoryAccessEvent = struct {
+    instruction_address: u64 = 0,
+    instruction: []const u8 = "",
+    address: u64 = 0,
+    bytes: u8 = 0,
+    access: []const u8 = "",
+    value: u64 = 0,
+    backed: bool = false,
+    near_null: bool = false,
+};
+
+pub const RuntimeContext = struct {
+    phase: []const u8 = "",
+    steps: u64 = 0,
+    phase_start_step: u64 = 0,
+    initializer: []const u8 = "",
 };
 
 pub const SymbolizedAddress = struct {
@@ -127,9 +174,14 @@ pub const ExitReport = struct {
     rip: u64,
     regs: TerminalRegs,
     last_instructions: []const TraceEntry = &.{},
+    terminal_instruction: ?TerminalInstruction = null,
+    stack_entries: []const StackEntry = &.{},
     terminal_symbol: ?SymbolizedAddress = null,
     dependency_calls: []const DependencyCall = &.{},
     control_transfer_failure: ?ControlTransferFailure = null,
+    memory_access_failure: ?MemoryAccessFailure = null,
+    recent_memory_accesses: []const MemoryAccessEvent = &.{},
+    runtime_context: ?RuntimeContext = null,
     unresolved_import_calls: u64 = 0,
     attribution: ?Attribution = null,
     cxx_exception: ?CxxExceptionReport = null,
@@ -166,6 +218,41 @@ pub fn logExitReport(report: ExitReport) void {
 
     if (report.detail.len > 0) {
         std.debug.print("  detail:       {s}\n", .{report.detail});
+    }
+
+    if (report.runtime_context) |context| {
+        std.debug.print("  runtime:      phase={s} steps={d} phase_start={d}", .{ context.phase, context.steps, context.phase_start_step });
+        if (context.initializer.len != 0) std.debug.print(" initializer={s}", .{context.initializer});
+        std.debug.print("\n", .{});
+    }
+
+    if (report.terminal_instruction) |instruction| {
+        std.debug.print("  \x1b[33mterminal instruction:\x1b[0m\n", .{});
+        std.debug.print("    rip=0x{x} op={s} len={d} bytes={any}\n", .{
+            instruction.address,
+            instruction.op,
+            instruction.length,
+            instruction.bytes[0..instruction.byte_count],
+        });
+    }
+
+    if (report.memory_access_failure) |failure| {
+        std.debug.print("  \x1b[33mmemory access failure:\x1b[0m\n", .{});
+        std.debug.print(
+            "    instruction={s} rip=0x{x} access={s} address=0x{x} bytes={d}\n",
+            .{ failure.instruction, failure.instruction_address, failure.access, failure.address, failure.bytes },
+        );
+        std.debug.print("    fault={s} mapped={}\n", .{ failure.fault, failure.mapped });
+    }
+
+    if (report.recent_memory_accesses.len > 0) {
+        std.debug.print("  \x1b[33mrecent scalar memory accesses (oldest first):\x1b[0m\n", .{});
+        for (report.recent_memory_accesses, 0..) |event, i| {
+            std.debug.print(
+                "    [{d:>2}] rip=0x{x} op={s} {s} addr=0x{x} bytes={d} value=0x{x} backed={} near_null={}\n",
+                .{ i, event.instruction_address, event.instruction, event.access, event.address, event.bytes, event.value, event.backed, event.near_null },
+            );
+        }
     }
 
     if (report.cxx_exception) |exception| {
@@ -247,6 +334,17 @@ pub fn logExitReport(report: ExitReport) void {
         }
     }
 
+    if (report.stack_entries.len > 0) {
+        std.debug.print("  \x1b[33mstack snapshot:\x1b[0m\n", .{});
+        for (report.stack_entries, 0..) |entry, i| {
+            if (entry.symbol.len != 0) {
+                std.debug.print("    [{d:>2}] 0x{x}: 0x{x} -> {s}+0x{x}\n", .{ i, entry.slot_address, entry.value, entry.symbol, entry.symbol_offset });
+            } else {
+                std.debug.print("    [{d:>2}] 0x{x}: 0x{x}\n", .{ i, entry.slot_address, entry.value });
+            }
+        }
+    }
+
     const trace = report.last_instructions;
     if (trace.len > 0) {
         std.debug.print("  \x1b[33mlast {d} instructions (oldest first):\x1b[0m\n", .{trace.len});
@@ -279,6 +377,10 @@ pub fn reasonLabel(reason: TerminationReason) []const u8 {
         .unresolved_import_result => "guest result depends on unresolved Mach-O imports",
         .invalid_control_flow_target => "control flow entered non-executable memory",
         .cxx_exception => "guest raised a C++ exception requiring incomplete phase-two unwinding",
+        .memory_access_violation => "guest instruction accessed invalid or forbidden memory",
+        .runtime_invariant_failure => "Rosette stopped without recording a concrete terminal event",
+        .initializer_transaction_failure => "initializer transaction could not begin, commit, or roll back",
+        .system_policy_rejected => "system boundary policy rejected the guest operation",
     };
 }
 
@@ -347,6 +449,30 @@ pub fn attribute(input: AttributionInput) Attribution {
             .evidence = "Guest control flow reached an address Rosette could not execute.",
             .next_action = "Inspect the last branch, imported thunk, and mapped executable ranges.",
         },
+        .memory_access_violation => .{
+            .owner = .rosette_runtime,
+            .authority = .diagnostic_only,
+            .evidence = "A decoded guest instruction requested memory outside the active mapping or permissions.",
+            .next_action = "Inspect the effective address, access width, terminal instruction bytes, and caller stack.",
+        },
+        .runtime_invariant_failure => .{
+            .owner = .rosette_runtime,
+            .authority = .diagnostic_only,
+            .evidence = "Rosette marked execution faulted without preserving a more specific terminal reason.",
+            .next_action = "Treat this as a runtime instrumentation defect and inspect the captured terminal evidence.",
+        },
+        .initializer_transaction_failure => .{
+            .owner = .rosette_runtime,
+            .authority = .diagnostic_only,
+            .evidence = "Rosette could not preserve initializer state transactionally.",
+            .next_action = "Inspect initializer journal capacity, rollback state, and the active initializer record.",
+        },
+        .system_policy_rejected => .{
+            .owner = .rosette_runtime,
+            .authority = .diagnostic_only,
+            .evidence = "The shared system-boundary policy rejected forwarding or emulation.",
+            .next_action = "Inspect the syscall/import domain, number or symbol, and backend policy.",
+        },
         .unknown => .{
             .owner = .indeterminate,
             .authority = .diagnostic_only,
@@ -392,6 +518,20 @@ pub fn normalizeReason(reason: TerminationReason, unresolved_import_calls: u64) 
     return reason;
 }
 
+pub const RuntimeEvidence = struct {
+    faulted: bool = false,
+    memory_access_failure: bool = false,
+    control_transfer_failure: bool = false,
+};
+
+pub fn inferReason(reason: TerminationReason, evidence: RuntimeEvidence) TerminationReason {
+    if (reason != .unknown) return reason;
+    if (evidence.memory_access_failure) return .memory_access_violation;
+    if (evidence.control_transfer_failure) return .invalid_control_flow_target;
+    if (evidence.faulted) return .runtime_invariant_failure;
+    return .unknown;
+}
+
 test "C++ exception stop is attributed to missing Rosette unwinding" {
     const result = attribute(.{ .reason = .cxx_exception, .faulted = false });
     try std.testing.expectEqual(StopOwner.rosette_runtime, result.owner);
@@ -422,5 +562,16 @@ test "unresolved import reason requires a concrete dependency record" {
     try std.testing.expectEqual(
         TerminationReason.unresolved_import_result,
         normalizeReason(.unresolved_import_result, 1),
+    );
+}
+
+test "unknown runtime faults are classified from captured evidence" {
+    try std.testing.expectEqual(
+        TerminationReason.memory_access_violation,
+        inferReason(.unknown, .{ .faulted = true, .memory_access_failure = true }),
+    );
+    try std.testing.expectEqual(
+        TerminationReason.runtime_invariant_failure,
+        inferReason(.unknown, .{ .faulted = true }),
     );
 }

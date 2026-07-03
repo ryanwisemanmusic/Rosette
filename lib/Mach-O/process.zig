@@ -51,6 +51,7 @@ const MEM_BASE: u64 = 0x0;
 const PAGE_SIZE: u64 = 4096;
 const TRACE_BUFFER_LEN: usize = 256;
 const IMPORT_TRACE_BUFFER_LEN: usize = 64;
+const MEMORY_TRACE_BUFFER_LEN: usize = 64;
 const STUB_ENTRY_SIZE: u64 = 10;
 const UNSUPPORTED_RUNTIME_EXIT_CODE: u64 = 125;
 const GUEST_FILE_BASE: u64 = 0xFFFF_FF10_0000_0000;
@@ -235,6 +236,10 @@ pub const MachOState = struct {
     unresolved_import_count: u64 = 0,
     pending_control_transfer: ?ControlTransferContext = null,
     terminal_control_transfer: ?exit_diagnostics.ControlTransferFailure = null,
+    terminal_memory_failure: ?exit_diagnostics.MemoryAccessFailure = null,
+    memory_trace_entries: [MEMORY_TRACE_BUFFER_LEN]exit_diagnostics.MemoryAccessEvent = [_]exit_diagnostics.MemoryAccessEvent{.{}} ** MEMORY_TRACE_BUFFER_LEN,
+    memory_trace_index: usize = 0,
+    memory_trace_filled: bool = false,
     guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
     bound_import_thunks: []BoundImportThunk = &.{},
     decode_cache: []DecodeCacheEntry,
@@ -587,21 +592,54 @@ pub const MachOState = struct {
     }
 
     pub fn readMemVal(self: *MachOState, addr: u64, size: Size) u64 {
-        return switch (size) {
+        const value = switch (size) {
             .bits8 => self.read8(addr),
             .bits16 => self.read16(addr),
             .bits32 => self.read32(addr),
             .bits64 => self.read64(addr),
         };
+        self.recordMemoryAccess(addr, size, "read", value);
+        return value;
     }
 
     pub fn writeMemVal(self: *MachOState, addr: u64, size: Size, val: u64) void {
+        self.recordMemoryAccess(addr, size, "write", val);
         switch (size) {
             .bits8 => self.write8(addr, @intCast(val & 0xFF)),
             .bits16 => self.write16(addr, @intCast(val & 0xFFFF)),
             .bits32 => self.write32(addr, @intCast(val & 0xFFFFFFFF)),
             .bits64 => self.write64(addr, val),
         }
+    }
+
+    fn recordMemoryAccess(self: *MachOState, address: u64, size: Size, access: []const u8, value: u64) void {
+        const bytes: u8 = switch (size) {
+            .bits8 => 1,
+            .bits16 => 2,
+            .bits32 => 4,
+            .bits64 => 8,
+        };
+        const offset = self.addrToOffset(address);
+        const backed = if (offset) |off| off + bytes <= self.mem.len else false;
+        const trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        const instruction = if (trace_count == 0)
+            "<runtime>"
+        else blk: {
+            const latest_index = if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1;
+            break :blk @tagName(self.trace_entries[latest_index].op);
+        };
+        self.memory_trace_entries[self.memory_trace_index] = .{
+            .instruction_address = self.regs.rip,
+            .instruction = instruction,
+            .address = address,
+            .bytes = bytes,
+            .access = access,
+            .value = value,
+            .backed = backed,
+            .near_null = address < PAGE_SIZE,
+        };
+        self.memory_trace_index = (self.memory_trace_index + 1) % MEMORY_TRACE_BUFFER_LEN;
+        if (self.memory_trace_index == 0) self.memory_trace_filled = true;
     }
 
     pub fn readMem128(self: *const MachOState, addr: u64) [16]u8 {
@@ -1909,6 +1947,7 @@ pub const MachOState = struct {
             self.faulted = true;
             self.terminated = true;
             self.exit_code = 126;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.system_policy_rejected);
             return;
         }
         const return_address = self.read64(self.regs.rsp);
@@ -2504,9 +2543,7 @@ pub const MachOState = struct {
         const access: x64_decoder.highway.MemoryAccess = if (direction == .register_to_memory and op != .cmp and op != .test_bits) .write else .read;
         const check = x64_decoder.highway.validateRange(0, self.mem.len, d.addr, width, access, true);
         if (!check.allowed()) {
-            self.faulted = true;
-            self.terminated = true;
-            self.exit_code = 127;
+            self.terminateForMemoryAccess(check, @tagName(op));
             return;
         }
         const reg = if (direction == .memory_to_register) d.dst_reg else d.src_reg;
@@ -2523,6 +2560,14 @@ pub const MachOState = struct {
             .bits32 => .bits32,
             .bits64 => .bits64,
         };
+        if (memory) {
+            const access: x64_decoder.highway.MemoryAccess = if (op == .cmp or op == .test_bits) .read else .write;
+            const check = x64_decoder.highway.validateRange(0, self.mem.len, d.addr, width, access, true);
+            if (!check.allowed()) {
+                self.terminateForMemoryAccess(check, @tagName(op));
+                return;
+            }
+        }
         const lhs = if (memory) self.readMemVal(d.addr, size) else self.regVal(d.dst_reg, size);
         const evaluated = x64_decoder.highway.evaluate(op, width, lhs, d.imm, self.regs.rflags);
         self.regs.rflags = evaluated.rflags;
@@ -2537,6 +2582,22 @@ pub const MachOState = struct {
         } else {
             self.regs.rflags &= ~flag;
         }
+    }
+
+    fn terminateForMemoryAccess(self: *MachOState, check: x64_decoder.highway.MemoryCheck, instruction: []const u8) void {
+        self.terminal_memory_failure = .{
+            .instruction_address = self.regs.rip,
+            .instruction = instruction,
+            .address = check.address,
+            .bytes = check.bytes,
+            .access = @tagName(check.access),
+            .fault = if (check.fault) |fault| @tagName(fault) else "backend_rejected",
+            .mapped = self.addrToOffset(check.address) != null,
+        };
+        self.faulted = true;
+        self.terminated = true;
+        self.exit_code = 127;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.memory_access_violation);
     }
 
     fn bitWidth(size: Size) u7 {
@@ -2714,6 +2775,7 @@ pub const MachOState = struct {
             )) {
                 self.faulted = true;
                 self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.initializer_transaction_failure);
                 self.terminated = true;
                 return .failed;
             }
@@ -2762,6 +2824,7 @@ pub const MachOState = struct {
                 );
                 self.faulted = true;
                 self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.initializer_transaction_failure);
                 self.terminated = true;
                 return .failed;
             }
@@ -2832,6 +2895,7 @@ pub const MachOState = struct {
             );
             self.faulted = true;
             self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.initializer_transaction_failure);
             self.terminated = true;
             return .failed;
         }
@@ -3339,11 +3403,16 @@ pub const MachOState = struct {
             }
         }
         const recorded_reason = exit_diagnostics.reasonFromValue(self.termination_reason);
-        const normalized_reason = exit_diagnostics.normalizeReason(recorded_reason, self.unresolved_import_count);
+        const inferred_reason = exit_diagnostics.inferReason(recorded_reason, .{
+            .faulted = self.faulted,
+            .memory_access_failure = self.terminal_memory_failure != null,
+            .control_transfer_failure = self.terminal_control_transfer != null,
+        });
+        const normalized_reason = exit_diagnostics.normalizeReason(inferred_reason, self.unresolved_import_count);
         if (normalized_reason != recorded_reason) {
             std.debug.print(
-                "macho-processor: diagnostics invariant repaired: reason={s} but unresolved_imports=0; reclassified={s}\n",
-                .{ @tagName(recorded_reason), @tagName(normalized_reason) },
+                "macho-processor: diagnostics invariant repaired: reason={s} faulted={} reclassified={s}\n",
+                .{ @tagName(recorded_reason), self.faulted, @tagName(normalized_reason) },
             );
             self.termination_reason = @intFromEnum(normalized_reason);
         }
@@ -3395,6 +3464,13 @@ pub const MachOState = struct {
             .attribution = attribution,
             .execution_authoritative = attribution.authority == .authoritative,
             .control_transfer_failure = self.terminal_control_transfer,
+            .memory_access_failure = self.terminal_memory_failure,
+            .runtime_context = .{
+                .phase = @tagName(self.startup.phase),
+                .steps = self.executed_steps,
+                .phase_start_step = self.startup.phase_start_step,
+                .initializer = if (self.initializer_resolver.current()) |initializer| initializer.symbol else "",
+            },
         };
 
         if (self.isExecutableAddress(self.regs.rip)) {
@@ -3406,6 +3482,38 @@ pub const MachOState = struct {
                 };
             }
         }
+
+        const terminal_trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        if (terminal_trace_count > 0) {
+            const latest_index = if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1;
+            const latest = self.trace_entries[latest_index];
+            var terminal = exit_diagnostics.TerminalInstruction{
+                .address = latest.rip,
+                .op = @tagName(latest.op),
+                .length = latest.len,
+            };
+            if (self.guestMemoryConst(latest.rip, terminal.bytes.len)) |bytes| {
+                terminal.byte_count = @intCast(@min(bytes.len, terminal.bytes.len));
+                @memcpy(terminal.bytes[0..terminal.byte_count], bytes[0..terminal.byte_count]);
+            }
+            report.terminal_instruction = terminal;
+        }
+
+        var stack_buf: [16]exit_diagnostics.StackEntry = undefined;
+        var stack_count: usize = 0;
+        var stack_address = self.regs.rsp;
+        while (stack_count < stack_buf.len) : (stack_address +%= 8) {
+            const offset = self.addrToOffset(stack_address) orelse break;
+            if (offset + 8 > self.mem.len) break;
+            const value = self.read64(stack_address);
+            stack_buf[stack_count] = .{ .slot_address = stack_address, .value = value };
+            if (self.metadata.nearestSymbol(value)) |symbol| {
+                stack_buf[stack_count].symbol = symbol.name;
+                stack_buf[stack_count].symbol_offset = symbol.offset;
+            }
+            stack_count += 1;
+        }
+        report.stack_entries = stack_buf[0..stack_count];
 
         if (self.cxx_exceptions.last_throw) |thrown| {
             var exception_report = exit_diagnostics.CxxExceptionReport{
@@ -3439,6 +3547,17 @@ pub const MachOState = struct {
                 "Rosette completed Itanium phase-one frame and catch inspection; this frame was not safe for phase-two context installation.";
         }
 
+        const memory_trace_count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
+        var memory_trace_buf: [MEMORY_TRACE_BUFFER_LEN]exit_diagnostics.MemoryAccessEvent = undefined;
+        for (0..memory_trace_count) |i| {
+            const index = if (self.memory_trace_filled)
+                (self.memory_trace_index + i) % MEMORY_TRACE_BUFFER_LEN
+            else
+                i;
+            memory_trace_buf[i] = self.memory_trace_entries[index];
+        }
+        report.recent_memory_accesses = memory_trace_buf[0..memory_trace_count];
+
         const import_trace_count: usize = if (self.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else self.import_trace_index;
         if (import_trace_count > 0) {
             var import_trace_buf: [IMPORT_TRACE_BUFFER_LEN]exit_diagnostics.DependencyCall = undefined;
@@ -3462,7 +3581,7 @@ pub const MachOState = struct {
             report.detail = "The interpreter did not execute these dynamic-library functions; the guest exit code is not authoritative.";
         }
 
-        const trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        const trace_count: usize = terminal_trace_count;
         if (trace_count > 0) {
             var trace_buf: [TRACE_BUFFER_LEN]exit_diagnostics.TraceEntry = undefined;
             for (0..trace_count) |i| {
@@ -3751,14 +3870,8 @@ pub const MachOState = struct {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.test_mem8_reg8) + @intFromEnum(Size.bits8));
                 self.executeHighwayMemoryBinary(d, .test_bits, sz, .register_to_memory);
             },
-            .test_reg8_imm8, .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => {
-                const r = self.regVal(d.dst_reg, d.size) & d.imm;
-                self.setFlagsLogic(r, d.size);
-            },
-            .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => {
-                const r = self.readMemVal(d.addr, d.size) & d.imm;
-                self.setFlagsLogic(r, d.size);
-            },
+            .test_reg8_imm8, .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => self.executeHighwayImmediate(d, .test_bits, d.size, false),
+            .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => self.executeHighwayImmediate(d, .test_bits, d.size, true),
 
             .inc_mem8, .inc_mem16, .inc_mem32, .inc_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.inc_mem8) + @intFromEnum(Size.bits8));
@@ -4587,6 +4700,7 @@ pub const MachOState = struct {
                     self.faulted = true;
                     self.terminated = true;
                     self.exit_code = 126;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.system_policy_rejected);
                     return;
                 }
                 self.dispatchMacOSSyscall(

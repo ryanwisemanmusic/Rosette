@@ -206,6 +206,23 @@ pub const AtomicTransaction = struct {
     committed: bool,
 };
 
+pub fn beginAtomic(address: u64, width: Width, order: AtomicOrder, locked: bool, before: u64) AtomicTransaction {
+    return .{
+        .address = address,
+        .width = width,
+        .order = order,
+        .locked = locked,
+        .before = before,
+        .after = before,
+        .committed = false,
+    };
+}
+
+pub fn commitAtomic(transaction: *AtomicTransaction, after: u64) void {
+    transaction.after = after & widthMask(transaction.width);
+    transaction.committed = true;
+}
+
 pub fn validateAtomic(address: u64, width: Width, locked: bool) MemoryCheck {
     const bytes: u8 = width.bits() / 8;
     return .{
@@ -289,7 +306,8 @@ pub const SimdRequest = struct {
 pub fn simdProvider(backend: Backend, request: SimdRequest) SimdProvider {
     if (request.vector_bits > 512 or request.element_bits == 0) return .pending;
     return switch (backend) {
-        .elf64, .macho64, .pe32 => .cleo,
+        .elf64, .macho64 => .cleo,
+        .pe32 => .pending,
         .cs218 => .native_adapter,
     };
 }
@@ -441,6 +459,10 @@ test "control, atomic, SIMD, and system boundaries are explicit" {
     const locked = validateAtomic(3, .bits32, true);
     try std.testing.expect(locked.allowed());
     try std.testing.expectEqual(MemoryAccess.atomic_read_modify_write, locked.access);
+    var transaction = beginAtomic(3, .bits32, .sequential, true, 10);
+    commitAtomic(&transaction, 9);
+    try std.testing.expect(transaction.committed);
+    try std.testing.expectEqual(@as(u64, 9), transaction.after);
     try std.testing.expectEqual(MemoryFault.unmapped, validateRange(0x1000, 16, 0x1010, .bits32, .read, true).fault.?);
     try std.testing.expectEqual(SimdProvider.cleo, simdProvider(.macho64, .{ .mnemonic = "VADDPS", .vector_bits = 256, .element_bits = 32 }));
     try std.testing.expectEqual(SystemDisposition.deny, systemBoundary(.elf64, .privileged, 0, "HLT").disposition);

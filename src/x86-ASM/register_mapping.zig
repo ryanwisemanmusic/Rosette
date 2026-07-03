@@ -49,6 +49,10 @@ pub const Register = enum(u4) {
         if (std.mem.eql(u8, lower, "cl")) return .ecx;
         if (std.mem.eql(u8, lower, "dl")) return .edx;
         if (std.mem.eql(u8, lower, "bl")) return .ebx;
+        if (std.mem.eql(u8, lower, "ah")) return .eax;
+        if (std.mem.eql(u8, lower, "ch")) return .ecx;
+        if (std.mem.eql(u8, lower, "dh")) return .edx;
+        if (std.mem.eql(u8, lower, "bh")) return .ebx;
         return null;
     }
 };
@@ -62,6 +66,18 @@ pub const ByteRegister = struct {
             .{ .base = @enumFromInt(@as(u4, bits)) }
         else
             .{ .base = @enumFromInt(@as(u4, bits - 4)), .high = true };
+    }
+
+    pub fn fromName(name: []const u8) ?ByteRegister {
+        if (std.ascii.eqlIgnoreCase(name, "al")) return .{ .base = .eax };
+        if (std.ascii.eqlIgnoreCase(name, "cl")) return .{ .base = .ecx };
+        if (std.ascii.eqlIgnoreCase(name, "dl")) return .{ .base = .edx };
+        if (std.ascii.eqlIgnoreCase(name, "bl")) return .{ .base = .ebx };
+        if (std.ascii.eqlIgnoreCase(name, "ah")) return .{ .base = .eax, .high = true };
+        if (std.ascii.eqlIgnoreCase(name, "ch")) return .{ .base = .ecx, .high = true };
+        if (std.ascii.eqlIgnoreCase(name, "dh")) return .{ .base = .edx, .high = true };
+        if (std.ascii.eqlIgnoreCase(name, "bh")) return .{ .base = .ebx, .high = true };
+        return null;
     }
 };
 
@@ -488,8 +504,17 @@ test "register fromName" {
     try testing.expectEqual(Register.eax, Register.fromName("eax").?);
     try testing.expectEqual(Register.eax, Register.fromName("ax").?);
     try testing.expectEqual(Register.eax, Register.fromName("al").?);
+    try testing.expectEqual(Register.eax, Register.fromName("ah").?);
     try testing.expectEqual(Register.ecx, Register.fromName("cx").?);
     try testing.expectEqual(null, Register.fromName("foo"));
+}
+
+test "byte register names preserve low and legacy high aliases" {
+    try testing.expectEqual(ByteRegister{ .base = .eax }, ByteRegister.fromName("AL").?);
+    try testing.expectEqual(ByteRegister{ .base = .eax, .high = true }, ByteRegister.fromName("ah").?);
+    try testing.expectEqual(ByteRegister{ .base = .ecx, .high = true }, ByteRegister.fromName("ch").?);
+    try testing.expectEqual(ByteRegister{ .base = .edx, .high = true }, ByteRegister.fromName("dh").?);
+    try testing.expectEqual(ByteRegister{ .base = .ebx, .high = true }, ByteRegister.fromName("bh").?);
 }
 
 test "push/pop" {
