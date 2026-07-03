@@ -82,6 +82,10 @@ const jmp_jpo = @import("JMP/JPO.zig");
 const jmp_jrcxz = @import("JMP/JRCXZ.zig");
 const jmp_js = @import("JMP/JS.zig");
 const jmp_jz = @import("JMP/JZ.zig");
+const kand_kandw = @import("KAND/KANDW.zig");
+const kand_kandb = @import("KAND/KANDB.zig");
+const kand_kandq = @import("KAND/KANDQ.zig");
+const kand_kandd = @import("KAND/KANDD.zig");
 const kortest_kortestw = @import("KORTEST/KORTESTW.zig");
 const kortest_kortestb = @import("KORTEST/KORTESTB.zig");
 const kortest_kortestq = @import("KORTEST/KORTESTQ.zig");
@@ -410,6 +414,10 @@ const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
 const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
+const vptestm_vptestmb = @import("VPTESTM/VPTESTMB.zig");
+const vptestm_vptestmw = @import("VPTESTM/VPTESTMW.zig");
+const vptestm_vptestmd = @import("VPTESTM/VPTESTMD.zig");
+const vptestm_vptestmq = @import("VPTESTM/VPTESTMQ.zig");
 const xor_xor = @import("XOR/XOR.zig");
 const xor_xorpd = @import("XOR/XORPD.zig");
 const xor_xorps = @import("XOR/XORPS.zig");
@@ -603,6 +611,10 @@ const examine_fxam = @import("EXAMINE/FXAM.zig");
 const expand_vpexpandb = @import("EXPAND/vpexpandb.zig");
 const expand_vpexpandw = @import("EXPAND/vpexpandw.zig");
 const free_ffree = @import("FREE/FFREE.zig");
+const pand_pand = @import("PAND/PAND.zig");
+const pand_vpand = @import("PAND/VPAND.zig");
+const pand_vpandd = @import("PAND/VPANDD.zig");
+const pand_vpandq = @import("PAND/VPANDQ.zig");
 const partial_fpatan = @import("PARTIAL/FPATAN.zig");
 const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
@@ -796,6 +808,10 @@ pub const specs = blk: {
         spec(jmp_jrcxz.meta),
         spec(jmp_js.meta),
         spec(jmp_jz.meta),
+        spec(kand_kandw.meta),
+        spec(kand_kandb.meta),
+        spec(kand_kandq.meta),
+        spec(kand_kandd.meta),
         spec(kortest_kortestw.meta),
         spec(kortest_kortestb.meta),
         spec(kortest_kortestq.meta),
@@ -1112,6 +1128,10 @@ pub const specs = blk: {
         spec(unordered_vucomish.meta),
         spec(verify_verr.meta),
         spec(verify_verw.meta),
+        spec(vptestm_vptestmb.meta),
+        spec(vptestm_vptestmw.meta),
+        spec(vptestm_vptestmd.meta),
+        spec(vptestm_vptestmq.meta),
         spec(xor_xor.meta),
         spec(xor_xorpd.meta),
         spec(xor_xorps.meta),
@@ -1305,6 +1325,10 @@ pub const specs = blk: {
         spec(expand_vpexpandb.meta),
         spec(expand_vpexpandw.meta),
         spec(free_ffree.meta),
+        spec(pand_pand.meta),
+        spec(pand_vpand.meta),
+        spec(pand_vpandd.meta),
+        spec(pand_vpandq.meta),
         spec(partial_fpatan.meta),
         spec(partial_fprem.meta),
         spec(partial_fprem1.meta),
@@ -1510,6 +1534,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     jmp_jrcxz.proof_report,
     jmp_js.proof_report,
     jmp_jz.proof_report,
+    kand_kandw.proof_report,
+    kand_kandb.proof_report,
+    kand_kandq.proof_report,
+    kand_kandd.proof_report,
     kortest_kortestw.proof_report,
     kortest_kortestb.proof_report,
     kortest_kortestq.proof_report,
@@ -1826,6 +1854,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     unordered_vucomish.proof_report,
     verify_verr.proof_report,
     verify_verw.proof_report,
+    vptestm_vptestmb.proof_report,
+    vptestm_vptestmw.proof_report,
+    vptestm_vptestmd.proof_report,
+    vptestm_vptestmq.proof_report,
     xor_xor.proof_report,
     xor_xorpd.proof_report,
     xor_xorps.proof_report,
@@ -2019,6 +2051,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     expand_vpexpandb.proof_report,
     expand_vpexpandw.proof_report,
     free_ffree.proof_report,
+    pand_pand.proof_report,
+    pand_vpand.proof_report,
+    pand_vpandd.proof_report,
+    pand_vpandq.proof_report,
     partial_fpatan.proof_report,
     partial_fprem.proof_report,
     partial_fprem1.proof_report,

@@ -80,6 +80,10 @@ const jmp_jpo = @import("JMP/JPO.zig");
 const jmp_jrcxz = @import("JMP/JRCXZ.zig");
 const jmp_js = @import("JMP/JS.zig");
 const jmp_jz = @import("JMP/JZ.zig");
+const kand_kandw = @import("KAND/KANDW.zig");
+const kand_kandb = @import("KAND/KANDB.zig");
+const kand_kandq = @import("KAND/KANDQ.zig");
+const kand_kandd = @import("KAND/KANDD.zig");
 const kortest_kortestw = @import("KORTEST/KORTESTW.zig");
 const kortest_kortestb = @import("KORTEST/KORTESTB.zig");
 const kortest_kortestq = @import("KORTEST/KORTESTQ.zig");
@@ -408,6 +412,10 @@ const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
 const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
+const vptestm_vptestmb = @import("VPTESTM/VPTESTMB.zig");
+const vptestm_vptestmw = @import("VPTESTM/VPTESTMW.zig");
+const vptestm_vptestmd = @import("VPTESTM/VPTESTMD.zig");
+const vptestm_vptestmq = @import("VPTESTM/VPTESTMQ.zig");
 const xor_xor = @import("XOR/XOR.zig");
 const xor_xorpd = @import("XOR/XORPD.zig");
 const xor_xorps = @import("XOR/XORPS.zig");
@@ -601,6 +609,10 @@ const examine_fxam = @import("EXAMINE/FXAM.zig");
 const expand_vpexpandb = @import("EXPAND/VPEXPANDB.zig");
 const expand_vpexpandw = @import("EXPAND/VPEXPANDW.zig");
 const free_ffree = @import("FREE/FFREE.zig");
+const pand_pand = @import("PAND/PAND.zig");
+const pand_vpand = @import("PAND/VPAND.zig");
+const pand_vpandd = @import("PAND/VPANDD.zig");
+const pand_vpandq = @import("PAND/VPANDQ.zig");
 const partial_fpatan = @import("PARTIAL/FPATAN.zig");
 const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
@@ -865,6 +877,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(jmp_jrcxz.family, jmp_jrcxz.path, jmp_jrcxz.source),
     mirror(jmp_js.family, jmp_js.path, jmp_js.source),
     mirror(jmp_jz.family, jmp_jz.path, jmp_jz.source),
+    mirror(kand_kandw.family, kand_kandw.path, kand_kandw.source),
+    mirror(kand_kandb.family, kand_kandb.path, kand_kandb.source),
+    mirror(kand_kandq.family, kand_kandq.path, kand_kandq.source),
+    mirror(kand_kandd.family, kand_kandd.path, kand_kandd.source),
     mirror(kortest_kortestw.family, kortest_kortestw.path, kortest_kortestw.source),
     mirror(kortest_kortestb.family, kortest_kortestb.path, kortest_kortestb.source),
     mirror(kortest_kortestq.family, kortest_kortestq.path, kortest_kortestq.source),
@@ -1181,6 +1197,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(unordered_vucomish.family, unordered_vucomish.path, unordered_vucomish.source),
     mirror(verify_verr.family, verify_verr.path, verify_verr.source),
     mirror(verify_verw.family, verify_verw.path, verify_verw.source),
+    mirror(vptestm_vptestmb.family, vptestm_vptestmb.path, vptestm_vptestmb.source),
+    mirror(vptestm_vptestmw.family, vptestm_vptestmw.path, vptestm_vptestmw.source),
+    mirror(vptestm_vptestmd.family, vptestm_vptestmd.path, vptestm_vptestmd.source),
+    mirror(vptestm_vptestmq.family, vptestm_vptestmq.path, vptestm_vptestmq.source),
     mirror(xor_xor.family, xor_xor.path, xor_xor.source),
     mirror(xor_xorpd.family, xor_xorpd.path, xor_xorpd.source),
     mirror(xor_xorps.family, xor_xorps.path, xor_xorps.source),
@@ -1374,6 +1394,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(expand_vpexpandb.family, expand_vpexpandb.path, expand_vpexpandb.source),
     mirror(expand_vpexpandw.family, expand_vpexpandw.path, expand_vpexpandw.source),
     mirror(free_ffree.family, free_ffree.path, free_ffree.source),
+    mirror(pand_pand.family, pand_pand.path, pand_pand.source),
+    mirror(pand_vpand.family, pand_vpand.path, pand_vpand.source),
+    mirror(pand_vpandd.family, pand_vpandd.path, pand_vpandd.source),
+    mirror(pand_vpandq.family, pand_vpandq.path, pand_vpandq.source),
     mirror(partial_fpatan.family, partial_fpatan.path, partial_fpatan.source),
     mirror(partial_fprem.family, partial_fprem.path, partial_fprem.source),
     mirror(partial_fprem1.family, partial_fprem1.path, partial_fprem1.source),
