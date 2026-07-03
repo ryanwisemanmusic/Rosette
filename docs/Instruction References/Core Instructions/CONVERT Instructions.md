@@ -4250,3 +4250,812 @@ Invalid, Precision.
 Other Exceptions:
 
 EVEX-encoded instructions, see Table 2-48, “Type E3NF Class Exception Conditions.”
+
+
+VGETEXPPD — Convert Exponents of Packed Double Precision Floating-Point Values to DoublePrecision Floating-Point Values
+
+Opcode/Instruction	                                                        Op/En	64/32 Bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.66.0F38.W1 42 /r VGETEXPPD xmm1 {k1}{z}, xmm2/m128/m64bcst	        A	    V/V	                    AVX512VL AVX512F	Convert the exponent of packed double precision floating-point values in the source operand to double precision floating-point results representing unbiased integer exponents and stores the results in the destination register.
+EVEX.256.66.0F38.W1 42 /r VGETEXPPD ymm1 {k1}{z}, ymm2/m256/m64bcst	        A	    V/V	                    AVX512VL AVX512F	Convert the exponent of packed double precision floating-point values in the source operand to double precision floating-point results representing unbiased integer exponents and stores the results in the destination register.
+EVEX.512.66.0F38.W1 42 /r VGETEXPPD zmm1 {k1}{z}, zmm2/m512/m64bcst{sae}	A	    V/V	                    AVX512F	            Convert the exponent of packed double precision floating-point values in the source operand to double precision floating-point results representing unbiased integer exponents and stores the results in the destination under writemask k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	    Operand 2	    Operand 3	Operand 4
+A	    Full	    ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+Extracts the biased exponents from the normalized double precision floating-point representation of each qword data element of the source operand (the second operand) as unbiased signed integer value, or convert the denormal representation of input data to unbiased negative integer values. Each integer value of the unbiased exponent is converted to double precision floating-point value and written to the corresponding qword elements of the destination operand (the first operand) as double precision floating-point numbers.
+
+The destination operand is a ZMM/YMM/XMM register and updated under the writemask. The source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location, or a 512/256/128-bit vector broadcasted from a 64-bit memory location.
+
+EVEX.vvvv is reserved and must be 1111b, otherwise instructions will #UD.
+
+Each GETEXP operation converts the exponent value into a floating-point number (permitting input value in denormal representation). Special cases of input values are listed in Table 5-15.
+
+The formula is:
+
+GETEXP(x) = floor(log2(|x|))
+
+Notation floor(x) stands for the greatest integer not exceeding real number x.
+
+Operation:
+
+NormalizeExpTinyDPFP(SRC[63:0])
+{
+    // Jbit is the hidden integral bit of a floating-point number. In case of denormal number it has the value of ZERO.
+    Src.Jbit := 0;
+    Dst.exp := 1;
+    Dst.fraction := SRC[51:0];
+    WHILE(Src.Jbit = 0)
+    {
+        Src.Jbit := Dst.fraction[51];
+                        // Get the fraction MSB
+        Dst.fraction := Dst.fraction << 1 ;
+                            // One bit shift left
+        Dst.exp-- ;
+                // Decrement the exponent
+    }
+    Dst.fraction := 0;
+    Dst.sign := 1;
+    TMP[63:0] := MXCSR.DAZ? 0 : (Dst.sign << 63) OR (Dst.exp << 52) OR (Dst.fraction) ;
+    Return (TMP[63:0]);
+}
+ConvertExpDPFP(SRC[63:0])
+{
+    Src.sign := 0;
+                // Zero out sign bit
+    Src.exp := SRC[62:52];
+    Src.fraction := SRC[51:0];
+    // Check for NaN
+    IF (SRC = NaN)
+    {
+        IF ( SRC = SNAN ) SET IE;
+        Return QNAN(SRC);
+    }
+    // Check for +INF
+    IF (Src = +INF) RETURN (Src);
+    // check if zero operand
+    IF ((Src.exp = 0) AND ((Src.fraction = 0) OR (MXCSR.DAZ = 1))) Return (-INF);
+    }
+    ELSE // check if denormal operand (notice that MXCSR.DAZ = 0)
+    {
+        IF ((Src.exp = 0) AND (Src.fraction != 0))
+        {
+            TMP[63:0] := NormalizeExpTinyDPFP(SRC[63:0]) ;
+                                // Get Normalized Exponent
+            Set #DE
+        }
+        ELSE // exponent value is correct
+        {
+            TMP[63:0] := (Src.sign << 63) OR (Src.exp << 52) OR (Src.fraction) ;
+        }
+        TMP := SAR(TMP, 52) ;
+                    // Shift Arithmetic Right
+        TMP := TMP – 1023;
+                    // Subtract Bias
+        Return CvtI2D(TMP);
+                    // Convert INT to double precision floating-point number
+    }
+}
+
+VGETEXPPD (EVEX encoded versions):
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 64
+    IF k1[j] OR *no writemask*
+        THEN
+            IF (EVEX.b = 1) AND (SRC *is memory*)
+                THEN
+                    DEST[i+63:i] :=
+            ConvertExpDPFP(SRC[63:0])
+                ELSE
+                    DEST[i+63:i] :=
+            ConvertExpDPFP(SRC[i+63:i])
+            FI;
+        ELSE
+            IF *merging-masking*
+                THEN *DEST[i+63:i] remains unchanged*
+                ELSE ; zeroing-masking
+                    DEST[i+63:i] := 0
+            FI
+    FI;
+ENDFOR
+DEST[MAXVL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VGETEXPPD __m512d _mm512_getexp_pd(__m512d a);
+VGETEXPPD __m512d _mm512_mask_getexp_pd(__m512d s, __mmask8 k, __m512d a);
+VGETEXPPD __m512d _mm512_maskz_getexp_pd( __mmask8 k, __m512d a);
+VGETEXPPD __m512d _mm512_getexp_round_pd(__m512d a, int sae);
+VGETEXPPD __m512d _mm512_mask_getexp_round_pd(__m512d s, __mmask8 k, __m512d a, int sae);
+VGETEXPPD __m512d _mm512_maskz_getexp_round_pd( __mmask8 k, __m512d a, int sae);
+VGETEXPPD __m256d _mm256_getexp_pd(__m256d a);
+VGETEXPPD __m256d _mm256_mask_getexp_pd(__m256d s, __mmask8 k, __m256d a);
+VGETEXPPD __m256d _mm256_maskz_getexp_pd( __mmask8 k, __m256d a);
+VGETEXPPD __m128d _mm_getexp_pd(__m128d a);
+VGETEXPPD __m128d _mm_mask_getexp_pd(__m128d s, __mmask8 k, __m128d a);
+VGETEXPPD __m128d _mm_maskz_getexp_pd( __mmask8 k, __m128d a);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions:
+
+See Table 2-46, “Type E2 Class Exception Conditions.”
+
+Additionally:
+
+#UD:
+	If EVEX.vvvv != 1111B.
+
+
+
+VGETEXPPH — Convert Exponents of Packed FP16 Values to FP16 Values
+
+Opcode/Instruction	                                                        Op/En	64/32 Bit Mode Support	CPUID Feature Flag	    Description
+EVEX.128.66.MAP6.W0 42 /r VGETEXPPH xmm1{k1}{z}, xmm2/m128/m16bcst	        A	    V/V	                    AVX512-FP16 AVX512VL	Convert the exponent of FP16 values in the source operand to FP16 results representing unbiased integer exponents and stores the results in the destination register subject to writemask k1.
+EVEX.256.66.MAP6.W0 42 /r VGETEXPPH ymm1{k1}{z}, ymm2/m256/m16bcst	        A	    V/V	                    AVX512-FP16 AVX512VL	Convert the exponent of FP16 values in the source operand to FP16 results representing unbiased integer exponents and stores the results in the destination register subject to writemask k1.
+EVEX.512.66.MAP6.W0 42 /r VGETEXPPH zmm1{k1}{z}, zmm2/m512/m16bcst {sae}	A	    V/V	                    AVX512-FP16	            Convert the exponent of FP16 values in the source operand to FP16 results representing unbiased integer exponents and stores the results in the destination register subject to writemask k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	Operand 4
+A	    Full	ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+This instruction extracts the biased exponents from the normalized FP16 representation of each word element of the source operand (the second operand) as unbiased signed integer value, or convert the denormal representation of input data to unbiased negative integer values. Each integer value of the unbiased exponent is converted to an FP16 value and written to the corresponding word elements of the destination operand (the first operand) as FP16 numbers.
+
+The destination elements are updated according to the writemask.
+
+Each GETEXP operation converts the exponent value into a floating-point number (permitting input value in denormal representation). Special cases of input values are listed in Table 5-6.
+
+The formula is:
+
+GETEXP(x) = floor(log2(|x|))
+
+Notation floor(x) stands for maximal integer not exceeding real number x.
+
+Software usage of VGETEXPxx and VGETMANTxx instructions generally involve a combination of GETEXP operation and GETMANT operation (see VGETMANTPH). Thus, the VGETEXPPH instruction does not require software to handle SIMD floating-point exceptions.
+
+
+Operation:
+
+def normalize_exponent_tiny_fp16(src):
+    jbit := 0
+    // src & dst are FP16 numbers with sign(1b), exp(5b) and fraction (10b) fields
+    dst.exp := 1 // write bits 14:10
+    dst.fraction := src.fraction // copy bits 9:0
+    while jbit == 0:
+        jbit := dst.fraction[9] // msb of the fraction
+        dst.fraction := dst.fraction << 1
+        dst.exp := dst.exp - 1
+    dst.fraction := 0
+    return dst
+def getexp_fp16(src):
+    src.sign := 0 // make positive
+    exponent_all_ones := (src[14:10] == 0x1F)
+    exponent_all_zeros := (src[14:10] == 0)
+    mantissa_all_zeros := (src[9:0] == 0)
+    zero := exponent_all_zeros and mantissa_all_zeros
+    signaling_bit := src[9]
+    nan := exponent_all_ones and not(mantissa_all_zeros)
+    snan := nan and not(signaling_bit)
+    qnan := nan and signaling_bit
+    positive_infinity := not(negative) and exponent_all_ones and mantissa_all_zeros
+    denormal := exponent_all_zeros and not(mantissa_all_zeros)
+    if nan:
+        if snan:
+            MXCSR.IE := 1
+        return qnan(src)
+                // convert snan to a qnan
+    if positive_infinity:
+        return src
+    if zero:
+        return -INF
+    if denormal:
+        tmp := normalize_exponent_tiny_fp16(src)
+        MXCSR.DE := 1
+    else:
+        tmp := src
+    tmp := SAR(tmp, 10) // shift arithmetic right
+    tmp := tmp - 15 // subtract bias
+    return convert_integer_to_fp16(tmp)
+
+VGETEXPPH dest{k1}, src:
+
+VL = 128, 256 or 512
+KL := VL/16
+FOR i := 0 to KL-1:
+    IF k1[i] or *no writemask*:
+        IF SRC is memory and (EVEX.b = 1):
+            tsrc := src.fp16[0]
+        ELSE:
+            tsrc := src.fp16[i]
+        DEST.fp16[i] := getexp_fp16(tsrc)
+    ELSE IF *zeroing*:
+        DEST.fp16[i] := 0
+    //else DEST.fp16[i] remains unchanged
+DEST[MAXVL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VGETEXPPH __m128h _mm_getexp_ph (__m128h a);
+VGETEXPPH __m128h _mm_mask_getexp_ph (__m128h src, __mmask8 k, __m128h a);
+VGETEXPPH __m128h _mm_maskz_getexp_ph (__mmask8 k, __m128h a);
+VGETEXPPH __m256h _mm256_getexp_ph (__m256h a);
+VGETEXPPH __m256h _mm256_mask_getexp_ph (__m256h src, __mmask16 k, __m256h a);
+VGETEXPPH __m256h _mm256_maskz_getexp_ph (__mmask16 k, __m256h a);
+VGETEXPPH __m512h _mm512_getexp_ph (__m512h a);
+VGETEXPPH __m512h _mm512_mask_getexp_ph (__m512h src, __mmask32 k, __m512h a);
+VGETEXPPH __m512h _mm512_maskz_getexp_ph (__mmask32 k, __m512h a);
+VGETEXPPH __m512h _mm512_getexp_round_ph (__m512h a, const int sae);
+VGETEXPPH __m512h _mm512_mask_getexp_round_ph (__m512h src, __mmask32 k, __m512h a, const int sae);
+VGETEXPPH __m512h _mm512_maskz_getexp_round_ph (__mmask32 k, __m512h a, const int sae);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-46, “Type E2 Class Exception Conditions.”
+
+
+VGETEXPPS — Convert Exponents of Packed Single Precision Floating-Point Values to SinglePrecision Floating-Point Values
+
+Opcode/Instruction	                                                        Op/En	64/32 Bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.66.0F38.W0 42 /r VGETEXPPS xmm1 {k1}{z}, xmm2/m128/m32bcst	        A	    V/V	                    AVX512VL AVX512F	Convert the exponent of packed single-precision floating-point values in the source operand to single-precision floating-point results representing unbiased integer exponents and stores the results in the destination register.
+EVEX.256.66.0F38.W0 42 /r VGETEXPPS ymm1 {k1}{z}, ymm2/m256/m32bcst	        A	    V/V	                    AVX512VL AVX512F	Convert the exponent of packed single-precision floating-point values in the source operand to single-precision floating-point results representing unbiased integer exponents and stores the results in the destination register.
+EVEX.512.66.0F38.W0 42 /r VGETEXPPS zmm1 {k1}{z}, zmm2/m512/m32bcst{sae}	A	    V/V	                        AVX512F	        Convert the exponent of packed single-precision floating-point values in the source operand to single-precision floating-point results representing unbiased integer exponents and stores the results in the destination register.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	    Operand 2	    Operand 3	Operand 4
+A	    Full	    ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+Extracts the biased exponents from the normalized single-precision floating-point representation of each dword element of the source operand (the second operand) as unbiased signed integer value, or convert the denormal representation of input data to unbiased negative integer values. Each integer value of the unbiased exponent is converted to single-precision floating-point value and written to the corresponding dword elements of the destination operand (the first operand) as single-precision floating-point numbers.
+
+The destination operand is a ZMM/YMM/XMM register and updated under the writemask. The source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location, or a 512/256/128-bit vector broadcasted from a 32-bit memory location.
+
+EVEX.vvvv is reserved and must be 1111b, otherwise instructions will #UD.
+
+Each GETEXP operation converts the exponent value into a floating-point number (permitting input value in denormal representation). Special cases of input values are listed in Table 5-17.
+
+The formula is:
+
+GETEXP(x) = floor(log2(|x|))
+
+Notation floor(x) stands for maximal integer not exceeding real number x.
+
+Software usage of VGETEXPxx and VGETMANTxx instructions generally involve a combination of GETEXP operation and GETMANT operation (see VGETMANTPD). Thus VGETEXPxx instruction do not require software to handle SIMD floating-point exceptions.
+
+Operation:
+
+NormalizeExpTinySPFP(SRC[31:0])
+{
+    // Jbit is the hidden integral bit of a floating-point number. In case of denormal number it has the value of ZERO.
+    Src.Jbit := 0;
+    Dst.exp := 1;
+    Dst.fraction := SRC[22:0];
+    WHILE(Src.Jbit = 0)
+    {
+        Src.Jbit := Dst.fraction[22];
+                        // Get the fraction MSB
+        Dst.fraction := Dst.fraction << 1 ;
+                        // One bit shift left
+        Dst.exp-- ;
+                // Decrement the exponent
+    }
+    Dst.fraction := 0;
+    Dst.sign := 1;
+    TMP[31:0] := MXCSR.DAZ? 0 : (Dst.sign << 31) OR (Dst.exp << 23) OR (Dst.fraction) ;
+    Return (TMP[31:0]);
+}
+ConvertExpSPFP(SRC[31:0])
+{
+    Src.sign := 0;
+                // Zero out sign bit
+    Src.exp := SRC[30:23];
+    Src.fraction := SRC[22:0];
+    // Check for NaN
+    IF (SRC = NaN)
+    {
+        IF ( SRC = SNAN ) SET IE;
+        Return QNAN(SRC);
+    }
+    // Check for +INF
+    IF (Src = +INF) RETURN (Src);
+    // check if zero operand
+    IF ((Src.exp = 0) AND ((Src.fraction = 0) OR (MXCSR.DAZ = 1))) Return (-INF);
+    }
+    ELSE // check if denormal operand (notice that MXCSR.DAZ = 0)
+    {
+        IF ((Src.exp = 0) AND (Src.fraction != 0))
+        {
+            TMP[31:0] := NormalizeExpTinySPFP(SRC[31:0]) ;
+                            // Get Normalized Exponent
+            Set #DE
+        }
+        ELSE // exponent value is correct
+        {
+            TMP[31:0] := (Src.sign << 31) OR (Src.exp << 23) OR (Src.fraction) ;
+        }
+        TMP := SAR(TMP, 23) ;
+                    // Shift Arithmetic Right
+        TMP := TMP – 127;
+                    // Subtract Bias
+        Return CvtI2S(TMP);
+                    // Convert INT to single precision floating-point number
+    }
+}
+
+VGETEXPPS (EVEX encoded versions):
+
+(KL, VL) = (4, 128), (8, 256), (16, 512)
+FOR j := 0 TO KL-1
+    i := j * 32
+    IF k1[j] OR *no writemask*
+        THEN
+            IF (EVEX.b = 1) AND (SRC *is memory*)
+                THEN
+                    DEST[i+31:i] :=
+            ConvertExpSPFP(SRC[31:0])
+                ELSE
+                    DEST[i+31:i] :=
+            ConvertExpSPFP(SRC[i+31:i])
+            FI;
+        ELSE
+            IF *merging-masking*
+                THEN *DEST[i+31:i] remains unchanged*
+                ELSE ; zeroing-masking
+                    DEST[i+31:i] := 0
+            FI
+    FI;
+ENDFOR
+DEST[MAXVL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VGETEXPPS __m512 _mm512_getexp_ps( __m512 a);
+VGETEXPPS __m512 _mm512_mask_getexp_ps(__m512 s, __mmask16 k, __m512 a);
+VGETEXPPS __m512 _mm512_maskz_getexp_ps( __mmask16 k, __m512 a);
+VGETEXPPS __m512 _mm512_getexp_round_ps( __m512 a, int sae);
+VGETEXPPS __m512 _mm512_mask_getexp_round_ps(__m512 s, __mmask16 k, __m512 a, int sae);
+VGETEXPPS __m512 _mm512_maskz_getexp_round_ps( __mmask16 k, __m512 a, int sae);
+VGETEXPPS __m256 _mm256_getexp_ps(__m256 a);
+VGETEXPPS __m256 _mm256_mask_getexp_ps(__m256 s, __mmask8 k, __m256 a);
+VGETEXPPS __m256 _mm256_maskz_getexp_ps( __mmask8 k, __m256 a);
+VGETEXPPS __m128 _mm_getexp_ps(__m128 a);
+VGETEXPPS __m128 _mm_mask_getexp_ps(__m128 s, __mmask8 k, __m128 a);
+VGETEXPPS __m128 _mm_maskz_getexp_ps( __mmask8 k, __m128 a);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions:
+
+See Table 2-46, “Type E2 Class Exception Conditions.”
+
+Additionally:
+
+#UD:
+	If EVEX.vvvv != 1111B.
+
+
+
+
+VGETEXPSD — Convert Exponents of Scalar Double Precision Floating-Point Value to DoublePrecision Floating-Point Value
+
+Opcode/Instruction	                                                Op/En	64/32 Bit Mode Support	CPUID Feature Flag	Description
+EVEX.LLIG.66.0F38.W1 43 /r VGETEXPSD xmm1 {k1}{z}, xmm2, xmm3/m64{sae}	A	V/V	                    AVX512F	            Convert the biased exponent (bits 62:52) of the low double precision floating-point value in xmm3/m64 to a double precision floating-point value representing unbiased integer exponent. Stores the result to the low 64-bit of xmm1 under the writemask k1 and merge with the other elements of xmm2.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	    Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Tuple1 Scalar	ModRM:reg (w)	EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Extracts the biased exponent from the normalized double precision floating-point representation of the low qword data element of the source operand (the third operand) as unbiased signed integer value, or convert the denormal representation of input data to unbiased negative integer values. The integer value of the unbiased exponent is converted to double precision floating-point value and written to the destination operand (the first operand) as double precision floating-point numbers. Bits (127:64) of the XMM register destination are copied from corresponding bits in the first source operand.
+
+The destination must be a XMM register, the source operand can be a XMM register or a float64 memory location.
+
+If writemasking is used, the low quadword element of the destination operand is conditionally updated depending on the value of writemask register k1. If writemasking is not used, the low quadword element of the destination operand is unconditionally updated.
+
+Each GETEXP operation converts the exponent value into a floating-point number (permitting input value in denormal representation). Special cases of input values are listed in Table 5-15.
+
+The formula is:
+
+GETEXP(x) = floor(log2(|x|))
+
+Notation floor(x) stands for maximal integer not exceeding real number x.
+
+Operation:
+
+// NormalizeExpTinyDPFP(SRC[63:0]) is defined in the Operation section of VGETEXPPD
+// ConvertExpDPFP(SRC[63:0]) is defined in the Operation section of VGETEXPPD
+
+VGETEXPSD (EVEX encoded version):
+
+IF k1[0] OR *no writemask*
+    THEN DEST[63:0] :=
+            ConvertExpDPFP(SRC2[63:0])
+    ELSE
+        IF *merging-masking*
+            THEN *DEST[63:0] remains unchanged*
+            ELSE ; zeroing-masking
+                DEST[63:0] := 0
+        FI
+FI;
+DEST[127:64] := SRC1[127:64]
+DEST[MAXVL-1:128] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VGETEXPSD __m128d _mm_getexp_sd( __m128d a, __m128d b);
+VGETEXPSD __m128d _mm_mask_getexp_sd(__m128d s, __mmask8 k, __m128d a, __m128d b);
+VGETEXPSD __m128d _mm_maskz_getexp_sd( __mmask8 k, __m128d a, __m128d b);
+VGETEXPSD __m128d _mm_getexp_round_sd( __m128d a, __m128d b, int sae);
+VGETEXPSD __m128d _mm_mask_getexp_round_sd(__m128d s, __mmask8 k, __m128d a, __m128d b, int sae);
+VGETEXPSD __m128d _mm_maskz_getexp_round_sd( __mmask8 k, __m128d a, __m128d b, int sae);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal
+
+Other Exceptions:
+
+See Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+
+
+
+VGETEXPSH — Convert Exponents of Scalar FP16 Values to FP16 Values
+
+Opcode/Instruction	                                                        Op/En	64/32 Bit Mode Support	CPUID Feature Flag	Description
+EVEX.LLIG.66.MAP6.W0 43 /r VGETEXPSH xmm1{k1}{z}, xmm2, xmm3/m16 {sae}	    A	    V/V	                    AVX512-FP16	        Convert the exponent of FP16 values in the low word of the source operand to FP16 results representing unbiased integer exponents, and stores the results in the low word of the destination register subject to writemask k1. Bits 127:16 of xmm2 are copied to xmm1[127:16].
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Scalar	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+This instruction extracts the biased exponents from the normalized FP16 representation of the low word element of the source operand (the second operand) as unbiased signed integer value, or convert the denormal representation of input data to an unbiased negative integer value. The integer value of the unbiased exponent is converted to an FP16 value and written to the low word element of the destination operand (the first operand) as an FP16 number.
+
+Bits 127:16 of the destination operand are copied from the corresponding bits of the first source operand. Bits MAXVL-1:128 of the destination operand are zeroed. The low FP16 element of the destination is updated according to the writemask.
+
+Each GETEXP operation converts the exponent value into a floating-point number (permitting input value in denormal representation). Special cases of input values are listed in Table 5-16.
+
+The formula is:
+
+GETEXP(x) = floor(log2(|x|))
+
+Notation floor(x) stands for maximal integer not exceeding real number x.
+
+Software usage of VGETEXPxx and VGETMANTxx instructions generally involve a combination of GETEXP operation and GETMANT operation (see VGETMANTSH). Thus, the VGETEXPSH instruction does not require software to handle SIMD floating-point exceptions.
+
+Operation:
+
+VGETEXPSH dest{k1}, src1, src2:
+
+IF k1[0] or *no writemask*:
+    DEST.fp16[0] := getexp_fp16(src2.fp16[0]) // see VGETEXPPH
+ELSE IF *zeroing*:
+    DEST.fp16[0] := 0
+//else DEST.fp16[0] remains unchanged
+DEST[127:16] := src1[127:16]
+DEST[MAXVL-1:128] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VGETEXPSH __m128h _mm_getexp_round_sh (__m128h a, __m128h b, const int sae);
+VGETEXPSH __m128h _mm_mask_getexp_round_sh (__m128h src, __mmask8 k, __m128h a, __m128h b, const int sae);
+VGETEXPSH __m128h _mm_maskz_getexp_round_sh (__mmask8 k, __m128h a, __m128h b, const int sae);
+VGETEXPSH __m128h _mm_getexp_sh (__m128h a, __m128h b);
+VGETEXPSH __m128h _mm_mask_getexp_sh (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VGETEXPSH __m128h _mm_maskz_getexp_sh (__mmask8 k, __m128h a, __m128h b);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+
+VGETEXPSS — Convert Exponents of Scalar Single Precision Floating-Point Value to SinglePrecision Floating-Point Value
+
+Opcode/Instruction	                                                    Op/En	64/32 Bit Mode Support	CPUID Feature Flag	Description
+EVEX.LLIG.66.0F38.W0 43 /r VGETEXPSS xmm1 {k1}{z}, xmm2, xmm3/m32{sae}	A	    V/V	                    AVX512F	            Convert the biased exponent (bits 30:23) of the low single-precision floating-point value in xmm3/m32 to a single-precision floating-point value representing unbiased integer exponent. Stores the result to xmm1 under the writemask k1 and merge with the other elements of xmm2.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	    Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Tuple1 Scalar	ModRM:reg (w)	EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Extracts the biased exponent from the normalized single-precision floating-point representation of the low double-word data element of the source operand (the third operand) as unbiased signed integer value, or convert the denormal representation of input data to unbiased negative integer values. The integer value of the unbiased exponent is converted to single-precision floating-point value and written to the destination operand (the first operand) as single-precision floating-point numbers. Bits (127:32) of the XMM register destination are copied from corresponding bits in the first source operand.
+
+The destination must be a XMM register, the source operand can be a XMM register or a float32 memory location.
+
+If writemasking is used, the low doubleword element of the destination operand is conditionally updated depending on the value of writemask register k1. If writemasking is not used, the low doubleword element of the destination operand is unconditionally updated.
+
+Each GETEXP operation converts the exponent value into a floating-point number (permitting input value in denormal representation). Special cases of input values are listed in Table 5-17.
+
+The formula is:
+
+GETEXP(x) = floor(log2(|x|))
+
+Notation floor(x) stands for maximal integer not exceeding real number x.
+
+Software usage of VGETEXPxx and VGETMANTxx instructions generally involve a combination of GETEXP operation and GETMANT operation (see VGETMANTPD). Thus VGETEXPxx instruction do not require software to handle SIMD floating-point exceptions.
+
+Operation:
+
+// NormalizeExpTinySPFP(SRC[31:0]) is defined in the Operation section of VGETEXPPS
+// ConvertExpSPFP(SRC[31:0]) is defined in the Operation section of VGETEXPPS
+
+VGETEXPSS (EVEX encoded version):
+
+IF k1[0] OR *no writemask*
+    THEN DEST[31:0] :=
+            ConvertExpDPFP(SRC2[31:0])
+    ELSE
+        IF *merging-masking*
+            THEN *DEST[31:0] remains unchanged*
+            ELSE ; zeroing-masking
+                DEST[31:0]:= 0
+            FI
+    FI;
+ENDFOR
+DEST[127:32] := SRC1[127:32]
+DEST[MAXVL-1:128] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VGETEXPSS __m128 _mm_getexp_ss( __m128 a, __m128 b);
+VGETEXPSS __m128 _mm_mask_getexp_ss(__m128 s, __mmask8 k, __m128 a, __m128 b);
+VGETEXPSS __m128 _mm_maskz_getexp_ss( __mmask8 k, __m128 a, __m128 b);
+VGETEXPSS __m128 _mm_getexp_round_ss( __m128 a, __m128 b, int sae);
+VGETEXPSS __m128 _mm_mask_getexp_round_ss(__m128 s, __mmask8 k, __m128 a, __m128 b, int sae);
+VGETEXPSS __m128 _mm_maskz_getexp_round_ss( __mmask8 k, __m128 a, __m128 b, int sae);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal
+
+Other Exceptions:
+
+See Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+VPMOVB2M/VPMOVW2M/VPMOVD2M/VPMOVQ2M — Convert a Vector Register to a Mask
+
+Opcode/Instruction	                            Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.F3.0F38.W0 29 /r VPMOVB2M k1, xmm1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding byte in XMM1.
+EVEX.256.F3.0F38.W0 29 /r VPMOVB2M k1, ymm1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding byte in YMM1.
+EVEX.512.F3.0F38.W0 29 /r VPMOVB2M k1, zmm1	    RM	    V/V	                    AVX512BW	        Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding byte in ZMM1.
+EVEX.128.F3.0F38.W1 29 /r VPMOVW2M k1, xmm1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding word in XMM1.
+EVEX.256.F3.0F38.W1 29 /r VPMOVW2M k1, ymm1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding word in YMM1.
+EVEX.512.F3.0F38.W1 29 /r VPMOVW2M k1, zmm1	    RM	    V/V	                    AVX512BW	        Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding word in ZMM1.
+EVEX.128.F3.0F38.W0 39 /r VPMOVD2M k1, xmm1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding doubleword in XMM1.   
+EVEX.256.F3.0F38.W0 39 /r VPMOVD2M k1, ymm1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding doubleword in YMM1.
+EVEX.512.F3.0F38.W0 39 /r VPMOVD2M k1, zmm1	    RM	    V/V	                    AVX512DQ	        Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding doubleword in ZMM1.
+EVEX.128.F3.0F38.W1 39 /r VPMOVQ2M k1, xmm1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding quadword in XMM1.
+EVEX.256.F3.0F38.W1 39 /r VPMOVQ2M k1, ymm1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding quadword in YMM1.
+EVEX.512.F3.0F38.W1 39 /r VPMOVQ2M k1, zmm1	    RM	    V/V	                    AVX512DQ	        Sets each bit in k1 to 1 or 0 based on the value of the most significant bit of the corresponding quadword in ZMM1.
+
+Instruction Operand Encoding:
+
+Op/En	Operand 1	    Operand 2	    Operand 3	Operand 4
+RM	    ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+Converts a vector register to a mask register. Each element in the destination register is set to 1 or 0 depending on the value of most significant bit of the corresponding element in the source register.
+
+The source operand is a ZMM/YMM/XMM register. The destination operand is a mask register.
+
+EVEX.vvvv is reserved and must be 1111b otherwise instructions will #UD.
+
+Operation:
+
+VPMOVB2M (EVEX encoded versions):
+
+(KL, VL) = (16, 128), (32, 256), (64, 512)
+FOR j := 0 TO KL-1
+    i := j * 8
+    IF SRC[i+7]
+        THEN DEST[j]:=1
+        ELSE DEST[j] := 0
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+VPMOVW2M (EVEX encoded versions):
+
+(KL, VL) = (8, 128), (16, 256), (32, 512)
+FOR j := 0 TO KL-1
+    i := j * 16
+    IF SRC[i+15]
+        THEN DEST[j]:=1
+        ELSE DEST[j] := 0
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+VPMOVD2M (EVEX encoded versions):
+
+(KL, VL) = (4, 128), (8, 256), (16, 512)
+FOR j := 0 TO KL-1
+    i := j * 32
+    IF SRC[i+31]
+        THEN DEST[j]:=1
+        ELSE DEST[j] := 0
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+VPMOVQ2M (EVEX encoded versions):
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 64
+    IF SRC[i+63]
+        THEN DEST[j]:=1
+        ELSE DEST[j] := 0
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalents:
+
+VPMPOVB2M __mmask64 _mm512_movepi8_mask( __m512i );
+VPMPOVD2M __mmask16 _mm512_movepi32_mask( __m512i );
+VPMPOVQ2M __mmask8 _mm512_movepi64_mask( __m512i );
+VPMPOVW2M __mmask32 _mm512_movepi16_mask( __m512i );
+VPMPOVB2M __mmask32 _mm256_movepi8_mask( __m256i );
+VPMPOVD2M __mmask8 _mm256_movepi32_mask( __m256i );
+VPMPOVQ2M __mmask8 _mm256_movepi64_mask( __m256i );
+VPMPOVW2M __mmask16 _mm256_movepi16_mask( __m256i );
+VPMPOVB2M __mmask16 _mm_movepi8_mask( __m128i );
+VPMPOVD2M __mmask8 _mm_movepi32_mask( __m128i );
+VPMPOVQ2M __mmask8 _mm_movepi64_mask( __m128i );
+VPMPOVW2M __mmask8 _mm_movepi16_mask( __m128i );
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+EVEX-encoded instruction, see Table 2-55, “Type E7NM Class Exception Conditions.”
+
+Additionally:
+
+#UD:
+	If EVEX.vvvv != 1111B.
+
+
+
+VPMOVM2B/VPMOVM2W/VPMOVM2D/VPMOVM2Q — Convert a Mask Register to a VectorRegister
+
+Opcode/Instruction	                            Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.F3.0F38.W0 28 /r VPMOVM2B xmm1, k1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each byte in XMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.256.F3.0F38.W0 28 /r VPMOVM2B ymm1, k1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each byte in YMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.512.F3.0F38.W0 28 /r VPMOVM2B zmm1, k1	    RM	    V/V	                    AVX512BW	        Sets each byte in ZMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.128.F3.0F38.W1 28 /r VPMOVM2W xmm1, k1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each word in XMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.256.F3.0F38.W1 28 /r VPMOVM2W ymm1, k1	    RM	    V/V	                    AVX512VL AVX512BW	Sets each word in YMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.512.F3.0F38.W1 28 /r VPMOVM2W zmm1, k1	    RM	    V/V	                    AVX512BW	        Sets each word in ZMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.128.F3.0F38.W0 38 /r VPMOVM2D xmm1, k1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each doubleword in XMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.256.F3.0F38.W0 38 /r VPMOVM2D ymm1, k1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each doubleword in YMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.512.F3.0F38.W0 38 /r VPMOVM2D zmm1, k1	    RM	    V/V	                    AVX512DQ	        Sets each doubleword in ZMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.128.F3.0F38.W1 38 /r VPMOVM2Q xmm1, k1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each quadword in XMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.256.F3.0F38.W1 38 /r VPMOVM2Q ymm1, k1	    RM	    V/V	                    AVX512VL AVX512DQ	Sets each quadword in YMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+EVEX.512.F3.0F38.W1 38 /r VPMOVM2Q zmm1, k1	    RM	    V/V	                    AVX512DQ	        Sets each quadword in ZMM1 to all 1’s or all 0’s based on the value of the corresponding bit in k1.
+
+Instruction Operand Encoding:
+
+Op/En	Operand 1	    Operand 2	    Operand 3	Operand 4
+RM	    ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+Converts a mask register to a vector register. Each element in the destination register is set to all 1’s or all 0’s depending on the value of the corresponding bit in the source mask register.
+
+The source operand is a mask register. The destination operand is a ZMM/YMM/XMM register.
+
+EVEX.vvvv is reserved and must be 1111b otherwise instructions will #UD.
+
+Operation:
+
+VPMOVM2B (EVEX encoded versions):
+
+(KL, VL) = (16, 128), (32, 256), (64, 512)
+FOR j := 0 TO KL-1
+    i := j * 8
+    IF SRC[j]
+        THEN DEST[i+7:i] := -1
+        ELSE DEST[i+7:i] := 0
+    FI;
+ENDFOR
+DEST[MAXVL-1:VL] := 0
+
+VPMOVM2W (EVEX encoded versions):
+
+(KL, VL) = (8, 128), (16, 256), (32, 512)
+FOR j := 0 TO KL-1
+    i := j * 16
+    IF SRC[j]
+        THEN DEST[i+15:i] := -1
+        ELSE DEST[i+15:i] := 0
+    FI;
+ENDFOR
+DEST[MAXVL-1:VL] := 0
+
+VPMOVM2D (EVEX encoded versions):
+
+(KL, VL) = (4, 128), (8, 256), (16, 512)
+FOR j := 0 TO KL-1
+    i := j * 32
+    IF SRC[j]
+        THEN DEST[i+31:i] := -1
+        ELSE DEST[i+31:i] := 0
+    FI;
+ENDFOR
+DEST[MAXVL-1:VL] := 0
+
+VPMOVM2Q (EVEX encoded versions):
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 64
+    IF SRC[j]
+        THEN DEST[i+63:i] := -1
+        ELSE DEST[i+63:i] := 0
+    FI;
+ENDFOR
+DEST[MAXVL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalents:
+
+VPMOVM2B __m512i _mm512_movm_epi8(__mmask64 );
+VPMOVM2D __m512i _mm512_movm_epi32(__mmask8 );
+VPMOVM2Q __m512i _mm512_movm_epi64(__mmask16 );
+VPMOVM2W __m512i _mm512_movm_epi16(__mmask32 );
+VPMOVM2B __m256i _mm256_movm_epi8(__mmask32 );
+VPMOVM2D __m256i _mm256_movm_epi32(__mmask8 );
+VPMOVM2Q __m256i _mm256_movm_epi64(__mmask8 );
+VPMOVM2W __m256i _mm256_movm_epi16(__mmask16 );
+VPMOVM2B __m128i _mm_movm_epi8(__mmask16 );
+VPMOVM2D __m128i _mm_movm_epi32(__mmask8 );
+VPMOVM2Q __m128i _mm_movm_epi64(__mmask8 );
+VPMOVM2W __m128i _mm_movm_epi16(__mmask8 );
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+EVEX-encoded instruction, see Table 2-55, “Type E7NM Class Exception Conditions.”
+
+Additionally:
+
+#UD:
+	If EVEX.vvvv != 1111B.
