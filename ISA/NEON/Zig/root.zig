@@ -398,6 +398,15 @@ const rotate_rcl = @import("ROTATE/RCL.zig");
 const rotate_rcr = @import("ROTATE/RCR.zig");
 const rotate_rol = @import("ROTATE/ROL.zig");
 const rotate_ror = @import("ROTATE/ROR.zig");
+const rotate_rorx = @import("ROTATE/RORX.zig");
+const rotate_vprold = @import("ROTATE/VPROLD.zig");
+const rotate_vprolvd = @import("ROTATE/VPROLVD.zig");
+const rotate_vprolq = @import("ROTATE/VPROLQ.zig");
+const rotate_vprolvq = @import("ROTATE/VPROLVQ.zig");
+const rotate_vprord = @import("ROTATE/VPRORD.zig");
+const rotate_vprorvd = @import("ROTATE/VPRORVD.zig");
+const rotate_vprorq = @import("ROTATE/VPRORQ.zig");
+const rotate_vprorvq = @import("ROTATE/VPRORVQ.zig");
 const save_fsave = @import("SAVE/FSAVE.zig");
 const save_fxsave = @import("SAVE/FXSAVE.zig");
 const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
@@ -1189,6 +1198,15 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(rotate_rcr.family, rotate_rcr.path, rotate_rcr.source),
     mirror(rotate_rol.family, rotate_rol.path, rotate_rol.source),
     mirror(rotate_ror.family, rotate_ror.path, rotate_ror.source),
+    mirror(rotate_rorx.family, rotate_rorx.path, rotate_rorx.source),
+    mirror(rotate_vprold.family, rotate_vprold.path, rotate_vprold.source),
+    mirror(rotate_vprolvd.family, rotate_vprolvd.path, rotate_vprolvd.source),
+    mirror(rotate_vprolq.family, rotate_vprolq.path, rotate_vprolq.source),
+    mirror(rotate_vprolvq.family, rotate_vprolvq.path, rotate_vprolvq.source),
+    mirror(rotate_vprord.family, rotate_vprord.path, rotate_vprord.source),
+    mirror(rotate_vprorvd.family, rotate_vprorvd.path, rotate_vprorvd.source),
+    mirror(rotate_vprorq.family, rotate_vprorq.path, rotate_vprorq.source),
+    mirror(rotate_vprorvq.family, rotate_vprorvq.path, rotate_vprorvq.source),
     mirror(save_fsave.family, save_fsave.path, save_fsave.source),
     mirror(save_fxsave.family, save_fxsave.path, save_fxsave.source),
     mirror(save_saveprevssp.family, save_saveprevssp.path, save_saveprevssp.source),
