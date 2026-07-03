@@ -426,6 +426,15 @@ const undef_ud2 = @import("UNDEF/UD2.zig");
 const unordered_ucomisd = @import("UNORDERED/UCOMISD.zig");
 const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
 const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
+const variable_vpsllvw = @import("VARIABLE/VPSLLVW.zig");
+const variable_vpsllvd = @import("VARIABLE/VPSLLVD.zig");
+const variable_vpsllvq = @import("VARIABLE/VPSLLVQ.zig");
+const variable_vpsravw = @import("VARIABLE/VPSRAVW.zig");
+const variable_vpsravd = @import("VARIABLE/VPSRAVD.zig");
+const variable_vpsravq = @import("VARIABLE/VPSRAVQ.zig");
+const variable_vpsrlvw = @import("VARIABLE/VPSRLVW.zig");
+const variable_vpsrlvd = @import("VARIABLE/VPSRLVD.zig");
+const variable_vpsrlvq = @import("VARIABLE/VPSRLVQ.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const vptestm_vptestmb = @import("VPTESTM/VPTESTMB.zig");
@@ -1167,6 +1176,15 @@ pub const specs = blk: {
         spec(unordered_ucomisd.meta),
         spec(unordered_ucomiss.meta),
         spec(unordered_vucomish.meta),
+        spec(variable_vpsllvw.meta),
+        spec(variable_vpsllvd.meta),
+        spec(variable_vpsllvq.meta),
+        spec(variable_vpsravw.meta),
+        spec(variable_vpsravd.meta),
+        spec(variable_vpsravq.meta),
+        spec(variable_vpsrlvw.meta),
+        spec(variable_vpsrlvd.meta),
+        spec(variable_vpsrlvq.meta),
         spec(verify_verr.meta),
         spec(verify_verw.meta),
         spec(vptestm_vptestmb.meta),
@@ -1920,6 +1938,15 @@ pub const proof_reports = [_]proofs.ProofReport{
     unordered_ucomisd.proof_report,
     unordered_ucomiss.proof_report,
     unordered_vucomish.proof_report,
+    variable_vpsllvw.proof_report,
+    variable_vpsllvd.proof_report,
+    variable_vpsllvq.proof_report,
+    variable_vpsravw.proof_report,
+    variable_vpsravd.proof_report,
+    variable_vpsravq.proof_report,
+    variable_vpsrlvw.proof_report,
+    variable_vpsrlvd.proof_report,
+    variable_vpsrlvq.proof_report,
     verify_verr.proof_report,
     verify_verw.proof_report,
     vptestm_vptestmb.proof_report,

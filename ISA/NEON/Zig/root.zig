@@ -424,6 +424,15 @@ const undef_ud2 = @import("UNDEF/UD2.zig");
 const unordered_ucomisd = @import("UNORDERED/UCOMISD.zig");
 const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
 const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
+const variable_vpsllvw = @import("VARIABLE/VPSLLVW.zig");
+const variable_vpsllvd = @import("VARIABLE/VPSLLVD.zig");
+const variable_vpsllvq = @import("VARIABLE/VPSLLVQ.zig");
+const variable_vpsravw = @import("VARIABLE/VPSRAVW.zig");
+const variable_vpsravd = @import("VARIABLE/VPSRAVD.zig");
+const variable_vpsravq = @import("VARIABLE/VPSRAVQ.zig");
+const variable_vpsrlvw = @import("VARIABLE/VPSRLVW.zig");
+const variable_vpsrlvd = @import("VARIABLE/VPSRLVD.zig");
+const variable_vpsrlvq = @import("VARIABLE/VPSRLVQ.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const vptestm_vptestmb = @import("VPTESTM/VPTESTMB.zig");
@@ -1236,6 +1245,15 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(unordered_ucomisd.family, unordered_ucomisd.path, unordered_ucomisd.source),
     mirror(unordered_ucomiss.family, unordered_ucomiss.path, unordered_ucomiss.source),
     mirror(unordered_vucomish.family, unordered_vucomish.path, unordered_vucomish.source),
+    mirror(variable_vpsllvw.family, variable_vpsllvw.path, variable_vpsllvw.source),
+    mirror(variable_vpsllvd.family, variable_vpsllvd.path, variable_vpsllvd.source),
+    mirror(variable_vpsllvq.family, variable_vpsllvq.path, variable_vpsllvq.source),
+    mirror(variable_vpsravw.family, variable_vpsravw.path, variable_vpsravw.source),
+    mirror(variable_vpsravd.family, variable_vpsravd.path, variable_vpsravd.source),
+    mirror(variable_vpsravq.family, variable_vpsravq.path, variable_vpsravq.source),
+    mirror(variable_vpsrlvw.family, variable_vpsrlvw.path, variable_vpsrlvw.source),
+    mirror(variable_vpsrlvd.family, variable_vpsrlvd.path, variable_vpsrlvd.source),
+    mirror(variable_vpsrlvq.family, variable_vpsrlvq.path, variable_vpsrlvq.source),
     mirror(verify_verr.family, verify_verr.path, verify_verr.source),
     mirror(verify_verw.family, verify_verw.path, verify_verw.source),
     mirror(vptestm_vptestmb.family, vptestm_vptestmb.path, vptestm_vptestmb.source),
