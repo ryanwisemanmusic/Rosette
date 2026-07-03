@@ -102,6 +102,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const isa_highway_module = b.createModule(.{
+        .root_source_file = b.path("../../ISA/highway.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const bridge_model_module = b.createModule(.{
         .root_source_file = b.path("../../src/bridge/register-tracing/model.zig"),
         .target = target,
@@ -179,6 +184,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    x64_decoder_module.addImport("isa_highway", isa_highway_module);
     const x64_interpreter_module = b.createModule(.{
         .root_source_file = b.path("../../src/x64-ASM/interpreter.zig"),
         .target = target,

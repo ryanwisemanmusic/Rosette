@@ -7,6 +7,7 @@ const Memory = reg_map.Memory;
 const runtime_abi = @import("runtime_abi_handshake");
 const isa_registry = @import("isa_registry");
 const isa_math = isa_registry.math.core;
+const highway = isa_registry.highway;
 const code_text = @import("entrypoint_code_text_segment");
 const reg_trace = @import("register-tracing/runtime.zig");
 const flag_trace = @import("flag-handling/runtime.zig");
@@ -40,6 +41,12 @@ fn mathInputFlags(regs: *const RegisterFile) isa_math.InputFlags {
         .of = regs.flags.of == 1,
         .af = regs.flags.af == 1,
     };
+}
+
+fn evaluateHighway32(regs: *RegisterFile, op: highway.BinaryOp, lhs: u32, rhs: u32) u32 {
+    const evaluated = highway.evaluate(op, .bits32, lhs, rhs, regs.flags.raw());
+    regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+    return @truncate(evaluated.value);
 }
 
 /// Operand types used by x86 instructions in this emulator.
@@ -175,9 +182,7 @@ pub const Executor = struct {
         const a = self.regs.get(dst);
         const b = self.regs.get(src);
         const flags_before = self.regs.flags.raw();
-        const math = isa_math.add(.bits32, a, b);
-        const result = mathResult32(math);
-        applyMathFlags(&self.regs, math.flags);
+        const result = evaluateHighway32(&self.regs, .add, a, b);
         self.regs.set(dst, result);
         runtime_abi.x86.validateArithmetic32(.add, a, b, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateArithmeticFlags("add_reg_reg", flags_before, &self.regs, a, b, result, .{
@@ -190,9 +195,7 @@ pub const Executor = struct {
     pub fn add_reg_imm(self: *Executor, dst: Register, imm: u32) void {
         const a = self.regs.get(dst);
         const flags_before = self.regs.flags.raw();
-        const math = isa_math.add(.bits32, a, imm);
-        const result = mathResult32(math);
-        applyMathFlags(&self.regs, math.flags);
+        const result = evaluateHighway32(&self.regs, .add, a, imm);
         self.regs.set(dst, result);
         runtime_abi.x86.validateArithmetic32(.add, a, imm, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateArithmeticFlags("add_reg_imm", flags_before, &self.regs, a, imm, result, .{
@@ -206,9 +209,7 @@ pub const Executor = struct {
         const a = self.regs.get(dst);
         const b = self.regs.get(src);
         const flags_before = self.regs.flags.raw();
-        const math = isa_math.sub(.bits32, a, b);
-        const result = mathResult32(math);
-        applyMathFlags(&self.regs, math.flags);
+        const result = evaluateHighway32(&self.regs, .sub, a, b);
         self.regs.set(dst, result);
         runtime_abi.x86.validateArithmetic32(.sub, a, b, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateArithmeticFlags("sub_reg_reg", flags_before, &self.regs, a, b, result, .{
@@ -221,9 +222,7 @@ pub const Executor = struct {
     pub fn sub_reg_imm(self: *Executor, dst: Register, imm: u32) void {
         const a = self.regs.get(dst);
         const flags_before = self.regs.flags.raw();
-        const math = isa_math.sub(.bits32, a, imm);
-        const result = mathResult32(math);
-        applyMathFlags(&self.regs, math.flags);
+        const result = evaluateHighway32(&self.regs, .sub, a, imm);
         self.regs.set(dst, result);
         runtime_abi.x86.validateArithmetic32(.sub, a, imm, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateArithmeticFlags("sub_reg_imm", flags_before, &self.regs, a, imm, result, .{
@@ -327,8 +326,7 @@ pub const Executor = struct {
         const lhs = self.regs.get(dst);
         const rhs = self.regs.get(src);
         const flags_before = self.regs.flags.raw();
-        const result = lhs ^ rhs;
-        self.regs.update_test(result);
+        const result = evaluateHighway32(&self.regs, .bit_xor, lhs, rhs);
         self.regs.set(dst, result);
         runtime_abi.x86.validateArithmetic32(.logical, lhs, rhs, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateLogicalFlags("xor_reg_reg", flags_before, &self.regs, result, .{
@@ -343,8 +341,7 @@ pub const Executor = struct {
         const lhs = self.regs.get(dst);
         const rhs = self.regs.get(src);
         const flags_before = self.regs.flags.raw();
-        const result = lhs & rhs;
-        self.regs.update_test(result);
+        const result = evaluateHighway32(&self.regs, .bit_and, lhs, rhs);
         self.regs.set(dst, result);
         runtime_abi.x86.validateArithmetic32(.test_and, lhs, rhs, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateLogicalFlags("and_reg_reg", flags_before, &self.regs, result, .{
@@ -359,8 +356,7 @@ pub const Executor = struct {
         const lhs = self.regs.get(dst);
         const rhs = self.regs.get(src);
         const flags_before = self.regs.flags.raw();
-        const result = lhs | rhs;
-        self.regs.update_test(result);
+        const result = evaluateHighway32(&self.regs, .bit_or, lhs, rhs);
         self.regs.set(dst, result);
         runtime_abi.x86.validateArithmetic32(.logical, lhs, rhs, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateLogicalFlags("or_reg_reg", flags_before, &self.regs, result, .{
@@ -449,9 +445,7 @@ pub const Executor = struct {
         const lhs = self.regs.get(a);
         const rhs = self.regs.get(b);
         const flags_before = self.regs.flags.raw();
-        const math = isa_math.sub(.bits32, lhs, rhs);
-        const result = mathResult32(math);
-        applyMathFlags(&self.regs, math.flags);
+        const result = evaluateHighway32(&self.regs, .cmp, lhs, rhs);
         runtime_abi.x86.validateArithmetic32(.cmp, lhs, rhs, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateArithmeticFlags("cmp_reg_reg", flags_before, &self.regs, lhs, rhs, result, .{
             .updated_mask = flag_trace.arithmeticMask(),
@@ -463,9 +457,7 @@ pub const Executor = struct {
     pub fn cmp_reg_imm(self: *Executor, a: Register, imm: u32) void {
         const lhs = self.regs.get(a);
         const flags_before = self.regs.flags.raw();
-        const math = isa_math.sub(.bits32, lhs, imm);
-        const result = mathResult32(math);
-        applyMathFlags(&self.regs, math.flags);
+        const result = evaluateHighway32(&self.regs, .cmp, lhs, imm);
         runtime_abi.x86.validateArithmetic32(.cmp, lhs, imm, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateArithmeticFlags("cmp_reg_imm", flags_before, &self.regs, lhs, imm, result, .{
             .updated_mask = flag_trace.arithmeticMask(),
@@ -476,9 +468,7 @@ pub const Executor = struct {
 
     pub fn cmp_mem_imm(self: *Executor, addr: u32, imm: u32) void {
         const lhs = self.mem.read32(addr);
-        const math = isa_math.sub(.bits32, lhs, imm);
-        const result = mathResult32(math);
-        applyMathFlags(&self.regs, math.flags);
+        const result = evaluateHighway32(&self.regs, .cmp, lhs, imm);
         runtime_abi.x86.validateArithmetic32(.cmp, lhs, imm, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
     }
 
@@ -486,8 +476,7 @@ pub const Executor = struct {
         const lhs = self.regs.get(a);
         const rhs = self.regs.get(b);
         const flags_before = self.regs.flags.raw();
-        const result = lhs & rhs;
-        self.regs.update_test(result);
+        const result = evaluateHighway32(&self.regs, .test_bits, lhs, rhs);
         runtime_abi.x86.validateArithmetic32(.test_and, lhs, rhs, result, self.regs.flags.zf, self.regs.flags.sf, self.regs.flags.cf, self.regs.flags.of);
         flag_trace.validateLogicalFlags("test_reg_reg", flags_before, &self.regs, result, .{
             .updated_mask = flag_trace.logicalMask(),

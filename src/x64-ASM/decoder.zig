@@ -1,6 +1,7 @@
 const std = @import("std");
 const cpu_state = @import("cpu_state.zig");
 const flags = @import("flags.zig");
+pub const highway = @import("isa_highway");
 pub const capabilities = @import("capabilities.zig");
 
 pub const OperandSize = flags.OperandSize;

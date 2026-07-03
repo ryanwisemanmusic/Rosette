@@ -2469,6 +2469,18 @@ pub const MachOState = struct {
         x64_decoder.applyLogic(&self.regs.rflags, result, size);
     }
 
+    fn executeHighwayRegisterBinary(self: *MachOState, d: DecodedInsn, op: x64_decoder.highway.BinaryOp, size: Size) void {
+        const width: x64_decoder.highway.Width = switch (size) {
+            .bits8 => .bits8,
+            .bits16 => .bits16,
+            .bits32 => .bits32,
+            .bits64 => .bits64,
+        };
+        const evaluated = x64_decoder.highway.evaluate(op, width, self.regVal(d.dst_reg, size), self.regVal(d.src_reg, size), self.regs.rflags);
+        self.regs.rflags = evaluated.rflags;
+        if (evaluated.writeback) self.setReg(d.dst_reg, size, evaluated.value);
+    }
+
     fn setFlag(self: *MachOState, flag: u32, enabled: bool) void {
         if (enabled) {
             self.regs.rflags |= flag;
@@ -3529,11 +3541,7 @@ pub const MachOState = struct {
 
             .add_reg8_reg8, .add_reg16_reg16, .add_reg32_reg32, .add_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a +% b;
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsAdd(a, b, r, sz);
+                self.executeHighwayRegisterBinary(d, .add, sz);
             },
             .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_mem8) + @intFromEnum(Size.bits8));
@@ -3562,11 +3570,7 @@ pub const MachOState = struct {
 
             .sub_reg8_reg8, .sub_reg16_reg16, .sub_reg32_reg32, .sub_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a -% b;
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsSub(a, b, r, sz);
+                self.executeHighwayRegisterBinary(d, .sub, sz);
             },
             .sub_reg8_mem8, .sub_reg16_mem16, .sub_reg32_mem32, .sub_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_mem8) + @intFromEnum(Size.bits8));
@@ -3586,12 +3590,7 @@ pub const MachOState = struct {
             },
             .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sbb_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const carry = (self.regs.rflags & RFL_CF) != 0;
-                const r = a -% b -% @intFromBool(carry);
-                self.setReg(d.dst_reg, sz, r);
-                x64_decoder.applySbb(&self.regs.rflags, a, b, carry, r, sz);
+                self.executeHighwayRegisterBinary(d, .sbb, sz);
             },
             .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_imm8) + @intFromEnum(Size.bits8));
@@ -3632,11 +3631,7 @@ pub const MachOState = struct {
 
             .and_reg8_reg8, .and_reg16_reg16, .and_reg32_reg32, .and_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.and_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a & b;
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsLogic(r, sz);
+                self.executeHighwayRegisterBinary(d, .bit_and, sz);
             },
             .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.and_reg8_mem8) + @intFromEnum(Size.bits8));
@@ -3659,11 +3654,7 @@ pub const MachOState = struct {
 
             .or_reg8_reg8, .or_reg16_reg16, .or_reg32_reg32, .or_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a | b;
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsLogic(r, sz);
+                self.executeHighwayRegisterBinary(d, .bit_or, sz);
             },
             .or_reg8_mem8, .or_reg16_mem16, .or_reg32_mem32, .or_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_reg8_mem8) + @intFromEnum(Size.bits8));
@@ -3702,11 +3693,7 @@ pub const MachOState = struct {
 
             .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a ^ b;
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsLogic(r, sz);
+                self.executeHighwayRegisterBinary(d, .bit_xor, sz);
             },
             .xor_reg8_mem8, .xor_reg16_mem16, .xor_reg32_mem32, .xor_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_reg8_mem8) + @intFromEnum(Size.bits8));
@@ -3734,10 +3721,7 @@ pub const MachOState = struct {
 
             .cmp_reg8_reg8, .cmp_reg16_reg16, .cmp_reg32_reg32, .cmp_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a -% b;
-                self.setFlagsSub(a, b, r, sz);
+                self.executeHighwayRegisterBinary(d, .cmp, sz);
             },
             .cmp_reg8_mem8, .cmp_reg16_mem16, .cmp_reg32_mem32, .cmp_reg64_mem64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_reg8_mem8) + @intFromEnum(Size.bits8));
@@ -3768,10 +3752,7 @@ pub const MachOState = struct {
 
             .test_reg8_reg8, .test_reg16_reg16, .test_reg32_reg32, .test_reg64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.test_reg8_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a & b;
-                self.setFlagsLogic(r, sz);
+                self.executeHighwayRegisterBinary(d, .test_bits, sz);
             },
             .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64 => {
                 const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.test_mem8_reg8) + @intFromEnum(Size.bits8));

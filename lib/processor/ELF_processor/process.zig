@@ -560,6 +560,18 @@ pub const ElfState = struct {
         x64_decoder.applyLogic(&self.regs.rflags, result, size);
     }
 
+    fn executeHighwayRegisterBinary(self: *ElfState, d: DecodedInsn, op: x64_decoder.highway.BinaryOp) void {
+        const width: x64_decoder.highway.Width = switch (d.size) {
+            .bits8 => .bits8,
+            .bits16 => .bits16,
+            .bits32 => .bits32,
+            .bits64 => .bits64,
+        };
+        const evaluated = x64_decoder.highway.evaluate(op, width, self.regVal(d.dst_reg, d.size), self.regVal(d.src_reg, d.size), self.regs.rflags);
+        self.regs.rflags = evaluated.rflags;
+        if (evaluated.writeback) self.setReg(d.dst_reg, d.size, evaluated.value);
+    }
+
     fn setFlag(self: *ElfState, flag: u32, enabled: bool) void {
         if (enabled) {
             self.regs.rflags |= flag;
@@ -909,34 +921,7 @@ pub const ElfState = struct {
             },
 
             // ── add reg, reg ──
-            .add_reg8_reg8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.regVal(d.src_reg, .bits8);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsAdd(a, b, r, .bits8);
-            },
-            .add_reg16_reg16 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const b = self.regVal(d.src_reg, .bits16);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits16, r);
-                self.setFlagsAdd(a, b, r, .bits16);
-            },
-            .add_reg32_reg32 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const b = self.regVal(d.src_reg, .bits32);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits32, r);
-                self.setFlagsAdd(a, b, r, .bits32);
-            },
-            .add_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const b = self.regVal(d.src_reg, .bits64);
-                const r = a +% b;
-                self.setReg(d.dst_reg, .bits64, r);
-                self.setFlagsAdd(a, b, r, .bits64);
-            },
+            .add_reg8_reg8, .add_reg16_reg16, .add_reg32_reg32, .add_reg64_reg64 => self.executeHighwayRegisterBinary(d, .add),
             .add_reg8_imm8, .add_reg16_imm8, .add_reg32_imm8, .add_reg64_imm8 => {
                 const a = self.regVal(d.dst_reg, d.size);
                 const imm = if (d.size == .bits8) d.imm & 0xFF else signExtendImm8(d.imm);
@@ -1037,42 +1022,8 @@ pub const ElfState = struct {
             },
 
             // ── sub reg, reg ──
-            .sub_reg8_reg8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.regVal(d.src_reg, .bits8);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsSub(a, b, r, .bits8);
-            },
-            .sub_reg16_reg16 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const b = self.regVal(d.src_reg, .bits16);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits16, r);
-                self.setFlagsSub(a, b, r, .bits16);
-            },
-            .sub_reg32_reg32 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const b = self.regVal(d.src_reg, .bits32);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits32, r);
-                self.setFlagsSub(a, b, r, .bits32);
-            },
-            .sub_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const b = self.regVal(d.src_reg, .bits64);
-                const r = a -% b;
-                self.setReg(d.dst_reg, .bits64, r);
-                self.setFlagsSub(a, b, r, .bits64);
-            },
-            .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const carry = (self.regs.rflags & RFL_CF) != 0;
-                const r = a -% b -% @intFromBool(carry);
-                self.setReg(d.dst_reg, d.size, r);
-                x64_decoder.applySbb(&self.regs.rflags, a, b, carry, r, d.size);
-            },
+            .sub_reg8_reg8, .sub_reg16_reg16, .sub_reg32_reg32, .sub_reg64_reg64 => self.executeHighwayRegisterBinary(d, .sub),
+            .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => self.executeHighwayRegisterBinary(d, .sbb),
 
             // ── sub r/m8, imm8 (0x80 /5) ──
             .sub_reg8_imm8 => {
@@ -1125,11 +1076,7 @@ pub const ElfState = struct {
 
             // ── logical register/imm operations ──
             .and_reg8_reg8, .and_reg16_reg16, .and_reg32_reg32, .and_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const r = a & b;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayRegisterBinary(d, .bit_and);
             },
             .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64 => {
                 const a = self.regVal(d.dst_reg, d.size);
@@ -1160,11 +1107,7 @@ pub const ElfState = struct {
                 self.setFlagsLogic(r, d.size);
             },
             .or_reg8_reg8, .or_reg16_reg16, .or_reg32_reg32, .or_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const r = a | b;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayRegisterBinary(d, .bit_or);
             },
             .or_reg8_mem8, .or_reg16_mem16, .or_reg32_mem32, .or_reg64_mem64 => {
                 const a = self.regVal(d.dst_reg, d.size);
@@ -1214,11 +1157,7 @@ pub const ElfState = struct {
                 self.setFlagsLogic(r, d.size);
             },
             .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, d.size);
-                const b = self.regVal(d.src_reg, d.size);
-                const r = a ^ b;
-                self.setReg(d.dst_reg, d.size, r);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayRegisterBinary(d, .bit_xor);
             },
             .xor_reg8_imm8 => {
                 const a = self.regVal(d.dst_reg, .bits8);
@@ -1337,8 +1276,7 @@ pub const ElfState = struct {
                 self.setFlagsSar(old, r, d.size, count);
             },
             .test_reg8_reg8, .test_reg16_reg16, .test_reg32_reg32, .test_reg64_reg64 => {
-                const r = self.regVal(d.dst_reg, d.size) & self.regVal(d.src_reg, d.size);
-                self.setFlagsLogic(r, d.size);
+                self.executeHighwayRegisterBinary(d, .test_bits);
             },
             .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64 => {
                 const r = self.readMemVal(d.addr, d.size) & self.regVal(d.src_reg, d.size);
@@ -1400,26 +1338,7 @@ pub const ElfState = struct {
             },
 
             // ── cmp reg, reg (opcode 0x39, mod=3) ──
-            .cmp_reg8_reg8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.regVal(d.src_reg, .bits8);
-                self.setFlagsSub(a, b, a -% b, .bits8);
-            },
-            .cmp_reg16_reg16 => {
-                const a = self.regVal(d.dst_reg, .bits16);
-                const b = self.regVal(d.src_reg, .bits16);
-                self.setFlagsSub(a, b, a -% b, .bits16);
-            },
-            .cmp_reg32_reg32 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const b = self.regVal(d.src_reg, .bits32);
-                self.setFlagsSub(a, b, a -% b, .bits32);
-            },
-            .cmp_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const b = self.regVal(d.src_reg, .bits64);
-                self.setFlagsSub(a, b, a -% b, .bits64);
-            },
+            .cmp_reg8_reg8, .cmp_reg16_reg16, .cmp_reg32_reg32, .cmp_reg64_reg64 => self.executeHighwayRegisterBinary(d, .cmp),
 
             // ── cmp reg, r/m (0x3A/0x3B, d=1) ──
             .cmp_reg8_mem8 => {

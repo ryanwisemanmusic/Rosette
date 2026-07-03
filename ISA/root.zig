@@ -4,6 +4,7 @@ const runtime_abi = @import("runtime_abi_handshake");
 pub const x86 = @import("x86/Zig/root.zig");
 pub const neon = @import("NEON/Zig/root.zig");
 pub const math = @import("Math/root.zig");
+pub const highway = @import("highway.zig");
 
 pub fn validateAll() void {
     runtime_abi.isa.init();

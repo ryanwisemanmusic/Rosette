@@ -15,6 +15,7 @@ const stack_trace = @import("stack/runtime.zig");
 const decode_trace = @import("instruction-decoding/runtime.zig");
 const exception_trace = @import("exceptions/runtime.zig");
 const reg_map = @import("register_mapping.zig");
+const highway = isa.isa_registry.highway;
 
 pub const ThunkHandler = *const fn (*Executor) void;
 
@@ -191,6 +192,20 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
         .pop_reg => ex.regs.set(decoded.register.?, ex.regs.pop(&ex.mem)),
         .push_imm => ex.push(decoded.immediate),
         .mov_reg_imm => ex.regs.set(decoded.register.?, decoded.immediate),
+        .binary_reg_reg => {
+            const rm_register = switch (decoded.operand.?) {
+                .reg => |reg| reg,
+                .mem => return stopRawUnsupported(ex, start_eip, decoded, "shared scalar adapter expected a register operand"),
+            };
+            const to_reg = (decoded.opcode & 0x02) != 0;
+            const dst = if (to_reg) decoded.register.? else rm_register;
+            const src = if (to_reg) rm_register else decoded.register.?;
+            const lhs = readRegisterWidth(&ex.regs, dst, decoded.width);
+            const rhs = readRegisterWidth(&ex.regs, src, decoded.width);
+            const evaluated = highway.evaluate(decoded.binary_op.?, decoded.width, lhs, rhs, ex.regs.flags.raw());
+            ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+            if (evaluated.writeback) writeRegisterWidth(&ex.regs, dst, decoded.width, evaluated.value);
+        },
         .group5_inc => switch (decoded.operand.?) {
             .reg => |reg| ex.inc(reg),
             .mem => return stopRawUnsupported(ex, start_eip, decoded, "INC r/m32 memory execution is not implemented yet"),
@@ -241,6 +256,22 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
     }
     ex.regs.eip = next_eip;
     return true;
+}
+
+fn readRegisterWidth(regs: *const reg_map.RegisterFile, reg: reg_map.Register, width: highway.Width) u64 {
+    return switch (width) {
+        .bits8 => regs.get8(reg),
+        .bits16 => regs.get16(reg),
+        .bits32, .bits64 => regs.get(reg),
+    };
+}
+
+fn writeRegisterWidth(regs: *reg_map.RegisterFile, reg: reg_map.Register, width: highway.Width, value: u64) void {
+    switch (width) {
+        .bits8 => regs.set8(reg, @truncate(value)),
+        .bits16 => regs.set16(reg, @truncate(value)),
+        .bits32, .bits64 => regs.set(reg, @truncate(value)),
+    }
 }
 
 fn execRawNext(ex: *Executor) bool {
@@ -465,4 +496,24 @@ test "raw PE mode executes Group5 absolute indirect JMP" {
     try std.testing.expect(execNext(&ex, &thunks));
     try std.testing.expectEqual(@as(u32, 0x00401234), ex.regs.eip);
     try std.testing.expectEqual(@as(u32, 0), ex.regs.pending_exception);
+}
+
+test "raw PE register arithmetic executes through the ISA highway" {
+    var ex = Executor.init(std.testing.allocator, 0x10000);
+    defer ex.deinit();
+    ex.setRawX86PeMode();
+    ex.mem.base = 0x00400000;
+    ex.regs.eip = 0x00400100;
+    ex.regs.eax = 0xFFFF_FFFF;
+    ex.regs.ecx = 1;
+
+    const entry_off = ex.regs.eip - ex.mem.base;
+    @memcpy(ex.mem.data[entry_off .. entry_off + 2], &[_]u8{ 0x01, 0xC8 });
+
+    var thunks = ThunkTable{};
+    try std.testing.expect(execNext(&ex, &thunks));
+    try std.testing.expectEqual(@as(u32, 0), ex.regs.eax);
+    try std.testing.expectEqual(@as(u1, 1), ex.regs.flags.cf);
+    try std.testing.expectEqual(@as(u1, 1), ex.regs.flags.zf);
+    try std.testing.expectEqual(@as(u32, 0x00400102), ex.regs.eip);
 }

@@ -326,6 +326,10 @@ pub fn sub(width: Width, lhs: u64, rhs: u64) IntegerResult {
     return subBorrow(width, lhs, rhs, false);
 }
 
+pub fn sbb(width: Width, lhs: u64, rhs: u64, borrow: bool) IntegerResult {
+    return subBorrow(width, lhs, rhs, borrow);
+}
+
 pub fn dec(width: Width, value: u64, flags_in: InputFlags) IntegerResult {
     var result = subBorrow(width, value, 1, false);
     result.flags.cf = boolFlag(flags_in.cf);
@@ -345,6 +349,31 @@ fn subBorrow(width: Width, lhs: u64, rhs: u64, borrow: bool) IntegerResult {
     flags.af = boolFlag(((lhs_t ^ rhs_t ^ result) & 0x10) != 0);
     flags.of = boolFlag((((lhs_t ^ rhs_t) & (lhs_t ^ result) & sign) != 0));
     return .{ .dest = result, .flags = flags };
+}
+
+fn logical(width: Width, result_wide: u64) IntegerResult {
+    const result = truncate(width, result_wide);
+    var flags = szpFlags(width, result);
+    flags.cf = .clear;
+    flags.of = .clear;
+    flags.af = .undefined;
+    return .{ .dest = result, .flags = flags };
+}
+
+pub fn bitAnd(width: Width, lhs: u64, rhs: u64) IntegerResult {
+    return logical(width, lhs & rhs);
+}
+
+pub fn bitOr(width: Width, lhs: u64, rhs: u64) IntegerResult {
+    return logical(width, lhs | rhs);
+}
+
+pub fn bitXor(width: Width, lhs: u64, rhs: u64) IntegerResult {
+    return logical(width, lhs ^ rhs);
+}
+
+pub fn testBits(width: Width, lhs: u64, rhs: u64) IntegerResult {
+    return bitAnd(width, lhs, rhs);
 }
 
 pub fn mov(width: Width, src: u64) IntegerResult {
