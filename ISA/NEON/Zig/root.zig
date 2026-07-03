@@ -456,6 +456,15 @@ const blend_blendpd = @import("BLEND/BLENDPD.zig");
 const blend_blendps = @import("BLEND/BLENDPS.zig");
 const blend_blendvpd = @import("BLEND/BLENDVPD.zig");
 const blend_blendvps = @import("BLEND/BLENDVPS.zig");
+const blend_pblendvb = @import("BLEND/PBLENDVB.zig");
+const blend_pblendw = @import("BLEND/PBLENDW.zig");
+const blend_vblendmpd = @import("BLEND/VBLENDMPD.zig");
+const blend_vblendmps = @import("BLEND/VBLENDMPS.zig");
+const blend_vpblendd = @import("BLEND/VPBLENDD.zig");
+const blend_vpblendmb = @import("BLEND/VPBLENDMB.zig");
+const blend_vpblendmw = @import("BLEND/VPBLENDMW.zig");
+const blend_vpblendmd = @import("BLEND/VPBLENDMD.zig");
+const blend_vpblendmq = @import("BLEND/VPBLENDMQ.zig");
 const bls_blsi = @import("BLS/BLSI.zig");
 const bls_blsmsk = @import("BLS/BLSMSK.zig");
 const bls_blsr = @import("BLS/BLSR.zig");
@@ -1273,6 +1282,15 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(blend_blendps.family, blend_blendps.path, blend_blendps.source),
     mirror(blend_blendvpd.family, blend_blendvpd.path, blend_blendvpd.source),
     mirror(blend_blendvps.family, blend_blendvps.path, blend_blendvps.source),
+    mirror(blend_pblendvb.family, blend_pblendvb.path, blend_pblendvb.source),
+    mirror(blend_pblendw.family, blend_pblendw.path, blend_pblendw.source),
+    mirror(blend_vblendmpd.family, blend_vblendmpd.path, blend_vblendmpd.source),
+    mirror(blend_vblendmps.family, blend_vblendmps.path, blend_vblendmps.source),
+    mirror(blend_vpblendd.family, blend_vpblendd.path, blend_vpblendd.source),
+    mirror(blend_vpblendmb.family, blend_vpblendmb.path, blend_vpblendmb.source),
+    mirror(blend_vpblendmw.family, blend_vpblendmw.path, blend_vpblendmw.source),
+    mirror(blend_vpblendmd.family, blend_vpblendmd.path, blend_vpblendmd.source),
+    mirror(blend_vpblendmq.family, blend_vpblendmq.path, blend_vpblendmq.source),
     mirror(bls_blsi.family, bls_blsi.path, bls_blsi.source),
     mirror(bls_blsmsk.family, bls_blsmsk.path, bls_blsmsk.source),
     mirror(bls_blsr.family, bls_blsr.path, bls_blsr.source),
