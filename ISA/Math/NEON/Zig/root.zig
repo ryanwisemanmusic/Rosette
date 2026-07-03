@@ -376,6 +376,11 @@ const mul_mulx = @import("MUL/MULX.zig");
 const or_or = @import("OR/OR.zig");
 const or_orpd = @import("OR/ORPD.zig");
 const or_orps = @import("OR/ORPS.zig");
+const output_out = @import("OUTPUT/OUT.zig");
+const output_outs = @import("OUTPUT/OUTS.zig");
+const output_outsb = @import("OUTPUT/OUTSB.zig");
+const output_outsw = @import("OUTPUT/OUTSW.zig");
+const output_outsd = @import("OUTPUT/OUTSD.zig");
 const pop_pop = @import("POP/POP.zig");
 const pop_popa = @import("POP/POPA.zig");
 const pop_popad = @import("POP/POPAD.zig");
@@ -1090,6 +1095,11 @@ pub const specs = blk: {
         spec(or_or.meta),
         spec(or_orpd.meta),
         spec(or_orps.meta),
+        spec(output_out.meta),
+        spec(output_outs.meta),
+        spec(output_outsb.meta),
+        spec(output_outsw.meta),
+        spec(output_outsd.meta),
         spec(pop_pop.meta),
         spec(pop_popa.meta),
         spec(pop_popad.meta),
@@ -1816,6 +1826,11 @@ pub const proof_reports = [_]proofs.ProofReport{
     or_or.proof_report,
     or_orpd.proof_report,
     or_orps.proof_report,
+    output_out.proof_report,
+    output_outs.proof_report,
+    output_outsb.proof_report,
+    output_outsw.proof_report,
+    output_outsd.proof_report,
     pop_pop.proof_report,
     pop_popa.proof_report,
     pop_popad.proof_report,

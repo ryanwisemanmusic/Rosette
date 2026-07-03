@@ -374,6 +374,11 @@ const mul_mulx = @import("MUL/MULX.zig");
 const or_or = @import("OR/OR.zig");
 const or_orpd = @import("OR/ORPD.zig");
 const or_orps = @import("OR/ORPS.zig");
+const output_out = @import("OUTPUT/OUT.zig");
+const output_outs = @import("OUTPUT/OUTS.zig");
+const output_outsb = @import("OUTPUT/OUTSB.zig");
+const output_outsw = @import("OUTPUT/OUTSW.zig");
+const output_outsd = @import("OUTPUT/OUTSD.zig");
 const pop_pop = @import("POP/POP.zig");
 const pop_popa = @import("POP/POPA.zig");
 const pop_popad = @import("POP/POPAD.zig");
@@ -1159,6 +1164,11 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(or_or.family, or_or.path, or_or.source),
     mirror(or_orpd.family, or_orpd.path, or_orpd.source),
     mirror(or_orps.family, or_orps.path, or_orps.source),
+    mirror(output_out.family, output_out.path, output_out.source),
+    mirror(output_outs.family, output_outs.path, output_outs.source),
+    mirror(output_outsb.family, output_outsb.path, output_outsb.source),
+    mirror(output_outsw.family, output_outsw.path, output_outsw.source),
+    mirror(output_outsd.family, output_outsd.path, output_outsd.source),
     mirror(pop_pop.family, pop_pop.path, pop_pop.source),
     mirror(pop_popa.family, pop_popa.path, pop_popa.source),
     mirror(pop_popad.family, pop_popad.path, pop_popad.source),
