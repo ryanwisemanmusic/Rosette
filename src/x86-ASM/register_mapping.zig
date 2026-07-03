@@ -37,45 +37,57 @@ pub const Register = enum(u4) {
         if (std.mem.eql(u8, lower, "ebp")) return .ebp;
         if (std.mem.eql(u8, lower, "esi")) return .esi;
         if (std.mem.eql(u8, lower, "edi")) return .edi;
-        if (std.mem.eql(u8, lower, "ax"))   return .eax;
-        if (std.mem.eql(u8, lower, "cx"))   return .ecx;
-        if (std.mem.eql(u8, lower, "dx"))   return .edx;
-        if (std.mem.eql(u8, lower, "bx"))   return .ebx;
-        if (std.mem.eql(u8, lower, "sp"))   return .esp;
-        if (std.mem.eql(u8, lower, "bp"))   return .ebp;
-        if (std.mem.eql(u8, lower, "si"))   return .esi;
-        if (std.mem.eql(u8, lower, "di"))   return .edi;
-        if (std.mem.eql(u8, lower, "al"))   return .eax;
-        if (std.mem.eql(u8, lower, "cl"))   return .ecx;
-        if (std.mem.eql(u8, lower, "dl"))   return .edx;
-        if (std.mem.eql(u8, lower, "bl"))   return .ebx;
+        if (std.mem.eql(u8, lower, "ax")) return .eax;
+        if (std.mem.eql(u8, lower, "cx")) return .ecx;
+        if (std.mem.eql(u8, lower, "dx")) return .edx;
+        if (std.mem.eql(u8, lower, "bx")) return .ebx;
+        if (std.mem.eql(u8, lower, "sp")) return .esp;
+        if (std.mem.eql(u8, lower, "bp")) return .ebp;
+        if (std.mem.eql(u8, lower, "si")) return .esi;
+        if (std.mem.eql(u8, lower, "di")) return .edi;
+        if (std.mem.eql(u8, lower, "al")) return .eax;
+        if (std.mem.eql(u8, lower, "cl")) return .ecx;
+        if (std.mem.eql(u8, lower, "dl")) return .edx;
+        if (std.mem.eql(u8, lower, "bl")) return .ebx;
         return null;
+    }
+};
+
+pub const ByteRegister = struct {
+    base: Register,
+    high: bool = false,
+
+    pub fn fromEncoding(bits: u3) ByteRegister {
+        return if (bits < 4)
+            .{ .base = @enumFromInt(@as(u4, bits)) }
+        else
+            .{ .base = @enumFromInt(@as(u4, bits - 4)), .high = true };
     }
 };
 
 /// x86 FLAGS register layout (EFLAGS).
 pub const Flags = packed struct(u32) {
-    cf: u1 = 0,         // Carry
-    reserved1: u1 = 1,  // bit 1 (always 1)
-    pf: u1 = 0,         // Parity
-    reserved2: u1 = 0,  // bit 3
-    af: u1 = 0,         // Auxiliary Carry
-    reserved3: u1 = 0,  // bit 5
-    zf: u1 = 0,         // Zero
-    sf: u1 = 0,         // Sign
-    tf: u1 = 0,         // Trap
-    if_: u1 = 1,        // Interrupt Enable
-    df: u1 = 0,         // Direction
-    of: u1 = 0,         // Overflow
-    iopl: u2 = 0,       // I/O Privilege Level
-    nt: u1 = 0,         // Nested Task
-    reserved4: u1 = 0,  // bit 15
-    rf: u1 = 0,         // Resume
-    vm: u1 = 0,         // Virtual 8086 Mode
-    ac: u1 = 0,         // Alignment Check
-    vif: u1 = 0,        // Virtual Interrupt
-    vip: u1 = 0,        // Virtual Interrupt Pending
-    id: u1 = 0,         // ID
+    cf: u1 = 0, // Carry
+    reserved1: u1 = 1, // bit 1 (always 1)
+    pf: u1 = 0, // Parity
+    reserved2: u1 = 0, // bit 3
+    af: u1 = 0, // Auxiliary Carry
+    reserved3: u1 = 0, // bit 5
+    zf: u1 = 0, // Zero
+    sf: u1 = 0, // Sign
+    tf: u1 = 0, // Trap
+    if_: u1 = 1, // Interrupt Enable
+    df: u1 = 0, // Direction
+    of: u1 = 0, // Overflow
+    iopl: u2 = 0, // I/O Privilege Level
+    nt: u1 = 0, // Nested Task
+    reserved4: u1 = 0, // bit 15
+    rf: u1 = 0, // Resume
+    vm: u1 = 0, // Virtual 8086 Mode
+    ac: u1 = 0, // Alignment Check
+    vif: u1 = 0, // Virtual Interrupt
+    vip: u1 = 0, // Virtual Interrupt Pending
+    id: u1 = 0, // ID
     reserved5: u10 = 0, // bits 22-31
 
     /// Read flags as a raw u32.
@@ -258,6 +270,20 @@ pub const RegisterFile = struct {
     pub fn set8(self: *RegisterFile, reg: Register, value: u8) void {
         const wide = self.get(reg) & 0xFFFFFF00 | value;
         self.set(reg, wide);
+    }
+
+    pub fn getByte(self: *const RegisterFile, reg: ByteRegister) u8 {
+        const value = self.get(reg.base);
+        return if (reg.high) @truncate(value >> 8) else @truncate(value);
+    }
+
+    pub fn setByte(self: *RegisterFile, reg: ByteRegister, value: u8) void {
+        const old = self.get(reg.base);
+        const updated = if (reg.high)
+            (old & 0xFFFF_00FF) | (@as(u32, value) << 8)
+        else
+            (old & 0xFFFF_FF00) | value;
+        self.set(reg.base, updated);
     }
 
     /// Push a 32-bit value onto the emulated stack (pre-decrement ESP).

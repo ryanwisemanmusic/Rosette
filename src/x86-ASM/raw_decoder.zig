@@ -2,11 +2,12 @@ const std = @import("std");
 const scaffold = @import("decode_scaffold.zig");
 const reg_map = @import("register_mapping.zig");
 const isa_registry = @import("isa_registry");
-const highway = isa_registry.highway;
+const highway = @import("isa_highway");
 
 const ModRm = scaffold.ModRm;
 const Sib = scaffold.Sib;
 const Register = reg_map.Register;
+const ByteRegister = reg_map.ByteRegister;
 
 pub const max_instruction_len = 15;
 
@@ -34,7 +35,8 @@ pub const RawOp = enum {
     pop_reg,
     push_imm,
     mov_reg_imm,
-    binary_reg_reg,
+    binary,
+    binary_immediate,
     group5_inc,
     group5_dec,
     group5_call,
@@ -90,6 +92,10 @@ pub const DecodedInstruction = struct {
     immediate: u32 = 0,
     binary_op: ?highway.BinaryOp = null,
     width: highway.Width = .bits32,
+    byte_register: ?ByteRegister = null,
+    byte_rm_register: ?ByteRegister = null,
+    locked: bool = false,
+    transfer: ?highway.ControlTransfer = null,
     target: u32 = 0,
     text: [96]u8 = [_]u8{0} ** 96,
     text_len: u8 = 0,
@@ -104,6 +110,7 @@ const PrefixState = struct {
     operand_size_override: bool = false,
     address_size_override: bool = false,
     count: u8 = 0,
+    locked: bool = false,
 };
 
 fn reg32Name(reg: Register) []const u8 {
@@ -135,6 +142,10 @@ fn readU32(cursor: *scaffold.DecodeCursor) !u32 {
     return result;
 }
 
+fn readU16(cursor: *scaffold.DecodeCursor) !u16 {
+    return @as(u16, try readU8(cursor)) | (@as(u16, try readU8(cursor)) << 8);
+}
+
 fn readI32(cursor: *scaffold.DecodeCursor) !i32 {
     return @bitCast(try readU32(cursor));
 }
@@ -150,7 +161,8 @@ fn parsePrefixes(cursor: *scaffold.DecodeCursor) !PrefixState {
         switch (byte) {
             0x66 => prefixes.operand_size_override = true,
             0x67 => prefixes.address_size_override = true,
-            0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65 => {},
+            0xF0 => prefixes.locked = true,
+            0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65 => {},
             else => break,
         }
         _ = try readU8(cursor);
@@ -251,6 +263,7 @@ fn relTarget(address: u32, len: usize, rel: i32) u32 {
 
 fn sourcePathForMnemonic(mnemonic: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(mnemonic, "add")) return "ADD/ADD.inc";
+    if (std.ascii.eqlIgnoreCase(mnemonic, "adc")) return "ADC-SBB/ADC.inc";
     if (std.ascii.eqlIgnoreCase(mnemonic, "bit_and")) return "AND/AND.inc";
     if (std.ascii.eqlIgnoreCase(mnemonic, "bit_or")) return "OR/OR.inc";
     if (std.ascii.eqlIgnoreCase(mnemonic, "bit_xor")) return "XOR/XOR.inc";
@@ -356,7 +369,8 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DecodedInstruction {
             const rel = try readI32(&cursor);
             var result = makeBase(address, opcode, .call_rel, .executable, "call");
             result.control = .near_call;
-            result.target = relTarget(address, cursor.offset, rel);
+            result.transfer = highway.relativeControl(.call, address, @intCast(cursor.offset), rel, true);
+            result.target = @truncate(result.transfer.?.target);
             try appendText(&result, "call 0x{X:0>8}", .{result.target});
             return finish(&result, bytes, cursor.offset);
         },
@@ -364,7 +378,8 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DecodedInstruction {
             const rel = try readI32(&cursor);
             var result = makeBase(address, opcode, .jmp_rel, .executable, "jmp");
             result.control = .near_jump;
-            result.target = relTarget(address, cursor.offset, rel);
+            result.transfer = highway.relativeControl(.jump, address, @intCast(cursor.offset), rel, true);
+            result.target = @truncate(result.transfer.?.target);
             try appendText(&result, "jmp 0x{X:0>8}", .{result.target});
             return finish(&result, bytes, cursor.offset);
         },
@@ -372,26 +387,19 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DecodedInstruction {
             const rel = @as(i32, try readI8(&cursor));
             var result = makeBase(address, opcode, .jmp_rel, .executable, "jmp");
             result.control = .near_jump;
-            result.target = relTarget(address, cursor.offset, rel);
+            result.transfer = highway.relativeControl(.jump, address, @intCast(cursor.offset), rel, true);
+            result.target = @truncate(result.transfer.?.target);
             try appendText(&result, "jmp 0x{X:0>8}", .{result.target});
             return finish(&result, bytes, cursor.offset);
         },
-        0x00...0x03, 0x08...0x0B, 0x18...0x1B, 0x20...0x23, 0x28...0x2B, 0x30...0x33, 0x38...0x3B => {
+        0x00...0x03, 0x08...0x0B, 0x10...0x13, 0x18...0x1B, 0x20...0x23, 0x28...0x2B, 0x30...0x33, 0x38...0x3B => {
             const modrm = try cursor.readModRm();
             var sib: ?Sib = null;
             const rm = try parseRm32(&cursor, modrm, &sib);
             var rm_buf: [64]u8 = undefined;
             const rm_text = try formatRm32(&rm_buf, rm);
-            const binary_op: highway.BinaryOp = switch (opcode >> 3) {
-                0 => .add,
-                1 => .bit_or,
-                3 => .sbb,
-                4 => .bit_and,
-                5 => .sub,
-                6 => .bit_xor,
-                7 => .cmp,
-                else => unreachable,
-            };
+            const encoding = highway.classifyLegacyBinaryOpcode(opcode).?;
+            const binary_op = encoding.op;
             const mnemonic = @tagName(binary_op);
             const width: highway.Width = if ((opcode & 1) == 0)
                 .bits8
@@ -399,24 +407,52 @@ pub fn decodeInstruction(address: u32, bytes: []const u8) !DecodedInstruction {
                 .bits16
             else
                 .bits32;
-            const executable = modrm.mod == 3 and width != .bits8;
-            var result = makeBase(address, opcode, if (executable) .binary_reg_reg else .recognized_unimplemented, if (executable) .executable else .recognized_unimplemented, mnemonic);
+            var result = makeBase(address, opcode, .binary, .executable, mnemonic);
             result.modrm = modrm;
             result.sib = sib;
             result.operand = rm;
             result.register = registerFromBits(modrm.reg);
             result.binary_op = binary_op;
             result.width = width;
-            result.unsupported_reason = if (width == .bits8)
-                "8-bit high-register aliases require the byte-register adapter"
-            else
-                "memory arithmetic requires the shared memory transaction adapter";
-            const d = (opcode >> 1) & 1;
-            if (d == 1) {
+            result.locked = prefixes.locked;
+            if (width == .bits8) {
+                result.byte_register = ByteRegister.fromEncoding(modrm.reg);
+                if (modrm.mod == 3) result.byte_rm_register = ByteRegister.fromEncoding(modrm.rm);
+            }
+            if (encoding.direction == .register_destination) {
                 try appendText(&result, "{s} {s}, {s}", .{ mnemonic, reg32Name(registerFromBits(modrm.reg)), rm_text });
             } else {
                 try appendText(&result, "{s} {s}, {s}", .{ mnemonic, rm_text, reg32Name(registerFromBits(modrm.reg)) });
             }
+            return finish(&result, bytes, cursor.offset);
+        },
+        0x80, 0x81, 0x83 => {
+            const modrm = try cursor.readModRm();
+            var sib: ?Sib = null;
+            const rm = try parseRm32(&cursor, modrm, &sib);
+            const encoding = highway.classifyGroup1(modrm.reg);
+            const width: highway.Width = if (opcode == 0x80)
+                .bits8
+            else if (prefixes.operand_size_override)
+                .bits16
+            else
+                .bits32;
+            const immediate: u32 = if (opcode == 0x80 or opcode == 0x83)
+                @as(u32, @bitCast(@as(i32, try readI8(&cursor))))
+            else if (width == .bits16)
+                try readU16(&cursor)
+            else
+                try readU32(&cursor);
+            var result = makeBase(address, opcode, .binary_immediate, .executable, @tagName(encoding.op));
+            result.modrm = modrm;
+            result.sib = sib;
+            result.operand = rm;
+            result.binary_op = encoding.op;
+            result.width = width;
+            result.immediate = immediate;
+            result.locked = prefixes.locked;
+            if (width == .bits8 and modrm.mod == 3) result.byte_rm_register = ByteRegister.fromEncoding(modrm.rm);
+            try appendText(&result, "{s} r/m, 0x{X}", .{ @tagName(encoding.op), immediate });
             return finish(&result, bytes, cursor.offset);
         },
         0x88...0x8B => {
@@ -501,19 +537,33 @@ pub fn validateGlobalIsaCoverage() void {
 
 test "portable register arithmetic decodes through the ISA highway" {
     const add = try decodeInstruction(0x00401000, &.{ 0x01, 0xC8 });
-    try std.testing.expectEqual(RawOp.binary_reg_reg, add.op);
+    try std.testing.expectEqual(RawOp.binary, add.op);
     try std.testing.expectEqual(DecodeStatus.executable, add.status);
     try std.testing.expectEqual(highway.BinaryOp.add, add.binary_op.?);
     try std.testing.expectEqual(highway.Width.bits32, add.width);
 
     const sbb = try decodeInstruction(0x00401002, &.{ 0x19, 0xC9 });
-    try std.testing.expectEqual(RawOp.binary_reg_reg, sbb.op);
+    try std.testing.expectEqual(RawOp.binary, sbb.op);
     try std.testing.expectEqual(highway.BinaryOp.sbb, sbb.binary_op.?);
     try std.testing.expectEqualStrings("ADC-SBB/SBB.inc", sbb.isa_path);
 
     const memory = try decodeInstruction(0x00401004, &.{ 0x29, 0x08 });
-    try std.testing.expectEqual(DecodeStatus.recognized_unimplemented, memory.status);
+    try std.testing.expectEqual(RawOp.binary, memory.op);
+    try std.testing.expectEqual(DecodeStatus.executable, memory.status);
     try std.testing.expectEqual(highway.BinaryOp.sub, memory.binary_op.?);
+
+    const high_bytes = try decodeInstruction(0x00401006, &.{ 0x28, 0xE5 });
+    try std.testing.expectEqual(highway.Width.bits8, high_bytes.width);
+    try std.testing.expect(high_bytes.byte_register.?.high);
+    try std.testing.expect(high_bytes.byte_rm_register.?.high);
+}
+
+test "Group1 immediates and LOCK decode through shared classification" {
+    const locked = try decodeInstruction(0x00402000, &.{ 0xF0, 0x83, 0x28, 0x01 });
+    try std.testing.expectEqual(RawOp.binary_immediate, locked.op);
+    try std.testing.expectEqual(highway.BinaryOp.sub, locked.binary_op.?);
+    try std.testing.expect(locked.locked);
+    try std.testing.expectEqual(@as(u32, 1), locked.immediate);
 }
 
 test "decodes Group5 absolute indirect JMP through global ISA table" {

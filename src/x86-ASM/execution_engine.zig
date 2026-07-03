@@ -15,7 +15,7 @@ const stack_trace = @import("stack/runtime.zig");
 const decode_trace = @import("instruction-decoding/runtime.zig");
 const exception_trace = @import("exceptions/runtime.zig");
 const reg_map = @import("register_mapping.zig");
-const highway = isa.isa_registry.highway;
+const highway = @import("isa_highway");
 
 pub const ThunkHandler = *const fn (*Executor) void;
 
@@ -125,6 +125,8 @@ fn resolveRawMemAddr(operand: raw_decode.Rm32, regs: *const reg_map.RegisterFile
 }
 
 fn dispatchIatCall(ex: *Executor, start_eip: u32, iat_addr: u32, name: []const u8, next_eip: u32) bool {
+    const boundary = highway.systemBoundary(.pe32, .import, iat_addr, name);
+    if (boundary.disposition != .forward) return false;
     if (ex.import_table.get(name) == null) return false;
     reg_trace.logControlTransfer("iat_call", start_eip, iat_addr, &ex.regs);
     stack_trace.logState("before_iat_call", .before_call, &ex.regs, &ex.mem);
@@ -139,6 +141,8 @@ fn dispatchIatCall(ex: *Executor, start_eip: u32, iat_addr: u32, name: []const u
 }
 
 fn dispatchIatJmp(ex: *Executor, iat_addr: u32, name: []const u8) bool {
+    const boundary = highway.systemBoundary(.pe32, .import, iat_addr, name);
+    if (boundary.disposition != .forward) return false;
     if (ex.import_table.get(name) == null) return false;
     reg_trace.logControlTransfer("iat_jmp", 0, iat_addr, &ex.regs);
     stack_trace.logState("before_iat_jmp", .before_call, &ex.regs, &ex.mem);
@@ -192,19 +196,76 @@ fn executeRawDecoded(ex: *Executor, decoded: raw_decode.DecodedInstruction, star
         .pop_reg => ex.regs.set(decoded.register.?, ex.regs.pop(&ex.mem)),
         .push_imm => ex.push(decoded.immediate),
         .mov_reg_imm => ex.regs.set(decoded.register.?, decoded.immediate),
-        .binary_reg_reg => {
-            const rm_register = switch (decoded.operand.?) {
-                .reg => |reg| reg,
-                .mem => return stopRawUnsupported(ex, start_eip, decoded, "shared scalar adapter expected a register operand"),
-            };
-            const to_reg = (decoded.opcode & 0x02) != 0;
-            const dst = if (to_reg) decoded.register.? else rm_register;
-            const src = if (to_reg) rm_register else decoded.register.?;
-            const lhs = readRegisterWidth(&ex.regs, dst, decoded.width);
-            const rhs = readRegisterWidth(&ex.regs, src, decoded.width);
-            const evaluated = highway.evaluate(decoded.binary_op.?, decoded.width, lhs, rhs, ex.regs.flags.raw());
-            ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
-            if (evaluated.writeback) writeRegisterWidth(&ex.regs, dst, decoded.width, evaluated.value);
+        .binary => switch (decoded.operand.?) {
+            .reg => |rm_register| {
+                const to_reg = (decoded.opcode & 0x02) != 0;
+                if (decoded.width == .bits8) {
+                    const dst = if (to_reg) decoded.byte_register.? else decoded.byte_rm_register.?;
+                    const src = if (to_reg) decoded.byte_rm_register.? else decoded.byte_register.?;
+                    const evaluated = highway.evaluate(decoded.binary_op.?, .bits8, ex.regs.getByte(dst), ex.regs.getByte(src), ex.regs.flags.raw());
+                    ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+                    if (evaluated.writeback) ex.regs.setByte(dst, @truncate(evaluated.value));
+                } else {
+                    const dst = if (to_reg) decoded.register.? else rm_register;
+                    const src = if (to_reg) rm_register else decoded.register.?;
+                    const lhs = readRegisterWidth(&ex.regs, dst, decoded.width);
+                    const rhs = readRegisterWidth(&ex.regs, src, decoded.width);
+                    const evaluated = highway.evaluate(decoded.binary_op.?, decoded.width, lhs, rhs, ex.regs.flags.raw());
+                    ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+                    if (evaluated.writeback) writeRegisterWidth(&ex.regs, dst, decoded.width, evaluated.value);
+                }
+            },
+            .mem => |memory| {
+                const address = memory.resolve(&ex.regs) orelse
+                    return stopRawUnsupported(ex, start_eip, decoded, "shared memory transaction address overflowed PE32");
+                const direction: highway.MemoryDirection = if ((decoded.opcode & 0x02) != 0) .memory_to_register else .register_to_memory;
+                const access: highway.MemoryAccess = if (direction == .register_to_memory and decoded.binary_op.? != .cmp and decoded.binary_op.? != .test_bits) .write else .read;
+                const range = highway.validateRange(ex.mem.base, ex.mem.data.len, address, decoded.width, access, true);
+                if (!range.allowed()) return stopRawUnsupported(ex, start_eip, decoded, @tagName(range.fault.?));
+                const register_value = if (decoded.width == .bits8)
+                    ex.regs.getByte(decoded.byte_register.?)
+                else
+                    readRegisterWidth(&ex.regs, decoded.register.?, decoded.width);
+                const memory_value = readMemoryWidth(&ex.mem, address, decoded.width);
+                const evaluated = highway.evaluateMemory(decoded.binary_op.?, decoded.width, register_value, memory_value, direction, ex.regs.flags.raw());
+                ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+                if (evaluated.write_register) {
+                    if (decoded.width == .bits8)
+                        ex.regs.setByte(decoded.byte_register.?, @truncate(evaluated.value))
+                    else
+                        writeRegisterWidth(&ex.regs, decoded.register.?, decoded.width, evaluated.value);
+                }
+                if (evaluated.write_memory) writeMemoryWidth(&ex.mem, address, decoded.width, evaluated.value);
+            },
+        },
+        .binary_immediate => switch (decoded.operand.?) {
+            .reg => |reg| {
+                if (decoded.locked) return stopRawUnsupported(ex, start_eip, decoded, "LOCK requires a memory destination");
+                if (decoded.width == .bits8) {
+                    const byte_reg = decoded.byte_rm_register.?;
+                    const evaluated = highway.evaluate(decoded.binary_op.?, .bits8, ex.regs.getByte(byte_reg), decoded.immediate, ex.regs.flags.raw());
+                    ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+                    if (evaluated.writeback) ex.regs.setByte(byte_reg, @truncate(evaluated.value));
+                } else {
+                    const lhs = readRegisterWidth(&ex.regs, reg, decoded.width);
+                    const evaluated = highway.evaluate(decoded.binary_op.?, decoded.width, lhs, decoded.immediate, ex.regs.flags.raw());
+                    ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+                    if (evaluated.writeback) writeRegisterWidth(&ex.regs, reg, decoded.width, evaluated.value);
+                }
+            },
+            .mem => |memory| {
+                const address = memory.resolve(&ex.regs) orelse
+                    return stopRawUnsupported(ex, start_eip, decoded, "immediate memory transaction address overflowed PE32");
+                const check = highway.validateAtomic(address, decoded.width, decoded.locked);
+                if (!check.allowed()) return stopRawUnsupported(ex, start_eip, decoded, @tagName(check.fault.?));
+                const access: highway.MemoryAccess = if (decoded.locked) .atomic_read_modify_write else .write;
+                const range = highway.validateRange(ex.mem.base, ex.mem.data.len, address, decoded.width, access, true);
+                if (!range.allowed()) return stopRawUnsupported(ex, start_eip, decoded, @tagName(range.fault.?));
+                const lhs = readMemoryWidth(&ex.mem, address, decoded.width);
+                const evaluated = highway.evaluate(decoded.binary_op.?, decoded.width, lhs, decoded.immediate, ex.regs.flags.raw());
+                ex.regs.flags = reg_map.Flags.fromRaw(evaluated.rflags);
+                if (evaluated.writeback) writeMemoryWidth(&ex.mem, address, decoded.width, evaluated.value);
+            },
         },
         .group5_inc => switch (decoded.operand.?) {
             .reg => |reg| ex.inc(reg),
@@ -271,6 +332,22 @@ fn writeRegisterWidth(regs: *reg_map.RegisterFile, reg: reg_map.Register, width:
         .bits8 => regs.set8(reg, @truncate(value)),
         .bits16 => regs.set16(reg, @truncate(value)),
         .bits32, .bits64 => regs.set(reg, @truncate(value)),
+    }
+}
+
+fn readMemoryWidth(memory: *const reg_map.Memory, address: u32, width: highway.Width) u64 {
+    return switch (width) {
+        .bits8 => memory.read8(address),
+        .bits16 => memory.read16(address),
+        .bits32, .bits64 => memory.read32(address),
+    };
+}
+
+fn writeMemoryWidth(memory: *reg_map.Memory, address: u32, width: highway.Width, value: u64) void {
+    switch (width) {
+        .bits8 => memory.write8(address, @truncate(value)),
+        .bits16 => memory.write16(address, @truncate(value)),
+        .bits32, .bits64 => memory.write32(address, @truncate(value)),
     }
 }
 
@@ -516,4 +593,59 @@ test "raw PE register arithmetic executes through the ISA highway" {
     try std.testing.expectEqual(@as(u1, 1), ex.regs.flags.cf);
     try std.testing.expectEqual(@as(u1, 1), ex.regs.flags.zf);
     try std.testing.expectEqual(@as(u32, 0x00400102), ex.regs.eip);
+}
+
+test "raw PE memory arithmetic executes through the ISA transaction highway" {
+    var ex = Executor.init(std.testing.allocator, 0x10000);
+    defer ex.deinit();
+    ex.setRawX86PeMode();
+    ex.mem.base = 0x00400000;
+    ex.regs.eip = 0x00400100;
+    ex.regs.eax = 0x00400200;
+    ex.regs.ecx = 3;
+    ex.mem.write32(ex.regs.eax, 10);
+
+    const entry_off = ex.regs.eip - ex.mem.base;
+    @memcpy(ex.mem.data[entry_off .. entry_off + 2], &[_]u8{ 0x29, 0x08 });
+
+    var thunks = ThunkTable{};
+    try std.testing.expect(execNext(&ex, &thunks));
+    try std.testing.expectEqual(@as(u32, 7), ex.mem.read32(ex.regs.eax));
+    try std.testing.expectEqual(@as(u1, 0), ex.regs.flags.zf);
+    try std.testing.expectEqual(@as(u32, 0x00400102), ex.regs.eip);
+}
+
+test "raw PE byte arithmetic preserves AH CH DH BH aliases" {
+    var ex = Executor.init(std.testing.allocator, 0x10000);
+    defer ex.deinit();
+    ex.setRawX86PeMode();
+    ex.mem.base = 0x00400000;
+    ex.regs.eip = 0x00400100;
+    ex.regs.eax = 0x0000_0200;
+    ex.regs.ecx = 0x0000_0500;
+
+    const entry_off = ex.regs.eip - ex.mem.base;
+    @memcpy(ex.mem.data[entry_off .. entry_off + 2], &[_]u8{ 0x28, 0xE5 });
+
+    var thunks = ThunkTable{};
+    try std.testing.expect(execNext(&ex, &thunks));
+    try std.testing.expectEqual(@as(u8, 3), ex.regs.getByte(.{ .base = .ecx, .high = true }));
+    try std.testing.expectEqual(@as(u8, 2), ex.regs.getByte(.{ .base = .eax, .high = true }));
+}
+
+test "raw PE LOCK memory immediate commits one highway transaction" {
+    var ex = Executor.init(std.testing.allocator, 0x10000);
+    defer ex.deinit();
+    ex.setRawX86PeMode();
+    ex.mem.base = 0x00400000;
+    ex.regs.eip = 0x00400100;
+    ex.regs.eax = 0x00400201;
+    ex.mem.write32(ex.regs.eax, 10);
+
+    const entry_off = ex.regs.eip - ex.mem.base;
+    @memcpy(ex.mem.data[entry_off .. entry_off + 4], &[_]u8{ 0xF0, 0x83, 0x28, 0x01 });
+
+    var thunks = ThunkTable{};
+    try std.testing.expect(execNext(&ex, &thunks));
+    try std.testing.expectEqual(@as(u32, 9), ex.mem.read32(ex.regs.eax));
 }
