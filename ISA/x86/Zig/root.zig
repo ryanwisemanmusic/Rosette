@@ -423,6 +423,15 @@ const undef_ud2 = @import("UNDEF/UD2.zig");
 const unordered_ucomisd = @import("UNORDERED/UCOMISD.zig");
 const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
 const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
+const variable_vpsllvw = @import("VARIABLE/VPSLLVW.zig");
+const variable_vpsllvd = @import("VARIABLE/VPSLLVD.zig");
+const variable_vpsllvq = @import("VARIABLE/VPSLLVQ.zig");
+const variable_vpsravw = @import("VARIABLE/VPSRAVW.zig");
+const variable_vpsravd = @import("VARIABLE/VPSRAVD.zig");
+const variable_vpsravq = @import("VARIABLE/VPSRAVQ.zig");
+const variable_vpsrlvw = @import("VARIABLE/VPSRLVW.zig");
+const variable_vpsrlvd = @import("VARIABLE/VPSRLVD.zig");
+const variable_vpsrlvq = @import("VARIABLE/VPSRLVQ.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
 const vptestm_vptestmb = @import("VPTESTM/VPTESTMB.zig");
@@ -1286,6 +1295,15 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "WRGSBASE",
     "WRMSR",
     "WRPKRU",
+    "VPSLLVW",
+    "VPSLLVD",
+    "VPSLLVQ",
+    "VPSRAVW",
+    "VPSRAVD",
+    "VPSRAVQ",
+    "VPSRLVW",
+    "VPSRLVD",
+    "VPSRLVQ",
 };
 
 pub const TableMetadata = struct {
@@ -1761,6 +1779,15 @@ pub const tables = [_]InstructionTable{
     entry(unordered_ucomisd.family, unordered_ucomisd.path, unordered_ucomisd.source),
     entry(unordered_ucomiss.family, unordered_ucomiss.path, unordered_ucomiss.source),
     entry(unordered_vucomish.family, unordered_vucomish.path, unordered_vucomish.source),
+    entry(variable_vpsllvw.family, variable_vpsllvw.path, variable_vpsllvw.source),
+    entry(variable_vpsllvd.family, variable_vpsllvd.path, variable_vpsllvd.source),
+    entry(variable_vpsllvq.family, variable_vpsllvq.path, variable_vpsllvq.source),
+    entry(variable_vpsravw.family, variable_vpsravw.path, variable_vpsravw.source),
+    entry(variable_vpsravd.family, variable_vpsravd.path, variable_vpsravd.source),
+    entry(variable_vpsravq.family, variable_vpsravq.path, variable_vpsravq.source),
+    entry(variable_vpsrlvw.family, variable_vpsrlvw.path, variable_vpsrlvw.source),
+    entry(variable_vpsrlvd.family, variable_vpsrlvd.path, variable_vpsrlvd.source),
+    entry(variable_vpsrlvq.family, variable_vpsrlvq.path, variable_vpsrlvq.source),
     entry(xor_xor.family, xor_xor.path, xor_xor.source),
     entry(xor_xorpd.family, xor_xorpd.path, xor_xorpd.source),
     entry(xor_xorps.family, xor_xorps.path, xor_xorps.source),
@@ -2248,7 +2275,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 587), tableCount());
+    try std.testing.expectEqual(@as(usize, 596), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
