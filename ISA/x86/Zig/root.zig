@@ -455,6 +455,15 @@ const blend_blendpd = @import("BLEND/BLENDPD.zig");
 const blend_blendps = @import("BLEND/BLENDPS.zig");
 const blend_blendvpd = @import("BLEND/BLENDVPD.zig");
 const blend_blendvps = @import("BLEND/BLENDVPS.zig");
+const blend_pblendvb = @import("BLEND/PBLENDVB.zig");
+const blend_pblendw = @import("BLEND/PBLENDW.zig");
+const blend_vblendmpd = @import("BLEND/VBLENDMPD.zig");
+const blend_vblendmps = @import("BLEND/VBLENDMPS.zig");
+const blend_vpblendd = @import("BLEND/VPBLENDD.zig");
+const blend_vpblendmb = @import("BLEND/VPBLENDMB.zig");
+const blend_vpblendmw = @import("BLEND/VPBLENDMW.zig");
+const blend_vpblendmd = @import("BLEND/VPBLENDMD.zig");
+const blend_vpblendmq = @import("BLEND/VPBLENDMQ.zig");
 const bls_blsi = @import("BLS/BLSI.zig");
 const bls_blsmsk = @import("BLS/BLSMSK.zig");
 const bls_blsr = @import("BLS/BLSR.zig");
@@ -1075,6 +1084,15 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "BLENDPS",
     "BLENDVPD",
     "BLENDVPS",
+    "PBLENDVB",
+    "PBLENDW",
+    "VBLENDMPD",
+    "VBLENDMPS",
+    "VPBLENDD",
+    "VPBLENDMB",
+    "VPBLENDMW",
+    "VPBLENDMD",
+    "VPBLENDMQ",
     "BLSI",
     "BLSMSK",
     "BLSR",
@@ -1801,6 +1819,15 @@ pub const tables = [_]InstructionTable{
     entry(blend_blendps.family, blend_blendps.path, blend_blendps.source),
     entry(blend_blendvpd.family, blend_blendvpd.path, blend_blendvpd.source),
     entry(blend_blendvps.family, blend_blendvps.path, blend_blendvps.source),
+    entry(blend_pblendvb.family, blend_pblendvb.path, blend_pblendvb.source),
+    entry(blend_pblendw.family, blend_pblendw.path, blend_pblendw.source),
+    entry(blend_vblendmpd.family, blend_vblendmpd.path, blend_vblendmpd.source),
+    entry(blend_vblendmps.family, blend_vblendmps.path, blend_vblendmps.source),
+    entry(blend_vpblendd.family, blend_vpblendd.path, blend_vpblendd.source),
+    entry(blend_vpblendmb.family, blend_vpblendmb.path, blend_vpblendmb.source),
+    entry(blend_vpblendmw.family, blend_vpblendmw.path, blend_vpblendmw.source),
+    entry(blend_vpblendmd.family, blend_vpblendmd.path, blend_vpblendmd.source),
+    entry(blend_vpblendmq.family, blend_vpblendmq.path, blend_vpblendmq.source),
     entry(bls_blsi.family, bls_blsi.path, bls_blsi.source),
     entry(bls_blsmsk.family, bls_blsmsk.path, bls_blsmsk.source),
     entry(bls_blsr.family, bls_blsr.path, bls_blsr.source),
@@ -2275,7 +2302,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 596), tableCount());
+    try std.testing.expectEqual(@as(usize, 605), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

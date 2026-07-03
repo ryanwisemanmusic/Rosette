@@ -457,6 +457,15 @@ const blend_blendpd = @import("BLEND/BLENDPD.zig");
 const blend_blendps = @import("BLEND/BLENDPS.zig");
 const blend_blendvpd = @import("BLEND/BLENDVPD.zig");
 const blend_blendvps = @import("BLEND/BLENDVPS.zig");
+const blend_pblendvb = @import("BLEND/PBLENDVB.zig");
+const blend_pblendw = @import("BLEND/PBLENDW.zig");
+const blend_vblendmpd = @import("BLEND/VBLENDMPD.zig");
+const blend_vblendmps = @import("BLEND/VBLENDMPS.zig");
+const blend_vpblendd = @import("BLEND/VPBLENDD.zig");
+const blend_vpblendmb = @import("BLEND/VPBLENDMB.zig");
+const blend_vpblendmw = @import("BLEND/VPBLENDMW.zig");
+const blend_vpblendmd = @import("BLEND/VPBLENDMD.zig");
+const blend_vpblendmq = @import("BLEND/VPBLENDMQ.zig");
 const bls_blsi = @import("BLS/BLSI.zig");
 const bls_blsmsk = @import("BLS/BLSMSK.zig");
 const bls_blsr = @import("BLS/BLSR.zig");
@@ -1203,6 +1212,15 @@ pub const specs = blk: {
         spec(blend_blendps.meta),
         spec(blend_blendvpd.meta),
         spec(blend_blendvps.meta),
+        spec(blend_pblendvb.meta),
+        spec(blend_pblendw.meta),
+        spec(blend_vblendmpd.meta),
+        spec(blend_vblendmps.meta),
+        spec(blend_vpblendd.meta),
+        spec(blend_vpblendmb.meta),
+        spec(blend_vpblendmw.meta),
+        spec(blend_vpblendmd.meta),
+        spec(blend_vpblendmq.meta),
         spec(bls_blsi.meta),
         spec(bls_blsmsk.meta),
         spec(bls_blsr.meta),
@@ -1965,6 +1983,15 @@ pub const proof_reports = [_]proofs.ProofReport{
     blend_blendps.proof_report,
     blend_blendvpd.proof_report,
     blend_blendvps.proof_report,
+    blend_pblendvb.proof_report,
+    blend_pblendw.proof_report,
+    blend_vblendmpd.proof_report,
+    blend_vblendmps.proof_report,
+    blend_vpblendd.proof_report,
+    blend_vpblendmb.proof_report,
+    blend_vpblendmw.proof_report,
+    blend_vpblendmd.proof_report,
+    blend_vpblendmq.proof_report,
     bls_blsi.proof_report,
     bls_blsmsk.proof_report,
     bls_blsr.proof_report,
@@ -2342,7 +2369,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 557), tableCount());
+    try std.testing.expectEqual(@as(usize, 566), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
