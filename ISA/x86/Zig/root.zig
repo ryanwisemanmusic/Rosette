@@ -373,6 +373,11 @@ const mul_mulx = @import("MUL/MULX.zig");
 const or_or = @import("OR/OR.zig");
 const or_orpd = @import("OR/ORPD.zig");
 const or_orps = @import("OR/ORPS.zig");
+const output_out = @import("OUTPUT/OUT.zig");
+const output_outs = @import("OUTPUT/OUTS.zig");
+const output_outsb = @import("OUTPUT/OUTSB.zig");
+const output_outsw = @import("OUTPUT/OUTSW.zig");
+const output_outsd = @import("OUTPUT/OUTSD.zig");
 const pop_pop = @import("POP/POP.zig");
 const pop_popa = @import("POP/POPA.zig");
 const pop_popad = @import("POP/POPAD.zig");
@@ -960,6 +965,11 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "OR",
     "ORPD",
     "ORPS",
+    "OUT",
+    "OUTS",
+    "OUTSB",
+    "OUTSW",
+    "OUTSD",
     "POP",
     "POPA",
     "POPAD",
