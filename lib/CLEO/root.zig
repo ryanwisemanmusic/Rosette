@@ -6,6 +6,7 @@ pub const neon = @import("NEON/root.zig");
 pub const cpu = @import("cpu.zig");
 pub const ops = @import("ops.zig");
 pub const registry = @import("registry.zig");
+pub const highway_adapter = @import("highway_adapter.zig");
 pub const SSE = @import("SSE/root.zig");
 pub const AVX = registry.AVX;
 pub const AVX2 = registry.AVX2;
