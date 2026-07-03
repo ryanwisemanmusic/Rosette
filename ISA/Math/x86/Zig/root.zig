@@ -475,6 +475,11 @@ const terminate_endbr32 = @import("TERMINATE/ENDBR32.zig");
 const terminate_endbr64 = @import("TERMINATE/ENDBR64.zig");
 const shuffle_shufpd = @import("SHUFFLE/SHUFPD.zig");
 const shuffle_shufps = @import("SHUFFLE/SHUFPS.zig");
+const shuffle_vpshufbitqmb = @import("SHUFFLE/VPSHUFBITQMB.zig");
+const shuffle_vshuff32x4 = @import("SHUFFLE/VSHUFF32x4.zig");
+const shuffle_vshuff64x2 = @import("SHUFFLE/VSHUFF64x2.zig");
+const shuffle_vshufi32x4 = @import("SHUFFLE/VSHUFI32x4.zig");
+const shuffle_vshufi64x2 = @import("SHUFFLE/VSHUFI64x2.zig");
 const shift_sal = @import("SHIFT/SAL.zig");
 const shift_sar = @import("SHIFT/SAR.zig");
 const shift_shl = @import("SHIFT/SHL.zig");
@@ -1204,6 +1209,11 @@ pub const specs = blk: {
         spec(sys_sysret.meta),
         spec(shuffle_shufpd.meta),
         spec(shuffle_shufps.meta),
+        spec(shuffle_vpshufbitqmb.meta),
+        spec(shuffle_vshuff32x4.meta),
+        spec(shuffle_vshuff64x2.meta),
+        spec(shuffle_vshufi32x4.meta),
+        spec(shuffle_vshufi64x2.meta),
         spec(shift_sal.meta),
         spec(shift_sar.meta),
         spec(shift_shl.meta),
@@ -1945,6 +1955,11 @@ pub const proof_reports = [_]proofs.ProofReport{
     sys_sysret.proof_report,
     shuffle_shufpd.proof_report,
     shuffle_shufps.proof_report,
+    shuffle_vpshufbitqmb.proof_report,
+    shuffle_vshuff32x4.proof_report,
+    shuffle_vshuff64x2.proof_report,
+    shuffle_vshufi32x4.proof_report,
+    shuffle_vshufi64x2.proof_report,
     shift_sal.proof_report,
     shift_sar.proof_report,
     shift_shl.proof_report,

@@ -473,6 +473,11 @@ const terminate_endbr32 = @import("TERMINATE/ENDBR32.zig");
 const terminate_endbr64 = @import("TERMINATE/ENDBR64.zig");
 const shuffle_shufpd = @import("SHUFFLE/SHUFPD.zig");
 const shuffle_shufps = @import("SHUFFLE/SHUFPS.zig");
+const shuffle_vpshufbitqmb = @import("SHUFFLE/VPSHUFBITQMB.zig");
+const shuffle_vshuff32x4 = @import("SHUFFLE/VSHUFF32x4.zig");
+const shuffle_vshuff64x2 = @import("SHUFFLE/VSHUFF64x2.zig");
+const shuffle_vshufi32x4 = @import("SHUFFLE/VSHUFI32x4.zig");
+const shuffle_vshufi64x2 = @import("SHUFFLE/VSHUFI64x2.zig");
 const shift_sal = @import("SHIFT/SAL.zig");
 const shift_sar = @import("SHIFT/SAR.zig");
 const shift_shl = @import("SHIFT/SHL.zig");
@@ -1082,6 +1087,11 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "SYSRET",
     "SHUFPD",
     "SHUFPS",
+    "VPSHUFBITQMB",
+    "VSHUFF32x4",
+    "VSHUFF64x2",
+    "VSHUFI32x4",
+    "VSHUFI64x2",
     "SAL",
     "SAR",
     "SHL",
@@ -1781,6 +1791,11 @@ pub const tables = [_]InstructionTable{
     entry(sys_sysret.family, sys_sysret.path, sys_sysret.source),
     entry(shuffle_shufpd.family, shuffle_shufpd.path, shuffle_shufpd.source),
     entry(shuffle_shufps.family, shuffle_shufps.path, shuffle_shufps.source),
+    entry(shuffle_vpshufbitqmb.family, shuffle_vpshufbitqmb.path, shuffle_vpshufbitqmb.source),
+    entry(shuffle_vshuff32x4.family, shuffle_vshuff32x4.path, shuffle_vshuff32x4.source),
+    entry(shuffle_vshuff64x2.family, shuffle_vshuff64x2.path, shuffle_vshuff64x2.source),
+    entry(shuffle_vshufi32x4.family, shuffle_vshufi32x4.path, shuffle_vshufi32x4.source),
+    entry(shuffle_vshufi64x2.family, shuffle_vshufi64x2.path, shuffle_vshufi64x2.source),
     entry(shift_sal.family, shift_sal.path, shift_sal.source),
     entry(shift_sar.family, shift_sar.path, shift_sar.source),
     entry(shift_shl.family, shift_shl.path, shift_shl.source),
