@@ -722,6 +722,13 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const write_ptwrite = @import("WRITE/PTWRITE.zig");
+const write_wbinvd = @import("WRITE/WBINVD.zig");
+const write_wbnoinvd = @import("WRITE/WBNOINVD.zig");
+const write_wrfsbase = @import("WRITE/WRFSBASE.zig");
+const write_wrgsbase = @import("WRITE/WRGSBASE.zig");
+const write_wrmsr = @import("WRITE/WRMSR.zig");
+const write_wrpkru = @import("WRITE/WRPKRU.zig");
 const absolute_fabs = @import("ABSOLUTE/fabs.zig");
 const absolute_pabsb = @import("ABSOLUTE/pabsb.zig");
 const absolute_pabsd = @import("ABSOLUTE/pabsd.zig");
@@ -1527,6 +1534,13 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(trig_fsincos.family, trig_fsincos.path, trig_fsincos.source),
     mirror(wait_wait.family, wait_wait.path, wait_wait.source),
     mirror(wait_mwait.family, wait_mwait.path, wait_mwait.source),
+    mirror(write_ptwrite.family, write_ptwrite.path, write_ptwrite.source),
+    mirror(write_wbinvd.family, write_wbinvd.path, write_wbinvd.source),
+    mirror(write_wbnoinvd.family, write_wbnoinvd.path, write_wbnoinvd.source),
+    mirror(write_wrfsbase.family, write_wrfsbase.path, write_wrfsbase.source),
+    mirror(write_wrgsbase.family, write_wrgsbase.path, write_wrgsbase.source),
+    mirror(write_wrmsr.family, write_wrmsr.path, write_wrmsr.source),
+    mirror(write_wrpkru.family, write_wrpkru.path, write_wrpkru.source),
     mirror(absolute_fabs.family, absolute_fabs.path, absolute_fabs.source),
     mirror(absolute_pabsb.family, absolute_pabsb.path, absolute_pabsb.source),
     mirror(absolute_pabsd.family, absolute_pabsd.path, absolute_pabsd.source),

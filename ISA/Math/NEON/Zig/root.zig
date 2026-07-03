@@ -724,6 +724,13 @@ const trig_fsin = @import("TRIG/fsin.zig");
 const trig_fsincos = @import("TRIG/fsincos.zig");
 const wait_wait = @import("WAIT/wait.zig");
 const wait_mwait = @import("WAIT/mwait.zig");
+const write_ptwrite = @import("WRITE/PTWRITE.zig");
+const write_wbinvd = @import("WRITE/WBINVD.zig");
+const write_wbnoinvd = @import("WRITE/WBNOINVD.zig");
+const write_wrfsbase = @import("WRITE/WRFSBASE.zig");
+const write_wrgsbase = @import("WRITE/WRGSBASE.zig");
+const write_wrmsr = @import("WRITE/WRMSR.zig");
+const write_wrpkru = @import("WRITE/WRPKRU.zig");
 const absolute_fabs = @import("ABSOLUTE/fabs.zig");
 const absolute_pabsb = @import("ABSOLUTE/pabsb.zig");
 const absolute_pabsd = @import("ABSOLUTE/pabsd.zig");
@@ -1458,6 +1465,13 @@ pub const specs = blk: {
         spec(trig_fsincos.meta),
         spec(wait_wait.meta),
         spec(wait_mwait.meta),
+        spec(write_ptwrite.meta),
+        spec(write_wbinvd.meta),
+        spec(write_wbnoinvd.meta),
+        spec(write_wrfsbase.meta),
+        spec(write_wrgsbase.meta),
+        spec(write_wrmsr.meta),
+        spec(write_wrpkru.meta),
         spec(absolute_fabs.meta),
         spec(absolute_pabsb.meta),
         spec(absolute_pabsd.meta),
@@ -2204,6 +2218,13 @@ pub const proof_reports = [_]proofs.ProofReport{
     trig_fsincos.proof_report,
     wait_wait.proof_report,
     wait_mwait.proof_report,
+    write_ptwrite.proof_report,
+    write_wbinvd.proof_report,
+    write_wbnoinvd.proof_report,
+    write_wrfsbase.proof_report,
+    write_wrgsbase.proof_report,
+    write_wrmsr.proof_report,
+    write_wrpkru.proof_report,
     absolute_fabs.proof_report,
     absolute_pabsb.proof_report,
     absolute_pabsd.proof_report,
