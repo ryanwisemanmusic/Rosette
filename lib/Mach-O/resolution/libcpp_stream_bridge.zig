@@ -22,6 +22,8 @@ const Stream = struct {
     fd: std.c.fd_t = -1,
     buffer: u64 = 0,
     buffer_size: u64 = 0,
+    eof: bool = false,
+    failed: bool = false,
 };
 
 pub const Bridge = struct {
@@ -137,6 +139,72 @@ pub const Bridge = struct {
         return self.setBuffer(object, buffer, size);
     }
 
+    pub fn constructIfstream(self: *Bridge, state: anytype, object: u64) bool {
+        const bytes = state.guestMemory(object, 512) orelse {
+            self.rejected +|= 1;
+            return false;
+        };
+        @memset(bytes, 0);
+        _ = self.ensure(object + FILEBUF_OFFSET_IN_IFSTREAM) orelse {
+            self.rejected +|= 1;
+            return false;
+        };
+        self.constructors +|= 1;
+        return true;
+    }
+
+    pub fn destroyIfstream(self: *Bridge, state: anytype, object: u64) void {
+        self.destroy(state, object + FILEBUF_OFFSET_IN_IFSTREAM);
+    }
+
+    pub fn readLine(self: *Bridge, state: anytype, object: u64, string_object: u64, delimiter: u8) bool {
+        self.reads +|= 1;
+        const stream = self.findFlexible(object) orelse {
+            self.rejected +|= 1;
+            return false;
+        };
+        if (stream.fd < 0) {
+            stream.failed = true;
+            return false;
+        }
+
+        var line: [64 * 1024]u8 = undefined;
+        var length: usize = 0;
+        while (length < line.len) {
+            var byte: [1]u8 = undefined;
+            const result = std.c.read(stream.fd, &byte, 1);
+            if (result < 0) {
+                stream.failed = true;
+                return false;
+            }
+            if (result == 0) {
+                stream.eof = true;
+                if (length == 0) stream.failed = true;
+                break;
+            }
+            if (byte[0] == delimiter) break;
+            line[length] = byte[0];
+            length += 1;
+        }
+        if (length == line.len) stream.failed = true;
+        return compat_runtime.initLibcppStringFromSlice(state, string_object, line[0..length]);
+    }
+
+    pub fn good(self: *Bridge, object: u64) bool {
+        const stream = self.findFlexible(object) orelse return false;
+        return !stream.failed;
+    }
+
+    pub fn failed(self: *Bridge, object: u64) bool {
+        const stream = self.findFlexible(object) orelse return true;
+        return stream.failed;
+    }
+
+    pub fn eof(self: *Bridge, object: u64) bool {
+        const stream = self.findFlexible(object) orelse return false;
+        return stream.eof;
+    }
+
     pub fn logSummary(self: *const Bridge) void {
         var live: usize = 0;
         for (self.streams) |stream| {
@@ -234,6 +302,7 @@ pub const Bridge = struct {
         const fd = std.c.open(@ptrCast(&path_z_buffer), flags, @as(std.c.mode_t, 0o666));
         if (fd < 0) {
             self.open_failures +|= 1;
+            if (self.find(object)) |stream| stream.failed = true;
             setOpenMarker(state, object, false);
             std.debug.print("macho-processor: libc++ filebuf open failed: {s} mode=0x{x}\n", .{ translated, mode });
             return 0;
@@ -246,6 +315,8 @@ pub const Bridge = struct {
         };
         closeStream(stream);
         stream.fd = fd;
+        stream.eof = false;
+        stream.failed = false;
         setOpenMarker(state, object, true);
         if (mode & OPENMODE_ATE != 0) _ = std.c.lseek(fd, 0, std.c.SEEK.END);
         std.debug.print("macho-processor: libc++ filebuf open: {s} mode=0x{x} fd={d}\n", .{ translated, mode, fd });
@@ -338,7 +409,14 @@ pub const Bridge = struct {
     }
 
     fn findFlexible(self: *Bridge, object: u64) ?*Stream {
-        return self.find(object) orelse self.find(object + FILEBUF_OFFSET_IN_IFSTREAM);
+        if (self.find(object)) |stream| return stream;
+        if (self.find(object + FILEBUF_OFFSET_IN_IFSTREAM)) |stream| return stream;
+        for (&self.streams) |*stream| {
+            if (!stream.active or stream.object < FILEBUF_OFFSET_IN_IFSTREAM) continue;
+            const ifstream = stream.object - FILEBUF_OFFSET_IN_IFSTREAM;
+            if (object == ifstream or object == ifstream + 424) return stream;
+        }
+        return null;
     }
 };
 
@@ -398,7 +476,8 @@ test "stream bridge handles libc++ base destructor chain" {
 
 test "stream bridge forwards guest file operations through typed host calls" {
     const TestState = struct {
-        mem: [512]u8 = [_]u8{0} ** 512,
+        mem: [1024]u8 = [_]u8{0} ** 1024,
+        next_alloc: u64 = 768,
         regs: struct {
             rdi: u64 = 0,
             rsi: u64 = 0,
@@ -430,6 +509,13 @@ test "stream bridge forwards guest file operations through typed host calls" {
         pub fn write64(self: *@This(), address: u64, value: u64) void {
             std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
         }
+
+        pub fn guestAlloc(self: *@This(), size: u64, alignment: u64) ?u64 {
+            const aligned = std.mem.alignForward(u64, self.next_alloc, alignment);
+            if (aligned + size > self.mem.len) return null;
+            self.next_alloc = aligned + size;
+            return aligned;
+        }
     };
     const IdentityFs = struct {
         fn resolveHostPath(_: *@This(), path: []const u8, _: []u8) ?[]const u8 {
@@ -455,4 +541,19 @@ test "stream bridge forwards guest file operations through typed host calls" {
     try std.testing.expectEqual(@as(i64, 0), bridge.seek(object, 0, std.c.SEEK.SET));
     try std.testing.expectEqual(object, bridge.close(&state, object));
     try std.testing.expectEqual(@as(u64, 0), state.read64(object + FILEBUF_OPEN_HANDLE_OFFSET));
+
+    var ifstream_bridge = Bridge{};
+    defer ifstream_bridge.deinit();
+    state = .{};
+    const ifstream: u64 = 0;
+    const string_object: u64 = 600;
+    try std.testing.expect(ifstream_bridge.constructIfstream(&state, ifstream));
+    @memcpy(state.mem[path_address .. path_address + "/dev/null".len], "/dev/null");
+    state.regs = .{ .rdi = ifstream, .rsi = path_address, .rdx = OPENMODE_IN };
+    try std.testing.expect(ifstream_bridge.dispatch(&state, &fs, "__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEE4openEPKcj") != null);
+    try std.testing.expect(ifstream_bridge.readLine(&state, ifstream, string_object, '\n'));
+    try std.testing.expect(ifstream_bridge.eof(ifstream));
+    try std.testing.expect(ifstream_bridge.failed(ifstream));
+    try std.testing.expect(!ifstream_bridge.good(ifstream + 424));
+    try std.testing.expectEqual(@as(u64, 0), compat_runtime.libcppStringView(&state, string_object).?.length);
 }

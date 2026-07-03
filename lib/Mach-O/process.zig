@@ -145,6 +145,14 @@ const InternalCompatibilityTargets = struct {
     guest_log_append_formatted: u64 = 0,
     guest_log_append_view: u64 = 0,
     libcxx_basic_streambuf_pubsetbuf: u64 = 0,
+    libcxx_basic_ifstream_default_constructor: u64 = 0,
+    libcxx_basic_ifstream_destructor_1: u64 = 0,
+    libcxx_basic_ifstream_destructor_2: u64 = 0,
+    libcxx_getline: u64 = 0,
+    libcxx_getline_delimiter: u64 = 0,
+    libcxx_basic_ios_bool: u64 = 0,
+    libcxx_basic_ios_fail: u64 = 0,
+    libcxx_basic_ios_eof: u64 = 0,
     print_config_to_log: u64 = 0,
 };
 
@@ -373,6 +381,30 @@ pub const MachOState = struct {
         result.internal_targets.libcxx_basic_streambuf_pubsetbuf = result.metadata.symbolAddressWithPrefix(
             "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9pubsetbuf",
         ) orelse 0;
+        result.internal_targets.libcxx_basic_ifstream_default_constructor = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1Ev",
+        ) orelse 0;
+        result.internal_targets.libcxx_basic_ifstream_destructor_1 = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED1Ev",
+        ) orelse 0;
+        result.internal_targets.libcxx_basic_ifstream_destructor_2 = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED2Ev",
+        ) orelse 0;
+        result.internal_targets.libcxx_getline = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__17getlineB7v160006IcNS_11char_traitsIcEENS_9allocatorIcEEEERNS_13basic_istreamIT_T0_EES9_RNS_12basic_stringIS6_S7_T1_EE",
+        ) orelse 0;
+        result.internal_targets.libcxx_getline_delimiter = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__17getlineB7v160006IcNS_11char_traitsIcEENS_9allocatorIcEEEERNS_13basic_istreamIT_T0_EES9_RNS_12basic_stringIS6_S7_T1_EES6_",
+        ) orelse 0;
+        result.internal_targets.libcxx_basic_ios_bool = result.metadata.symbolAddressWithPrefix(
+            "__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEEcvbB7v160006Ev",
+        ) orelse 0;
+        result.internal_targets.libcxx_basic_ios_fail = result.metadata.symbolAddressWithPrefix(
+            "__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE4failB7v160006Ev",
+        ) orelse 0;
+        result.internal_targets.libcxx_basic_ios_eof = result.metadata.symbolAddressWithPrefix(
+            "__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE3eofB7v160006Ev",
+        ) orelse 0;
         result.internal_targets.print_config_to_log = result.metadata.symbolAddressWithPrefix(
             "__ZN6config16PrintConfigToLog",
         ) orelse 0;
@@ -419,6 +451,8 @@ pub const MachOState = struct {
 
         var applied: usize = 0;
         var callable_got_bindings: usize = 0;
+        var bridged_abi_data_bindings: usize = 0;
+        var deferred_abi_data_bindings: usize = 0;
         var stack_guard_address: u64 = 0;
         for (self.metadata.bindings) |binding| {
             if (std.mem.eql(u8, binding.name, "___stdinp") or
@@ -442,7 +476,15 @@ pub const MachOState = struct {
                 continue;
             }
             const section = self.metadata.sectionAtAddress(binding.address) orelse continue;
-            if (!isCallableConstantBinding(section, binding.name, stubs.contains(binding.name))) continue;
+            if (!isCallableConstantBinding(section, binding.name, stubs.contains(binding.name))) {
+                if (isAbiDataSymbol(binding.name)) {
+                    if (isBridgedLibcppDataSymbol(binding.name))
+                        bridged_abi_data_bindings += 1
+                    else
+                        deferred_abi_data_bindings += 1;
+                }
+                continue;
+            }
             const destination = self.guestMemory(binding.address, @sizeOf(u64)) orelse continue;
             const existing = std.mem.readInt(u64, destination[0..8], .little);
             if (std.mem.eql(u8, binding.dylib, "weak-lookup") and existing != 0) continue;
@@ -471,8 +513,8 @@ pub const MachOState = struct {
 
         self.bound_import_thunks = try thunks.toOwnedSlice(self.allocator);
         std.debug.print(
-            "macho-processor: applied {d} dyld data binding(s), including {d} callable GOT pointer(s); created {d} synthetic import thunk(s)\n",
-            .{ applied, callable_got_bindings, self.bound_import_thunks.len },
+            "macho-processor: applied {d} dyld data binding(s), including {d} callable GOT pointer(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d}\n",
+            .{ applied, callable_got_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings },
         );
     }
 
@@ -486,13 +528,25 @@ pub const MachOState = struct {
         if (has_import_stub) return true;
         if (!std.mem.startsWith(u8, symbol_name, "__Z")) return false;
 
-        const abi_data_symbols = [_][]const u8{
-            "__ZGV", "__ZGR", "__ZTC", "__ZTI", "__ZTS", "__ZTT", "__ZTV",
-        };
-        for (abi_data_symbols) |prefix| {
-            if (std.mem.startsWith(u8, symbol_name, prefix)) return false;
-        }
+        if (isAbiDataSymbol(symbol_name)) return false;
         return true;
+    }
+
+    fn isAbiDataSymbol(symbol_name: []const u8) bool {
+        const prefixes = [_][]const u8{ "__ZGV", "__ZGR", "__ZTC", "__ZTI", "__ZTS", "__ZTT", "__ZTV" };
+        for (prefixes) |prefix| {
+            if (std.mem.startsWith(u8, symbol_name, prefix)) return true;
+        }
+        return false;
+    }
+
+    fn isBridgedLibcppDataSymbol(symbol_name: []const u8) bool {
+        if (!isAbiDataSymbol(symbol_name)) return false;
+        return std.mem.indexOf(u8, symbol_name, "basic_ifstream") != null or
+            std.mem.indexOf(u8, symbol_name, "basic_istream") != null or
+            std.mem.indexOf(u8, symbol_name, "basic_filebuf") != null or
+            std.mem.indexOf(u8, symbol_name, "basic_ios") != null or
+            std.mem.indexOf(u8, symbol_name, "ios_base") != null;
     }
 
     fn bindingRequiresBoundThunk(section: macho_metadata.Section) bool {
@@ -628,6 +682,8 @@ pub const MachOState = struct {
             const latest_index = if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1;
             break :blk @tagName(self.trace_entries[latest_index].op);
         };
+        // Check for near-null or negative addresses (high bit set in 64-bit, or very small positive addresses)
+        const near_null = (address & 0x8000_0000_0000_0000) != 0 or address < 0x1000;
         self.memory_trace_entries[self.memory_trace_index] = .{
             .instruction_address = self.regs.rip,
             .instruction = instruction,
@@ -636,7 +692,7 @@ pub const MachOState = struct {
             .access = access,
             .value = value,
             .backed = backed,
-            .near_null = address < PAGE_SIZE,
+            .near_null = near_null,
         };
         self.memory_trace_index = (self.memory_trace_index + 1) % MEMORY_TRACE_BUFFER_LEN;
         if (self.memory_trace_index == 0) self.memory_trace_filled = true;
@@ -3034,6 +3090,47 @@ pub const MachOState = struct {
             self.regs.rip = self.pop();
             return true;
         }
+        if (self.internal_targets.libcxx_basic_ifstream_default_constructor != 0 and
+            self.regs.rip == self.internal_targets.libcxx_basic_ifstream_default_constructor)
+        {
+            if (!self.libcxx_streams.constructIfstream(self, self.regs.rdi)) return false;
+            self.regs.rax = self.regs.rdi;
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if ((self.internal_targets.libcxx_basic_ifstream_destructor_1 != 0 and
+            self.regs.rip == self.internal_targets.libcxx_basic_ifstream_destructor_1) or
+            (self.internal_targets.libcxx_basic_ifstream_destructor_2 != 0 and
+                self.regs.rip == self.internal_targets.libcxx_basic_ifstream_destructor_2))
+        {
+            self.libcxx_streams.destroyIfstream(self, self.regs.rdi);
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if ((self.internal_targets.libcxx_getline != 0 and self.regs.rip == self.internal_targets.libcxx_getline) or
+            (self.internal_targets.libcxx_getline_delimiter != 0 and self.regs.rip == self.internal_targets.libcxx_getline_delimiter))
+        {
+            const delimiter: u8 = if (self.regs.rip == self.internal_targets.libcxx_getline_delimiter) @truncate(self.regs.rdx) else '\n';
+            _ = self.libcxx_streams.readLine(self, self.regs.rdi, self.regs.rsi, delimiter);
+            self.regs.rax = self.regs.rdi;
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if (self.internal_targets.libcxx_basic_ios_bool != 0 and self.regs.rip == self.internal_targets.libcxx_basic_ios_bool) {
+            self.regs.rax = @intFromBool(self.libcxx_streams.good(self.regs.rdi));
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if (self.internal_targets.libcxx_basic_ios_fail != 0 and self.regs.rip == self.internal_targets.libcxx_basic_ios_fail) {
+            self.regs.rax = @intFromBool(self.libcxx_streams.failed(self.regs.rdi));
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if (self.internal_targets.libcxx_basic_ios_eof != 0 and self.regs.rip == self.internal_targets.libcxx_basic_ios_eof) {
+            self.regs.rax = @intFromBool(self.libcxx_streams.eof(self.regs.rdi));
+            self.regs.rip = self.pop();
+            return true;
+        }
         if (self.internal_targets.print_config_to_log != 0 and
             self.regs.rip == self.internal_targets.print_config_to_log)
         {
@@ -5067,7 +5164,9 @@ fn alignDown(value: u64, alignment: u64) u64 {
 }
 
 fn mappedOffset(mem_base: u64, mem_size: u64, mapped_min: u64, address: u64) ?u64 {
-    if (address < mapped_min or address < mem_base) return null;
+    // Check for near-null or negative addresses (high bit set in 64-bit, or very small positive addresses)
+    const near_null = (address & 0x8000_0000_0000_0000) != 0 or address < 0x1000;
+    if (near_null or address < mapped_min or address < mem_base) return null;
     const offset = address - mem_base;
     return if (offset < mem_size) offset else null;
 }
@@ -8559,6 +8658,9 @@ test "dyld data bindings materialize callable constant and GOT slots" {
     try std.testing.expect(!MachOState.isCallableConstantBinding(constant_section, "__ZTVN10__cxxabiv117__class_type_infoE", false));
     try std.testing.expect(MachOState.isCallableConstantBinding(got_section, "_strcmp", true));
     try std.testing.expect(!MachOState.isCallableConstantBinding(got_section, "___stack_chk_guard", false));
+    try std.testing.expect(MachOState.isAbiDataSymbol("__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE"));
+    try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE"));
+    try std.testing.expect(!MachOState.isBridgedLibcppDataSymbol("__ZTVN10__cxxabiv117__class_type_infoE"));
     try std.testing.expect(MachOState.bindingRequiresBoundThunk(got_section));
     try std.testing.expect(!MachOState.bindingRequiresBoundThunk(constant_section));
 }
@@ -8567,6 +8669,8 @@ test "Mach-O PAGEZERO is excluded from guest memory" {
     try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0));
     try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0x30));
     try std.testing.expectEqual(@as(?u64, 0x4000), mappedOffset(0, 0x2000_0000, 0x4000, 0x4000));
+    try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0xffff_ffff_ffff_ffe8));
+    try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0x800));
 }
 
 test "decode compiler long NOP with segment override" {

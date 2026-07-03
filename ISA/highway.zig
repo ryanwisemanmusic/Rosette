@@ -235,8 +235,10 @@ pub fn validateAtomic(address: u64, width: Width, locked: bool) MemoryCheck {
 
 pub fn validateRange(base: u64, length: usize, address: u64, width: Width, access: MemoryAccess, permitted: bool) MemoryCheck {
     const bytes: u8 = width.bits() / 8;
+    // Check for near-null or negative addresses (high bit set in 64-bit, or very small positive addresses)
+    const near_null = (address & 0x8000_0000_0000_0000) != 0 or address < 0x1000;
     const relative = address -| base;
-    const outside = address < base or relative > length or bytes > length -| @as(usize, @intCast(relative));
+    const outside = near_null or address < base or relative > length or bytes > length -| @as(usize, @intCast(relative));
     return .{
         .address = address,
         .bytes = bytes,
@@ -464,6 +466,8 @@ test "control, atomic, SIMD, and system boundaries are explicit" {
     try std.testing.expect(transaction.committed);
     try std.testing.expectEqual(@as(u64, 9), transaction.after);
     try std.testing.expectEqual(MemoryFault.unmapped, validateRange(0x1000, 16, 0x1010, .bits32, .read, true).fault.?);
+    try std.testing.expectEqual(MemoryFault.unmapped, validateRange(0x1000, 16, 0xffff_ffff_ffff_ffe8, .bits64, .read, true).fault.?);
+    try std.testing.expectEqual(MemoryFault.unmapped, validateRange(0x1000, 16, 0x800, .bits32, .read, true).fault.?);
     try std.testing.expectEqual(SimdProvider.cleo, simdProvider(.macho64, .{ .mnemonic = "VADDPS", .vector_bits = 256, .element_bits = 32 }));
     try std.testing.expectEqual(SystemDisposition.deny, systemBoundary(.elf64, .privileged, 0, "HLT").disposition);
 }
