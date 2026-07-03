@@ -622,6 +622,7 @@ const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
 const partial_fptan = @import("PARTIAL/FPTAN.zig");
 const pause_tpause = @import("PAUSE/TPAUSE.zig");
+const platform_pconfig = @import("PLATFORM/PCONFIG.zig");
 const prefetch_prefetchw = @import("PREFETCH/PREFETCHW.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
 const prefetch_prefetcht1 = @import("PREFETCH/PREFETCHT1.zig");
@@ -962,6 +963,7 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "MULSS",
     "MULX",
     "PAUSE",
+    "PCONFIG",
     "OR",
     "ORPD",
     "ORPS",

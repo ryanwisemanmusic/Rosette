@@ -624,6 +624,7 @@ const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
 const partial_fptan = @import("PARTIAL/FPTAN.zig");
 const pause_tpause = @import("PAUSE/tpause.zig");
+const platform_pconfig = @import("PLATFORM/PCONFIG.zig");
 const prefetch_prefetchw = @import("PREFETCH/prefetchw.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/prefetcht0.zig");
 const prefetch_prefetcht1 = @import("PREFETCH/prefetcht1.zig");
@@ -1343,6 +1344,7 @@ pub const specs = blk: {
         spec(partial_fprem1.meta),
         spec(partial_fptan.meta),
         spec(pause_tpause.meta),
+        spec(platform_pconfig.meta),
         spec(prefetch_prefetchw.meta),
         spec(prefetch_prefetcht0.meta),
         spec(prefetch_prefetcht1.meta),
@@ -2074,6 +2076,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     partial_fprem1.proof_report,
     partial_fptan.proof_report,
     pause_tpause.proof_report,
+    platform_pconfig.proof_report,
     prefetch_prefetchw.proof_report,
     prefetch_prefetcht0.proof_report,
     prefetch_prefetcht1.proof_report,
