@@ -79,6 +79,10 @@ const jmp_jpo = @import("JMP/JPO.zig");
 const jmp_jrcxz = @import("JMP/JRCXZ.zig");
 const jmp_js = @import("JMP/JS.zig");
 const jmp_jz = @import("JMP/JZ.zig");
+const kand_kandw = @import("KAND/KANDW.zig");
+const kand_kandb = @import("KAND/KANDB.zig");
+const kand_kandq = @import("KAND/KANDQ.zig");
+const kand_kandd = @import("KAND/KANDD.zig");
 const kortest_kortestw = @import("KORTEST/KORTESTW.zig");
 const kortest_kortestb = @import("KORTEST/KORTESTB.zig");
 const kortest_kortestq = @import("KORTEST/KORTESTQ.zig");
@@ -407,6 +411,10 @@ const unordered_ucomiss = @import("UNORDERED/UCOMISS.zig");
 const unordered_vucomish = @import("UNORDERED/VUCOMISH.zig");
 const verify_verr = @import("VERIFY/VERR.zig");
 const verify_verw = @import("VERIFY/VERW.zig");
+const vptestm_vptestmb = @import("VPTESTM/VPTESTMB.zig");
+const vptestm_vptestmw = @import("VPTESTM/VPTESTMW.zig");
+const vptestm_vptestmd = @import("VPTESTM/VPTESTMD.zig");
+const vptestm_vptestmq = @import("VPTESTM/VPTESTMQ.zig");
 const xor_xor = @import("XOR/XOR.zig");
 const xor_xorpd = @import("XOR/XORPD.zig");
 const xor_xorps = @import("XOR/XORPS.zig");
@@ -600,6 +608,10 @@ const examine_fxam = @import("EXAMINE/FXAM.zig");
 const expand_vpexpandb = @import("EXPAND/VPEXPANDB.zig");
 const expand_vpexpandw = @import("EXPAND/VPEXPANDW.zig");
 const free_ffree = @import("FREE/FFREE.zig");
+const pand_pand = @import("PAND/PAND.zig");
+const pand_vpand = @import("PAND/VPAND.zig");
+const pand_vpandd = @import("PAND/VPANDD.zig");
+const pand_vpandq = @import("PAND/VPANDQ.zig");
 const partial_fpatan = @import("PARTIAL/FPATAN.zig");
 const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
@@ -1362,6 +1374,10 @@ pub const tables = [_]InstructionTable{
     entry(jmp_jrcxz.family, jmp_jrcxz.path, jmp_jrcxz.source),
     entry(jmp_js.family, jmp_js.path, jmp_js.source),
     entry(jmp_jz.family, jmp_jz.path, jmp_jz.source),
+    entry(kand_kandw.family, kand_kandw.path, kand_kandw.source),
+    entry(kand_kandb.family, kand_kandb.path, kand_kandb.source),
+    entry(kand_kandq.family, kand_kandq.path, kand_kandq.source),
+    entry(kand_kandd.family, kand_kandd.path, kand_kandd.source),
     entry(kortest_kortestw.family, kortest_kortestw.path, kortest_kortestw.source),
     entry(kortest_kortestb.family, kortest_kortestb.path, kortest_kortestb.source),
     entry(kortest_kortestq.family, kortest_kortestq.path, kortest_kortestq.source),
@@ -1430,6 +1446,10 @@ pub const tables = [_]InstructionTable{
     entry(load_vbroadcasti64x4.family, load_vbroadcasti64x4.path, load_vbroadcasti64x4.source),
     entry(verify_verr.family, verify_verr.path, verify_verr.source),
     entry(verify_verw.family, verify_verw.path, verify_verw.source),
+    entry(vptestm_vptestmb.family, vptestm_vptestmb.path, vptestm_vptestmb.source),
+    entry(vptestm_vptestmw.family, vptestm_vptestmw.path, vptestm_vptestmw.source),
+    entry(vptestm_vptestmd.family, vptestm_vptestmd.path, vptestm_vptestmd.source),
+    entry(vptestm_vptestmq.family, vptestm_vptestmq.path, vptestm_vptestmq.source),
     entry(load_vpexpandd.family, load_vpexpandd.path, load_vpexpandd.source),
     entry(load_vpexpandq.family, load_vpexpandq.path, load_vpexpandq.source),
     entry(load_xresldtrk.family, load_xresldtrk.path, load_xresldtrk.source),
@@ -1871,6 +1891,10 @@ pub const tables = [_]InstructionTable{
     entry(expand_vpexpandb.family, expand_vpexpandb.path, expand_vpexpandb.source),
     entry(expand_vpexpandw.family, expand_vpexpandw.path, expand_vpexpandw.source),
     entry(free_ffree.family, free_ffree.path, free_ffree.source),
+    entry(pand_pand.family, pand_pand.path, pand_pand.source),
+    entry(pand_vpand.family, pand_vpand.path, pand_vpand.source),
+    entry(pand_vpandd.family, pand_vpandd.path, pand_vpandd.source),
+    entry(pand_vpandq.family, pand_vpandq.path, pand_vpandq.source),
     entry(partial_fpatan.family, partial_fpatan.path, partial_fpatan.source),
     entry(partial_fprem.family, partial_fprem.path, partial_fprem.source),
     entry(partial_fprem1.family, partial_fprem1.path, partial_fprem1.source),
@@ -2149,7 +2173,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 563), tableCount());
+    try std.testing.expectEqual(@as(usize, 575), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
