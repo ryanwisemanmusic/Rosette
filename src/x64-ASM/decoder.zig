@@ -1,6 +1,8 @@
 const std = @import("std");
 const cpu_state = @import("cpu_state.zig");
 const flags = @import("flags.zig");
+const isa_registry = @import("isa_registry");
+const runtime_abi = @import("runtime_abi_handshake");
 pub const highway = @import("isa_highway");
 pub const capabilities = @import("capabilities.zig");
 
@@ -565,6 +567,46 @@ pub const Op = enum(u16) {
     call_reg64,
     hlt,
 };
+
+fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {
+    if (op == .invalid) return null;
+
+    const tag = @tagName(op);
+    const stem = tag[0 .. std.mem.indexOfScalar(u8, tag, '_') orelse tag.len];
+    const canonical = if (std.mem.eql(u8, stem, "cmovcc"))
+        "cmove"
+    else if (std.mem.eql(u8, stem, "setcc"))
+        "sete"
+    else if (std.mem.eql(u8, stem, "jcc"))
+        "je"
+    else
+        stem;
+
+    std.debug.assert(canonical.len <= buffer.len);
+    return std.ascii.upperString(buffer[0..canonical.len], canonical);
+}
+
+test "every executable x64 decoder operation has a validated ISA ABI contract" {
+    runtime_abi.isa.init();
+    defer runtime_abi.isa.deinit();
+
+    const violations_before = runtime_abi.common.violationCount();
+    const validations_before = runtime_abi.common.validationCount();
+
+    for (std.enums.values(Op)) |op| {
+        var mnemonic_buffer: [32]u8 = undefined;
+        const mnemonic = canonicalMnemonic(op, &mnemonic_buffer) orelse continue;
+        const table = isa_registry.x86.findByName(mnemonic) orelse {
+            std.debug.print("decoder operation {s} has no ISA ABI contract for {s}\n", .{ @tagName(op), mnemonic });
+            return error.MissingDecoderIsaContract;
+        };
+        table.validate();
+        isa_registry.neon.validateTable(table);
+    }
+
+    try std.testing.expect(runtime_abi.common.validationCount() > validations_before);
+    try std.testing.expectEqual(violations_before, runtime_abi.common.violationCount());
+}
 
 pub const CpuidResult = capabilities.CpuidResult;
 

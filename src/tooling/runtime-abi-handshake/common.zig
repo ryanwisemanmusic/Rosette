@@ -67,6 +67,14 @@ pub fn noteValidation() void {
     validation_count += 1;
 }
 
+pub fn violationCount() usize {
+    return violation_count;
+}
+
+pub fn validationCount() usize {
+    return validation_count;
+}
+
 pub fn writeLine(comptime fmt: []const u8, args: anytype) void {
     if (log_file == null) return;
     var line_buf: [2048]u8 = undefined;
