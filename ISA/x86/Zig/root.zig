@@ -37,6 +37,11 @@ const div_divps = @import("DIV/DIVPS.zig");
 const div_divsd = @import("DIV/DIVSD.zig");
 const div_divss = @import("DIV/DIVSS.zig");
 const div_idiv = @import("DIV/IDIV.zig");
+const div_fdiv = @import("DIV/fdiv.zig");
+const div_fdivp = @import("DIV/fdivp.zig");
+const div_fidiv = @import("DIV/fidiv.zig");
+const div_vdivph = @import("DIV/VDIVPH.zig");
+const div_vdivsh = @import("DIV/VDIVSH.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -1436,6 +1441,11 @@ pub const tables = [_]InstructionTable{
     entry(div_divsd.family, div_divsd.path, div_divsd.source),
     entry(div_divss.family, div_divss.path, div_divss.source),
     entry(div_idiv.family, div_idiv.path, div_idiv.source),
+    entry(div_fdiv.family, div_fdiv.path, div_fdiv.source),
+    entry(div_fdivp.family, div_fdivp.path, div_fdivp.source),
+    entry(div_fidiv.family, div_fidiv.path, div_fidiv.source),
+    entry(div_vdivph.family, div_vdivph.path, div_vdivph.source),
+    entry(div_vdivsh.family, div_vdivsh.path, div_vdivsh.source),
     entry(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     entry(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
     entry(interrupt_int.family, interrupt_int.path, interrupt_int.source),
@@ -2330,7 +2340,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 619), tableCount());
+    try std.testing.expectEqual(@as(usize, 624), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
