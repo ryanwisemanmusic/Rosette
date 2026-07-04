@@ -60,6 +60,11 @@ const full_permute_vpermt2q = @import("FULL_PERMUTE/VPERMT2Q.zig");
 const full_permute_vpermt2w = @import("FULL_PERMUTE/VPERMT2W.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
+const input_in = @import("INPUT/IN.zig");
+const input_ins = @import("INPUT/INS.zig");
+const input_insb = @import("INPUT/INSB.zig");
+const input_insw = @import("INPUT/INSW.zig");
+const input_insd = @import("INPUT/INSD.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
@@ -527,6 +532,8 @@ const terminate_endbr64 = @import("TERMINATE/ENDBR64.zig");
 const shuffle_shufpd = @import("SHUFFLE/SHUFPD.zig");
 const shuffle_shufps = @import("SHUFFLE/SHUFPS.zig");
 const shuffle_vpshufbitqmb = @import("SHUFFLE/VPSHUFBITQMB.zig");
+const shuffle_vpunpckldq = @import("SHUFFLE/VPUNPCKLDQ.zig");
+const shuffle_vpermilpd = @import("SHUFFLE/VPERMILPD.zig");
 const shuffle_vshuff32x4 = @import("SHUFFLE/VSHUFF32x4.zig");
 const shuffle_vshuff64x2 = @import("SHUFFLE/VSHUFF64x2.zig");
 const shuffle_vshufi32x4 = @import("SHUFFLE/VSHUFI32x4.zig");
@@ -833,6 +840,11 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "IDIV",
     "IMUL",
     "INC",
+    "IN",
+    "INS",
+    "INSB",
+    "INSW",
+    "INSD",
     "INT",
     "INT1",
     "INT3",
@@ -1480,6 +1492,11 @@ pub const tables = [_]InstructionTable{
     entry(full_permute_vpermt2w.family, full_permute_vpermt2w.path, full_permute_vpermt2w.source),
     entry(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     entry(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
+    entry(input_in.family, input_in.path, input_in.source),
+    entry(input_ins.family, input_ins.path, input_ins.source),
+    entry(input_insb.family, input_insb.path, input_insb.source),
+    entry(input_insw.family, input_insw.path, input_insw.source),
+    entry(input_insd.family, input_insd.path, input_insd.source),
     entry(interrupt_int.family, interrupt_int.path, interrupt_int.source),
     entry(interrupt_int1.family, interrupt_int1.path, interrupt_int1.source),
     entry(interrupt_int3.family, interrupt_int3.path, interrupt_int3.source),
@@ -1822,6 +1839,11 @@ pub const tables = [_]InstructionTable{
     entry(or_or.family, or_or.path, or_or.source),
     entry(or_orpd.family, or_orpd.path, or_orpd.source),
     entry(or_orps.family, or_orps.path, or_orps.source),
+    entry(output_out.family, output_out.path, output_out.source),
+    entry(output_outs.family, output_outs.path, output_outs.source),
+    entry(output_outsb.family, output_outsb.path, output_outsb.source),
+    entry(output_outsw.family, output_outsw.path, output_outsw.source),
+    entry(output_outsd.family, output_outsd.path, output_outsd.source),
     entry(pop_pop.family, pop_pop.path, pop_pop.source),
     entry(pop_popa.family, pop_popa.path, pop_popa.source),
     entry(pop_popad.family, pop_popad.path, pop_popad.source),
@@ -1930,6 +1952,8 @@ pub const tables = [_]InstructionTable{
     entry(shuffle_shufpd.family, shuffle_shufpd.path, shuffle_shufpd.source),
     entry(shuffle_shufps.family, shuffle_shufps.path, shuffle_shufps.source),
     entry(shuffle_vpshufbitqmb.family, shuffle_vpshufbitqmb.path, shuffle_vpshufbitqmb.source),
+    entry(shuffle_vpunpckldq.family, shuffle_vpunpckldq.path, shuffle_vpunpckldq.source),
+    entry(shuffle_vpermilpd.family, shuffle_vpermilpd.path, shuffle_vpermilpd.source),
     entry(shuffle_vshuff32x4.family, shuffle_vshuff32x4.path, shuffle_vshuff32x4.source),
     entry(shuffle_vshuff64x2.family, shuffle_vshuff64x2.path, shuffle_vshuff64x2.source),
     entry(shuffle_vshufi32x4.family, shuffle_vshufi32x4.path, shuffle_vshufi32x4.source),
@@ -2092,6 +2116,7 @@ pub const tables = [_]InstructionTable{
     entry(partial_fprem1.family, partial_fprem1.path, partial_fprem1.source),
     entry(partial_fptan.family, partial_fptan.path, partial_fptan.source),
     entry(pause_tpause.family, pause_tpause.path, pause_tpause.source),
+    entry(platform_pconfig.family, platform_pconfig.path, platform_pconfig.source),
     entry(prefetch_prefetchw.family, prefetch_prefetchw.path, prefetch_prefetchw.source),
     entry(prefetch_prefetcht0.family, prefetch_prefetcht0.path, prefetch_prefetcht0.source),
     entry(prefetch_prefetcht1.family, prefetch_prefetcht1.path, prefetch_prefetcht1.source),
@@ -2372,7 +2397,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 640), tableCount());
+    try std.testing.expectEqual(@as(usize, 804), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

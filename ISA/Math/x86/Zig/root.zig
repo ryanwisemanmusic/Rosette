@@ -62,6 +62,11 @@ const full_permute_vpermt2q = @import("FULL_PERMUTE/VPERMT2Q.zig");
 const full_permute_vpermt2w = @import("FULL_PERMUTE/VPERMT2W.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
+const input_in = @import("INPUT/IN.zig");
+const input_ins = @import("INPUT/INS.zig");
+const input_insb = @import("INPUT/INSB.zig");
+const input_insw = @import("INPUT/INSW.zig");
+const input_insd = @import("INPUT/INSD.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
@@ -868,6 +873,11 @@ pub const specs = blk: {
         spec(full_permute_vpermt2w.meta),
         spec(inc_dec_dec.meta),
         spec(inc_dec_inc.meta),
+        spec(input_in.meta),
+        spec(input_ins.meta),
+        spec(input_insb.meta),
+        spec(input_insw.meta),
+        spec(input_insd.meta),
         spec(interrupt_int.meta),
         spec(interrupt_int1.meta),
         spec(interrupt_int3.meta),
@@ -1674,6 +1684,11 @@ pub const proof_reports = [_]proofs.ProofReport{
     full_permute_vpermt2w.proof_report,
     inc_dec_dec.proof_report,
     inc_dec_inc.proof_report,
+    input_in.proof_report,
+    input_ins.proof_report,
+    input_insb.proof_report,
+    input_insw.proof_report,
+    input_insd.proof_report,
     interrupt_int.proof_report,
     interrupt_int1.proof_report,
     interrupt_int3.proof_report,
