@@ -44,6 +44,10 @@ const div_fdivp = @import("DIV/fdivp.zig");
 const div_fidiv = @import("DIV/fidiv.zig");
 const div_vdivph = @import("DIV/VDIVPH.zig");
 const div_vdivsh = @import("DIV/VDIVSH.zig");
+const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
+const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
+const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
+const fix_up_vfixupimmss = @import("FIX_UP/VFIXUPIMMSS.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -834,6 +838,10 @@ pub const specs = blk: {
         spec(div_fidiv.meta),
         spec(div_vdivph.meta),
         spec(div_vdivsh.meta),
+        spec(fix_up_vfixupimmpd.meta),
+        spec(fix_up_vfixupimmps.meta),
+        spec(fix_up_vfixupimmsd.meta),
+        spec(fix_up_vfixupimmss.meta),
         spec(inc_dec_dec.meta),
         spec(inc_dec_inc.meta),
         spec(interrupt_int.meta),
@@ -1624,6 +1632,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     div_fidiv.proof_report,
     div_vdivph.proof_report,
     div_vdivsh.proof_report,
+    fix_up_vfixupimmpd.proof_report,
+    fix_up_vfixupimmps.proof_report,
+    fix_up_vfixupimmsd.proof_report,
+    fix_up_vfixupimmss.proof_report,
     inc_dec_dec.proof_report,
     inc_dec_inc.proof_report,
     interrupt_int.proof_report,
@@ -2426,7 +2438,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 585), tableCount());
+    try std.testing.expectEqual(@as(usize, 589), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();

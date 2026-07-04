@@ -42,6 +42,10 @@ const div_fdivp = @import("DIV/fdivp.zig");
 const div_fidiv = @import("DIV/fidiv.zig");
 const div_vdivph = @import("DIV/VDIVPH.zig");
 const div_vdivsh = @import("DIV/VDIVSH.zig");
+const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
+const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
+const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
+const fix_up_vfixupimmss = @import("FIX_UP/VFIXUPIMMSS.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -1446,6 +1450,10 @@ pub const tables = [_]InstructionTable{
     entry(div_fidiv.family, div_fidiv.path, div_fidiv.source),
     entry(div_vdivph.family, div_vdivph.path, div_vdivph.source),
     entry(div_vdivsh.family, div_vdivsh.path, div_vdivsh.source),
+    entry(fix_up_vfixupimmpd.family, fix_up_vfixupimmpd.path, fix_up_vfixupimmpd.source),
+    entry(fix_up_vfixupimmps.family, fix_up_vfixupimmps.path, fix_up_vfixupimmps.source),
+    entry(fix_up_vfixupimmsd.family, fix_up_vfixupimmsd.path, fix_up_vfixupimmsd.source),
+    entry(fix_up_vfixupimmss.family, fix_up_vfixupimmss.path, fix_up_vfixupimmss.source),
     entry(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     entry(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
     entry(interrupt_int.family, interrupt_int.path, interrupt_int.source),
@@ -2340,7 +2348,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 624), tableCount());
+    try std.testing.expectEqual(@as(usize, 628), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
