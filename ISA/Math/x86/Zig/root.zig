@@ -349,6 +349,10 @@ const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
 const loop_pause = @import("LOOP/PAUSE.zig");
 const memory_mfence = @import("MEMORY/MFENCE.zig");
+const mov_kmovw = @import("MOV/KMOVW.zig");
+const mov_kmovb = @import("MOV/KMOVB.zig");
+const mov_kmovq = @import("MOV/KMOVQ.zig");
+const mov_kmovd = @import("MOV/KMOVD.zig");
 const mov_mov = @import("MOV/MOV.zig");
 const mov_movapd = @import("MOV/MOVAPD.zig");
 const mov_movaps = @import("MOV/MOVAPS.zig");
@@ -389,6 +393,7 @@ const mov_movsxd = @import("MOV/MOVSXD.zig");
 const mov_movupd = @import("MOV/MOVUPD.zig");
 const mov_movups = @import("MOV/MOVUPS.zig");
 const mov_movzx = @import("MOV/MOVZX.zig");
+const mov_pmovmskb = @import("MOV/PMOVMSKB.zig");
 const mov_vmovapd = @import("MOV/VMOVAPD.zig");
 const mov_vmovaps = @import("MOV/VMOVAPS.zig");
 const mov_vmovd = @import("MOV/VMOVD.zig");
@@ -415,11 +420,13 @@ const mov_vmovntpd = @import("MOV/VMOVNTPD.zig");
 const mov_vmovntps = @import("MOV/VMOVNTPS.zig");
 const mov_vmovq = @import("MOV/VMOVQ.zig");
 const mov_vmovsd = @import("MOV/VMOVSD.zig");
+const mov_vmovsh = @import("MOV/VMOVSH.zig");
 const mov_vmovshdup = @import("MOV/VMOVSHDUP.zig");
 const mov_vmovsldup = @import("MOV/VMOVSLDUP.zig");
 const mov_vmovss = @import("MOV/VMOVSS.zig");
 const mov_vmovupd = @import("MOV/VMOVUPD.zig");
 const mov_vmovups = @import("MOV/VMOVUPS.zig");
+const mov_vmovw = @import("MOV/VMOVW.zig");
 const mul_imul = @import("MUL/IMUL.zig");
 const mul_mul = @import("MUL/MUL.zig");
 const mul_mulpd = @import("MUL/MULPD.zig");
@@ -1167,6 +1174,10 @@ pub const specs = blk: {
         spec(loop_loopne.meta),
         spec(loop_pause.meta),
         spec(memory_mfence.meta),
+        spec(mov_kmovw.meta),
+        spec(mov_kmovb.meta),
+        spec(mov_kmovq.meta),
+        spec(mov_kmovd.meta),
         spec(mov_mov.meta),
         spec(mov_movapd.meta),
         spec(mov_movaps.meta),
@@ -1207,6 +1218,7 @@ pub const specs = blk: {
         spec(mov_movupd.meta),
         spec(mov_movups.meta),
         spec(mov_movzx.meta),
+        spec(mov_pmovmskb.meta),
         spec(mov_vmovapd.meta),
         spec(mov_vmovaps.meta),
         spec(mov_vmovd.meta),
@@ -1233,11 +1245,13 @@ pub const specs = blk: {
         spec(mov_vmovntps.meta),
         spec(mov_vmovq.meta),
         spec(mov_vmovsd.meta),
+        spec(mov_vmovsh.meta),
         spec(mov_vmovshdup.meta),
         spec(mov_vmovsldup.meta),
         spec(mov_vmovss.meta),
         spec(mov_vmovupd.meta),
         spec(mov_vmovups.meta),
+        spec(mov_vmovw.meta),
         spec(mul_imul.meta),
         spec(mul_mul.meta),
         spec(mul_mulpd.meta),
@@ -1997,6 +2011,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     loop_loopne.proof_report,
     loop_pause.proof_report,
     memory_mfence.proof_report,
+    mov_kmovw.proof_report,
+    mov_kmovb.proof_report,
+    mov_kmovq.proof_report,
+    mov_kmovd.proof_report,
     mov_mov.proof_report,
     mov_movapd.proof_report,
     mov_movaps.proof_report,
@@ -2037,6 +2055,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     mov_movupd.proof_report,
     mov_movups.proof_report,
     mov_movzx.proof_report,
+    mov_pmovmskb.proof_report,
     mov_vmovapd.proof_report,
     mov_vmovaps.proof_report,
     mov_vmovd.proof_report,
@@ -2063,11 +2082,13 @@ pub const proof_reports = [_]proofs.ProofReport{
     mov_vmovntps.proof_report,
     mov_vmovq.proof_report,
     mov_vmovsd.proof_report,
+    mov_vmovsh.proof_report,
     mov_vmovshdup.proof_report,
     mov_vmovsldup.proof_report,
     mov_vmovss.proof_report,
     mov_vmovupd.proof_report,
     mov_vmovups.proof_report,
+    mov_vmovw.proof_report,
     mul_imul.proof_report,
     mul_mul.proof_report,
     mul_mulpd.proof_report,
@@ -2546,7 +2567,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 605), tableCount());
+    try std.testing.expectEqual(@as(usize, 612), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();

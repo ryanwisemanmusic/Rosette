@@ -347,6 +347,10 @@ const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
 const loop_pause = @import("LOOP/PAUSE.zig");
 const memory_mfence = @import("MEMORY/MFENCE.zig");
+const mov_kmovw = @import("MOV/KMOVW.zig");
+const mov_kmovb = @import("MOV/KMOVB.zig");
+const mov_kmovq = @import("MOV/KMOVQ.zig");
+const mov_kmovd = @import("MOV/KMOVD.zig");
 const mov_mov = @import("MOV/MOV.zig");
 const mov_movapd = @import("MOV/MOVAPD.zig");
 const mov_movaps = @import("MOV/MOVAPS.zig");
@@ -387,6 +391,7 @@ const mov_movsxd = @import("MOV/MOVSXD.zig");
 const mov_movupd = @import("MOV/MOVUPD.zig");
 const mov_movups = @import("MOV/MOVUPS.zig");
 const mov_movzx = @import("MOV/MOVZX.zig");
+const mov_pmovmskb = @import("MOV/PMOVMSKB.zig");
 const mov_vmovapd = @import("MOV/VMOVAPD.zig");
 const mov_vmovaps = @import("MOV/VMOVAPS.zig");
 const mov_vmovd = @import("MOV/VMOVD.zig");
@@ -413,11 +418,13 @@ const mov_vmovntpd = @import("MOV/VMOVNTPD.zig");
 const mov_vmovntps = @import("MOV/VMOVNTPS.zig");
 const mov_vmovq = @import("MOV/VMOVQ.zig");
 const mov_vmovsd = @import("MOV/VMOVSD.zig");
+const mov_vmovsh = @import("MOV/VMOVSH.zig");
 const mov_vmovshdup = @import("MOV/VMOVSHDUP.zig");
 const mov_vmovsldup = @import("MOV/VMOVSLDUP.zig");
 const mov_vmovss = @import("MOV/VMOVSS.zig");
 const mov_vmovupd = @import("MOV/VMOVUPD.zig");
 const mov_vmovups = @import("MOV/VMOVUPS.zig");
+const mov_vmovw = @import("MOV/VMOVW.zig");
 const mul_imul = @import("MUL/IMUL.zig");
 const mul_mul = @import("MUL/MUL.zig");
 const mul_mulpd = @import("MUL/MULPD.zig");
@@ -1392,6 +1399,13 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VPSRLVW",
     "VPSRLVD",
     "VPSRLVQ",
+    "KMOVB",
+    "KMOVD",
+    "KMOVQ",
+    "KMOVW",
+    "PMOVMSKB",
+    "VMOVSH",
+    "VMOVW",
     "INSERTPS",
     "PINSRB",
     "PINSRD",
@@ -1811,6 +1825,10 @@ pub const tables = [_]InstructionTable{
     entry(loop_loopne.family, loop_loopne.path, loop_loopne.source),
     entry(loop_pause.family, loop_pause.path, loop_pause.source),
     entry(memory_mfence.family, memory_mfence.path, memory_mfence.source),
+    entry(mov_kmovw.family, mov_kmovw.path, mov_kmovw.source),
+    entry(mov_kmovb.family, mov_kmovb.path, mov_kmovb.source),
+    entry(mov_kmovq.family, mov_kmovq.path, mov_kmovq.source),
+    entry(mov_kmovd.family, mov_kmovd.path, mov_kmovd.source),
     entry(mov_mov.family, mov_mov.path, mov_mov.source),
     entry(mov_movapd.family, mov_movapd.path, mov_movapd.source),
     entry(mov_movaps.family, mov_movaps.path, mov_movaps.source),
@@ -1851,6 +1869,7 @@ pub const tables = [_]InstructionTable{
     entry(mov_movupd.family, mov_movupd.path, mov_movupd.source),
     entry(mov_movups.family, mov_movups.path, mov_movups.source),
     entry(mov_movzx.family, mov_movzx.path, mov_movzx.source),
+    entry(mov_pmovmskb.family, mov_pmovmskb.path, mov_pmovmskb.source),
     entry(mov_vmovapd.family, mov_vmovapd.path, mov_vmovapd.source),
     entry(mov_vmovaps.family, mov_vmovaps.path, mov_vmovaps.source),
     entry(mov_vmovd.family, mov_vmovd.path, mov_vmovd.source),
@@ -1877,11 +1896,13 @@ pub const tables = [_]InstructionTable{
     entry(mov_vmovntps.family, mov_vmovntps.path, mov_vmovntps.source),
     entry(mov_vmovq.family, mov_vmovq.path, mov_vmovq.source),
     entry(mov_vmovsd.family, mov_vmovsd.path, mov_vmovsd.source),
+    entry(mov_vmovsh.family, mov_vmovsh.path, mov_vmovsh.source),
     entry(mov_vmovshdup.family, mov_vmovshdup.path, mov_vmovshdup.source),
     entry(mov_vmovsldup.family, mov_vmovsldup.path, mov_vmovsldup.source),
     entry(mov_vmovss.family, mov_vmovss.path, mov_vmovss.source),
     entry(mov_vmovupd.family, mov_vmovupd.path, mov_vmovupd.source),
     entry(mov_vmovups.family, mov_vmovups.path, mov_vmovups.source),
+    entry(mov_vmovw.family, mov_vmovw.path, mov_vmovw.source),
     entry(mul_imul.family, mul_imul.path, mul_imul.source),
     entry(mul_mul.family, mul_mul.path, mul_mul.source),
     entry(mul_mulpd.family, mul_mulpd.path, mul_mulpd.source),
@@ -2454,7 +2475,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 823), tableCount());
+    try std.testing.expectEqual(@as(usize, 830), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
