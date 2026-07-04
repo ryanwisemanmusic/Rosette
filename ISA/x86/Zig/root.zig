@@ -65,6 +65,21 @@ const input_ins = @import("INPUT/INS.zig");
 const input_insb = @import("INPUT/INSB.zig");
 const input_insw = @import("INPUT/INSW.zig");
 const input_insd = @import("INPUT/INSD.zig");
+const insert_insertps = @import("INSERT/INSERTPS.zig");
+const insert_pinsrb = @import("INSERT/PINSRB.zig");
+const insert_pinsrd = @import("INSERT/PINSRD.zig");
+const insert_pinsrq = @import("INSERT/PINSRQ.zig");
+const insert_pinsrw = @import("INSERT/PINSRW.zig");
+const insert_vinsertf128 = @import("INSERT/VINSERTF128.zig");
+const insert_vinsertf32x4 = @import("INSERT/VINSERTF32X4.zig");
+const insert_vinsertf64x2 = @import("INSERT/VINSERTF64X2.zig");
+const insert_vinsertf32x8 = @import("INSERT/VINSERTF32X8.zig");
+const insert_vinsertf64x4 = @import("INSERT/VINSERTF64X4.zig");
+const insert_vinserti128 = @import("INSERT/VINSERTI128.zig");
+const insert_vinserti32x4 = @import("INSERT/VINSERTI32X4.zig");
+const insert_vinserti64x2 = @import("INSERT/VINSERTI64X2.zig");
+const insert_vinserti32x8 = @import("INSERT/VINSERTI32X8.zig");
+const insert_vinserti64x4 = @import("INSERT/VINSERTI64X4.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
@@ -1369,6 +1384,21 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VPSRLVW",
     "VPSRLVD",
     "VPSRLVQ",
+    "INSERTPS",
+    "PINSRB",
+    "PINSRD",
+    "PINSRQ",
+    "PINSRW",
+    "VINSERTF128",
+    "VINSERTF32X4",
+    "VINSERTF64X2",
+    "VINSERTF32X8",
+    "VINSERTF64X4",
+    "VINSERTI128",
+    "VINSERTI32X4",
+    "VINSERTI64X2",
+    "VINSERTI32X8",
+    "VINSERTI64X4",
 };
 
 pub const TableMetadata = struct {
@@ -1497,6 +1527,21 @@ pub const tables = [_]InstructionTable{
     entry(input_insb.family, input_insb.path, input_insb.source),
     entry(input_insw.family, input_insw.path, input_insw.source),
     entry(input_insd.family, input_insd.path, input_insd.source),
+    entry(insert_insertps.family, insert_insertps.path, insert_insertps.source),
+    entry(insert_pinsrb.family, insert_pinsrb.path, insert_pinsrb.source),
+    entry(insert_pinsrd.family, insert_pinsrd.path, insert_pinsrd.source),
+    entry(insert_pinsrq.family, insert_pinsrq.path, insert_pinsrq.source),
+    entry(insert_pinsrw.family, insert_pinsrw.path, insert_pinsrw.source),
+    entry(insert_vinsertf128.family, insert_vinsertf128.path, insert_vinsertf128.source),
+    entry(insert_vinsertf32x4.family, insert_vinsertf32x4.path, insert_vinsertf32x4.source),
+    entry(insert_vinsertf64x2.family, insert_vinsertf64x2.path, insert_vinsertf64x2.source),
+    entry(insert_vinsertf32x8.family, insert_vinsertf32x8.path, insert_vinsertf32x8.source),
+    entry(insert_vinsertf64x4.family, insert_vinsertf64x4.path, insert_vinsertf64x4.source),
+    entry(insert_vinserti128.family, insert_vinserti128.path, insert_vinserti128.source),
+    entry(insert_vinserti32x4.family, insert_vinserti32x4.path, insert_vinserti32x4.source),
+    entry(insert_vinserti64x2.family, insert_vinserti64x2.path, insert_vinserti64x2.source),
+    entry(insert_vinserti32x8.family, insert_vinserti32x8.path, insert_vinserti32x8.source),
+    entry(insert_vinserti64x4.family, insert_vinserti64x4.path, insert_vinserti64x4.source),
     entry(interrupt_int.family, interrupt_int.path, interrupt_int.source),
     entry(interrupt_int1.family, interrupt_int1.path, interrupt_int1.source),
     entry(interrupt_int3.family, interrupt_int3.path, interrupt_int3.source),
@@ -2397,7 +2442,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 804), tableCount());
+    try std.testing.expectEqual(@as(usize, 819), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
