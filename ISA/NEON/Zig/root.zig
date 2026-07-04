@@ -47,6 +47,18 @@ const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
 const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
 const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
 const fix_up_vfixupimmss = @import("FIX_UP/VFIXUPIMMSS.zig");
+const full_permute_vpermI2b = @import("FULL_PERMUTE/VPERMI2B.zig");
+const full_permute_vpermI2d = @import("FULL_PERMUTE/VPERMI2D.zig");
+const full_permute_vpermI2pd = @import("FULL_PERMUTE/VPERMI2PD.zig");
+const full_permute_vpermI2ps = @import("FULL_PERMUTE/VPERMI2PS.zig");
+const full_permute_vpermI2q = @import("FULL_PERMUTE/VPERMI2Q.zig");
+const full_permute_vpermI2w = @import("FULL_PERMUTE/VPERMI2W.zig");
+const full_permute_vpermt2b = @import("FULL_PERMUTE/VPERMT2B.zig");
+const full_permute_vpermt2d = @import("FULL_PERMUTE/VPERMT2D.zig");
+const full_permute_vpermt2pd = @import("FULL_PERMUTE/VPERMT2PD.zig");
+const full_permute_vpermt2ps = @import("FULL_PERMUTE/VPERMT2PS.zig");
+const full_permute_vpermt2q = @import("FULL_PERMUTE/VPERMT2Q.zig");
+const full_permute_vpermt2w = @import("FULL_PERMUTE/VPERMT2W.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -912,6 +924,18 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(fix_up_vfixupimmps.family, fix_up_vfixupimmps.path, fix_up_vfixupimmps.source),
     mirror(fix_up_vfixupimmsd.family, fix_up_vfixupimmsd.path, fix_up_vfixupimmsd.source),
     mirror(fix_up_vfixupimmss.family, fix_up_vfixupimmss.path, fix_up_vfixupimmss.source),
+    mirror(full_permute_vpermI2b.family, full_permute_vpermI2b.path, full_permute_vpermI2b.source),
+    mirror(full_permute_vpermI2d.family, full_permute_vpermI2d.path, full_permute_vpermI2d.source),
+    mirror(full_permute_vpermI2pd.family, full_permute_vpermI2pd.path, full_permute_vpermI2pd.source),
+    mirror(full_permute_vpermI2ps.family, full_permute_vpermI2ps.path, full_permute_vpermI2ps.source),
+    mirror(full_permute_vpermI2q.family, full_permute_vpermI2q.path, full_permute_vpermI2q.source),
+    mirror(full_permute_vpermI2w.family, full_permute_vpermI2w.path, full_permute_vpermI2w.source),
+    mirror(full_permute_vpermt2b.family, full_permute_vpermt2b.path, full_permute_vpermt2b.source),
+    mirror(full_permute_vpermt2d.family, full_permute_vpermt2d.path, full_permute_vpermt2d.source),
+    mirror(full_permute_vpermt2pd.family, full_permute_vpermt2pd.path, full_permute_vpermt2pd.source),
+    mirror(full_permute_vpermt2ps.family, full_permute_vpermt2ps.path, full_permute_vpermt2ps.source),
+    mirror(full_permute_vpermt2q.family, full_permute_vpermt2q.path, full_permute_vpermt2q.source),
+    mirror(full_permute_vpermt2w.family, full_permute_vpermt2w.path, full_permute_vpermt2w.source),
     mirror(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     mirror(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
     mirror(interrupt_int.family, interrupt_int.path, interrupt_int.source),

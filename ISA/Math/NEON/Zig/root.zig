@@ -49,6 +49,18 @@ const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
 const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
 const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
 const fix_up_vfixupimmss = @import("FIX_UP/VFIXUPIMMSS.zig");
+const full_permute_vpermI2b = @import("FULL_PERMUTE/VPERMI2B.zig");
+const full_permute_vpermI2d = @import("FULL_PERMUTE/VPERMI2D.zig");
+const full_permute_vpermI2pd = @import("FULL_PERMUTE/VPERMI2PD.zig");
+const full_permute_vpermI2ps = @import("FULL_PERMUTE/VPERMI2PS.zig");
+const full_permute_vpermI2q = @import("FULL_PERMUTE/VPERMI2Q.zig");
+const full_permute_vpermI2w = @import("FULL_PERMUTE/VPERMI2W.zig");
+const full_permute_vpermt2b = @import("FULL_PERMUTE/VPERMT2B.zig");
+const full_permute_vpermt2d = @import("FULL_PERMUTE/VPERMT2D.zig");
+const full_permute_vpermt2pd = @import("FULL_PERMUTE/VPERMT2PD.zig");
+const full_permute_vpermt2ps = @import("FULL_PERMUTE/VPERMT2PS.zig");
+const full_permute_vpermt2q = @import("FULL_PERMUTE/VPERMT2Q.zig");
+const full_permute_vpermt2w = @import("FULL_PERMUTE/VPERMT2W.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -843,6 +855,18 @@ pub const specs = blk: {
         spec(fix_up_vfixupimmps.meta),
         spec(fix_up_vfixupimmsd.meta),
         spec(fix_up_vfixupimmss.meta),
+        spec(full_permute_vpermI2b.meta),
+        spec(full_permute_vpermI2d.meta),
+        spec(full_permute_vpermI2pd.meta),
+        spec(full_permute_vpermI2ps.meta),
+        spec(full_permute_vpermI2q.meta),
+        spec(full_permute_vpermI2w.meta),
+        spec(full_permute_vpermt2b.meta),
+        spec(full_permute_vpermt2d.meta),
+        spec(full_permute_vpermt2pd.meta),
+        spec(full_permute_vpermt2ps.meta),
+        spec(full_permute_vpermt2q.meta),
+        spec(full_permute_vpermt2w.meta),
         spec(inc_dec_dec.meta),
         spec(inc_dec_inc.meta),
         spec(interrupt_int.meta),
@@ -1637,6 +1661,18 @@ pub const proof_reports = [_]proofs.ProofReport{
     fix_up_vfixupimmps.proof_report,
     fix_up_vfixupimmsd.proof_report,
     fix_up_vfixupimmss.proof_report,
+    full_permute_vpermI2b.proof_report,
+    full_permute_vpermI2d.proof_report,
+    full_permute_vpermI2pd.proof_report,
+    full_permute_vpermI2ps.proof_report,
+    full_permute_vpermI2q.proof_report,
+    full_permute_vpermI2w.proof_report,
+    full_permute_vpermt2b.proof_report,
+    full_permute_vpermt2d.proof_report,
+    full_permute_vpermt2pd.proof_report,
+    full_permute_vpermt2ps.proof_report,
+    full_permute_vpermt2q.proof_report,
+    full_permute_vpermt2w.proof_report,
     inc_dec_dec.proof_report,
     inc_dec_inc.proof_report,
     interrupt_int.proof_report,
