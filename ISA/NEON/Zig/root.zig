@@ -61,6 +61,11 @@ const full_permute_vpermt2q = @import("FULL_PERMUTE/VPERMT2Q.zig");
 const full_permute_vpermt2w = @import("FULL_PERMUTE/VPERMT2W.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
+const input_in = @import("INPUT/IN.zig");
+const input_ins = @import("INPUT/INS.zig");
+const input_insb = @import("INPUT/INSB.zig");
+const input_insw = @import("INPUT/INSW.zig");
+const input_insd = @import("INPUT/INSD.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
@@ -528,6 +533,8 @@ const terminate_endbr64 = @import("TERMINATE/ENDBR64.zig");
 const shuffle_shufpd = @import("SHUFFLE/SHUFPD.zig");
 const shuffle_shufps = @import("SHUFFLE/SHUFPS.zig");
 const shuffle_vpshufbitqmb = @import("SHUFFLE/VPSHUFBITQMB.zig");
+const shuffle_vpunpckldq = @import("SHUFFLE/VPUNPCKLDQ.zig");
+const shuffle_vpermilpd = @import("SHUFFLE/VPERMILPD.zig");
 const shuffle_vshuff32x4 = @import("SHUFFLE/VSHUFF32x4.zig");
 const shuffle_vshuff64x2 = @import("SHUFFLE/VSHUFF64x2.zig");
 const shuffle_vshufi32x4 = @import("SHUFFLE/VSHUFI32x4.zig");
@@ -938,6 +945,11 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(full_permute_vpermt2w.family, full_permute_vpermt2w.path, full_permute_vpermt2w.source),
     mirror(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     mirror(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
+    mirror(input_in.family, input_in.path, input_in.source),
+    mirror(input_ins.family, input_ins.path, input_ins.source),
+    mirror(input_insb.family, input_insb.path, input_insb.source),
+    mirror(input_insw.family, input_insw.path, input_insw.source),
+    mirror(input_insd.family, input_insd.path, input_insd.source),
     mirror(interrupt_int.family, interrupt_int.path, interrupt_int.source),
     mirror(interrupt_int1.family, interrupt_int1.path, interrupt_int1.source),
     mirror(interrupt_int3.family, interrupt_int3.path, interrupt_int3.source),
@@ -1393,6 +1405,8 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(shuffle_shufpd.family, shuffle_shufpd.path, shuffle_shufpd.source),
     mirror(shuffle_shufps.family, shuffle_shufps.path, shuffle_shufps.source),
     mirror(shuffle_vpshufbitqmb.family, shuffle_vpshufbitqmb.path, shuffle_vpshufbitqmb.source),
+    mirror(shuffle_vpunpckldq.family, shuffle_vpunpckldq.path, shuffle_vpunpckldq.source),
+    mirror(shuffle_vpermilpd.family, shuffle_vpermilpd.path, shuffle_vpermilpd.source),
     mirror(shuffle_vshuff32x4.family, shuffle_vshuff32x4.path, shuffle_vshuff32x4.source),
     mirror(shuffle_vshuff64x2.family, shuffle_vshuff64x2.path, shuffle_vshuff64x2.source),
     mirror(shuffle_vshufi32x4.family, shuffle_vshufi32x4.path, shuffle_vshufi32x4.source),
@@ -1707,40 +1721,42 @@ pub fn planFor(table: x86.InstructionTable) LoweringPlan {
 
 pub fn validateAll() void {
     runtime_abi.isa.validateMirrorTableCounts(x86.tableCount(), tableCount());
-    for (x86.tables) |table| {
-        const meta = table.metadata();
-        const mirror_table = findMirror(table.path) orelse {
-            runtime_abi.isa.validateMissingNeonMirror(table.path);
-            continue;
-        };
-        runtime_abi.isa.validateNeonMirror(.{
-            .x86_path = table.path,
-            .neon_path = mirror_table.path,
-            .declared_x86_table = mirror_table.x86TablePath(),
-            .x86_name = meta.name,
-            .neon_name = mirror_table.name(),
-            .x86_lowering = meta.jit_lowering,
-            .neon_lowering = mirror_table.neonLowering(),
-            .x86_encoding_count = meta.encoding_count,
-            .neon_encoding_count = mirror_table.encodingCount(),
-            .x86_has_semantic = meta.has_semantic,
-            .neon_has_semantic = mirror_table.hasSemantic(),
-            .x86_has_flags = meta.has_flags,
-            .neon_has_flags = mirror_table.hasFlags(),
-            .neon_has_register_model = mirror_table.hasNeonRegisterModel(),
-            .neon_has_flag_model = mirror_table.hasNeonFlagModel(),
-            .neon_has_assembly = mirror_table.hasNeonAssembly(),
-        });
+    for (x86.tables) |table| validateTable(table);
+}
 
-        const plan = planFor(table);
-        runtime_abi.isa.validateNeonLowering(.{
-            .name = plan.x86_name,
-            .jit_lowering = plan.x86_lowering,
-            .kind = @tagName(plan.kind),
-            .assembly = plan.assembly,
-            .can_lower = plan.can_lower,
-        });
-    }
+pub fn validateTable(table: x86.InstructionTable) void {
+    const meta = table.metadata();
+    const mirror_table = findMirror(table.path) orelse {
+        runtime_abi.isa.validateMissingNeonMirror(table.path);
+        return;
+    };
+    runtime_abi.isa.validateNeonMirror(.{
+        .x86_path = table.path,
+        .neon_path = mirror_table.path,
+        .declared_x86_table = mirror_table.x86TablePath(),
+        .x86_name = meta.name,
+        .neon_name = mirror_table.name(),
+        .x86_lowering = meta.jit_lowering,
+        .neon_lowering = mirror_table.neonLowering(),
+        .x86_encoding_count = meta.encoding_count,
+        .neon_encoding_count = mirror_table.encodingCount(),
+        .x86_has_semantic = meta.has_semantic,
+        .neon_has_semantic = mirror_table.hasSemantic(),
+        .x86_has_flags = meta.has_flags,
+        .neon_has_flags = mirror_table.hasFlags(),
+        .neon_has_register_model = mirror_table.hasNeonRegisterModel(),
+        .neon_has_flag_model = mirror_table.hasNeonFlagModel(),
+        .neon_has_assembly = mirror_table.hasNeonAssembly(),
+    });
+
+    const plan = planFor(table);
+    runtime_abi.isa.validateNeonLowering(.{
+        .name = plan.x86_name,
+        .jit_lowering = plan.x86_lowering,
+        .kind = @tagName(plan.kind),
+        .assembly = plan.assembly,
+        .can_lower = plan.can_lower,
+    });
 }
 
 fn mirror(family: []const u8, path: []const u8, source: []const u8) MirrorTable {
