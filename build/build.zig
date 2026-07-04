@@ -985,6 +985,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     x64_decoder_mod.addImport("isa_highway", isa_highway_module);
+    x64_decoder_mod.addImport("isa_registry", isa_module);
+    x64_decoder_mod.addImport("runtime_abi_handshake", runtime_abi_module);
+    const x64_decoder_test_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/decoder_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    x64_decoder_test_mod.addImport("x64_decoder", x64_decoder_mod);
+    const x64_decoder_test = b.addTest(.{ .root_module = x64_decoder_test_mod });
+    const run_x64_decoder_test = b.addRunArtifact(x64_decoder_test);
+    check_step.dependOn(&run_x64_decoder_test.step);
     const isa_highway_test = b.addTest(.{ .root_module = isa_highway_module });
     check_step.dependOn(&isa_highway_test.step);
     const x64_interpreter_mod = b.createModule(.{
@@ -1021,6 +1032,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("x64_linux_runtime", x64_linux_runtime_mod);
         elf_processor_mod.addImport("x64_syscalls", x64_syscalls_mod);
         elf_processor_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
+        elf_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -1037,6 +1049,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("x64_linux_runtime", x64_linux_runtime_mod);
         elf_processor_test_mod.addImport("x64_syscalls", x64_syscalls_mod);
         elf_processor_test_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
+        elf_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&elf_processor_test.step);
 
