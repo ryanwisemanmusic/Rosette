@@ -1,3 +1,159 @@
+FDIV/FDIVP/FIDIV — Divide
+
+Opcode	Instruction	        64-Bit Mode	    Compat/Leg Mode	    Description
+D8 /6	FDIV m32fp	        Valid	        Valid	            Divide ST(0) by m32fp and store result in ST(0).
+DC /6	FDIV m64fp	        Valid	        Valid	            Divide ST(0) by m64fp and store result in ST(0).
+D8 F0+i	FDIV ST(0), ST(i)   Valid	        Valid	            Divide ST(0) by ST(i) and store result in ST(0).
+DC F8+i	FDIV ST(i), ST(0)   Valid	        Valid	            Divide ST(i) by ST(0) and store result in ST(i).
+DE F8+i	FDIVP ST(i),ST(0)	Valid	        Valid	            Divide ST(i) by ST(0), store result in ST(i), and pop the register stack.
+DE F9	FDIVP	            Valid	        Valid	            Divide ST(1) by ST(0), store result in ST(1), and pop the register stack.
+DA /6	FIDIV m32int	    Valid	        Valid	            Divide ST(0) by m32int and store result in ST(0).
+DE /6	FIDIV m16int	    Valid	        Valid	            Divide ST(0) by m16int and store result in ST(0).
+
+Description:
+
+Divides the destination operand by the source operand and stores the result in the destination location. The destination operand (dividend) is always in an FPU register; the source operand (divisor) can be a register or a memory location. Source operands in memory can be in single precision or double precision floating-point format, word or doubleword integer format.
+
+The no-operand version of the instruction divides the contents of the ST(1) register by the contents of the ST(0) register. The one-operand version divides the contents of the ST(0) register by the contents of a memory location (either a floating-point or an integer value). The two-operand version, divides the contents of the ST(0) register by the contents of the ST(i) register or vice versa.
+
+The FDIVP instructions perform the additional operation of popping the FPU register stack after storing the result. To pop the register stack, the processor marks the ST(0) register as empty and increments the stack pointer (TOP) by 1. The no-operand version of the floating-point divide instructions always results in the register stack being popped. In some assemblers, the mnemonic for this instruction is FDIV rather than FDIVP.
+
+The FIDIV instructions convert an integer source operand to double extended-precision floating-point format before performing the division. When the source operand is an integer 0, it is treated as a +0.
+
+If an unmasked divide-by-zero exception (#Z) is generated, no result is stored; if the exception is masked, an ∞ of the appropriate sign is stored in the destination operand.
+
+The following table shows the results obtained when dividing various classes of numbers, assuming that neither overflow nor underflow occurs.
+
+DEST/SRC
+    −∞	−F	−0	+0	+F	+∞	NaN
+−∞	*	+0	+0	−0	−0	*	NaN
+−F	+∞	+F	+0	−0	−F	−∞	NaN
+−I	+∞	+F	+0	−0	−F	−∞	NaN
+−0	+∞	**	*	*	**	−∞	NaN
++0	−∞	**	*	*	**	+∞	NaN
++I	−∞	−F	−0	+0	+F	+∞	NaN
++F	−∞	−F	−0	+0	+F	+∞	NaN
++∞	*	−0	−0	+0	+0	*	NaN
+NaN	NaN	NaN	NaN	NaN	NaN	NaN	NaN
+
+Table 3-24. FDIV/FDIVP/FIDIV Results
+
+F Means finite floating-point value.
+I Means integer.
+* Indicates floating-point invalid-arithmetic-operand (#IA) exception.
+** Indicates floating-point zero-divide (#Z) exception.
+This instruction’s operation is the same in non-64-bit modes and 64-bit mode.
+
+Operation:
+
+IF SRC = 0
+    THEN
+        #Z;
+    ELSE
+        IF Instruction is FIDIV
+            THEN
+                DEST := DEST / ConvertToDoubleExtendedPrecisionFP(SRC);
+            ELSE (* Source operand is floating-point value *)
+                DEST := DEST / SRC;
+        FI;
+FI;
+IF Instruction = FDIVP
+    THEN
+        PopRegisterStack;
+FI;
+
+FPU Flags Affected:
+
+C1:
+	Set to 0 if stack underflow occurred.
+    Set if result was rounded up; cleared otherwise.
+C0, C2, C3:
+	Undefined.
+
+Floating-Point Exceptions:
+
+#IS:
+	Stack underflow occurred.
+#IA:
+	Operand is an SNaN value or unsupported format.
+    ±∞ / ±∞; ±0 / ±0
+#D:
+	Source is a denormal value.
+#Z:
+	DEST / ±0, where DEST is not equal to ±0.
+#U:
+	Result is too small for destination format.
+#O:
+	Result is too large for destination format.
+#P:
+	Value cannot be represented exactly in destination format.
+
+Protected Mode Exceptions:
+
+#GP(0):
+	If a memory operand effective address is outside the CS, DS, ES, FS, or GS segment limit.
+    If the DS, ES, FS, or GS register contains a NULL segment selector.
+#SS(0):
+	If a memory operand effective address is outside the SS segment limit.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#PF(fault-code):
+	If a page fault occurs.
+#AC(0):
+	If alignment checking is enabled and an unaligned memory reference is made while the current privilege level is 3.
+#UD:
+	If the LOCK prefix is used.
+
+Real-Address Mode Exceptions:
+
+#GP:
+	If a memory operand effective address is outside the CS, DS, ES, FS, or GS segment limit.
+#SS:
+	If a memory operand effective address is outside the SS segment limit.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#UD:
+	If the LOCK prefix is used.
+
+Virtual-8086 Mode Exceptions:
+
+#GP(0):
+	If a memory operand effective address is outside the CS, DS, ES, FS, or GS segment limit.
+#SS(0):
+	If a memory operand effective address is outside the SS segment limit.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#PF(fault-code):
+	If a page fault occurs.
+#AC(0):
+	If alignment checking is enabled and an unaligned memory reference is made.
+#UD:
+	If the LOCK prefix is used.
+
+Compatibility Mode Exceptions:
+
+Same exceptions as in protected mode.
+
+64-Bit Mode Exceptions:
+
+#SS(0):
+	If a memory address referencing the SS segment is in a non-canonical form.
+#GP(0):
+	If the memory address is in a non-canonical form.
+#NM:
+	CR0.EM[bit 2] or CR0.TS[bit 3] = 1.
+#MF:
+	If there is a pending x87 FPU exception.
+#PF(fault-code):
+	If a page fault occurs.
+#AC(0):
+	If alignment checking is enabled and an unaligned memory reference is made while the current privilege level is 3.
+#UD:
+	If the LOCK prefix is used.
+
+
+
+
 https://www.felixcloutier.com/x86/
 IDIV — Signed Divide
 
@@ -710,4 +866,125 @@ EVEX-encoded instructions, see Table 2-47, “Type E3 Class Exception Conditions
 
 
 
-If anymore pop up in relationship to DIV, I will write them here
+
+VDIVPH — Divide Packed FP16 Values
+
+Opcode	                    Instruction	                                        Op/En	64-Bit Mode	    Compat/Leg Mode	        Description
+EVEX.128.NP.MAP5.W0 5E /r   VDIVPH xmm1{k1}{z}, xmm2, xmm3/m128/m16bcst	        A	    V/V	            AVX512-FP16 AVX512VL	Divide packed FP16 values in xmm2 by packed FP16 values in xmm3/m128/m16bcst, and store the result in xmm1 subject to writemask k1.
+EVEX.256.NP.MAP5.W0 5E /r   VDIVPH ymm1{k1}{z}, ymm2, ymm3/m256/m16bcst	        A	    V/V	            AVX512-FP16 AVX512VL	Divide packed FP16 values in ymm2 by packed FP16 values in ymm3/m256/m16bcst, and store the result in ymm1 subject to writemask k1.
+EVEX.512.NP.MAP5.W0 5E /r   VDIVPH zmm1{k1}{z}, zmm2, zmm3/m512/m16bcst {er}	A	    V/V	            AVX512-FP16	            Divide packed FP16 values in zmm2 by packed FP16 values in zmm3/m512/m16bcst, and store the result in zmm1 subject to writemask k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+This instruction divides packed FP16 values from the first source operand by the corresponding elements in the second source operand, storing the packed FP16 result in the destination operand. The destination elements are updated according to the writemask.
+
+Operation:
+
+VDIVPH (EVEX Encoded Versions) When SRC2 Operand is a Register:
+
+VL = 128, 256 or 512
+KL := VL/16
+IF (VL = 512) AND (EVEX.b = 1):
+    SET_RM(EVEX.RC)
+ELSE
+    SET_RM(MXCSR.RC)
+FOR j := 0 TO KL-1:
+    IF k1[j] OR *no writemask*:
+        DEST.fp16[j] := SRC1.fp16[j] / SRC2.fp16[j]
+    ELSE IF *zeroing*:
+        DEST.fp16[j] := 0
+    // else dest.fp16[j] remains unchanged
+DEST[MAXVL-1:VL] := 0
+
+VDIVPH (EVEX Encoded Versions) When SRC2 Operand is a Memory Source:
+
+VL = 128, 256 or 512
+KL := VL/16
+FOR j := 0 TO KL-1:
+    IF k1[j] OR *no writemask*:
+        IF EVEX.b = 1:
+            DEST.fp16[j] := SRC1.fp16[j] / SRC2.fp16[0]
+        ELSE:
+            DEST.fp16[j] := SRC1.fp16[j] / SRC2.fp16[j]
+    ELSE IF *zeroing*:
+        DEST.fp16[j] := 0
+    // else dest.fp16[j] remains unchanged
+DEST[MAXVL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VDIVPH __m128h _mm_div_ph (__m128h a, __m128h b);
+VDIVPH __m128h _mm_mask_div_ph (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VDIVPH __m128h _mm_maskz_div_ph (__mmask8 k, __m128h a, __m128h b);
+VDIVPH __m256h _mm256_div_ph (__m256h a, __m256h b);
+VDIVPH __m256h _mm256_mask_div_ph (__m256h src, __mmask16 k, __m256h a, __m256h b);
+VDIVPH __m256h _mm256_maskz_div_ph (__mmask16 k, __m256h a, __m256h b);
+VDIVPH __m512h _mm512_div_ph (__m512h a, __m512h b);
+VDIVPH __m512h _mm512_mask_div_ph (__m512h src, __mmask32 k, __m512h a, __m512h b);
+VDIVPH __m512h _mm512_maskz_div_ph (__mmask32 k, __m512h a, __m512h b);
+VDIVPH __m512h _mm512_div_round_ph (__m512h a, __m512h b, int rounding);
+VDIVPH __m512h _mm512_mask_div_round_ph (__m512h src, __mmask32 k, __m512h a, __m512h b, int rounding);
+VDIVPH __m512h _mm512_maskz_div_round_ph (__mmask32 k, __m512h a, __m512h b, int rounding);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Underflow, Overflow, Precision, Denormal, Zero.
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-46, “Type E2 Class Exception Conditions.”
+
+
+VDIVSH — Divide Scalar FP16 Values
+
+Opcode	                    Instruction	                                Op/En	64-Bit Mode	    Compat/Leg Mode	    Description
+EVEX.LLIG.F3.MAP5.W0 5E /r  VDIVSH xmm1{k1}{z}, xmm2, xmm3/m16 {er}	    A	    V/V	            AVX512-FP16	        Divide low FP16 value in xmm2 by low FP16 value in xmm3/m16, and store the result in xmm1 subject to writemask k1. Bits 127:16 of xmm2 are copied to xmm1[127:16].
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Scalar	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+This instruction divides the low FP16 value from the first source operand by the corresponding value in the second source operand, storing the FP16 result in the destination operand. Bits 127:16 of the destination operand are copied from the corresponding bits of the first source operand. Bits MAXVL-1:128 of the destination operand are zeroed. The low FP16 element of the destination is updated according to the writemask.
+
+Operation:
+
+VDIVSH (EVEX Encoded Versions):
+
+IF EVEX.b = 1 and SRC2 is a register:
+    SET_RM(EVEX.RC)
+ELSE
+    SET_RM(MXCSR.RC)
+IF k1[0] OR *no writemask*:
+    DEST.fp16[0] := SRC1.fp16[0] / SRC2.fp16[0]
+ELSE IF *zeroing*:
+    DEST.fp16[0] := 0
+// else dest.fp16[0] remains unchanged
+DEST[127:16] := SRC1[127:16]
+DEST[MAXVL-1:128] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VDIVSH __m128h _mm_div_round_sh (__m128h a, __m128h b, int rounding);
+VDIVSH __m128h _mm_mask_div_round_sh (__m128h src, __mmask8 k, __m128h a, __m128h b, int rounding);
+VDIVSH __m128h _mm_maskz_div_round_sh (__mmask8 k, __m128h a, __m128h b, int rounding);
+VDIVSH __m128h _mm_div_sh (__m128h a, __m128h b);
+VDIVSH __m128h _mm_mask_div_sh (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VDIVSH __m128h _mm_maskz_div_sh (__mmask8 k, __m128h a, __m128h b);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Underflow, Overflow, Precision, Denormal, Zero.
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
