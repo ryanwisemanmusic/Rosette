@@ -43,6 +43,10 @@ const div_fdivp = @import("DIV/fdivp.zig");
 const div_fidiv = @import("DIV/fidiv.zig");
 const div_vdivph = @import("DIV/VDIVPH.zig");
 const div_vdivsh = @import("DIV/VDIVSH.zig");
+const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
+const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
+const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
+const fix_up_vfixupimmss = @import("FIX_UP/VFIXUPIMMSS.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -904,6 +908,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(div_fidiv.family, div_fidiv.path, div_fidiv.source),
     mirror(div_vdivph.family, div_vdivph.path, div_vdivph.source),
     mirror(div_vdivsh.family, div_vdivsh.path, div_vdivsh.source),
+    mirror(fix_up_vfixupimmpd.family, fix_up_vfixupimmpd.path, fix_up_vfixupimmpd.source),
+    mirror(fix_up_vfixupimmps.family, fix_up_vfixupimmps.path, fix_up_vfixupimmps.source),
+    mirror(fix_up_vfixupimmsd.family, fix_up_vfixupimmsd.path, fix_up_vfixupimmsd.source),
+    mirror(fix_up_vfixupimmss.family, fix_up_vfixupimmss.path, fix_up_vfixupimmss.source),
     mirror(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     mirror(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
     mirror(interrupt_int.family, interrupt_int.path, interrupt_int.source),
