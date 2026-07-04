@@ -1,4 +1,86 @@
 https://www.felixcloutier.com/x86/
+
+KMOVW/KMOVB/KMOVQ/KMOVD — Move From and to Mask Registers
+
+Opcode/Instruction	                    Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+VEX.L0.0F.W0 90 /r KMOVW k1, k2/m16	    RM	    V/V	                    AVX512F	            Move 16 bits mask from k2/m16 and store the result in k1.
+VEX.L0.66.0F.W0 90 /r KMOVB k1, k2/m8	RM	    V/V	                    AVX512DQ	        Move 8 bits mask from k2/m8 and store the result in k1.
+VEX.L0.0F.W1 90 /r KMOVQ k1, k2/m64	    RM	    V/V	                    AVX512BW	        Move 64 bits mask from k2/m64 and store the result in k1.
+VEX.L0.66.0F.W1 90 /r KMOVD k1, k2/m32	RM	    V/V	                    AVX512BW	        Move 32 bits mask from k2/m32 and store the result in k1.
+VEX.L0.0F.W0 91 /r KMOVW m16, k1	    MR	    V/V	                    AVX512F	            Move 16 bits mask from k1 and store the result in m16.
+VEX.L0.66.0F.W0 91 /r KMOVB m8, k1	    MR	    V/V	                    AVX512DQ	        Move 8 bits mask from k1 and store the result in m8.
+VEX.L0.0F.W1 91 /r KMOVQ m64, k1	    MR	    V/V	                    AVX512BW	        Move 64 bits mask from k1 and store the result in m64.
+VEX.L0.66.0F.W1 91 /r KMOVD m32, k1	    MR	    V/V	                    AVX512BW	        Move 32 bits mask from k1 and store the result in m32.
+VEX.L0.0F.W0 92 /r KMOVW k1, r32	    RR	    V/V	                    AVX512F	            Move 16 bits mask from r32 to k1.
+VEX.L0.66.0F.W0 92 /r KMOVB k1, r32	    RR	    V/V	                    AVX512DQ	        Move 8 bits mask from r32 to k1.
+VEX.L0.F2.0F.W1 92 /r KMOVQ k1, r64	    RR	    V/I	                    AVX512BW	        Move 64 bits mask from r64 to k1.
+VEX.L0.F2.0F.W0 92 /r KMOVD k1, r32	    RR	    V/V	                    AVX512BW	        Move 32 bits mask from r32 to k1.
+VEX.L0.0F.W0 93 /r KMOVW r32, k1	    RR	    V/V	                    AVX512F	            Move 16 bits mask from k1 to r32.
+VEX.L0.66.0F.W0 93 /r KMOVB r32, k1	    RR	    V/V	                    AVX512DQ	        Move 8 bits mask from k1 to r32.
+VEX.L0.F2.0F.W1 93 /r KMOVQ r64, k1	    RR	    V/I	                    AVX512BW	        Move 64 bits mask from k1 to r64.
+VEX.L0.F2.0F.W0 93 /r KMOVD r32, k1	    RR	    V/V	                    AVX512BW	        Move 32 bits mask from k1 to r32.
+
+Instruction Operand Encoding:
+
+Op/En	Operand 1	                                    Operand 2
+RM	    ModRM:reg (w)	                                ModRM:r/m (r)
+MR	    ModRM:r/m (w, ModRM:[7:6] must not be 11b)	    ModRM:reg (r)
+RR	    ModRM:reg (w)	                                ModRM:r/m (r, ModRM:[7:6] must be 11b)
+
+Description:
+
+Copies values from the source operand (second operand) to the destination operand (first operand). The source and destination operands can be mask registers, memory location or general purpose. The instruction cannot be used to transfer data between general purpose registers and or memory locations.
+
+When moving to a mask register, the result is zero extended to MAX_KL size (i.e., 64 bits currently). When moving to a general-purpose register (GPR), the result is zero-extended to the size of the destination. In 32-bit mode, the default GPR destination’s size is 32 bits. In 64-bit mode, the default GPR destination’s size is 64 bits. Note that VEX.W can only be used to modify the size of the GPR operand in 64b mode.
+
+Operation:
+
+KMOVW:
+
+IF *destination is a memory location*
+    DEST[15:0] := SRC[15:0]
+IF *destination is a mask register or a GPR *
+    DEST := ZeroExtension(SRC[15:0])
+
+KMOVB:
+
+IF *destination is a memory location*
+    DEST[7:0] := SRC[7:0]
+IF *destination is a mask register or a GPR *
+    DEST := ZeroExtension(SRC[7:0])
+
+KMOVQ:
+
+IF *destination is a memory location or a GPR*
+    DEST[63:0] := SRC[63:0]
+IF *destination is a mask register*
+    DEST := ZeroExtension(SRC[63:0])
+
+KMOVD:
+
+IF *destination is a memory location*
+    DEST[31:0] := SRC[31:0]
+IF *destination is a mask register or a GPR *
+    DEST := ZeroExtension(SRC[31:0])
+Intel C/C++ Compiler Intrinsic Equivalent ¶
+
+KMOVW __mmask16 _mm512_kmov(__mmask16 a);
+
+Flags Affected:
+
+None.
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+Instructions with RR operand encoding, see Table 2-63, “TYPE K20 Exception Definition (VEX-Encoded OpMask Instructions w/o Memory Arg).”
+
+Instructions with RM or MR operand encoding, see Table 2-64, “TYPE K21 Exception Definition (VEX-Encoded OpMask Instructions Addressing Memory).”
+
+
 MOV — Move
 Opcode	            Instruction	            Op/En	64-Bit Mode	    Compat/Leg Mode	    Description
 88 /r	            MOV r/m8, r8	        MR	    Valid	        Valid	            Move r8 to r/m8.
@@ -4285,4 +4367,223 @@ Same exceptions as in protected mode.
 	If alignment checking is enabled and an unaligned memory reference is made while the current privilege level is 3.
 #UD:
 	If the LOCK prefix is used.
+    
+
+PMOVMSKB — Move Byte Mask
+
+Opcode/Instruction	                            Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+NP 0F D7 /r1 PMOVMSKB reg, mm	                RM	    V/V	                    SSE	                Move a byte mask of mm to reg. The upper bits of r32 or r64 are zeroed
+66 0F D7 /r PMOVMSKB reg, xmm	                RM	    V/V	                    SSE2	            Move a byte mask of xmm to reg. The upper bits of r32 or r64 are zeroed
+VEX.128.66.0F.WIG D7 /r VPMOVMSKB reg, xmm1	    RM	    V/V	                    AVX	                Move a byte mask of xmm1 to reg. The upper bits of r32 or r64 are filled with zeros.
+VEX.256.66.0F.WIG D7 /r VPMOVMSKB reg, ymm1	    RM	    V/V	                    AVX2	            Move a 32-bit mask of ymm1 to reg. The upper bits of r64 are filled with zeros.
+
+1. See note in Section 2.5, “Intel® AVX and Intel® SSE Instruction Exception Classification,” in the Intel® 64 and IA-32 Architectures Software Developer’s Manual, Volume 2A, and Section 23.25.3, “Exception Conditions of Legacy SIMD Instructions Operating on MMX Registers,” in the Intel® 64 and IA-32 Architectures Software Developer’s Manual, Volume 3B.
+
+Instruction Operand Encoding:
+
+Op/En	Operand 1	    Operand 2	    Operand 3	Operand 4
+RM	    ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+Creates a mask made up of the most significant bit of each byte of the source operand (second operand) and stores the result in the low byte or word of the destination operand (first operand).
+
+The byte mask is 8 bits for 64-bit source operand, 16 bits for 128-bit source operand and 32 bits for 256-bit source operand. The destination operand is a general-purpose register.
+
+In 64-bit mode, the instruction can access additional registers (XMM8-XMM15, R8-R15) when used with a REX.R prefix. The default operand size is 64-bit in 64-bit mode.
+
+Legacy SSE version: The source operand is an MMX technology register.
+
+128-bit Legacy SSE version: The source operand is an XMM register.
+
+VEX.128 encoded version: The source operand is an XMM register.
+
+VEX.256 encoded version: The source operand is a YMM register.
+
+Note: VEX.vvvv is reserved and must be 1111b.
+
+Operation:
+
+PMOVMSKB (With 64-bit Source Operand and r32):
+
+r32[0] := SRC[7];
+r32[1] := SRC[15];
+(* Repeat operation for bytes 2 through 6 *)
+r32[7] := SRC[63];
+r32[31:8] := ZERO_FILL;
+
+(V)PMOVMSKB (With 128-bit Source Operand and r32):
+
+r32[0] := SRC[7];
+r32[1] := SRC[15];
+(* Repeat operation for bytes 2 through 14 *)
+r32[15] := SRC[127];
+r32[31:16] := ZERO_FILL;
+
+VPMOVMSKB (With 256-bit Source Operand and r32):
+
+r32[0] := SRC[7];
+r32[1] := SRC[15];
+(* Repeat operation for bytes 3rd through 31*)
+r32[31] := SRC[255];
+
+PMOVMSKB (With 64-bit Source Operand and r64):
+
+r64[0] := SRC[7];
+r64[1] := SRC[15];
+(* Repeat operation for bytes 2 through 6 *)
+r64[7] := SRC[63];
+r64[63:8] := ZERO_FILL;
+
+(V)PMOVMSKB (With 128-bit Source Operand and r64):
+
+r64[0] := SRC[7];
+r64[1] := SRC[15];
+(* Repeat operation for bytes 2 through 14 *)
+r64[15] := SRC[127];
+r64[63:16] := ZERO_FILL;
+
+VPMOVMSKB (With 256-bit Source Operand and r64):
+
+r64[0] := SRC[7];
+r64[1] := SRC[15];
+(* Repeat operation for bytes 2 through 31*)
+r64[31] := SRC[255];
+r64[63:32] := ZERO_FILL;
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+PMOVMSKB int _mm_movemask_pi8(__m64 a)
+(V)PMOVMSKB int _mm_movemask_epi8 ( __m128i a)
+VPMOVMSKB int _mm256_movemask_epi8 ( __m256i a)
+
+Flags Affected:
+
+None.
+
+Numeric Exceptions:
+
+None.
+
+Other Exceptions:
+
+See Table 2-24, “Type 7 Class Exception Conditions,” additionally:
+
+#UD:
+	If VEX.vvvv ≠ 1111B.
+
+
+
+VMOVSH — Move Scalar FP16 Value
+
+Opcode/Instruction	                                        Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.LLIG.F3.MAP5.W0 10 /r VMOVSH xmm1{k1}{z}, m16	        A	    V/V	                    AVX512-FP16	        Move FP16 value from m16 to xmm1 subject to writemask k1.
+EVEX.LLIG.F3.MAP5.W0 11 /r VMOVSH m16{k1}, xmm1	            B	    V/V	                    AVX512-FP16	        Move low FP16 value from xmm1 to m16 subject to writemask k1.
+EVEX.LLIG.F3.MAP5.W0 10 /r VMOVSH xmm1{k1}{z}, xmm2, xmm3	C	    V/V	                    AVX512-FP16	        Move low FP16 values from xmm3 to xmm1 subject to writemask k1. Bits 127:16 of xmm2 are copied to xmm1[127:16].
+EVEX.LLIG.F3.MAP5.W0 11 /r VMOVSH xmm1{k1}{z}, xmm2, xmm3	D	    V/V	                    AVX512-FP16	        Move low FP16 values from xmm3 to xmm1 subject to writemask k1. Bits 127:16 of xmm2 are copied to xmm1[127:16].
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Scalar	ModRM:reg (w)	ModRM:r/m (r)	N/A	            N/A
+B	    Scalar	ModRM:r/m (w)	ModRM:reg (r)	N/A	            N/A
+C	    N/A	    ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+D	    N/A	    ModRM:r/m (w)	VEX.vvvv (r)	ModRM:reg (r)	N/A
+
+Description:
+
+This instruction moves a FP16 value to a register or memory location.
+
+The two register-only forms are aliases and differ only in where their operands are encoded; this is a side effect of the encodings selected.
+
+Operation:
+
+VMOVSH dest, src (two operand load):
+
+IF k1[0] or no writemask:
+    DEST.fp16[0] := SRC.fp16[0]
+ELSE IF *zeroing*:
+    DEST.fp16[0] := 0
+// ELSE DEST.fp16[0] remains unchanged
+DEST[MAXVL:16] := 0
+
+VMOVSH dest, src (two operand store):
+
+IF k1[0] or no writemask:
+    DEST.fp16[0] := SRC.fp16[0]
+// ELSE DEST.fp16[0] remains unchanged
+
+VMOVSH dest, src1, src2 (three operand copy):
+
+IF k1[0] or no writemask:
+    DEST.fp16[0] := SRC2.fp16[0]
+ELSE IF *zeroing*:
+    DEST.fp16[0] := 0
+// ELSE DEST.fp16[0] remains unchanged
+DEST[127:16] := SRC1[127:16]
+DEST[MAXVL:128] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMOVSH __m128h _mm_load_sh (void const* mem_addr);
+VMOVSH __m128h _mm_mask_load_sh (__m128h src, __mmask8 k, void const* mem_addr);
+VMOVSH __m128h _mm_maskz_load_sh (__mmask8 k, void const* mem_addr);
+VMOVSH __m128h _mm_mask_move_sh (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VMOVSH __m128h _mm_maskz_move_sh (__mmask8 k, __m128h a, __m128h b);
+VMOVSH __m128h _mm_move_sh (__m128h a, __m128h b);
+VMOVSH void _mm_mask_store_sh (void * mem_addr, __mmask8 k, __m128h a);
+VMOVSH void _mm_store_sh (void * mem_addr, __m128h a);
+
+SIMD Floating-Point Exceptions:
+
+None
+
+Other Exceptions:
+
+EVEX-encoded instruction, see Table 2-51, “Type E5 Class Exception Conditions.”
+
+
+
+
+VMOVW — Move Word
+
+Opcode/Instruction	                            Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.66.MAP5.WIG 6E /r VMOVW xmm1, reg/m16	A	    V/V	                    AVX512-FP16	        Copy word from reg/m16 to xmm1.
+EVEX.128.66.MAP5.WIG 7E /r VMOVW reg/m16, xmm1	B	    V/V	                    AVX512-FP16	        Copy word from xmm1 to reg/m16.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	Operand 4
+A	    Scalar	ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+B	    Scalar	ModRM:r/m (w)	ModRM:reg (r)	N/A     	N/A
+
+Description:
+
+This instruction either (a) copies one word element from an XMM register to a general-purpose register or memory location or (b) copies one word element from a general-purpose register or memory location to an XMM register. When writing a general-purpose register, the lower 16-bits of the register will contain the word value. The upper bits of the general-purpose register are written with zeros.
+
+Operation:
+
+VMOVW dest, src (two operand load):
+
+DEST.word[0] := SRC.word[0]
+DEST[MAXVL:16] := 0
+
+VMOVW dest, src (two operand store):
+
+DEST.word[0] := SRC.word[0]
+// upper bits of GPR DEST are zeroed
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMOVW short _mm_cvtsi128_si16 (__m128i a);
+VMOVW __m128i _mm_cvtsi16_si128 (short a);
+
+SIMD Floating-Point Exceptions:
+
+None
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-57, “Type E9NF Class Exception Conditions.”
+
     
