@@ -68,6 +68,21 @@ const input_ins = @import("INPUT/INS.zig");
 const input_insb = @import("INPUT/INSB.zig");
 const input_insw = @import("INPUT/INSW.zig");
 const input_insd = @import("INPUT/INSD.zig");
+const insert_insertps = @import("INSERT/INSERTPS.zig");
+const insert_pinsrb = @import("INSERT/PINSRB.zig");
+const insert_pinsrd = @import("INSERT/PINSRD.zig");
+const insert_pinsrq = @import("INSERT/PINSRQ.zig");
+const insert_pinsrw = @import("INSERT/PINSRW.zig");
+const insert_vinsertf128 = @import("INSERT/VINSERTF128.zig");
+const insert_vinsertf32x4 = @import("INSERT/VINSERTF32X4.zig");
+const insert_vinsertf64x2 = @import("INSERT/VINSERTF64X2.zig");
+const insert_vinsertf32x8 = @import("INSERT/VINSERTF32X8.zig");
+const insert_vinsertf64x4 = @import("INSERT/VINSERTF64X4.zig");
+const insert_vinserti128 = @import("INSERT/VINSERTI128.zig");
+const insert_vinserti32x4 = @import("INSERT/VINSERTI32X4.zig");
+const insert_vinserti64x2 = @import("INSERT/VINSERTI64X2.zig");
+const insert_vinserti32x8 = @import("INSERT/VINSERTI32X8.zig");
+const insert_vinserti64x4 = @import("INSERT/VINSERTI64X4.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
 const interrupt_int1 = @import("INTERRUPT/INT1.zig");
 const interrupt_int3 = @import("INTERRUPT/INT3.zig");
@@ -879,6 +894,21 @@ pub const specs = blk: {
         spec(input_insb.meta),
         spec(input_insw.meta),
         spec(input_insd.meta),
+        spec(insert_insertps.meta),
+        spec(insert_pinsrb.meta),
+        spec(insert_pinsrd.meta),
+        spec(insert_pinsrq.meta),
+        spec(insert_pinsrw.meta),
+        spec(insert_vinsertf128.meta),
+        spec(insert_vinsertf32x4.meta),
+        spec(insert_vinsertf64x2.meta),
+        spec(insert_vinsertf32x8.meta),
+        spec(insert_vinsertf64x4.meta),
+        spec(insert_vinserti128.meta),
+        spec(insert_vinserti32x4.meta),
+        spec(insert_vinserti64x2.meta),
+        spec(insert_vinserti32x8.meta),
+        spec(insert_vinserti64x4.meta),
         spec(interrupt_int.meta),
         spec(interrupt_int1.meta),
         spec(interrupt_int3.meta),
@@ -1690,6 +1720,21 @@ pub const proof_reports = [_]proofs.ProofReport{
     input_insb.proof_report,
     input_insw.proof_report,
     input_insd.proof_report,
+    insert_insertps.proof_report,
+    insert_pinsrb.proof_report,
+    insert_pinsrd.proof_report,
+    insert_pinsrq.proof_report,
+    insert_pinsrw.proof_report,
+    insert_vinsertf128.proof_report,
+    insert_vinsertf32x4.proof_report,
+    insert_vinsertf64x2.proof_report,
+    insert_vinsertf32x8.proof_report,
+    insert_vinsertf64x4.proof_report,
+    insert_vinserti128.proof_report,
+    insert_vinserti32x4.proof_report,
+    insert_vinserti64x2.proof_report,
+    insert_vinserti32x8.proof_report,
+    insert_vinserti64x4.proof_report,
     interrupt_int.proof_report,
     interrupt_int1.proof_report,
     interrupt_int3.proof_report,
