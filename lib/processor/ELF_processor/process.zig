@@ -994,6 +994,14 @@ pub const ElfState = struct {
             .lzcnt_reg_mem,
             => self.executeBitScan(d),
             .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
+            .crc32_reg_reg, .crc32_reg_mem => {
+                const source = if (d.op == .crc32_reg_mem)
+                    self.readMemVal(d.addr, d.size)
+                else
+                    self.regVal(d.src_reg, d.size);
+                const crc = x64_decoder.crc32cAccumulator(@truncate(self.regVal(d.dst_reg, .bits32)), source, d.size);
+                self.setReg(d.dst_reg, d.dst_size, crc);
+            },
             .rol_reg_cl,
             .rol_mem_cl,
             .ror_reg_cl,
@@ -2024,6 +2032,8 @@ pub const ElfState = struct {
             .vxorps,
             .vxorpd,
             .vpcmpeqd,
+            .vpunpckldq,
+            .vpermilpd,
             => unreachable,
         }
 

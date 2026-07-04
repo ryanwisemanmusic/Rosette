@@ -89,6 +89,7 @@ pub const Metadata = struct {
     symtab: ?Symtab,
     dysymtab: ?Dysymtab,
     dyld_info: ?DyldInfo,
+    defined_symbols: std.StringHashMap(u64),
 
     pub fn init(allocator: std.mem.Allocator, data: []const u8) !Metadata {
         if (data.len < MACH_HEADER_64_SIZE) return error.TruncatedMachO;
@@ -203,8 +204,10 @@ pub const Metadata = struct {
             .symtab = symtab,
             .dysymtab = dysymtab,
             .dyld_info = dyld_info,
+            .defined_symbols = std.StringHashMap(u64).init(allocator),
         };
         errdefer metadata.deinit();
+        try metadata.indexDefinedSymbols();
         metadata.imports = try metadata.collectImports();
         metadata.bindings = try metadata.collectBindings();
         metadata.initializer_addresses = try metadata.collectInitializers();
@@ -218,6 +221,7 @@ pub const Metadata = struct {
         if (self.imports.len != 0) self.allocator.free(self.imports);
         if (self.bindings.len != 0) self.allocator.free(self.bindings);
         if (self.initializer_addresses.len != 0) self.allocator.free(self.initializer_addresses);
+        self.defined_symbols.deinit();
         self.* = undefined;
     }
 
@@ -277,6 +281,24 @@ pub const Metadata = struct {
             if (address != 0) return address;
         }
         return null;
+    }
+
+    pub fn definedSymbolAddress(self: *const Metadata, expected_name: []const u8) ?u64 {
+        return self.defined_symbols.get(expected_name);
+    }
+
+    fn indexDefinedSymbols(self: *Metadata) !void {
+        const table = self.symtab orelse return;
+        var index: u32 = 0;
+        while (index < table.symbol_count) : (index += 1) {
+            const entry_offset = @as(usize, table.symbol_offset) + @as(usize, index) * NLIST_64_SIZE;
+            if (entry_offset + NLIST_64_SIZE > self.data.len) break;
+            const symbol_type = self.data[entry_offset + 4];
+            if ((symbol_type & N_STAB) != 0 or (symbol_type & N_TYPE) != N_SECT) continue;
+            const name = self.symbolName(table, readU32(self.data, entry_offset)) orelse continue;
+            const address = readU64(self.data, entry_offset + 8);
+            if (address != 0) try self.defined_symbols.put(name, address);
+        }
     }
 
     pub fn symbolAddressesMatching(
@@ -604,7 +626,7 @@ test "metadata maps indirect stubs to imported symbols" {
     std.mem.writeInt(u32, data[offset..][0..4], macho.LC_SYMTAB, .little);
     std.mem.writeInt(u32, data[offset + 4 ..][0..4], 24, .little);
     std.mem.writeInt(u32, data[offset + 8 ..][0..4], 320, .little);
-    std.mem.writeInt(u32, data[offset + 12 ..][0..4], 1, .little);
+    std.mem.writeInt(u32, data[offset + 12 ..][0..4], 2, .little);
     std.mem.writeInt(u32, data[offset + 16 ..][0..4], 352, .little);
     std.mem.writeInt(u32, data[offset + 20 ..][0..4], 32, .little);
 
@@ -617,6 +639,10 @@ test "metadata maps indirect stubs to imported symbols" {
     std.mem.writeInt(u32, data[320..324], 1, .little);
     data[326] = 0;
     data[327] = 0;
+    std.mem.writeInt(u32, data[336..340], 1, .little);
+    data[340] = N_SECT;
+    data[341] = 1;
+    std.mem.writeInt(u64, data[344..352], 0x2000, .little);
     @memcpy(data[353..][0..11], "_test_call\x00");
     std.mem.writeInt(u32, data[384..388], 0, .little);
 
@@ -625,6 +651,8 @@ test "metadata maps indirect stubs to imported symbols" {
     try std.testing.expectEqual(@as(usize, 1), metadata.imports.len);
     try std.testing.expectEqualStrings("_test_call", metadata.imports[0].name);
     try std.testing.expectEqual(@as(u64, 0x1000), metadata.imports[0].stub_address);
+    try std.testing.expectEqual(@as(u64, 0x2000), metadata.definedSymbolAddress("_test_call").?);
+    try std.testing.expect(metadata.definedSymbolAddress("_missing") == null);
 }
 
 test "metadata decodes classic dyld data bindings" {

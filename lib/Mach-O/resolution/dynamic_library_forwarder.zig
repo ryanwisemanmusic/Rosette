@@ -15,6 +15,7 @@ pub const Signature = enum {
     buffer_length_usize,
     two_buffers_length_i32,
     buffer_byte_length_pointer,
+    guest_memory_copy,
     libcxx_getloc,
     libcxx_istream_sentry_constructor,
 };
@@ -48,6 +49,7 @@ const specs = [_]Spec{
     .{ .symbol = "strncmp", .library = .libsystem, .signature = .two_buffers_length_i32 },
     .{ .symbol = "memcmp", .library = .libsystem, .signature = .two_buffers_length_i32 },
     .{ .symbol = "memchr", .library = .libsystem, .signature = .buffer_byte_length_pointer },
+    .{ .symbol = "memcpy", .library = .libsystem, .signature = .guest_memory_copy },
     .{ .symbol = "_ZNSt3__18ios_base6xallocEv", .library = .libcxx, .signature = .no_args_i32 },
     .{ .symbol = "_ZNKSt3__18ios_base6getlocEv", .library = .libcxx, .signature = .libcxx_getloc },
     .{ .symbol = "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", .library = .libcxx, .signature = .libcxx_istream_sentry_constructor },
@@ -85,6 +87,22 @@ pub const Forwarder = struct {
         if (!libraryMatches(spec.library, dylib)) {
             self.rejected_library += 1;
             return null;
+        }
+        if (spec.signature == .guest_memory_copy) {
+            const length: usize = @intCast(state.regs.rdx);
+            if (length != 0) {
+                const destination = state.guestMemory(state.regs.rdi, state.regs.rdx) orelse {
+                    self.rejected_guest_memory += 1;
+                    return null;
+                };
+                const source = state.guestMemoryConst(state.regs.rsi, state.regs.rdx) orelse {
+                    self.rejected_guest_memory += 1;
+                    return null;
+                };
+                std.mem.copyForwards(u8, destination[0..length], source[0..length]);
+            }
+            self.forwarded += 1;
+            return .{ .handled = state.regs.rdi };
         }
         const handle = self.libraryHandle(dylib) orelse {
             self.rejected_library += 1;
@@ -165,6 +183,15 @@ pub const Forwarder = struct {
                 if (offset >= bytes.len) return null;
                 break :blk .{ .handled = state.regs.rdi + offset };
             },
+            .guest_memory_copy => blk: {
+                const length: usize = @intCast(state.regs.rdx);
+                if (length != 0) {
+                    const destination = state.guestMemory(state.regs.rdi, state.regs.rdx) orelse return null;
+                    const source = state.guestMemoryConst(state.regs.rsi, state.regs.rdx) orelse return null;
+                    std.mem.copyForwards(u8, destination[0..length], source[0..length]);
+                }
+                break :blk .{ .handled = state.regs.rdi };
+            },
             .libcxx_getloc => blk: {
                 // ios_base::getloc() - takes ios_base pointer in rdi, returns locale pointer in rax
                 // We can't directly forward this because the guest and host have different memory layouts
@@ -209,6 +236,21 @@ fn nulTerminate(buffer: []u8, value: []const u8) ?[*:0]const u8 {
     return @ptrCast(buffer.ptr);
 }
 
+const TestState = struct {
+    mem: [32]u8 = [_]u8{0} ** 32,
+    regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0 } = .{},
+
+    pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+        if (address + length > self.mem.len) return null;
+        return self.mem[@intCast(address)..@intCast(address + length)];
+    }
+
+    fn guestMemoryConst(self: *@This(), address: u64, length: u64) ?[]const u8 {
+        if (address + length > self.mem.len) return null;
+        return self.mem[@intCast(address)..@intCast(address + length)];
+    }
+};
+
 test "forwarding registry only admits typed libSystem functions" {
     try std.testing.expectEqual(Signature.no_args_i32, specFor("getpid").?.signature);
     try std.testing.expect(specFor("objc_msgSend") == null);
@@ -221,15 +263,6 @@ test "forwarding registry only admits typed libSystem functions" {
 
 test "forwarder invokes an allowlisted host symbol" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
-    const TestState = struct {
-        mem: [32]u8 = [_]u8{0} ** 32,
-        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0 } = .{},
-
-        fn guestMemoryConst(self: *@This(), address: u64, length: u64) ?[]const u8 {
-            if (address + length > self.mem.len) return null;
-            return self.mem[@intCast(address)..@intCast(address + length)];
-        }
-    };
     var forwarder = Forwarder{};
     defer forwarder.deinit();
     var state = TestState{};
@@ -241,4 +274,20 @@ test "forwarder invokes an allowlisted host symbol" {
     const length = forwarder.forward(&state, "/usr/lib/libSystem.B.dylib", "_strnlen") orelse return error.SymbolUnavailable;
     try std.testing.expectEqual(@as(u64, 3), length.handled);
     try std.testing.expectEqual(@as(u64, 2), forwarder.forwarded);
+}
+
+test "forwarder copies guest memory for memcpy" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    var state = TestState{};
+    @memcpy(state.mem[8..12], "----");
+    @memcpy(state.mem[16..20], "copy");
+    state.regs.rdi = 8;
+    state.regs.rsi = 16;
+    state.regs.rdx = 4;
+
+    const outcome = forwarder.forward(&state, "/usr/lib/libSystem.B.dylib", "_memcpy") orelse return error.SymbolUnavailable;
+    try std.testing.expectEqual(@as(u64, 8), outcome.handled);
+    try std.testing.expectEqualStrings("copy", state.mem[8..12]);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.forwarded);
 }

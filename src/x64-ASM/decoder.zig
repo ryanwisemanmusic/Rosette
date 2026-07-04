@@ -85,6 +85,27 @@ pub fn byteSwap(size: OperandSize, value: u64) u64 {
     };
 }
 
+pub fn crc32cAccumulator(initial: u32, source: u64, size: OperandSize) u32 {
+    var crc = initial;
+    var value = source;
+    const byte_count: u8 = switch (size) {
+        .bits8 => 1,
+        .bits16 => 2,
+        .bits32 => 4,
+        .bits64 => 8,
+    };
+    var byte_index: u8 = 0;
+    while (byte_index < byte_count) : (byte_index += 1) {
+        crc ^= @as(u8, @truncate(value));
+        value >>= 8;
+        var bit_index: u4 = 0;
+        while (bit_index < 8) : (bit_index += 1) {
+            crc = (crc >> 1) ^ (0x82F6_3B78 & (0 -% (crc & 1)));
+        }
+    }
+    return crc;
+}
+
 pub const Op = enum(u16) {
     invalid,
     nop,
@@ -268,6 +289,8 @@ pub const Op = enum(u16) {
     lzcnt_reg_reg,
     lzcnt_reg_mem,
     bswap_reg,
+    crc32_reg_reg,
+    crc32_reg_mem,
     // test
     test_reg8_reg8,
     test_reg16_reg16,
@@ -526,6 +549,8 @@ pub const Op = enum(u16) {
     vorpd,
     vxorps,
     vxorpd,
+    vpunpckldq,
+    vpermilpd,
     // conditional / unconditional jumps
     jmp_rel8,
     jcc_rel8,
@@ -570,6 +595,7 @@ test "shared byte swap preserves operand width" {
 pub const DecodedInsn = struct {
     op: Op = .invalid,
     size: OperandSize = .bits32,
+    dst_size: OperandSize = .bits32,
     dst_reg: RegId = .al_ax_eax_rax,
     src_reg: RegId = .al_ax_eax_rax,
     addr: u64 = 0,
@@ -589,3 +615,7 @@ pub const DecodedInsn = struct {
     xmm_src2: u8 = 0,
     vector_256: bool = false,
 };
+
+test "shared CRC32C accumulator follows x86 byte order" {
+    try std.testing.expectEqual(@as(u32, 0x93AD_1061), crc32cAccumulator(0, 'a', .bits8));
+}

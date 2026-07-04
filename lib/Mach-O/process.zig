@@ -36,6 +36,7 @@ const Op = x64_decoder.Op;
 const DecodedInsn = x64_decoder.DecodedInsn;
 const BitScanKind = x64_decoder.BitScanKind;
 const bitScan = x64_decoder.bitScan;
+const crc32cAccumulator = x64_decoder.crc32cAccumulator;
 
 const RFL_CF = x64_decoder.RFL_CF;
 const RFL_PF: u32 = 1 << 2;
@@ -154,6 +155,8 @@ const InternalCompatibilityTargets = struct {
     libcxx_basic_ios_fail: u64 = 0,
     libcxx_basic_ios_eof: u64 = 0,
     print_config_to_log: u64 = 0,
+    imgui_default_malloc: u64 = 0,
+    imgui_default_free: u64 = 0,
 };
 
 const InitializerCheckpoint = struct {
@@ -191,7 +194,7 @@ pub const MachOState = struct {
     ios_xalloc_next: u64 = 4,
     verbose_trace: bool = false,
     contract_verification: bool = false,
-    max_steps: u64 = 100_000_000,
+    max_steps: u64 = 0,
     guest_assertion_count: u64 = 0,
     initializer_abort_requested: bool = false,
     cxxopts_split_accelerations: u64 = 0,
@@ -407,6 +410,12 @@ pub const MachOState = struct {
         ) orelse 0;
         result.internal_targets.print_config_to_log = result.metadata.symbolAddressWithPrefix(
             "__ZN6config16PrintConfigToLog",
+        ) orelse 0;
+        result.internal_targets.imgui_default_malloc = result.metadata.symbolAddressWithPrefix(
+            "__ZL13MallocWrappermPv",
+        ) orelse 0;
+        result.internal_targets.imgui_default_free = result.metadata.symbolAddressWithPrefix(
+            "__ZL11FreeWrapperPvS_",
         ) orelse 0;
         result.logging.configure(
             result.internal_targets.guest_log_get_thread_buffer != 0,
@@ -1160,6 +1169,20 @@ pub const MachOState = struct {
 
     fn handleImportImpl(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
         const name = imported.name;
+        if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove")) {
+            return self.handleGuestMemoryCopy(name);
+        }
+        if (self.metadata.definedSymbolAddress(name)) |target| {
+            if (target != imported.stub_address and self.isExecutableAddress(target)) {
+                self.regs.rip = target;
+                self.import_provider_override = .local_definition;
+                self.import_confidence_override = .verified;
+                if (self.verbose_trace) {
+                    std.debug.print("    [local definition] {s}: stub=0x{x} -> target=0x{x}\n", .{ name, imported.stub_address, target });
+                }
+                return .control_transferred;
+            }
+        }
         if (self.libcxx_streams.dispatch(self, &self.fs_forwarder, name)) |resolution| {
             self.import_provider_override = .libcpp_stream;
             self.import_confidence_override = .modeled;
@@ -1995,6 +2018,29 @@ pub const MachOState = struct {
 
         if (self.verbose_trace) std.debug.print("    [import] (unhandled) {s}\n", .{name});
         return .{ .unsupported = 0 };
+    }
+
+    fn handleGuestMemoryCopy(self: *MachOState, name: []const u8) ImportHandlerResult {
+        const destination_address = self.regs.rdi;
+        const source_address = self.regs.rsi;
+        const count = self.regs.rdx;
+        if (count == 0) return .{ .handled = destination_address };
+
+        const source = self.guestMemoryConst(source_address, count);
+        const destination = self.guestMemory(destination_address, count);
+        if (source != null and destination != null) {
+            if (destination_address > source_address and destination_address - source_address < count) {
+                std.mem.copyBackwards(u8, destination.?, source.?);
+            } else {
+                std.mem.copyForwards(u8, destination.?, source.?);
+            }
+        } else if (self.verbose_trace) {
+            std.debug.print(
+                "macho-processor: {s} skipped: source=0x{x} destination=0x{x} bytes={d} source_backed={} destination_backed={}\n",
+                .{ name, source_address, destination_address, count, source != null, destination != null },
+            );
+        }
+        return .{ .handled = destination_address };
     }
 
     fn handleDirectImportCall(self: *MachOState, imported: macho_metadata.ImportedSymbol) void {
@@ -3034,6 +3080,20 @@ pub const MachOState = struct {
     }
 
     fn handleInternalCompatibility(self: *MachOState) bool {
+        if (self.internal_targets.imgui_default_malloc != 0 and
+            self.regs.rip == self.internal_targets.imgui_default_malloc)
+        {
+            self.regs.rax = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0;
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if (self.internal_targets.imgui_default_free != 0 and
+            self.regs.rip == self.internal_targets.imgui_default_free)
+        {
+            self.memory_forwarder.release(self.regs.rdi);
+            self.regs.rip = self.pop();
+            return true;
+        }
         if (self.internal_targets.parse_launch_arguments != 0 and
             self.regs.rip == self.internal_targets.parse_launch_arguments)
         {
@@ -3457,7 +3517,7 @@ pub const MachOState = struct {
 
     pub fn run(self: *MachOState) void {
         var steps: u64 = 0;
-        while (!self.terminated and steps < self.max_steps) : (steps += 1) {
+        while (!self.terminated and stepBudgetAllows(self.max_steps, steps)) : (steps +|= 1) {
             self.executed_steps = steps;
             if (steps % 500000 == 0) {
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
@@ -3486,7 +3546,7 @@ pub const MachOState = struct {
             }
             if (!self.step()) break;
         }
-        if (steps >= self.max_steps) {
+        if (self.max_steps != 0 and steps >= self.max_steps) {
             log.warn("reached max steps ({d})", .{self.max_steps});
             self.faulted = true;
             self.exit_code = 124;
@@ -4217,6 +4277,15 @@ pub const MachOState = struct {
 
             .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
 
+            .crc32_reg_reg, .crc32_reg_mem => {
+                const source = if (d.op == .crc32_reg_mem)
+                    self.readMemVal(d.addr, d.size)
+                else
+                    self.regVal(d.src_reg, d.size);
+                const crc = crc32cAccumulator(@truncate(self.regVal(d.dst_reg, .bits32)), source, d.size);
+                self.setReg(d.dst_reg, d.dst_size, crc);
+            },
+
             .rol_reg_cl,
             .rol_mem_cl,
             .ror_reg_cl,
@@ -4611,6 +4680,26 @@ pub const MachOState = struct {
                 if (d.vector_256) {
                     const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                     self.ymm_hi[d.xmm_dst] = compareEqualDwords(self.ymm_hi[d.xmm_src], rhs_high);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vpunpckldq => {
+                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = unpackLowDwords(self.xmm[d.xmm_src], rhs_low);
+                if (d.vector_256) {
+                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = unpackLowDwords(self.ymm_hi[d.xmm_src], rhs_high);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vpermilpd => {
+                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = permutePackedDoubles(source_low, @truncate(d.imm));
+                if (d.vector_256) {
+                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = permutePackedDoubles(source_high, @truncate(d.imm >> 2));
                 } else {
                     @memset(&self.ymm_hi[d.xmm_dst], 0);
                 }
@@ -5220,6 +5309,17 @@ fn environmentUnsigned(name: [*:0]const u8, fallback: u64) u64 {
     const raw = std.c.getenv(name) orelse return fallback;
     const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
     return std.fmt.parseUnsigned(u64, value, 10) catch fallback;
+}
+
+fn stepBudgetAllows(max_steps: u64, completed_steps: u64) bool {
+    return max_steps == 0 or completed_steps < max_steps;
+}
+
+test "Mach-O execution is unlimited unless an explicit step budget is set" {
+    try std.testing.expect(stepBudgetAllows(0, 0));
+    try std.testing.expect(stepBudgetAllows(0, std.math.maxInt(u64)));
+    try std.testing.expect(stepBudgetAllows(100, 99));
+    try std.testing.expect(!stepBudgetAllows(100, 100));
 }
 
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
@@ -5915,6 +6015,23 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode == 0x62 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpunpckldq, .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if ((opcode == 0x12 or opcode == 0x13 or opcode == 0x16 or opcode == 0x17) and
         !vector_256 and (prefix == 0 or prefix == 1))
     {
@@ -5939,6 +6056,28 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             decoded.src_reg = @enumFromInt(rm.addr);
             decoded.op = if (prefix == 2) .vcvtsi2ss_xmm_reg else .vcvtsi2sd_xmm_reg;
         }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if ((opcode == 0x2C or opcode == 0x2D) and !vector_256 and (prefix == 2 or prefix == 3) and (vex & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .size = .bits32 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        decoded.dst_reg = rm.reg;
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src = @intCast(rm.addr);
+        }
+        decoded.op = if (opcode == 0x2C)
+            if (prefix == 2) .vcvttss2si else .vcvttsd2si
+        else if (prefix == 2)
+            .vcvtss2si
+        else
+            .vcvtsd2si;
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -6180,6 +6319,24 @@ fn compareEqualDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
     return result;
 }
 
+fn unpackLowDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    @memcpy(result[0..4], lhs[0..4]);
+    @memcpy(result[4..8], rhs[0..4]);
+    @memcpy(result[8..12], lhs[4..8]);
+    @memcpy(result[12..16], rhs[4..8]);
+    return result;
+}
+
+fn permutePackedDoubles(source: [16]u8, control: u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    const low_source: usize = if (control & 0x01 == 0) 0 else 8;
+    const high_source: usize = if (control & 0x02 == 0) 0 else 8;
+    @memcpy(result[0..8], source[low_source..][0..8]);
+    @memcpy(result[8..16], source[high_source..][0..8]);
+    return result;
+}
+
 fn vexArithmeticForOp(op: Op) VexArithmetic {
     return switch (op) {
         .vaddss, .vaddsd, .vaddps, .vaddpd => .add,
@@ -6351,6 +6508,42 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         } else {
             decoded.xmm_src2 = @intCast(rm.addr);
         }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and opcode == 0x62 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpunpckldq, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 3 and opcode == 0x05 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpermilpd, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        if (pos >= bytes.len) return .{};
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src = @intCast(rm.addr);
+        }
+        decoded.imm = bytes[pos];
+        pos += 1;
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -6836,10 +7029,36 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
 }
 
 fn decodeThreeByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_f2: bool, has_f3: bool, opcode: u8) DecodedInsn {
-    _ = has_66;
-    _ = has_f2;
-    _ = has_f3;
-    _ = opcode;
+    if (opcode == 0x38 and has_f2 and !has_f3 and pos.* < bytes.len) {
+        const opcode3 = bytes[pos.*];
+        if (opcode3 == 0xF0 or opcode3 == 0xF1) {
+            pos.* += 1;
+            var decoded = DecodedInsn{};
+            if (pos.* >= bytes.len) return .{};
+            const is_memory = bytes[pos.*] < 0xC0;
+            const source_size: Size = if (opcode3 == 0xF0)
+                .bits8
+            else if (rex_w)
+                .bits64
+            else if (has_66)
+                .bits16
+            else
+                .bits32;
+            const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, source_size);
+            decoded.op = if (is_memory) .crc32_reg_mem else .crc32_reg_reg;
+            decoded.size = source_size;
+            decoded.dst_size = if (rex_w) .bits64 else .bits32;
+            decoded.dst_reg = rm.reg;
+            if (is_memory) {
+                decoded.addr = rm.addr;
+            } else {
+                decoded.src_reg = @enumFromInt(rm.addr);
+            }
+            decoded.len = @intCast(pos.*);
+            return decoded;
+        }
+    }
+
     if (pos.* >= bytes.len) return .{};
     const opcode3 = bytes[pos.*];
     if (opcode3 == 0xF5 or opcode3 == 0xF7 or opcode3 == 0xFA or opcode3 == 0xFB or opcode3 == 0xFC) {
@@ -7965,6 +8184,25 @@ test "decode group two rotate forms" {
     try std.testing.expectEqual(@as(u64, 1), ror_rax.imm);
 }
 
+test "decode CRC32 forms without consuming the following instruction" {
+    const imgui_hash = decodeInsn(&[_]u8{ 0xF2, 0x0F, 0x38, 0xF0, 0xC1, 0xE9, 0x8F, 0xFF, 0xFF, 0xFF });
+    try std.testing.expectEqual(Op.crc32_reg_reg, imgui_hash.op);
+    try std.testing.expectEqual(Size.bits8, imgui_hash.size);
+    try std.testing.expectEqual(Size.bits32, imgui_hash.dst_size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, imgui_hash.dst_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, imgui_hash.src_reg);
+    try std.testing.expectEqual(@as(u8, 5), imgui_hash.len);
+
+    const qword_memory = decodeInsn(&[_]u8{ 0xF2, 0x48, 0x0F, 0x38, 0xF1, 0x48, 0x08 });
+    try std.testing.expectEqual(Op.crc32_reg_mem, qword_memory.op);
+    try std.testing.expectEqual(Size.bits64, qword_memory.size);
+    try std.testing.expectEqual(Size.bits64, qword_memory.dst_size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, qword_memory.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, qword_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 8), qword_memory.addr);
+    try std.testing.expectEqual(@as(u8, 7), qword_memory.len);
+}
+
 test "decode register MOVZX without consuming the following instruction" {
     const decoded = decodeInsn(&[_]u8{ 0x0F, 0xB6, 0xC0, 0x48, 0x83, 0xC4, 0x30 });
     try std.testing.expectEqual(Op.movzx_reg32_mem8, decoded.op);
@@ -8417,6 +8655,15 @@ test "VEX rounding modes include ties-to-even" {
 }
 
 test "decode VEX scalar float to signed integer conversions" {
+    const imgui_truncate_memory = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x2C, 0x45, 0xFC, 0xC5, 0xFA, 0x2A, 0xC0 });
+    try std.testing.expectEqual(Op.vcvttss2si, imgui_truncate_memory.op);
+    try std.testing.expectEqual(Size.bits32, imgui_truncate_memory.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, imgui_truncate_memory.dst_reg);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, imgui_truncate_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -4))), imgui_truncate_memory.addr);
+    try std.testing.expect(!imgui_truncate_memory.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), imgui_truncate_memory.len);
+
     const truncate_to_64 = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xFA, 0x2C, 0xC1 });
     try std.testing.expectEqual(Op.vcvttss2si, truncate_to_64.op);
     try std.testing.expectEqual(Size.bits64, truncate_to_64.size);
