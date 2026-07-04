@@ -628,6 +628,10 @@ const min_max_pminub = @import("MIN-MAX/PMINUB.zig");
 const min_max_pminuw = @import("MIN-MAX/PMINUW.zig");
 const min_max_pminud = @import("MIN-MAX/PMINUD.zig");
 const min_max_pminuq = @import("MIN-MAX/PMINUQ.zig");
+const min_max_maxpd = @import("MIN-MAX/MAXPD.zig");
+const min_max_maxps = @import("MIN-MAX/MAXPS.zig");
+const min_max_minpd = @import("MIN-MAX/MINPD.zig");
+const min_max_minps = @import("MIN-MAX/MINPS.zig");
 const set_monitor = @import("SET/MONITOR.zig");
 const set_umonitor = @import("SET/UMONITOR.zig");
 const set_stac = @import("SET/STAC.zig");
@@ -1057,6 +1061,10 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "MOVUPD",
     "MOVUPS",
     "MOVZX",
+    "MAXPD",
+    "MAXPS",
+    "MINPD",
+    "MINPS",
     "MUL",
     "MULPD",
     "MULPS",
@@ -2078,6 +2086,10 @@ pub const tables = [_]InstructionTable{
     entry(min_max_pminuw.family, min_max_pminuw.path, min_max_pminuw.source),
     entry(min_max_pminud.family, min_max_pminud.path, min_max_pminud.source),
     entry(min_max_pminuq.family, min_max_pminuq.path, min_max_pminuq.source),
+    entry(min_max_maxpd.family, min_max_maxpd.path, min_max_maxpd.source),
+    entry(min_max_maxps.family, min_max_maxps.path, min_max_maxps.source),
+    entry(min_max_minpd.family, min_max_minpd.path, min_max_minpd.source),
+    entry(min_max_minps.family, min_max_minps.path, min_max_minps.source),
     entry(set_monitor.family, set_monitor.path, set_monitor.source),
     entry(set_umonitor.family, set_umonitor.path, set_umonitor.source),
     entry(set_stac.family, set_stac.path, set_stac.source),
@@ -2442,7 +2454,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 819), tableCount());
+    try std.testing.expectEqual(@as(usize, 823), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

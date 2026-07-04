@@ -628,6 +628,10 @@ const min_max_pminub = @import("MIN-MAX/PMINUB.zig");
 const min_max_pminuw = @import("MIN-MAX/PMINUW.zig");
 const min_max_pminud = @import("MIN-MAX/PMINUD.zig");
 const min_max_pminuq = @import("MIN-MAX/PMINUQ.zig");
+const min_max_maxpd = @import("MIN-MAX/MAXPD.zig");
+const min_max_maxps = @import("MIN-MAX/MAXPS.zig");
+const min_max_minpd = @import("MIN-MAX/MINPD.zig");
+const min_max_minps = @import("MIN-MAX/MINPS.zig");
 const set_monitor = @import("SET/MONITOR.zig");
 const set_umonitor = @import("SET/UMONITOR.zig");
 const set_stac = @import("SET/STAC.zig");
@@ -1442,6 +1446,10 @@ pub const specs = blk: {
         spec(min_max_pminuw.meta),
         spec(min_max_pminud.meta),
         spec(min_max_pminuq.meta),
+        spec(min_max_maxpd.meta),
+        spec(min_max_maxps.meta),
+        spec(min_max_minpd.meta),
+        spec(min_max_minps.meta),
         spec(set_monitor.meta),
         spec(set_umonitor.meta),
         spec(set_stac.meta),
@@ -2268,6 +2276,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     min_max_pminuw.proof_report,
     min_max_pminud.proof_report,
     min_max_pminuq.proof_report,
+    min_max_maxpd.proof_report,
+    min_max_maxps.proof_report,
+    min_max_minpd.proof_report,
+    min_max_minps.proof_report,
     set_monitor.proof_report,
     set_umonitor.proof_report,
     set_stac.proof_report,
@@ -2534,7 +2546,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 601), tableCount());
+    try std.testing.expectEqual(@as(usize, 605), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
