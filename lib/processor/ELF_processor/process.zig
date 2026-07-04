@@ -9,6 +9,7 @@ const x64_decoder = @import("x64_decoder");
 const x64_interpreter = @import("x64_interpreter");
 const x64_linux_runtime = @import("x64_linux_runtime");
 const x64_syscalls = @import("x64_syscalls");
+const exit_diagnostics = @import("exit_diagnostics");
 
 const SYS_close = x64_syscalls.SYS_close;
 const SYS_creat = x64_syscalls.SYS_creat;
@@ -30,6 +31,17 @@ const MEM_SIZE: u64 = 64 * 1024 * 1024; // 64 MB total address space
 const MEM_BASE: u64 = 0x1000000;
 const SYNTHETIC_INIT_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF00;
 const SYNTHETIC_MAIN_RETURN: u64 = 0xFFFF_FFFF_FFFF_FF08;
+const TRACE_BUFFER_LEN: usize = 256;
+
+const ElfTraceEntry = struct {
+    rip: u64 = 0,
+    op: Op = .invalid,
+    len: u8 = 0,
+    rsp: u64 = 0,
+    rax: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+};
 
 // ─── Shared x64 execution types ───
 
@@ -48,11 +60,18 @@ pub const ElfState = struct {
     mem: []u8,
     mem_base: u64,
     mem_size: u64,
+    image_low: u64 = 0,
+    image_high: u64 = 0,
     regs: ElfRegs = .{},
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     terminated: bool = false,
     exit_code: u64 = 0,
     faulted: bool = false,
+    termination_reason: exit_diagnostics.TerminationReason = .unknown,
+    executed_steps: u64 = 0,
+    trace_entries: [TRACE_BUFFER_LEN]ElfTraceEntry = [_]ElfTraceEntry{.{}} ** TRACE_BUFFER_LEN,
+    trace_index: usize = 0,
+    trace_filled: bool = false,
     libc_start_main_trampolined: bool = false,
     dynamic_relocations: []const elf_loader.DynamicRelocation = &.{},
     local_symbols: []const elf_loader.Symbol = &.{},
@@ -157,6 +176,8 @@ pub const ElfState = struct {
     pub fn loadElf(self: *ElfState, elf_bytes: []const u8) !void {
         const plan = try elf_loader.planExecutableLoad(self.mem.len, elf_bytes, STACK_SIZE);
         self.mem_base = plan.mem_base;
+        self.image_low = plan.image_low;
+        self.image_high = plan.image_high;
         self.heap_next = plan.heap_start;
         self.regs.rip = try elf_loader.loadExecutableSegments(self.mem_base, self.mem, elf_bytes);
         log.info("load plan: guest_base=0x{x} image=[0x{x}, 0x{x}) heap=0x{x} entry=0x{x}", .{
@@ -232,6 +253,31 @@ pub const ElfState = struct {
         return null;
     }
 
+    fn nearestLocalSymbol(self: *const ElfState, address: u64) ?exit_diagnostics.SymbolizedAddress {
+        if (address < self.image_low or address >= self.image_high) return null;
+        var best: ?elf_loader.Symbol = null;
+        for (self.local_symbols) |symbol| {
+            if (symbol.value == 0 or symbol.value > address) continue;
+            if (best == null or symbol.value > best.?.value) best = symbol;
+        }
+        const symbol = best orelse return null;
+        return .{ .address = symbol.value, .symbol = symbol.name, .symbol_offset = address - symbol.value };
+    }
+
+    fn recordTrace(self: *ElfState, decoded: DecodedInsn) void {
+        self.trace_entries[self.trace_index] = .{
+            .rip = self.regs.rip,
+            .op = decoded.op,
+            .len = decoded.len,
+            .rsp = self.regs.rsp,
+            .rax = self.regs.rax,
+            .rcx = self.regs.rcx,
+            .rdx = self.regs.rdx,
+        };
+        self.trace_index = (self.trace_index + 1) % TRACE_BUFFER_LEN;
+        if (self.trace_index == 0) self.trace_filled = true;
+    }
+
     pub fn guestAlloc(self: *ElfState, requested_size: u64, requested_alignment: u64) ?u64 {
         const size = if (requested_size == 0) 1 else requested_size;
         if (size > std.math.maxInt(usize)) return null;
@@ -300,6 +346,9 @@ pub const ElfState = struct {
     fn step(self: *ElfState) bool {
         if (self.handleSyntheticRip()) return !self.terminated;
         const decoded = self.decodeAt() orelse {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = .decode_failed;
             self.terminated = true;
             return false;
         };
@@ -307,9 +356,11 @@ pub const ElfState = struct {
             log.err("invalid instruction at rip=0x{x}", .{self.regs.rip});
             self.faulted = true;
             self.exit_code = 127;
+            self.termination_reason = .invalid_instruction;
             self.terminated = true;
             return false;
         }
+        self.recordTrace(decoded);
         const trace_this = shouldTraceRip(self.regs.rip);
         if (trace_this) {
             log.info("trace before rip=0x{x} op={s} len={d} rax=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} rsp=0x{x} rbp=0x{x} flags=0x{x}", .{
@@ -347,6 +398,7 @@ pub const ElfState = struct {
         var steps: u64 = 0;
         const max_steps: u64 = 2_000_000;
         while (!self.terminated and steps < max_steps) : (steps += 1) {
+            self.executed_steps = steps;
             if (steps % 100000 == 0) {
                 log.info("step {d}: rip=0x{x}, rax=0x{x}, rbx=0x{x}, rcx=0x{x}, rsi=0x{x}, rdi=0x{x}", .{ steps, self.regs.rip, self.regs.rax, self.regs.rbx, self.regs.rcx, self.regs.rsi, self.regs.rdi });
             }
@@ -357,8 +409,81 @@ pub const ElfState = struct {
             self.logRegs();
             self.faulted = true;
             self.exit_code = 124;
+            self.termination_reason = .max_steps_reached;
             self.terminated = true;
         }
+        if (self.faulted) self.logExitDiagnostics();
+    }
+
+    fn logExitDiagnostics(self: *const ElfState) void {
+        var terminal = exit_diagnostics.TerminalInstruction{
+            .address = self.regs.rip,
+            .op = if (self.termination_reason == .invalid_instruction) "invalid" else "decode_failed",
+        };
+        if (self.addrToOffset(self.regs.rip)) |offset| {
+            terminal.byte_count = @intCast(@min(@as(usize, 16), self.mem.len - @as(usize, @intCast(offset))));
+            @memcpy(terminal.bytes[0..terminal.byte_count], self.mem[@intCast(offset)..][0..terminal.byte_count]);
+        }
+
+        var stack_entries: [16]exit_diagnostics.StackEntry = undefined;
+        var stack_count: usize = 0;
+        while (stack_count < stack_entries.len) : (stack_count += 1) {
+            const slot = self.regs.rsp +| @as(u64, @intCast(stack_count * 8));
+            if (self.addrToOffset(slot) == null) break;
+            const value = self.read64(slot);
+            stack_entries[stack_count] = .{ .slot_address = slot, .value = value };
+            if (self.nearestLocalSymbol(value)) |symbol| {
+                stack_entries[stack_count].symbol = symbol.symbol;
+                stack_entries[stack_count].symbol_offset = symbol.symbol_offset;
+            }
+        }
+
+        const trace_count = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        var trace: [TRACE_BUFFER_LEN]exit_diagnostics.TraceEntry = undefined;
+        for (0..trace_count) |index| {
+            const source_index = if (self.trace_filled) (self.trace_index + index) % TRACE_BUFFER_LEN else index;
+            const entry = self.trace_entries[source_index];
+            trace[index] = .{
+                .rip = entry.rip,
+                .op = @tagName(entry.op),
+                .len = entry.len,
+                .rsp = entry.rsp,
+                .rax = entry.rax,
+                .rcx = entry.rcx,
+                .rdx = entry.rdx,
+            };
+        }
+
+        exit_diagnostics.logExitReport(.{
+            .exit_code = self.exit_code,
+            .reason = self.termination_reason,
+            .faulted = self.faulted,
+            .rip = self.regs.rip,
+            .regs = .{
+                .rax = self.regs.rax,
+                .rbx = self.regs.rbx,
+                .rcx = self.regs.rcx,
+                .rdx = self.regs.rdx,
+                .rsi = self.regs.rsi,
+                .rdi = self.regs.rdi,
+                .rbp = self.regs.rbp,
+                .rsp = self.regs.rsp,
+                .r8 = self.regs.r8,
+                .r9 = self.regs.r9,
+                .r10 = self.regs.r10,
+                .r11 = self.regs.r11,
+                .r12 = self.regs.r12,
+                .r13 = self.regs.r13,
+                .r14 = self.regs.r14,
+                .r15 = self.regs.r15,
+            },
+            .last_instructions = trace[0..trace_count],
+            .terminal_instruction = terminal,
+            .stack_entries = stack_entries[0..stack_count],
+            .terminal_symbol = self.nearestLocalSymbol(self.regs.rip),
+            .runtime_context = .{ .phase = "elf_execution", .steps = self.executed_steps },
+            .detail = "Rosette stopped while executing an x86-64 ELF program.",
+        });
     }
 
     fn logRegs(self: *ElfState) void {
