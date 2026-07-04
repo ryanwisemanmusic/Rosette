@@ -46,6 +46,18 @@ const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
 const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
 const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
 const fix_up_vfixupimmss = @import("FIX_UP/VFIXUPIMMSS.zig");
+const full_permute_vpermI2b = @import("FULL_PERMUTE/VPERMI2B.zig");
+const full_permute_vpermI2d = @import("FULL_PERMUTE/VPERMI2D.zig");
+const full_permute_vpermI2pd = @import("FULL_PERMUTE/VPERMI2PD.zig");
+const full_permute_vpermI2ps = @import("FULL_PERMUTE/VPERMI2PS.zig");
+const full_permute_vpermI2q = @import("FULL_PERMUTE/VPERMI2Q.zig");
+const full_permute_vpermI2w = @import("FULL_PERMUTE/VPERMI2W.zig");
+const full_permute_vpermt2b = @import("FULL_PERMUTE/VPERMT2B.zig");
+const full_permute_vpermt2d = @import("FULL_PERMUTE/VPERMT2D.zig");
+const full_permute_vpermt2pd = @import("FULL_PERMUTE/VPERMT2PD.zig");
+const full_permute_vpermt2ps = @import("FULL_PERMUTE/VPERMT2PS.zig");
+const full_permute_vpermt2q = @import("FULL_PERMUTE/VPERMT2Q.zig");
+const full_permute_vpermt2w = @import("FULL_PERMUTE/VPERMT2W.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -1454,6 +1466,18 @@ pub const tables = [_]InstructionTable{
     entry(fix_up_vfixupimmps.family, fix_up_vfixupimmps.path, fix_up_vfixupimmps.source),
     entry(fix_up_vfixupimmsd.family, fix_up_vfixupimmsd.path, fix_up_vfixupimmsd.source),
     entry(fix_up_vfixupimmss.family, fix_up_vfixupimmss.path, fix_up_vfixupimmss.source),
+    entry(full_permute_vpermI2b.family, full_permute_vpermI2b.path, full_permute_vpermI2b.source),
+    entry(full_permute_vpermI2d.family, full_permute_vpermI2d.path, full_permute_vpermI2d.source),
+    entry(full_permute_vpermI2pd.family, full_permute_vpermI2pd.path, full_permute_vpermI2pd.source),
+    entry(full_permute_vpermI2ps.family, full_permute_vpermI2ps.path, full_permute_vpermI2ps.source),
+    entry(full_permute_vpermI2q.family, full_permute_vpermI2q.path, full_permute_vpermI2q.source),
+    entry(full_permute_vpermI2w.family, full_permute_vpermI2w.path, full_permute_vpermI2w.source),
+    entry(full_permute_vpermt2b.family, full_permute_vpermt2b.path, full_permute_vpermt2b.source),
+    entry(full_permute_vpermt2d.family, full_permute_vpermt2d.path, full_permute_vpermt2d.source),
+    entry(full_permute_vpermt2pd.family, full_permute_vpermt2pd.path, full_permute_vpermt2pd.source),
+    entry(full_permute_vpermt2ps.family, full_permute_vpermt2ps.path, full_permute_vpermt2ps.source),
+    entry(full_permute_vpermt2q.family, full_permute_vpermt2q.path, full_permute_vpermt2q.source),
+    entry(full_permute_vpermt2w.family, full_permute_vpermt2w.path, full_permute_vpermt2w.source),
     entry(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     entry(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
     entry(interrupt_int.family, interrupt_int.path, interrupt_int.source),
@@ -2348,7 +2372,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 628), tableCount());
+    try std.testing.expectEqual(@as(usize, 640), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
