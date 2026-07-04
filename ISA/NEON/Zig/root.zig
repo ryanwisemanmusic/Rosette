@@ -348,6 +348,10 @@ const loop_loope = @import("LOOP/LOOPE.zig");
 const loop_loopne = @import("LOOP/LOOPNE.zig");
 const loop_pause = @import("LOOP/PAUSE.zig");
 const memory_mfence = @import("MEMORY/MFENCE.zig");
+const mov_kmovw = @import("MOV/KMOVW.zig");
+const mov_kmovb = @import("MOV/KMOVB.zig");
+const mov_kmovq = @import("MOV/KMOVQ.zig");
+const mov_kmovd = @import("MOV/KMOVD.zig");
 const mov_mov = @import("MOV/MOV.zig");
 const mov_movapd = @import("MOV/MOVAPD.zig");
 const mov_movaps = @import("MOV/MOVAPS.zig");
@@ -388,6 +392,7 @@ const mov_movsxd = @import("MOV/MOVSXD.zig");
 const mov_movupd = @import("MOV/MOVUPD.zig");
 const mov_movups = @import("MOV/MOVUPS.zig");
 const mov_movzx = @import("MOV/MOVZX.zig");
+const mov_pmovmskb = @import("MOV/PMOVMSKB.zig");
 const mov_vmovapd = @import("MOV/VMOVAPD.zig");
 const mov_vmovaps = @import("MOV/VMOVAPS.zig");
 const mov_vmovd = @import("MOV/VMOVD.zig");
@@ -414,11 +419,13 @@ const mov_vmovntpd = @import("MOV/VMOVNTPD.zig");
 const mov_vmovntps = @import("MOV/VMOVNTPS.zig");
 const mov_vmovq = @import("MOV/VMOVQ.zig");
 const mov_vmovsd = @import("MOV/VMOVSD.zig");
+const mov_vmovsh = @import("MOV/VMOVSH.zig");
 const mov_vmovshdup = @import("MOV/VMOVSHDUP.zig");
 const mov_vmovsldup = @import("MOV/VMOVSLDUP.zig");
 const mov_vmovss = @import("MOV/VMOVSS.zig");
 const mov_vmovupd = @import("MOV/VMOVUPD.zig");
 const mov_vmovups = @import("MOV/VMOVUPS.zig");
+const mov_vmovw = @import("MOV/VMOVW.zig");
 const mul_imul = @import("MUL/IMUL.zig");
 const mul_mul = @import("MUL/MUL.zig");
 const mul_mulpd = @import("MUL/MULPD.zig");
@@ -1239,6 +1246,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(loop_loopne.family, loop_loopne.path, loop_loopne.source),
     mirror(loop_pause.family, loop_pause.path, loop_pause.source),
     mirror(memory_mfence.family, memory_mfence.path, memory_mfence.source),
+    mirror(mov_kmovw.family, mov_kmovw.path, mov_kmovw.source),
+    mirror(mov_kmovb.family, mov_kmovb.path, mov_kmovb.source),
+    mirror(mov_kmovq.family, mov_kmovq.path, mov_kmovq.source),
+    mirror(mov_kmovd.family, mov_kmovd.path, mov_kmovd.source),
     mirror(mov_mov.family, mov_mov.path, mov_mov.source),
     mirror(mov_movapd.family, mov_movapd.path, mov_movapd.source),
     mirror(mov_movaps.family, mov_movaps.path, mov_movaps.source),
@@ -1279,6 +1290,7 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(mov_movupd.family, mov_movupd.path, mov_movupd.source),
     mirror(mov_movups.family, mov_movups.path, mov_movups.source),
     mirror(mov_movzx.family, mov_movzx.path, mov_movzx.source),
+    mirror(mov_pmovmskb.family, mov_pmovmskb.path, mov_pmovmskb.source),
     mirror(mov_vmovapd.family, mov_vmovapd.path, mov_vmovapd.source),
     mirror(mov_vmovaps.family, mov_vmovaps.path, mov_vmovaps.source),
     mirror(mov_vmovd.family, mov_vmovd.path, mov_vmovd.source),
@@ -1305,11 +1317,13 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(mov_vmovntps.family, mov_vmovntps.path, mov_vmovntps.source),
     mirror(mov_vmovq.family, mov_vmovq.path, mov_vmovq.source),
     mirror(mov_vmovsd.family, mov_vmovsd.path, mov_vmovsd.source),
+    mirror(mov_vmovsh.family, mov_vmovsh.path, mov_vmovsh.source),
     mirror(mov_vmovshdup.family, mov_vmovshdup.path, mov_vmovshdup.source),
     mirror(mov_vmovsldup.family, mov_vmovsldup.path, mov_vmovsldup.source),
     mirror(mov_vmovss.family, mov_vmovss.path, mov_vmovss.source),
     mirror(mov_vmovupd.family, mov_vmovupd.path, mov_vmovupd.source),
     mirror(mov_vmovups.family, mov_vmovups.path, mov_vmovups.source),
+    mirror(mov_vmovw.family, mov_vmovw.path, mov_vmovw.source),
     mirror(mul_imul.family, mul_imul.path, mul_imul.source),
     mirror(mul_mul.family, mul_mul.path, mul_mul.source),
     mirror(mul_mulpd.family, mul_mulpd.path, mul_mulpd.source),
