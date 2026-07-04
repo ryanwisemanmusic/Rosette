@@ -38,6 +38,11 @@ const div_divps = @import("DIV/DIVPS.zig");
 const div_divsd = @import("DIV/DIVSD.zig");
 const div_divss = @import("DIV/DIVSS.zig");
 const div_idiv = @import("DIV/IDIV.zig");
+const div_fdiv = @import("DIV/fdiv.zig");
+const div_fdivp = @import("DIV/fdivp.zig");
+const div_fidiv = @import("DIV/fidiv.zig");
+const div_vdivph = @import("DIV/VDIVPH.zig");
+const div_vdivsh = @import("DIV/VDIVSH.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -894,6 +899,11 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(div_divsd.family, div_divsd.path, div_divsd.source),
     mirror(div_divss.family, div_divss.path, div_divss.source),
     mirror(div_idiv.family, div_idiv.path, div_idiv.source),
+    mirror(div_fdiv.family, div_fdiv.path, div_fdiv.source),
+    mirror(div_fdivp.family, div_fdivp.path, div_fdivp.source),
+    mirror(div_fidiv.family, div_fidiv.path, div_fidiv.source),
+    mirror(div_vdivph.family, div_vdivph.path, div_vdivph.source),
+    mirror(div_vdivsh.family, div_vdivsh.path, div_vdivsh.source),
     mirror(inc_dec_dec.family, inc_dec_dec.path, inc_dec_dec.source),
     mirror(inc_dec_inc.family, inc_dec_inc.path, inc_dec_inc.source),
     mirror(interrupt_int.family, interrupt_int.path, interrupt_int.source),

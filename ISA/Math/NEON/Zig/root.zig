@@ -40,6 +40,11 @@ const div_divps = @import("DIV/DIVPS.zig");
 const div_divsd = @import("DIV/DIVSD.zig");
 const div_divss = @import("DIV/DIVSS.zig");
 const div_idiv = @import("DIV/IDIV.zig");
+const div_fdiv = @import("DIV/fdiv.zig");
+const div_fdivp = @import("DIV/fdivp.zig");
+const div_fidiv = @import("DIV/fidiv.zig");
+const div_vdivph = @import("DIV/VDIVPH.zig");
+const div_vdivsh = @import("DIV/VDIVSH.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const interrupt_int = @import("INTERRUPT/INT.zig");
@@ -825,6 +830,11 @@ pub const specs = blk: {
         spec(div_divsd.meta),
         spec(div_divss.meta),
         spec(div_idiv.meta),
+        spec(div_fdiv.meta),
+        spec(div_fdivp.meta),
+        spec(div_fidiv.meta),
+        spec(div_vdivph.meta),
+        spec(div_vdivsh.meta),
         spec(inc_dec_dec.meta),
         spec(inc_dec_inc.meta),
         spec(interrupt_int.meta),
@@ -1610,6 +1620,11 @@ pub const proof_reports = [_]proofs.ProofReport{
     div_divsd.proof_report,
     div_divss.proof_report,
     div_idiv.proof_report,
+    div_fdiv.proof_report,
+    div_fdivp.proof_report,
+    div_fidiv.proof_report,
+    div_vdivph.proof_report,
+    div_vdivsh.proof_report,
     inc_dec_dec.proof_report,
     inc_dec_inc.proof_report,
     interrupt_int.proof_report,
