@@ -253,13 +253,21 @@ shell-clean-state: shell-helper-build
 # Outputs land in program/ tree at the project root.
 # ---------------------------------------------------------------------------
 .PHONY: app-wrapper
-app-wrapper: mscoree-native shell-helper-build bundled-app-exes
+app-wrapper: mscoree-native shell-helper-build
 	@mkdir -p program/app
 	@echo "Building Rosette.app bundle..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
 	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/bundling/build.zig 2>&1
+	@rm -rf \
+		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/app_testing" \
+		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/assets/exe_examples" \
+		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/include/assets/exe_examples"
 	@rm -rf program/app/Rosette.app
 	@cp -R app/bundling/zig-out/Rosette.app program/app/
+	@if find "program/app/Rosette.app" \( -type d -name app_testing -o -type d -name exe_examples \) -print -quit | grep -q .; then \
+		echo "error: source-only prodder content entered Rosette.app"; \
+		exit 1; \
+	fi
 	@rm -rf "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
 	@cp -R "$(MSCOREE_NATIVE_HELPER_APP)" "program/app/Rosette.app/Contents/MacOS/"
 	@cp "$(ELF_PROCESSOR_BIN)" "program/app/Rosette.app/Contents/MacOS/elf_processor"
@@ -285,7 +293,12 @@ installer: app-wrapper
 	@mkdir -p program/installer
 	@echo "Building Rosette Installer.app..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
+	@rm -rf "app/dmg/installer/zig-out/Rosette Installer.app"
 	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/dmg/installer/build.zig -Dpayload-app=program/app/Rosette.app 2>&1
+	@if find "app/dmg/installer/zig-out/Rosette Installer.app" \( -type d -name app_testing -o -type d -name exe_examples \) -print -quit | grep -q .; then \
+		echo "error: source-only prodder content entered Rosette Installer.app"; \
+		exit 1; \
+	fi
 	@echo "Signing Rosette Installer.app..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/installer/zig-out/Rosette Installer.app/Contents/MacOS/rosette-install-helper"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/installer/zig-out/Rosette Installer.app/Contents/MacOS/rosette-installer"

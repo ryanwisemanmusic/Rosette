@@ -2,6 +2,7 @@ const std = @import("std");
 const fmt = @import("pe_format.zig");
 const parser = @import("pe_parser.zig");
 const pkg = @import("rosette_package.zig");
+const launch_config = @import("launch_config.zig");
 const trace = @import("mandatory_trace.zig");
 const x86_disasm = @import("x86_disasm");
 const x86_asm = @import("x86_asm");
@@ -17,6 +18,7 @@ const image_scn_mem_execute: u32 = 0x2000_0000;
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn system(command: [*:0]const u8) c_int;
+extern fn chdir(path: [*:0]const u8) c_int;
 
 fn machineName(machine: u16) []const u8 {
     return switch (machine) {
@@ -52,6 +54,17 @@ fn setEnvValue(allocator: std.mem.Allocator, name: [*:0]const u8, value: []const
 
 fn setEnvLiteral(name: [*:0]const u8, value: [*:0]const u8) !void {
     if (setenv(name, value, 1) != 0) return error.SetEnvironmentFailed;
+}
+
+fn currentWorkingDirectory(allocator: std.mem.Allocator) ![]const u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&buffer, buffer.len) orelse return error.WorkingDirectoryUnavailable;
+    return allocator.dupe(u8, std.mem.sliceTo(cwd_ptr, 0));
+}
+
+fn changeWorkingDirectory(allocator: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    if (chdir(path_z.ptr) != 0) return error.WorkingDirectoryUnavailable;
 }
 
 fn prepareNativeMscoreeEnvironment(
@@ -527,7 +540,34 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
         return;
     }
 
+    const profile = try launch_config.resolve(allocator, init.io, exe_path, image.machine, image.subsystem);
+    try setEnvValue(allocator, "ROSETTE_EXE_PATH", profile.executable_path);
+    try setEnvValue(allocator, "ROSETTE_EXE_CWD", profile.working_directory);
+    try setEnvValue(allocator, "ROSETTE_EXE_CONFIG_SOURCE", @tagName(profile.source));
+
+    var profile_buf: [std.fs.max_path_bytes * 2 + 256]u8 = undefined;
+    const profile_note = try std.fmt.bufPrint(
+        &profile_buf,
+        "launch_config = {s}\nconfig_path = {s}\nworking_directory = {s}\narchitecture = {s}\nui_mode = {s}\n",
+        .{
+            @tagName(profile.source),
+            profile.config_path orelse "<synthesized; no CFG required>",
+            profile.working_directory,
+            @tagName(profile.architecture),
+            @tagName(profile.ui_mode),
+        },
+    );
+    trace.logText(profile_note);
+    std.debug.print(
+        "  launch config: {s}\n  working directory: {s}\n  architecture: {s}\n  UI mode: {s}\n",
+        .{ @tagName(profile.source), profile.working_directory, @tagName(profile.architecture), @tagName(profile.ui_mode) },
+    );
+
     if (launch_allowed) {
+        const previous_cwd = try currentWorkingDirectory(allocator);
+        try changeWorkingDirectory(allocator, profile.working_directory);
+        defer changeWorkingDirectory(allocator, previous_cwd) catch {};
+
         bootLog("7_import_exec_engine: loading x86 emulation modules");
         const exec_engine = x86_asm.execution_engine;
         const win32 = x86_asm.win32_thunks;
@@ -590,7 +630,7 @@ pub fn run(init: std.process.Init, exe_path: []const u8, log_path: [:0]const u8,
             trace.logText("managed_gui = true\n");
         }
         bootLog("15_mscoree_env: setting CLR environment variables");
-        try prepareNativeMscoreeEnvironment(allocator, exe_path, log_path, managed_gui);
+        try prepareNativeMscoreeEnvironment(allocator, profile.executable_path, log_path, managed_gui);
 
         if (managed_gui) {
             bootLog("15b_managed_gui_helper: launching mscoree window helper");

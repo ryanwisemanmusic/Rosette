@@ -484,17 +484,6 @@ pub fn build(b: *std.Build) void {
         .{ .source = "../../lib/Assemblers", .destination = "Assemblers" },
         .{ .source = "../../lib/processor/ELF_processor", .destination = "ELF_processor" },
         .{ .source = "../../ISA", .destination = "ISA" },
-        .{ .source = "../../app_testing/basic_snake", .destination = "app_testing/basic_snake" },
-        .{ .source = "../../app_testing/Console-Tetris", .destination = "app_testing/Console-Tetris" },
-        .{ .source = "../../app_testing/minesweeper", .destination = "app_testing/minesweeper" },
-        .{ .source = "../../app_testing/PACMAN-x86", .destination = "app_testing/PACMAN-x86" },
-        .{ .source = "../../app_testing/Rocket-Shooting", .destination = "app_testing/Rocket-Shooting" },
-        .{ .source = "../../app_testing/snax86_windowed", .destination = "app_testing/snax86_windowed" },
-        .{ .source = "../../app_testing/snax86", .destination = "app_testing/snax86" },
-        .{ .source = "../../app_testing/tetrisx86_win32_windowed", .destination = "app_testing/tetrisx86_win32_windowed" },
-        .{ .source = "../../app_testing/tetrisx86_win32", .destination = "app_testing/tetrisx86_win32" },
-        .{ .source = "../../app_testing/tetrisx86_windowed", .destination = "app_testing/tetrisx86_windowed" },
-        .{ .source = "../../app_testing/tetrisx86", .destination = "app_testing/tetrisx86" },
         .{ .source = "../../include/assets", .destination = "assets" },
         .{ .source = "../../lib/processor/bat_processor", .destination = "bat_processor" },
         .{ .source = "../../include", .destination = "include" },
@@ -550,7 +539,6 @@ pub fn build(b: *std.Build) void {
         \\  Assemblers
         \\  ELF_processor
         \\  ISA
-        \\  app_testing (excl. Text-Wrangler, xenia)
         \\  assets
         \\  bat_processor
         \\  include
@@ -571,21 +559,11 @@ pub fn build(b: *std.Build) void {
         \\  src/tooling/exe_parser/rosette_app_exe.zig
         \\  src/tooling/exe_parser/rosette_exe_runner.zig
         \\  src/compat/rosetta2
-        \\  app_testing/basic_snake
-        \\  app_testing/Console-Tetris
-        \\  app_testing/minesweeper
-        \\  app_testing/PACMAN-x86
-        \\  app_testing/Rocket-Shooting
-        \\  app_testing/snax86
-        \\  app_testing/snax86_windowed
-        \\  app_testing/tetrisx86
-        \\  app_testing/tetrisx86_windowed
-        \\  app_testing/tetrisx86_win32
-        \\  app_testing/tetrisx86_win32_windowed
         \\permanent blacklist:
         \\  .rosette
-        \\  app_testing/Text-Wrangler
-        \\  app_testing/xenia
+        \\  app_testing
+        \\  assets/exe_examples
+        \\  include/assets/exe_examples
         \\  docs
         \\
     );
