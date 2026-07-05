@@ -739,6 +739,10 @@ const pxor_pxor = @import("PXOR/PXOR.zig");
 const pxor_vpxor = @import("PXOR/VPXOR.zig");
 const pxor_vpxord = @import("PXOR/VPXORD.zig");
 const pxor_vpxorq = @import("PXOR/VPXORQ.zig");
+const range_vrangepd = @import("RANGE/VRANGEPD.zig");
+const range_vrangeps = @import("RANGE/VRANGEPS.zig");
+const range_vrangesd = @import("RANGE/VRANGESD.zig");
+const range_vrangess = @import("RANGE/VRANGESS.zig");
 const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
 const reset_hreset = @import("RESET/HRESET.zig");
 const resume_rsm = @import("RESUME/RSM.zig");
@@ -1643,6 +1647,10 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(pxor_vpxor.family, pxor_vpxor.path, pxor_vpxor.source),
     mirror(pxor_vpxord.family, pxor_vpxord.path, pxor_vpxord.source),
     mirror(pxor_vpxorq.family, pxor_vpxorq.path, pxor_vpxorq.source),
+    mirror(range_vrangepd.family, range_vrangepd.path, range_vrangepd.source),
+    mirror(range_vrangeps.family, range_vrangeps.path, range_vrangeps.source),
+    mirror(range_vrangesd.family, range_vrangesd.path, range_vrangesd.source),
+    mirror(range_vrangess.family, range_vrangess.path, range_vrangess.source),
     mirror(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
     mirror(reset_hreset.family, reset_hreset.path, reset_hreset.source),
     mirror(resume_rsm.family, resume_rsm.path, resume_rsm.source),
