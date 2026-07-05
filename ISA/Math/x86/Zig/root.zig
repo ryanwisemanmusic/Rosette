@@ -742,6 +742,16 @@ const range_vrangepd = @import("RANGE/VRANGEPD.zig");
 const range_vrangeps = @import("RANGE/VRANGEPS.zig");
 const range_vrangesd = @import("RANGE/VRANGESD.zig");
 const range_vrangess = @import("RANGE/VRANGESS.zig");
+const read_rdfsbase = @import("READ/RDFSBASE.zig");
+const read_rdgsbase = @import("READ/RDGSBASE.zig");
+const read_rdmsr = @import("READ/RDMSR.zig");
+const read_rdpid = @import("READ/RDPID.zig");
+const read_rdpkru = @import("READ/RDPKRU.zig");
+const read_rdpmc = @import("READ/RDPMC.zig");
+const read_rdrand = @import("READ/RDRAND.zig");
+const read_rdseed = @import("READ/RDSEED.zig");
+const read_rdtsc = @import("READ/RDTSC.zig");
+const read_rdtscp = @import("READ/RDTSCP.zig");
 const release_tilerelease = @import("RELEASE/tilerelease.zig");
 const reset_hreset = @import("RESET/hreset.zig");
 const resume_rsm = @import("RESUME/rsm.zig");
@@ -1577,6 +1587,16 @@ pub const specs = blk: {
         spec(range_vrangeps.meta),
         spec(range_vrangesd.meta),
         spec(range_vrangess.meta),
+        spec(read_rdfsbase.meta),
+        spec(read_rdgsbase.meta),
+        spec(read_rdmsr.meta),
+        spec(read_rdpid.meta),
+        spec(read_rdpkru.meta),
+        spec(read_rdpmc.meta),
+        spec(read_rdrand.meta),
+        spec(read_rdseed.meta),
+        spec(read_rdtsc.meta),
+        spec(read_rdtscp.meta),
         spec(release_tilerelease.meta),
         spec(reset_hreset.meta),
         spec(resume_rsm.meta),
@@ -2424,6 +2444,16 @@ pub const proof_reports = [_]proofs.ProofReport{
     range_vrangeps.proof_report,
     range_vrangesd.proof_report,
     range_vrangess.proof_report,
+    read_rdfsbase.proof_report,
+    read_rdgsbase.proof_report,
+    read_rdmsr.proof_report,
+    read_rdpid.proof_report,
+    read_rdpkru.proof_report,
+    read_rdpmc.proof_report,
+    read_rdrand.proof_report,
+    read_rdseed.proof_report,
+    read_rdtsc.proof_report,
+    read_rdtscp.proof_report,
     release_tilerelease.proof_report,
     reset_hreset.proof_report,
     resume_rsm.proof_report,
@@ -2597,7 +2627,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 622), tableCount());
+    try std.testing.expectEqual(@as(usize, 632), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();

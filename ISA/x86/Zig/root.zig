@@ -742,6 +742,16 @@ const range_vrangepd = @import("RANGE/VRANGEPD.zig");
 const range_vrangeps = @import("RANGE/VRANGEPS.zig");
 const range_vrangesd = @import("RANGE/VRANGESD.zig");
 const range_vrangess = @import("RANGE/VRANGESS.zig");
+const read_rdfsbase = @import("READ/RDFSBASE.zig");
+const read_rdgsbase = @import("READ/RDGSBASE.zig");
+const read_rdmsr = @import("READ/RDMSR.zig");
+const read_rdpid = @import("READ/RDPID.zig");
+const read_rdpkru = @import("READ/RDPKRU.zig");
+const read_rdpmc = @import("READ/RDPMC.zig");
+const read_rdrand = @import("READ/RDRAND.zig");
+const read_rdseed = @import("READ/RDSEED.zig");
+const read_rdtsc = @import("READ/RDTSC.zig");
+const read_rdtscp = @import("READ/RDTSCP.zig");
 const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
 const reset_hreset = @import("RESET/HRESET.zig");
 const resume_rsm = @import("RESUME/RSM.zig");
@@ -1426,6 +1436,16 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VRANGEPS",
     "VRANGESD",
     "VRANGESS",
+    "RDFSBASE",
+    "RDGSBASE",
+    "RDMSR",
+    "RDPID",
+    "RDPKRU",
+    "RDPMC",
+    "RDRAND",
+    "RDSEED",
+    "RDTSC",
+    "RDTSCP",
     "INSERTPS",
     "PINSRB",
     "PINSRD",
@@ -2234,6 +2254,16 @@ pub const tables = [_]InstructionTable{
     entry(range_vrangeps.family, range_vrangeps.path, range_vrangeps.source),
     entry(range_vrangesd.family, range_vrangesd.path, range_vrangesd.source),
     entry(range_vrangess.family, range_vrangess.path, range_vrangess.source),
+    entry(read_rdfsbase.family, read_rdfsbase.path, read_rdfsbase.source),
+    entry(read_rdgsbase.family, read_rdgsbase.path, read_rdgsbase.source),
+    entry(read_rdmsr.family, read_rdmsr.path, read_rdmsr.source),
+    entry(read_rdpid.family, read_rdpid.path, read_rdpid.source),
+    entry(read_rdpkru.family, read_rdpkru.path, read_rdpkru.source),
+    entry(read_rdpmc.family, read_rdpmc.path, read_rdpmc.source),
+    entry(read_rdrand.family, read_rdrand.path, read_rdrand.source),
+    entry(read_rdseed.family, read_rdseed.path, read_rdseed.source),
+    entry(read_rdtsc.family, read_rdtsc.path, read_rdtsc.source),
+    entry(read_rdtscp.family, read_rdtscp.path, read_rdtscp.source),
     entry(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
     entry(reset_hreset.family, reset_hreset.path, reset_hreset.source),
     entry(resume_rsm.family, resume_rsm.path, resume_rsm.source),
@@ -2505,7 +2535,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 840), tableCount());
+    try std.testing.expectEqual(@as(usize, 850), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
