@@ -14,6 +14,7 @@ const exit_diagnostics = @import("exit_diagnostics");
 const SYS_close = x64_syscalls.SYS_close;
 const SYS_creat = x64_syscalls.SYS_creat;
 const SYS_exit = x64_syscalls.SYS_exit;
+const SYS_arch_prctl = x64_syscalls.SYS_arch_prctl;
 const SYS_gettid = x64_syscalls.SYS_gettid;
 const SYS_open = x64_syscalls.SYS_open;
 const SYS_read = x64_syscalls.SYS_read;
@@ -164,11 +165,13 @@ pub const ElfState = struct {
 
     pub fn push(self: *ElfState, val: u64) void {
         self.regs.rsp -|= 8;
-        self.write64(self.regs.rsp, val);
+        const address = self.regs.rsp +% x64_decoder.segmentBase(&self.regs, .ss, .long64);
+        self.write64(address, val);
     }
 
     pub fn pop(self: *ElfState) u64 {
-        const val = self.read64(self.regs.rsp);
+        const address = self.regs.rsp +% x64_decoder.segmentBase(&self.regs, .ss, .long64);
+        const val = self.read64(address);
         self.regs.rsp +|= 8;
         return val;
     }
@@ -307,39 +310,40 @@ pub const ElfState = struct {
     }
 
     fn sibAddr(self: *const ElfState, d: *DecodedInsn) void {
-        if (!d.sib_has_index) return;
-        const scale: u3 = @as(u3, d.sib_scale);
-        const index_val = self.regVal(d.sib_index_reg, .bits64);
-        d.addr +%= index_val << @as(u6, scale);
+        d.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+            .displacement = d.addr,
+            .has_index = d.sib_has_index,
+            .index_reg = d.sib_index_reg,
+            .scale = d.sib_scale,
+            .has_base = d.sib_has_base,
+            .base_reg = d.sib_base_reg,
+            .rip_relative = d.rip_relative,
+            .segment = d.segment,
+        }, self.regs.rip +% d.len, .bits64, .long64, true);
     }
 
     fn decodeAt(self: *ElfState) ?DecodedInsn {
-        const off = self.addrToOffset(self.regs.rip) orelse return null;
+        const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
+        const off = self.addrToOffset(fetch_address) orelse return null;
         const remaining = self.mem.len - off;
         if (remaining == 0) return null;
         const bytes = self.mem[off..];
         var d = decodeInsn(bytes);
-        // Detect address-size override (0x67) prefix in the raw instruction
-        for (bytes[0..@min(@as(usize, @intCast(d.len)), bytes.len)]) |b| {
-            if (b == 0x67) {
-                d.has_0x67 = true;
-                break;
-            }
-            if (b != 0x66 and b != 0x2E and b != 0x64 and b != 0xF0 and !hasRexPrefix(b)) break;
-        }
+        const prefixes = x64_decoder.decodeLegacyPrefixes(bytes);
+        d.has_0x67 = prefixes.address_size_override;
         const addr_size: Size = if (d.has_0x67) .bits32 else .bits64;
-        if (d.sib_has_index) {
-            const scale: u3 = @as(u3, d.sib_scale);
-            const index_val = self.regVal(d.sib_index_reg, addr_size);
-            d.addr +%= index_val << @as(u6, scale);
-        }
-        if (d.sib_has_base) {
-            const base_val = self.regVal(d.sib_base_reg, addr_size);
-            d.addr +%= base_val;
-        }
-        if (d.rip_relative) {
-            d.addr +%= self.regs.rip + d.len;
-        }
+        const base: ?RegId = if (d.sib_has_base) d.sib_base_reg else null;
+        d.segment = x64_decoder.selectSegment(.explicit_data, base, prefixes.segment_override);
+        d.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+            .displacement = d.addr,
+            .has_index = d.sib_has_index,
+            .index_reg = d.sib_index_reg,
+            .scale = d.sib_scale,
+            .has_base = d.sib_has_base,
+            .base_reg = d.sib_base_reg,
+            .rip_relative = d.rip_relative,
+            .segment = d.segment,
+        }, self.regs.rip +% d.len, addr_size, .long64, d.op != .lea_reg_mem);
         return d;
     }
 
@@ -353,7 +357,12 @@ pub const ElfState = struct {
             return false;
         };
         if (decoded.op == .invalid) {
-            log.err("invalid instruction at rip=0x{x}", .{self.regs.rip});
+            const available: []const u8 = if (self.addrToOffset(self.regs.rip)) |off|
+                if (off < self.mem.len) self.mem[@intCast(off)..] else &[_]u8{}
+            else
+                &[_]u8{};
+            const opcode_bytes = available[0..@min(available.len, 16)];
+            log.err("invalid instruction at rip=0x{x}, bytes={any}", .{ self.regs.rip, opcode_bytes });
             self.faulted = true;
             self.exit_code = 127;
             self.termination_reason = .invalid_instruction;
@@ -506,6 +515,14 @@ pub const ElfState = struct {
 
     fn setReg(self: *ElfState, id: RegId, size: Size, val: u64) void {
         x64_decoder.setReg(&self.regs, id, size, val);
+    }
+
+    fn decodedRegVal(self: *const ElfState, id: RegId, high8: bool, size: Size) u64 {
+        return x64_decoder.registerOperandValue(&self.regs, .{ .id = id, .high8 = high8 }, size);
+    }
+
+    fn setDecodedReg(self: *ElfState, id: RegId, high8: bool, size: Size, val: u64) void {
+        x64_decoder.setRegisterOperand(&self.regs, .{ .id = id, .high8 = high8 }, size, val);
     }
 
     fn readMemVal(self: *ElfState, addr: u64, size: Size) u64 {
@@ -946,7 +963,7 @@ pub const ElfState = struct {
             // ── mov reg, mem ──
             .mov_reg8_mem8 => {
                 const val = self.readMemVal(d.addr, .bits8);
-                self.setReg(d.dst_reg, .bits8, val);
+                self.setDecodedReg(d.dst_reg, d.dst_high8, .bits8, val);
             },
             .mov_reg16_mem16 => {
                 const val = self.readMemVal(d.addr, .bits16);
@@ -963,7 +980,7 @@ pub const ElfState = struct {
 
             // ── mov mem, reg ──
             .mov_mem8_reg8 => {
-                const val = self.regVal(d.src_reg, .bits8);
+                const val = self.decodedRegVal(d.src_reg, d.src_high8, .bits8);
                 self.writeMemVal(d.addr, .bits8, val);
             },
             .mov_mem16_reg16 => {
@@ -981,11 +998,16 @@ pub const ElfState = struct {
 
             // ── mov reg, imm ──
             .mov_reg_imm => {
-                self.setReg(d.dst_reg, d.size, d.imm);
+                self.setDecodedReg(d.dst_reg, d.dst_high8, d.size, d.imm);
             },
 
             .lods => {
-                const src_addr = self.regs.rsi;
+                const address_size: Size = if (d.has_0x67) .bits32 else .bits64;
+                const src_addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+                    .has_base = true,
+                    .base_reg = .dh_si_esi_rsi,
+                    .segment = d.segment,
+                }, 0, address_size, .long64, true);
                 switch (d.size) {
                     .bits8 => self.setReg(.al_ax_eax_rax, .bits8, self.readMemVal(src_addr, .bits8)),
                     .bits16 => self.setReg(.al_ax_eax_rax, .bits16, self.readMemVal(src_addr, .bits16)),
@@ -998,11 +1020,12 @@ pub const ElfState = struct {
                     .bits32 => 4,
                     .bits64 => 8,
                 };
-                if ((self.regs.rflags & RFL_DF) != 0) {
-                    self.regs.rsi -|= stride;
-                } else {
-                    self.regs.rsi +|= stride;
-                }
+                const old_index = self.regVal(.dh_si_esi_rsi, address_size);
+                const new_index = if ((self.regs.rflags & RFL_DF) != 0)
+                    old_index -% stride
+                else
+                    old_index +% stride;
+                self.setReg(.dh_si_esi_rsi, address_size, new_index);
             },
 
             // ── mov mem, imm ──
@@ -1021,8 +1044,8 @@ pub const ElfState = struct {
 
             // ── mov reg64, reg64 ──
             .mov_reg8_reg8 => {
-                const val = self.regVal(d.src_reg, .bits8);
-                self.setReg(d.dst_reg, .bits8, val);
+                const val = self.decodedRegVal(d.src_reg, d.src_high8, .bits8);
+                self.setDecodedReg(d.dst_reg, d.dst_high8, .bits8, val);
             },
             .mov_reg16_reg16 => {
                 const val = self.regVal(d.src_reg, .bits16);
@@ -2200,6 +2223,9 @@ pub const ElfState = struct {
             SYS_creat => {
                 self.handleCreatSyscall();
             },
+            SYS_arch_prctl => {
+                self.handleArchPrctlSyscall();
+            },
             SYS_gettid => {
                 self.regs.rax = 1;
                 self.traceSyscall("gettid() -> {d}", .{self.regs.rax});
@@ -2219,6 +2245,34 @@ pub const ElfState = struct {
         const rest = self.mem[off_usize..];
         const len = std.mem.indexOfScalar(u8, rest, 0) orelse return null;
         return rest[0..len];
+    }
+
+    fn handleArchPrctlSyscall(self: *ElfState) void {
+        const ARCH_SET_GS: u64 = 0x1001;
+        const ARCH_SET_FS: u64 = 0x1002;
+        const ARCH_GET_FS: u64 = 0x1003;
+        const ARCH_GET_GS: u64 = 0x1004;
+        const code = self.regs.rdi;
+        const address = self.regs.rsi;
+        self.regs.rax = switch (code) {
+            ARCH_SET_FS => blk: {
+                self.regs.segments.fs.base = address;
+                break :blk 0;
+            },
+            ARCH_SET_GS => blk: {
+                self.regs.segments.gs.base = address;
+                break :blk 0;
+            },
+            ARCH_GET_FS, ARCH_GET_GS => blk: {
+                const off = self.addrToOffset(address) orelse break :blk x64_syscalls.errnoValue(.bad_address);
+                if (off + 8 > self.mem.len) break :blk x64_syscalls.errnoValue(.bad_address);
+                const base = if (code == ARCH_GET_FS) self.regs.segments.fs.base else self.regs.segments.gs.base;
+                self.write64(address, base);
+                break :blk 0;
+            },
+            else => x64_syscalls.errnoValue(.invalid_argument),
+        };
+        self.traceSyscall("arch_prctl(code=0x{x}, address=0x{x}) -> {d}", .{ code, address, syscallResult(self.regs.rax) });
     }
 
     fn handleOpenSyscall(self: *ElfState) void {
@@ -2394,20 +2448,12 @@ fn parseEnvU64(text: []const u8) ?u64 {
 
 // ─── Decoder ───
 
-fn hasRexPrefix(byte: u8) bool {
-    return byte & 0xF0 == 0x40;
-}
-
 fn rexW(rex: u8) bool {
     return rex & 0x08 != 0;
 }
 
 fn rexR(rex: u8) bool {
     return rex & 0x04 != 0;
-}
-
-fn rexX(rex: u8) bool {
-    return rex & 0x02 != 0;
 }
 
 fn rexB(rex: u8) bool {
@@ -2442,11 +2488,6 @@ fn shuffleBytes(source: [16]u8, mask: [16]u8) [16]u8 {
         if (selector & 0x80 == 0) result[index] = source[selector & 0x0F];
     }
     return result;
-}
-
-fn signExtendDisp32(raw: u32) u64 {
-    const signed: i32 = @bitCast(raw);
-    return @as(u64, @bitCast(@as(i64, signed)));
 }
 
 fn testImmForSize(imm: u64, size: Size) u64 {
@@ -2485,130 +2526,29 @@ const MemRef = struct {
 };
 
 fn parseModRmMemory(bytes: []const u8, pos: *usize, mod: u3, rm: u8, rex: u8) ?MemRef {
-    if (rm == 4) return parseSib(bytes, pos, mod, rex);
-
-    var addr: u64 = 0;
-    var has_base = true;
-    var rip_relative = false;
-    if (mod == 0 and rm == 5) {
-        if (pos.* + 4 > bytes.len) return null;
-        const disp = std.mem.readInt(i32, bytes[pos.*..][0..4], .little);
-        addr = @as(u64, @bitCast(@as(i64, disp)));
-        pos.* += 4;
-        has_base = false;
-        rip_relative = true;
-    } else if (mod == 1) {
-        if (pos.* + 1 > bytes.len) return null;
-        addr = @as(u64, @bitCast(@as(i64, std.mem.readInt(i8, bytes[pos.*..][0..1], .little))));
-        pos.* += 1;
-    } else if (mod == 2) {
-        if (pos.* + 4 > bytes.len) return null;
-        addr = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
-        pos.* += 4;
-    }
-
+    const memory = x64_decoder.decodeMemoryOperand(bytes, pos, @truncate(mod), @truncate(rm), .{
+        .rex = rex,
+        .has_rex = rex != 0,
+    }) orelse return null;
     return .{
-        .addr = addr,
-        .sib_has_index = false,
-        .sib_index_reg = .al_ax_eax_rax,
-        .sib_scale = 0,
-        .sib_has_base = has_base,
-        .sib_base_reg = modRmRm(rm, rex),
-        .rip_relative = rip_relative,
-    };
-}
-
-fn parseSib(bytes: []const u8, pos: *usize, mod: u3, rex: u8) ?MemRef {
-    if (pos.* >= bytes.len) return null;
-    const sib_byte = bytes[pos.*];
-    pos.* += 1;
-    const base = sib_byte & 7;
-    const index = (sib_byte >> 3) & 7;
-    const scale: u2 = @as(u2, @truncate(sib_byte >> 6));
-
-    // Absolute disp32: mod=00, base=5, index=4
-    if (mod == 0 and base == 5 and index == 4) {
-        if (pos.* + 4 > bytes.len) return null;
-        const addr = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
-        pos.* += 4;
-        return .{
-            .addr = addr,
-            .sib_has_index = false,
-            .sib_index_reg = .al_ax_eax_rax,
-            .sib_scale = 0,
-            .sib_has_base = false,
-            .sib_base_reg = .al_ax_eax_rax,
-            .rip_relative = false,
-        };
-    }
-
-    // SIB with register components — read displacement
-    var addr: u64 = 0;
-    if (mod == 0 and base == 5) {
-        // [index*scale + disp32], no base register
-        if (pos.* + 4 > bytes.len) return null;
-        addr = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
-        pos.* += 4;
-    } else if (mod == 1) {
-        if (pos.* + 1 > bytes.len) return null;
-        addr = @as(u64, @bitCast(@as(i64, std.mem.readInt(i8, bytes[pos.*..][0..1], .little))));
-        pos.* += 1;
-    } else if (mod == 2) {
-        if (pos.* + 4 > bytes.len) return null;
-        addr = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
-        pos.* += 4;
-    }
-
-    return .{
-        .addr = addr,
-        .sib_has_index = (index != 4),
-        .sib_index_reg = regId(index, rexX(rex)),
-        .sib_scale = scale,
-        .sib_has_base = !(mod == 0 and base == 5),
-        .sib_base_reg = modRmRm(base, rex),
-        .rip_relative = false,
+        .addr = memory.displacement,
+        .sib_has_index = memory.has_index,
+        .sib_index_reg = memory.index_reg,
+        .sib_scale = memory.scale,
+        .sib_has_base = memory.has_base,
+        .sib_base_reg = memory.base_reg,
+        .rip_relative = memory.rip_relative,
     };
 }
 
 fn decodeInsn(bytes: []const u8) DecodedInsn {
     if (bytes.len == 0) return .{};
 
-    var pos: usize = 0;
-    var rex: u8 = 0;
-    var has_66: bool = false;
-    var has_0x67: bool = false;
-    var has_f3: bool = false;
-
-    // Parse prefixes
-    while (pos < bytes.len and pos < 15) {
-        const b = bytes[pos];
-        if (b == 0x66) {
-            has_66 = true;
-            pos += 1;
-        } else if (b == 0x67) {
-            has_0x67 = true;
-            pos += 1;
-        } else if (b == 0x2E) {
-            // CS segment override, used in long NOP encodings.
-            pos += 1;
-        } else if (b == 0x64) {
-            // FS segment override. The emulator currently maps the low TLS canary
-            // slot as zero, which is enough for compiler-generated stack checks.
-            pos += 1;
-        } else if (b == 0xF0) {
-            // LOCK prefix. The ELF runner is single-threaded, so accept it and
-            // let the memory operation execute normally.
-            pos += 1;
-        } else if (b == 0xF3) {
-            has_f3 = true;
-            pos += 1;
-        } else if (hasRexPrefix(b)) {
-            rex = b;
-            pos += 1;
-        } else {
-            break;
-        }
-    }
+    const prefixes = x64_decoder.decodeLegacyPrefixes(bytes);
+    var pos = prefixes.len;
+    const rex = prefixes.rex;
+    const has_66 = prefixes.operand_size_override;
+    const has_f3 = prefixes.repeat == .rep;
 
     if (pos >= bytes.len) return .{};
 
@@ -3375,77 +3315,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             };
         },
 
-        0x88, 0x89 => {
-            // MOV r/m, r  (88=byte, 89=dword/qword)
-            if (pos >= bytes.len) return .{};
-            const modrm = bytes[pos];
-            pos += 1;
-            const mod_v = modrm >> 6;
-            const reg = (modrm >> 3) & 7;
-            const rm = modrm & 7;
-            const w = opcode & 1;
-
-            const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
-            const src_reg = modRmReg(reg, rex);
-
-            if (mod_v == 3) {
-                const dst_reg = modRmRm(rm, rex);
-                return switch (size) {
-                    .bits8 => DecodedInsn{ .op = .mov_reg8_reg8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                    .bits16 => DecodedInsn{ .op = .mov_reg16_reg16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                    .bits32 => DecodedInsn{ .op = .mov_reg32_reg32, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                    .bits64 => DecodedInsn{ .op = .mov_reg64_reg64, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                };
-            }
-
-            if (mod_v != 3) {
-                const sib_info = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-                return switch (size) {
-                    .bits8 => DecodedInsn{ .op = .mov_mem8_reg8, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                    .bits16 => DecodedInsn{ .op = .mov_mem16_reg16, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                    .bits32 => DecodedInsn{ .op = .mov_mem32_reg32, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                    .bits64 => DecodedInsn{ .op = .mov_mem64_reg64, .size = size, .src_reg = src_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                };
-            }
-
-            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-        },
-
-        0x8A, 0x8B => {
-            // MOV r, r/m  (8A=byte, 8B=dword/qword)
-            if (pos >= bytes.len) return .{};
-            const modrm = bytes[pos];
-            pos += 1;
-            const mod_v = modrm >> 6;
-            const reg = (modrm >> 3) & 7;
-            const rm = modrm & 7;
-            const w = opcode & 1;
-
-            const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else if (w == 1) .bits32 else .bits8;
-            const dst_reg = modRmReg(reg, rex);
-
-            if (mod_v == 3) {
-                const src_reg = modRmRm(rm, rex);
-                return switch (size) {
-                    .bits8 => DecodedInsn{ .op = .mov_reg8_mem8, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                    .bits16 => DecodedInsn{ .op = .mov_reg16_mem16, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                    .bits32 => DecodedInsn{ .op = .mov_reg32_mem32, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                    .bits64 => DecodedInsn{ .op = .mov_reg64_mem64, .size = size, .dst_reg = dst_reg, .src_reg = src_reg, .len = @intCast(pos) },
-                };
-            }
-
-            if (mod_v != 3) {
-                const sib_info = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-                return switch (size) {
-                    .bits8 => DecodedInsn{ .op = .mov_reg8_mem8, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                    .bits16 => DecodedInsn{ .op = .mov_reg16_mem16, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                    .bits32 => DecodedInsn{ .op = .mov_reg32_mem32, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                    .bits64 => DecodedInsn{ .op = .mov_reg64_mem64, .size = size, .dst_reg = dst_reg, .addr = sib_info.addr, .sib_has_index = sib_info.sib_has_index, .sib_index_reg = sib_info.sib_index_reg, .sib_scale = sib_info.sib_scale, .sib_has_base = sib_info.sib_has_base, .sib_base_reg = sib_info.sib_base_reg, .rip_relative = sib_info.rip_relative, .len = @intCast(pos) },
-                };
-            }
-
-            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-        },
+        0x88...0x8B, 0xA0...0xA3 => return x64_decoder.decodeLegacyMov(bytes, &pos, prefixes, opcode) orelse .{ .len = @intCast(pos) },
 
         0x8D => {
             // LEA r, m
@@ -3524,110 +3394,7 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             return DecodedInsn{ .op = .test_reg8_imm8, .size = .bits8, .dst_reg = .al_ax_eax_rax, .imm = imm, .len = @intCast(pos) };
         },
 
-        0xB0...0xB7 => {
-            // MOV r8, imm8
-            const reg = regId(opcode - 0xB0, rexB(rex));
-            if (pos >= bytes.len) return .{};
-            const imm = bytes[pos];
-            pos += 1;
-            return DecodedInsn{ .op = .mov_reg_imm, .size = .bits8, .dst_reg = reg, .imm = imm, .len = @intCast(pos) };
-        },
-
-        0xB8...0xBF => {
-            // MOV r, imm32 (with REX.W: imm32 sign-extended)
-            const reg_bits = opcode - 0xB8;
-            const reg = regId(reg_bits, rexB(rex));
-            if (has_66) {
-                if (pos + 2 > bytes.len) return .{};
-                const imm = std.mem.readInt(u16, bytes[pos..][0..2], .little);
-                pos += 2;
-                return DecodedInsn{ .op = .mov_reg_imm, .size = .bits16, .dst_reg = reg, .imm = imm, .len = @intCast(pos) };
-            } else if (rex_w) {
-                if (pos + 8 > bytes.len) return .{};
-                const imm = std.mem.readInt(u64, bytes[pos..][0..8], .little);
-                pos += 8;
-                return DecodedInsn{ .op = .mov_reg_imm, .size = .bits64, .dst_reg = reg, .imm = imm, .len = @intCast(pos) };
-            } else {
-                if (pos + 4 > bytes.len) return .{};
-                const imm = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                pos += 4;
-                return DecodedInsn{ .op = .mov_reg_imm, .size = .bits32, .dst_reg = reg, .imm = imm, .len = @intCast(pos) };
-            }
-        },
-
-        0xC6 => {
-            // MOV r/m8, imm8 (Group 11, /0)
-            if (pos >= bytes.len) return .{};
-            const modrm = bytes[pos];
-            pos += 1;
-            const mod_v = modrm >> 6;
-            const reg_field = (modrm >> 3) & 7;
-            const rm = modrm & 7;
-            if (reg_field != 0) return .{};
-            if (pos >= bytes.len) return .{};
-            if (mod_v == 3) {
-                const imm = bytes[pos];
-                pos += 1;
-                return DecodedInsn{ .op = .mov_reg_imm, .size = .bits8, .dst_reg = modRmRm(rm, rex), .imm = imm, .len = @intCast(pos) };
-            }
-            const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-            if (pos >= bytes.len) return .{};
-            const imm = bytes[pos];
-            pos += 1;
-            return DecodedInsn{ .op = .mov_mem8_imm8, .size = .bits8, .addr = mem.addr, .imm = imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) };
-        },
-
-        0xC7 => {
-            // MOV r/m, imm32 (Group 11, /0)
-            if (pos >= bytes.len) return .{};
-            const modrm = bytes[pos];
-            pos += 1;
-            const mod_v = modrm >> 6;
-            const reg_field = (modrm >> 3) & 7;
-            const rm = modrm & 7;
-
-            if (reg_field != 0) return .{};
-
-            const size: Size = if (has_66) .bits16 else if (rex_w) .bits64 else .bits32;
-
-            if (mod_v == 3) {
-                // MOV reg, imm32
-                if (pos + 4 > bytes.len) return .{};
-                const imm = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-                pos += 4;
-                return DecodedInsn{
-                    .op = .mov_reg_imm,
-                    .size = size,
-                    .dst_reg = modRmRm(rm, rex),
-                    .imm = if (size == .bits64) @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(imm))))) else imm,
-                    .len = @intCast(pos),
-                };
-            }
-
-            // Memory form
-            if (mod_v != 3) {
-                const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-                const imm_len: usize = if (size == .bits16) 2 else 4;
-                if (pos + imm_len > bytes.len) return .{};
-                const imm = if (size == .bits16)
-                    @as(u64, std.mem.readInt(u16, bytes[pos..][0..2], .little))
-                else
-                    @as(u64, std.mem.readInt(u32, bytes[pos..][0..4], .little));
-                pos += imm_len;
-                const stored_imm = if (size == .bits64)
-                    @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(imm)))))))
-                else
-                    imm;
-                return switch (size) {
-                    .bits16 => DecodedInsn{ .op = .mov_mem16_imm16, .size = size, .addr = mem.addr, .imm = stored_imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
-                    .bits32 => DecodedInsn{ .op = .mov_mem32_imm32, .size = size, .addr = mem.addr, .imm = stored_imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
-                    .bits64 => DecodedInsn{ .op = .mov_mem64_imm32, .size = size, .addr = mem.addr, .imm = stored_imm, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
-                    else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
-                };
-            }
-
-            return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
-        },
+        0xB0...0xBF, 0xC6, 0xC7 => return x64_decoder.decodeLegacyMov(bytes, &pos, prefixes, opcode) orelse .{ .len = @intCast(pos) },
 
         0xC3 => {
             // RET near
@@ -4869,6 +4636,98 @@ test "mul byte [mem] and check result" {
     state.execute(decoded);
     // 34 * 19 = 646 = 0x286
     try testing.expectEqual(@as(u64, 0x286), state.regs.rax & 0xFFFF);
+}
+
+test "CS218 AST03 base-12 digit sequence decodes and executes" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+
+    state.regs.rdx = '9';
+    state.regs.rbx = 0;
+
+    const copy_digit = decodeInsn(&[_]u8{ 0x88, 0xD3 }); // mov bl, dl
+    try testing.expectEqual(Op.mov_reg8_reg8, copy_digit.op);
+    state.execute(copy_digit);
+
+    const normalize_digit = decodeInsn(&[_]u8{ 0x80, 0xEB, 0x30 }); // sub bl, '0'
+    try testing.expectEqual(Op.sub_reg8_imm8, normalize_digit.op);
+    state.execute(normalize_digit);
+
+    try testing.expectEqual(@as(u64, 9), state.regs.rbx);
+}
+
+test "shared MOV layer executes reverse direction and legacy high bytes" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+
+    state.regs.rdx = 0x5A;
+    const reverse = decodeInsn(&[_]u8{ 0x8A, 0xDA }); // mov bl, dl
+    try testing.expectEqual(Op.mov_reg8_reg8, reverse.op);
+    state.execute(reverse);
+    try testing.expectEqual(@as(u64, 0x5A), state.regs.rbx);
+
+    state.regs.rax = 0x1234;
+    const high_immediate = decodeInsn(&[_]u8{ 0xB4, 0xAB }); // mov ah, 0xab
+    try testing.expect(high_immediate.dst_high8);
+    state.execute(high_immediate);
+    try testing.expectEqual(@as(u64, 0xAB34), state.regs.rax);
+
+    state.regs.rsp = 0xFF00;
+    const rex_low_immediate = decodeInsn(&[_]u8{ 0x40, 0xB4, 0x7C }); // mov spl, 0x7c
+    try testing.expect(!rex_low_immediate.dst_high8);
+    state.execute(rex_low_immediate);
+    try testing.expectEqual(@as(u64, 0xFF7C), state.regs.rsp);
+}
+
+test "FS override participates in decoded long-mode memory addresses" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+
+    state.regs.rip = MEM_BASE + 0x1000;
+    state.regs.rax = 0x200;
+    state.regs.segments.fs.base = MEM_BASE;
+    state.write8(state.regs.rip, 0x64);
+    state.write8(state.regs.rip + 1, 0x8A);
+    state.write8(state.regs.rip + 2, 0x00); // mov al, fs:[rax]
+    state.write8(MEM_BASE + 0x200, 0x7A);
+
+    const decoded = state.decodeAt() orelse return error.ExpectedInstruction;
+    try testing.expectEqual(x64_decoder.Segment.fs, decoded.segment);
+    try testing.expectEqual(@as(u64, MEM_BASE + 0x200), decoded.addr);
+    state.execute(decoded);
+    try testing.expectEqual(@as(u64, 0x27A), state.regs.rax);
+}
+
+test "arch_prctl sets and reads architectural FS and GS bases" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+
+    state.invokeLinuxSyscall(SYS_arch_prctl, 0x1002, MEM_BASE + 0x5000, 0, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try testing.expectEqual(@as(u64, MEM_BASE + 0x5000), state.regs.segments.fs.base);
+
+    const output = MEM_BASE + 0x80;
+    state.invokeLinuxSyscall(SYS_arch_prctl, 0x1003, output, 0, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try testing.expectEqual(@as(u64, MEM_BASE + 0x5000), state.read64(output));
+    try testing.expect(!state.terminated);
+    try testing.expect(!state.faulted);
+}
+
+test "CS218 file input syscall 2 is handled without terminating the guest" {
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+
+    const path_addr = MEM_BASE;
+    const missing_path = "rosette-cs218-file-that-does-not-exist.txt\x00";
+    const path_off: usize = @intCast(path_addr - state.mem_base);
+    @memcpy(state.mem[path_off..][0..missing_path.len], missing_path);
+
+    state.invokeLinuxSyscall(SYS_open, path_addr, 0, 0, 0, 0, 0);
+
+    try testing.expect(!state.terminated);
+    try testing.expect(!state.faulted);
+    try testing.expectEqual(x64_syscalls.errnoValue(.no_entry), state.regs.rax);
 }
 
 test "cmp reg32 imm8 treats negative 32-bit values as signed negative" {

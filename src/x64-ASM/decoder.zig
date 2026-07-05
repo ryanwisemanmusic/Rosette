@@ -10,11 +10,251 @@ pub const OperandSize = flags.OperandSize;
 pub const Condition = flags.Condition;
 pub const RegId = cpu_state.RegId;
 pub const Regs = cpu_state.Regs;
+pub const Segment = cpu_state.Segment;
+pub const SegmentState = cpu_state.SegmentState;
+
+pub const ExecutionMode = enum {
+    long64,
+    compatibility,
+    protected,
+};
+
+pub const MemoryReferenceKind = enum {
+    instruction_fetch,
+    stack,
+    explicit_data,
+    string_source,
+    string_destination,
+};
 
 pub const RFL_CF = flags.RFL_CF;
 pub const RFL_ZF = flags.RFL_ZF;
 pub const RFL_SF = flags.RFL_SF;
 pub const RFL_OF = flags.RFL_OF;
+
+/// Prefix state shared by every legacy x86-64 instruction family. Keeping
+/// this in the decoder prevents each opcode handler from growing its own
+/// subtly different prefix loop.
+pub const LegacyPrefixes = struct {
+    len: usize = 0,
+    rex: u8 = 0,
+    has_rex: bool = false,
+    operand_size_override: bool = false,
+    address_size_override: bool = false,
+    lock: bool = false,
+    repeat: enum { none, repne, rep } = .none,
+    segment_override: ?Segment = null,
+
+    pub fn rexW(self: LegacyPrefixes) bool {
+        return self.rex & 0x08 != 0;
+    }
+
+    pub fn rexR(self: LegacyPrefixes) bool {
+        return self.rex & 0x04 != 0;
+    }
+
+    pub fn rexX(self: LegacyPrefixes) bool {
+        return self.rex & 0x02 != 0;
+    }
+
+    pub fn rexB(self: LegacyPrefixes) bool {
+        return self.rex & 0x01 != 0;
+    }
+};
+
+pub fn decodeLegacyPrefixes(bytes: []const u8) LegacyPrefixes {
+    var result = LegacyPrefixes{};
+    while (result.len < bytes.len and result.len < 15) {
+        const byte = bytes[result.len];
+        switch (byte) {
+            0x66 => result.operand_size_override = true,
+            0x67 => result.address_size_override = true,
+            0xF0 => result.lock = true,
+            0xF2 => result.repeat = .repne,
+            0xF3 => result.repeat = .rep,
+            0x26 => result.segment_override = .es,
+            0x2E => result.segment_override = .cs,
+            0x36 => result.segment_override = .ss,
+            0x3E => result.segment_override = .ds,
+            0x64 => result.segment_override = .fs,
+            0x65 => result.segment_override = .gs,
+            0x40...0x4F => {
+                result.rex = byte;
+                result.has_rex = true;
+            },
+            else => break,
+        }
+        result.len += 1;
+    }
+    return result;
+}
+
+pub const RegisterOperand = struct {
+    id: RegId,
+    high8: bool = false,
+};
+
+pub const MemoryOperand = struct {
+    displacement: u64 = 0,
+    has_index: bool = false,
+    index_reg: RegId = .al_ax_eax_rax,
+    scale: u2 = 0,
+    has_base: bool = false,
+    base_reg: RegId = .al_ax_eax_rax,
+    rip_relative: bool = false,
+    segment: Segment = .ds,
+};
+
+pub const RmOperand = union(enum) {
+    register: RegisterOperand,
+    memory: MemoryOperand,
+};
+
+pub const DecodedModRm = struct {
+    reg: RegisterOperand,
+    rm: RmOperand,
+    group: u3,
+};
+
+fn registerId(code: u8, extended: bool) RegId {
+    const value: u4 = @as(u4, @truncate(code)) | if (extended) @as(u4, 8) else @as(u4, 0);
+    return @enumFromInt(value);
+}
+
+/// Decodes the otherwise ambiguous 8-bit register codes 4...7. Without a
+/// REX prefix they name AH/CH/DH/BH; with any REX prefix they name
+/// SPL/BPL/SIL/DIL. The old decoder discarded this distinction.
+pub fn decodeRegister(code: u8, extended: bool, byte_operand: bool, has_rex: bool) RegisterOperand {
+    if (byte_operand and !has_rex and !extended and code >= 4 and code <= 7) {
+        return .{ .id = registerId(code - 4, false), .high8 = true };
+    }
+    return .{ .id = registerId(code, extended) };
+}
+
+fn signExtendDisp32(raw: u32) u64 {
+    const signed: i32 = @bitCast(raw);
+    return @bitCast(@as(i64, signed));
+}
+
+pub fn defaultSegment(reference_kind: MemoryReferenceKind, base: ?RegId) Segment {
+    return switch (reference_kind) {
+        .instruction_fetch => .cs,
+        .stack => .ss,
+        .string_destination => .es,
+        .string_source => .ds,
+        .explicit_data => if (base == .ah_sp_esp_rsp or base == .ch_bp_ebp_rbp) .ss else .ds,
+    };
+}
+
+pub fn selectSegment(reference_kind: MemoryReferenceKind, base: ?RegId, override: ?Segment) Segment {
+    return switch (reference_kind) {
+        .instruction_fetch, .stack, .string_destination => defaultSegment(reference_kind, base),
+        .explicit_data, .string_source => override orelse defaultSegment(reference_kind, base),
+    };
+}
+
+pub fn segmentBase(regs: *const Regs, segment: Segment, mode: ExecutionMode) u64 {
+    if (mode == .long64 and segment != .fs and segment != .gs) return 0;
+    return regs.segments.get(segment).base;
+}
+
+pub fn resolveMemoryAddress(regs: *const Regs, memory: MemoryOperand, instruction_end: u64, address_size: OperandSize, mode: ExecutionMode, apply_segment: bool) u64 {
+    std.debug.assert(address_size == .bits32 or address_size == .bits64);
+    const offset: u64 = if (address_size == .bits32) blk: {
+        var value: u32 = @truncate(memory.displacement);
+        if (memory.has_index) {
+            const index: u32 = @truncate(regVal(regs, memory.index_reg, .bits32));
+            value +%= index << @as(u5, memory.scale);
+        }
+        if (memory.has_base) value +%= @truncate(regVal(regs, memory.base_reg, .bits32));
+        if (memory.rip_relative) value +%= @truncate(instruction_end);
+        break :blk value;
+    } else blk: {
+        var value = memory.displacement;
+        if (memory.has_index) value +%= regVal(regs, memory.index_reg, .bits64) << @as(u6, memory.scale);
+        if (memory.has_base) value +%= regVal(regs, memory.base_reg, .bits64);
+        if (memory.rip_relative) value +%= instruction_end;
+        break :blk value;
+    };
+    return offset +% if (apply_segment) segmentBase(regs, memory.segment, mode) else 0;
+}
+
+fn applyDefaultSegment(memory: *MemoryOperand, prefixes: LegacyPrefixes) void {
+    const base: ?RegId = if (memory.has_base) memory.base_reg else null;
+    memory.segment = selectSegment(.explicit_data, base, prefixes.segment_override);
+}
+
+pub fn decodeMemoryOperand(bytes: []const u8, pos: *usize, mode: u2, rm: u3, prefixes: LegacyPrefixes) ?MemoryOperand {
+    if (rm != 4) {
+        var result = MemoryOperand{
+            .has_base = true,
+            .base_reg = registerId(rm, prefixes.rexB()),
+        };
+        if (mode == 0 and rm == 5) {
+            if (pos.* + 4 > bytes.len) return null;
+            result.displacement = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
+            result.has_base = false;
+            result.rip_relative = true;
+            pos.* += 4;
+        } else if (mode == 1) {
+            if (pos.* >= bytes.len) return null;
+            result.displacement = @bitCast(@as(i64, @as(i8, @bitCast(bytes[pos.*]))));
+            pos.* += 1;
+        } else if (mode == 2) {
+            if (pos.* + 4 > bytes.len) return null;
+            result.displacement = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
+            pos.* += 4;
+        }
+        applyDefaultSegment(&result, prefixes);
+        return result;
+    }
+
+    if (pos.* >= bytes.len) return null;
+    const sib = bytes[pos.*];
+    pos.* += 1;
+    const base: u3 = @truncate(sib);
+    const index: u3 = @truncate(sib >> 3);
+    var result = MemoryOperand{
+        .has_index = index != 4 or prefixes.rexX(),
+        .index_reg = registerId(index, prefixes.rexX()),
+        .scale = @truncate(sib >> 6),
+        .has_base = !(mode == 0 and base == 5),
+        .base_reg = registerId(base, prefixes.rexB()),
+    };
+    if (mode == 0 and base == 5) {
+        if (pos.* + 4 > bytes.len) return null;
+        result.displacement = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
+        pos.* += 4;
+    } else if (mode == 1) {
+        if (pos.* >= bytes.len) return null;
+        result.displacement = @bitCast(@as(i64, @as(i8, @bitCast(bytes[pos.*]))));
+        pos.* += 1;
+    } else if (mode == 2) {
+        if (pos.* + 4 > bytes.len) return null;
+        result.displacement = signExtendDisp32(std.mem.readInt(u32, bytes[pos.*..][0..4], .little));
+        pos.* += 4;
+    }
+    applyDefaultSegment(&result, prefixes);
+    return result;
+}
+
+/// Universally decodes the ModR/M byte and any following SIB/displacement.
+/// Instruction handlers consume this structure instead of reimplementing
+/// addressing rules for every mnemonic.
+pub fn decodeModRm(bytes: []const u8, pos: *usize, prefixes: LegacyPrefixes, byte_operand: bool) ?DecodedModRm {
+    if (pos.* >= bytes.len) return null;
+    const modrm = bytes[pos.*];
+    pos.* += 1;
+    const mode: u2 = @truncate(modrm >> 6);
+    const reg_code: u3 = @truncate(modrm >> 3);
+    const rm_code: u3 = @truncate(modrm);
+    const reg = decodeRegister(reg_code, prefixes.rexR(), byte_operand, prefixes.has_rex);
+    const rm: RmOperand = if (mode == 3)
+        .{ .register = decodeRegister(rm_code, prefixes.rexB(), byte_operand, prefixes.has_rex) }
+    else
+        .{ .memory = decodeMemoryOperand(bytes, pos, mode, rm_code, prefixes) orelse return null };
+    return .{ .reg = reg, .rm = rm, .group = reg_code };
+}
 
 pub const applySub = flags.applySub;
 pub const applySbb = flags.applySbb;
@@ -640,6 +880,8 @@ pub const DecodedInsn = struct {
     dst_size: OperandSize = .bits32,
     dst_reg: RegId = .al_ax_eax_rax,
     src_reg: RegId = .al_ax_eax_rax,
+    dst_high8: bool = false,
+    src_high8: bool = false,
     addr: u64 = 0,
     imm: u64 = 0,
     len: u8 = 0,
@@ -649,6 +891,7 @@ pub const DecodedInsn = struct {
     sib_has_base: bool = false,
     sib_base_reg: RegId = .al_ax_eax_rax,
     rip_relative: bool = false,
+    segment: Segment = .ds,
     has_0x67: bool = false,
     is_reg_form: bool = false,
     cond: Condition = .e,
@@ -658,6 +901,365 @@ pub const DecodedInsn = struct {
     vector_256: bool = false,
 };
 
+pub fn registerOperandValue(regs: *const Regs, operand: RegisterOperand, size: OperandSize) u64 {
+    if (!operand.high8) return regVal(regs, operand.id, size);
+    std.debug.assert(size == .bits8);
+    return (regVal(regs, operand.id, .bits16) >> 8) & 0xFF;
+}
+
+pub fn setRegisterOperand(regs: *Regs, operand: RegisterOperand, size: OperandSize, value: u64) void {
+    if (!operand.high8) {
+        setReg(regs, operand.id, size, value);
+        return;
+    }
+    std.debug.assert(size == .bits8);
+    const old = regVal(regs, operand.id, .bits16);
+    setReg(regs, operand.id, .bits16, (old & 0x00FF) | ((value & 0xFF) << 8));
+}
+
+fn operandSizeForW(prefixes: LegacyPrefixes, byte_form: bool) OperandSize {
+    if (byte_form) return .bits8;
+    if (prefixes.operand_size_override) return .bits16;
+    if (prefixes.rexW()) return .bits64;
+    return .bits32;
+}
+
+fn setMemory(decoded: *DecodedInsn, memory: MemoryOperand) void {
+    decoded.addr = memory.displacement;
+    decoded.sib_has_index = memory.has_index;
+    decoded.sib_index_reg = memory.index_reg;
+    decoded.sib_scale = memory.scale;
+    decoded.sib_has_base = memory.has_base;
+    decoded.sib_base_reg = memory.base_reg;
+    decoded.rip_relative = memory.rip_relative;
+    decoded.segment = memory.segment;
+}
+
+fn movRegRegOp(size: OperandSize) Op {
+    return switch (size) {
+        .bits8 => .mov_reg8_reg8,
+        .bits16 => .mov_reg16_reg16,
+        .bits32 => .mov_reg32_reg32,
+        .bits64 => .mov_reg64_reg64,
+    };
+}
+
+fn movRegMemOp(size: OperandSize) Op {
+    return switch (size) {
+        .bits8 => .mov_reg8_mem8,
+        .bits16 => .mov_reg16_mem16,
+        .bits32 => .mov_reg32_mem32,
+        .bits64 => .mov_reg64_mem64,
+    };
+}
+
+fn movMemRegOp(size: OperandSize) Op {
+    return switch (size) {
+        .bits8 => .mov_mem8_reg8,
+        .bits16 => .mov_mem16_reg16,
+        .bits32 => .mov_mem32_reg32,
+        .bits64 => .mov_mem64_reg64,
+    };
+}
+
+fn movMemImmOp(size: OperandSize) Op {
+    return switch (size) {
+        .bits8 => .mov_mem8_imm8,
+        .bits16 => .mov_mem16_imm16,
+        .bits32 => .mov_mem32_imm32,
+        .bits64 => .mov_mem64_imm32,
+    };
+}
+
+fn readUnsignedImmediate(bytes: []const u8, pos: *usize, byte_count: usize) ?u64 {
+    if (pos.* + byte_count > bytes.len) return null;
+    const value: u64 = switch (byte_count) {
+        1 => bytes[pos.*],
+        2 => std.mem.readInt(u16, bytes[pos.*..][0..2], .little),
+        4 => std.mem.readInt(u32, bytes[pos.*..][0..4], .little),
+        8 => std.mem.readInt(u64, bytes[pos.*..][0..8], .little),
+        else => unreachable,
+    };
+    pos.* += byte_count;
+    return value;
+}
+
+/// Decodes every legacy general-purpose MOV encoding that is valid in long
+/// mode: ModR/M register/memory forms, opcode-embedded immediates, Group 11
+/// immediates, and moffs accumulator forms. All forms share the same prefix,
+/// register, SIB, and displacement machinery above.
+pub fn decodeLegacyMov(bytes: []const u8, pos: *usize, prefixes: LegacyPrefixes, opcode: u8) ?DecodedInsn {
+    switch (opcode) {
+        0x88...0x8B => {
+            const size = operandSizeForW(prefixes, opcode & 1 == 0);
+            const operands = decodeModRm(bytes, pos, prefixes, size == .bits8) orelse return null;
+            const load = opcode & 2 != 0;
+            var decoded = DecodedInsn{
+                .size = size,
+                .len = @intCast(pos.*),
+                .has_0x67 = prefixes.address_size_override,
+            };
+            switch (operands.rm) {
+                .register => |rm_reg| {
+                    decoded.op = movRegRegOp(size);
+                    const dst = if (load) operands.reg else rm_reg;
+                    const src = if (load) rm_reg else operands.reg;
+                    decoded.dst_reg = dst.id;
+                    decoded.dst_high8 = dst.high8;
+                    decoded.src_reg = src.id;
+                    decoded.src_high8 = src.high8;
+                    decoded.is_reg_form = true;
+                },
+                .memory => |memory| {
+                    decoded.op = if (load) movRegMemOp(size) else movMemRegOp(size);
+                    if (load) {
+                        decoded.dst_reg = operands.reg.id;
+                        decoded.dst_high8 = operands.reg.high8;
+                    } else {
+                        decoded.src_reg = operands.reg.id;
+                        decoded.src_high8 = operands.reg.high8;
+                    }
+                    setMemory(&decoded, memory);
+                },
+            }
+            return decoded;
+        },
+        0xA0...0xA3 => {
+            const load = opcode < 0xA2;
+            const size = operandSizeForW(prefixes, opcode & 1 == 0);
+            const address_bytes: usize = if (prefixes.address_size_override) 4 else 8;
+            const address = readUnsignedImmediate(bytes, pos, address_bytes) orelse return null;
+            return .{
+                .op = if (load) movRegMemOp(size) else movMemRegOp(size),
+                .size = size,
+                .dst_reg = .al_ax_eax_rax,
+                .src_reg = .al_ax_eax_rax,
+                .addr = address,
+                .len = @intCast(pos.*),
+                .has_0x67 = prefixes.address_size_override,
+            };
+        },
+        0xB0...0xB7 => {
+            const register = decodeRegister(opcode - 0xB0, prefixes.rexB(), true, prefixes.has_rex);
+            const immediate = readUnsignedImmediate(bytes, pos, 1) orelse return null;
+            return .{
+                .op = .mov_reg_imm,
+                .size = .bits8,
+                .dst_reg = register.id,
+                .dst_high8 = register.high8,
+                .imm = immediate,
+                .len = @intCast(pos.*),
+                .has_0x67 = prefixes.address_size_override,
+            };
+        },
+        0xB8...0xBF => {
+            const size = operandSizeForW(prefixes, false);
+            const register = decodeRegister(opcode - 0xB8, prefixes.rexB(), false, prefixes.has_rex);
+            const immediate_bytes: usize = switch (size) {
+                .bits16 => 2,
+                .bits32 => 4,
+                .bits64 => 8,
+                .bits8 => unreachable,
+            };
+            const immediate = readUnsignedImmediate(bytes, pos, immediate_bytes) orelse return null;
+            return .{
+                .op = .mov_reg_imm,
+                .size = size,
+                .dst_reg = register.id,
+                .imm = immediate,
+                .len = @intCast(pos.*),
+                .has_0x67 = prefixes.address_size_override,
+            };
+        },
+        0xC6, 0xC7 => {
+            const size = operandSizeForW(prefixes, opcode == 0xC6);
+            const operands = decodeModRm(bytes, pos, prefixes, size == .bits8) orelse return null;
+            if (operands.group != 0) return null;
+            const immediate_bytes: usize = switch (size) {
+                .bits8 => 1,
+                .bits16 => 2,
+                .bits32, .bits64 => 4,
+            };
+            var immediate = readUnsignedImmediate(bytes, pos, immediate_bytes) orelse return null;
+            if (size == .bits64) immediate = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(immediate))))));
+            var decoded = DecodedInsn{
+                .size = size,
+                .imm = immediate,
+                .len = @intCast(pos.*),
+                .has_0x67 = prefixes.address_size_override,
+            };
+            switch (operands.rm) {
+                .register => |register| {
+                    decoded.op = .mov_reg_imm;
+                    decoded.dst_reg = register.id;
+                    decoded.dst_high8 = register.high8;
+                    decoded.is_reg_form = true;
+                },
+                .memory => |memory| {
+                    decoded.op = movMemImmOp(size);
+                    setMemory(&decoded, memory);
+                },
+            }
+            return decoded;
+        },
+        else => return null,
+    }
+}
+
 test "shared CRC32C accumulator follows x86 byte order" {
     try std.testing.expectEqual(@as(u32, 0x93AD_1061), crc32cAccumulator(0, 'a', .bits8));
+}
+
+fn decodeMovForTest(bytes: []const u8) ?DecodedInsn {
+    const prefixes = decodeLegacyPrefixes(bytes);
+    if (prefixes.len >= bytes.len) return null;
+    var pos = prefixes.len;
+    const opcode = bytes[pos];
+    pos += 1;
+    return decodeLegacyMov(bytes, &pos, prefixes, opcode);
+}
+
+test "shared legacy prefix decoder normalizes prefix classes" {
+    const prefixes = decodeLegacyPrefixes(&[_]u8{ 0xF0, 0x2E, 0x66, 0x67, 0xF3, 0x4D, 0x89, 0xC8 });
+    try std.testing.expectEqual(@as(usize, 6), prefixes.len);
+    try std.testing.expect(prefixes.lock);
+    try std.testing.expectEqual(@as(?Segment, .cs), prefixes.segment_override);
+    try std.testing.expect(prefixes.operand_size_override);
+    try std.testing.expect(prefixes.address_size_override);
+    try std.testing.expectEqual(@as(@TypeOf(prefixes.repeat), .rep), prefixes.repeat);
+    try std.testing.expect(prefixes.rexW());
+    try std.testing.expect(prefixes.rexR());
+    try std.testing.expect(prefixes.rexB());
+}
+
+test "shared MOV decoder covers width direction and extended registers" {
+    const Case = struct {
+        bytes: []const u8,
+        op: Op,
+        size: OperandSize,
+        dst: RegId,
+        src: RegId,
+    };
+    const cases = [_]Case{
+        .{ .bytes = &.{ 0x88, 0xD3 }, .op = .mov_reg8_reg8, .size = .bits8, .dst = .bl_bx_ebx_rbx, .src = .dl_dx_edx_rdx },
+        .{ .bytes = &.{ 0x8A, 0xDA }, .op = .mov_reg8_reg8, .size = .bits8, .dst = .bl_bx_ebx_rbx, .src = .dl_dx_edx_rdx },
+        .{ .bytes = &.{ 0x66, 0x89, 0xD8 }, .op = .mov_reg16_reg16, .size = .bits16, .dst = .al_ax_eax_rax, .src = .bl_bx_ebx_rbx },
+        .{ .bytes = &.{ 0x89, 0xD8 }, .op = .mov_reg32_reg32, .size = .bits32, .dst = .al_ax_eax_rax, .src = .bl_bx_ebx_rbx },
+        .{ .bytes = &.{ 0x48, 0x89, 0xD8 }, .op = .mov_reg64_reg64, .size = .bits64, .dst = .al_ax_eax_rax, .src = .bl_bx_ebx_rbx },
+        .{ .bytes = &.{ 0x4D, 0x89, 0xC8 }, .op = .mov_reg64_reg64, .size = .bits64, .dst = .r8b_r8w_r8d_r8, .src = .r9b_r9w_r9d_r9 },
+    };
+    for (cases) |case| {
+        const decoded = decodeMovForTest(case.bytes) orelse return error.ExpectedMov;
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(case.size, decoded.size);
+        try std.testing.expectEqual(case.dst, decoded.dst_reg);
+        try std.testing.expectEqual(case.src, decoded.src_reg);
+        try std.testing.expect(decoded.is_reg_form);
+    }
+}
+
+test "shared MOV decoder covers SIB displacement and immediate forms" {
+    const load = decodeMovForTest(&[_]u8{ 0x48, 0x8B, 0x44, 0x8B, 0xF0 }) orelse return error.ExpectedMov;
+    try std.testing.expectEqual(Op.mov_reg64_mem64, load.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, load.dst_reg);
+    try std.testing.expect(load.sib_has_base);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, load.sib_base_reg);
+    try std.testing.expect(load.sib_has_index);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, load.sib_index_reg);
+    try std.testing.expectEqual(@as(u2, 2), load.sib_scale);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -16))), load.addr);
+
+    const imm16 = decodeMovForTest(&[_]u8{ 0x66, 0xC7, 0xC0, 0x34, 0x12 }) orelse return error.ExpectedMov;
+    try std.testing.expectEqual(Op.mov_reg_imm, imm16.op);
+    try std.testing.expectEqual(OperandSize.bits16, imm16.size);
+    try std.testing.expectEqual(@as(u64, 0x1234), imm16.imm);
+    try std.testing.expectEqual(@as(u8, 5), imm16.len);
+
+    const imm64_memory = decodeMovForTest(&[_]u8{ 0x48, 0xC7, 0x45, 0xF8, 0xFF, 0xFF, 0xFF, 0xFF }) orelse return error.ExpectedMov;
+    try std.testing.expectEqual(Op.mov_mem64_imm32, imm64_memory.op);
+    try std.testing.expectEqual(std.math.maxInt(u64), imm64_memory.imm);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, imm64_memory.sib_base_reg);
+
+    const fs_load = decodeMovForTest(&[_]u8{ 0x64, 0x48, 0x8B, 0x45, 0xF8 }) orelse return error.ExpectedMov;
+    try std.testing.expectEqual(Segment.fs, fs_load.segment);
+    const stack_load = decodeMovForTest(&[_]u8{ 0x48, 0x8B, 0x45, 0xF8 }) orelse return error.ExpectedMov;
+    try std.testing.expectEqual(Segment.ss, stack_load.segment);
+}
+
+test "shared MOV decoder preserves high-byte versus REX low-byte registers" {
+    const legacy = decodeMovForTest(&[_]u8{ 0x88, 0xE0 }) orelse return error.ExpectedMov; // mov al, ah
+    try std.testing.expectEqual(Op.mov_reg8_reg8, legacy.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, legacy.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, legacy.src_reg);
+    try std.testing.expect(!legacy.dst_high8);
+    try std.testing.expect(legacy.src_high8);
+
+    const rex = decodeMovForTest(&[_]u8{ 0x40, 0x88, 0xE0 }) orelse return error.ExpectedMov; // mov al, spl
+    try std.testing.expectEqual(RegId.ah_sp_esp_rsp, rex.src_reg);
+    try std.testing.expect(!rex.src_high8);
+
+    const legacy_imm = decodeMovForTest(&[_]u8{ 0xB4, 0x12 }) orelse return error.ExpectedMov; // mov ah, 0x12
+    try std.testing.expect(legacy_imm.dst_high8);
+    const rex_imm = decodeMovForTest(&[_]u8{ 0x40, 0xB4, 0x12 }) orelse return error.ExpectedMov; // mov spl, 0x12
+    try std.testing.expectEqual(RegId.ah_sp_esp_rsp, rex_imm.dst_reg);
+    try std.testing.expect(!rex_imm.dst_high8);
+}
+
+test "default segment selection follows instruction stack data and string rules" {
+    try std.testing.expectEqual(Segment.cs, defaultSegment(.instruction_fetch, null));
+    try std.testing.expectEqual(Segment.ss, defaultSegment(.stack, null));
+    try std.testing.expectEqual(Segment.ss, defaultSegment(.explicit_data, .ah_sp_esp_rsp));
+    try std.testing.expectEqual(Segment.ss, defaultSegment(.explicit_data, .ch_bp_ebp_rbp));
+    try std.testing.expectEqual(Segment.ds, defaultSegment(.explicit_data, .al_ax_eax_rax));
+    try std.testing.expectEqual(Segment.ds, defaultSegment(.explicit_data, .r12b_r12w_r12d_r12));
+    try std.testing.expectEqual(Segment.ds, defaultSegment(.string_source, .dh_si_esi_rsi));
+    try std.testing.expectEqual(Segment.es, defaultSegment(.string_destination, .bh_di_edi_rdi));
+
+    try std.testing.expectEqual(Segment.fs, selectSegment(.explicit_data, .ch_bp_ebp_rbp, .fs));
+    try std.testing.expectEqual(Segment.gs, selectSegment(.string_source, .dh_si_esi_rsi, .gs));
+    try std.testing.expectEqual(Segment.es, selectSegment(.string_destination, .bh_di_edi_rdi, .fs));
+    try std.testing.expectEqual(Segment.ss, selectSegment(.stack, .ah_sp_esp_rsp, .gs));
+}
+
+test "long mode effective addresses apply only FS and GS segment bases" {
+    var regs = Regs{};
+    regs.rbp = 0x1000;
+    regs.segments.ss.base = 0x2000;
+    regs.segments.fs.base = 0x3000;
+
+    const stack_default = MemoryOperand{
+        .displacement = 8,
+        .has_base = true,
+        .base_reg = .ch_bp_ebp_rbp,
+        .segment = .ss,
+    };
+    try std.testing.expectEqual(@as(u64, 0x1008), resolveMemoryAddress(&regs, stack_default, 0, .bits64, .long64, true));
+    try std.testing.expectEqual(@as(u64, 0x3008), resolveMemoryAddress(&regs, .{ .displacement = 8, .segment = .fs }, 0, .bits64, .long64, true));
+    try std.testing.expectEqual(@as(u64, 0x3008), resolveMemoryAddress(&regs, stack_default, 0, .bits64, .protected, true));
+}
+
+test "effective address resolver wraps address-size 32 before segmentation" {
+    var regs = Regs{};
+    regs.rax = 0xFFFF_FFFF;
+    regs.rcx = 2;
+    regs.segments.fs.base = 0x1000;
+    const memory = MemoryOperand{
+        .displacement = 3,
+        .has_base = true,
+        .base_reg = .al_ax_eax_rax,
+        .has_index = true,
+        .index_reg = .cl_cx_ecx_rcx,
+        .scale = 1,
+        .segment = .fs,
+    };
+    try std.testing.expectEqual(@as(u64, 0x1006), resolveMemoryAddress(&regs, memory, 0, .bits32, .long64, true));
+}
+
+test "RIP relative address resolution uses the end of the instruction" {
+    const regs = Regs{};
+    const memory = MemoryOperand{
+        .displacement = @bitCast(@as(i64, -4)),
+        .rip_relative = true,
+    };
+    try std.testing.expectEqual(@as(u64, 0x1003), resolveMemoryAddress(&regs, memory, 0x1007, .bits64, .long64, true));
 }
