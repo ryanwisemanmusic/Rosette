@@ -2,6 +2,51 @@ const flags = @import("flags.zig");
 
 pub const OperandSize = flags.OperandSize;
 
+pub const Segment = enum(u3) {
+    es,
+    cs,
+    ss,
+    ds,
+    fs,
+    gs,
+};
+
+pub const SegmentRegister = struct {
+    selector: u16 = 0,
+    base: u64 = 0,
+};
+
+pub const SegmentState = struct {
+    es: SegmentRegister = .{},
+    cs: SegmentRegister = .{},
+    ss: SegmentRegister = .{},
+    ds: SegmentRegister = .{},
+    fs: SegmentRegister = .{},
+    gs: SegmentRegister = .{},
+
+    pub fn get(self: *const SegmentState, segment: Segment) SegmentRegister {
+        return switch (segment) {
+            .es => self.es,
+            .cs => self.cs,
+            .ss => self.ss,
+            .ds => self.ds,
+            .fs => self.fs,
+            .gs => self.gs,
+        };
+    }
+
+    pub fn getPtr(self: *SegmentState, segment: Segment) *SegmentRegister {
+        return switch (segment) {
+            .es => &self.es,
+            .cs => &self.cs,
+            .ss => &self.ss,
+            .ds => &self.ds,
+            .fs => &self.fs,
+            .gs => &self.gs,
+        };
+    }
+};
+
 pub const RegId = enum(u4) {
     al_ax_eax_rax = 0,
     cl_cx_ecx_rcx = 1,
@@ -45,6 +90,7 @@ pub const Regs = struct {
     r15: u64 = 0,
     rip: u64 = 0,
     rflags: u32 = 0x0002,
+    segments: SegmentState = .{},
 
     pub fn get(self: *const Regs, comptime reg: []const u8) u64 {
         _ = self;
