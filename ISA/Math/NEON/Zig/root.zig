@@ -474,6 +474,13 @@ const rotate_vprorvq = @import("ROTATE/VPRORVQ.zig");
 const save_fsave = @import("SAVE/FSAVE.zig");
 const save_fxsave = @import("SAVE/FXSAVE.zig");
 const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
+const scale_fscale = @import("SCALE/FSCALE.zig");
+const scale_vscalefpd = @import("SCALE/VSCALEFPD.zig");
+const scale_vscalefph = @import("SCALE/VSCALEFPH.zig");
+const scale_vscalefps = @import("SCALE/VSCALEFPS.zig");
+const scale_vscalefsd = @import("SCALE/VSCALEFSD.zig");
+const scale_vscalefsh = @import("SCALE/VSCALEFSH.zig");
+const scale_vscalefss = @import("SCALE/VSCALEFSS.zig");
 const swap_swapgs = @import("SWAP/SWAPGS.zig");
 const sub_sub = @import("SUB/SUB.zig");
 const sub_subpd = @import("SUB/SUBPD.zig");
@@ -1319,6 +1326,13 @@ pub const specs = blk: {
         spec(save_fsave.meta),
         spec(save_fxsave.meta),
         spec(save_saveprevssp.meta),
+        spec(scale_fscale.meta),
+        spec(scale_vscalefpd.meta),
+        spec(scale_vscalefph.meta),
+        spec(scale_vscalefps.meta),
+        spec(scale_vscalefsd.meta),
+        spec(scale_vscalefsh.meta),
+        spec(scale_vscalefss.meta),
         spec(swap_swapgs.meta),
         spec(sub_sub.meta),
         spec(sub_subpd.meta),
@@ -2176,6 +2190,13 @@ pub const proof_reports = [_]proofs.ProofReport{
     save_fsave.proof_report,
     save_fxsave.proof_report,
     save_saveprevssp.proof_report,
+    scale_fscale.proof_report,
+    scale_vscalefpd.proof_report,
+    scale_vscalefph.proof_report,
+    scale_vscalefps.proof_report,
+    scale_vscalefsd.proof_report,
+    scale_vscalefsh.proof_report,
+    scale_vscalefss.proof_report,
     swap_swapgs.proof_report,
     sub_sub.proof_report,
     sub_subpd.proof_report,
