@@ -743,6 +743,16 @@ const range_vrangepd = @import("RANGE/VRANGEPD.zig");
 const range_vrangeps = @import("RANGE/VRANGEPS.zig");
 const range_vrangesd = @import("RANGE/VRANGESD.zig");
 const range_vrangess = @import("RANGE/VRANGESS.zig");
+const read_rdfsbase = @import("READ/RDFSBASE.zig");
+const read_rdgsbase = @import("READ/RDGSBASE.zig");
+const read_rdmsr = @import("READ/RDMSR.zig");
+const read_rdpid = @import("READ/RDPID.zig");
+const read_rdpkru = @import("READ/RDPKRU.zig");
+const read_rdpmc = @import("READ/RDPMC.zig");
+const read_rdrand = @import("READ/RDRAND.zig");
+const read_rdseed = @import("READ/RDSEED.zig");
+const read_rdtsc = @import("READ/RDTSC.zig");
+const read_rdtscp = @import("READ/RDTSCP.zig");
 const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
 const reset_hreset = @import("RESET/HRESET.zig");
 const resume_rsm = @import("RESUME/RSM.zig");
@@ -1651,6 +1661,16 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(range_vrangeps.family, range_vrangeps.path, range_vrangeps.source),
     mirror(range_vrangesd.family, range_vrangesd.path, range_vrangesd.source),
     mirror(range_vrangess.family, range_vrangess.path, range_vrangess.source),
+    mirror(read_rdfsbase.family, read_rdfsbase.path, read_rdfsbase.source),
+    mirror(read_rdgsbase.family, read_rdgsbase.path, read_rdgsbase.source),
+    mirror(read_rdmsr.family, read_rdmsr.path, read_rdmsr.source),
+    mirror(read_rdpid.family, read_rdpid.path, read_rdpid.source),
+    mirror(read_rdpkru.family, read_rdpkru.path, read_rdpkru.source),
+    mirror(read_rdpmc.family, read_rdpmc.path, read_rdpmc.source),
+    mirror(read_rdrand.family, read_rdrand.path, read_rdrand.source),
+    mirror(read_rdseed.family, read_rdseed.path, read_rdseed.source),
+    mirror(read_rdtsc.family, read_rdtsc.path, read_rdtsc.source),
+    mirror(read_rdtscp.family, read_rdtscp.path, read_rdtscp.source),
     mirror(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
     mirror(reset_hreset.family, reset_hreset.path, reset_hreset.source),
     mirror(resume_rsm.family, resume_rsm.path, resume_rsm.source),
