@@ -722,6 +722,12 @@ const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
 const partial_fptan = @import("PARTIAL/FPTAN.zig");
 const pause_tpause = @import("PAUSE/TPAUSE.zig");
+const perform_vreducepd = @import("PERFORM/VREDUCEPD.zig");
+const perform_vreduceph = @import("PERFORM/VREDUCEPH.zig");
+const perform_vreduceps = @import("PERFORM/VREDUCEPS.zig");
+const perform_vreducesd = @import("PERFORM/VREDUCESD.zig");
+const perform_vreducesh = @import("PERFORM/VREDUCESH.zig");
+const perform_vreducess = @import("PERFORM/VREDUCESS.zig");
 const platform_pconfig = @import("PLATFORM/PCONFIG.zig");
 const prefetch_prefetchw = @import("PREFETCH/PREFETCHW.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
@@ -1406,6 +1412,12 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "PMOVMSKB",
     "VMOVSH",
     "VMOVW",
+    "VREDUCEPD",
+    "VREDUCEPH",
+    "VREDUCEPS",
+    "VREDUCESD",
+    "VREDUCESH",
+    "VREDUCESS",
     "INSERTPS",
     "PINSRB",
     "PINSRD",
@@ -2194,6 +2206,12 @@ pub const tables = [_]InstructionTable{
     entry(partial_fprem1.family, partial_fprem1.path, partial_fprem1.source),
     entry(partial_fptan.family, partial_fptan.path, partial_fptan.source),
     entry(pause_tpause.family, pause_tpause.path, pause_tpause.source),
+    entry(perform_vreducepd.family, perform_vreducepd.path, perform_vreducepd.source),
+    entry(perform_vreduceph.family, perform_vreduceph.path, perform_vreduceph.source),
+    entry(perform_vreduceps.family, perform_vreduceps.path, perform_vreduceps.source),
+    entry(perform_vreducesd.family, perform_vreducesd.path, perform_vreducesd.source),
+    entry(perform_vreducesh.family, perform_vreducesh.path, perform_vreducesh.source),
+    entry(perform_vreducess.family, perform_vreducess.path, perform_vreducess.source),
     entry(platform_pconfig.family, platform_pconfig.path, platform_pconfig.source),
     entry(prefetch_prefetchw.family, prefetch_prefetchw.path, prefetch_prefetchw.source),
     entry(prefetch_prefetcht0.family, prefetch_prefetcht0.path, prefetch_prefetcht0.source),
@@ -2475,7 +2493,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 830), tableCount());
+    try std.testing.expectEqual(@as(usize, 836), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

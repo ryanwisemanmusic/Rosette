@@ -722,6 +722,12 @@ const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
 const partial_fptan = @import("PARTIAL/FPTAN.zig");
 const pause_tpause = @import("PAUSE/tpause.zig");
+const perform_vreducepd = @import("PERFORM/VREDUCEPD.zig");
+const perform_vreduceph = @import("PERFORM/VREDUCEPH.zig");
+const perform_vreduceps = @import("PERFORM/VREDUCEPS.zig");
+const perform_vreducesd = @import("PERFORM/VREDUCESD.zig");
+const perform_vreducesh = @import("PERFORM/VREDUCESH.zig");
+const perform_vreducess = @import("PERFORM/VREDUCESS.zig");
 const platform_pconfig = @import("PLATFORM/PCONFIG.zig");
 const prefetch_prefetchw = @import("PREFETCH/prefetchw.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/prefetcht0.zig");
@@ -1547,6 +1553,12 @@ pub const specs = blk: {
         spec(partial_fprem1.meta),
         spec(partial_fptan.meta),
         spec(pause_tpause.meta),
+        spec(perform_vreducepd.meta),
+        spec(perform_vreduceph.meta),
+        spec(perform_vreduceps.meta),
+        spec(perform_vreducesd.meta),
+        spec(perform_vreducesh.meta),
+        spec(perform_vreducess.meta),
         spec(platform_pconfig.meta),
         spec(prefetch_prefetchw.meta),
         spec(prefetch_prefetcht0.meta),
@@ -2384,6 +2396,12 @@ pub const proof_reports = [_]proofs.ProofReport{
     partial_fprem1.proof_report,
     partial_fptan.proof_report,
     pause_tpause.proof_report,
+    perform_vreducepd.proof_report,
+    perform_vreduceph.proof_report,
+    perform_vreduceps.proof_report,
+    perform_vreducesd.proof_report,
+    perform_vreducesh.proof_report,
+    perform_vreducess.proof_report,
     platform_pconfig.proof_report,
     prefetch_prefetchw.proof_report,
     prefetch_prefetcht0.proof_report,
@@ -2567,7 +2585,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 612), tableCount());
+    try std.testing.expectEqual(@as(usize, 618), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
