@@ -471,6 +471,13 @@ const rotate_vprorvq = @import("ROTATE/VPRORVQ.zig");
 const save_fsave = @import("SAVE/FSAVE.zig");
 const save_fxsave = @import("SAVE/FXSAVE.zig");
 const save_saveprevssp = @import("SAVE/SAVEPREVSSP.zig");
+const scale_fscale = @import("SCALE/FSCALE.zig");
+const scale_vscalefpd = @import("SCALE/VSCALEFPD.zig");
+const scale_vscalefph = @import("SCALE/VSCALEFPH.zig");
+const scale_vscalefps = @import("SCALE/VSCALEFPS.zig");
+const scale_vscalefsd = @import("SCALE/VSCALEFSD.zig");
+const scale_vscalefsh = @import("SCALE/VSCALEFSH.zig");
+const scale_vscalefss = @import("SCALE/VSCALEFSS.zig");
 const swap_swapgs = @import("SWAP/SWAPGS.zig");
 const sub_sub = @import("SUB/SUB.zig");
 const sub_subpd = @import("SUB/SUBPD.zig");
@@ -1446,6 +1453,13 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "RDSEED",
     "RDTSC",
     "RDTSCP",
+    "FSCALE",
+    "VSCALEFPD",
+    "VSCALEFPH",
+    "VSCALEFPS",
+    "VSCALEFSD",
+    "VSCALEFSH",
+    "VSCALEFSS",
     "INSERTPS",
     "PINSRB",
     "PINSRD",
@@ -1989,6 +2003,13 @@ pub const tables = [_]InstructionTable{
     entry(save_fsave.family, save_fsave.path, save_fsave.source),
     entry(save_fxsave.family, save_fxsave.path, save_fxsave.source),
     entry(save_saveprevssp.family, save_saveprevssp.path, save_saveprevssp.source),
+    entry(scale_fscale.family, scale_fscale.path, scale_fscale.source),
+    entry(scale_vscalefpd.family, scale_vscalefpd.path, scale_vscalefpd.source),
+    entry(scale_vscalefph.family, scale_vscalefph.path, scale_vscalefph.source),
+    entry(scale_vscalefps.family, scale_vscalefps.path, scale_vscalefps.source),
+    entry(scale_vscalefsd.family, scale_vscalefsd.path, scale_vscalefsd.source),
+    entry(scale_vscalefsh.family, scale_vscalefsh.path, scale_vscalefsh.source),
+    entry(scale_vscalefss.family, scale_vscalefss.path, scale_vscalefss.source),
     entry(swap_swapgs.family, swap_swapgs.path, swap_swapgs.source),
     entry(sub_sub.family, sub_sub.path, sub_sub.source),
     entry(sub_subpd.family, sub_subpd.path, sub_subpd.source),
@@ -2535,7 +2556,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 850), tableCount());
+    try std.testing.expectEqual(@as(usize, 857), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
