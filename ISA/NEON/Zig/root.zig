@@ -723,6 +723,12 @@ const partial_fprem = @import("PARTIAL/FPREM.zig");
 const partial_fprem1 = @import("PARTIAL/FPREM1.zig");
 const partial_fptan = @import("PARTIAL/FPTAN.zig");
 const pause_tpause = @import("PAUSE/TPAUSE.zig");
+const perform_vreducepd = @import("PERFORM/VREDUCEPD.zig");
+const perform_vreduceph = @import("PERFORM/VREDUCEPH.zig");
+const perform_vreduceps = @import("PERFORM/VREDUCEPS.zig");
+const perform_vreducesd = @import("PERFORM/VREDUCESD.zig");
+const perform_vreducesh = @import("PERFORM/VREDUCESH.zig");
+const perform_vreducess = @import("PERFORM/VREDUCESS.zig");
 const platform_pconfig = @import("PLATFORM/PCONFIG.zig");
 const prefetch_prefetchw = @import("PREFETCH/PREFETCHW.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
@@ -1621,6 +1627,12 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(partial_fprem1.family, partial_fprem1.path, partial_fprem1.source),
     mirror(partial_fptan.family, partial_fptan.path, partial_fptan.source),
     mirror(pause_tpause.family, pause_tpause.path, pause_tpause.source),
+    mirror(perform_vreducepd.family, perform_vreducepd.path, perform_vreducepd.source),
+    mirror(perform_vreduceph.family, perform_vreduceph.path, perform_vreduceph.source),
+    mirror(perform_vreduceps.family, perform_vreduceps.path, perform_vreduceps.source),
+    mirror(perform_vreducesd.family, perform_vreducesd.path, perform_vreducesd.source),
+    mirror(perform_vreducesh.family, perform_vreducesh.path, perform_vreducesh.source),
+    mirror(perform_vreducess.family, perform_vreducess.path, perform_vreducess.source),
     mirror(platform_pconfig.family, platform_pconfig.path, platform_pconfig.source),
     mirror(prefetch_prefetchw.family, prefetch_prefetchw.path, prefetch_prefetchw.source),
     mirror(prefetch_prefetcht0.family, prefetch_prefetcht0.path, prefetch_prefetcht0.source),
