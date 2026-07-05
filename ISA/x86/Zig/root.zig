@@ -738,6 +738,10 @@ const pxor_pxor = @import("PXOR/PXOR.zig");
 const pxor_vpxor = @import("PXOR/VPXOR.zig");
 const pxor_vpxord = @import("PXOR/VPXORD.zig");
 const pxor_vpxorq = @import("PXOR/VPXORQ.zig");
+const range_vrangepd = @import("RANGE/VRANGEPD.zig");
+const range_vrangeps = @import("RANGE/VRANGEPS.zig");
+const range_vrangesd = @import("RANGE/VRANGESD.zig");
+const range_vrangess = @import("RANGE/VRANGESS.zig");
 const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
 const reset_hreset = @import("RESET/HRESET.zig");
 const resume_rsm = @import("RESUME/RSM.zig");
@@ -1418,6 +1422,10 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "VREDUCESD",
     "VREDUCESH",
     "VREDUCESS",
+    "VRANGEPD",
+    "VRANGEPS",
+    "VRANGESD",
+    "VRANGESS",
     "INSERTPS",
     "PINSRB",
     "PINSRD",
@@ -2222,6 +2230,10 @@ pub const tables = [_]InstructionTable{
     entry(pxor_vpxor.family, pxor_vpxor.path, pxor_vpxor.source),
     entry(pxor_vpxord.family, pxor_vpxord.path, pxor_vpxord.source),
     entry(pxor_vpxorq.family, pxor_vpxorq.path, pxor_vpxorq.source),
+    entry(range_vrangepd.family, range_vrangepd.path, range_vrangepd.source),
+    entry(range_vrangeps.family, range_vrangeps.path, range_vrangeps.source),
+    entry(range_vrangesd.family, range_vrangesd.path, range_vrangesd.source),
+    entry(range_vrangess.family, range_vrangess.path, range_vrangess.source),
     entry(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
     entry(reset_hreset.family, reset_hreset.path, reset_hreset.source),
     entry(resume_rsm.family, resume_rsm.path, resume_rsm.source),
@@ -2493,7 +2505,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 836), tableCount());
+    try std.testing.expectEqual(@as(usize, 840), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();

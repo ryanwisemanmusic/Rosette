@@ -738,6 +738,10 @@ const pxor_pxor = @import("PXOR/PXOR.zig");
 const pxor_vpxor = @import("PXOR/VPXOR.zig");
 const pxor_vpxord = @import("PXOR/VPXORD.zig");
 const pxor_vpxorq = @import("PXOR/VPXORQ.zig");
+const range_vrangepd = @import("RANGE/VRANGEPD.zig");
+const range_vrangeps = @import("RANGE/VRANGEPS.zig");
+const range_vrangesd = @import("RANGE/VRANGESD.zig");
+const range_vrangess = @import("RANGE/VRANGESS.zig");
 const release_tilerelease = @import("RELEASE/tilerelease.zig");
 const reset_hreset = @import("RESET/hreset.zig");
 const resume_rsm = @import("RESUME/rsm.zig");
@@ -1569,6 +1573,10 @@ pub const specs = blk: {
         spec(pxor_vpxor.meta),
         spec(pxor_vpxord.meta),
         spec(pxor_vpxorq.meta),
+        spec(range_vrangepd.meta),
+        spec(range_vrangeps.meta),
+        spec(range_vrangesd.meta),
+        spec(range_vrangess.meta),
         spec(release_tilerelease.meta),
         spec(reset_hreset.meta),
         spec(resume_rsm.meta),
@@ -2412,6 +2420,10 @@ pub const proof_reports = [_]proofs.ProofReport{
     pxor_vpxor.proof_report,
     pxor_vpxord.proof_report,
     pxor_vpxorq.proof_report,
+    range_vrangepd.proof_report,
+    range_vrangeps.proof_report,
+    range_vrangesd.proof_report,
+    range_vrangess.proof_report,
     release_tilerelease.proof_report,
     reset_hreset.proof_report,
     resume_rsm.proof_report,
@@ -2585,7 +2597,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 618), tableCount());
+    try std.testing.expectEqual(@as(usize, 622), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
