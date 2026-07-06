@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime_abi = @import("runtime_abi_handshake");
 const reg_trace = @import("register-tracing/runtime.zig");
 const exception_trace = @import("exceptions/runtime.zig");
+const modes = @import("modes/root.zig");
 
 pub const Register64 = enum(u5) {
     rax,
@@ -127,12 +128,52 @@ pub const RegisterFile64 = struct {
 pub const X64State = struct {
     regs: RegisterFile64 = .{},
 
+    /// Memory model configuration for this x64 state
+    memory_config: modes.MemoryModelConfig = modes.memory.longModeDefaults(),
+
     pub fn instructionPointer(self: *X64State) *u64 {
         return &self.regs.rip;
     }
 
     pub fn stackPointer(self: *X64State) *u64 {
         return &self.regs.rsp;
+    }
+
+    /// Get current operating mode
+    pub fn operatingMode(self: *const X64State) modes.OperatingMode {
+        return self.memory_config.operating_mode;
+    }
+
+    /// Get current memory model
+    pub fn memoryModel(self: *const X64State) modes.MemoryModel {
+        return self.memory_config.memory_model;
+    }
+
+    /// Translate effective address to linear address
+    pub fn effectiveToLinear(self: *const X64State, effective: u64, segment: enum { cs, ds, es, ss, fs, gs }) !modes.LinearAddress {
+        return modes.memory.effectiveToLinear(&self.memory_config, effective, switch (segment) {
+            .cs => .cs,
+            .ds => .ds,
+            .es => .es,
+            .ss => .ss,
+            .fs => .fs,
+            .gs => .gs,
+        });
+    }
+
+    /// Set operating mode (reconfigures memory model appropriately)
+    pub fn setOperatingMode(self: *X64State, mode: modes.OperatingMode) void {
+        self.memory_config = switch (mode) {
+            .long_mode => modes.memory.longModeDefaults(),
+            .compatibility => modes.memory.compatibilityModeDefaults(),
+            .system_management => modes.memory.systemManagementDefaults(),
+        };
+    }
+
+    /// Check if address is canonical
+    pub fn isCanonical(self: *const X64State, addr: u64) bool {
+        _ = self;
+        return modes.memory.isCanonicalAddress(addr);
     }
 };
 
@@ -153,4 +194,21 @@ test "x64 state covers extended registers and pointers" {
     exception_trace.logStructuredException("x64-state-test", 0xC0000005, state.regs.rip, &state.regs);
     try std.testing.expectEqual(@as(u64, 0xCAFE_BABE), state.regs.get(.r13));
     try std.testing.expectEqual(@as(u64, 0x1400_1000), state.instructionPointer().*);
+}
+
+test "x64 state memory model integration" {
+    var state: X64State = .{};
+    try std.testing.expectEqual(modes.OperatingMode.long_mode, state.operatingMode());
+    try std.testing.expectEqual(modes.MemoryModel.flat_64, state.memoryModel());
+
+    const linear = try state.effectiveToLinear(0x4000, .cs);
+    try std.testing.expectEqual(@as(u64, 0x4000), linear);
+
+    try std.testing.expect(state.isCanonical(0x0000_0000_0000_0000));
+    try std.testing.expect(state.isCanonical(0x0000_7FFF_FFFF_FFFF));
+    try std.testing.expect(!state.isCanonical(0x0000_8000_0000_0000));
+
+    state.setOperatingMode(.compatibility);
+    try std.testing.expectEqual(modes.OperatingMode.compatibility, state.operatingMode());
+    try std.testing.expectEqual(modes.MemoryModel.compatibility_segmented, state.memoryModel());
 }
