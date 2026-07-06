@@ -1202,6 +1202,14 @@ pub const MachOState = struct {
                 .handled_void => .handled_void,
             };
         }
+        if (std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEEC") != null) {
+            const ok = import_resolution.executeIosBaseInit(self, self.regs.rdi, self.regs.rsi);
+            if (self.verbose_trace) std.debug.print(
+                "    [libc++] basic_ostream constructor(this=0x{x}, sb=0x{x}) -> {}\n",
+                .{ self.regs.rdi, self.regs.rsi, ok },
+            );
+            return if (ok) .handled_void else .{ .unsupported = 0 };
+        }
         if (self.foreign_objects.dispatch(self, name)) |resolution| {
             self.import_confidence_override = .modeled;
             return switch (resolution) {
