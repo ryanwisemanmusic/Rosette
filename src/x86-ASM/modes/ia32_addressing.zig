@@ -175,14 +175,8 @@ pub fn defaultSegmentForAddressing(form: AddressingForm, base_reg: ?u8) SegmentO
     };
 }
 
-/// Address size override handling
-pub const AddressSize = enum(u8) {
-    bits16 = 16,
-    bits32 = 32,
-};
-
 /// Check if addressing form is available in given mode
-pub fn isAddressingFormAvailable(form: AddressingForm, mode: memory.OperatingMode, addr_size: AddressSize) bool {
+pub fn isAddressingFormAvailable(form: AddressingForm, mode: memory.OperatingMode, addr_size: memory.AddressSize) bool {
     const caps = addressingCapabilitiesFor(mode);
 
     return switch (form) {
@@ -292,7 +286,7 @@ test "effective address validation" {
         .displacement = 0,
     };
     try std.testing.expect(valid.isValid());
-    
+
     // Scale field is u2, so only values 0-3 are possible (all valid)
     // Scale values map to multipliers: 0->1, 1->2, 2->4, 3->8
     const no_index = EffectiveAddress{
