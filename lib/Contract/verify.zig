@@ -50,6 +50,11 @@ pub fn allEntries() []const VerificationEntry {
         .{ .symbol = "_pthread_detach", .expected = .{ .handled = 0 } },
         .{ .symbol = "_gtk_dialog_run", .expected = .{ .handled = 0 } },
         .{ .symbol = "_gtk_widget_destroy", .expected = .{ .handled = 0 } },
+        .{ .symbol = "_gtk_box_pack_start", .expected = .{ .handled = 0 } },
+        .{ .symbol = "_gtk_label_set_xalign", .expected = .{ .handled = 0 } },
+        .{ .symbol = "_gtk_widget_set_margin_start", .expected = .{ .handled = 0 } },
+        .{ .symbol = "_g_object_ref_sink", .expected = .{ .handled = 0 } },
+        .{ .symbol = "__ZNSt3__18ios_base5clearEj", .expected = .{ .handled = 0 } },
         .{ .symbol = "_localtime", .expected = .{ .handled = 0 } },
         .{ .symbol = "_strftime", .expected = .{ .handled = 0 } },
         // .synthesize contracts with fixed values
@@ -58,6 +63,14 @@ pub fn allEntries() []const VerificationEntry {
         .{ .symbol = "recursive_mutex8try_lockEv", .expected = .{ .handled = 1 } },
         .{ .symbol = "_gtk_message_dialog_new", .expected = .{ .handled = 1 } },
         .{ .symbol = "_gtk_dialog_get_type", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_menu_bar_new", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_menu_item_new_with_mnemonic", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_box_new", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_box_get_type", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_label_new_with_mnemonic", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_label_get_type", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_label_new", .expected = .{ .handled = 1 } },
+        .{ .symbol = "_gtk_menu_item_get_type", .expected = .{ .handled = 1 } },
     };
 }
 
@@ -109,6 +122,11 @@ test "verification matches contract dispatch for stub symbols" {
         "recursive_mutex4lockEv",
         "_gtk_dialog_run",
         "_gtk_widget_destroy",
+        "_gtk_box_pack_start",
+        "_gtk_label_set_xalign",
+        "_gtk_widget_set_margin_start",
+        "_g_object_ref_sink",
+        "__ZNSt3__18ios_base5clearEj",
         "_localtime",
         "_readdir",
         "__ZdlPv",
@@ -128,6 +146,14 @@ test "verification matches contract dispatch for synthesize symbols" {
         .{ .sym = "recursive_mutex8try_lockEv", .val = 1 },
         .{ .sym = "_gtk_message_dialog_new", .val = 1 },
         .{ .sym = "_gtk_dialog_get_type", .val = 1 },
+        .{ .sym = "_gtk_menu_bar_new", .val = 1 },
+        .{ .sym = "_gtk_menu_item_new_with_mnemonic", .val = 1 },
+        .{ .sym = "_gtk_box_new", .val = 1 },
+        .{ .sym = "_gtk_box_get_type", .val = 1 },
+        .{ .sym = "_gtk_label_new_with_mnemonic", .val = 1 },
+        .{ .sym = "_gtk_label_get_type", .val = 1 },
+        .{ .sym = "_gtk_label_new", .val = 1 },
+        .{ .sym = "_gtk_menu_item_get_type", .val = 1 },
     };
     for (synths) |s| {
         const outcome = runtime.dispatchFromAllFamilies(s.sym, 0);

@@ -287,6 +287,10 @@ pub const Metadata = struct {
         return self.defined_symbols.get(expected_name);
     }
 
+    pub fn definedSymbolIterator(self: *const Metadata) std.StringHashMap(u64).Iterator {
+        return self.defined_symbols.iterator();
+    }
+
     fn indexDefinedSymbols(self: *Metadata) !void {
         const table = self.symtab orelse return;
         var index: u32 = 0;

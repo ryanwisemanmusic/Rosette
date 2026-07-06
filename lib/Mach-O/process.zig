@@ -21,6 +21,7 @@ const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
 const itanium_dynamic_cast = @import("resolution/itanium_dynamic_cast.zig");
 const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
 const libcpp_stream_bridge = @import("resolution/libcpp_stream_bridge.zig");
+const foreign_object_runtime = @import("resolution/foreign_object_runtime.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
@@ -218,6 +219,8 @@ pub const MachOState = struct {
     fs_forwarder: fs_io_forwarder.Forwarder,
     libcxx_filesystem: libcpp_filesystem.Bridge = .{},
     libcxx_streams: libcpp_stream_bridge.Bridge = .{},
+    foreign_objects: foreign_object_runtime.Runtime = .{},
+    local_libcpp_stream_targets: std.AutoHashMap(u64, []const u8),
     logging: logging_runtime.Engine = .{},
     pthreads: pthread_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
@@ -347,11 +350,13 @@ pub const MachOState = struct {
             .initializer_memory = memory_transaction.Journal.init(allocator, PAGE_SIZE),
             .fs_forwarder = fs_io_forwarder.Forwarder.init(allocator),
             .memory_forwarder = memory_management_forwarder.Manager.init(allocator),
+            .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
             .decode_cache = decode_cache,
             .mapped_min = mapped_min,
             .executable_min = executable_min,
             .executable_max = executable_max,
         };
+        errdefer result.deinit();
         result.guest_files[0] = .{ .active = true, .fd = 0, .kind = .regular };
         result.guest_files[1] = .{ .active = true, .fd = 1, .kind = .stdout };
         result.guest_files[2] = .{ .active = true, .fd = 2, .kind = .stderr };
@@ -417,6 +422,11 @@ pub const MachOState = struct {
         result.internal_targets.imgui_default_free = result.metadata.symbolAddressWithPrefix(
             "__ZL11FreeWrapperPvS_",
         ) orelse 0;
+        var defined_symbols = result.metadata.definedSymbolIterator();
+        while (defined_symbols.next()) |entry| {
+            if (!libcpp_stream_bridge.Bridge.recognizesSymbol(entry.key_ptr.*)) continue;
+            try result.local_libcpp_stream_targets.put(entry.value_ptr.*, entry.key_ptr.*);
+        }
         result.logging.configure(
             result.internal_targets.guest_log_get_thread_buffer != 0,
             result.internal_targets.guest_log_append_formatted != 0,
@@ -432,6 +442,7 @@ pub const MachOState = struct {
     pub fn deinit(self: *MachOState) void {
         self.closeGuestFiles();
         self.libcxx_streams.deinit();
+        self.local_libcpp_stream_targets.deinit();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
         self.dynamic_forwarder.deinit();
@@ -1185,6 +1196,13 @@ pub const MachOState = struct {
         }
         if (self.libcxx_streams.dispatch(self, &self.fs_forwarder, name)) |resolution| {
             self.import_provider_override = .libcpp_stream;
+            self.import_confidence_override = .modeled;
+            return switch (resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
+            };
+        }
+        if (self.foreign_objects.dispatch(self, name)) |resolution| {
             self.import_confidence_override = .modeled;
             return switch (resolution) {
                 .handled => |value| .{ .handled = value },
@@ -3080,6 +3098,7 @@ pub const MachOState = struct {
     }
 
     fn handleInternalCompatibility(self: *MachOState) bool {
+        if (self.handleLocalLibcppStreamCompatibility()) return true;
         if (self.internal_targets.imgui_default_malloc != 0 and
             self.regs.rip == self.internal_targets.imgui_default_malloc)
         {
@@ -3203,6 +3222,17 @@ pub const MachOState = struct {
             }
         }
         return false;
+    }
+
+    fn handleLocalLibcppStreamCompatibility(self: *MachOState) bool {
+        const symbol = self.local_libcpp_stream_targets.get(self.regs.rip) orelse return false;
+        const resolution = self.libcxx_streams.dispatch(self, &self.fs_forwarder, symbol) orelse return false;
+        switch (resolution) {
+            .handled => |value| self.regs.rax = value,
+            .handled_void => {},
+        }
+        self.regs.rip = self.pop();
+        return true;
     }
 
     fn capturePositionalLaunchOptions(self: *MachOState) void {
