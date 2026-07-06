@@ -15,6 +15,9 @@ const smart_stub_generator = @import("resolution/smart_stub_generator.zig");
 const cxx_exception_diagnostics = @import("resolution/cxx_exception_diagnostics.zig");
 const fs_io_forwarder = @import("resolution/fs_io_forwarder.zig");
 const memory_management_forwarder = @import("resolution/memory_management_forwarder.zig");
+const memory_provenance = @import("resolution/memory_provenance.zig");
+const pointer_firewall = @import("resolution/pointer_firewall.zig");
+const semantic_fault_classifier = @import("resolution/semantic_fault_classifier.zig");
 const launch_argument_accelerator = @import("resolution/launch_argument_accelerator.zig");
 const startup_observer = @import("resolution/startup_observer.zig");
 const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
@@ -225,6 +228,8 @@ pub const MachOState = struct {
     pthreads: pthread_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
     memory_forwarder: memory_management_forwarder.Manager,
+    memory_regions: memory_provenance.Registry,
+    pointer_firewall: pointer_firewall.Firewall,
     smart_stubs: smart_stub_generator.Generator = .{},
     cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
     unwinder: itanium_unwinder.Engine = .{},
@@ -350,6 +355,8 @@ pub const MachOState = struct {
             .initializer_memory = memory_transaction.Journal.init(allocator, PAGE_SIZE),
             .fs_forwarder = fs_io_forwarder.Forwarder.init(allocator),
             .memory_forwarder = memory_management_forwarder.Manager.init(allocator),
+            .memory_regions = memory_provenance.Registry.init(allocator),
+            .pointer_firewall = pointer_firewall.Firewall.init(allocator),
             .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
             .decode_cache = decode_cache,
             .mapped_min = mapped_min,
@@ -357,6 +364,22 @@ pub const MachOState = struct {
             .executable_max = executable_max,
         };
         errdefer result.deinit();
+        for (result.segments) |segment| {
+            const kind: memory_provenance.RegionKind = if (segment.initprot & 0x04 != 0)
+                .macho_text
+            else if (segment.initprot & 0x02 != 0)
+                .macho_data
+            else
+                .macho_const;
+            _ = result.memory_regions.register(segment.vmaddr, segment.vmsize, .{
+                .read = segment.initprot & 0x01 != 0,
+                .write = segment.initprot & 0x02 != 0,
+                .execute = segment.initprot & 0x04 != 0,
+            }, kind, segment.name, 0);
+        }
+        const stack_size = result.stack_size;
+        const stack_start = result.mem_base + result.mem_size -| stack_size;
+        _ = result.memory_regions.register(stack_start, stack_size, .{}, .guest_stack, "main guest stack", 0);
         result.guest_files[0] = .{ .active = true, .fd = 0, .kind = .regular };
         result.guest_files[1] = .{ .active = true, .fd = 1, .kind = .stdout };
         result.guest_files[2] = .{ .active = true, .fd = 2, .kind = .stderr };
@@ -448,6 +471,8 @@ pub const MachOState = struct {
         self.dynamic_forwarder.deinit();
         self.fs_forwarder.deinit();
         self.memory_forwarder.deinit();
+        self.memory_regions.deinit();
+        self.pointer_firewall.deinit();
         self.initializer_memory.deinit();
         self.allocator.free(self.decode_cache);
         if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
@@ -574,6 +599,7 @@ pub const MachOState = struct {
     }
 
     pub fn addrToOffset(self: *const MachOState, vaddr: u64) ?u64 {
+        if (!self.pointer_firewall.mayDereference(vaddr)) return null;
         return mappedOffset(self.mem_base, self.mem_size, self.mapped_min, vaddr);
     }
 
@@ -773,7 +799,23 @@ pub const MachOState = struct {
         const storage = self.guestMemory(start, size) orelse return null;
         @memset(storage, 0);
         self.heap_next = end;
+        _ = self.memory_regions.register(start, size, .{}, .guest_heap, "guestAlloc", self.regs.rip);
+        _ = self.pointer_firewall.register(start, size, .{ .kind = .owned_guest, .may_dereference = true, .owner = "guestAlloc" });
         return start;
+    }
+
+    pub fn registerSyntheticRegion(self: *MachOState, address: u64, size: u64, kind: memory_provenance.RegionKind, owner: []const u8, policy: pointer_firewall.Policy) void {
+        const permissions: memory_provenance.Permissions = switch (kind) {
+            .synthetic_vtable, .synthetic_typeinfo => .{ .write = false },
+            else => .{},
+        };
+        _ = self.memory_regions.register(address, size, permissions, kind, owner, self.regs.rip);
+        _ = self.pointer_firewall.register(address, size, policy);
+    }
+
+    pub fn registerOpaqueHandle(self: *MachOState, address: u64, owner: []const u8) void {
+        _ = self.memory_regions.register(address, 1, .{ .read = false, .write = false }, .objc_handle, owner, self.regs.rip);
+        _ = self.pointer_firewall.register(address, 1, .{ .kind = .opaque_identity, .may_dereference = false, .owner = owner });
     }
 
     pub fn guestHeapAllocate(self: *MachOState, size: u64, alignment: u64) ?u64 {
@@ -1287,12 +1329,14 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "_objc_getClass")) {
             const class_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
             const handle = self.compat.classNamed(class_name);
+            self.registerOpaqueHandle(handle, "objc class identity");
             std.debug.print("    [objc] class {s} -> 0x{x}\n", .{ class_name, handle });
             return .{ .handled = handle };
         }
         if (std.mem.eql(u8, name, "_sel_registerName")) {
             const selector_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
             const handle = self.compat.selectorNamed(selector_name);
+            self.registerOpaqueHandle(handle, "Objective-C selector identity");
             std.debug.print("    [objc] selector {s} -> 0x{x}\n", .{ selector_name, handle });
             return .{ .handled = handle };
         }
@@ -3557,7 +3601,7 @@ pub const MachOState = struct {
         var steps: u64 = 0;
         while (!self.terminated and stepBudgetAllows(self.max_steps, steps)) : (steps +|= 1) {
             self.executed_steps = steps;
-            if (steps % 500000 == 0) {
+            if (self.startup.enabled and steps % 500000 == 0) {
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const heap_summary = self.memory_forwarder.summary();
                 self.startup.checkpoint(.{
@@ -3625,7 +3669,7 @@ pub const MachOState = struct {
         );
     }
 
-    fn logExitDiagnostics(self: *const MachOState) void {
+    fn logExitDiagnostics(self: *MachOState) void {
         const reason: exit_diagnostics.TerminationReason = exit_diagnostics.reasonFromValue(self.termination_reason);
         const attribution = exit_diagnostics.attribute(.{
             .reason = reason,
@@ -3676,6 +3720,47 @@ pub const MachOState = struct {
                     .symbol_offset = symbol.offset,
                 };
             }
+        }
+
+        if (self.terminal_memory_failure) |failure| {
+            const terminal_symbol = self.metadata.nearestSymbol(failure.instruction_address);
+            const symbol_name = if (terminal_symbol) |symbol| symbol.name else "";
+            var vtable_header_mapped = true;
+            var typeinfo_mapped = true;
+            if (self.guestMemoryConst(self.regs.rdi, 8) != null) {
+                const vptr = self.read64(self.regs.rdi);
+                if (vptr == 0 or vptr < 16 or self.guestMemoryConst(vptr - 16, 16) == null) {
+                    vtable_header_mapped = false;
+                } else {
+                    const typeinfo = self.read64(vptr - 8);
+                    typeinfo_mapped = typeinfo != 0 and self.guestMemoryConst(typeinfo, 16) != null;
+                }
+            }
+            const classification = semantic_fault_classifier.classify(.{
+                .instruction = failure.instruction,
+                .symbol = symbol_name,
+                .address = failure.address,
+                .rdi = self.regs.rdi,
+                .rsi = self.regs.rsi,
+                .rsp = self.regs.rsp,
+                .rbp = self.regs.rbp,
+                .rdi_mapped = self.guestMemoryConst(self.regs.rdi, 1) != null,
+                .rsi_mapped = self.guestMemoryConst(self.regs.rsi, 1) != null,
+                .stack_mapped = self.guestMemoryConst(self.regs.rsp, 1) != null and
+                    (self.regs.rbp == 0 or self.guestMemoryConst(self.regs.rbp, 1) != null),
+                .vtable_header_mapped = vtable_header_mapped,
+                .typeinfo_mapped = typeinfo_mapped,
+            });
+            report.semantic_fault = .{
+                .class = @tagName(classification.class),
+                .reason = classification.reason,
+                .next_subsystem = classification.next_subsystem,
+            };
+            if (self.memory_regions.find(failure.address, @as(u64, failure.bytes))) |region| {
+                report.semantic_fault.?.region_kind = @tagName(region.kind);
+                report.semantic_fault.?.region_owner = region.owner;
+            }
+            if (symbol_name.len != 0) self.import_resolver.markCrashNearby(symbol_name);
         }
 
         const terminal_trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
@@ -5373,6 +5458,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     defer state.deinit();
     state.cpu_profile = selectedCpuProfile();
     state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");
+    state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.strict_initializers = environmentFlag("ROSETTE_MACHO_STRICT_INITIALIZERS");
     state.strict_imports = environmentFlag("ROSETTE_MACHO_STRICT_IMPORTS");

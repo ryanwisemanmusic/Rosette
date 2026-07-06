@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
+const pointer_firewall = @import("pointer_firewall.zig");
 
 pub const Outcome = enum {
     resolved,
@@ -50,6 +51,7 @@ pub const ReturnConvention = enum {
 pub const Effects = struct {
     return_convention: ReturnConvention,
     writes_guest_memory: bool = false,
+    pointer_result: ?pointer_firewall.PointerKind = null,
 };
 
 pub const ContractId = enum {
@@ -167,7 +169,7 @@ pub const runtime_error_destructor = Contract{
 
 pub const fileno = Contract{
     .id = .posix_fileno,
-    .canonical_symbol = "_fileno",
+    .canonical_symbol = "fileno",
     .domain = .posix,
     .confidence = .verified,
     .effects = .{ .return_convention = .rax },
@@ -175,7 +177,7 @@ pub const fileno = Contract{
 
 pub const isatty = Contract{
     .id = .posix_isatty,
-    .canonical_symbol = "_isatty",
+    .canonical_symbol = "isatty",
     .domain = .posix,
     .confidence = .verified,
     .effects = .{ .return_convention = .rax },
@@ -183,18 +185,18 @@ pub const isatty = Contract{
 
 pub const cfstring_create_with_cstring = Contract{
     .id = .corefoundation_cfstring_create_with_cstring,
-    .canonical_symbol = "_CFStringCreateWithCString",
+    .canonical_symbol = "CFStringCreateWithCString",
     .domain = .corefoundation,
     .confidence = .verified,
-    .effects = .{ .return_convention = .rax },
+    .effects = .{ .return_convention = .rax, .writes_guest_memory = true, .pointer_result = .owned_guest },
 };
 
 pub const cfdictionary_create = Contract{
     .id = .corefoundation_cfdictionary_create,
-    .canonical_symbol = "_CFDictionaryCreate",
+    .canonical_symbol = "CFDictionaryCreate",
     .domain = .corefoundation,
     .confidence = .verified,
-    .effects = .{ .return_convention = .rax },
+    .effects = .{ .return_convention = .rax, .writes_guest_memory = true, .pointer_result = .owned_guest },
 };
 
 pub const ios_base_getloc = Contract{
@@ -202,7 +204,7 @@ pub const ios_base_getloc = Contract{
     .canonical_symbol = "_ZNKSt3__18ios_base6getlocEv",
     .domain = .libcxx,
     .confidence = .verified,
-    .effects = .{ .return_convention = .rax },
+    .effects = .{ .return_convention = .rax, .writes_guest_memory = true, .pointer_result = .owned_guest },
 };
 
 pub const basic_istream_sentry_constructor = Contract{
@@ -381,6 +383,10 @@ const Entry = struct {
     domain: Domain,
     provider: Provider,
     confidence: Confidence,
+    writes_guest_memory: bool = false,
+    pointer_kind: ?pointer_firewall.PointerKind = null,
+    object_model_safe: bool = false,
+    crash_nearby: bool = false,
     calls: u64 = 0,
     resolved: u64 = 0,
     unresolved: u64 = 0,
@@ -454,6 +460,8 @@ pub const Engine = struct {
         }
 
         const index = self.indices.get(symbol) orelse create: {
+            const declared_contract = contractFor(symbol);
+            const pointer_policy = pointer_firewall.policyForSymbol(symbol);
             const new_index = self.entries.items.len;
             self.entries.append(self.allocator, .{
                 .symbol = symbol,
@@ -463,6 +471,9 @@ pub const Engine = struct {
                 .domain = classifyDomain(symbol),
                 .provider = provider,
                 .confidence = confidence,
+                .writes_guest_memory = if (declared_contract) |declared| declared.effects.writes_guest_memory else false,
+                .pointer_kind = if (declared_contract) |declared| declared.effects.pointer_result else if (pointer_policy) |policy| policy.kind else null,
+                .object_model_safe = provider == .libcpp_stream or (pointer_policy != null and pointer_policy.?.may_dereference),
             }) catch {
                 self.dropped_records += 1;
                 return;
@@ -478,6 +489,7 @@ pub const Engine = struct {
         const entry = &self.entries.items[index];
         if (@intFromEnum(confidence) < @intFromEnum(entry.confidence)) entry.confidence = confidence;
         if (entry.provider == .none and provider != .none) entry.provider = provider;
+        if (provider == .libcpp_stream) entry.object_model_safe = true;
         entry.calls += 1;
         switch (outcome) {
             .resolved => entry.resolved += 1,
@@ -530,6 +542,29 @@ pub const Engine = struct {
                 );
             }
         }
+
+        std.debug.print("macho-processor: import contract coverage matrix:\n", .{});
+        for (self.entries.items) |entry| {
+            const pointer_kind = if (entry.pointer_kind) |kind| @tagName(kind) else "none";
+            std.debug.print(
+                "  {s} | domain={s} provider={s} confidence={s} calls={d} writes_guest_memory={} pointer={s} object_model_safe={} crash_nearby={}\n",
+                .{
+                    entry.symbol,
+                    @tagName(entry.domain),
+                    @tagName(entry.provider),
+                    @tagName(entry.confidence),
+                    entry.calls,
+                    entry.writes_guest_memory,
+                    pointer_kind,
+                    entry.object_model_safe,
+                    entry.crash_nearby,
+                },
+            );
+        }
+    }
+
+    pub fn markCrashNearby(self: *Engine, symbol: []const u8) void {
+        if (self.indices.get(symbol)) |index| self.entries.items[index].crash_nearby = true;
     }
 };
 
@@ -678,35 +713,47 @@ pub fn executeIsatty(state: anytype, fd: u64) bool {
 }
 
 pub fn executeCFStringCreateWithCString(state: anytype, allocator: u64, cstr: u64, encoding: u64) bool {
-    // CFStringCreateWithCString creates a CFString from a C string
-    // For Rosette's purposes, we return a dummy non-null pointer
-    // This allows the message box code to continue
     _ = allocator;
-    _ = cstr;
     _ = encoding;
-    state.regs.rax = 0x1000; // Dummy CFString pointer
+    const source = state.guestCString(cstr, 1024 * 1024) orelse return false;
+    const bytes_address = state.guestAlloc(source.len + 1, 1) orelse return false;
+    const bytes = state.guestMemory(bytes_address, source.len + 1) orelse return false;
+    @memcpy(bytes[0..source.len], source);
+    bytes[source.len] = 0;
+    const object = state.guestAlloc(16, @alignOf(u64)) orelse return false;
+    state.write64(object, source.len);
+    state.write64(object + 8, bytes_address);
+    if (@hasDecl(@TypeOf(state.*), "registerSyntheticRegion")) {
+        state.registerSyntheticRegion(bytes_address, source.len + 1, .file_buffer, "CFString bytes", .{ .kind = .owned_guest, .may_dereference = true, .owner = "CFString bytes" });
+        state.registerSyntheticRegion(object, 16, .synthetic_object, "CFString", .{ .kind = .owned_guest, .may_dereference = true, .owner = "CFString" });
+    }
+    state.regs.rax = object;
     return true;
 }
 
 pub fn executeCFDictionaryCreate(state: anytype, allocator: u64, keys: u64, values: u64, num_values: u64, call_backs: u64) bool {
-    // CFDictionaryCreate creates a CFDictionary from key/value pairs
-    // For Rosette's purposes, we return a dummy non-null pointer
-    // This allows the message box code to continue
     _ = allocator;
-    _ = keys;
-    _ = values;
-    _ = num_values;
     _ = call_backs;
-    state.regs.rax = 0x2000; // Dummy CFDictionary pointer
+    const object = state.guestAlloc(24, @alignOf(u64)) orelse return false;
+    state.write64(object, num_values);
+    state.write64(object + 8, keys);
+    state.write64(object + 16, values);
+    if (@hasDecl(@TypeOf(state.*), "registerSyntheticRegion")) {
+        state.registerSyntheticRegion(object, 24, .synthetic_object, "CFDictionary", .{ .kind = .owned_guest, .may_dereference = true, .owner = "CFDictionary" });
+    }
+    state.regs.rax = object;
     return true;
 }
 
 pub fn executeIosBaseGetloc(state: anytype, ios_base: u64) bool {
-    // ios_base::getloc returns the current locale object
-    // For Rosette's purposes, we return a dummy locale pointer
-    // The locale is typically 24-32 bytes depending on libc++ implementation
     _ = ios_base;
-    state.regs.rax = 0x3000; // Dummy locale pointer
+    const object = state.guestAlloc(16, @alignOf(u64)) orelse return false;
+    state.write64(object, 1);
+    state.write64(object + 8, 0);
+    if (@hasDecl(@TypeOf(state.*), "registerSyntheticRegion")) {
+        state.registerSyntheticRegion(object, 16, .synthetic_object, "std::locale", .{ .kind = .owned_guest, .may_dereference = true, .owner = "std::locale" });
+    }
+    state.regs.rax = object;
     return true;
 }
 
@@ -796,6 +843,19 @@ test "import audit separates resolved and unresolved calls" {
     try std.testing.expectEqual(@as(u64, 1), engine.unresolved_calls);
 }
 
+test "import coverage matrix records memory and pointer semantics" {
+    var engine = Engine.init(std.testing.allocator);
+    defer engine.deinit();
+    const symbol = "_CFStringCreateWithCString";
+    engine.record(symbol, "caller", "main", .execution, .resolved, .contract, .verified);
+    engine.markCrashNearby(symbol);
+    const entry = engine.entries.items[engine.indices.get(symbol).?];
+    try std.testing.expect(entry.writes_guest_memory);
+    try std.testing.expectEqual(pointer_firewall.PointerKind.owned_guest, entry.pointer_kind.?);
+    try std.testing.expect(entry.object_model_safe);
+    try std.testing.expect(entry.crash_nearby);
+}
+
 test "libc++ newline matcher contract accepts ordinary bytes and rejects newlines" {
     var state = TestState{};
     const matcher: u64 = 16;
@@ -836,4 +896,22 @@ test "libc++ runtime_error constructor initializes object" {
     try std.testing.expectEqualStrings("bad config", state.guestCString(what, 64).?);
     try std.testing.expect(executeRuntimeErrorDestructor(&state, object));
     try std.testing.expectEqual(@as(u64, 0), state.read64(object + 8));
+}
+
+test "CoreFoundation contracts return guest-backed objects" {
+    var state = TestState{};
+    const source: u64 = 32;
+    @memcpy(state.mem[source .. source + "Rosette".len], "Rosette");
+    try std.testing.expect(executeCFStringCreateWithCString(&state, 0, source, 0));
+    const string_object = state.regs.rax;
+    try std.testing.expect(string_object >= 320);
+    try std.testing.expectEqual(@as(u64, "Rosette".len), state.read64(string_object));
+    try std.testing.expectEqualStrings("Rosette", state.guestCString(state.read64(string_object + 8), 32).?);
+
+    state = .{};
+    try std.testing.expect(executeCFDictionaryCreate(&state, 0, 0x80, 0xA0, 3, 0));
+    const dictionary = state.regs.rax;
+    try std.testing.expectEqual(@as(u64, 3), state.read64(dictionary));
+    try std.testing.expectEqual(@as(u64, 0x80), state.read64(dictionary + 8));
+    try std.testing.expectEqual(@as(u64, 0xA0), state.read64(dictionary + 16));
 }

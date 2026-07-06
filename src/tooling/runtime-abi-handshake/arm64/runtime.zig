@@ -69,6 +69,7 @@ pub fn validateSignalDelivery(phase: []const u8, signal_kind: HostSignalKind, ma
             if (mapped_exception == 0)
                 common.violation("arm64", "signal_mapping", "{s}: signal {s} missing mapped exception code", .{ phase, @tagName(signal_kind) });
         },
+        else => {},
     }
 }
 

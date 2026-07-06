@@ -97,6 +97,14 @@ pub const MemoryAccessFailure = struct {
     mapped: bool = false,
 };
 
+pub const SemanticFault = struct {
+    class: []const u8 = "",
+    reason: []const u8 = "",
+    next_subsystem: []const u8 = "",
+    region_kind: []const u8 = "",
+    region_owner: []const u8 = "",
+};
+
 pub const MemoryAccessEvent = struct {
     instruction_address: u64 = 0,
     instruction: []const u8 = "",
@@ -180,6 +188,7 @@ pub const ExitReport = struct {
     dependency_calls: []const DependencyCall = &.{},
     control_transfer_failure: ?ControlTransferFailure = null,
     memory_access_failure: ?MemoryAccessFailure = null,
+    semantic_fault: ?SemanticFault = null,
     recent_memory_accesses: []const MemoryAccessEvent = &.{},
     runtime_context: ?RuntimeContext = null,
     unresolved_import_calls: u64 = 0,
@@ -243,6 +252,16 @@ pub fn logExitReport(report: ExitReport) void {
             .{ failure.instruction, failure.instruction_address, failure.access, failure.address, failure.bytes },
         );
         std.debug.print("    fault={s} mapped={}\n", .{ failure.fault, failure.mapped });
+    }
+
+    if (report.semantic_fault) |semantic| {
+        std.debug.print("  \x1b[33msemantic fault classification:\x1b[0m\n", .{});
+        std.debug.print("    class={s}\n", .{semantic.class});
+        std.debug.print("    reason={s}\n", .{semantic.reason});
+        std.debug.print("    next_subsystem={s}\n", .{semantic.next_subsystem});
+        if (semantic.region_kind.len != 0) {
+            std.debug.print("    memory_region={s} owner={s}\n", .{ semantic.region_kind, semantic.region_owner });
+        }
     }
 
     if (report.recent_memory_accesses.len > 0) {

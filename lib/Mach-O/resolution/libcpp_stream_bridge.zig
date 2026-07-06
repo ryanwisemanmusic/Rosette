@@ -1,11 +1,10 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
+const cxx_object_model = @import("cxx_object_model.zig");
 
 const MAX_STREAMS = 64;
-const FILEBUF_OFFSET_IN_IFSTREAM: u64 = 16;
-const BASIC_IOS_OFFSET_IN_IFSTREAM: u64 = 424;
-const SYNTHETIC_VTABLE_SIZE: u64 = 64;
-const SYNTHETIC_VTABLE_ADDRESS_POINT_OFFSET: u64 = 32;
+const FILEBUF_OFFSET_IN_IFSTREAM = cxx_object_model.FILEBUF_OFFSET_IN_IFSTREAM;
+const BASIC_IOS_OFFSET_IN_IFSTREAM = cxx_object_model.BASIC_IOS_OFFSET_IN_IFSTREAM;
 
 const OPENMODE_APP: u64 = 1 << 0;
 const OPENMODE_ATE: u64 = 1 << 1;
@@ -29,6 +28,7 @@ const Stream = struct {
 };
 
 pub const Bridge = struct {
+    object_model: cxx_object_model.Model = .{},
     streams: [MAX_STREAMS]Stream = [_]Stream{.{}} ** MAX_STREAMS,
     constructors: u64 = 0,
     opens: u64 = 0,
@@ -46,6 +46,7 @@ pub const Bridge = struct {
 
     pub fn deinit(self: *Bridge) void {
         for (&self.streams) |*stream| closeStream(stream);
+        self.object_model.reset();
         self.* = .{};
     }
 
@@ -167,33 +168,18 @@ pub const Bridge = struct {
     }
 
     pub fn constructIfstream(self: *Bridge, state: anytype, object: u64) bool {
-        _ = state.guestMemory(object, BASIC_IOS_OFFSET_IN_IFSTREAM + 8) orelse {
-            self.rejected +|= 1;
-            return false;
-        };
-        if (!self.ensureSyntheticStreamVtables(state)) {
+        if (!self.object_model.initializeIfstream(state, object)) {
             self.rejected +|= 1;
             return false;
         }
-
-        // This bridge owns these three address-point slots while the remaining
-        // libc++ object representation stays guest-owned and untouched.
-        state.write64(object, self.ifstream_vtable);
-        state.write64(object + FILEBUF_OFFSET_IN_IFSTREAM, self.filebuf_vtable);
-        state.write64(object + BASIC_IOS_OFFSET_IN_IFSTREAM, self.basic_ios_vtable);
+        self.ifstream_vtable = state.read64(object);
+        self.filebuf_vtable = state.read64(object + FILEBUF_OFFSET_IN_IFSTREAM);
+        self.basic_ios_vtable = state.read64(object + BASIC_IOS_OFFSET_IN_IFSTREAM);
         _ = self.ensure(object + FILEBUF_OFFSET_IN_IFSTREAM) orelse {
             self.rejected +|= 1;
             return false;
         };
         self.constructors +|= 1;
-        return true;
-    }
-
-    fn ensureSyntheticStreamVtables(self: *Bridge, state: anytype) bool {
-        if (self.ifstream_vtable != 0 and self.filebuf_vtable != 0 and self.basic_ios_vtable != 0) return true;
-        self.ifstream_vtable = makeSyntheticVtable(state, BASIC_IOS_OFFSET_IN_IFSTREAM) orelse return false;
-        self.filebuf_vtable = makeSyntheticVtable(state, 0) orelse return false;
-        self.basic_ios_vtable = makeSyntheticVtable(state, 0) orelse return false;
         return true;
     }
 
@@ -432,15 +418,6 @@ fn closeStream(stream: *Stream) void {
     stream.fd = -1;
 }
 
-fn makeSyntheticVtable(state: anytype, virtual_base_offset: u64) ?u64 {
-    const allocation = state.guestAlloc(SYNTHETIC_VTABLE_SIZE, @alignOf(u64)) orelse return null;
-    const bytes = state.guestMemory(allocation, SYNTHETIC_VTABLE_SIZE) orelse return null;
-    @memset(bytes, 0);
-    const address_point = allocation + SYNTHETIC_VTABLE_ADDRESS_POINT_OFFSET;
-    state.write64(address_point - 24, virtual_base_offset);
-    return address_point;
-}
-
 fn normalizeSymbol(symbol: []const u8) []const u8 {
     if (symbol.len != 0 and symbol[0] == '_') return symbol[1..];
     return symbol;
@@ -538,6 +515,18 @@ test "stream bridge forwards guest file operations through typed host calls" {
 
         pub fn read64(self: *const @This(), address: u64) u64 {
             return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
+        }
+
+        pub fn read32(self: *const @This(), address: u64) u32 {
+            return std.mem.readInt(u32, self.mem[@intCast(address)..][0..4], .little);
+        }
+
+        pub fn write8(self: *@This(), address: u64, value: u8) void {
+            self.mem[@intCast(address)] = value;
+        }
+
+        pub fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.mem[@intCast(address)..][0..4], value, .little);
         }
 
         pub fn write64(self: *@This(), address: u64, value: u64) void {

@@ -31,6 +31,7 @@ pub const Snapshot = struct {
 };
 
 pub const Observer = struct {
+    enabled: bool = false,
     phase: Phase = .execution,
     phase_start_step: u64 = 0,
     checkpoints: u64 = 0,
@@ -43,10 +44,12 @@ pub const Observer = struct {
         self.phase_start_step = step;
         self.last_symbol = "<unknown>";
         self.same_symbol_checkpoints = 0;
+        if (!self.enabled) return;
         std.debug.print("macho-processor: startup phase entered: {s} at step {d}\n", .{ @tagName(phase), step });
     }
 
     pub fn checkpoint(self: *Observer, snapshot: Snapshot) void {
+        if (!self.enabled) return;
         self.checkpoints +|= 1;
         if (std.mem.eql(u8, self.last_symbol, snapshot.symbol)) {
             self.same_symbol_checkpoints +|= 1;
@@ -69,6 +72,7 @@ pub const Observer = struct {
     }
 
     pub fn logSummary(self: *const Observer) void {
+        if (!self.enabled) return;
         std.debug.print(
             "macho-processor: startup observer: phase={s} checkpoints={d} phase_steps={d}\n",
             .{ @tagName(self.phase), self.checkpoints, self.phase_start_step },
@@ -77,7 +81,7 @@ pub const Observer = struct {
 };
 
 test "observer tracks repeated checkpoint symbols" {
-    var observer = Observer{};
+    var observer = Observer{ .enabled = true };
     const snapshot = Snapshot{
         .step = 1,
         .rip = 0x1000,
