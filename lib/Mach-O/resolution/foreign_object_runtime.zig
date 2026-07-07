@@ -34,6 +34,10 @@ pub const Runtime = struct {
     references: u64 = 0,
     mutations: u64 = 0,
     rejected: u64 = 0,
+    main_loop_entries: u64 = 0,
+    main_loop_bypasses: u64 = 0,
+    main_loop_quits: u64 = 0,
+    main_loop_depth: u32 = 0,
 
     pub fn dispatch(self: *Runtime, state: anytype, symbol: []const u8) ?Outcome {
         const name = normalize(symbol);
@@ -68,7 +72,26 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "gtk_init_check")) return .{ .handled = 1 };
         if (std.mem.eql(u8, name, "g_signal_connect_data")) return .{ .handled = self.calls };
         if (isBooleanQuery(name)) return .{ .handled = @intFromBool(self.isObject(state.regs.rdi)) };
-        if (std.mem.eql(u8, name, "gtk_dialog_run") or std.mem.eql(u8, name, "gtk_main_level")) {
+        if (std.mem.eql(u8, name, "gtk_main_level")) {
+            return .{ .handled = self.main_loop_depth };
+        }
+        if (std.mem.eql(u8, name, "gtk_main_quit")) {
+            self.main_loop_quits +|= 1;
+            if (self.main_loop_depth != 0) self.main_loop_depth -= 1;
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "gtk_main")) {
+            self.main_loop_entries +|= 1;
+            self.main_loop_depth +|= 1;
+            self.main_loop_bypasses +|= 1;
+            std.debug.print(
+                "macho-processor: GTK main loop bypass #{d}: no cooperative guest-thread/event dispatcher is active; returning from gtk_main will initiate guest shutdown\n",
+                .{self.main_loop_bypasses},
+            );
+            self.main_loop_depth -= 1;
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "gtk_dialog_run")) {
             return .{ .handled = 0 };
         }
 
@@ -78,8 +101,8 @@ pub const Runtime = struct {
 
     pub fn logSummary(self: *const Runtime) void {
         std.debug.print(
-            "macho-processor: foreign object runtime: calls={d} types={d} objects={d} allocations={d} refs={d} mutations={d} rejected={d}\n",
-            .{ self.calls, self.type_count, self.object_count, self.allocations, self.references, self.mutations, self.rejected },
+            "macho-processor: foreign object runtime: calls={d} types={d} objects={d} allocations={d} refs={d} mutations={d} rejected={d} main_loop(entries/bypasses/quits/depth)={d}/{d}/{d}/{d}\n",
+            .{ self.calls, self.type_count, self.object_count, self.allocations, self.references, self.mutations, self.rejected, self.main_loop_entries, self.main_loop_bypasses, self.main_loop_quits, self.main_loop_depth },
         );
     }
 
@@ -213,4 +236,10 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
     state.regs.rdi = object;
     try std.testing.expectEqual(object, runtime.dispatch(&state, "_g_object_ref_sink").?.handled);
     try std.testing.expectEqual(object, runtime.dispatch(&state, "_g_type_check_instance_cast").?.handled);
+
+    try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_gtk_main_level").?.handled);
+    try std.testing.expect(runtime.dispatch(&state, "_gtk_main").? == .handled_void);
+    try std.testing.expectEqual(@as(u64, 1), runtime.main_loop_entries);
+    try std.testing.expectEqual(@as(u64, 1), runtime.main_loop_bypasses);
+    try std.testing.expectEqual(@as(u32, 0), runtime.main_loop_depth);
 }

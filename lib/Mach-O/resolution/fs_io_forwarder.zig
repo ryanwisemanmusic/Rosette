@@ -14,6 +14,8 @@ pub const Forwarder = struct {
     seek_count: u64 = 0,
     access_count: u64 = 0,
     directory_read_count: u64 = 0,
+    errno_updates: u64 = 0,
+    last_errno: c_int = 0,
 
     pub fn init(allocator: std.mem.Allocator) Forwarder {
         return .{
@@ -41,7 +43,7 @@ pub const Forwarder = struct {
 
     pub fn open(self: *Forwarder, state: anytype) u64 {
         self.open_count += 1;
-        const path = state.guestCString(state.regs.rdi, 4096) orelse return @bitCast(@as(i64, -1));
+        const path = state.guestCString(state.regs.rdi, 4096) orelse return self.fail(state, .FAULT);
         var temp_buf: [4096]u8 = undefined;
         var translated_path = path;
         if (self.translator.translate(path, &temp_buf)) |t| {
@@ -49,16 +51,16 @@ pub const Forwarder = struct {
         }
         var path_buffer = std.ArrayList(u8).empty;
         defer path_buffer.deinit(self.translator.allocator);
-        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return @bitCast(@as(i64, -1));
-        path_buffer.append(self.translator.allocator, 0) catch return @bitCast(@as(i64, -1));
+        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return self.fail(state, .NOMEM);
+        path_buffer.append(self.translator.allocator, 0) catch return self.fail(state, .NOMEM);
 
         const host_fd = std.c.open(
             @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
             @bitCast(@as(u32, @truncate(state.regs.rsi))),
             @as(c_int, @intCast(state.regs.rdx & 0xFFFF)),
         );
-        if (host_fd < 0) return @bitCast(@as(i64, -1));
-        const guest_fd = self.fd_manager.register(host_fd, .file) orelse return @bitCast(@as(i64, -1));
+        if (host_fd < 0) return self.failHost(state, host_fd);
+        const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
         if (shouldTrace(self.open_count)) {
             std.debug.print("macho-processor: fs open #{d}: {s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, translated_path, guest_fd, host_fd });
         }
@@ -67,11 +69,8 @@ pub const Forwarder = struct {
 
     pub fn openat(self: *Forwarder, state: anytype) u64 {
         self.open_count += 1;
-        const dir_fd = self.fd_manager.hostFd(state.regs.rdi) orelse {
-            if (state.regs.rdi == fd_management.STREAM_FD_COUNT) return @bitCast(@as(i64, -1));
-            return @bitCast(@as(i64, -1));
-        };
-        const path = state.guestCString(state.regs.rsi, 4096) orelse return @bitCast(@as(i64, -1));
+        const dir_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return self.fail(state, .BADF);
+        const path = state.guestCString(state.regs.rsi, 4096) orelse return self.fail(state, .FAULT);
         var temp_buf: [4096]u8 = undefined;
         var translated_path = path;
         if (self.translator.translate(path, &temp_buf)) |t| {
@@ -79,8 +78,8 @@ pub const Forwarder = struct {
         }
         var path_buffer = std.ArrayList(u8).empty;
         defer path_buffer.deinit(self.translator.allocator);
-        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return @bitCast(@as(i64, -1));
-        path_buffer.append(self.translator.allocator, 0) catch return @bitCast(@as(i64, -1));
+        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return self.fail(state, .NOMEM);
+        path_buffer.append(self.translator.allocator, 0) catch return self.fail(state, .NOMEM);
 
         const host_fd = std.c.openat(
             dir_fd,
@@ -88,8 +87,8 @@ pub const Forwarder = struct {
             @bitCast(@as(u32, @truncate(state.regs.rdx))),
             @as(c_int, @intCast(state.regs.rcx & 0xFFFF)),
         );
-        if (host_fd < 0) return @bitCast(@as(i64, -1));
-        const guest_fd = self.fd_manager.register(host_fd, .file) orelse return @bitCast(@as(i64, -1));
+        if (host_fd < 0) return self.failHost(state, host_fd);
+        const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
         if (shouldTrace(self.open_count)) {
             std.debug.print("macho-processor: fs openat #{d}: {s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, translated_path, guest_fd, host_fd });
         }
@@ -200,17 +199,21 @@ pub const Forwarder = struct {
 
     pub fn fstat(self: *Forwarder, state: anytype) u64 {
         self.stat_count += 1;
-        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return self.fail(state, .BADF);
         var host_stat: std.c.Stat = undefined;
-        if (std.c.fstat(host_fd, &host_stat) != 0) return @bitCast(@as(i64, -1));
-        const destination = state.guestMemory(state.regs.rsi, @sizeOf(std.c.Stat)) orelse return @bitCast(@as(i64, -1));
+        const rc = std.c.fstat(host_fd, &host_stat);
+        if (rc != 0) return self.failHost(state, rc);
+        const destination = state.guestMemory(state.regs.rsi, @sizeOf(std.c.Stat)) orelse return self.fail(state, .FAULT);
         @memcpy(destination, std.mem.asBytes(&host_stat));
+        if (shouldTrace(self.stat_count)) {
+            std.debug.print("macho-processor: fs fstat #{d}: guest_fd={d} host_fd={d} mode=0{o}\n", .{ self.stat_count, state.regs.rdi, host_fd, host_stat.mode });
+        }
         return 0;
     }
 
     pub fn fstatat(self: *Forwarder, state: anytype) u64 {
         self.stat_count += 1;
-        const dir_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return @bitCast(@as(i64, -1));
+        const dir_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return self.fail(state, .BADF);
         return self.statAtDir(state, dir_fd, state.regs.rsi, state.regs.rdx, state.regs.rcx);
     }
 
@@ -452,12 +455,15 @@ pub const Forwarder = struct {
     }
 
     pub fn ftruncate(self: *Forwarder, state: anytype) u64 {
-        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        return @intCast(std.c.ftruncate(host_fd, @bitCast(state.regs.rsi)));
+        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return self.fail(state, .BADF);
+        const rc = std.c.ftruncate(host_fd, @bitCast(state.regs.rsi));
+        if (rc != 0) return self.failHost(state, rc);
+        std.debug.print("macho-processor: fs ftruncate: guest_fd={d} host_fd={d} length={d}\n", .{ state.regs.rdi, host_fd, state.regs.rsi });
+        return 0;
     }
 
     pub fn opendir(self: *Forwarder, state: anytype) u64 {
-        const path = state.guestCString(state.regs.rdi, 4096) orelse return 0;
+        const path = state.guestCString(state.regs.rdi, 4096) orelse return self.failNull(state, .FAULT);
         var temp_buf: [4096]u8 = undefined;
         var translated_path = path;
         if (self.translator.translate(path, &temp_buf)) |t| {
@@ -465,10 +471,10 @@ pub const Forwarder = struct {
         }
         var path_buffer = std.ArrayList(u8).empty;
         defer path_buffer.deinit(self.translator.allocator);
-        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return 0;
-        path_buffer.append(self.translator.allocator, 0) catch return 0;
-        const directory = std.c.opendir(@as([*:0]const u8, @ptrCast(path_buffer.items.ptr))) orelse return 0;
-        return self.fd_manager.registerDirectory(directory) orelse 0;
+        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return self.failNull(state, .NOMEM);
+        path_buffer.append(self.translator.allocator, 0) catch return self.failNull(state, .NOMEM);
+        const directory = std.c.opendir(@as([*:0]const u8, @ptrCast(path_buffer.items.ptr))) orelse return self.failHostNull(state);
+        return self.fd_manager.registerDirectory(directory) orelse self.failNull(state, .NOMEM);
     }
 
     pub fn readdir(self: *Forwarder, state: anytype) u64 {
@@ -488,12 +494,16 @@ pub const Forwarder = struct {
     }
 
     pub fn closedir(self: *Forwarder, state: anytype) u64 {
-        return @intCast(self.fd_manager.close(state.regs.rdi));
+        _ = self.fd_manager.hostFdWithKind(state.regs.rdi, .directory) orelse return self.fail(state, .BADF);
+        const rc = self.fd_manager.close(state.regs.rdi);
+        return if (rc != 0) self.failHost(state, rc) else 0;
     }
 
     pub fn dirfd(self: *Forwarder, state: anytype) u64 {
-        const host_fd = self.fd_manager.hostFdWithKind(state.regs.rdi, .directory) orelse return @bitCast(@as(i64, -1));
-        return @intCast(host_fd);
+        _ = self.fd_manager.hostFdWithKind(state.regs.rdi, .directory) orelse return self.fail(state, .BADF);
+        // Guest code must keep using the virtual descriptor. Returning the host
+        // descriptor makes the following openat/fstatat lookup fail or alias.
+        return state.regs.rdi;
     }
 
     pub fn pipe(self: *Forwarder, state: anytype) u64 {
@@ -522,7 +532,14 @@ pub const Forwarder = struct {
         const offset: i64 = @bitCast(state.regs.r9);
         if (length == 0) return @bitCast(@as(i64, -1));
         const map_flags: std.c.MAP = @bitCast(raw_flags);
-        if (state.regs.rdi != 0 and map_flags.FIXED) return @bitCast(@as(i64, -1));
+        if (state.regs.rdi != 0 and map_flags.FIXED) {
+            const host_fd = self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
+            if (state.regs.rdi % (64 * 1024) != 0) return @bitCast(@as(i64, -1));
+            return if (state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset)))
+                state.regs.rdi
+            else
+                @bitCast(@as(i64, -1));
+        }
         const mapped = state.guestHeapAllocate(length, 4096) orelse return @bitCast(@as(i64, -1));
         const destination = state.guestMemory(mapped, length) orelse {
             state.guestHeapRelease(mapped);
@@ -545,6 +562,7 @@ pub const Forwarder = struct {
 
     pub fn munmap(self: *Forwarder, state: anytype) u64 {
         _ = self;
+        if (state.guestUnmapFile(state.regs.rdi, state.regs.rsi)) return 0;
         if (!state.guestHeapContains(state.regs.rdi)) return @bitCast(@as(i64, -1));
         state.guestHeapRelease(state.regs.rdi);
         return 0;
@@ -557,7 +575,7 @@ pub const Forwarder = struct {
 
     pub fn logSummary(self: *const Forwarder) void {
         std.debug.print(
-            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} access={d}\n",
+            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} access={d} errno_updates={d} last_errno={d}\n",
             .{
                 self.open_count,
                 self.read_count,
@@ -568,6 +586,8 @@ pub const Forwarder = struct {
                 self.directory_read_count,
                 self.mmap_count,
                 self.access_count,
+                self.errno_updates,
+                self.last_errno,
             },
         );
         self.fd_manager.logSummary();
@@ -579,7 +599,7 @@ pub const Forwarder = struct {
     }
 
     fn statAtDir(self: *Forwarder, state: anytype, dir_fd: c_int, path_guest: u64, stat_guest: u64, flags_guest: u64) u64 {
-        const path = state.guestCString(path_guest, 4096) orelse return @bitCast(@as(i64, -1));
+        const path = state.guestCString(path_guest, 4096) orelse return self.fail(state, .FAULT);
         var temp_buf: [4096]u8 = undefined;
         var translated_path = path;
         if (self.translator.translate(path, &temp_buf)) |t| {
@@ -587,8 +607,8 @@ pub const Forwarder = struct {
         }
         var path_buffer = std.ArrayList(u8).empty;
         defer path_buffer.deinit(self.translator.allocator);
-        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return @bitCast(@as(i64, -1));
-        path_buffer.append(self.translator.allocator, 0) catch return @bitCast(@as(i64, -1));
+        path_buffer.appendSlice(self.translator.allocator, translated_path) catch return self.fail(state, .NOMEM);
+        path_buffer.append(self.translator.allocator, 0) catch return self.fail(state, .NOMEM);
 
         var host_stat: std.c.Stat = undefined;
         const effective_dir_fd = if (dir_fd == fd_management.STREAM_FD_COUNT) std.c.AT.FDCWD else dir_fd;
@@ -598,13 +618,87 @@ pub const Forwarder = struct {
             &host_stat,
             @intCast(flags_guest),
         );
-        if (rc != 0) return @bitCast(@as(i64, -1));
-        const destination = state.guestMemory(stat_guest, @sizeOf(std.c.Stat)) orelse return @bitCast(@as(i64, -1));
+        if (rc != 0) return self.failHost(state, rc);
+        const destination = state.guestMemory(stat_guest, @sizeOf(std.c.Stat)) orelse return self.fail(state, .FAULT);
         @memcpy(destination, std.mem.asBytes(&host_stat));
         return 0;
+    }
+
+    fn fail(self: *Forwarder, state: anytype, err: std.c.E) u64 {
+        self.recordErrno(state, err);
+        return @bitCast(@as(i64, -1));
+    }
+
+    fn failNull(self: *Forwarder, state: anytype, err: std.c.E) u64 {
+        self.recordErrno(state, err);
+        return 0;
+    }
+
+    fn failHost(self: *Forwarder, state: anytype, rc: anytype) u64 {
+        return self.fail(state, std.c.errno(rc));
+    }
+
+    fn failHostNull(self: *Forwarder, state: anytype) u64 {
+        return self.failNull(state, std.c.errno(-1));
+    }
+
+    fn recordErrno(self: *Forwarder, state: anytype, err: std.c.E) void {
+        const value: c_int = @intCast(@intFromEnum(err));
+        self.errno_updates +|= 1;
+        self.last_errno = value;
+        state.setGuestErrno(value);
     }
 };
 
 fn shouldTrace(count: u64) bool {
     return count <= 8 or count % 1000 == 0;
+}
+
+test "directory descriptors remain virtual and fstatat propagates ENOENT" {
+    const TestState = struct {
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        memory: [8192]u8 = [_]u8{0} ** 8192,
+        guest_errno: c_int = 0,
+
+        fn guestCString(self: *@This(), address: u64, max_len: usize) ?[]const u8 {
+            if (address >= self.memory.len) return null;
+            const start: usize = @intCast(address);
+            const limit = @min(self.memory.len, start + max_len);
+            const end = std.mem.indexOfScalar(u8, self.memory[start..limit], 0) orelse return null;
+            return self.memory[start .. start + end];
+        }
+
+        fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+            const start: usize = std.math.cast(usize, address) orelse return null;
+            const len: usize = std.math.cast(usize, length) orelse return null;
+            const end = std.math.add(usize, start, len) catch return null;
+            if (end > self.memory.len) return null;
+            return self.memory[start..end];
+        }
+
+        fn setGuestErrno(self: *@This(), value: c_int) void {
+            self.guest_errno = value;
+        }
+    };
+
+    var forwarder = Forwarder.init(std.testing.allocator);
+    defer forwarder.deinit();
+    var state = TestState{};
+    @memcpy(state.memory[64..68], "/tmp");
+    state.memory[68] = 0;
+    state.regs.rdi = 64;
+    const guest_dir = forwarder.opendir(&state);
+    try std.testing.expect(guest_dir >= fd_management.STREAM_FD_COUNT);
+
+    state.regs.rdi = guest_dir;
+    try std.testing.expectEqual(guest_dir, forwarder.dirfd(&state));
+
+    const missing = "rosette-fstatat-errno-regression-file";
+    @memcpy(state.memory[128 .. 128 + missing.len], missing);
+    state.memory[128 + missing.len] = 0;
+    state.regs.rsi = 128;
+    state.regs.rdx = 512;
+    state.regs.rcx = std.c.AT.SYMLINK_NOFOLLOW;
+    try std.testing.expectEqual(std.math.maxInt(u64), forwarder.fstatat(&state));
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(std.c.E.NOENT)), state.guest_errno);
 }

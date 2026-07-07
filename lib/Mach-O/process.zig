@@ -15,6 +15,7 @@ const smart_stub_generator = @import("resolution/smart_stub_generator.zig");
 const cxx_exception_diagnostics = @import("resolution/cxx_exception_diagnostics.zig");
 const fs_io_forwarder = @import("resolution/fs_io_forwarder.zig");
 const memory_management_forwarder = @import("resolution/memory_management_forwarder.zig");
+const sparse_virtual_memory = @import("resolution/sparse_virtual_memory.zig");
 const memory_provenance = @import("resolution/memory_provenance.zig");
 const pointer_firewall = @import("resolution/pointer_firewall.zig");
 const semantic_fault_classifier = @import("resolution/semantic_fault_classifier.zig");
@@ -29,6 +30,8 @@ const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
 const contract = @import("contract");
+
+extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
 
 const log = std.log.scoped(.macho);
 
@@ -64,6 +67,8 @@ const GUEST_FILE_MAX: usize = 32;
 const BOUND_IMPORT_THUNK_BASE: u64 = 0xFFFF_FC00_0000_0000;
 const BOUND_IMPORT_THUNK_STRIDE: u64 = 16;
 const INITIALIZER_RETURN_SENTINEL: u64 = 0xFFFF_FB00_0000_0000;
+const GUEST_THREAD_RETURN_SENTINEL: u64 = 0xFFFF_FA00_0000_0000;
+const DEFAULT_GUEST_THREAD_STACK_SIZE: u64 = 2 * 1024 * 1024;
 const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 16;
@@ -191,6 +196,12 @@ const InitializerCheckpoint = struct {
     guest_errno_address: u64,
 };
 
+const CooperativeUiContext = struct {
+    regs: Regs,
+    xmm: [16][16]u8,
+    ymm_hi: [16][16]u8,
+};
+
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
     mem: []u8,
@@ -227,6 +238,10 @@ pub const MachOState = struct {
     launch_options: launch_argument_accelerator.Filter = .{},
     startup: startup_observer.Observer = .{},
     guest_errno_address: u64 = 0,
+    cooperative_ui_context: ?CooperativeUiContext = null,
+    active_guest_thread: u64 = 0,
+    cooperative_thread_switches: u64 = 0,
+    cooperative_thread_returns: u64 = 0,
     guest_stdin_pointer_address: u64 = 0,
     guest_stdout_pointer_address: u64 = 0,
     guest_stderr_pointer_address: u64 = 0,
@@ -247,6 +262,7 @@ pub const MachOState = struct {
     pthreads: pthread_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
     memory_forwarder: memory_management_forwarder.Manager,
+    sparse_memory: sparse_virtual_memory.Manager,
     memory_regions: memory_provenance.Registry,
     pointer_firewall: pointer_firewall.Firewall,
     page_permissions: []u8,
@@ -377,6 +393,7 @@ pub const MachOState = struct {
             .initializer_memory = memory_transaction.Journal.init(allocator, PAGE_SIZE),
             .fs_forwarder = fs_io_forwarder.Forwarder.init(allocator),
             .memory_forwarder = memory_management_forwarder.Manager.init(allocator),
+            .sparse_memory = sparse_virtual_memory.Manager.init(allocator),
             .memory_regions = memory_provenance.Registry.init(allocator),
             .pointer_firewall = pointer_firewall.Firewall.init(allocator),
             .page_permissions = page_permissions,
@@ -499,6 +516,7 @@ pub const MachOState = struct {
         self.dynamic_forwarder.deinit();
         self.fs_forwarder.deinit();
         self.memory_forwarder.deinit();
+        self.sparse_memory.deinit();
         self.memory_regions.deinit();
         self.pointer_firewall.deinit();
         self.allocator.free(self.page_permissions);
@@ -667,9 +685,15 @@ pub const MachOState = struct {
     }
 
     fn describeGuestAccess(self: *const MachOState, address: u64, size: u64, access: GuestAccess) GuestAccessDescription {
+        const sparse_mapped = self.sparse_memory.contains(address, size);
+        const sparse_allowed = switch (access) {
+            .read => self.sparse_memory.bytesConst(address, size) != null,
+            .write => false,
+            .execute => false,
+        };
         return .{
-            .mapped = mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address) != null,
-            .allowed = self.translateGuest(address, size, access) != null,
+            .mapped = sparse_mapped or mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address) != null,
+            .allowed = sparse_allowed or self.translateGuest(address, size, access) != null,
             .region = self.memory_regions.find(address, size),
             .pointer_policy = self.pointer_firewall.policyAt(address),
         };
@@ -690,26 +714,34 @@ pub const MachOState = struct {
     }
 
     pub fn read8(self: *const MachOState, vaddr: u64) u8 {
+        if (self.sparse_memory.bytesConst(vaddr, 1)) |bytes| return bytes[0];
         const off = self.translateGuest(vaddr, 1, .read) orelse return 0;
         return self.mem[off];
     }
 
     pub fn read16(self: *const MachOState, vaddr: u64) u16 {
+        if (self.sparse_memory.bytesConst(vaddr, 2)) |bytes| return std.mem.readInt(u16, bytes[0..2], .little);
         const off = self.translateGuest(vaddr, 2, .read) orelse return 0;
         return std.mem.readInt(u16, self.mem[off..][0..2], .little);
     }
 
     pub fn read32(self: *const MachOState, vaddr: u64) u32 {
+        if (self.sparse_memory.bytesConst(vaddr, 4)) |bytes| return std.mem.readInt(u32, bytes[0..4], .little);
         const off = self.translateGuest(vaddr, 4, .read) orelse return 0;
         return std.mem.readInt(u32, self.mem[off..][0..4], .little);
     }
 
     pub fn read64(self: *const MachOState, vaddr: u64) u64 {
+        if (self.sparse_memory.bytesConst(vaddr, 8)) |bytes| return std.mem.readInt(u64, bytes[0..8], .little);
         const off = self.translateGuest(vaddr, 8, .read) orelse return 0;
         return std.mem.readInt(u64, self.mem[off..][0..8], .little);
     }
 
     pub fn write8(self: *MachOState, vaddr: u64, val: u8) void {
+        if (self.sparse_memory.bytes(vaddr, 1, true)) |bytes| {
+            bytes[0] = val;
+            return;
+        }
         const off = self.translateGuest(vaddr, 1, .write) orelse return;
         if (off < self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 1);
@@ -719,6 +751,10 @@ pub const MachOState = struct {
     }
 
     pub fn write16(self: *MachOState, vaddr: u64, val: u16) void {
+        if (self.sparse_memory.bytes(vaddr, 2, true)) |bytes| {
+            std.mem.writeInt(u16, bytes[0..2], val, .little);
+            return;
+        }
         const off = self.translateGuest(vaddr, 2, .write) orelse return;
         if (off + 2 <= self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 2);
@@ -728,6 +764,10 @@ pub const MachOState = struct {
     }
 
     pub fn write32(self: *MachOState, vaddr: u64, val: u32) void {
+        if (self.sparse_memory.bytes(vaddr, 4, true)) |bytes| {
+            std.mem.writeInt(u32, bytes[0..4], val, .little);
+            return;
+        }
         const off = self.translateGuest(vaddr, 4, .write) orelse return;
         if (off + 4 <= self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 4);
@@ -737,6 +777,10 @@ pub const MachOState = struct {
     }
 
     pub fn write64(self: *MachOState, vaddr: u64, val: u64) void {
+        if (self.sparse_memory.bytes(vaddr, 8, true)) |bytes| {
+            std.mem.writeInt(u64, bytes[0..8], val, .little);
+            return;
+        }
         const off = self.translateGuest(vaddr, 8, .write) orelse return;
         if (off + 8 <= self.mem.len) {
             self.initializer_memory.capture(self.mem, @intCast(off), 8);
@@ -760,6 +804,16 @@ pub const MachOState = struct {
 
     pub fn readMemVal(self: *MachOState, addr: u64, size: Size) u64 {
         const bytes = bytesForSize(size);
+        if (self.sparse_memory.bytesConst(addr, bytes)) |storage| {
+            const value: u64 = switch (size) {
+                .bits8 => storage[0],
+                .bits16 => std.mem.readInt(u16, storage[0..2], .little),
+                .bits32 => std.mem.readInt(u32, storage[0..4], .little),
+                .bits64 => std.mem.readInt(u64, storage[0..8], .little),
+            };
+            self.recordMemoryAccess(addr, size, "read", value);
+            return value;
+        }
         const off = self.translateGuest(addr, bytes, .read) orelse {
             self.terminateForGuestAccess(addr, bytes, .read, @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op));
             return 0;
@@ -776,6 +830,16 @@ pub const MachOState = struct {
 
     pub fn writeMemVal(self: *MachOState, addr: u64, size: Size, val: u64) void {
         const bytes = bytesForSize(size);
+        if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
+            self.recordMemoryAccess(addr, size, "write", val);
+            switch (size) {
+                .bits8 => storage[0] = @truncate(val),
+                .bits16 => std.mem.writeInt(u16, storage[0..2], @truncate(val), .little),
+                .bits32 => std.mem.writeInt(u32, storage[0..4], @truncate(val), .little),
+                .bits64 => std.mem.writeInt(u64, storage[0..8], val, .little),
+            }
+            return;
+        }
         const off = self.translateGuest(addr, bytes, .write) orelse {
             self.terminateForGuestAccess(addr, bytes, .write, @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op));
             return;
@@ -801,6 +865,8 @@ pub const MachOState = struct {
     }
 
     fn ensureGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) bool {
+        if (access == .read and self.sparse_memory.bytesConst(address, bytes) != null) return true;
+        if (access == .write and self.sparse_memory.bytes(address, bytes, true) != null) return true;
         if (self.translateGuest(address, bytes, access) != null) return true;
         self.terminateForGuestAccess(address, bytes, access, instruction);
         return false;
@@ -879,6 +945,7 @@ pub const MachOState = struct {
     }
 
     pub fn guestMemory(self: *MachOState, addr: u64, count: u64) ?[]u8 {
+        if (self.sparse_memory.bytes(addr, count, true)) |bytes| return bytes;
         if (count > std.math.maxInt(usize)) return null;
         const off = self.translateGuest(addr, count, .write) orelse return null;
         const off_usize: usize = @intCast(off);
@@ -899,6 +966,7 @@ pub const MachOState = struct {
     }
 
     pub fn guestMemoryConst(self: *const MachOState, addr: u64, count: u64) ?[]const u8 {
+        if (self.sparse_memory.bytesConst(addr, count)) |bytes| return bytes;
         if (count > std.math.maxInt(usize)) return null;
         const off = self.translateGuest(addr, count, .read) orelse return null;
         const off_usize: usize = @intCast(off);
@@ -951,6 +1019,21 @@ pub const MachOState = struct {
 
     pub fn guestHeapContains(self: *const MachOState, address: u64) bool {
         return self.memory_forwarder.allocationSize(address) != null;
+    }
+
+    pub fn guestMapFile(self: *MachOState, address: u64, length: u64, prot: u32, flags: u32, host_fd: std.posix.fd_t, offset: u64) bool {
+        if (!self.sparse_memory.mapFile(address, length, prot, flags, host_fd, offset)) return false;
+        _ = self.memory_regions.register(address, length, .{
+            .read = prot & 1 != 0,
+            .write = prot & 2 != 0,
+            .execute = prot & 4 != 0,
+        }, .guest_mmap, "sparse 64K guest mmap", self.regs.rip);
+        _ = self.pointer_firewall.register(address, length, .{ .kind = .guest_backed, .may_dereference = true, .may_execute = prot & 4 != 0, .owner = "sparse 64K guest mmap" });
+        return true;
+    }
+
+    pub fn guestUnmapFile(self: *MachOState, address: u64, length: u64) bool {
+        return self.sparse_memory.unmap(address, length);
     }
 
     pub fn guestCString(self: *const MachOState, addr: u64, max_len: usize) ?[]const u8 {
@@ -1348,8 +1431,24 @@ pub const MachOState = struct {
 
     fn handleImportImpl(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
         const name = imported.name;
+        if ((std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) and
+            self.foreign_objects.main_loop_bypasses != 0)
+        {
+            std.debug.print(
+                "macho-processor: guest exit attribution: follows {d} bypassed GTK main loop(s); this is UI event-loop shutdown, not a filesystem or config-write failure\n",
+                .{self.foreign_objects.main_loop_bypasses},
+            );
+        }
         if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove")) {
             return self.handleGuestMemoryCopy(name);
+        }
+        if (std.mem.eql(u8, name, "_gtk_main") and self.beginGtkMainLoop()) {
+            return .control_transferred;
+        }
+        if (std.mem.eql(u8, name, "_gtk_main_quit") and self.cooperative_ui_context != null) {
+            self.foreign_objects.main_loop_quits +|= 1;
+            self.restoreGtkMainLoopCaller("gtk_main_quit");
+            return .control_transferred;
         }
         if (self.metadata.definedSymbolAddress(name)) |target| {
             if (target != imported.stub_address and self.isExecutableAddress(target)) {
@@ -2031,6 +2130,25 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "_ftruncate")) {
             return .{ .handled = self.fs_forwarder.ftruncate(self) };
         }
+        if (std.mem.eql(u8, name, "_shm_open")) {
+            if (self.verbose_trace) std.debug.print("    [import] shm_open(name=0x{x}, oflag=0x{x}, mode=0x{x})\n", .{ self.regs.rdi, self.regs.rsi, self.regs.rdx });
+            const path = self.guestCString(self.regs.rdi, 4096) orelse return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
+            var path_buffer = std.ArrayList(u8).empty;
+            defer path_buffer.deinit(self.allocator);
+            path_buffer.appendSlice(self.allocator, path) catch return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
+            path_buffer.append(self.allocator, 0) catch return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
+            const host_fd = shm_open(
+                @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
+                @as(c_int, @bitCast(@as(u32, @truncate(self.regs.rsi)))),
+                @as(std.c.mode_t, @intCast(self.regs.rdx & 0xFFFF)),
+            );
+            if (host_fd < 0) return .{ .handled = @bitCast(@as(i64, @as(c_int, host_fd))) };
+            const guest_fd = self.fs_forwarder.fd_manager.register(host_fd, .file) orelse {
+                _ = std.c.close(host_fd);
+                return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
+            };
+            return .{ .handled = guest_fd };
+        }
         if (std.mem.eql(u8, name, "_opendir$INODE64") or std.mem.eql(u8, name, "_opendir")) {
             return .{ .handled = self.fs_forwarder.opendir(self) };
         }
@@ -2187,6 +2305,11 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "__ZNSt3__16thread4joinEv")) {
             if (self.verbose_trace) std.debug.print("    [import] std::thread::join(object=0x{x})\n", .{self.regs.rdi});
             return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__119__thread_local_dataEv")) {
+            const allocation = self.guestAlloc(64, 16) orelse return .{ .unsupported = 0 };
+            if (self.verbose_trace) std.debug.print("    [import] __thread_local_data() -> 0x{x}\n", .{allocation});
+            return .{ .handled = allocation };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev")) {
             const object = self.regs.rdi;
@@ -2456,7 +2579,7 @@ pub const MachOState = struct {
         return guest_fd;
     }
 
-    fn setGuestErrno(self: *MachOState, value: c_int) void {
+    pub fn setGuestErrno(self: *MachOState, value: c_int) void {
         if (self.guest_errno_address == 0) {
             self.guest_errno_address = self.guestAlloc(@sizeOf(c_int), @alignOf(c_int)) orelse return;
         }
@@ -2581,12 +2704,12 @@ pub const MachOState = struct {
     }
 
     fn hostWriteAll(self: *MachOState, file: *GuestFile, bytes: []const u8) bool {
-        _ = self;
         if (file.fd < 0) return false;
         var written: usize = 0;
         while (written < bytes.len) {
             const rc = std.c.write(file.fd, bytes.ptr + written, bytes.len - written);
             if (rc < 0) {
+                self.setGuestErrno(@intCast(@intFromEnum(std.c.errno(rc))));
                 file.error_flag = true;
                 return false;
             }
@@ -2612,12 +2735,27 @@ pub const MachOState = struct {
     }
 
     fn handleFdopen(self: *MachOState) ?u64 {
-        _ = self.guestCString(self.regs.rsi, 32) orelse return null;
-        const host_fd = self.fs_forwarder.fd_manager.take(self.regs.rdi) orelse return null;
-        return self.allocGuestFile(host_fd, .regular) orelse {
-            _ = std.c.close(host_fd);
+        const mode = self.guestCString(self.regs.rsi, 32) orelse {
+            self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
+            std.debug.print("macho-processor: fdopen rejected: unreadable mode pointer=0x{x}\n", .{self.regs.rsi});
             return null;
         };
+        const guest_fd = self.regs.rdi;
+        const host_fd = self.fs_forwarder.fd_manager.take(guest_fd) orelse {
+            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
+            std.debug.print("macho-processor: fdopen rejected: invalid guest_fd={d} mode={s}\n", .{ guest_fd, mode });
+            return null;
+        };
+        const handle = self.allocGuestFile(host_fd, .regular) orelse {
+            _ = std.c.close(host_fd);
+            self.setGuestErrno(@intFromEnum(std.c.E.NOMEM));
+            return null;
+        };
+        std.debug.print(
+            "macho-processor: fdopen: guest_fd={d} host_fd={d} mode={s} -> FILE=0x{x}\n",
+            .{ guest_fd, host_fd, mode, handle },
+        );
+        return handle;
     }
 
     fn handleFileno(self: *MachOState) u64 {
@@ -2661,10 +2799,25 @@ pub const MachOState = struct {
         const element_size = self.regs.rsi;
         const element_count = self.regs.rdx;
         if (element_size == 0 or element_count == 0) return 0;
-        const byte_count = std.math.mul(u64, element_size, element_count) catch return 0;
-        const bytes = self.guestMemoryConst(self.regs.rdi, byte_count) orelse return 0;
-        const file = self.guestFileFromHandle(self.regs.rcx) orelse return 0;
-        if (!self.hostWriteAll(file, bytes)) return 0;
+        const byte_count = std.math.mul(u64, element_size, element_count) catch {
+            self.setGuestErrno(@intFromEnum(std.c.E.OVERFLOW));
+            return 0;
+        };
+        const bytes = self.guestMemoryConst(self.regs.rdi, byte_count) orelse {
+            self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
+            std.debug.print("macho-processor: fwrite rejected: source=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
+            return 0;
+        };
+        const file = self.guestFileFromHandle(self.regs.rcx) orelse {
+            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
+            std.debug.print("macho-processor: fwrite rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
+            return 0;
+        };
+        if (!self.hostWriteAll(file, bytes)) {
+            std.debug.print("macho-processor: fwrite failed: FILE=0x{x} host_fd={d} requested={d}\n", .{ self.regs.rcx, file.fd, byte_count });
+            return 0;
+        }
+        std.debug.print("macho-processor: fwrite: FILE=0x{x} host_fd={d} bytes={d} elements={d}\n", .{ self.regs.rcx, file.fd, byte_count, element_count });
         return element_count;
     }
 
@@ -3699,6 +3852,10 @@ pub const MachOState = struct {
     }
 
     fn step(self: *MachOState) bool {
+        if (self.regs.rip == GUEST_THREAD_RETURN_SENTINEL) {
+            self.finishActiveGuestThread();
+            return !self.terminated;
+        }
         if (self.handleInternalCompatibility()) return !self.terminated;
         if (self.handleBoundImportThunk()) return !self.terminated;
         if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
@@ -3790,6 +3947,82 @@ pub const MachOState = struct {
             self.regs.rip +%= decoded.len;
         }
         return !self.terminated;
+    }
+
+    fn beginGtkMainLoop(self: *MachOState) bool {
+        if (self.cooperative_ui_context != null) return false;
+        const deferred = self.pthreads.takeNewestDeferred() orelse return false;
+        self.cooperative_ui_context = .{
+            .regs = self.regs,
+            .xmm = self.xmm,
+            .ymm_hi = self.ymm_hi,
+        };
+        self.foreign_objects.main_loop_entries +|= 1;
+        self.foreign_objects.main_loop_depth +|= 1;
+        if (!self.startDeferredGuestThread(deferred)) {
+            self.cooperative_ui_context = null;
+            self.foreign_objects.main_loop_depth -|= 1;
+            return false;
+        }
+        std.debug.print(
+            "macho-processor: GTK cooperative main loop entered: guest_thread=0x{x} start=0x{x} deferred_remaining={d}\n",
+            .{ deferred.handle, deferred.start_routine, self.pthreads.deferred_threads },
+        );
+        return true;
+    }
+
+    fn startDeferredGuestThread(self: *MachOState, deferred: pthread_runtime.DeferredThread) bool {
+        if (!self.isExecutableAddress(deferred.start_routine)) {
+            std.debug.print("macho-processor: deferred guest thread rejected: start=0x{x} is not executable\n", .{deferred.start_routine});
+            return false;
+        }
+        const requested_stack = if (deferred.stack_size == 0) DEFAULT_GUEST_THREAD_STACK_SIZE else deferred.stack_size;
+        const stack_size = std.math.clamp(requested_stack, @as(u64, 64 * 1024), @as(u64, 32 * 1024 * 1024));
+        const stack_base = self.guestAlloc(stack_size, 16) orelse return false;
+        self.regs = .{};
+        self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
+        self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
+        self.regs.rip = deferred.start_routine;
+        self.regs.rdi = deferred.argument;
+        self.regs.rsp = alignDown(stack_base + stack_size, 16);
+        self.push(GUEST_THREAD_RETURN_SENTINEL);
+        self.active_guest_thread = deferred.handle;
+        self.cooperative_thread_switches +|= 1;
+        return true;
+    }
+
+    fn finishActiveGuestThread(self: *MachOState) void {
+        if (self.active_guest_thread != 0) {
+            self.pthreads.markCompleted(self.active_guest_thread);
+            self.cooperative_thread_returns +|= 1;
+            std.debug.print("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
+            self.active_guest_thread = 0;
+        }
+        if (self.pthreads.takeNewestDeferred()) |next| {
+            if (self.startDeferredGuestThread(next)) return;
+        }
+        self.restoreGtkMainLoopCaller("all cooperative guest threads returned");
+    }
+
+    fn restoreGtkMainLoopCaller(self: *MachOState, reason: []const u8) void {
+        const context = self.cooperative_ui_context orelse return;
+        self.regs = context.regs;
+        self.xmm = context.xmm;
+        self.ymm_hi = context.ymm_hi;
+        self.cooperative_ui_context = null;
+        self.active_guest_thread = 0;
+        self.foreign_objects.main_loop_depth -|= 1;
+        const return_address = self.pop();
+        if (return_address == 0 or !self.isExecutableAddress(return_address)) {
+            self.terminateForInvalidControlTransfer(.{
+                .kind = "gtk_main cooperative return",
+                .instruction_address = self.regs.rip,
+                .target_address = return_address,
+            });
+            return;
+        }
+        self.regs.rip = return_address;
+        std.debug.print("macho-processor: GTK cooperative main loop exited: {s}\n", .{reason});
     }
 
     fn handleSyntheticRuntimeThunk(self: *MachOState) bool {

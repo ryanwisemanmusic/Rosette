@@ -17,6 +17,13 @@ const Attribute = struct {
     stack_size: u64 = 0,
 };
 
+pub const DeferredThread = struct {
+    handle: u64,
+    start_routine: u64,
+    argument: u64,
+    stack_size: u64,
+};
+
 const Thread = struct {
     active: bool = false,
     handle: u64 = 0,
@@ -25,6 +32,8 @@ const Thread = struct {
     stack_size: u64 = 0,
     joined: bool = false,
     cancelled: bool = false,
+    started: bool = false,
+    completed: bool = false,
 };
 
 const Mutex = struct {
@@ -46,6 +55,8 @@ pub const Runtime = struct {
     collapsed_waits: u64 = 0,
     condition_notifications: u64 = 0,
     tls_sets: u64 = 0,
+    scheduled_threads: u64 = 0,
+    completed_threads: u64 = 0,
 
     pub fn dispatch(self: *Runtime, state: anytype, name: []const u8) ?Outcome {
         if (std.mem.eql(u8, name, "_pthread_self")) return .{ .handled = CURRENT_THREAD_HANDLE };
@@ -62,6 +73,7 @@ pub const Runtime = struct {
             std.mem.eql(u8, name, "_pthread_yield_np")) return .{ .handled = 0 };
         if (std.mem.eql(u8, name, "_pthread_getname_np")) return .{ .handled = self.getName(state) };
         if (std.mem.eql(u8, name, "_pthread_getschedparam")) return .{ .handled = self.getSchedule(state) };
+        if (std.mem.eql(u8, name, "_pthread_getspecific")) return .{ .handled = 0 };
         if (std.mem.eql(u8, name, "_pthread_setspecific")) {
             self.tls_sets +|= 1;
             return .{ .handled = 0 };
@@ -92,10 +104,12 @@ pub const Runtime = struct {
     pub fn logSummary(self: *const Runtime) void {
         if (self.created_threads == 0 and self.mutex_locks == 0 and self.collapsed_waits == 0 and self.tls_sets == 0) return;
         std.debug.print(
-            "macho-processor: pthread runtime: created={d} deferred={d} joined={d} cancelled={d} mutex(lock/unlock)={d}/{d} cond_notify={d} waits_collapsed={d} tls_sets={d}\n",
+            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} cancelled={d} mutex(lock/unlock)={d}/{d} cond_notify={d} waits_collapsed={d} tls_sets={d}\n",
             .{
                 self.created_threads,
                 self.deferred_threads,
+                self.scheduled_threads,
+                self.completed_threads,
                 self.joined_threads,
                 self.cancelled_threads,
                 self.mutex_locks,
@@ -105,6 +119,32 @@ pub const Runtime = struct {
                 self.tls_sets,
             },
         );
+    }
+
+    pub fn takeNewestDeferred(self: *Runtime) ?DeferredThread {
+        var index = self.threads.len;
+        while (index != 0) {
+            index -= 1;
+            const thread = &self.threads[index];
+            if (!thread.active or thread.started or thread.cancelled) continue;
+            thread.started = true;
+            self.deferred_threads -|= 1;
+            self.scheduled_threads +|= 1;
+            return .{
+                .handle = thread.handle,
+                .start_routine = thread.start_routine,
+                .argument = thread.argument,
+                .stack_size = thread.stack_size,
+            };
+        }
+        return null;
+    }
+
+    pub fn markCompleted(self: *Runtime, handle: u64) void {
+        const thread = self.threadForHandle(handle) orelse return;
+        if (thread.completed) return;
+        thread.completed = true;
+        self.completed_threads +|= 1;
     }
 
     fn attributeInit(self: *Runtime, state: anytype) u64 {
@@ -291,4 +331,10 @@ test "pthread runtime records deferred guest threads" {
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_pthread_create").?.handled);
     try std.testing.expectEqual(@as(u64, 1), runtime.deferred_threads);
     try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024), runtime.threads[0].stack_size);
+    const deferred = runtime.takeNewestDeferred().?;
+    try std.testing.expectEqual(@as(u64, 0x1234), deferred.start_routine);
+    try std.testing.expectEqual(@as(u64, 0x5678), deferred.argument);
+    try std.testing.expectEqual(@as(u64, 0), runtime.deferred_threads);
+    runtime.markCompleted(deferred.handle);
+    try std.testing.expectEqual(@as(u64, 1), runtime.completed_threads);
 }
