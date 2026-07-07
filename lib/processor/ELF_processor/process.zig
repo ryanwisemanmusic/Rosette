@@ -1800,24 +1800,33 @@ pub const ElfState = struct {
             .setcc_mem8 => {
                 self.writeMemVal(d.addr, .bits8, if (evalCond(self.regs.rflags, d.cond)) 1 else 0);
             },
-            .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64 => {
+            .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .cmpxchg_reg32_reg32, .cmpxchg_reg64_reg64 => {
                 const size = d.size;
                 const accum = self.regVal(.al_ax_eax_rax, size);
-                const old = self.readMemVal(d.addr, size);
+                const old = if (d.is_reg_form) self.regVal(d.dst_reg, size) else self.readMemVal(d.addr, size);
                 self.setFlagsSub(accum, old, accum -% old, size);
                 if ((accum & maskForSize(size)) == (old & maskForSize(size))) {
-                    self.writeMemVal(d.addr, size, self.regVal(d.src_reg, size));
+                    if (d.is_reg_form) {
+                        self.setReg(d.dst_reg, size, self.regVal(d.src_reg, size));
+                    } else {
+                        self.writeMemVal(d.addr, size, self.regVal(d.src_reg, size));
+                    }
                     self.setFlag(RFL_ZF, true);
                 } else {
                     self.setReg(.al_ax_eax_rax, size, old);
                     self.setFlag(RFL_ZF, false);
                 }
             },
-            .xchg_mem32_reg32, .xchg_mem64_reg64 => {
-                const old_mem = self.readMemVal(d.addr, d.size);
-                const old_reg = self.regVal(d.src_reg, d.size);
-                self.writeMemVal(d.addr, d.size, old_reg);
-                self.setReg(d.src_reg, d.size, old_mem);
+            .xchg_mem32_reg32, .xchg_mem64_reg64, .xchg_reg32_reg32, .xchg_reg64_reg64 => {
+                const size = d.size;
+                const old_mem = if (d.is_reg_form) self.regVal(d.dst_reg, size) else self.readMemVal(d.addr, size);
+                const old_reg = self.regVal(d.src_reg, size);
+                if (d.is_reg_form) {
+                    self.setReg(d.dst_reg, size, old_reg);
+                } else {
+                    self.writeMemVal(d.addr, size, old_reg);
+                }
+                self.setReg(d.src_reg, size, old_mem);
             },
             .xadd_mem32_reg32, .xadd_mem64_reg64 => {
                 const old_mem = self.readMemVal(d.addr, d.size);

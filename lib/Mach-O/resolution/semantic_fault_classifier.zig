@@ -49,8 +49,19 @@ pub fn classify(context: Context) Classification {
     }
     const near_null = context.address < 0x1000 or context.address >= std.math.maxInt(u64) - 0x1000;
     const stream_symbol = std.mem.indexOf(u8, context.symbol, "basic_ostream") != null or
+        std.mem.indexOf(u8, context.symbol, "basic_ostringstream") != null or
         std.mem.indexOf(u8, context.symbol, "basic_istream") != null or
+        std.mem.indexOf(u8, context.symbol, "basic_istringstream") != null or
         std.mem.indexOf(u8, context.symbol, "basic_ios") != null;
+    // Missing vtable/typeinfo evidence is meaningful only while executing an
+    // object-model operation. A generic mangled C++ function may use RDI for
+    // any value at all (cpuid does), so treating every __ZN symbol as an object
+    // method produces confident but unrelated diagnoses.
+    const cxx_object_symbol = stream_symbol or
+        std.mem.indexOf(u8, context.symbol, "dynamic_cast") != null or
+        std.mem.indexOf(u8, context.symbol, "__dynamic_cast") != null or
+        std.mem.indexOf(u8, context.symbol, "vtable") != null or
+        std.mem.indexOf(u8, context.symbol, "type_info") != null;
     if (stream_symbol and near_null and context.rsi < 0x1000 and context.rdx_mapped) {
         return .{
             .class = .cxx_invalid_vtt,
@@ -68,10 +79,10 @@ pub fn classify(context: Context) Classification {
     if (stream_symbol and (!context.rsi_mapped or context.rsi < 0x1000)) {
         return .{ .class = .bad_streambuf_pointer, .reason = "stream constructor received an invalid streambuf pointer", .next_subsystem = "cxx_object_model / libcpp_stream_bridge" };
     }
-    if (!context.vtable_header_mapped) {
+    if (cxx_object_symbol and !context.vtable_header_mapped) {
         return .{ .class = .bad_vtable_header, .reason = "object vptr exists but its Itanium negative header is not readable", .next_subsystem = "itanium_vtable_builder" };
     }
-    if (!context.typeinfo_mapped) {
+    if (cxx_object_symbol and !context.typeinfo_mapped) {
         return .{ .class = .bad_typeinfo_pointer, .reason = "dynamic typeinfo pointer is not guest-backed", .next_subsystem = "itanium_dynamic_cast / itanium_vtable_builder" };
     }
     if (std.mem.eql(u8, context.instruction, "ret") and near_null) {
@@ -87,6 +98,24 @@ pub fn classify(context: Context) Classification {
         return .{ .class = .bad_this_pointer, .reason = "pointer-like argument is outside all guest mappings", .next_subsystem = "pointer_firewall / calling convention bridge" };
     }
     return .{ .class = .generic_memory, .reason = "memory access is outside the active guest mapping", .next_subsystem = "memory provenance / decoder" };
+}
+
+test "plain C++ namespace functions do not imply a typeinfo fault" {
+    const result = classify(.{
+        .instruction = "xchg_mem64_reg64",
+        .symbol = "__ZN2xe12_GLOBAL__N_15cpuidEjjPj",
+        .address = 0,
+        .rdi = 0x1000,
+        .rsi = 0,
+        .rsp = 0x8000,
+        .rbp = 0x8000,
+        .rdi_mapped = true,
+        .rsi_mapped = false,
+        .stack_mapped = true,
+        .vtable_header_mapped = false,
+        .typeinfo_mapped = false,
+    });
+    try std.testing.expectEqual(FaultClass.generic_memory, result.class);
 }
 
 test "stream near-null faults identify object model rather than arithmetic" {

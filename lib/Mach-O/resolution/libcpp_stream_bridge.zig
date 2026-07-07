@@ -65,6 +65,14 @@ pub const Bridge = struct {
             self.base_destructors +|= 1;
             return .handled_void;
         }
+        if (isStringStreamDestructor(name)) {
+            // The complete-object destructor normally loads its hidden VTT
+            // from dyld ABI data before entering D2. The modeled base stream
+            // owns no host resource here, so destruction is intentionally a
+            // no-op rather than dereferencing an unavailable VTT.
+            self.base_destructors +|= 1;
+            return .handled_void;
+        }
         if (isBasicIosInit(name)) {
             return if (self.object_model.initializeBasicIos(state, state.regs.rdi, state.regs.rsi))
                 .handled_void
@@ -172,6 +180,7 @@ pub const Bridge = struct {
         const name = normalizeSymbol(symbol);
         return isBasicOstreamConstructor(name) or
             isBasicOstreamDestructor(name) or
+            isStringStreamDestructor(name) or
             isBaseDestructor(name) or
             isBasicIosInit(name) or
             isBasicIosRdbuf(name) or
@@ -530,6 +539,13 @@ fn isBasicOstreamDestructor(name: []const u8) bool {
         std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEED2") != null;
 }
 
+fn isStringStreamDestructor(name: []const u8) bool {
+    const family = std.mem.indexOf(u8, name, "basic_ostringstream") != null or
+        std.mem.indexOf(u8, name, "basic_istringstream") != null or
+        std.mem.indexOf(u8, name, "basic_stringstream") != null;
+    return family and (std.mem.indexOf(u8, name, "D1Ev") != null or std.mem.indexOf(u8, name, "D2Ev") != null);
+}
+
 fn isBasicIosMethod(name: []const u8, marker: []const u8) bool {
     return std.mem.indexOf(u8, name, "basic_iosIcNS_11char_traitsIcEEE") != null and
         std.mem.indexOf(u8, name, marker) != null;
@@ -632,6 +648,9 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
     try std.testing.expect(isIfstreamCStringConstructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj")));
     try std.testing.expect(isIfstreamDestructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED2Ev")));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE7rdstateB7v160006Ev"));
 }
 

@@ -121,6 +121,8 @@ const DecodeCacheEntry = struct {
     decoded: DecodedInsn = .{},
 };
 
+const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
+
 const ImportHandlerResult = union(enum) {
     handled: u64,
     handled_void,
@@ -175,6 +177,9 @@ const InternalCompatibilityTargets = struct {
     print_config_to_log: u64 = 0,
     imgui_default_malloc: u64 = 0,
     imgui_default_free: u64 = 0,
+    imgui_mem_alloc: u64 = 0,
+    imgui_mem_free: u64 = 0,
+    imgui_settings_push_back: u64 = 0,
 };
 
 const InitializerCheckpoint = struct {
@@ -458,6 +463,15 @@ pub const MachOState = struct {
         ) orelse 0;
         result.internal_targets.imgui_default_free = result.metadata.symbolAddressWithPrefix(
             "__ZL11FreeWrapperPvS_",
+        ) orelse 0;
+        result.internal_targets.imgui_mem_alloc = result.metadata.symbolAddressWithPrefix(
+            "__ZN5ImGui8MemAllocEm",
+        ) orelse 0;
+        result.internal_targets.imgui_mem_free = result.metadata.symbolAddressWithPrefix(
+            "__ZN5ImGui7MemFreeEPv",
+        ) orelse 0;
+        result.internal_targets.imgui_settings_push_back = result.metadata.symbolAddressWithPrefix(
+            "__ZN8ImVectorI20ImGuiSettingsHandlerE9push_backERKS0_",
         ) orelse 0;
         var defined_symbols = result.metadata.definedSymbolIterator();
         while (defined_symbols.next()) |entry| {
@@ -1900,19 +1914,25 @@ pub const MachOState = struct {
             const dst = self.regs.rdi;
             const value: u8 = @intCast(self.regs.rsi & 0xFF);
             const count = self.regs.rdx;
-            if (self.guestMemory(dst, count)) |buf| {
-                @memset(buf, value);
-                if (self.verbose_trace) std.debug.print("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
-            }
+            if (count == 0) return .{ .handled = dst };
+            const buf = self.guestMemory(dst, count) orelse {
+                self.terminateForGuestAccess(dst, @intCast(@min(count, std.math.maxInt(u8))), .write, "_memset");
+                return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+            };
+            @memset(buf, value);
+            if (self.verbose_trace) std.debug.print("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
             return .{ .handled = dst };
         }
         if (std.mem.eql(u8, name, "___bzero")) {
             const dst = self.regs.rdi;
             const count = self.regs.rsi;
-            if (self.guestMemory(dst, count)) |buf| {
-                @memset(buf, 0);
-                if (self.verbose_trace) std.debug.print("    [import] _bzero(dst=0x{x}, count={d})\n", .{ dst, count });
-            }
+            if (count == 0) return .handled_void;
+            const buf = self.guestMemory(dst, count) orelse {
+                self.terminateForGuestAccess(dst, @intCast(@min(count, std.math.maxInt(u8))), .write, "___bzero");
+                return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+            };
+            @memset(buf, 0);
+            if (self.verbose_trace) std.debug.print("    [import] _bzero(dst=0x{x}, count={d})\n", .{ dst, count });
             return .handled_void;
         }
 
@@ -1920,8 +1940,15 @@ pub const MachOState = struct {
             const dst = self.regs.rdi;
             const src = self.regs.rsi;
             const count = self.regs.rdx;
-            const src_buf = self.guestMemoryConst(src, count) orelse return .{ .unsupported = 0 };
-            const dst_buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
+            if (count == 0) return .{ .handled = dst };
+            const src_buf = self.guestMemoryConst(src, count) orelse {
+                self.terminateForGuestAccess(src, @intCast(@min(count, std.math.maxInt(u8))), .read, name);
+                return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+            };
+            const dst_buf = self.guestMemory(dst, count) orelse {
+                self.terminateForGuestAccess(dst, @intCast(@min(count, std.math.maxInt(u8))), .write, name);
+                return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+            };
             std.mem.copyForwards(u8, dst_buf, src_buf);
             return .{ .handled = dst };
         }
@@ -2155,6 +2182,34 @@ pub const MachOState = struct {
             std.mem.writeInt(u64, env_bytes[16..24], self.regs.rbp, .little);
             std.mem.writeInt(u64, env_bytes[24..32], self.regs.rip, .little);
             return .{ .handled = 0 };
+        }
+
+        if (std.mem.eql(u8, name, "__ZNSt3__16thread4joinEv")) {
+            if (self.verbose_trace) std.debug.print("    [import] std::thread::join(object=0x{x})\n", .{self.regs.rdi});
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev")) {
+            const object = self.regs.rdi;
+            if (self.guestMemory(object, 64)) |buf| {
+                @memset(buf, 0);
+                if (self.libcxx_streams.object_model.ensureType(self, .basic_streambuf, null)) |record| {
+                    self.write64(object, record.vtable);
+                }
+                if (self.verbose_trace) std.debug.print("    [import] basic_streambuf::C2(object=0x{x})\n", .{object});
+            }
+            return .{ .handled = object };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv")) {
+            if (self.verbose_trace) std.debug.print("    [import] operator<<(void* ptr=0x{x}) -> *this\n", .{self.regs.rsi});
+            return .{ .handled = self.regs.rdi };
+        }
+        if (std.mem.eql(u8, name, "__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv")) {
+            const output_ptr = self.regs.rdi;
+            const stringbuf_ptr = self.regs.rsi;
+            _ = stringbuf_ptr;
+            _ = compat_runtime.initLibcppStringLiteral(self, output_ptr, "");
+            if (self.verbose_trace) std.debug.print("    [import] basic_stringbuf::str() -> empty string at 0x{x}\n", .{output_ptr});
+            return .{ .handled = output_ptr };
         }
 
         if (std.mem.endsWith(u8, name, "_g_type_check_instance_cast")) {
@@ -3283,8 +3338,91 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn appendTrivialVector(self: *MachOState, vector: u64, item: u64, element_size: u64, minimum_capacity: u32) bool {
+        const header_size: u64 = 16;
+        if (element_size == 0 or self.guestMemory(vector, header_size) == null or self.guestMemoryConst(item, element_size) == null) {
+            const bad_address = if (self.guestMemory(vector, header_size) == null) vector else item;
+            self.terminateForGuestAccess(bad_address, @intCast(@min(@max(element_size, header_size), std.math.maxInt(u8))), .read, "trivial_vector_push_back");
+            return false;
+        }
+
+        const size = self.read32(vector);
+        var capacity = self.read32(vector + 4);
+        var data = self.read64(vector + 8);
+        const storage_is_valid = data != 0 and capacity >= size and
+            self.guestMemoryConst(data, @as(u64, capacity) * element_size) != null;
+
+        // A non-empty vector without backing storage cannot be repaired without
+        // inventing missing elements. Stop at the violated invariant instead
+        // of allowing a later near-null dereference to obscure the cause.
+        if (size != 0 and !storage_is_valid) {
+            self.terminateForGuestAccess(data, @intCast(@min(element_size, std.math.maxInt(u8))), .read, "trivial_vector_invalid_storage");
+            return false;
+        }
+
+        if (!storage_is_valid or size == capacity) {
+            const requested = size +| 1;
+            const grown = if (capacity == 0) minimum_capacity else capacity +| capacity / 2;
+            const new_capacity = @max(requested, grown);
+            const allocation_size = std.math.mul(u64, new_capacity, element_size) catch {
+                self.terminated = true;
+                self.faulted = true;
+                self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
+                return false;
+            };
+            const new_data = self.memory_forwarder.allocate(self, allocation_size, 16) orelse {
+                self.terminated = true;
+                self.faulted = true;
+                self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
+                return false;
+            };
+            if (size != 0) {
+                const used = @as(u64, size) * element_size;
+                const source = self.guestMemoryConst(data, used) orelse return false;
+                const destination = self.guestMemory(new_data, used) orelse return false;
+                std.mem.copyForwards(u8, destination, source);
+                self.memory_forwarder.release(data);
+            }
+            data = new_data;
+            capacity = new_capacity;
+            self.write32(vector + 4, capacity);
+            self.write64(vector + 8, data);
+        }
+
+        const destination_address = data + @as(u64, size) * element_size;
+        const source = self.guestMemoryConst(item, element_size) orelse return false;
+        const destination = self.guestMemory(destination_address, element_size) orelse return false;
+        std.mem.copyForwards(u8, destination, source);
+        self.write32(vector, size +| 1);
+        return true;
+    }
+
     fn handleInternalCompatibility(self: *MachOState) bool {
         if (self.handleLocalLibcppStreamCompatibility()) return true;
+        if (self.internal_targets.imgui_settings_push_back != 0 and
+            self.regs.rip == self.internal_targets.imgui_settings_push_back)
+        {
+            _ = self.appendTrivialVector(self.regs.rdi, self.regs.rsi, 0x48, 8);
+            if (!self.terminated) self.regs.rip = self.pop();
+            return true;
+        }
+        // ImGui::MemAlloc dispatches through a writable global callback. Model
+        // the stable allocator boundary directly while dyld data bindings are
+        // synthetic, preventing Size > 0 / Data == null container states.
+        if (self.internal_targets.imgui_mem_alloc != 0 and
+            self.regs.rip == self.internal_targets.imgui_mem_alloc)
+        {
+            self.regs.rax = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0;
+            self.regs.rip = self.pop();
+            return true;
+        }
+        if (self.internal_targets.imgui_mem_free != 0 and
+            self.regs.rip == self.internal_targets.imgui_mem_free)
+        {
+            self.memory_forwarder.release(self.regs.rdi);
+            self.regs.rip = self.pop();
+            return true;
+        }
         if (self.internal_targets.imgui_default_malloc != 0 and
             self.regs.rip == self.internal_targets.imgui_default_malloc)
         {
@@ -3724,10 +3862,10 @@ pub const MachOState = struct {
         var steps: u64 = 0;
         while (!self.terminated and stepBudgetAllows(self.max_steps, steps)) : (steps +|= 1) {
             self.executed_steps = steps;
-            if (self.startup.enabled and steps % 500000 == 0) {
+            if (steps != 0 and steps % PROGRESS_REPORT_INTERVAL == 0) {
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const heap_summary = self.memory_forwarder.summary();
-                self.startup.checkpoint(.{
+                const snapshot: startup_observer.Snapshot = .{
                     .step = steps,
                     .rip = self.regs.rip,
                     .symbol = if (symbol) |resolved| resolved.name else "<unknown>",
@@ -3747,7 +3885,15 @@ pub const MachOState = struct {
                     .pthread_waits_collapsed = self.pthreads.collapsed_waits,
                     .diagnostic_text_runs = self.diagnostic_text.accelerations,
                     .diagnostic_text_lines = self.diagnostic_text.lines_retained,
-                });
+                };
+                if (self.startup.enabled) {
+                    self.startup.checkpoint(snapshot);
+                } else {
+                    std.debug.print(
+                        "info(macho): step={d} rip=0x{x} at {s}+0x{x}\n",
+                        .{ steps, self.regs.rip, snapshot.symbol, snapshot.symbol_offset },
+                    );
+                }
             }
             if (!self.step()) break;
         }
@@ -4919,6 +5065,29 @@ pub const MachOState = struct {
                 }
             },
 
+            .cmpxchg_reg32_reg32 => {
+                const expected = self.regVal(.al_ax_eax_rax, .bits32);
+                const actual = self.regVal(d.dst_reg, .bits32);
+                if (expected == actual) {
+                    self.setReg(d.dst_reg, .bits32, self.regVal(d.src_reg, .bits32));
+                    self.setFlag(RFL_ZF, true);
+                } else {
+                    self.setReg(.al_ax_eax_rax, .bits32, actual);
+                    self.setFlag(RFL_ZF, false);
+                }
+            },
+            .cmpxchg_reg64_reg64 => {
+                const expected = self.regs.rax;
+                const actual = self.regVal(d.dst_reg, .bits64);
+                if (expected == actual) {
+                    self.setReg(d.dst_reg, .bits64, self.regVal(d.src_reg, .bits64));
+                    self.setFlag(RFL_ZF, true);
+                } else {
+                    self.regs.rax = actual;
+                    self.setFlag(RFL_ZF, false);
+                }
+            },
+
             .xchg_mem32_reg32 => {
                 const a = self.readMemVal(d.addr, .bits32);
                 const b = self.regVal(d.src_reg, .bits32);
@@ -4929,6 +5098,18 @@ pub const MachOState = struct {
                 const a = self.readMemVal(d.addr, .bits64);
                 const b = self.regVal(d.src_reg, .bits64);
                 self.writeMemVal(d.addr, .bits64, b);
+                self.setReg(d.src_reg, .bits64, a);
+            },
+            .xchg_reg32_reg32 => {
+                const a = self.regVal(d.dst_reg, .bits32);
+                const b = self.regVal(d.src_reg, .bits32);
+                self.setReg(d.dst_reg, .bits32, b);
+                self.setReg(d.src_reg, .bits32, a);
+            },
+            .xchg_reg64_reg64 => {
+                const a = self.regVal(d.dst_reg, .bits64);
+                const b = self.regVal(d.src_reg, .bits64);
+                self.setReg(d.dst_reg, .bits64, b);
                 self.setReg(d.src_reg, .bits64, a);
             },
             .xadd_mem32_reg32, .xadd_mem64_reg64 => {
@@ -8165,12 +8346,13 @@ fn decodeXchgRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
         d.src_reg = rm.reg;
     } else {
         d.op = switch (sz) {
-            .bits32 => .xchg_mem32_reg32,
-            .bits64 => .xchg_mem64_reg64,
+            .bits32 => .xchg_reg32_reg32,
+            .bits64 => .xchg_reg64_reg64,
             else => .invalid,
         };
         d.dst_reg = @enumFromInt(rm.addr);
         d.src_reg = rm.reg;
+        d.is_reg_form = true;
     }
 
     d.len = @as(u8, @intCast(pos));
@@ -8274,12 +8456,13 @@ fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, 
         d.src_reg = rm.reg;
     } else {
         d.op = switch (sz) {
-            .bits32 => .cmpxchg_mem32_reg32,
-            .bits64 => .cmpxchg_mem64_reg64,
-            else => .cmpxchg_mem32_reg32,
+            .bits32 => .cmpxchg_reg32_reg32,
+            .bits64 => .cmpxchg_reg64_reg64,
+            else => .cmpxchg_reg32_reg32,
         };
         d.dst_reg = @enumFromInt(rm.addr);
         d.src_reg = rm.reg;
+        d.is_reg_form = true;
     }
 
     d.len = @as(u8, @intCast(pos));
@@ -9211,6 +9394,31 @@ test "decode 64-bit OR register immediate without aliasing memory opcodes" {
     try std.testing.expectEqual(@as(u64, 8), memory.addr);
     try std.testing.expectEqual(@as(u64, 1), memory.imm);
     try std.testing.expectEqual(@as(u8, 5), memory.len);
+}
+
+test "decode XCHG ModRM register and memory forms without aliasing" {
+    // 4C 87 C3 is XCHG RBX,R8, the exact instruction family that previously
+    // fell through the memory executor and attempted to dereference address 0.
+    const register = decodeInsn(&[_]u8{ 0x4C, 0x87, 0xC3 });
+    try std.testing.expectEqual(Op.xchg_reg64_reg64, register.op);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, register.dst_reg);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, register.src_reg);
+    try std.testing.expect(register.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 3), register.len);
+
+    const memory = decodeInsn(&[_]u8{ 0x4C, 0x87, 0x03 });
+    try std.testing.expectEqual(Op.xchg_mem64_reg64, memory.op);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, memory.sib_base_reg);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, memory.src_reg);
+    try std.testing.expect(!memory.is_reg_form);
+}
+
+test "decode CMPXCHG ModRM register form without aliasing memory" {
+    const register = decodeInsn(&[_]u8{ 0x4C, 0x0F, 0xB1, 0xC3 });
+    try std.testing.expectEqual(Op.cmpxchg_reg64_reg64, register.op);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, register.dst_reg);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, register.src_reg);
+    try std.testing.expect(register.is_reg_form);
 }
 
 test "dyld data bindings materialize callable constant and GOT slots" {
