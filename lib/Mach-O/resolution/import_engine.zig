@@ -71,6 +71,17 @@ pub const ContractId = enum {
     corefoundation_cfdictionary_create,
     libcxx_ios_base_getloc,
     libcxx_basic_istream_sentry_constructor,
+    libcxx_basic_ostream_constructor,
+    libcxx_basic_ostream_destructor,
+    libcxx_basic_ios_init,
+    libcxx_basic_ios_rdbuf,
+    libcxx_basic_ios_rdstate,
+    libcxx_basic_ios_clear,
+    libcxx_basic_ios_setstate,
+    libcxx_basic_ios_bool,
+    libcxx_basic_ios_good,
+    libcxx_basic_ios_fail,
+    libcxx_basic_ios_eof,
 };
 
 pub const Contract = struct {
@@ -215,6 +226,18 @@ pub const basic_istream_sentry_constructor = Contract{
     .effects = .{ .return_convention = .void, .writes_guest_memory = true },
 };
 
+pub const basic_ostream_constructor = Contract{ .id = .libcxx_basic_ostream_constructor, .canonical_symbol = "basic_ostream::constructor", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax, .writes_guest_memory = true, .pointer_result = .caller_storage } };
+pub const basic_ostream_destructor = Contract{ .id = .libcxx_basic_ostream_destructor, .canonical_symbol = "basic_ostream::destructor", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .void, .writes_guest_memory = true } };
+pub const basic_ios_init = Contract{ .id = .libcxx_basic_ios_init, .canonical_symbol = "basic_ios::init", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .void, .writes_guest_memory = true } };
+pub const basic_ios_rdbuf = Contract{ .id = .libcxx_basic_ios_rdbuf, .canonical_symbol = "basic_ios::rdbuf", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax, .pointer_result = .borrowed_guest } };
+pub const basic_ios_rdstate = Contract{ .id = .libcxx_basic_ios_rdstate, .canonical_symbol = "basic_ios::rdstate", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
+pub const basic_ios_clear = Contract{ .id = .libcxx_basic_ios_clear, .canonical_symbol = "basic_ios::clear", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .void, .writes_guest_memory = true } };
+pub const basic_ios_setstate = Contract{ .id = .libcxx_basic_ios_setstate, .canonical_symbol = "basic_ios::setstate", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .void, .writes_guest_memory = true } };
+pub const basic_ios_bool = Contract{ .id = .libcxx_basic_ios_bool, .canonical_symbol = "basic_ios::operator bool", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
+pub const basic_ios_good = Contract{ .id = .libcxx_basic_ios_good, .canonical_symbol = "basic_ios::good", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
+pub const basic_ios_fail = Contract{ .id = .libcxx_basic_ios_fail, .canonical_symbol = "basic_ios::fail", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
+pub const basic_ios_eof = Contract{ .id = .libcxx_basic_ios_eof, .canonical_symbol = "basic_ios::eof", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
+
 pub fn normalizeSymbol(symbol: []const u8) []const u8 {
     var normalized = symbol;
     if (normalized.len != 0 and normalized[0] == '_') normalized = normalized[1..];
@@ -275,6 +298,21 @@ pub fn contractFor(symbol: []const u8) ?Contract {
     }
     if (std.mem.eql(u8, normalized, basic_istream_sentry_constructor.canonical_symbol)) {
         return basic_istream_sentry_constructor;
+    }
+    if (std.mem.indexOf(u8, normalized, "basic_ostreamIcNS_11char_traitsIcEEEC1") != null or
+        std.mem.indexOf(u8, normalized, "basic_ostreamIcNS_11char_traitsIcEEEC2") != null) return basic_ostream_constructor;
+    if (std.mem.indexOf(u8, normalized, "basic_ostreamIcNS_11char_traitsIcEEED1") != null or
+        std.mem.indexOf(u8, normalized, "basic_ostreamIcNS_11char_traitsIcEEED2") != null) return basic_ostream_destructor;
+    if (std.mem.indexOf(u8, normalized, "basic_iosIcNS_11char_traitsIcEEE") != null) {
+        if (std.mem.indexOf(u8, normalized, "4initE") != null) return basic_ios_init;
+        if (std.mem.indexOf(u8, normalized, "5rdbuf") != null) return basic_ios_rdbuf;
+        if (std.mem.indexOf(u8, normalized, "7rdstate") != null) return basic_ios_rdstate;
+        if (std.mem.indexOf(u8, normalized, "5clearE") != null) return basic_ios_clear;
+        if (std.mem.indexOf(u8, normalized, "8setstateE") != null) return basic_ios_setstate;
+        if (std.mem.indexOf(u8, normalized, "cvb") != null) return basic_ios_bool;
+        if (std.mem.indexOf(u8, normalized, "4good") != null) return basic_ios_good;
+        if (std.mem.indexOf(u8, normalized, "4fail") != null) return basic_ios_fail;
+        if (std.mem.indexOf(u8, normalized, "3eof") != null) return basic_ios_eof;
     }
     return null;
 }
@@ -346,6 +384,18 @@ pub fn dispatchContract(state: anytype, symbol: []const u8) ?ContractDispatch {
             .handled_void
         else
             .failed,
+        .libcxx_basic_ostream_constructor,
+        .libcxx_basic_ostream_destructor,
+        .libcxx_basic_ios_init,
+        .libcxx_basic_ios_rdbuf,
+        .libcxx_basic_ios_rdstate,
+        .libcxx_basic_ios_clear,
+        .libcxx_basic_ios_setstate,
+        .libcxx_basic_ios_bool,
+        .libcxx_basic_ios_good,
+        .libcxx_basic_ios_fail,
+        .libcxx_basic_ios_eof,
+        => .failed,
     };
 }
 
@@ -831,6 +881,9 @@ test "symbol normalization and contract lookup" {
     try std.testing.expectEqual(ContractId.corefoundation_cfdictionary_create, contractFor("_CFDictionaryCreate").?.id);
     try std.testing.expectEqual(ContractId.libcxx_ios_base_getloc, contractFor("__ZNKSt3__18ios_base6getlocEv").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_istream_sentry_constructor, contractFor("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b").?.id);
+    try std.testing.expectEqual(ContractId.libcxx_basic_ostream_constructor, contractFor("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE").?.id);
+    try std.testing.expectEqual(ContractId.libcxx_basic_ios_rdbuf, contractFor("__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE5rdbufB7v160006Ev").?.id);
+    try std.testing.expectEqual(ContractId.libcxx_basic_ios_setstate, contractFor("__ZNSt3__19basic_iosIcNS_11char_traitsIcEEE8setstateEj").?.id);
 }
 
 test "import audit separates resolved and unresolved calls" {

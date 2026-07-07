@@ -11,6 +11,9 @@ pub const PointerKind = enum {
 pub const Policy = struct {
     kind: PointerKind,
     may_dereference: bool,
+    may_execute: bool = false,
+    may_compare: bool = true,
+    may_pass_to_modeled_api: bool = true,
     owner: []const u8,
 };
 

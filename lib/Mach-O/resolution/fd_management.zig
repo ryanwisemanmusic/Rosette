@@ -146,6 +146,19 @@ pub const Manager = struct {
         return 0;
     }
 
+    /// Transfers ownership of a host descriptor out of the POSIX descriptor
+    /// table without closing it. Used by fdopen, which makes FILE own the fd.
+    pub fn take(self: *Manager, guest_fd: u64) ?c_int {
+        const index = @as(usize, @intCast(guest_fd));
+        if (index >= self.capacity) return null;
+        const entry = &self.entries[index];
+        if (entry.host_fd < 0 or entry.directory != null) return null;
+        const host_fd = entry.host_fd;
+        entry.* = .{};
+        if (guest_fd < self.next_hint) self.next_hint = @max(guest_fd, STREAM_FD_COUNT);
+        return host_fd;
+    }
+
     pub fn dup(self: *Manager, guest_fd: u64) ?u64 {
         const index = @as(usize, @intCast(guest_fd));
         if (index >= self.capacity) return null;
@@ -276,4 +289,18 @@ test "fd table grows dynamically" {
     }
     try std.testing.expect(last >= 64);
     try std.testing.expect(mgr.capacity >= 128);
+}
+
+test "fd ownership can transfer to stdio without closing" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const guest = mgr.register(fds[0], .pipe).?;
+    const host = mgr.take(guest).?;
+    try std.testing.expectEqual(fds[0], host);
+    try std.testing.expect(mgr.hostFd(guest) == null);
+    _ = std.c.close(host);
+    _ = std.c.close(fds[1]);
 }

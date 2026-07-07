@@ -101,8 +101,21 @@ pub const SemanticFault = struct {
     class: []const u8 = "",
     reason: []const u8 = "",
     next_subsystem: []const u8 = "",
+    current_symbol: []const u8 = "",
+    instruction: []const u8 = "",
+    effective_address: u64 = 0,
     region_kind: []const u8 = "",
     region_owner: []const u8 = "",
+    region_start: u64 = 0,
+    region_end: u64 = 0,
+    region_readable: bool = false,
+    region_writable: bool = false,
+    region_executable: bool = false,
+    region_synthetic: bool = false,
+    pointer_kind: []const u8 = "",
+    pointer_owner: []const u8 = "",
+    pointer_may_dereference: bool = false,
+    pointer_may_execute: bool = false,
 };
 
 pub const MemoryAccessEvent = struct {
@@ -259,8 +272,27 @@ pub fn logExitReport(report: ExitReport) void {
         std.debug.print("    class={s}\n", .{semantic.class});
         std.debug.print("    reason={s}\n", .{semantic.reason});
         std.debug.print("    next_subsystem={s}\n", .{semantic.next_subsystem});
+        std.debug.print("    symbol={s} instruction={s} effective_address=0x{x}\n", .{ semantic.current_symbol, semantic.instruction, semantic.effective_address });
         if (semantic.region_kind.len != 0) {
-            std.debug.print("    memory_region={s} owner={s}\n", .{ semantic.region_kind, semantic.region_owner });
+            std.debug.print(
+                "    memory_region={s} owner={s} range=[0x{x},0x{x}) permissions={c}{c}{c} synthetic={}\n",
+                .{
+                    semantic.region_kind,
+                    semantic.region_owner,
+                    semantic.region_start,
+                    semantic.region_end,
+                    @as(u8, if (semantic.region_readable) 'r' else '-'),
+                    @as(u8, if (semantic.region_writable) 'w' else '-'),
+                    @as(u8, if (semantic.region_executable) 'x' else '-'),
+                    semantic.region_synthetic,
+                },
+            );
+        }
+        if (semantic.pointer_kind.len != 0) {
+            std.debug.print(
+                "    pointer_policy={s} owner={s} dereference={} execute={}\n",
+                .{ semantic.pointer_kind, semantic.pointer_owner, semantic.pointer_may_dereference, semantic.pointer_may_execute },
+            );
         }
     }
 

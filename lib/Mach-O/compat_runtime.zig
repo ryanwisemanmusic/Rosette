@@ -250,7 +250,7 @@ pub fn syntheticThunk(address: u64) ?SyntheticThunk {
     };
 }
 
-fn thunkAddress(thunk: SyntheticThunk) u64 {
+pub fn thunkAddress(thunk: SyntheticThunk) u64 {
     return synthetic_thunk_base + @intFromEnum(thunk);
 }
 

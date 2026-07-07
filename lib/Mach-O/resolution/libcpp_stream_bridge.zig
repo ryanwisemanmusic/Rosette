@@ -20,6 +20,7 @@ pub const Outcome = union(enum) {
 const Stream = struct {
     active: bool = false,
     object: u64 = 0,
+    ios_object: u64 = 0,
     fd: std.c.fd_t = -1,
     buffer: u64 = 0,
     buffer_size: u64 = 0,
@@ -52,6 +53,36 @@ pub const Bridge = struct {
 
     pub fn dispatch(self: *Bridge, state: anytype, fs: anytype, symbol: []const u8) ?Outcome {
         const name = normalizeSymbol(symbol);
+
+        if (isBasicOstreamConstructor(name)) {
+            const streambuf = selectStreambufArgument(state);
+            return if (self.constructOstream(state, state.regs.rdi, streambuf))
+                .{ .handled = state.regs.rdi }
+            else
+                null;
+        }
+        if (isBasicOstreamDestructor(name) or isBaseDestructor(name)) {
+            self.base_destructors +|= 1;
+            return .handled_void;
+        }
+        if (isBasicIosInit(name)) {
+            return if (self.object_model.initializeBasicIos(state, state.regs.rdi, state.regs.rsi))
+                .handled_void
+            else
+                null;
+        }
+        if (isBasicIosRdbuf(name)) return .{ .handled = self.object_model.rdbuf(state, state.regs.rdi) };
+        if (isBasicIosRdstate(name)) return .{ .handled = self.object_model.rdstate(state, state.regs.rdi) };
+        if (isBasicIosClear(name)) {
+            return if (self.object_model.clear(state, state.regs.rdi, @truncate(state.regs.rsi))) .handled_void else null;
+        }
+        if (isBasicIosSetstate(name)) {
+            return if (self.object_model.setstate(state, state.regs.rdi, @truncate(state.regs.rsi))) .handled_void else null;
+        }
+        if (isBasicIosGood(name)) return .{ .handled = @intFromBool(self.object_model.good(state, state.regs.rdi)) };
+        if (isBasicIosFail(name)) return .{ .handled = @intFromBool(self.object_model.fail(state, state.regs.rdi)) };
+        if (isBasicIosEof(name)) return .{ .handled = @intFromBool(self.object_model.eof(state, state.regs.rdi)) };
+        if (isBasicIosBool(name)) return .{ .handled = @intFromBool(!self.object_model.fail(state, state.regs.rdi)) };
 
         if (isIfstreamDefaultConstructor(name)) {
             return if (self.constructIfstream(state, state.regs.rdi))
@@ -139,7 +170,19 @@ pub const Bridge = struct {
 
     pub fn recognizesSymbol(symbol: []const u8) bool {
         const name = normalizeSymbol(symbol);
-        return isIfstreamDefaultConstructor(name) or
+        return isBasicOstreamConstructor(name) or
+            isBasicOstreamDestructor(name) or
+            isBaseDestructor(name) or
+            isBasicIosInit(name) or
+            isBasicIosRdbuf(name) or
+            isBasicIosRdstate(name) or
+            isBasicIosClear(name) or
+            isBasicIosSetstate(name) or
+            isBasicIosGood(name) or
+            isBasicIosFail(name) or
+            isBasicIosEof(name) or
+            isBasicIosBool(name) or
+            isIfstreamDefaultConstructor(name) or
             isIfstreamCStringConstructor(name) or
             isIfstreamDestructor(name) or
             std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj") or
@@ -175,10 +218,24 @@ pub const Bridge = struct {
         self.ifstream_vtable = state.read64(object);
         self.filebuf_vtable = state.read64(object + FILEBUF_OFFSET_IN_IFSTREAM);
         self.basic_ios_vtable = state.read64(object + BASIC_IOS_OFFSET_IN_IFSTREAM);
-        _ = self.ensure(object + FILEBUF_OFFSET_IN_IFSTREAM) orelse {
+        const stream = self.ensure(object + FILEBUF_OFFSET_IN_IFSTREAM) orelse {
             self.rejected +|= 1;
             return false;
         };
+        stream.ios_object = object + BASIC_IOS_OFFSET_IN_IFSTREAM;
+        self.constructors +|= 1;
+        return true;
+    }
+
+    pub fn constructOstream(self: *Bridge, state: anytype, object: u64, streambuf: u64) bool {
+        if (streambuf == 0 or state.guestMemoryConst(streambuf, 8) == null) {
+            self.rejected +|= 1;
+            return false;
+        }
+        if (!self.object_model.initializeStream(state, .basic_ostream, object, streambuf)) {
+            self.rejected +|= 1;
+            return false;
+        }
         self.constructors +|= 1;
         return true;
     }
@@ -195,6 +252,7 @@ pub const Bridge = struct {
         };
         if (stream.fd < 0) {
             stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.FAILBIT);
             return false;
         }
 
@@ -205,18 +263,26 @@ pub const Bridge = struct {
             const result = std.c.read(stream.fd, &byte, 1);
             if (result < 0) {
                 stream.failed = true;
+                self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
                 return false;
             }
             if (result == 0) {
                 stream.eof = true;
-                if (length == 0) stream.failed = true;
+                self.noteState(state, stream, cxx_object_model.EOFBIT);
+                if (length == 0) {
+                    stream.failed = true;
+                    self.noteState(state, stream, cxx_object_model.FAILBIT);
+                }
                 break;
             }
             if (byte[0] == delimiter) break;
             line[length] = byte[0];
             length += 1;
         }
-        if (length == line.len) stream.failed = true;
+        if (length == line.len) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.FAILBIT);
+        }
         return compat_runtime.initLibcppStringFromSlice(state, string_object, line[0..length]);
     }
 
@@ -270,7 +336,6 @@ pub const Bridge = struct {
     }
 
     fn openBytes(self: *Bridge, state: anytype, fs: anytype, object: u64, path: []const u8, mode: u64) u64 {
-        _ = state;
         self.opens += 1;
         var translated_buffer: [4096]u8 = undefined;
         const translated = fs.resolveHostPath(path, &translated_buffer) orelse path;
@@ -306,6 +371,7 @@ pub const Bridge = struct {
         stream.fd = fd;
         stream.eof = false;
         stream.failed = false;
+        if (stream.ios_object != 0) _ = self.object_model.clear(state, stream.ios_object, 0);
         if (mode & OPENMODE_ATE != 0) _ = std.c.lseek(fd, 0, std.c.SEEK.END);
         std.debug.print("macho-processor: libc++ filebuf open: {s} mode=0x{x} fd={d}\n", .{ translated, mode, fd });
         return object;
@@ -329,10 +395,32 @@ pub const Bridge = struct {
     fn readInto(self: *Bridge, state: anytype, object: u64, destination: u64, count: u64) i64 {
         self.reads += 1;
         const stream = self.findFlexible(object) orelse return -1;
-        if (stream.fd < 0) return -1;
-        const bytes = state.guestMemory(destination, count) orelse return -1;
+        if (stream.fd < 0) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.FAILBIT);
+            return -1;
+        }
+        const bytes = state.guestMemory(destination, count) orelse {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
+            return -1;
+        };
         const result = std.c.read(stream.fd, bytes.ptr, bytes.len);
-        return if (result < 0) -1 else @intCast(result);
+        if (result < 0) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
+            return -1;
+        }
+        if (result == 0 and count != 0) {
+            stream.eof = true;
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.EOFBIT | cxx_object_model.FAILBIT);
+        }
+        return @intCast(result);
+    }
+
+    fn noteState(self: *Bridge, state: anytype, stream: *const Stream, bits: u32) void {
+        if (stream.ios_object != 0) _ = self.object_model.setstate(state, stream.ios_object, bits);
     }
 
     fn seek(self: *Bridge, object: u64, offset: i64, direction: std.c.whence_t) i64 {
@@ -423,6 +511,66 @@ fn normalizeSymbol(symbol: []const u8) []const u8 {
     return symbol;
 }
 
+fn selectStreambufArgument(state: anytype) u64 {
+    // The libc++ C2 base constructor carries a hidden VTT in RSI and moves the
+    // declared streambuf argument to RDX. A tiny RSI (the logger showed 0x8)
+    // is never a valid object pointer even in test-backed address spaces.
+    if (state.regs.rsi >= 0x1000 and state.guestMemoryConst(state.regs.rsi, 8) != null) return state.regs.rsi;
+    if (state.regs.rdx != 0 and state.guestMemoryConst(state.regs.rdx, 8) != null) return state.regs.rdx;
+    return 0;
+}
+
+fn isBasicOstreamConstructor(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEEC1") != null or
+        std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEEC2") != null;
+}
+
+fn isBasicOstreamDestructor(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEED1") != null or
+        std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEED2") != null;
+}
+
+fn isBasicIosMethod(name: []const u8, marker: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_iosIcNS_11char_traitsIcEEE") != null and
+        std.mem.indexOf(u8, name, marker) != null;
+}
+
+fn isBasicIosInit(name: []const u8) bool {
+    return isBasicIosMethod(name, "4initE");
+}
+
+fn isBasicIosRdbuf(name: []const u8) bool {
+    return isBasicIosMethod(name, "5rdbuf");
+}
+
+fn isBasicIosRdstate(name: []const u8) bool {
+    return isBasicIosMethod(name, "7rdstate");
+}
+
+fn isBasicIosClear(name: []const u8) bool {
+    return isBasicIosMethod(name, "5clearE");
+}
+
+fn isBasicIosSetstate(name: []const u8) bool {
+    return isBasicIosMethod(name, "8setstateE");
+}
+
+fn isBasicIosGood(name: []const u8) bool {
+    return isBasicIosMethod(name, "4good");
+}
+
+fn isBasicIosFail(name: []const u8) bool {
+    return isBasicIosMethod(name, "4fail");
+}
+
+fn isBasicIosEof(name: []const u8) bool {
+    return isBasicIosMethod(name, "3eof");
+}
+
+fn isBasicIosBool(name: []const u8) bool {
+    return isBasicIosMethod(name, "cvb");
+}
+
 fn isBaseDestructor(name: []const u8) bool {
     return std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev") or
         std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED1Ev") or
@@ -483,6 +631,8 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
     try std.testing.expect(isIfstreamDefaultConstructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC2Ev")));
     try std.testing.expect(isIfstreamCStringConstructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj")));
     try std.testing.expect(isIfstreamDestructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED2Ev")));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE7rdstateB7v160006Ev"));
 }
 
 test "stream bridge forwards guest file operations through typed host calls" {
@@ -593,4 +743,19 @@ test "stream bridge forwards guest file operations through typed host calls" {
 
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj"));
     try std.testing.expect(!Bridge.recognizesSymbol("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev"));
+
+    var ostream_bridge = Bridge{};
+    defer ostream_bridge.deinit();
+    state = .{};
+    const ostream: u64 = 32;
+    const streambuf: u64 = 256;
+    state.regs = .{ .rdi = ostream, .rsi = 8, .rdx = streambuf };
+    try std.testing.expect(ostream_bridge.dispatch(&state, &fs, "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE") != null);
+    try std.testing.expect(state.read64(ostream) != 0);
+    try std.testing.expectEqual(@as(u64, 0), state.read64(state.read64(ostream) - 24));
+    try std.testing.expectEqual(streambuf, ostream_bridge.object_model.rdbuf(&state, ostream));
+    state.regs = .{ .rdi = ostream, .rsi = cxx_object_model.FAILBIT };
+    try std.testing.expect(ostream_bridge.dispatch(&state, &fs, "__ZNSt3__19basic_iosIcNS_11char_traitsIcEEE8setstateEj") != null);
+    state.regs = .{ .rdi = ostream };
+    try std.testing.expectEqual(@as(u64, 1), ostream_bridge.dispatch(&state, &fs, "__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE4failB7v160006Ev").?.handled);
 }

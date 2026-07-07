@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub const FaultClass = enum {
+    opaque_identity_dereference,
+    cxx_invalid_vtt,
     cxx_object_model_null_vtable,
     bad_this_pointer,
     bad_vtable_header,
@@ -20,9 +22,13 @@ pub const Context = struct {
     rsi: u64,
     rsp: u64,
     rbp: u64,
+    rdx: u64 = 0,
     rdi_mapped: bool,
     rsi_mapped: bool,
+    rdx_mapped: bool = false,
     stack_mapped: bool,
+    pointer_opaque: bool = false,
+    pointer_owner: []const u8 = "",
     vtable_header_mapped: bool = true,
     typeinfo_mapped: bool = true,
 };
@@ -34,10 +40,24 @@ pub const Classification = struct {
 };
 
 pub fn classify(context: Context) Classification {
+    if (context.pointer_opaque) {
+        return .{
+            .class = .opaque_identity_dereference,
+            .reason = "an opaque identity token was used as memory; it may only be compared or passed back to its modeled API",
+            .next_subsystem = context.pointer_owner,
+        };
+    }
     const near_null = context.address < 0x1000 or context.address >= std.math.maxInt(u64) - 0x1000;
     const stream_symbol = std.mem.indexOf(u8, context.symbol, "basic_ostream") != null or
         std.mem.indexOf(u8, context.symbol, "basic_istream") != null or
         std.mem.indexOf(u8, context.symbol, "basic_ios") != null;
+    if (stream_symbol and near_null and context.rsi < 0x1000 and context.rdx_mapped) {
+        return .{
+            .class = .cxx_invalid_vtt,
+            .reason = "libc++ basic_ostream base construction received a null/low hidden VTT while the declared streambuf remained valid in RDX",
+            .next_subsystem = "libcpp_stream_bridge / cxx_object_model / itanium_vtable_builder",
+        };
+    }
     if (stream_symbol and near_null) {
         return .{
             .class = .cxx_object_model_null_vtable,
@@ -83,4 +103,40 @@ test "stream near-null faults identify object model rather than arithmetic" {
         .stack_mapped = true,
     });
     try std.testing.expectEqual(FaultClass.cxx_object_model_null_vtable, result.class);
+}
+
+test "basic ostream C2 fault identifies invalid hidden VTT" {
+    const result = classify(.{
+        .instruction = "add_reg64_mem64",
+        .symbol = "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE",
+        .address = std.math.maxInt(u64) - 23,
+        .rdi = 0x1ffffa98,
+        .rsi = 8,
+        .rdx = 0x1ffffaa0,
+        .rsp = 0x1ffff8d0,
+        .rbp = 0x1ffff8f0,
+        .rdi_mapped = true,
+        .rsi_mapped = false,
+        .rdx_mapped = true,
+        .stack_mapped = true,
+    });
+    try std.testing.expectEqual(FaultClass.cxx_invalid_vtt, result.class);
+}
+
+test "opaque identities are never classified as generic memory" {
+    const result = classify(.{
+        .instruction = "mov_reg64_mem64",
+        .symbol = "caller",
+        .address = 0xfffffe0000000010,
+        .rdi = 0xfffffe0000000010,
+        .rsi = 0,
+        .rsp = 0x8000,
+        .rbp = 0,
+        .rdi_mapped = false,
+        .rsi_mapped = false,
+        .stack_mapped = true,
+        .pointer_opaque = true,
+        .pointer_owner = "Objective-C selector identity",
+    });
+    try std.testing.expectEqual(FaultClass.opaque_identity_dereference, result.class);
 }

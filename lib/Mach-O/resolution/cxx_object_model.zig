@@ -39,6 +39,9 @@ pub const stream_layout = StreamLayout{
 pub const FILEBUF_OFFSET_IN_IFSTREAM: u64 = 16;
 pub const BASIC_IOS_OFFSET_IN_IFSTREAM: u64 = 424;
 pub const IFSTREAM_SIZE: u64 = BASIC_IOS_OFFSET_IN_IFSTREAM + stream_layout.size;
+pub const BADBIT: u32 = 1;
+pub const EOFBIT: u32 = 2;
+pub const FAILBIT: u32 = 4;
 
 const TypeRecord = struct {
     typeinfo: u64 = 0,
@@ -54,7 +57,7 @@ pub const Model = struct {
         self.* = .{};
     }
 
-    pub fn ensureType(self: *Model, state: anytype, kind: Kind, virtual_base_offset: i64) ?TypeRecord {
+    pub fn ensureType(self: *Model, state: anytype, kind: Kind, virtual_base_offset: ?i64) ?TypeRecord {
         const record = &self.types[@intFromEnum(kind)];
         if (record.vtable != 0) return record.*;
         const name = @tagName(kind);
@@ -74,7 +77,7 @@ pub const Model = struct {
                 .{ .kind = .guest_backed, .may_dereference = true, .owner = name },
             );
         }
-        const virtual_bases: []const i64 = if (virtual_base_offset == 0) &.{} else &.{virtual_base_offset};
+        const virtual_bases: []const i64 = if (virtual_base_offset) |offset| &.{offset} else &.{};
         const table = self.builder.create(state, .{
             .type_name = name,
             .typeinfo = typeinfo,
@@ -87,7 +90,7 @@ pub const Model = struct {
 
     pub fn initializeBasicIos(self: *Model, state: anytype, object: u64, streambuf: u64) bool {
         if (state.guestMemory(object, stream_layout.size) == null) return false;
-        const record = self.ensureType(state, .basic_ios, 0) orelse return false;
+        const record = self.ensureType(state, .basic_ios, null) orelse return false;
         state.write64(object, record.vtable);
         state.write64(object + stream_layout.rdbuf_offset, streambuf);
         state.write32(object + stream_layout.state_offset, 0);
@@ -103,6 +106,9 @@ pub const Model = struct {
     pub fn initializeStream(self: *Model, state: anytype, kind: Kind, object: u64, streambuf: u64) bool {
         if (kind != .basic_istream and kind != .basic_ostream and kind != .basic_iostream) return false;
         if (state.guestMemory(object, stream_layout.size) == null) return false;
+        // basic_istream/basic_ostream virtually inherit basic_ios. Even when
+        // Rosette's compact model uses a zero adjustment, vtable[-3] must
+        // exist because libc++ constructor code reads that ABI slot.
         const record = self.ensureType(state, kind, 0) orelse return false;
         state.write64(object, record.vtable);
         state.write64(object + stream_layout.rdbuf_offset, streambuf);
@@ -119,7 +125,7 @@ pub const Model = struct {
     pub fn initializeIfstream(self: *Model, state: anytype, object: u64) bool {
         if (state.guestMemory(object, IFSTREAM_SIZE) == null) return false;
         const ifstream = self.ensureType(state, .basic_ifstream, @intCast(BASIC_IOS_OFFSET_IN_IFSTREAM)) orelse return false;
-        const filebuf = self.ensureType(state, .basic_filebuf, 0) orelse return false;
+        const filebuf = self.ensureType(state, .basic_filebuf, null) orelse return false;
         state.write64(object, ifstream.vtable);
         state.write64(object + FILEBUF_OFFSET_IN_IFSTREAM, filebuf.vtable);
         if (!self.initializeBasicIos(state, object + BASIC_IOS_OFFSET_IN_IFSTREAM, object + FILEBUF_OFFSET_IN_IFSTREAM)) return false;
@@ -144,6 +150,18 @@ pub const Model = struct {
 
     pub fn setstate(self: *Model, state: anytype, object: u64, value: u32) bool {
         return self.clear(state, object, self.rdstate(state, object) | value);
+    }
+
+    pub fn good(self: *const Model, state: anytype, object: u64) bool {
+        return self.rdstate(state, object) == 0;
+    }
+
+    pub fn fail(self: *const Model, state: anytype, object: u64) bool {
+        return self.rdstate(state, object) & (BADBIT | FAILBIT) != 0;
+    }
+
+    pub fn eof(self: *const Model, state: anytype, object: u64) bool {
+        return self.rdstate(state, object) & EOFBIT != 0;
     }
 
     fn markObject(_: *Model, state: anytype, object: u64, size: u64, kind: Kind) void {
@@ -205,6 +223,9 @@ test "C++ object model initializes dereferenceable stream state" {
     try std.testing.expectEqual(@as(u64, 0x300), model.rdbuf(&state, 64));
     try std.testing.expect(model.setstate(&state, 64, 0x4));
     try std.testing.expectEqual(@as(u32, 0x4), model.rdstate(&state, 64));
+    try std.testing.expect(model.fail(&state, 64));
+    try std.testing.expect(!model.good(&state, 64));
+    try std.testing.expect(!model.eof(&state, 64));
     try std.testing.expect(state.marked_objects != 0);
 }
 

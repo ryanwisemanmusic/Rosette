@@ -5,6 +5,8 @@ pub const RegionKind = enum {
     macho_data,
     macho_const,
     guest_heap,
+    guest_mmap,
+    guest_unmapped,
     guest_stack,
     synthetic_vtable,
     synthetic_typeinfo,
@@ -12,6 +14,7 @@ pub const RegionKind = enum {
     synthetic_handle,
     import_got,
     lazy_bind_stub,
+    synthetic_thunk,
     pthread_stack,
     file_buffer,
     objc_handle,
@@ -35,6 +38,13 @@ pub const Region = struct {
     pub fn contains(self: Region, address: u64, size: u64) bool {
         const end = std.math.add(u64, address, size) catch return false;
         return address >= self.start and end <= self.end;
+    }
+
+    pub fn isSynthetic(self: Region) bool {
+        return switch (self.kind) {
+            .synthetic_vtable, .synthetic_typeinfo, .synthetic_object, .synthetic_handle, .lazy_bind_stub, .synthetic_thunk, .objc_handle => true,
+            else => false,
+        };
     }
 };
 
