@@ -5,10 +5,22 @@ const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
 const MAX_ATTRIBUTES = 32;
 const MAX_THREADS = 64;
 const MAX_MUTEXES = 128;
+const MAX_CONDVARS = 64;
 
 pub const Outcome = union(enum) {
     handled: u64,
     handled_void,
+};
+
+pub const ThreadState = enum {
+    runnable,
+    sleeping,
+    blocked,
+    waiting_condvar,
+    waiting_mutex,
+    waiting_join,
+    completed,
+    cancelled,
 };
 
 const Attribute = struct {
@@ -22,6 +34,14 @@ pub const DeferredThread = struct {
     start_routine: u64,
     argument: u64,
     stack_size: u64,
+    state: ThreadState,
+};
+
+const CondVar = struct {
+    active: bool = false,
+    address: u64 = 0,
+    waiters: u32 = 0,
+    notifications: u64 = 0,
 };
 
 const Thread = struct {
@@ -33,30 +53,40 @@ const Thread = struct {
     joined: bool = false,
     cancelled: bool = false,
     started: bool = false,
-    completed: bool = false,
+    state: ThreadState = .runnable,
+    blocked_since_step: u64 = 0,
+    blocked_reason: []const u8 = "",
 };
 
 const Mutex = struct {
     active: bool = false,
     address: u64 = 0,
     depth: u32 = 0,
+    owner_thread: u64 = 0,
+    contention_count: u64 = 0,
 };
 
 pub const Runtime = struct {
     attributes: [MAX_ATTRIBUTES]Attribute = [_]Attribute{.{}} ** MAX_ATTRIBUTES,
     threads: [MAX_THREADS]Thread = [_]Thread{.{}} ** MAX_THREADS,
     mutexes: [MAX_MUTEXES]Mutex = [_]Mutex{.{}} ** MAX_MUTEXES,
+    condvars: [MAX_CONDVARS]CondVar = [_]CondVar{.{}} ** MAX_CONDVARS,
     created_threads: u64 = 0,
     deferred_threads: u64 = 0,
     joined_threads: u64 = 0,
     cancelled_threads: u64 = 0,
     mutex_locks: u64 = 0,
     mutex_unlocks: u64 = 0,
+    mutex_contentions: u64 = 0,
     collapsed_waits: u64 = 0,
     condition_notifications: u64 = 0,
+    condition_broadcasts: u64 = 0,
     tls_sets: u64 = 0,
     scheduled_threads: u64 = 0,
     completed_threads: u64 = 0,
+    blocked_threads: u64 = 0,
+    main_thread_handle: u64 = CURRENT_THREAD_HANDLE,
+    last_diagnostic_step: u64 = 0,
 
     pub fn dispatch(self: *Runtime, state: anytype, name: []const u8) ?Outcome {
         if (std.mem.eql(u8, name, "_pthread_self")) return .{ .handled = CURRENT_THREAD_HANDLE };
@@ -84,19 +114,19 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "_pthread_mutex_unlock")) return .{ .handled = self.mutexUnlock(state.regs.rdi) };
         if (std.mem.eql(u8, name, "_pthread_cond_init")) return .{ .handled = initializeOpaque(state, state.regs.rdi, 48) };
         if (std.mem.eql(u8, name, "_pthread_cond_destroy")) return .{ .handled = 0 };
-        if (std.mem.eql(u8, name, "_pthread_cond_signal") or std.mem.eql(u8, name, "_pthread_cond_broadcast")) {
+        if (std.mem.eql(u8, name, "_pthread_cond_signal")) {
             self.condition_notifications +|= 1;
+            self.condvarSignal(state.regs.rdi);
+            return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "_pthread_cond_broadcast")) {
+            self.condition_notifications +|= 1;
+            self.condition_broadcasts +|= 1;
+            self.condvarBroadcast(state.regs.rdi);
             return .{ .handled = 0 };
         }
         if (std.mem.eql(u8, name, "_pthread_cond_wait")) {
-            self.collapsed_waits +|= 1;
-            if (self.collapsed_waits <= 8 or self.collapsed_waits % 1000 == 0) {
-                std.debug.print(
-                    "macho-processor: pthread runtime: collapsed condition wait #{d} cond=0x{x} mutex=0x{x} (single guest execution thread)\n",
-                    .{ self.collapsed_waits, state.regs.rdi, state.regs.rsi },
-                );
-            }
-            return .{ .handled = 0 };
+            return .{ .handled = self.condvarWait(state) };
         }
         return null;
     }
@@ -104,7 +134,7 @@ pub const Runtime = struct {
     pub fn logSummary(self: *const Runtime) void {
         if (self.created_threads == 0 and self.mutex_locks == 0 and self.collapsed_waits == 0 and self.tls_sets == 0) return;
         std.debug.print(
-            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} cancelled={d} mutex(lock/unlock)={d}/{d} cond_notify={d} waits_collapsed={d} tls_sets={d}\n",
+            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits)={d}/{d}/{d} tls_sets={d}\n",
             .{
                 self.created_threads,
                 self.deferred_threads,
@@ -112,13 +142,49 @@ pub const Runtime = struct {
                 self.completed_threads,
                 self.joined_threads,
                 self.cancelled_threads,
+                self.blocked_threads,
                 self.mutex_locks,
                 self.mutex_unlocks,
+                self.mutex_contentions,
                 self.condition_notifications,
+                self.condition_broadcasts,
                 self.collapsed_waits,
                 self.tls_sets,
             },
         );
+    }
+
+    pub fn diagnoseStuck(self: *Runtime, current_step: u64, current_rip: u64) void {
+        _ = current_rip;
+        if (current_step -| self.last_diagnostic_step < 5_000_000) return;
+        var blocked_count: u32 = 0;
+        for (&self.threads) |*thread| {
+            if (!thread.active or thread.state == .runnable or thread.state == .completed) continue;
+            blocked_count += 1;
+            const blocked_steps = current_step -| thread.blocked_since_step;
+            if (blocked_steps > 2_000_000) {
+                std.debug.print(
+                    "macho-processor: thread stuck: handle=0x{x} state={s} blocked_for={d} steps reason={s}\n",
+                    .{ thread.handle, @tagName(thread.state), blocked_steps, thread.blocked_reason },
+                );
+            }
+        }
+        if (blocked_count > 0) {
+            const active = self.activeCount();
+            std.debug.print(
+                "macho-processor: scheduler: {d} threads active, {d} blocked/deferred, total={d}\n",
+                .{ active, blocked_count, self.created_threads },
+            );
+        }
+        self.last_diagnostic_step = current_step;
+    }
+
+    pub fn activeCount(self: *const Runtime) u64 {
+        var count: u64 = 0;
+        for (&self.threads) |*thread| {
+            if (thread.active and (thread.state == .runnable or thread.state == .sleeping)) count += 1;
+        }
+        return count;
     }
 
     pub fn takeNewestDeferred(self: *Runtime) ?DeferredThread {
@@ -126,8 +192,9 @@ pub const Runtime = struct {
         while (index != 0) {
             index -= 1;
             const thread = &self.threads[index];
-            if (!thread.active or thread.started or thread.cancelled) continue;
+            if (!thread.active or thread.started or thread.cancelled or thread.state != .runnable) continue;
             thread.started = true;
+            thread.state = .runnable;
             self.deferred_threads -|= 1;
             self.scheduled_threads +|= 1;
             return .{
@@ -135,6 +202,7 @@ pub const Runtime = struct {
                 .start_routine = thread.start_routine,
                 .argument = thread.argument,
                 .stack_size = thread.stack_size,
+                .state = .runnable,
             };
         }
         return null;
@@ -142,8 +210,8 @@ pub const Runtime = struct {
 
     pub fn markCompleted(self: *Runtime, handle: u64) void {
         const thread = self.threadForHandle(handle) orelse return;
-        if (thread.completed) return;
-        thread.completed = true;
+        if (thread.state == .completed) return;
+        thread.state = .completed;
         self.completed_threads +|= 1;
     }
 
@@ -186,6 +254,7 @@ pub const Runtime = struct {
                 .start_routine = state.regs.rdx,
                 .argument = state.regs.rcx,
                 .stack_size = self.stackSize(state.regs.rsi),
+                .state = .runnable,
             };
             state.write64(state.regs.rdi, handle);
             self.created_threads +|= 1;
@@ -201,6 +270,11 @@ pub const Runtime = struct {
 
     fn join(self: *Runtime, state: anytype) u64 {
         const thread = self.threadForHandle(state.regs.rdi) orelse return 3;
+        if (thread.state != .completed) {
+            thread.state = .waiting_join;
+            thread.blocked_reason = "pthread_join waiting";
+            self.blocked_threads +|= 1;
+        }
         thread.joined = true;
         self.joined_threads +|= 1;
         if (state.regs.rsi != 0 and state.guestMemory(state.regs.rsi, 8) != null) state.write64(state.regs.rsi, 0);
@@ -210,6 +284,7 @@ pub const Runtime = struct {
     fn cancel(self: *Runtime, handle: u64) u64 {
         const thread = self.threadForHandle(handle) orelse return 3;
         thread.cancelled = true;
+        thread.state = .cancelled;
         self.cancelled_threads +|= 1;
         return 0;
     }
@@ -227,15 +302,83 @@ pub const Runtime = struct {
 
     fn mutexLock(self: *Runtime, address: u64) u64 {
         const mutex = self.mutexForAddress(address, true) orelse return 12;
+        if (mutex.depth > 0 and mutex.owner_thread != 0) {
+            mutex.contention_count +|= 1;
+            self.mutex_contentions +|= 1;
+            if (mutex.contention_count <= 8 or mutex.contention_count % 100 == 0) {
+                std.debug.print(
+                    "macho-processor: pthread mutex contention #{d} mutex=0x{x} depth={d} owner=0x{x}\n",
+                    .{ mutex.contention_count, address, mutex.depth, mutex.owner_thread },
+                );
+            }
+        }
         mutex.depth +|= 1;
+        mutex.owner_thread = CURRENT_THREAD_HANDLE;
         self.mutex_locks +|= 1;
         return 0;
     }
 
     fn mutexUnlock(self: *Runtime, address: u64) u64 {
         const mutex = self.mutexForAddress(address, false) orelse return 22;
-        if (mutex.depth != 0) mutex.depth -= 1;
+        if (mutex.depth != 0) {
+            mutex.depth -= 1;
+            if (mutex.depth == 0) mutex.owner_thread = 0;
+        }
         self.mutex_unlocks +|= 1;
+        return 0;
+    }
+
+    fn condvarInit(self: *Runtime, address: u64) ?*CondVar {
+        for (&self.condvars) |*cv| {
+            if (cv.active and cv.address == address) return cv;
+        }
+        for (&self.condvars) |*cv| {
+            if (cv.active) continue;
+            cv.* = .{ .active = true, .address = address };
+            return cv;
+        }
+        return null;
+    }
+
+    fn condvarSignal(self: *Runtime, address: u64) void {
+        if (self.condvarForAddress(address)) |cv| {
+            cv.notifications +|= 1;
+            if (cv.waiters > 0) {
+                cv.waiters -= 1;
+                std.debug.print(
+                    "macho-processor: condvar signal: cond=0x{x} remaining_waiters={d} total_notifications={d}\n",
+                    .{ address, cv.waiters, cv.notifications },
+                );
+            }
+        }
+    }
+
+    fn condvarBroadcast(self: *Runtime, address: u64) void {
+        if (self.condvarForAddress(address)) |cv| {
+            const woke = cv.waiters;
+            cv.waiters = 0;
+            cv.notifications +|= woke;
+            if (woke > 0) {
+                std.debug.print(
+                    "macho-processor: condvar broadcast: cond=0x{x} woke={d} total_notifications={d}\n",
+                    .{ address, woke, cv.notifications },
+                );
+            }
+        }
+    }
+
+    fn condvarWait(self: *Runtime, state: anytype) u64 {
+        self.collapsed_waits +|= 1;
+        const cond_addr = state.regs.rdi;
+        const mutex_addr = state.regs.rsi;
+        const cv = self.condvarInit(cond_addr) orelse return 12;
+        cv.waiters +|= 1;
+        if (self.collapsed_waits <= 8 or self.collapsed_waits % 1000 == 0) {
+            std.debug.print(
+                "macho-processor: pthread condvar wait #{d} cond=0x{x} mutex=0x{x} waiters={d} (single guest execution thread, wait collapsed)\n",
+                .{ self.collapsed_waits, cond_addr, mutex_addr, cv.waiters },
+            );
+        }
         return 0;
     }
 
@@ -291,6 +434,13 @@ pub const Runtime = struct {
         }
         return null;
     }
+
+    fn condvarForAddress(self: *Runtime, address: u64) ?*CondVar {
+        for (&self.condvars) |*cv| {
+            if (cv.active and cv.address == address) return cv;
+        }
+        return null;
+    }
 };
 
 fn initializeOpaque(state: anytype, address: u64, size: u64) u64 {
@@ -337,4 +487,25 @@ test "pthread runtime records deferred guest threads" {
     try std.testing.expectEqual(@as(u64, 0), runtime.deferred_threads);
     runtime.markCompleted(deferred.handle);
     try std.testing.expectEqual(@as(u64, 1), runtime.completed_threads);
+}
+
+test "pthread mutex contention tracking" {
+    var runtime = Runtime{};
+    const mutex_addr: u64 = 0x1000;
+    var test_state = struct {
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 { _ = self; return null; }
+        fn write64(self: *@This(), _: u64, _: u64) void { _ = self; }
+        fn write32(self: *@This(), _: u64, _: u32) void { _ = self; }
+    }{ .regs = .{ .rdi = mutex_addr } };
+    _ = runtime.dispatch(&test_state, "_pthread_mutex_init");
+    _ = runtime.mutexLock(mutex_addr);
+    _ = runtime.mutexLock(mutex_addr);
+    try std.testing.expectEqual(@as(u64, 1), runtime.mutex_contentions);
+    try std.testing.expectEqual(@as(u64, 2), runtime.mutex_locks);
+}
+
+test "thread state transitions" {
+    var runtime = Runtime{};
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeCount());
 }

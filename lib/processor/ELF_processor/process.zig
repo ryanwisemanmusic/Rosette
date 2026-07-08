@@ -2041,6 +2041,13 @@ pub const ElfState = struct {
                 );
                 x64_guest_abi.diagnoseSyscall(self, syscall_number, syscall_fd, syscall_buf, syscall_count, self.regs.rax);
             },
+            .ud2 => {
+                log.err("elf-processor: UD2 instruction at rip=0x{x} — intentional invalid opcode exception", .{self.regs.rip});
+                self.faulted = true;
+                self.terminated = true;
+                self.exit_code = 127;
+                return;
+            },
             .cpuid => {
                 const result = x64_decoder.emulatedCpuid(@truncate(self.regs.rax), @truncate(self.regs.rcx));
                 self.setReg(.al_ax_eax_rax, .bits32, result.eax);

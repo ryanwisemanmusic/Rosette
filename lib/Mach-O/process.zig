@@ -73,6 +73,7 @@ const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 16;
 const DECODE_CACHE_HASH_SHIFT: u6 = 48;
+const IMPORT_ROUTE_CACHE_SIZE: usize = 1024;
 const PAGE_READ: u8 = 1 << 0;
 const PAGE_WRITE: u8 = 1 << 1;
 const PAGE_EXECUTE: u8 = 1 << 2;
@@ -127,6 +128,7 @@ const DecodeCacheEntry = struct {
 };
 
 const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
+const HEARTBEAT_INTERVAL: u64 = 5_000_000;
 
 const ImportHandlerResult = union(enum) {
     handled: u64,
@@ -134,6 +136,41 @@ const ImportHandlerResult = union(enum) {
     control_transferred,
     unsupported: u64,
     terminated: u64,
+};
+
+const ImportRoute = enum(u8) {
+    legacy,
+    guest_memory_copy,
+    memset,
+    bzero,
+    gtk_main,
+    gtk_main_quit,
+    local_definition,
+    libcxx_stream,
+    foreign_object,
+    import_contract,
+    libcxx_filesystem,
+    pthread,
+    dynamic_library,
+    shared_contract,
+    allocate,
+    release,
+    reallocate,
+    posix_memalign,
+    aligned_alloc,
+    calloc,
+    chkstk,
+};
+
+const ImportRouteCacheEntry = struct {
+    stub_address: u64 = 0,
+    route: ImportRoute = .legacy,
+    valid: bool = false,
+};
+
+const BulkConstructionRange = struct {
+    byte_count: u64,
+    new_end: u64,
 };
 
 const InitializerRunOutcome = enum {
@@ -185,6 +222,7 @@ const InternalCompatibilityTargets = struct {
     imgui_mem_alloc: u64 = 0,
     imgui_mem_free: u64 = 0,
     imgui_settings_push_back: u64 = 0,
+    page_entry_construct_at_end: u64 = 0,
 };
 
 const InitializerCheckpoint = struct {
@@ -273,6 +311,14 @@ pub const MachOState = struct {
     last_unwind_inspection: ?itanium_unwinder.Inspection = null,
     import_provider_override: ?import_resolution.Provider = null,
     import_confidence_override: ?import_resolution.Confidence = null,
+    import_route_cache: [IMPORT_ROUTE_CACHE_SIZE]ImportRouteCacheEntry = [_]ImportRouteCacheEntry{.{}} ** IMPORT_ROUTE_CACHE_SIZE,
+    resolving_import_route: ImportRoute = .legacy,
+    import_route_cache_hits: u64 = 0,
+    import_route_cache_misses: u64 = 0,
+    import_route_cache_collisions: u64 = 0,
+    import_route_cache_fallbacks: u64 = 0,
+    page_entry_bulk_initializations: u64 = 0,
+    page_entry_bulk_bytes: u64 = 0,
     initializer_memory: memory_transaction.Journal,
     initializer_checkpoint: ?InitializerCheckpoint = null,
     trace_entries: [TRACE_BUFFER_LEN]TraceEntry = [_]TraceEntry{TraceEntry{}} ** TRACE_BUFFER_LEN,
@@ -489,6 +535,9 @@ pub const MachOState = struct {
         ) orelse 0;
         result.internal_targets.imgui_settings_push_back = result.metadata.symbolAddressWithPrefix(
             "__ZN8ImVectorI20ImGuiSettingsHandlerE9push_backERKS0_",
+        ) orelse 0;
+        result.internal_targets.page_entry_construct_at_end = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__114__split_bufferIN2xe9PageEntryERNS_9allocatorIS2_EEE18__construct_at_endEm",
         ) orelse 0;
         var defined_symbols = result.metadata.definedSymbolIterator();
         while (defined_symbols.next()) |entry| {
@@ -1430,6 +1479,31 @@ pub const MachOState = struct {
     }
 
     fn handleImportImpl(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
+        const cache_index = importRouteCacheIndex(imported.stub_address);
+        const entry = &self.import_route_cache[cache_index];
+        if (entry.valid and entry.stub_address == imported.stub_address) {
+            if (self.dispatchImportRoute(entry.route, imported)) |result| {
+                self.import_route_cache_hits +|= 1;
+                return result;
+            }
+            self.import_route_cache_fallbacks +|= 1;
+            entry.valid = false;
+        } else {
+            self.import_route_cache_misses +|= 1;
+            if (entry.valid) self.import_route_cache_collisions +|= 1;
+        }
+
+        self.resolving_import_route = .legacy;
+        const result = self.handleImportSlow(imported);
+        entry.* = .{
+            .stub_address = imported.stub_address,
+            .route = self.resolving_import_route,
+            .valid = true,
+        };
+        return result;
+    }
+
+    fn handleImportSlow(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
         const name = imported.name;
         if ((std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) and
             self.foreign_objects.main_loop_bypasses != 0)
@@ -1440,12 +1514,36 @@ pub const MachOState = struct {
             );
         }
         if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove")) {
+            self.resolving_import_route = .guest_memory_copy;
             return self.handleGuestMemoryCopy(name);
         }
+        if (std.mem.eql(u8, name, "_memset")) {
+            self.resolving_import_route = .memset;
+            const dst = self.regs.rdi;
+            const val: u8 = @truncate(self.regs.rsi);
+            const count = self.regs.rdx;
+            if (count != 0) {
+                const buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
+                @memset(buf, val);
+            }
+            return .{ .handled = dst };
+        }
+        if (std.mem.eql(u8, name, "_bzero") or std.mem.eql(u8, name, "__bzero")) {
+            self.resolving_import_route = .bzero;
+            const dst = self.regs.rdi;
+            const count = self.regs.rsi;
+            if (count != 0) {
+                const buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
+                @memset(buf, 0);
+            }
+            return .{ .handled = 0 };
+        }
         if (std.mem.eql(u8, name, "_gtk_main") and self.beginGtkMainLoop()) {
+            self.resolving_import_route = .gtk_main;
             return .control_transferred;
         }
         if (std.mem.eql(u8, name, "_gtk_main_quit") and self.cooperative_ui_context != null) {
+            self.resolving_import_route = .gtk_main_quit;
             self.foreign_objects.main_loop_quits +|= 1;
             self.restoreGtkMainLoopCaller("gtk_main_quit");
             return .control_transferred;
@@ -1453,6 +1551,7 @@ pub const MachOState = struct {
         if (self.metadata.definedSymbolAddress(name)) |target| {
             if (target != imported.stub_address and self.isExecutableAddress(target)) {
                 self.regs.rip = target;
+                self.resolving_import_route = .local_definition;
                 self.import_provider_override = .local_definition;
                 self.import_confidence_override = .verified;
                 if (self.verbose_trace) {
@@ -1462,6 +1561,7 @@ pub const MachOState = struct {
             }
         }
         if (self.libcxx_streams.dispatch(self, &self.fs_forwarder, name)) |resolution| {
+            self.resolving_import_route = .libcxx_stream;
             self.import_provider_override = .libcpp_stream;
             self.import_confidence_override = .modeled;
             return switch (resolution) {
@@ -1470,6 +1570,7 @@ pub const MachOState = struct {
             };
         }
         if (self.foreign_objects.dispatch(self, name)) |resolution| {
+            self.resolving_import_route = .foreign_object;
             self.import_confidence_override = .modeled;
             return switch (resolution) {
                 .handled => |value| .{ .handled = value },
@@ -1477,6 +1578,7 @@ pub const MachOState = struct {
             };
         }
         if (import_resolution.dispatchContract(self, name)) |resolution| {
+            self.resolving_import_route = .import_contract;
             return switch (resolution) {
                 .handled => |value| .{ .handled = value },
                 .handled_void => .handled_void,
@@ -1485,6 +1587,7 @@ pub const MachOState = struct {
         }
 
         if (self.libcxx_filesystem.dispatch(self, &self.fs_forwarder, name)) |resolution| {
+            self.resolving_import_route = .libcxx_filesystem;
             self.import_provider_override = .libcpp_filesystem;
             self.import_confidence_override = .verified;
             return switch (resolution) {
@@ -1494,6 +1597,7 @@ pub const MachOState = struct {
         }
 
         if (self.pthreads.dispatch(self, name)) |resolution| {
+            self.resolving_import_route = .pthread;
             self.import_provider_override = .pthread_runtime;
             self.import_confidence_override = .modeled;
             return switch (resolution) {
@@ -1503,6 +1607,7 @@ pub const MachOState = struct {
         }
 
         if (self.dynamic_forwarder.forward(self, imported.dylib, name)) |resolution| {
+            self.resolving_import_route = .dynamic_library;
             self.import_provider_override = .dynamic_library;
             self.import_confidence_override = .verified;
             return switch (resolution) {
@@ -1512,6 +1617,7 @@ pub const MachOState = struct {
         }
 
         if (contract.dispatchFromAllFamilies(name, self.regs.rdi)) |outcome| {
+            self.resolving_import_route = .shared_contract;
             if (self.verbose_trace) {
                 const c = contract.resolveFromAllFamilies(name);
                 const tag = @tagName(outcome);
@@ -1971,21 +2077,32 @@ pub const MachOState = struct {
 
         if (std.mem.eql(u8, name, "__Znwm") or std.mem.eql(u8, name, "__Znam") or
             std.mem.eql(u8, name, "__ZnwmRKSt9nothrow_t") or
+            std.mem.eql(u8, name, "__ZnwmSt11align_val_t") or
+            std.mem.eql(u8, name, "__ZnamSt11align_val_t") or
             std.mem.endsWith(u8, name, "_malloc"))
         {
-            return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 };
+            self.resolving_import_route = .allocate;
+            const alignment: u64 = if (std.mem.endsWith(u8, name, "St11align_val_t")) self.regs.rsi else 16;
+            return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, alignment) orelse 0 };
         }
         if (std.mem.eql(u8, name, "__ZdlPv") or std.mem.eql(u8, name, "__ZdaPv") or
             std.mem.eql(u8, name, "__ZdlPvm") or std.mem.eql(u8, name, "__ZdaPvm") or
+            std.mem.eql(u8, name, "__ZdlPvSt11align_val_t") or
+            std.mem.eql(u8, name, "__ZdaPvSt11align_val_t") or
+            std.mem.eql(u8, name, "__ZdlPvmSt11align_val_t") or
+            std.mem.eql(u8, name, "__ZdaPvmSt11align_val_t") or
             std.mem.endsWith(u8, name, "_free"))
         {
+            self.resolving_import_route = .release;
             self.memory_forwarder.release(self.regs.rdi);
             return .handled_void;
         }
         if (std.mem.endsWith(u8, name, "_realloc")) {
+            self.resolving_import_route = .reallocate;
             return .{ .handled = self.memory_forwarder.reallocate(self, self.regs.rdi, self.regs.rsi) orelse 0 };
         }
         if (std.mem.eql(u8, name, "_posix_memalign")) {
+            self.resolving_import_route = .posix_memalign;
             const output = self.regs.rdi;
             const alignment = self.regs.rsi;
             const size = self.regs.rdx;
@@ -1998,14 +2115,17 @@ pub const MachOState = struct {
             return .{ .handled = 0 };
         }
         if (std.mem.eql(u8, name, "_aligned_alloc")) {
+            self.resolving_import_route = .aligned_alloc;
             const alignment = self.regs.rdi;
             if (!std.math.isPowerOfTwo(alignment) or self.regs.rsi % alignment != 0) return .{ .handled = 0 };
             return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rsi, alignment) orelse 0 };
         }
         if (std.mem.endsWith(u8, name, "_calloc")) {
+            self.resolving_import_route = .calloc;
             return .{ .handled = self.memory_forwarder.allocateZeroed(self, self.regs.rdi, self.regs.rsi) orelse 0 };
         }
         if (std.mem.eql(u8, name, "____chkstk_darwin")) {
+            self.resolving_import_route = .chkstk;
             return .{ .handled = self.regs.rax };
         }
 
@@ -2379,6 +2499,136 @@ pub const MachOState = struct {
 
         if (self.verbose_trace) std.debug.print("    [import] (unhandled) {s}\n", .{name});
         return .{ .unsupported = 0 };
+    }
+
+    fn dispatchImportRoute(self: *MachOState, route: ImportRoute, imported: macho_metadata.ImportedSymbol) ?ImportHandlerResult {
+        const name = imported.name;
+        return switch (route) {
+            .legacy => self.handleImportSlow(imported),
+            .guest_memory_copy => self.handleGuestMemoryCopy(name),
+            .memset => blk: {
+                const destination = self.regs.rdi;
+                if (self.regs.rdx != 0) {
+                    const bytes = self.guestMemory(destination, self.regs.rdx) orelse break :blk .{ .unsupported = 0 };
+                    @memset(bytes, @truncate(self.regs.rsi));
+                }
+                break :blk .{ .handled = destination };
+            },
+            .bzero => blk: {
+                if (self.regs.rsi != 0) {
+                    const bytes = self.guestMemory(self.regs.rdi, self.regs.rsi) orelse break :blk .{ .unsupported = 0 };
+                    @memset(bytes, 0);
+                }
+                break :blk .{ .handled = 0 };
+            },
+            .gtk_main => if (self.beginGtkMainLoop()) .control_transferred else null,
+            .gtk_main_quit => blk: {
+                if (self.cooperative_ui_context == null) break :blk null;
+                self.foreign_objects.main_loop_quits +|= 1;
+                self.restoreGtkMainLoopCaller("gtk_main_quit");
+                break :blk .control_transferred;
+            },
+            .local_definition => blk: {
+                const target = self.metadata.definedSymbolAddress(name) orelse break :blk null;
+                if (target == imported.stub_address or !self.isExecutableAddress(target)) break :blk null;
+                self.regs.rip = target;
+                self.import_provider_override = .local_definition;
+                self.import_confidence_override = .verified;
+                break :blk .control_transferred;
+            },
+            .libcxx_stream => blk: {
+                const resolution = self.libcxx_streams.dispatch(self, &self.fs_forwarder, name) orelse break :blk null;
+                self.import_provider_override = .libcpp_stream;
+                self.import_confidence_override = .modeled;
+                break :blk switch (resolution) {
+                    .handled => |value| .{ .handled = value },
+                    .handled_void => .handled_void,
+                };
+            },
+            .foreign_object => blk: {
+                const resolution = self.foreign_objects.dispatch(self, name) orelse break :blk null;
+                self.import_confidence_override = .modeled;
+                break :blk switch (resolution) {
+                    .handled => |value| .{ .handled = value },
+                    .handled_void => .handled_void,
+                };
+            },
+            .import_contract => blk: {
+                const resolution = import_resolution.dispatchContract(self, name) orelse break :blk null;
+                break :blk switch (resolution) {
+                    .handled => |value| .{ .handled = value },
+                    .handled_void => .handled_void,
+                    .failed => .{ .unsupported = 0 },
+                };
+            },
+            .libcxx_filesystem => blk: {
+                const resolution = self.libcxx_filesystem.dispatch(self, &self.fs_forwarder, name) orelse break :blk null;
+                self.import_provider_override = .libcpp_filesystem;
+                self.import_confidence_override = .verified;
+                break :blk switch (resolution) {
+                    .handled => |value| .{ .handled = value },
+                    .handled_void => .handled_void,
+                };
+            },
+            .pthread => blk: {
+                const resolution = self.pthreads.dispatch(self, name) orelse break :blk null;
+                self.import_provider_override = .pthread_runtime;
+                self.import_confidence_override = .modeled;
+                break :blk switch (resolution) {
+                    .handled => |value| .{ .handled = value },
+                    .handled_void => .handled_void,
+                };
+            },
+            .dynamic_library => blk: {
+                const resolution = self.dynamic_forwarder.forward(self, imported.dylib, name) orelse break :blk null;
+                self.import_provider_override = .dynamic_library;
+                self.import_confidence_override = .verified;
+                break :blk switch (resolution) {
+                    .handled => |value| .{ .handled = value },
+                    .handled_void => .handled_void,
+                };
+            },
+            .shared_contract => self.dispatchSharedContract(name),
+            .allocate => .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 },
+            .release => blk: {
+                self.memory_forwarder.release(self.regs.rdi);
+                break :blk .handled_void;
+            },
+            .reallocate => .{ .handled = self.memory_forwarder.reallocate(self, self.regs.rdi, self.regs.rsi) orelse 0 },
+            .posix_memalign => self.handleCachedPosixMemalign(),
+            .aligned_alloc => blk: {
+                const alignment = self.regs.rdi;
+                if (!std.math.isPowerOfTwo(alignment) or self.regs.rsi % alignment != 0) break :blk .{ .handled = 0 };
+                break :blk .{ .handled = self.memory_forwarder.allocate(self, self.regs.rsi, alignment) orelse 0 };
+            },
+            .calloc => .{ .handled = self.memory_forwarder.allocateZeroed(self, self.regs.rdi, self.regs.rsi) orelse 0 },
+            .chkstk => .{ .handled = self.regs.rax },
+        };
+    }
+
+    fn dispatchSharedContract(self: *MachOState, name: []const u8) ?ImportHandlerResult {
+        const outcome = contract.dispatchFromAllFamilies(name, self.regs.rdi) orelse return null;
+        if (self.contract_verification and !contract.verify.verifyDispatch(name, outcome, self.regs.rdi)) {
+            if (contract.verify.resolveExpected(name, self.regs.rdi)) |expected| {
+                return switch (expected) {
+                    .handled => |value| .{ .handled = value },
+                    .terminated => |code| .{ .terminated = code },
+                };
+            }
+        }
+        return switch (outcome) {
+            .handled => |value| .{ .handled = value },
+            .terminated => |code| .{ .terminated = code },
+        };
+    }
+
+    fn handleCachedPosixMemalign(self: *MachOState) ImportHandlerResult {
+        const alignment = self.regs.rsi;
+        if (alignment < @sizeOf(u64) or !std.math.isPowerOfTwo(alignment)) return .{ .handled = 22 };
+        if (self.guestMemory(self.regs.rdi, @sizeOf(u64)) == null) return .{ .unsupported = 14 };
+        const allocation = self.memory_forwarder.allocate(self, self.regs.rdx, alignment) orelse return .{ .handled = 12 };
+        self.write64(self.regs.rdi, allocation);
+        return .{ .handled = 0 };
     }
 
     fn handleGuestMemoryCopy(self: *MachOState, name: []const u8) ImportHandlerResult {
@@ -3384,18 +3634,17 @@ pub const MachOState = struct {
             );
             self.dumpRecentTrace();
             _ = self.rollbackInitializerTransaction();
-            self.initializer_resolver.fail(
-                .step_limit,
+            self.initializer_resolver.deferCurrent(
                 steps,
                 final_abi,
                 self.unresolved_import_count,
                 self.guest_assertion_count,
             );
-            self.faulted = true;
-            self.exit_code = 124;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.max_steps_reached);
-            self.terminated = true;
-            return .failed;
+            std.debug.print(
+                "macho-processor: deferred initializer [{d}/{d}] {s} after step limit\n",
+                .{ index + 1, self.metadata.initializer_addresses.len, symbol_name },
+            );
+            return .deferred;
         }
 
         const final_abi = self.initializerAbi();
@@ -3552,6 +3801,12 @@ pub const MachOState = struct {
 
     fn handleInternalCompatibility(self: *MachOState) bool {
         if (self.handleLocalLibcppStreamCompatibility()) return true;
+        if (self.internal_targets.page_entry_construct_at_end != 0 and
+            self.regs.rip == self.internal_targets.page_entry_construct_at_end and
+            self.handlePageEntryBulkInitialization())
+        {
+            return true;
+        }
         if (self.internal_targets.imgui_settings_push_back != 0 and
             self.regs.rip == self.internal_targets.imgui_settings_push_back)
         {
@@ -3675,7 +3930,7 @@ pub const MachOState = struct {
         if (self.internal_targets.print_config_to_log != 0 and
             self.regs.rip == self.internal_targets.print_config_to_log)
         {
-            self.startup.enter(.configuration, self.executed_steps);
+            self.startup.enter(.config_load, self.executed_steps);
             if (self.diagnostic_text.buildConfigDump(self, &self.fs_forwarder, self.regs.rdi)) |dump| {
                 const emitted = self.emitGuestLog('i', dump.address, dump.length);
                 self.logging.recordEmission(dump.length, emitted);
@@ -3684,6 +3939,32 @@ pub const MachOState = struct {
             }
         }
         return false;
+    }
+
+    fn handlePageEntryBulkInitialization(self: *MachOState) bool {
+        const split_buffer = self.regs.rdi;
+        const count = self.regs.rsi;
+        if (self.guestMemoryConst(split_buffer, 32) == null) return false;
+
+        const begin = self.read64(split_buffer + 8);
+        const end = self.read64(split_buffer + 16);
+        const capacity_end = self.read64(split_buffer + 24);
+        if (begin == 0 or end < begin or capacity_end < end) return false;
+
+        const range = calculateBulkConstructionRange(begin, end, capacity_end, count, 16) orelse return false;
+        if (range.byte_count != 0) {
+            const destination = self.guestMemory(end, range.byte_count) orelse return false;
+            @memset(destination, 0);
+        }
+        self.write64(split_buffer + 16, range.new_end);
+        self.page_entry_bulk_initializations +|= 1;
+        self.page_entry_bulk_bytes +|= range.byte_count;
+        std.debug.print(
+            "macho-processor: bulk default construction: PageEntry count={d} bytes={d} range=0x{x}-0x{x}\n",
+            .{ count, range.byte_count, end, range.new_end },
+        );
+        self.regs.rip = self.pop();
+        return !self.terminated;
     }
 
     fn handleLocalLibcppStreamCompatibility(self: *MachOState) bool {
@@ -3964,6 +4245,8 @@ pub const MachOState = struct {
             self.foreign_objects.main_loop_depth -|= 1;
             return false;
         }
+        self.startup.enter(.gtk_init, self.executed_steps);
+        self.startup.enter(.main_loop, self.executed_steps);
         std.debug.print(
             "macho-processor: GTK cooperative main loop entered: guest_thread=0x{x} start=0x{x} deferred_remaining={d}\n",
             .{ deferred.handle, deferred.start_routine, self.pthreads.deferred_threads },
@@ -4118,6 +4401,8 @@ pub const MachOState = struct {
                     .pthread_waits_collapsed = self.pthreads.collapsed_waits,
                     .diagnostic_text_runs = self.diagnostic_text.accelerations,
                     .diagnostic_text_lines = self.diagnostic_text.lines_retained,
+                    .pthread_blocked = self.pthreads.blocked_threads,
+                    .thread_id = self.active_guest_thread,
                 };
                 if (self.startup.enabled) {
                     self.startup.checkpoint(snapshot);
@@ -4127,6 +4412,31 @@ pub const MachOState = struct {
                         .{ steps, self.regs.rip, snapshot.symbol, snapshot.symbol_offset },
                     );
                 }
+            }
+            if (steps % HEARTBEAT_INTERVAL == 0) {
+                const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
+                self.startup.heartbeat(.{
+                    .step = steps,
+                    .rip = self.regs.rip,
+                    .symbol = if (hb_symbol) |resolved| resolved.name else "<unknown>",
+                    .symbol_offset = if (hb_symbol) |resolved| resolved.offset else 0,
+                    .heap_next = self.heap_next,
+                    .import_calls = self.import_resolver.total_calls,
+                    .fs_open = self.fs_forwarder.open_count,
+                    .fs_read = self.fs_forwarder.read_count,
+                    .fs_write = self.fs_forwarder.write_count,
+                    .heap_allocations = 0,
+                    .heap_live = 0,
+                    .options_seen = self.launch_options.registrations_seen,
+                    .options_kept = self.launch_options.registrations_kept,
+                    .options_skipped = self.launch_options.registrations_skipped,
+                    .logging_lines = self.logging.emitted_lines,
+                    .pthread_created = self.pthreads.created_threads,
+                    .pthread_waits_collapsed = self.pthreads.collapsed_waits,
+                    .pthread_blocked = self.pthreads.blocked_threads,
+                    .thread_id = self.active_guest_thread,
+                });
+                self.pthreads.diagnoseStuck(steps, self.regs.rip);
             }
             if (!self.step()) break;
         }
@@ -4168,6 +4478,19 @@ pub const MachOState = struct {
         std.debug.print(
             "macho-processor: decode cache: entries={d} hits={d} misses={d} hit_rate={d}% code_generation={d}\n",
             .{ self.decode_cache.len, self.decode_cache_hits, self.decode_cache_misses, hit_percent, self.code_generation },
+        );
+    }
+
+    fn logPerformanceAccelerationSummary(self: *const MachOState) void {
+        const total = self.import_route_cache_hits + self.import_route_cache_misses;
+        const hit_percent = if (total == 0) 0 else self.import_route_cache_hits * 100 / total;
+        std.debug.print(
+            "macho-processor: import route cache: entries={d} hits={d} misses={d} hit_rate={d}% collisions={d} fallbacks={d}\n",
+            .{ IMPORT_ROUTE_CACHE_SIZE, self.import_route_cache_hits, self.import_route_cache_misses, hit_percent, self.import_route_cache_collisions, self.import_route_cache_fallbacks },
+        );
+        std.debug.print(
+            "macho-processor: bulk construction acceleration: page_entry_runs={d} bytes={d}\n",
+            .{ self.page_entry_bulk_initializations, self.page_entry_bulk_bytes },
         );
     }
 
@@ -5641,6 +5964,15 @@ pub const MachOState = struct {
                 );
             },
 
+            .ud2 => {
+                std.debug.print("macho-processor: UD2 instruction at rip=0x{x} — intentional invalid opcode exception\n", .{self.regs.rip});
+                self.faulted = true;
+                self.terminated = true;
+                self.exit_code = 127;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
+                return;
+            },
+
             .cpuid => {
                 const leaf: u32 = @truncate(self.regs.rax);
                 const subleaf: u32 = @truncate(self.regs.rcx);
@@ -5996,6 +6328,33 @@ fn alignDown(value: u64, alignment: u64) u64 {
     return value & ~(alignment - 1);
 }
 
+fn importRouteCacheIndex(stub_address: u64) usize {
+    const mixed = stub_address ^ (stub_address >> 17) ^ (stub_address >> 37);
+    return @intCast(mixed & (IMPORT_ROUTE_CACHE_SIZE - 1));
+}
+
+fn calculateBulkConstructionRange(begin: u64, end: u64, capacity_end: u64, count: u64, element_size: u64) ?BulkConstructionRange {
+    if (begin == 0 or end < begin or capacity_end < end or element_size == 0) return null;
+    const byte_count = std.math.mul(u64, count, element_size) catch return null;
+    const new_end = std.math.add(u64, end, byte_count) catch return null;
+    if (new_end > capacity_end) return null;
+    return .{ .byte_count = byte_count, .new_end = new_end };
+}
+
+test "bulk construction range validates capacity and overflow" {
+    const range = calculateBulkConstructionRange(0x1000, 0x1800, 0x3000, 128, 16).?;
+    try std.testing.expectEqual(@as(u64, 2048), range.byte_count);
+    try std.testing.expectEqual(@as(u64, 0x2000), range.new_end);
+    try std.testing.expectEqual(@as(?BulkConstructionRange, null), calculateBulkConstructionRange(0x1000, 0x1800, 0x1FFF, 128, 16));
+    try std.testing.expectEqual(@as(?BulkConstructionRange, null), calculateBulkConstructionRange(0x1000, std.math.maxInt(u64) - 7, std.math.maxInt(u64), 1, 16));
+}
+
+test "import route cache index is stable and bounded" {
+    const index = importRouteCacheIndex(0x133_147E);
+    try std.testing.expect(index < IMPORT_ROUTE_CACHE_SIZE);
+    try std.testing.expectEqual(index, importRouteCacheIndex(0x133_147E));
+}
+
 fn mappedOffset(mem_base: u64, mem_size: u64, mapped_min: u64, address: u64) ?u64 {
     // Check for near-null or negative addresses (high bit set in 64-bit, or very small positive addresses)
     const near_null = (address & 0x8000_0000_0000_0000) != 0 or address < 0x1000;
@@ -6149,6 +6508,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.setupMachOState(options.path, options.args);
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
 
+    state.startup.enter(.static_init, state.executed_steps);
     std.debug.print("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
     const initializers_ok = state.runInitializers();
     state.initializer_resolver.logSummary();
@@ -6168,16 +6528,19 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.diagnostic_text.logSummary();
         state.smart_stubs.logSummary();
         state.logDecodeCacheSummary();
+        state.logPerformanceAccelerationSummary();
         std.debug.print("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
         return state.exit_code;
     }
 
+    state.startup.enter(.main_enter, state.executed_steps);
     std.debug.print("macho-processor: starting execution at 0x{x}, rsp=0x{x}\n", .{ state.regs.rip, state.regs.rsp });
 
     state.run();
 
     std.debug.print("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
     state.logDecodeCacheSummary();
+    state.logPerformanceAccelerationSummary();
     state.import_resolver.logSummary();
     state.dynamic_forwarder.logSummary();
     state.fs_forwarder.logSummary();
@@ -6188,11 +6551,14 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.memory_forwarder.logSummary();
     state.launch_options.logSummary();
     state.startup.logSummary();
+    state.startup.timingSummary();
     state.smart_stubs.logSummary();
     state.cxx_exceptions.logSummary();
     state.unwinder.logSummary();
     state.dynamic_casts.logSummary();
     state.diagnostic_text.logSummary();
+    state.pthreads.logSummary();
+    state.sparse_memory.logSummary();
     if (state.guest_log_line_count != 0) {
         std.debug.print(
             "macho-processor: synchronous guest log bridge: mirrored_lines={d}\n",
@@ -7558,6 +7924,12 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
 
     if (opcode2 == 0x05) {
         d.op = .syscall;
+        d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
+    if (opcode2 == 0x0B) {
+        d.op = .ud2;
         d.len = @as(u8, @intCast(pos.*));
         return d;
     }
@@ -8958,6 +9330,12 @@ test "decode register MOVZX without consuming the following instruction" {
     try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.dst_reg);
     try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.src_reg);
     try std.testing.expectEqual(@as(u8, 3), decoded.len);
+}
+
+test "decode UD2 undefined instruction" {
+    const ud2 = decodeInsn(&[_]u8{ 0x0F, 0x0B, 0x48, 0x8B, 0x45, 0xB0 });
+    try std.testing.expectEqual(Op.ud2, ud2.op);
+    try std.testing.expectEqual(@as(u8, 2), ud2.len);
 }
 
 test "decode MOVSX memory and accumulator byte immediate forms" {

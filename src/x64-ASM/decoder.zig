@@ -805,6 +805,7 @@ pub const Op = enum(u16) {
     jmp_reg64,
     // syscall
     syscall,
+    ud2,
     cpuid,
     xgetbv,
     call_mem64,
@@ -823,6 +824,8 @@ fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {
         "sete"
     else if (std.mem.eql(u8, stem, "jcc"))
         "je"
+    else if (std.mem.eql(u8, stem, "ud2"))
+        "UD2"
     else
         stem;
 
