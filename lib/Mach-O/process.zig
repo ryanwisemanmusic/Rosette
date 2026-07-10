@@ -29,7 +29,12 @@ const foreign_object_runtime = @import("resolution/foreign_object_runtime.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
+const symbol_assembly_context = @import("resolution/symbol_assembly_context.zig");
 const contract = @import("contract");
+
+test {
+    std.testing.refAllDecls(symbol_assembly_context);
+}
 
 extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
 
@@ -305,6 +310,8 @@ pub const MachOState = struct {
     pointer_firewall: pointer_firewall.Firewall,
     page_permissions: []u8,
     smart_stubs: smart_stub_generator.Generator = .{},
+    symbol_assembly: symbol_assembly_context.Tracker,
+    symbol_assembly_catalog: ?symbol_assembly_context.Catalog = null,
     cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
     unwinder: itanium_unwinder.Engine = .{},
     dynamic_casts: itanium_dynamic_cast.Engine = .{},
@@ -442,6 +449,7 @@ pub const MachOState = struct {
             .sparse_memory = sparse_virtual_memory.Manager.init(allocator),
             .memory_regions = memory_provenance.Registry.init(allocator),
             .pointer_firewall = pointer_firewall.Firewall.init(allocator),
+            .symbol_assembly = symbol_assembly_context.Tracker.init(allocator),
             .page_permissions = page_permissions,
             .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
             .decode_cache = decode_cache,
@@ -568,6 +576,8 @@ pub const MachOState = struct {
         self.sparse_memory.deinit();
         self.memory_regions.deinit();
         self.pointer_firewall.deinit();
+        if (self.symbol_assembly_catalog) |*catalog| catalog.deinit();
+        self.symbol_assembly.deinit();
         self.allocator.free(self.page_permissions);
         self.initializer_memory.deinit();
         self.allocator.free(self.decode_cache);
@@ -2742,10 +2752,142 @@ pub const MachOState = struct {
             entry.caller_symbol = caller_sym.name;
             entry.caller_offset = caller_sym.offset;
         }
+        self.analyzeUnknownSymbol(imported, return_address);
         self.import_trace_entries[self.import_trace_index] = entry;
         self.import_trace_index = (self.import_trace_index + 1) % IMPORT_TRACE_BUFFER_LEN;
         if (self.import_trace_index == 0) self.import_trace_filled = true;
         self.unresolved_import_count += 1;
+    }
+
+    fn analyzeUnknownSymbol(
+        self: *MachOState,
+        imported: macho_metadata.ImportedSymbol,
+        return_address: u64,
+    ) void {
+        const use_site = self.traceCallSite(return_address) orelse return_address;
+        const observation = self.symbol_assembly.observe(imported.name, use_site) catch |err| {
+            std.debug.print(
+                "  [unknown-symbol assembly] tracking failed for {s}: {s}\n",
+                .{ imported.name, @errorName(err) },
+            );
+            return;
+        };
+
+        if (observation.first_symbol) {
+            if (self.symbol_assembly_catalog == null) {
+                self.symbol_assembly_catalog = symbol_assembly_context.Catalog.build(
+                    self.allocator,
+                    &self.metadata,
+                    decodeInsn,
+                ) catch |err| {
+                    std.debug.print(
+                        "  [unknown-symbol assembly] static index failed for {s}: {s}\n",
+                        .{ imported.name, @errorName(err) },
+                    );
+                    return;
+                };
+            }
+            self.symbol_assembly_catalog.?.logImport(&self.metadata, imported, decodeInsn);
+        }
+
+        if (observation.first_use_site) {
+            self.logDynamicUnknownSymbolContext(imported, use_site, observation.symbol_hits);
+        } else if (observation.site_hits == 2) {
+            std.debug.print(
+                "  [unknown-symbol assembly] repeated symbol={s} use_site=0x{x}; identical context is deduplicated\n",
+                .{ imported.name, use_site },
+            );
+        }
+    }
+
+    fn traceCallSite(self: *const MachOState, return_address: u64) ?u64 {
+        const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        var ordinal = count;
+        while (ordinal != 0) {
+            ordinal -= 1;
+            const index = if (self.trace_filled)
+                (self.trace_index + ordinal) % TRACE_BUFFER_LEN
+            else
+                ordinal;
+            const entry = self.trace_entries[index];
+            if (entry.rip +% entry.len != return_address) continue;
+            switch (entry.op) {
+                .call_rel32, .call_reg64, .call_mem64 => return entry.rip,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn logDynamicUnknownSymbolContext(
+        self: *const MachOState,
+        imported: macho_metadata.ImportedSymbol,
+        use_site: u64,
+        symbol_hits: u64,
+    ) void {
+        const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        if (count == 0) return;
+        var selected_ordinal: ?usize = null;
+        for (0..count) |ordinal| {
+            const index = if (self.trace_filled)
+                (self.trace_index + ordinal) % TRACE_BUFFER_LEN
+            else
+                ordinal;
+            if (self.trace_entries[index].rip == use_site) selected_ordinal = ordinal;
+        }
+        const selected = selected_ordinal orelse return;
+        const start = selected -| symbol_assembly_context.CONTEXT_BEFORE;
+        const end = @min(count, selected + 1 + symbol_assembly_context.CONTEXT_AFTER);
+        if (self.metadata.nearestSymbol(use_site)) |caller| {
+            std.debug.print(
+                "  [unknown-symbol runtime block] symbol={s} occurrence={d} use_site=0x{x} caller={s}+0x{x}\n",
+                .{ imported.name, symbol_hits, use_site, caller.name, caller.offset },
+            );
+        } else {
+            std.debug.print(
+                "  [unknown-symbol runtime block] symbol={s} occurrence={d} use_site=0x{x} caller=<unknown>\n",
+                .{ imported.name, symbol_hits, use_site },
+            );
+        }
+        std.debug.print(
+            "    entry-registers: rdi=0x{x} rsi=0x{x} rdx=0x{x} rcx=0x{x} r8=0x{x} r9=0x{x} rsp=0x{x}\n",
+            .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9, self.regs.rsp },
+        );
+        for (self.xmm[0..4], 0..) |value, index| {
+            std.debug.print(
+                "    entry-xmm{d}: low=0x{x} high=0x{x}\n",
+                .{
+                    index,
+                    std.mem.readInt(u64, value[0..8], .little),
+                    std.mem.readInt(u64, value[8..16], .little),
+                },
+            );
+        }
+
+        for (start..end) |ordinal| {
+            const index = if (self.trace_filled)
+                (self.trace_index + ordinal) % TRACE_BUFFER_LEN
+            else
+                ordinal;
+            const entry = self.trace_entries[index];
+            const offset = self.addrToOffset(entry.rip) orelse continue;
+            if (offset >= self.mem.len) continue;
+            const available = @min(@as(usize, entry.len), self.mem.len - offset);
+            if (available == 0) continue;
+            const decoded = decodeInsn(self.mem[offset..]);
+            const instruction = symbol_assembly_context.Instruction.init(
+                entry.rip,
+                self.mem[offset..],
+                decoded,
+                available,
+            );
+            symbol_assembly_context.logDynamicInstruction(
+                &self.metadata,
+                instruction,
+                ordinal == selected,
+                .{ .rsp = entry.rsp, .rax = entry.rax, .rcx = entry.rcx, .rdx = entry.rdx },
+            );
+        }
     }
 
     fn terminateForUnresolvedImport(self: *MachOState) void {
@@ -6527,6 +6669,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.dynamic_casts.logSummary();
         state.diagnostic_text.logSummary();
         state.smart_stubs.logSummary();
+        state.symbol_assembly.logSummary();
         state.logDecodeCacheSummary();
         state.logPerformanceAccelerationSummary();
         std.debug.print("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
@@ -6553,6 +6696,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.startup.logSummary();
     state.startup.timingSummary();
     state.smart_stubs.logSummary();
+    state.symbol_assembly.logSummary();
     state.cxx_exceptions.logSummary();
     state.unwinder.logSummary();
     state.dynamic_casts.logSummary();
