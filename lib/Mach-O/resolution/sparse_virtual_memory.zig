@@ -164,7 +164,7 @@ pub const Manager = struct {
             const mapping_end = mapping.guest_base + mapping.memory.len;
             if (guest_base >= mapping.guest_base and end <= mapping_end) {
                 const offset = @as(usize, @intCast(guest_base - mapping.guest_base));
-                const page_aligned = @as([*]align(std.heap.page_size_min) u8, @alignCast(@ptrCast(&mapping.memory[offset])));
+                const page_aligned = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(&mapping.memory[offset])));
                 if (mprotect(page_aligned, @intCast(length), @as(c_int, @intCast(prot_raw))) != 0) return false;
                 mapping.readable = prot_raw & 1 != 0;
                 mapping.writable = prot_raw & 2 != 0;
@@ -269,6 +269,17 @@ pub const Manager = struct {
 
 test "64K guest mapping alignment is explicit" {
     try std.testing.expectEqual(@as(u64, 65536), PAGE_64K);
+}
+
+test "fixed anonymous guest range uses independent host backing" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const darwin_map_private_anonymous_fixed: u32 = 0x0002 | 0x1000 | 0x0010;
+    try std.testing.expect(manager.mapFile(0x8000_0000, PAGE_64K, 3, darwin_map_private_anonymous_fixed, -1, 0));
+    const bytes = manager.bytes(0x8000_0000, 16, true) orelse return error.TestUnexpectedResult;
+    bytes[0] = 0xA5;
+    try std.testing.expectEqual(@as(u8, 0xA5), manager.bytesConst(0x8000_0000, 1).?[0]);
 }
 
 test "reserve large address space region" {

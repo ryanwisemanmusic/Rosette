@@ -533,7 +533,14 @@ pub const Forwarder = struct {
         if (length == 0) return @bitCast(@as(i64, -1));
         const map_flags: std.c.MAP = @bitCast(raw_flags);
         if (state.regs.rdi != 0 and map_flags.FIXED) {
-            const host_fd = self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
+            // Anonymous mappings deliberately use fd=-1. Do not pass that
+            // sentinel through the guest descriptor table: the sparse-memory
+            // manager supplies host backing while preserving the requested
+            // fixed address in the guest address space.
+            const host_fd: std.posix.fd_t = if (map_flags.ANONYMOUS)
+                -1
+            else
+                self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
             if (state.regs.rdi % (64 * 1024) != 0) return @bitCast(@as(i64, -1));
             return if (state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset)))
                 state.regs.rdi
