@@ -481,7 +481,11 @@ pub const Forwarder = struct {
         self.directory_read_count +|= 1;
         const entry = self.fd_manager.lookup(state.regs.rdi) orelse return 0;
         const directory = entry.directory orelse return 0;
-        const host_dirent = std.c.readdir(directory) orelse return 0;
+        const host_dirent = while (std.c.readdir(directory)) |candidate| {
+            const name = std.mem.sliceTo(&candidate.name, 0);
+            if (name.len > 0 and isMacOSMetadataEntry(name)) continue;
+            break candidate;
+        } else return 0;
         const record_size = @min(@as(usize, host_dirent.reclen), @sizeOf(std.c.dirent));
         if (record_size == 0) return 0;
         if (entry.guest_dirent == 0) {
@@ -656,6 +660,13 @@ pub const Forwarder = struct {
         state.setGuestErrno(value);
     }
 };
+
+fn isMacOSMetadataEntry(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".DS_Store") or
+        std.mem.eql(u8, name, ".localized") or
+        std.mem.eql(u8, name, "Icon\r") or
+        std.mem.startsWith(u8, name, "._");
+}
 
 fn shouldTrace(count: u64) bool {
     return count <= 8 or count % 1000 == 0;

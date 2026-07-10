@@ -25,6 +25,7 @@ const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
 const itanium_dynamic_cast = @import("resolution/itanium_dynamic_cast.zig");
 const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
 const libcpp_stream_bridge = @import("resolution/libcpp_stream_bridge.zig");
+const vtt_resolution = @import("resolution/vtt_resolver.zig");
 const foreign_object_runtime = @import("resolution/foreign_object_runtime.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
@@ -73,6 +74,8 @@ const BOUND_IMPORT_THUNK_BASE: u64 = 0xFFFF_FC00_0000_0000;
 const BOUND_IMPORT_THUNK_STRIDE: u64 = 16;
 const INITIALIZER_RETURN_SENTINEL: u64 = 0xFFFF_FB00_0000_0000;
 const GUEST_THREAD_RETURN_SENTINEL: u64 = 0xFFFF_FA00_0000_0000;
+const GUEST_SIGNAL_RETURN_SENTINEL: u64 = 0xFFFF_F900_0000_0000;
+const GUEST_ATEXIT_RETURN_SENTINEL: u64 = 0xFFFF_F800_0000_0000;
 const DEFAULT_GUEST_THREAD_STACK_SIZE: u64 = 2 * 1024 * 1024;
 const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
@@ -82,6 +85,15 @@ const IMPORT_ROUTE_CACHE_SIZE: usize = 1024;
 const PAGE_READ: u8 = 1 << 0;
 const PAGE_WRITE: u8 = 1 << 1;
 const PAGE_EXECUTE: u8 = 1 << 2;
+const GUEST_SIGILL: u8 = 4;
+const SA_RESETHAND: u32 = 0x0004;
+const SA_SIGINFO: u32 = 0x0040;
+const GUEST_SIGNAL_ACTION_COUNT: usize = 32;
+const GUEST_SIGNAL_FRAME_DEPTH: usize = 8;
+const DARWIN_SIGACTION_SIZE: u64 = 16;
+const DARWIN_SIGINFO_SIZE: u64 = 128;
+const DARWIN_UCONTEXT_SIZE: u64 = 56;
+const DARWIN_MCONTEXT_SIZE: u64 = 184;
 
 const GuestAccess = enum {
     read,
@@ -165,6 +177,7 @@ const ImportRoute = enum(u8) {
     aligned_alloc,
     calloc,
     chkstk,
+    sysconf,
 };
 
 const ImportRouteCacheEntry = struct {
@@ -206,6 +219,7 @@ const BoundImportThunk = struct {
 };
 
 const InternalCompatibilityTargets = struct {
+    xenia_cpu_feature_detector_initialize_cpu_info: u64 = 0,
     cxxopts_split_option_names: u64 = 0,
     parse_launch_arguments: u64 = 0,
     initialize_logging: u64 = 0,
@@ -243,6 +257,21 @@ const CooperativeUiContext = struct {
     regs: Regs,
     xmm: [16][16]u8,
     ymm_hi: [16][16]u8,
+};
+
+const GuestSignalAction = struct {
+    handler: u64 = 0,
+    mask: u32 = 0,
+    flags: u32 = 0,
+};
+
+const GuestSignalFrame = struct {
+    signal: u8 = 0,
+    instruction_len: u8 = 0,
+    fault_rip: u64 = 0,
+    siginfo: u64 = 0,
+    mcontext: u64 = 0,
+    ucontext: u64 = 0,
 };
 
 pub const MachOState = struct {
@@ -293,8 +322,16 @@ pub const MachOState = struct {
     guest_log_line_count: u64 = 0,
     strict_initializers: bool = false,
     strict_imports: bool = false,
+    signal_actions: [GUEST_SIGNAL_ACTION_COUNT]GuestSignalAction = [_]GuestSignalAction{.{}} ** GUEST_SIGNAL_ACTION_COUNT,
+    signal_frames: [GUEST_SIGNAL_FRAME_DEPTH]GuestSignalFrame = [_]GuestSignalFrame{.{}} ** GUEST_SIGNAL_FRAME_DEPTH,
+    signal_frame_count: usize = 0,
+    guest_signal_deliveries: u64 = 0,
+    atexit_running: bool = false,
+    pending_exit_code: u64 = 0,
+    atexit_callbacks_invoked: u64 = 0,
     import_resolver: import_resolution.Engine,
     initializer_resolver: initialization_resolution.Engine,
+    vtt_resolver: vtt_resolution.VttBindingResolver,
     dynamic_forwarder: dynamic_library_forwarder.Forwarder = .{},
     fs_forwarder: fs_io_forwarder.Forwarder,
     libcxx_filesystem: libcpp_filesystem.Bridge = .{},
@@ -443,6 +480,7 @@ pub const MachOState = struct {
             .stack_size = if (state.stack_size > 0) state.stack_size else STACK_SIZE,
             .import_resolver = import_resolution.Engine.init(allocator),
             .initializer_resolver = initialization_resolution.Engine.init(allocator, initializer_count),
+            .vtt_resolver = vtt_resolution.VttBindingResolver.init(allocator),
             .initializer_memory = memory_transaction.Journal.init(allocator, PAGE_SIZE),
             .fs_forwarder = fs_io_forwarder.Forwarder.init(allocator),
             .memory_forwarder = memory_management_forwarder.Manager.init(allocator),
@@ -484,6 +522,9 @@ pub const MachOState = struct {
         result.guest_files[2] = .{ .active = true, .fd = 2, .kind = .stderr };
         result.internal_targets.cxxopts_split_option_names = result.metadata.symbolAddressWithPrefix(
             "__ZN7cxxopts6values11parser_tool18split_option_names",
+        ) orelse 0;
+        result.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe3cpu7backend3x6418CPUFeatureDetector17InitializeCPUInfoEv",
         ) orelse 0;
         result.internal_targets.parse_launch_arguments = result.metadata.symbolAddressWithPrefix(
             "__ZN4cvar20ParseLaunchArguments",
@@ -570,6 +611,7 @@ pub const MachOState = struct {
         self.local_libcpp_stream_targets.deinit();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
+        self.vtt_resolver.deinit();
         self.dynamic_forwarder.deinit();
         self.fs_forwarder.deinit();
         self.memory_forwarder.deinit();
@@ -629,10 +671,12 @@ pub const MachOState = struct {
             const section = self.metadata.sectionAtAddress(binding.address) orelse continue;
             if (!isCallableConstantBinding(section, binding.name, stubs.contains(binding.name))) {
                 if (isAbiDataSymbol(binding.name)) {
-                    if (isBridgedLibcppDataSymbol(binding.name))
-                        bridged_abi_data_bindings += 1
-                    else
+                    if (isBridgedLibcppDataSymbol(binding.name)) {
+                        bridged_abi_data_bindings += 1;
+                    } else {
                         deferred_abi_data_bindings += 1;
+                        self.vtt_resolver.record(binding.address, binding.name) catch {};
+                    }
                 }
                 continue;
             }
@@ -667,9 +711,33 @@ pub const MachOState = struct {
         for (self.bound_import_thunks) |thunk| {
             self.registerSyntheticThunk(thunk.address, BOUND_IMPORT_THUNK_STRIDE, thunk.name);
         }
+
+        if (self.vtt_resolver.totalDeferred() > 0) {
+            const resolved = blk: {
+                var count: usize = 0;
+                for (self.vtt_resolver.deferred.items) |*item| {
+                    if (item.resolved) continue;
+                    if (vtt_resolution.VttBindingResolver.lookupSymbol(item.symbol)) |value| {
+                        self.write64(item.address, value);
+                        item.resolved = true;
+                        count += 1;
+                    }
+                }
+                self.vtt_resolver.resolved_count = count;
+                break :blk count;
+            };
+            if (resolved > 0) {
+                applied +|= resolved;
+                std.debug.print(
+                    "macho-processor: resolved {d} deferred VTT/VTable binding(s) via dlsym\n",
+                    .{resolved},
+                );
+            }
+        }
+
         std.debug.print(
-            "macho-processor: applied {d} dyld data binding(s), including {d} callable GOT pointer(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d}\n",
-            .{ applied, callable_got_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings },
+            "macho-processor: applied {d} dyld data binding(s), including {d} callable GOT pointer(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d} VTT resolved={d}\n",
+            .{ applied, callable_got_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings, self.vtt_resolver.resolved_count },
         );
     }
 
@@ -1523,6 +1591,12 @@ pub const MachOState = struct {
                 .{self.foreign_objects.main_loop_bypasses},
             );
         }
+        if (std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) {
+            const exit_code = self.regs.rdi;
+            if (self.beginGuestExit(exit_code)) return .control_transferred;
+            if (self.terminated) return .control_transferred;
+            return .{ .terminated = exit_code };
+        }
         if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove")) {
             self.resolving_import_route = .guest_memory_copy;
             return self.handleGuestMemoryCopy(name);
@@ -1547,6 +1621,26 @@ pub const MachOState = struct {
                 @memset(buf, 0);
             }
             return .{ .handled = 0 };
+        }
+        if (std.mem.eql(u8, name, "_sysconf")) {
+            self.resolving_import_route = .sysconf;
+            const selector: i32 = @bitCast(@as(u32, @truncate(self.regs.rdi)));
+            const value = guestSysconf(selector);
+            if (self.verbose_trace) {
+                std.debug.print("    [posix] sysconf({d}) -> {d}\n", .{ selector, @as(i64, @bitCast(value)) });
+            }
+            return .{ .handled = value };
+        }
+        if (std.mem.eql(u8, name, "_SDL_GetVersion")) {
+            const output = self.guestMemory(self.regs.rdi, 3) orelse return .{ .unsupported = 0 };
+            output[0..3].* = sdlCompatibilityVersion();
+            if (self.verbose_trace) {
+                std.debug.print(
+                    "    [SDL2] SDL_GetVersion(output=0x{x}) -> {d}.{d}.{d}\n",
+                    .{ self.regs.rdi, output[0], output[1], output[2] },
+                );
+            }
+            return .handled_void;
         }
         if (std.mem.eql(u8, name, "_gtk_main") and self.beginGtkMainLoop()) {
             self.resolving_import_route = .gtk_main;
@@ -1856,6 +1950,18 @@ pub const MachOState = struct {
             const found = std.mem.indexOfScalarPos(u8, bytes, start, needle) orelse return .{ .handled = std.math.maxInt(u64) };
             return .{ .handled = found };
         }
+        if (std.mem.eql(u8, name, "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc")) {
+            const rhs = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
+            const result = compat_runtime.compareLibcppStringWithBytes(self, self.regs.rdi, self.regs.rsi, rhs.len) orelse
+                return .{ .unsupported = 0 };
+            if (self.verbose_trace) {
+                std.debug.print(
+                    "    [libc++] basic_string::compare(this=0x{x}, rhs=0x{x}, rhs_length={d}) -> {d}\n",
+                    .{ self.regs.rdi, self.regs.rsi, rhs.len, result },
+                );
+            }
+            return .{ .handled = @as(u32, @bitCast(result)) };
+        }
 
         if (std.mem.eql(u8, name, "___cxa_guard_acquire")) {
             const result = compat_runtime.cxaGuardAcquire(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
@@ -1873,6 +1979,16 @@ pub const MachOState = struct {
                 "    [c++] __cxa_atexit(function=0x{x}, argument=0x{x}, dso=0x{x}) -> {}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, registered },
             );
+            return .{ .handled = if (registered) 0 else 1 };
+        }
+        if (std.mem.eql(u8, name, "_atexit")) {
+            const registered = self.compat.registerPlainAtexit(self.regs.rdi);
+            if (self.verbose_trace) {
+                std.debug.print(
+                    "    [posix] atexit(function=0x{x}) -> {}\n",
+                    .{ self.regs.rdi, registered },
+                );
+            }
             return .{ .handled = if (registered) 0 else 1 };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__112__next_primeEm")) {
@@ -2421,7 +2537,7 @@ pub const MachOState = struct {
             return .{ .handled = @bitCast(@as(i64, -1)) };
         }
         if (std.mem.eql(u8, name, "_sigaction")) {
-            return .{ .handled = 0 };
+            return .{ .handled = self.handleSigaction() };
         }
         if (std.mem.eql(u8, name, "_setjmp")) {
             const env_bytes = self.guestMemory(self.regs.rdi, @sizeOf(u64) * 4) orelse return .{ .unsupported = 0 };
@@ -2613,6 +2729,7 @@ pub const MachOState = struct {
             },
             .calloc => .{ .handled = self.memory_forwarder.allocateZeroed(self, self.regs.rdi, self.regs.rsi) orelse 0 },
             .chkstk => .{ .handled = self.regs.rax },
+            .sysconf => .{ .handled = guestSysconf(@bitCast(@as(u32, @truncate(self.regs.rdi)))) },
         };
     }
 
@@ -2888,6 +3005,190 @@ pub const MachOState = struct {
                 .{ .rsp = entry.rsp, .rax = entry.rax, .rcx = entry.rcx, .rdx = entry.rdx },
             );
         }
+    }
+
+    fn beginGuestExit(self: *MachOState, exit_code: u64) bool {
+        if (self.atexit_running or self.compat.atexit_count == 0) return false;
+        self.atexit_running = true;
+        self.pending_exit_code = exit_code;
+        // Model the call boundary that libc would establish before invoking
+        // the first callback. Each callback then enters with rsp % 16 == 8.
+        self.regs.rsp &= ~@as(u64, 0xF);
+        self.dispatchNextAtexit();
+        return self.atexit_running and !self.terminated;
+    }
+
+    fn dispatchNextAtexit(self: *MachOState) void {
+        while (self.compat.takeLastAtexit()) |entry| {
+            if (entry.function == 0 or !self.isExecutableAddress(entry.function)) {
+                std.debug.print(
+                    "macho-processor: skipping invalid atexit callback 0x{x} argument=0x{x} dso=0x{x}\n",
+                    .{ entry.function, entry.argument, entry.dso },
+                );
+                continue;
+            }
+            self.push(GUEST_ATEXIT_RETURN_SENTINEL);
+            if (self.terminated) return;
+            self.regs.rdi = if (entry.takes_argument) entry.argument else 0;
+            self.regs.rip = entry.function;
+            self.atexit_callbacks_invoked +|= 1;
+            if (self.verbose_trace) {
+                std.debug.print(
+                    "macho-processor: invoking atexit callback #{d}: function=0x{x} argument=0x{x} dso=0x{x} takes_argument={}\n",
+                    .{ self.atexit_callbacks_invoked, entry.function, entry.argument, entry.dso, entry.takes_argument },
+                );
+            }
+            return;
+        }
+        self.atexit_running = false;
+        self.exit_code = self.pending_exit_code;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
+        self.terminated = true;
+        std.debug.print(
+            "macho-processor: guest exit callbacks complete: invoked={d} exit_code={d}\n",
+            .{ self.atexit_callbacks_invoked, self.exit_code },
+        );
+    }
+
+    fn continueGuestExit(self: *MachOState) bool {
+        if (!self.atexit_running) {
+            self.faulted = true;
+            self.terminated = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            return false;
+        }
+        self.dispatchNextAtexit();
+        return !self.terminated;
+    }
+
+    fn handleSigaction(self: *MachOState) u64 {
+        const signal_index = guestSignalIndex(self.regs.rdi) orelse return signalFailureResult();
+        const previous = self.signal_actions[signal_index];
+
+        if (self.regs.rdx != 0) {
+            const output = self.guestMemory(self.regs.rdx, DARWIN_SIGACTION_SIZE) orelse return signalFailureResult();
+            writeDarwinSigaction(output, previous);
+        }
+        if (self.regs.rsi != 0) {
+            const input = self.guestMemoryConst(self.regs.rsi, DARWIN_SIGACTION_SIZE) orelse return signalFailureResult();
+            self.signal_actions[signal_index] = readDarwinSigaction(input) orelse return signalFailureResult();
+        }
+        if (self.verbose_trace) {
+            const action = self.signal_actions[signal_index];
+            std.debug.print(
+                "    [signal] sigaction signal={d} handler=0x{x} flags=0x{x} mask=0x{x}\n",
+                .{ self.regs.rdi, action.handler, action.flags, action.mask },
+            );
+        }
+        return 0;
+    }
+
+    fn deliverGuestSignal(self: *MachOState, signal: u8, fault_rip: u64, instruction_len: u8) bool {
+        const signal_index = guestSignalIndex(signal) orelse return false;
+        const action = self.signal_actions[signal_index];
+        if (action.handler == 0) return false; // SIG_DFL: retain Rosette's diagnostic termination.
+        if (action.handler == 1) { // SIG_IGN: make forward progress without synthesizing a callback.
+            self.regs.rip +%= instruction_len;
+            std.debug.print("macho-processor: guest ignored signal {d} at rip=0x{x}\n", .{ signal, fault_rip });
+            return true;
+        }
+        if (!self.isExecutableAddress(action.handler) or self.signal_frame_count >= self.signal_frames.len) return false;
+
+        const frame = &self.signal_frames[self.signal_frame_count];
+        if (!self.ensureGuestSignalFrameStorage(frame)) return false;
+        const siginfo_bytes = self.guestMemory(frame.siginfo, DARWIN_SIGINFO_SIZE) orelse return false;
+        const mcontext_bytes = self.guestMemory(frame.mcontext, DARWIN_MCONTEXT_SIZE) orelse return false;
+        const ucontext_bytes = self.guestMemory(frame.ucontext, DARWIN_UCONTEXT_SIZE) orelse return false;
+
+        writeDarwinSiginfo(siginfo_bytes, signal, fault_rip);
+        writeDarwinMcontext(mcontext_bytes, self.regs);
+        writeDarwinUcontext(ucontext_bytes, frame.mcontext);
+
+        if (action.flags & SA_RESETHAND != 0) self.signal_actions[signal_index] = .{};
+        frame.signal = signal;
+        frame.instruction_len = instruction_len;
+        frame.fault_rip = fault_rip;
+        self.signal_frame_count += 1;
+        self.push(GUEST_SIGNAL_RETURN_SENTINEL);
+        if (self.terminated) {
+            self.signal_frame_count -= 1;
+            return false;
+        }
+        self.regs.rdi = signal;
+        if (action.flags & SA_SIGINFO != 0) {
+            self.regs.rsi = frame.siginfo;
+            self.regs.rdx = frame.ucontext;
+        } else {
+            self.regs.rsi = 0;
+            self.regs.rdx = 0;
+        }
+        self.regs.rip = action.handler;
+        self.guest_signal_deliveries +|= 1;
+        std.debug.print(
+            "macho-processor: delivered guest signal {d} to 0x{x}; fault_rip=0x{x} siginfo=0x{x} ucontext=0x{x}\n",
+            .{ signal, action.handler, fault_rip, frame.siginfo, frame.ucontext },
+        );
+        return true;
+    }
+
+    fn ensureGuestSignalFrameStorage(self: *MachOState, frame: *GuestSignalFrame) bool {
+        if (frame.siginfo == 0) frame.siginfo = self.guestAlloc(DARWIN_SIGINFO_SIZE, 16) orelse return false;
+        if (frame.mcontext == 0) frame.mcontext = self.guestAlloc(DARWIN_MCONTEXT_SIZE, 16) orelse return false;
+        if (frame.ucontext == 0) frame.ucontext = self.guestAlloc(DARWIN_UCONTEXT_SIZE, 16) orelse return false;
+        return true;
+    }
+
+    fn finishGuestSignalReturn(self: *MachOState) bool {
+        if (self.signal_frame_count == 0) {
+            self.faulted = true;
+            self.terminated = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            return false;
+        }
+        self.signal_frame_count -= 1;
+        const frame = self.signal_frames[self.signal_frame_count];
+        const bytes = self.guestMemoryConst(frame.mcontext, DARWIN_MCONTEXT_SIZE) orelse {
+            self.faulted = true;
+            self.terminated = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            return false;
+        };
+        if (!readDarwinMcontext(bytes, &self.regs)) {
+            self.faulted = true;
+            self.terminated = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            return false;
+        }
+        const fault_bytes = self.guestMemoryConst(frame.fault_rip, frame.instruction_len) orelse &.{};
+        const resume_rip = resolveGuestSignalReturn(frame, self.regs.rip, fault_bytes) orelse {
+            std.debug.print(
+                "macho-processor: guest signal {d} handler returned without resolving fault at rip=0x{x}\n",
+                .{ frame.signal, frame.fault_rip },
+            );
+            self.faulted = true;
+            self.terminated = true;
+            self.exit_code = 128 + frame.signal;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unhandled_guest_signal);
+            return false;
+        };
+        if (resume_rip != self.regs.rip) {
+            std.debug.print(
+                "macho-processor: guest signal {d} handler returned with unchanged UD2 at rip=0x{x}; resuming at 0x{x}\n",
+                .{ frame.signal, frame.fault_rip, resume_rip },
+            );
+            self.regs.rip = resume_rip;
+        }
+        if (self.verbose_trace) {
+            std.debug.print(
+                "macho-processor: guest signal {d} returned; fault_rip=0x{x} resume_rip=0x{x}\n",
+                .{ frame.signal, frame.fault_rip, self.regs.rip },
+            );
+        }
+        return true;
     }
 
     fn terminateForUnresolvedImport(self: *MachOState) void {
@@ -3943,6 +4244,17 @@ pub const MachOState = struct {
 
     fn handleInternalCompatibility(self: *MachOState) bool {
         if (self.handleLocalLibcppStreamCompatibility()) return true;
+        // Xenia's backend dispatches through a host-populated CPU feature
+        // detector. Under guest execution that dispatch table has no host
+        // implementation, leaving its first slot null. The function is void;
+        // completing it here preserves the backend's portable fallback path.
+        if (self.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info != 0 and
+            self.regs.rip == self.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info)
+        {
+            std.debug.print("macho-processor: modeled x64 CPU feature detection\n", .{});
+            self.regs.rip = self.pop();
+            return true;
+        }
         if (self.internal_targets.page_entry_construct_at_end != 0 and
             self.regs.rip == self.internal_targets.page_entry_construct_at_end and
             self.handlePageEntryBulkInitialization())
@@ -4275,6 +4587,12 @@ pub const MachOState = struct {
     }
 
     fn step(self: *MachOState) bool {
+        if (self.regs.rip == GUEST_ATEXIT_RETURN_SENTINEL) {
+            return self.continueGuestExit();
+        }
+        if (self.regs.rip == GUEST_SIGNAL_RETURN_SENTINEL) {
+            return self.finishGuestSignalReturn() and !self.terminated;
+        }
         if (self.regs.rip == GUEST_THREAD_RETURN_SENTINEL) {
             self.finishActiveGuestThread();
             return !self.terminated;
@@ -6083,7 +6401,7 @@ pub const MachOState = struct {
                 const source: f64 = @bitCast(source_bits);
                 self.setReg(d.dst_reg, d.size, convertVexFloatToSigned(f64, source, d.size, d.op == .vcvttsd2si));
             },
-            .vandps, .vandpd, .vandnps, .vandnpd, .vorps, .vorpd, .vxorps, .vxorpd => {
+            .vandps, .vandpd, .vandnps, .vandnpd, .vorps, .vorpd, .vxorps, .vxorpd, .vpor, .vpand, .vpandn, .vpxor => {
                 self.executeVexBitwise(d, vexBitwiseForOp(d.op));
             },
 
@@ -6107,11 +6425,12 @@ pub const MachOState = struct {
             },
 
             .ud2 => {
-                std.debug.print("macho-processor: UD2 instruction at rip=0x{x} — intentional invalid opcode exception\n", .{self.regs.rip});
+                if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len)) return;
+                std.debug.print("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});
                 self.faulted = true;
                 self.terminated = true;
-                self.exit_code = 127;
-                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
+                self.exit_code = 128 + GUEST_SIGILL;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unhandled_guest_signal);
                 return;
             },
 
@@ -6521,6 +6840,145 @@ fn parseFopenFlags(mode: []const u8) ?i32 {
     return flags;
 }
 
+fn guestSignalIndex(raw_signal: u64) ?usize {
+    if (raw_signal == 0 or raw_signal >= GUEST_SIGNAL_ACTION_COUNT) return null;
+    return @intCast(raw_signal);
+}
+
+fn signalFailureResult() u64 {
+    return @bitCast(@as(i64, -1));
+}
+
+fn signalHandlerMadeProgress(frame: GuestSignalFrame, resume_rip: u64, fault_bytes: []const u8) bool {
+    if (resume_rip != frame.fault_rip) return true;
+    if (frame.signal != GUEST_SIGILL) return false;
+    if (fault_bytes.len < 2) return false;
+    return fault_bytes[0] != 0x0F or fault_bytes[1] != 0x0B;
+}
+
+/// A guest handler can observe a SIGILL/UD2 assertion and return without
+/// editing the saved machine context.  Re-entering the same UD2 would only
+/// redeliver the signal, so treat that acknowledged assertion as resolved.
+fn resolveGuestSignalReturn(frame: GuestSignalFrame, resume_rip: u64, fault_bytes: []const u8) ?u64 {
+    if (signalHandlerMadeProgress(frame, resume_rip, fault_bytes)) return resume_rip;
+    if (frame.signal != GUEST_SIGILL or fault_bytes.len < 2) return null;
+    if (fault_bytes[0] != 0x0F or fault_bytes[1] != 0x0B) return null;
+    return frame.fault_rip +% frame.instruction_len;
+}
+
+fn readDarwinSigaction(bytes: []const u8) ?GuestSignalAction {
+    if (bytes.len < DARWIN_SIGACTION_SIZE) return null;
+    return .{
+        .handler = std.mem.readInt(u64, bytes[0..8], .little),
+        .mask = std.mem.readInt(u32, bytes[8..12], .little),
+        .flags = std.mem.readInt(u32, bytes[12..16], .little),
+    };
+}
+
+fn writeDarwinSigaction(bytes: []u8, action: GuestSignalAction) void {
+    if (bytes.len < DARWIN_SIGACTION_SIZE) return;
+    std.mem.writeInt(u64, bytes[0..8], action.handler, .little);
+    std.mem.writeInt(u32, bytes[8..12], action.mask, .little);
+    std.mem.writeInt(u32, bytes[12..16], action.flags, .little);
+}
+
+fn writeDarwinSiginfo(bytes: []u8, signal: u8, fault_rip: u64) void {
+    if (bytes.len < DARWIN_SIGINFO_SIZE) return;
+    @memset(bytes[0..DARWIN_SIGINFO_SIZE], 0);
+    std.mem.writeInt(i32, bytes[0..4], signal, .little);
+    std.mem.writeInt(i32, bytes[8..12], 1, .little); // ILL_ILLOPC
+    std.mem.writeInt(u64, bytes[24..32], fault_rip, .little); // si_addr
+}
+
+fn writeDarwinUcontext(bytes: []u8, mcontext: u64) void {
+    if (bytes.len < DARWIN_UCONTEXT_SIZE) return;
+    @memset(bytes[0..DARWIN_UCONTEXT_SIZE], 0);
+    std.mem.writeInt(u64, bytes[40..48], DARWIN_MCONTEXT_SIZE, .little); // uc_mcsize
+    std.mem.writeInt(u64, bytes[48..56], mcontext, .little); // uc_mcontext
+}
+
+fn writeDarwinMcontext(bytes: []u8, regs: Regs) void {
+    if (bytes.len < DARWIN_MCONTEXT_SIZE) return;
+    @memset(bytes[0..DARWIN_MCONTEXT_SIZE], 0);
+    std.mem.writeInt(u16, bytes[0..2], 6, .little); // #UD / invalid-opcode trap number
+    std.mem.writeInt(u64, bytes[8..16], regs.rip, .little); // exception state faultvaddr
+    const values = [_]u64{
+        regs.rax, regs.rbx, regs.rcx, regs.rdx,    regs.rdi,                  regs.rsi,                  regs.rbp,
+        regs.rsp, regs.r8,  regs.r9,  regs.r10,    regs.r11,                  regs.r12,                  regs.r13,
+        regs.r14, regs.r15, regs.rip, regs.rflags, regs.segments.cs.selector, regs.segments.fs.selector, regs.segments.gs.selector,
+    };
+    for (values, 0..) |value, index| {
+        const offset = 16 + index * @sizeOf(u64);
+        std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
+    }
+}
+
+fn readDarwinMcontext(bytes: []const u8, regs: *Regs) bool {
+    if (bytes.len < DARWIN_MCONTEXT_SIZE) return false;
+    const thread = bytes[16..][0 .. 21 * @sizeOf(u64)];
+    regs.rax = std.mem.readInt(u64, thread[0..8], .little);
+    regs.rbx = std.mem.readInt(u64, thread[8..16], .little);
+    regs.rcx = std.mem.readInt(u64, thread[16..24], .little);
+    regs.rdx = std.mem.readInt(u64, thread[24..32], .little);
+    regs.rdi = std.mem.readInt(u64, thread[32..40], .little);
+    regs.rsi = std.mem.readInt(u64, thread[40..48], .little);
+    regs.rbp = std.mem.readInt(u64, thread[48..56], .little);
+    regs.rsp = std.mem.readInt(u64, thread[56..64], .little);
+    regs.r8 = std.mem.readInt(u64, thread[64..72], .little);
+    regs.r9 = std.mem.readInt(u64, thread[72..80], .little);
+    regs.r10 = std.mem.readInt(u64, thread[80..88], .little);
+    regs.r11 = std.mem.readInt(u64, thread[88..96], .little);
+    regs.r12 = std.mem.readInt(u64, thread[96..104], .little);
+    regs.r13 = std.mem.readInt(u64, thread[104..112], .little);
+    regs.r14 = std.mem.readInt(u64, thread[112..120], .little);
+    regs.r15 = std.mem.readInt(u64, thread[120..128], .little);
+    regs.rip = std.mem.readInt(u64, thread[128..136], .little);
+    regs.rflags = @truncate(std.mem.readInt(u64, thread[136..144], .little));
+    regs.segments.cs.selector = @truncate(std.mem.readInt(u64, thread[144..152], .little));
+    regs.segments.fs.selector = @truncate(std.mem.readInt(u64, thread[152..160], .little));
+    regs.segments.gs.selector = @truncate(std.mem.readInt(u64, thread[160..168], .little));
+    return true;
+}
+
+test "Darwin sigaction and x86_64 mcontext preserve guest signal state" {
+    var action_bytes = [_]u8{0} ** DARWIN_SIGACTION_SIZE;
+    const expected_action = GuestSignalAction{ .handler = 0x1234, .mask = 0xA5, .flags = SA_SIGINFO };
+    writeDarwinSigaction(&action_bytes, expected_action);
+    const decoded_action = readDarwinSigaction(&action_bytes).?;
+    try std.testing.expectEqual(expected_action.handler, decoded_action.handler);
+    try std.testing.expectEqual(expected_action.mask, decoded_action.mask);
+    try std.testing.expectEqual(expected_action.flags, decoded_action.flags);
+
+    var original = Regs{ .rax = 1, .rbx = 2, .rcx = 3, .rdx = 4, .rdi = 5, .rsi = 6, .rbp = 7, .rsp = 8, .r8 = 9, .r9 = 10, .r10 = 11, .r11 = 12, .r12 = 13, .r13 = 14, .r14 = 15, .r15 = 16, .rip = 0xBEEF, .rflags = 0x202 };
+    original.segments.cs.selector = 0x2B;
+    original.segments.fs.selector = 0x53;
+    original.segments.gs.selector = 0x5B;
+    var mcontext = [_]u8{0} ** DARWIN_MCONTEXT_SIZE;
+    writeDarwinMcontext(&mcontext, original);
+    var restored = Regs{};
+    try std.testing.expect(readDarwinMcontext(&mcontext, &restored));
+    try std.testing.expectEqual(original.rax, restored.rax);
+    try std.testing.expectEqual(original.r15, restored.r15);
+    try std.testing.expectEqual(original.rip, restored.rip);
+    try std.testing.expectEqual(original.rflags, restored.rflags);
+    try std.testing.expectEqual(original.segments.gs.selector, restored.segments.gs.selector);
+}
+
+test "guest SIGILL return requires a changed RIP or patched UD2 bytes" {
+    const frame = GuestSignalFrame{ .signal = GUEST_SIGILL, .instruction_len = 2, .fault_rip = 0x4000 };
+    try std.testing.expect(signalHandlerMadeProgress(frame, 0x4002, &.{ 0x0F, 0x0B }));
+    try std.testing.expect(signalHandlerMadeProgress(frame, 0x4000, &.{ 0x90, 0x90 }));
+    try std.testing.expect(!signalHandlerMadeProgress(frame, 0x4000, &.{ 0x0F, 0x0B }));
+}
+
+test "guest SIGILL handler return resolves an unchanged UD2 by advancing" {
+    const ud2_frame = GuestSignalFrame{ .signal = GUEST_SIGILL, .instruction_len = 2, .fault_rip = 0x4000 };
+    try std.testing.expectEqual(@as(?u64, 0x4002), resolveGuestSignalReturn(ud2_frame, 0x4000, &.{ 0x0F, 0x0B }));
+
+    const other_signal = GuestSignalFrame{ .signal = 11, .instruction_len = 2, .fault_rip = 0x4000 };
+    try std.testing.expectEqual(@as(?u64, null), resolveGuestSignalReturn(other_signal, 0x4000, &.{ 0x0F, 0x0B }));
+}
+
 fn alignUp(value: u64, alignment: u64) !u64 {
     const mask = alignment - 1;
     return (try std.math.add(u64, value, mask)) & ~mask;
@@ -6560,11 +7018,45 @@ fn stepBudgetAllows(max_steps: u64, completed_steps: u64) bool {
     return max_steps == 0 or completed_steps < max_steps;
 }
 
+const VexDecoderAudit = struct {
+    passed: usize,
+    total: usize,
+
+    fn ready(self: VexDecoderAudit) bool {
+        return self.passed == self.total;
+    }
+};
+
+/// AVX CPUID exposure is a promise that the foundational VEX encodings used
+/// by compilers and JITs are executable. Audit both VEX2/VEX3, 128/256-bit,
+/// extended-base, scalar-move, arithmetic and zero-upper forms before launch.
+fn auditVexDecoder() VexDecoderAudit {
+    const cases = [_][]const u8{
+        &.{ 0xC5, 0xFA, 0x7E, 0x40, 0x48 }, // vmovq xmm0, [rax+0x48]
+        &.{ 0xC5, 0xFA, 0x6F, 0x00 }, // vmovdqu xmm0, [rax]
+        &.{ 0xC4, 0xC1, 0x7A, 0x7F, 0x01 }, // vmovdqu [r9], xmm0
+        &.{ 0xC5, 0xFC, 0x10, 0x00 }, // vmovups ymm0, [rax]
+        &.{ 0xC5, 0xF8, 0x58, 0xC1 }, // vaddps xmm0, xmm0, xmm1
+        &.{ 0xC5, 0xF8, 0x57, 0xC0 }, // vxorps xmm0, xmm0, xmm0
+        &.{ 0xC5, 0xF8, 0x77 }, // vzeroupper
+    };
+    var passed: usize = 0;
+    for (cases) |bytes| {
+        const decoded = decodeInsn(bytes);
+        if (decoded.op != .invalid and decoded.len == bytes.len) passed += 1;
+    }
+    return .{ .passed = passed, .total = cases.len };
+}
+
 test "Mach-O execution is unlimited unless an explicit step budget is set" {
     try std.testing.expect(stepBudgetAllows(0, 0));
     try std.testing.expect(stepBudgetAllows(0, std.math.maxInt(u64)));
     try std.testing.expect(stepBudgetAllows(100, 99));
     try std.testing.expect(!stepBudgetAllows(100, 100));
+}
+
+test "advertised AVX profile passes baseline VEX decoder audit" {
+    try std.testing.expect(auditVexDecoder().ready());
 }
 
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
@@ -6621,6 +7113,19 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             x64_decoder.capabilities.xcr0(state.cpu_profile),
         },
     );
+    const vex_audit = auditVexDecoder();
+    const avx_advertised = x64_decoder.capabilities.supports(state.cpu_profile, .avx);
+    std.debug.print(
+        "  decoder ISA verification: VEX baseline={d}/{d} ready={} AVX advertised={}\n",
+        .{ vex_audit.passed, vex_audit.total, vex_audit.ready(), avx_advertised },
+    );
+    if (avx_advertised and !vex_audit.ready()) {
+        std.debug.print(
+            "macho-processor: refusing incoherent AVX profile: CPUID advertises AVX but baseline VEX decoder audit failed\n",
+            .{},
+        );
+        return 1;
+    }
     if (state.metadata.nearestSymbol(state.entry_point_vaddr)) |entry_symbol| {
         std.debug.print("  entry_symbol: {s}+0x{x}\n", .{ entry_symbol.name, entry_symbol.offset });
     }
@@ -7252,6 +7757,22 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode == 0x7E and (vex & 0x78) == 0x78 and !vector_256 and prefix == 2) {
+        var decoded = DecodedInsn{ .size = .bits64 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        if (is_memory) {
+            decoded.op = .vmovq_xmm_mem64;
+            decoded.addr = rm.addr;
+        } else {
+            return .{};
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode == 0x76 and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
@@ -7406,6 +7927,29 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             else => unreachable,
         };
         decoded.len = @intCast(bitwise_pos);
+        return decoded;
+    }
+
+    if ((opcode == 0xDB or opcode == 0xDF or opcode == 0xEB or opcode == 0xEF) and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pp_pos = start_pos + 3;
+        const is_mem = bytes[pp_pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pp_pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0xDB => .vpand,
+            0xDF => .vpandn,
+            0xEB => .vpor,
+            0xEF => .vpxor,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pp_pos);
         return decoded;
     }
 
@@ -7613,10 +8157,10 @@ fn applyVexArithmetic(comptime Float: type, lhs: Float, rhs: Float, operation: V
 
 fn vexBitwiseForOp(op: Op) VexBitwise {
     return switch (op) {
-        .vandps, .vandpd => .@"and",
-        .vandnps, .vandnpd => .and_not,
-        .vorps, .vorpd => .@"or",
-        .vxorps, .vxorpd => .xor,
+        .vandps, .vandpd, .vpand => .@"and",
+        .vandnps, .vandnpd, .vpandn => .and_not,
+        .vorps, .vorpd, .vpor => .@"or",
+        .vxorps, .vxorpd, .vpxor => .xor,
         else => unreachable,
     };
 }
@@ -7940,6 +8484,82 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         }
         decoded.imm = bytes[pos];
         pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and (opcode == 0xDB or opcode == 0xDF or opcode == 0xEB or opcode == 0xEF) and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pp_pos = start_pos + 4;
+        const is_mem = bytes[pp_pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pp_pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0xDB => .vpand,
+            0xDF => .vpandn,
+            0xEB => .vpor,
+            0xEF => .vpxor,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pp_pos);
+        return decoded;
+    }
+
+    // Three-byte VEX is required when X/B extension bits address r8-r15 even
+    // for ordinary 0F-map moves. Xbyak emits this form for VMOVDQU [r9],xmm0.
+    if (opcode_map == 1 and (opcode == 0x6F or opcode == 0x7F) and
+        (prefix == 1 or prefix == 2) and (vex_control & 0x78) == 0x78)
+    {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        const unaligned = prefix == 2;
+        if (opcode == 0x6F) {
+            decoded.xmm_dst = @intFromEnum(rm.reg);
+            if (is_memory) {
+                decoded.addr = rm.addr;
+                decoded.op = if (vector_256)
+                    if (unaligned) .vmovdqu_ymm_mem else .vmovdqa_ymm_mem
+                else if (unaligned)
+                    .vmovdqu_xmm_mem
+                else
+                    .vmovdqa_xmm_mem;
+            } else {
+                decoded.xmm_src = @intCast(rm.addr);
+                decoded.op = if (vector_256)
+                    if (unaligned) .vmovdqu_ymm_ymm else .vmovdqa_ymm_ymm
+                else if (unaligned)
+                    .vmovdqu_xmm_xmm
+                else
+                    .vmovdqa_xmm_xmm;
+            }
+        } else {
+            decoded.xmm_src = @intFromEnum(rm.reg);
+            if (is_memory) {
+                decoded.addr = rm.addr;
+                decoded.op = if (vector_256)
+                    if (unaligned) .vmovdqu_mem_ymm else .vmovdqa_mem_ymm
+                else if (unaligned)
+                    .vmovdqu_mem_xmm
+                else
+                    .vmovdqa_mem_xmm;
+            } else {
+                decoded.xmm_dst = @intCast(rm.addr);
+                decoded.op = if (vector_256)
+                    if (unaligned) .vmovdqu_ymm_ymm else .vmovdqa_ymm_ymm
+                else if (unaligned)
+                    .vmovdqu_xmm_xmm
+                else
+                    .vmovdqa_xmm_xmm;
+            }
+        }
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -9396,6 +10016,33 @@ fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, r
     return d;
 }
 
+/// Darwin's `_SC_PAGESIZE` selector is 29. Keep this guest-facing instead of
+/// forwarding to the ARM64 host so generated x86 code observes the page
+/// geometry used by Rosette's Mach-O address space.
+fn guestSysconf(selector: i32) u64 {
+    return switch (selector) {
+        29 => 4096,
+        else => @bitCast(@as(i64, -1)),
+    };
+}
+
+fn sdlCompatibilityVersion() [3]u8 {
+    return .{ 2, 0, 0 };
+}
+
+test "Darwin sysconf reports Rosette guest page size" {
+    try std.testing.expectEqual(@as(u64, 4096), guestSysconf(29));
+    try std.testing.expectEqual(std.math.maxInt(u64), guestSysconf(-1));
+    try std.testing.expectEqual(std.math.maxInt(u64), guestSysconf(9999));
+}
+
+test "SDL compatibility version satisfies SDL2 callers" {
+    const version = sdlCompatibilityVersion();
+    try std.testing.expectEqual(@as(u8, 2), version[0]);
+    try std.testing.expectEqual(@as(u8, 0), version[1]);
+    try std.testing.expectEqual(@as(u8, 0), version[2]);
+}
+
 test "decode Xbyak shl ecx immediate" {
     const decoded = decodeInsn(&[_]u8{ 0xC1, 0xE1, 0x08 });
     try std.testing.expectEqual(Op.shl_reg_imm, decoded.op);
@@ -9632,6 +10279,12 @@ test "decode Xbyak unaligned feature-mask copy" {
 }
 
 test "decode 128-bit VEX move families" {
+    const extended_base_store = decodeInsn(&[_]u8{ 0xC4, 0xC1, 0x7A, 0x7F, 0x01 });
+    try std.testing.expectEqual(Op.vmovdqu_mem_xmm, extended_base_store.op);
+    try std.testing.expectEqual(@as(u8, 0), extended_base_store.xmm_src);
+    try std.testing.expectEqual(RegId.r9b_r9w_r9d_r9, extended_base_store.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 5), extended_base_store.len);
+
     const load_dqu = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x6F, 0x00 });
     try std.testing.expectEqual(Op.vmovdqu_xmm_mem, load_dqu.op);
     try std.testing.expectEqual(@as(u8, 0), load_dqu.xmm_dst);
@@ -9699,6 +10352,13 @@ test "decode VEX dword move and byte insertion" {
 }
 
 test "decode VEX qword moves between XMM general registers and memory" {
+    const failing_vex2_load = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x7E, 0x40, 0x48 });
+    try std.testing.expectEqual(Op.vmovq_xmm_mem64, failing_vex2_load.op);
+    try std.testing.expectEqual(@as(u8, 0), failing_vex2_load.xmm_dst);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, failing_vex2_load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x48), failing_vex2_load.addr);
+    try std.testing.expectEqual(@as(u8, 5), failing_vex2_load.len);
+
     const failing_signbit_move = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x7E, 0xC0 });
     try std.testing.expectEqual(Op.vmovq_reg64_xmm, failing_signbit_move.op);
     try std.testing.expectEqual(RegId.al_ax_eax_rax, failing_signbit_move.dst_reg);

@@ -3,7 +3,7 @@ const std = @import("std");
 const max_named_handles = 128;
 const max_objects = 128;
 const max_locale_facets = 32;
-const max_atexit_entries = 128;
+const max_atexit_entries = 1024;
 const handle_base: u64 = 0xFFFF_FE00_0000_0000;
 const synthetic_thunk_base: u64 = 0xFFFF_FD00_0000_0000;
 
@@ -47,6 +47,7 @@ pub const AtexitEntry = struct {
     function: u64 = 0,
     argument: u64 = 0,
     dso: u64 = 0,
+    takes_argument: bool = true,
 };
 
 pub const MessageResult = struct {
@@ -187,7 +188,7 @@ pub const Runtime = struct {
     }
 
     pub fn registerAtexit(self: *Runtime, function: u64, argument: u64, dso: u64) bool {
-        if (self.atexit_count >= self.atexit_entries.len) return false;
+        if (function == 0 or self.atexit_count >= self.atexit_entries.len) return false;
         self.atexit_entries[self.atexit_count] = .{
             .function = function,
             .argument = argument,
@@ -195,6 +196,24 @@ pub const Runtime = struct {
         };
         self.atexit_count += 1;
         return true;
+    }
+
+    pub fn registerPlainAtexit(self: *Runtime, function: u64) bool {
+        if (function == 0 or self.atexit_count >= self.atexit_entries.len) return false;
+        self.atexit_entries[self.atexit_count] = .{
+            .function = function,
+            .takes_argument = false,
+        };
+        self.atexit_count += 1;
+        return true;
+    }
+
+    pub fn takeLastAtexit(self: *Runtime) ?AtexitEntry {
+        if (self.atexit_count == 0) return null;
+        self.atexit_count -= 1;
+        const entry = self.atexit_entries[self.atexit_count];
+        self.atexit_entries[self.atexit_count] = .{};
+        return entry;
     }
 
     fn intern(
@@ -398,6 +417,17 @@ pub fn libcppStringView(state: anytype, object: u64) ?LibcppStringView {
 pub fn copyLibcppString(state: anytype, destination: u64, source: u64) bool {
     const view = libcppStringView(state, source) orelse return false;
     return initLibcppString(state, destination, view.address, view.length);
+}
+
+pub fn compareLibcppStringWithBytes(state: anytype, object: u64, rhs_address: u64, rhs_length: u64) ?i32 {
+    const lhs_view = libcppStringView(state, object) orelse return null;
+    const lhs = state.guestMemoryConst(lhs_view.address, lhs_view.length) orelse return null;
+    const rhs = state.guestMemoryConst(rhs_address, rhs_length) orelse return null;
+    return switch (std.mem.order(u8, lhs, rhs)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
 }
 
 pub fn appendLibcppString(state: anytype, object: u64, source: u64, source_length: u64) bool {
@@ -644,6 +674,22 @@ test "libc++ string assignment tolerates an overlapping source" {
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), state.mem[0..24]);
 }
 
+test "libc++ string compare with C string bytes is lexicographic" {
+    var state = TestState{};
+    @memcpy(state.mem[32..37], "hello");
+    @memcpy(state.mem[48..53], "hello");
+    @memcpy(state.mem[56..61], "hellp");
+    @memcpy(state.mem[64..68], "hell");
+    try std.testing.expect(initLibcppString(&state, 0, 32, 5));
+    try std.testing.expectEqual(@as(?i32, 0), compareLibcppStringWithBytes(&state, 0, 48, 5));
+    try std.testing.expectEqual(@as(?i32, -1), compareLibcppStringWithBytes(&state, 0, 56, 5));
+    try std.testing.expectEqual(@as(?i32, 1), compareLibcppStringWithBytes(&state, 0, 64, 4));
+
+    @memset(state.mem[96..128], 'x');
+    try std.testing.expect(initLibcppString(&state, 128, 96, 32));
+    try std.testing.expectEqual(@as(?i32, 0), compareLibcppStringWithBytes(&state, 128, 96, 32));
+}
+
 test "Itanium C++ guard acquire release and abort lifecycle" {
     var state = TestState{};
     try std.testing.expectEqual(@as(?u64, 1), cxaGuardAcquire(&state, 32));
@@ -675,6 +721,21 @@ test "libc++ locale identities facets and destructor registration are stable" {
     try std.testing.expectEqual(@as(usize, 1), runtime.atexit_count);
     try std.testing.expect(runtime.destroyLocale(&state, 8));
     try std.testing.expectEqual(@as(u64, 0), state.read64(8));
+}
+
+test "plain and C++ atexit callbacks drain in reverse registration order" {
+    var runtime = Runtime{};
+    try std.testing.expect(runtime.registerPlainAtexit(0x10));
+    try std.testing.expect(runtime.registerAtexit(0x20, 0x21, 0x22));
+
+    const cxx = runtime.takeLastAtexit().?;
+    try std.testing.expectEqual(@as(u64, 0x20), cxx.function);
+    try std.testing.expectEqual(@as(u64, 0x21), cxx.argument);
+    try std.testing.expect(cxx.takes_argument);
+    const plain = runtime.takeLastAtexit().?;
+    try std.testing.expectEqual(@as(u64, 0x10), plain.function);
+    try std.testing.expect(!plain.takes_argument);
+    try std.testing.expect(runtime.takeLastAtexit() == null);
 }
 
 test "libc++ regex class names use Apple ctype masks" {
