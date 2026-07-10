@@ -795,6 +795,10 @@ pub const Op = enum(u16) {
     vorpd,
     vxorps,
     vxorpd,
+    vpor,
+    vpand,
+    vpandn,
+    vpxor,
     vpunpckldq,
     vpermilpd,
     // conditional / unconditional jumps
