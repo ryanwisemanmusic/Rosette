@@ -52,7 +52,9 @@ pub const CpuidResult = struct { eax: u32 = 0, ebx: u32 = 0, ecx: u32 = 0, edx: 
 
 pub fn cpuid(profile: Profile, leaf: u32, subleaf: u32) CpuidResult {
     return switch (leaf) {
-        0 => .{ .eax = 7, .ebx = 0x756E_6547, .edx = 0x4965_6E69, .ecx = 0x6C65_746E },
+        // Advertise every basic leaf we model.  In particular, AVX profiles
+        // expose XSAVE, so leaf 0xD must be available and coherent with XCR0.
+        0 => .{ .eax = 0xD, .ebx = 0x756E_6547, .edx = 0x4965_6E69, .ecx = 0x6C65_746E },
         1 => .{
             .eax = 0x0003_06C3,
             .ebx = 0x0008_0000,
@@ -63,12 +65,40 @@ pub fn cpuid(profile: Profile, leaf: u32, subleaf: u32) CpuidResult {
                 (@as(u32, 1) << 25) | (@as(u32, 1) << 26),
         },
         7 => if (subleaf == 0) leaf7(profile) else .{},
+        0xD => leafD(profile, subleaf),
         0x8000_0000 => .{ .eax = 0x8000_0008 },
+        // Extended leaves are queried by portable x86 feature probes.  They
+        // must be populated whenever 0x80000008 is advertised as the limit.
+        0x8000_0001 => leaf80000001(profile),
         0x8000_0002 => .{ .eax = 0x6573_6F52, .ebx = 0x2065_7474, .ecx = 0x7472_6956, .edx = 0x206C_6175 },
         0x8000_0003 => .{ .eax = 0x2D36_3878, .ebx = 0x4320_3436, .ecx = 0x2020_5550, .edx = 0x2020_2020 },
-        0x8000_0004 => .{},
+        0x8000_0004 => .{ .eax = 0x2020_2020, .ebx = 0x2020_2020, .ecx = 0x2020_2020, .edx = 0x2020_2020 },
+        0x8000_0005 => .{ .ecx = 0x2002_0040, .edx = 0x2002_0040 },
+        0x8000_0006 => .{ .ecx = 0x0100_6040 },
+        0x8000_0007 => .{ .edx = @as(u32, 1) << 8 }, // invariant TSC
         0x8000_0008 => .{ .eax = 0x0000_3030 },
         else => .{},
+    };
+}
+
+fn leafD(profile: Profile, subleaf: u32) CpuidResult {
+    if (subleaf != 0) return .{};
+    const avx_enabled = profile != .conservative;
+    const state_mask: u32 = if (avx_enabled) 0x7 else 0x3;
+    const xsave_size: u32 = if (avx_enabled) 0x340 else 0x200;
+    return .{ .eax = state_mask, .ebx = xsave_size, .ecx = xsave_size };
+}
+
+fn leaf80000001(profile: Profile) CpuidResult {
+    _ = profile;
+    return .{
+        // LZCNT is emulated; do not advertise RDTSCP or other instructions
+        // the guest decoder does not execute yet.
+        .ecx = @as(u32, 1) << 5,
+        .edx = (@as(u32, 1) << 0) | (@as(u32, 1) << 4) | (@as(u32, 1) << 5) |
+            (@as(u32, 1) << 8) | (@as(u32, 1) << 11) | (@as(u32, 1) << 15) |
+            (@as(u32, 1) << 20) | (@as(u32, 1) << 23) | (@as(u32, 1) << 24) |
+            (@as(u32, 1) << 25) | (@as(u32, 1) << 29),
     };
 }
 
@@ -160,6 +190,21 @@ test "profiles expose coherent AVX and AVX-512 state" {
     const avx512 = cpuid(.experimental_avx512, 7, 0);
     try std.testing.expect(avx512.ebx & (@as(u32, 1) << 16) != 0);
     try std.testing.expectEqual(@as(u64, 0xE7), xcr0(.experimental_avx512));
+}
+
+test "extended CPUID and XSAVE leaves are coherent with the advertised limits" {
+    const basic = cpuid(.xenia, 0, 0);
+    try std.testing.expect(basic.eax >= 0xD);
+    const xsave = cpuid(.xenia, 0xD, 0);
+    try std.testing.expectEqual(@as(u32, 0x7), xsave.eax);
+    try std.testing.expectEqual(@as(u32, 0x340), xsave.ebx);
+
+    const extended_limit = cpuid(.xenia, 0x8000_0000, 0);
+    try std.testing.expect(extended_limit.eax >= 0x8000_0008);
+    const extended_features = cpuid(.xenia, 0x8000_0001, 0);
+    try std.testing.expect(extended_features.ecx & (@as(u32, 1) << 5) != 0);
+    try std.testing.expect(extended_features.edx & (@as(u32, 1) << 29) != 0);
+    try std.testing.expectEqual(@as(u32, 0x0000_3030), cpuid(.xenia, 0x8000_0008, 0).eax);
 }
 
 test "classify VEX and EVEX instruction families" {
