@@ -44,9 +44,8 @@ const default_config_text =
     \\[compat]
     \\# Compatibility routing is intentionally explicit. Use:
     \\#   rosette route run --prefer-intel /path/to/Xenia.app
-    \\# Apple Rosetta 2 remains a traced fallback while Rosette's Mach-O
-    \\# x86_64 backend is being brought up.
-    \\allow_rosetta2_fallback = true
+    \\# Rosette's Mach-O x86_64 backend handles all x86_64 Mach-O routes.
+    \\allow_rosetta2_fallback = false
     \\# Strict is for diagnostics: Rosette must own the route, and fallback or
     \\# unsupported routes abort loudly instead of quietly using Apple Rosetta 2.
     \\strict = false
@@ -57,9 +56,8 @@ const default_config_text =
 ;
 
 const compat_config_upgrade_text =
-    \\# Apple Rosetta 2 remains a traced fallback while Rosette's Mach-O
-    \\# x86_64 backend is being brought up.
-    \\allow_rosetta2_fallback = true
+    \\# Rosette's Mach-O x86_64 backend handles all x86_64 Mach-O routes.
+    \\allow_rosetta2_fallback = false
     \\# Strict is for diagnostics: Rosette must own the route, and fallback or
     \\# unsupported routes abort loudly instead of quietly using Apple Rosetta 2.
     \\strict = false
@@ -253,7 +251,7 @@ fn usage(exe_name: []const u8) void {
         \\  [graphics]
         \\  enabled = false
         \\  [compat]
-        \\  allow_rosetta2_fallback = true
+        \\  allow_rosetta2_fallback = false
         \\  strict = false
         \\  abort_on_fallback = false
         \\  abort_on_unsupported = false
@@ -690,7 +688,7 @@ const CompatConfigLine = struct {
 };
 
 const compat_config_lines = [_]CompatConfigLine{
-    .{ .key = "allow_rosetta2_fallback", .line = "allow_rosetta2_fallback = true\n" },
+    .{ .key = "allow_rosetta2_fallback", .line = "allow_rosetta2_fallback = false\n" },
     .{ .key = "strict", .line = "strict = false\n", .strict_group = true },
     .{ .key = "abort_on_fallback", .line = "abort_on_fallback = false\n", .strict_group = true },
     .{ .key = "abort_on_unsupported", .line = "abort_on_unsupported = false\n", .strict_group = true },
