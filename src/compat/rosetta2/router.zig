@@ -14,7 +14,7 @@ const c = @cImport({
 
 pub const Policy = struct {
     prefer_rosette: bool = true,
-    allow_rosetta2_fallback: bool = true,
+    allow_rosetta2_fallback: bool = false,
     force_apple_rosetta2: bool = false,
     prefer_intel_slice: bool = false,
     strict_rosette: bool = false,
