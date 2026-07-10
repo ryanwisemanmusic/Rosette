@@ -190,6 +190,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const pseudo_kernel_code_cache_table_module = b.createModule(.{
+        .root_source_file = b.path("../src/pseudo-kernel-space/code-cache-table/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const entrypoint_data_init_common_module = b.createModule(.{
         .root_source_file = b.path("../src/entrypoint/.data-initializer/common.zig"),
         .target = target,
@@ -1145,6 +1150,11 @@ pub fn build(b: *std.Build) void {
     {
         const pseudo_kernel_cache_test = b.addTest(.{ .root_module = pseudo_kernel_cache_module });
         check_step.dependOn(&pseudo_kernel_cache_test.step);
+    }
+
+    {
+        const pseudo_kernel_code_cache_table_test = b.addTest(.{ .root_module = pseudo_kernel_code_cache_table_module });
+        check_step.dependOn(&pseudo_kernel_code_cache_table_test.step);
     }
 
     {
