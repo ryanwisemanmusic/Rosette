@@ -17,6 +17,7 @@ pub const TerminationReason = enum(u8) {
     runtime_invariant_failure = 13,
     initializer_transaction_failure = 14,
     system_policy_rejected = 15,
+    unhandled_guest_signal = 16,
 };
 
 pub const StopOwner = enum {
@@ -432,6 +433,7 @@ pub fn reasonLabel(reason: TerminationReason) []const u8 {
         .runtime_invariant_failure => "Rosette stopped without recording a concrete terminal event",
         .initializer_transaction_failure => "initializer transaction could not begin, commit, or roll back",
         .system_policy_rejected => "system boundary policy rejected the guest operation",
+        .unhandled_guest_signal => "guest signal handler did not resolve the fault",
     };
 }
 
@@ -524,6 +526,12 @@ pub fn attribute(input: AttributionInput) Attribution {
             .evidence = "The shared system-boundary policy rejected forwarding or emulation.",
             .next_action = "Inspect the syscall/import domain, number or symbol, and backend policy.",
         },
+        .unhandled_guest_signal => .{
+            .owner = .guest_application,
+            .authority = .diagnostic_only,
+            .evidence = "The guest SIGILL handler returned while the faulting UD2 and instruction pointer were unchanged.",
+            .next_action = "Inspect why the guest rejected this UD2 as a managed breakpoint; the decoder successfully executed the signal path.",
+        },
         .unknown => .{
             .owner = .indeterminate,
             .authority = .diagnostic_only,
@@ -587,6 +595,13 @@ test "C++ exception stop is attributed to missing Rosette unwinding" {
     const result = attribute(.{ .reason = .cxx_exception, .faulted = false });
     try std.testing.expectEqual(StopOwner.rosette_runtime, result.owner);
     try std.testing.expectEqual(ResultAuthority.diagnostic_only, result.authority);
+}
+
+test "unresolved guest SIGILL is not reported as a decoder failure" {
+    const result = attribute(.{ .reason = .unhandled_guest_signal, .faulted = true });
+    try std.testing.expectEqual(StopOwner.guest_application, result.owner);
+    try std.testing.expectEqual(ResultAuthority.diagnostic_only, result.authority);
+    try std.testing.expectEqualStrings("guest signal handler did not resolve the fault", reasonLabel(.unhandled_guest_signal));
 }
 
 test "clean guest exit is authoritative" {
