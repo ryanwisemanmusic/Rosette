@@ -24,6 +24,7 @@ const Stream = struct {
     fd: std.c.fd_t = -1,
     buffer: u64 = 0,
     buffer_size: u64 = 0,
+    last_read_count: i64 = 0,
     eof: bool = false,
     failed: bool = false,
 };
@@ -131,6 +132,9 @@ pub const Bridge = struct {
             _ = self.readInto(state, state.regs.rdi, state.regs.rsi, state.regs.rdx);
             return .{ .handled = state.regs.rdi };
         }
+        if (std.mem.eql(u8, name, "_ZNKSt3__113basic_istreamIcNS_11char_traitsIcEEE6gcountEv")) {
+            return .{ .handled = @bitCast(self.gcount(state.regs.rdi)) };
+        }
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsgetnEPcl")) {
             return .{ .handled = @bitCast(self.readInto(state, state.regs.rdi, state.regs.rsi, state.regs.rdx)) };
         }
@@ -200,6 +204,7 @@ pub const Bridge = struct {
             std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE5closeEv") or
             std.mem.eql(u8, name, "_ZNKSt3__113basic_filebufIcNS_11char_traitsIcEEE7is_openEv") or
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE4readEPcl") or
+            std.mem.eql(u8, name, "_ZNKSt3__113basic_istreamIcNS_11char_traitsIcEEE6gcountEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsgetnEPcl") or
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5tellgEv") or
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgENS_4fposI11__mbstate_tEE") or
@@ -404,6 +409,7 @@ pub const Bridge = struct {
     fn readInto(self: *Bridge, state: anytype, object: u64, destination: u64, count: u64) i64 {
         self.reads += 1;
         const stream = self.findFlexible(object) orelse return -1;
+        stream.last_read_count = 0;
         if (stream.fd < 0) {
             stream.failed = true;
             self.noteState(state, stream, cxx_object_model.FAILBIT);
@@ -420,12 +426,21 @@ pub const Bridge = struct {
             self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
             return -1;
         }
-        if (result == 0 and count != 0) {
+        stream.last_read_count = @intCast(result);
+        if (result < bytes.len) {
+            @memset(bytes[@intCast(result)..], 0);
+        }
+        if (@as(u64, @intCast(result)) < count) {
             stream.eof = true;
             stream.failed = true;
             self.noteState(state, stream, cxx_object_model.EOFBIT | cxx_object_model.FAILBIT);
         }
         return @intCast(result);
+    }
+
+    fn gcount(self: *Bridge, object: u64) i64 {
+        const stream = self.findFlexible(object) orelse return 0;
+        return stream.last_read_count;
     }
 
     fn noteState(self: *Bridge, state: anytype, stream: *const Stream, bits: u32) void {
@@ -591,7 +606,9 @@ fn isBaseDestructor(name: []const u8) bool {
     return std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev") or
         std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED1Ev") or
         std.mem.eql(u8, name, "_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev") or
-        std.mem.eql(u8, name, "_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED1Ev");
+        std.mem.eql(u8, name, "_ZNSt3__19basic_iosIcNS_11char_traitsIcEEED1Ev") or
+        std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED2Ev") or
+        std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED1Ev");
 }
 
 fn isIfstreamDefaultConstructor(name: []const u8) bool {
@@ -639,7 +656,7 @@ test "stream bridge resolves ifstream base objects to their filebuf" {
 test "stream bridge handles libc++ base destructor chain" {
     try std.testing.expect(isBaseDestructor(normalizeSymbol("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev")));
     try std.testing.expect(isBaseDestructor(normalizeSymbol("__ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev")));
-    try std.testing.expect(!isBaseDestructor(normalizeSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED2Ev")));
+    try std.testing.expect(isBaseDestructor(normalizeSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEED2Ev")));
 }
 
 test "stream bridge recognizes constructor and destructor ABI aliases" {

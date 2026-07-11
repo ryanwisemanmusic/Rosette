@@ -111,6 +111,7 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "_pthread_mutex_init")) return .{ .handled = self.mutexInit(state) };
         if (std.mem.eql(u8, name, "_pthread_mutex_destroy")) return .{ .handled = self.mutexDestroy(state.regs.rdi) };
         if (std.mem.eql(u8, name, "_pthread_mutex_lock")) return .{ .handled = self.mutexLock(state.regs.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_trylock")) return .{ .handled = self.mutexTryLock(state.regs.rdi) };
         if (std.mem.eql(u8, name, "_pthread_mutex_unlock")) return .{ .handled = self.mutexUnlock(state.regs.rdi) };
         if (std.mem.eql(u8, name, "_pthread_cond_init")) return .{ .handled = initializeOpaque(state, state.regs.rdi, 48) };
         if (std.mem.eql(u8, name, "_pthread_cond_destroy")) return .{ .handled = 0 };
@@ -328,6 +329,23 @@ pub const Runtime = struct {
         return 0;
     }
 
+    fn mutexTryLock(self: *Runtime, address: u64) u64 {
+        const mutex = self.mutexForAddress(address, true) orelse return 12;
+        if (mutex.depth != 0) {
+            mutex.contention_count +|= 1;
+            self.mutex_contentions +|= 1;
+            return 16; // EBUSY
+        }
+        mutex.depth = 1;
+        mutex.owner_thread = CURRENT_THREAD_HANDLE;
+        self.mutex_locks +|= 1;
+        return 0;
+    }
+
+    pub fn cppMutexTryLock(self: *Runtime, address: u64) bool {
+        return self.mutexTryLock(address) == 0;
+    }
+
     fn condvarInit(self: *Runtime, address: u64) ?*CondVar {
         for (&self.condvars) |*cv| {
             if (cv.active and cv.address == address) return cv;
@@ -494,15 +512,31 @@ test "pthread mutex contention tracking" {
     const mutex_addr: u64 = 0x1000;
     var test_state = struct {
         regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
-        fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 { _ = self; return null; }
-        fn write64(self: *@This(), _: u64, _: u64) void { _ = self; }
-        fn write32(self: *@This(), _: u64, _: u32) void { _ = self; }
+        fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
+            _ = self;
+            return null;
+        }
+        fn write64(self: *@This(), _: u64, _: u64) void {
+            _ = self;
+        }
+        fn write32(self: *@This(), _: u64, _: u32) void {
+            _ = self;
+        }
     }{ .regs = .{ .rdi = mutex_addr } };
     _ = runtime.dispatch(&test_state, "_pthread_mutex_init");
     _ = runtime.mutexLock(mutex_addr);
     _ = runtime.mutexLock(mutex_addr);
     try std.testing.expectEqual(@as(u64, 1), runtime.mutex_contentions);
     try std.testing.expectEqual(@as(u64, 2), runtime.mutex_locks);
+}
+
+test "pthread mutex try-lock reports busy and succeeds after unlock" {
+    var runtime = Runtime{};
+    const address: u64 = 0x2000;
+    try std.testing.expect(runtime.cppMutexTryLock(address));
+    try std.testing.expect(!runtime.cppMutexTryLock(address));
+    try std.testing.expectEqual(@as(u64, 0), runtime.mutexUnlock(address));
+    try std.testing.expect(runtime.cppMutexTryLock(address));
 }
 
 test "thread state transitions" {

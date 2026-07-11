@@ -29,6 +29,7 @@ const vtt_resolution = @import("resolution/vtt_resolver.zig");
 const foreign_object_runtime = @import("resolution/foreign_object_runtime.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
+const tlv_runtime = @import("resolution/tlv_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
 const symbol_assembly_context = @import("resolution/symbol_assembly_context.zig");
 const contract = @import("contract");
@@ -310,6 +311,7 @@ pub const MachOState = struct {
     launch_options: launch_argument_accelerator.Filter = .{},
     startup: startup_observer.Observer = .{},
     guest_errno_address: u64 = 0,
+    classic_locale_object: u64 = 0,
     cooperative_ui_context: ?CooperativeUiContext = null,
     active_guest_thread: u64 = 0,
     cooperative_thread_switches: u64 = 0,
@@ -340,6 +342,7 @@ pub const MachOState = struct {
     local_libcpp_stream_targets: std.AutoHashMap(u64, []const u8),
     logging: logging_runtime.Engine = .{},
     pthreads: pthread_runtime.Runtime = .{},
+    tlv: tlv_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
     memory_forwarder: memory_management_forwarder.Manager,
     sparse_memory: sparse_virtual_memory.Manager,
@@ -602,6 +605,10 @@ pub const MachOState = struct {
         result.applyDyldBindings() catch |err| {
             log.warn("dyld data binding setup failed: {s}", .{@errorName(err)});
         };
+        result.tlv.installDescriptors(&result);
+        if (result.tlv.descriptor_count != 0) {
+            result.registerSyntheticThunk(tlv_runtime.bootstrap_thunk, 16, "_tlv_bootstrap");
+        }
         return result;
     }
 
@@ -1053,6 +1060,10 @@ pub const MachOState = struct {
 
     pub fn readMem128(self: *MachOState, addr: u64) [16]u8 {
         var value = [_]u8{0} ** 16;
+        if (self.sparse_memory.bytesConst(addr, 16)) |storage| {
+            @memcpy(value[0..], storage[0..16]);
+            return value;
+        }
         const off = self.translateGuest(addr, 16, .read) orelse {
             self.terminateForGuestAccess(addr, 16, .read, "vector_read");
             return value;
@@ -1062,6 +1073,10 @@ pub const MachOState = struct {
     }
 
     pub fn writeMem128(self: *MachOState, addr: u64, value: [16]u8) void {
+        if (self.sparse_memory.bytes(addr, 16, true)) |storage| {
+            @memcpy(storage[0..16], value[0..]);
+            return;
+        }
         const off = self.translateGuest(addr, 16, .write) orelse {
             self.terminateForGuestAccess(addr, 16, .write, "vector_write");
             return;
@@ -1631,6 +1646,33 @@ pub const MachOState = struct {
             }
             return .{ .handled = value };
         }
+        if (std.mem.eql(u8, name, "_dlopen")) {
+            const path = self.guestCString(self.regs.rdi, 1024) orelse return .{ .handled = 0 };
+            const handle = self.dynamic_forwarder.openGuest(path, self.regs.rsi);
+            if (self.verbose_trace or handle == 0) {
+                std.debug.print(
+                    "    [dynamic loader] dlopen({s}, 0x{x}) -> 0x{x}\n",
+                    .{ path, self.regs.rsi, handle },
+                );
+            }
+            return .{ .handled = handle };
+        }
+        if (std.mem.eql(u8, name, "_dlclose")) {
+            const result = self.dynamic_forwarder.closeGuest(self.regs.rdi);
+            return .{ .handled = @as(u32, @bitCast(result)) };
+        }
+        if (std.mem.eql(u8, name, "_dlsym")) {
+            const symbol = self.guestCString(self.regs.rsi, 512) orelse return .{ .handled = 0 };
+            const address = self.dynamic_forwarder.lookupGuest(self.regs.rdi, symbol);
+            if (address != 0) self.registerSyntheticThunk(address, 1, symbol);
+            if (self.verbose_trace or address == 0) {
+                std.debug.print(
+                    "    [dynamic loader] dlsym(0x{x}, {s}) -> 0x{x}\n",
+                    .{ self.regs.rdi, symbol, address },
+                );
+            }
+            return .{ .handled = address };
+        }
         if (std.mem.eql(u8, name, "_SDL_GetVersion")) {
             const output = self.guestMemory(self.regs.rdi, 3) orelse return .{ .unsupported = 0 };
             output[0..3].* = sdlCompatibilityVersion();
@@ -1664,6 +1706,7 @@ pub const MachOState = struct {
                 return .control_transferred;
             }
         }
+        if (self.dispatchLibcppLocale(name)) |resolution| return resolution;
         if (self.libcxx_streams.dispatch(self, &self.fs_forwarder, name)) |resolution| {
             self.resolving_import_route = .libcxx_stream;
             self.import_provider_override = .libcpp_stream;
@@ -1708,6 +1751,13 @@ pub const MachOState = struct {
                 .handled => |value| .{ .handled = value },
                 .handled_void => .handled_void,
             };
+        }
+
+        if (std.mem.eql(u8, name, "__ZNSt3__15mutex8try_lockEv")) {
+            self.resolving_import_route = .pthread;
+            self.import_provider_override = .pthread_runtime;
+            self.import_confidence_override = .modeled;
+            return .{ .handled = @intFromBool(self.pthreads.cppMutexTryLock(self.regs.rdi)) };
         }
 
         if (self.dynamic_forwarder.forward(self, imported.dylib, name)) |resolution| {
@@ -2634,6 +2684,68 @@ pub const MachOState = struct {
 
         if (self.verbose_trace) std.debug.print("    [import] (unhandled) {s}\n", .{name});
         return .{ .unsupported = 0 };
+    }
+
+    fn dispatchLibcppLocale(self: *MachOState, name: []const u8) ?ImportHandlerResult {
+        if (std.mem.eql(u8, name, "__ZNSt3__16locale7classicEv")) {
+            if (self.classic_locale_object == 0) {
+                const object = self.guestAlloc(8, 8) orelse return .{ .unsupported = 0 };
+                if (!self.compat.initLocale(self, object, null)) return .{ .unsupported = 0 };
+                self.classic_locale_object = object;
+                self.registerSyntheticRegion(object, 8, .synthetic_object, "std::locale::classic", .{
+                    .kind = .owned_guest,
+                    .may_dereference = true,
+                    .owner = "libc++ locale runtime",
+                });
+            }
+            return .{ .handled = self.classic_locale_object };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__16localeC1Ev") or
+            std.mem.eql(u8, name, "__ZNSt3__16localeC2Ev"))
+        {
+            return if (self.compat.initLocale(self, self.regs.rdi, null)) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__16localeC1ERKS0_") or
+            std.mem.eql(u8, name, "__ZNSt3__16localeC2ERKS0_"))
+        {
+            const source: ?u64 = if (self.regs.rsi != 0 and self.guestMemoryConst(self.regs.rsi, 8) != null) self.regs.rsi else null;
+            return if (self.compat.initLocale(self, self.regs.rdi, source)) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__16localeaSERKS0_")) {
+            const source: ?u64 = if (self.regs.rsi != 0 and self.guestMemoryConst(self.regs.rsi, 8) != null) self.regs.rsi else null;
+            return if (self.compat.initLocale(self, self.regs.rdi, source)) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__18ios_base5imbueERKNS_6localeE")) {
+            // libc++ returns the previous locale through the hidden sret object
+            // in RDI; RSI is ios_base and RDX is the replacement locale.
+            const previous_impl = if (self.guestMemoryConst(self.regs.rsi + 40, 8) != null) self.read64(self.regs.rsi + 40) else 0;
+            if (previous_impl != 0) {
+                self.write64(self.regs.rdi, previous_impl);
+            } else if (!self.compat.initLocale(self, self.regs.rdi, null)) {
+                return .{ .unsupported = 0 };
+            }
+            const replacement = if (self.regs.rdx != 0 and self.guestMemoryConst(self.regs.rdx, 8) != null)
+                self.read64(self.regs.rdx)
+            else blk: {
+                const classic = self.classicLocale();
+                if (classic == 0) return .{ .unsupported = 0 };
+                break :blk self.read64(classic);
+            };
+            if (self.guestMemory(self.regs.rsi + 40, 8) != null) self.write64(self.regs.rsi + 40, replacement);
+            return .{ .handled = self.regs.rdi };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5imbueERKNS_6localeE")) {
+            return .handled_void;
+        }
+        return null;
+    }
+
+    fn classicLocale(self: *MachOState) u64 {
+        if (self.classic_locale_object != 0) return self.classic_locale_object;
+        const object = self.guestAlloc(8, 8) orelse return 0;
+        if (!self.compat.initLocale(self, object, null)) return 0;
+        self.classic_locale_object = object;
+        return object;
     }
 
     fn dispatchImportRoute(self: *MachOState, route: ImportRoute, imported: macho_metadata.ImportedSymbol) ?ImportHandlerResult {
@@ -4607,8 +4719,10 @@ pub const MachOState = struct {
             return !self.terminated;
         }
         if (self.handleInternalCompatibility()) return !self.terminated;
+        if (self.handleTlvBootstrap()) return !self.terminated;
         if (self.handleBoundImportThunk()) return !self.terminated;
         if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
+        if (self.handleDynamicLibraryThunk()) return !self.terminated;
         if (self.handleStubHelperTransition()) {
             return !self.terminated;
         }
@@ -4827,6 +4941,24 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn handleTlvBootstrap(self: *MachOState) bool {
+        if (!tlv_runtime.Runtime.handles(self.regs.rip)) return false;
+        const descriptor = self.regs.rdi;
+        self.regs.rax = self.tlv.resolve(self, descriptor, self.active_guest_thread) orelse 0;
+        const return_address = self.pop();
+        if (self.regs.rax == 0 or return_address == 0 or !self.isExecutableAddress(return_address)) {
+            self.terminateForInvalidControlTransfer(.{
+                .kind = "Darwin TLV bootstrap return",
+                .instruction_address = tlv_runtime.bootstrap_thunk,
+                .operand_address = descriptor,
+                .target_address = return_address,
+            });
+        } else {
+            self.regs.rip = return_address;
+        }
+        return true;
+    }
+
     fn handleBoundImportThunk(self: *MachOState) bool {
         if (self.regs.rip < BOUND_IMPORT_THUNK_BASE) return false;
         for (self.bound_import_thunks) |thunk| {
@@ -4841,6 +4973,28 @@ pub const MachOState = struct {
             return true;
         }
         return false;
+    }
+
+    fn handleDynamicLibraryThunk(self: *MachOState) bool {
+        const thunk_address = self.regs.rip;
+        if (!self.dynamic_forwarder.dispatchGuestSymbol(self, thunk_address)) return false;
+        const return_address = self.pop();
+        if (self.verbose_trace) {
+            std.debug.print(
+                "    [dynamic loader thunk] address=0x{x} -> rax=0x{x} return=0x{x}\n",
+                .{ thunk_address, self.regs.rax, return_address },
+            );
+        }
+        if (return_address == 0 or !self.isExecutableAddress(return_address)) {
+            self.terminateForInvalidControlTransfer(.{
+                .kind = "dynamic-library thunk return",
+                .instruction_address = thunk_address,
+                .target_address = return_address,
+            });
+        } else {
+            self.regs.rip = return_address;
+        }
+        return true;
     }
 
     pub fn run(self: *MachOState) void {
@@ -7060,6 +7214,7 @@ fn auditVexDecoder() VexDecoderAudit {
         &.{ 0xC5, 0xFA, 0x6F, 0x00 }, // vmovdqu xmm0, [rax]
         &.{ 0xC4, 0xC1, 0x7A, 0x7F, 0x01 }, // vmovdqu [r9], xmm0
         &.{ 0xC5, 0xFC, 0x10, 0x00 }, // vmovups ymm0, [rax]
+        &.{ 0xC5, 0xFC, 0x11, 0x00 }, // vmovups [rax], ymm0
         &.{ 0xC5, 0xF8, 0x58, 0xC1 }, // vaddps xmm0, xmm0, xmm1
         &.{ 0xC5, 0xF8, 0x57, 0xC0 }, // vxorps xmm0, xmm0, xmm0
         &.{ 0xC5, 0xF8, 0x77 }, // vzeroupper

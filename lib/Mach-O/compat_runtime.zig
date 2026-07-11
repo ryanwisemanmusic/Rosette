@@ -124,17 +124,15 @@ pub const Runtime = struct {
     }
 
     pub fn initLocale(self: *Runtime, state: anytype, object: u64, source: ?u64) bool {
-        const impl = if (source) |source_object|
-            state.read64(source_object)
-        else blk: {
+        var impl = if (source) |source_object| state.read64(source_object) else 0;
+        if (impl == 0) {
             if (self.locale_impl == 0) {
                 self.locale_impl = state.guestAlloc(64, 16) orelse return false;
                 const bytes = state.guestMemory(self.locale_impl, 64) orelse return false;
                 @memset(bytes, 0);
             }
-            break :blk self.locale_impl;
-        };
-        if (impl == 0) return false;
+            impl = self.locale_impl;
+        }
         state.write64(object, impl);
         return true;
     }
@@ -708,6 +706,9 @@ test "libc++ locale identities facets and destructor registration are stable" {
     try std.testing.expect(runtime.initLocale(&state, 0, null));
     try std.testing.expect(runtime.initLocale(&state, 8, 0));
     try std.testing.expectEqual(state.read64(0), state.read64(8));
+    try std.testing.expectEqual(@as(u64, 0), state.read64(16));
+    try std.testing.expect(runtime.initLocale(&state, 24, 16));
+    try std.testing.expectEqual(state.read64(0), state.read64(24));
     const facet = runtime.localeFacet(&state, 0x1234, .ctype) orelse return error.OutOfMemory;
     try std.testing.expectEqual(facet, runtime.localeFacet(&state, 0x1234, .ctype).?);
     const vtable = state.read64(facet);

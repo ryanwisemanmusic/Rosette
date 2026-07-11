@@ -4,6 +4,10 @@ const builtin = @import("builtin");
 const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
 const MAX_LIBRARIES = 16;
+const MAX_GUEST_LIBRARIES = 32;
+const MAX_GUEST_SYMBOLS = 256;
+const GUEST_LIBRARY_HANDLE_BASE: u64 = 0xFFFF_FC00_0000_0000;
+const GUEST_SYMBOL_THUNK_BASE: u64 = 0xFFFF_FB00_0000_0000;
 
 extern fn dlopen(path: ?[*:0]const u8, mode: c_int) ?*anyopaque;
 extern fn dlsym(handle: *anyopaque, symbol: [*:0]const u8) ?*anyopaque;
@@ -60,9 +64,32 @@ const Library = struct {
     handle: ?*anyopaque = null,
 };
 
+const GuestLibrary = struct {
+    token: u64 = 0,
+    handle: ?*anyopaque = null,
+};
+
+const GuestSymbolKind = enum {
+    get_instance_proc_addr,
+    destroy_instance,
+    @"opaque",
+};
+
+const GuestSymbol = struct {
+    token: u64 = 0,
+    library_token: u64 = 0,
+    kind: GuestSymbolKind = .@"opaque",
+};
+
 pub const Forwarder = struct {
     libraries: [MAX_LIBRARIES]Library = [_]Library{.{}} ** MAX_LIBRARIES,
     library_count: usize = 0,
+    guest_libraries: [MAX_GUEST_LIBRARIES]GuestLibrary = [_]GuestLibrary{.{}} ** MAX_GUEST_LIBRARIES,
+    guest_symbols: [MAX_GUEST_SYMBOLS]GuestSymbol = [_]GuestSymbol{.{}} ** MAX_GUEST_SYMBOLS,
+    guest_open_count: u64 = 0,
+    guest_close_count: u64 = 0,
+    guest_lookup_count: u64 = 0,
+    guest_thunk_calls: u64 = 0,
     considered: u64 = 0,
     forwarded: u64 = 0,
     rejected_not_allowlisted: u64 = 0,
@@ -74,7 +101,89 @@ pub const Forwarder = struct {
         for (self.libraries[0..self.library_count]) |loaded_library| {
             if (loaded_library.handle) |handle| _ = dlclose(handle);
         }
+        for (&self.guest_libraries) |*loaded_library| {
+            if (loaded_library.handle) |handle| _ = dlclose(handle);
+            loaded_library.* = .{};
+        }
         self.* = .{};
+    }
+
+    pub fn lookupGuest(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
+        const library = self.guestLibrary(library_token) orelse return 0;
+        var symbol_buffer: [512]u8 = undefined;
+        const symbol_z = nulTerminate(&symbol_buffer, symbol) orelse return 0;
+        _ = dlsym(library, symbol_z) orelse return 0;
+        const kind: GuestSymbolKind = if (std.mem.eql(u8, symbol, "vkGetInstanceProcAddr"))
+            .get_instance_proc_addr
+        else if (std.mem.eql(u8, symbol, "vkDestroyInstance"))
+            .destroy_instance
+        else
+            .@"opaque";
+        for (&self.guest_symbols, 0..) |*entry, index| {
+            if (entry.token != 0) continue;
+            const token = GUEST_SYMBOL_THUNK_BASE + @as(u64, @intCast(index)) * 16 + 1;
+            entry.* = .{ .token = token, .library_token = library_token, .kind = kind };
+            self.guest_lookup_count +|= 1;
+            return token;
+        }
+        return 0;
+    }
+
+    pub fn dispatchGuestSymbol(self: *Forwarder, state: anytype, token: u64) bool {
+        for (&self.guest_symbols) |*entry| {
+            if (entry.token != token) continue;
+            if (self.guestLibrary(entry.library_token) == null) return false;
+            self.guest_thunk_calls +|= 1;
+            switch (entry.kind) {
+                .get_instance_proc_addr => {
+                    const symbol = state.guestCString(state.regs.rsi, 512) orelse {
+                        state.regs.rax = 0;
+                        return true;
+                    };
+                    const result = self.lookupGuest(entry.library_token, symbol);
+                    if (result != 0) state.registerSyntheticThunk(result, 1, symbol);
+                    state.regs.rax = result;
+                },
+                .destroy_instance => state.regs.rax = 0,
+                // A non-null lookup remains useful for capability discovery,
+                // but calling an untyped ARM64 function through x86 registers
+                // is unsafe. Keep it contained until its Vulkan ABI signature
+                // has an explicit bridge.
+                .@"opaque" => state.regs.rax = 0,
+            }
+            return true;
+        }
+        return false;
+    }
+
+    pub fn openGuest(self: *Forwarder, path: []const u8, mode: u64) u64 {
+        var path_buffer: [1024]u8 = undefined;
+        const path_z = nulTerminate(&path_buffer, path) orelse return 0;
+        const host_mode: c_int = @bitCast(@as(u32, @truncate(mode)));
+        const host_handle = dlopen(path_z, host_mode) orelse return 0;
+        for (&self.guest_libraries, 0..) |*entry, index| {
+            if (entry.token != 0) continue;
+            const token = GUEST_LIBRARY_HANDLE_BASE + @as(u64, @intCast(index)) * 16 + 1;
+            entry.* = .{ .token = token, .handle = host_handle };
+            self.guest_open_count +|= 1;
+            return token;
+        }
+        _ = dlclose(host_handle);
+        return 0;
+    }
+
+    pub fn closeGuest(self: *Forwarder, token: u64) c_int {
+        for (&self.guest_libraries) |*entry| {
+            if (entry.token != token) continue;
+            const result = if (entry.handle) |handle| dlclose(handle) else -1;
+            entry.* = .{};
+            for (&self.guest_symbols) |*symbol| {
+                if (symbol.library_token == token) symbol.* = .{};
+            }
+            if (result == 0) self.guest_close_count +|= 1;
+            return result;
+        }
+        return -1;
     }
 
     pub fn forward(self: *Forwarder, state: anytype, dylib: []const u8, symbol: []const u8) ?Outcome {
@@ -127,10 +236,14 @@ pub const Forwarder = struct {
 
     pub fn logSummary(self: *const Forwarder) void {
         std.debug.print(
-            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d}\n",
+            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} guest_thunk_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d}\n",
             .{
                 self.considered,
                 self.forwarded,
+                self.guest_open_count,
+                self.guest_close_count,
+                self.guest_lookup_count,
+                self.guest_thunk_calls,
                 self.rejected_not_allowlisted,
                 self.rejected_library,
                 self.rejected_symbol,
@@ -151,6 +264,13 @@ pub const Forwarder = struct {
         self.libraries[self.library_count] = .{ .path = dylib, .handle = handle };
         self.library_count += 1;
         return handle;
+    }
+
+    fn guestLibrary(self: *Forwarder, token: u64) ?*anyopaque {
+        for (&self.guest_libraries) |*entry| {
+            if (entry.token == token) return entry.handle;
+        }
+        return null;
     }
 
     fn invoke(self: *Forwarder, state: anytype, signature: Signature, address: *anyopaque) ?Outcome {
@@ -290,4 +410,20 @@ test "forwarder copies guest memory for memcpy" {
     try std.testing.expectEqual(@as(u64, 8), outcome.handled);
     try std.testing.expectEqualStrings("copy", state.mem[8..12]);
     try std.testing.expectEqual(@as(u64, 1), forwarder.forwarded);
+}
+
+test "guest dynamic-library handles are opaque and close exactly once" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    const token = forwarder.openGuest("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_LOCAL);
+    try std.testing.expect(token >= GUEST_LIBRARY_HANDLE_BASE);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.guest_open_count);
+    const symbol = forwarder.lookupGuest(token, "getpid");
+    try std.testing.expect(symbol >= GUEST_SYMBOL_THUNK_BASE);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.guest_lookup_count);
+    try std.testing.expectEqual(@as(c_int, 0), forwarder.closeGuest(token));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.guest_close_count);
+    try std.testing.expectEqual(@as(c_int, -1), forwarder.closeGuest(token));
+    try std.testing.expectEqual(@as(u64, 0), forwarder.lookupGuest(token, "getpid"));
 }
