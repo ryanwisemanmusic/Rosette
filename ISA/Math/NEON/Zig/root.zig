@@ -551,6 +551,21 @@ const sub_vsubph = @import("SUB/VSUBPH.zig");
 const sub_vsubsh = @import("SUB/VSUBSH.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
+const test_ftst = @import("TEST/FTST.zig");
+const test_ktestw = @import("TEST/KTESTW.zig");
+const test_ktestb = @import("TEST/KTESTB.zig");
+const test_ktestq = @import("TEST/KTESTQ.zig");
+const test_ktestd = @import("TEST/KTESTD.zig");
+const test_ptest = @import("TEST/PTEST.zig");
+const test_vfpclasspd = @import("TEST/VFPCLASSPD.zig");
+const test_vfpclassph = @import("TEST/VFPCLASSPH.zig");
+const test_vfpclassps = @import("TEST/VFPCLASSPS.zig");
+const test_vfpclasssd = @import("TEST/VFPCLASSSD.zig");
+const test_vfpclasssh = @import("TEST/VFPCLASSSH.zig");
+const test_vfpclassss = @import("TEST/VFPCLASSSS.zig");
+const test_vtestpd = @import("TEST/VTESTPD.zig");
+const test_vtestps = @import("TEST/VTESTPS.zig");
+const test_xtest = @import("TEST/XTEST.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
 const undef_ud1 = @import("UNDEF/UD1.zig");
 const undef_ud2 = @import("UNDEF/UD2.zig");
@@ -1465,6 +1480,21 @@ pub const specs = blk: {
         spec(sub_vsubsh.meta),
         spec(test_test.meta),
         spec(test_testui.meta),
+        spec(test_ftst.meta),
+        spec(test_ktestw.meta),
+        spec(test_ktestb.meta),
+        spec(test_ktestq.meta),
+        spec(test_ktestd.meta),
+        spec(test_ptest.meta),
+        spec(test_vfpclasspd.meta),
+        spec(test_vfpclassph.meta),
+        spec(test_vfpclassps.meta),
+        spec(test_vfpclasssd.meta),
+        spec(test_vfpclasssh.meta),
+        spec(test_vfpclassss.meta),
+        spec(test_vtestpd.meta),
+        spec(test_vtestps.meta),
+        spec(test_xtest.meta),
         spec(undef_ud0.meta),
         spec(undef_ud1.meta),
         spec(undef_ud2.meta),
@@ -2391,6 +2421,21 @@ pub const proof_reports = [_]proofs.ProofReport{
     sub_vsubsh.proof_report,
     test_test.proof_report,
     test_testui.proof_report,
+    test_ftst.proof_report,
+    test_ktestw.proof_report,
+    test_ktestb.proof_report,
+    test_ktestq.proof_report,
+    test_ktestd.proof_report,
+    test_ptest.proof_report,
+    test_vfpclasspd.proof_report,
+    test_vfpclassph.proof_report,
+    test_vfpclassps.proof_report,
+    test_vfpclasssd.proof_report,
+    test_vfpclasssh.proof_report,
+    test_vfpclassss.proof_report,
+    test_vtestpd.proof_report,
+    test_vtestps.proof_report,
+    test_xtest.proof_report,
     undef_ud0.proof_report,
     undef_ud1.proof_report,
     undef_ud2.proof_report,
