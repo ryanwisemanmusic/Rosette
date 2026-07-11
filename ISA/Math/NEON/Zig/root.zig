@@ -530,6 +530,25 @@ const sub_subpd = @import("SUB/SUBPD.zig");
 const sub_subps = @import("SUB/SUBPS.zig");
 const sub_subsd = @import("SUB/SUBSD.zig");
 const sub_subss = @import("SUB/SUBSS.zig");
+const sub_fsub = @import("SUB/FSUB.zig");
+const sub_fsubp = @import("SUB/FSUBP.zig");
+const sub_fisub = @import("SUB/FISUB.zig");
+const sub_hsubpd = @import("SUB/HSUBPD.zig");
+const sub_hsubps = @import("SUB/HSUBPS.zig");
+const sub_phsubw = @import("SUB/PHSUBW.zig");
+const sub_phsubd = @import("SUB/PHSUBD.zig");
+const sub_phsubsw = @import("SUB/PHSUBSW.zig");
+const sub_psubb = @import("SUB/PSUBB.zig");
+const sub_psubw = @import("SUB/PSUBW.zig");
+const sub_psubd = @import("SUB/PSUBD.zig");
+const sub_psubq = @import("SUB/PSUBQ.zig");
+const sub_psubsb = @import("SUB/PSUBSB.zig");
+const sub_psubsw = @import("SUB/PSUBSW.zig");
+const sub_psubusb = @import("SUB/PSUBUSB.zig");
+const sub_psubusw = @import("SUB/PSUBUSW.zig");
+const sub_sbb = @import("SUB/SBB.zig");
+const sub_vsubph = @import("SUB/VSUBPH.zig");
+const sub_vsubsh = @import("SUB/VSUBSH.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
@@ -1425,6 +1444,25 @@ pub const specs = blk: {
         spec(sub_subps.meta),
         spec(sub_subsd.meta),
         spec(sub_subss.meta),
+        spec(sub_fsub.meta),
+        spec(sub_fsubp.meta),
+        spec(sub_fisub.meta),
+        spec(sub_hsubpd.meta),
+        spec(sub_hsubps.meta),
+        spec(sub_phsubw.meta),
+        spec(sub_phsubd.meta),
+        spec(sub_phsubsw.meta),
+        spec(sub_psubb.meta),
+        spec(sub_psubw.meta),
+        spec(sub_psubd.meta),
+        spec(sub_psubq.meta),
+        spec(sub_psubsb.meta),
+        spec(sub_psubsw.meta),
+        spec(sub_psubusb.meta),
+        spec(sub_psubusw.meta),
+        spec(sub_sbb.meta),
+        spec(sub_vsubph.meta),
+        spec(sub_vsubsh.meta),
         spec(test_test.meta),
         spec(test_testui.meta),
         spec(undef_ud0.meta),
@@ -2332,6 +2370,25 @@ pub const proof_reports = [_]proofs.ProofReport{
     sub_subps.proof_report,
     sub_subsd.proof_report,
     sub_subss.proof_report,
+    sub_fsub.proof_report,
+    sub_fsubp.proof_report,
+    sub_fisub.proof_report,
+    sub_hsubpd.proof_report,
+    sub_hsubps.proof_report,
+    sub_phsubw.proof_report,
+    sub_phsubd.proof_report,
+    sub_phsubsw.proof_report,
+    sub_psubb.proof_report,
+    sub_psubw.proof_report,
+    sub_psubd.proof_report,
+    sub_psubq.proof_report,
+    sub_psubsb.proof_report,
+    sub_psubsw.proof_report,
+    sub_psubusb.proof_report,
+    sub_psubusw.proof_report,
+    sub_sbb.proof_report,
+    sub_vsubph.proof_report,
+    sub_vsubsh.proof_report,
     test_test.proof_report,
     test_testui.proof_report,
     undef_ud0.proof_report,
