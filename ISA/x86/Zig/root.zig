@@ -548,6 +548,21 @@ const sub_vsubph = @import("SUB/VSUBPH.zig");
 const sub_vsubsh = @import("SUB/VSUBSH.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
+const test_ftst = @import("TEST/FTST.zig");
+const test_ktestw = @import("TEST/KTESTW.zig");
+const test_ktestb = @import("TEST/KTESTB.zig");
+const test_ktestq = @import("TEST/KTESTQ.zig");
+const test_ktestd = @import("TEST/KTESTD.zig");
+const test_ptest = @import("TEST/PTEST.zig");
+const test_vfpclasspd = @import("TEST/VFPCLASSPD.zig");
+const test_vfpclassph = @import("TEST/VFPCLASSPH.zig");
+const test_vfpclassps = @import("TEST/VFPCLASSPS.zig");
+const test_vfpclasssd = @import("TEST/VFPCLASSSD.zig");
+const test_vfpclasssh = @import("TEST/VFPCLASSSH.zig");
+const test_vfpclassss = @import("TEST/VFPCLASSSS.zig");
+const test_vtestpd = @import("TEST/VTESTPD.zig");
+const test_vtestps = @import("TEST/VTESTPS.zig");
+const test_xtest = @import("TEST/XTEST.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
 const undef_ud1 = @import("UNDEF/UD1.zig");
 const undef_ud2 = @import("UNDEF/UD2.zig");
@@ -1250,6 +1265,21 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "SWAPGS",
     "TEST",
     "TESTUI",
+    "FTST",
+    "KTESTB",
+    "KTESTD",
+    "KTESTQ",
+    "KTESTW",
+    "PTEST",
+    "VFPCLASSPD",
+    "VFPCLASSPH",
+    "VFPCLASSPS",
+    "VFPCLASSSD",
+    "VFPCLASSSH",
+    "VFPCLASSSS",
+    "VTESTPD",
+    "VTESTPS",
+    "XTEST",
     "VMOVAPD",
     "VMOVAPS",
     "VMOVD",
@@ -2186,6 +2216,21 @@ pub const tables = [_]InstructionTable{
     entry(sub_vsubsh.family, sub_vsubsh.path, sub_vsubsh.source),
     entry(test_test.family, test_test.path, test_test.source),
     entry(test_testui.family, test_testui.path, test_testui.source),
+    entry(test_ftst.family, test_ftst.path, test_ftst.source),
+    entry(test_ktestw.family, test_ktestw.path, test_ktestw.source),
+    entry(test_ktestb.family, test_ktestb.path, test_ktestb.source),
+    entry(test_ktestq.family, test_ktestq.path, test_ktestq.source),
+    entry(test_ktestd.family, test_ktestd.path, test_ktestd.source),
+    entry(test_ptest.family, test_ptest.path, test_ptest.source),
+    entry(test_vfpclasspd.family, test_vfpclasspd.path, test_vfpclasspd.source),
+    entry(test_vfpclassph.family, test_vfpclassph.path, test_vfpclassph.source),
+    entry(test_vfpclassps.family, test_vfpclassps.path, test_vfpclassps.source),
+    entry(test_vfpclasssd.family, test_vfpclasssd.path, test_vfpclasssd.source),
+    entry(test_vfpclasssh.family, test_vfpclasssh.path, test_vfpclasssh.source),
+    entry(test_vfpclassss.family, test_vfpclassss.path, test_vfpclassss.source),
+    entry(test_vtestpd.family, test_vtestpd.path, test_vtestpd.source),
+    entry(test_vtestps.family, test_vtestps.path, test_vtestps.source),
+    entry(test_xtest.family, test_xtest.path, test_xtest.source),
     entry(undef_ud0.family, undef_ud0.path, undef_ud0.source),
     entry(undef_ud1.family, undef_ud1.path, undef_ud1.source),
     entry(undef_ud2.family, undef_ud2.path, undef_ud2.source),
