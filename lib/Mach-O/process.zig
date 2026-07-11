@@ -2186,7 +2186,7 @@ pub const MachOState = struct {
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         }
-        if (std.mem.eql(u8, name, "__Unwind_Resume")) {
+        if (std.mem.eql(u8, name, "__Unwind_Resume") or std.mem.eql(u8, name, "__Unwind_Resume_or_Rethrow")) {
             if (self.unwinder.resumePhaseTwo(self)) return .control_transferred;
             std.debug.print("macho-processor: guest requested exception resume without an active phase-2 cleanup chain\n", .{});
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
@@ -2194,9 +2194,18 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "___cxa_rethrow")) {
             const object_address = self.cxx_exceptions.recordRethrow() orelse self.regs.rdi;
-            const type_info = if (self.cxx_exceptions.last_throw) |thrown| thrown.type_info_address else 0;
             std.debug.print("macho-processor: guest rethrew exception object=0x{x}\n", .{object_address});
-            self.last_unwind_inspection = self.unwinder.inspectThrow(self, type_info);
+            const thrown = self.cxx_exceptions.last_throw orelse {
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
+                return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+            };
+            var inspection = self.unwinder.inspectThrow(self, thrown.type_info_address);
+            const exception_header = if (thrown.allocation) |allocation| allocation.storage_address else object_address;
+            if (self.unwinder.installPhaseTwo(self, &inspection, exception_header)) {
+                self.last_unwind_inspection = inspection;
+                return .control_transferred;
+            }
+            self.last_unwind_inspection = inspection;
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         }
@@ -6199,14 +6208,29 @@ pub const MachOState = struct {
                     @memset(&self.ymm_hi[d.xmm_dst], 0);
                 }
             },
-            .vpcmpeqd => {
+            .vpcmpeqb, .vpcmpeqw, .vpcmpeqd, .vpcmpeqq, .vpcmpgtb, .vpcmpgtw, .vpcmpgtd, .vpcmpgtq => {
                 const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = compareEqualDwords(self.xmm[d.xmm_src], rhs_low);
+                self.xmm[d.xmm_dst] = applyVexCompare(self.xmm[d.xmm_src], rhs_low, d.op);
                 if (d.vector_256) {
                     const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = compareEqualDwords(self.ymm_hi[d.xmm_src], rhs_high);
+                    self.ymm_hi[d.xmm_dst] = applyVexCompare(self.ymm_hi[d.xmm_src], rhs_high, d.op);
                 } else {
                     @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vptest => {
+                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                const low_zf = bitwiseAndAllZero(self.xmm[d.xmm_src], rhs_low);
+                const low_cf = bitwiseAndNotAllZero(self.xmm[d.xmm_src], rhs_low);
+                if (d.vector_256) {
+                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
+                    if (low_zf and bitwiseAndAllZero(self.ymm_hi[d.xmm_src], rhs_high)) self.regs.rflags |= RFL_ZF;
+                    if (low_cf and bitwiseAndNotAllZero(self.ymm_hi[d.xmm_src], rhs_high)) self.regs.rflags |= RFL_CF;
+                } else {
+                    self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
+                    if (low_zf) self.regs.rflags |= RFL_ZF;
+                    if (low_cf) self.regs.rflags |= RFL_CF;
                 }
             },
             .vpunpckldq => {
@@ -7072,6 +7096,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     defer state.deinit();
     state.cpu_profile = selectedCpuProfile();
     state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");
+    state.unwinder.verbose = state.verbose_trace or environmentFlag("ROSETTE_MACHO_UNWIND_VERBOSE");
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.strict_initializers = environmentFlag("ROSETTE_MACHO_STRICT_INITIALIZERS");
@@ -7773,12 +7798,11 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    if (opcode == 0x76 and prefix == 1) {
+    if ((opcode == 0x64 or opcode == 0x65 or opcode == 0x66 or opcode == 0x74 or opcode == 0x75 or opcode == 0x76) and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
         const is_mem = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
-        decoded.op = .vpcmpeqd;
         decoded.xmm_dst = @intFromEnum(rm.reg);
         decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
         decoded.is_reg_form = !is_mem;
@@ -7787,6 +7811,15 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         } else {
             decoded.xmm_src2 = @intCast(rm.addr);
         }
+        decoded.op = switch (opcode) {
+            0x64 => .vpcmpgtb,
+            0x65 => .vpcmpgtw,
+            0x66 => .vpcmpgtd,
+            0x74 => .vpcmpeqb,
+            0x75 => .vpcmpeqw,
+            0x76 => .vpcmpeqd,
+            else => unreachable,
+        };
         decoded.len = @intCast(pos);
         return decoded;
     }
@@ -8136,6 +8169,84 @@ fn permutePackedDoubles(source: [16]u8, control: u8) [16]u8 {
     return result;
 }
 
+fn bitwiseAndAllZero(a: [16]u8, b: [16]u8) bool {
+    for (a, b) |ai, bi| if (ai & bi != 0) return false;
+    return true;
+}
+
+fn bitwiseAndNotAllZero(a: [16]u8, b: [16]u8) bool {
+    for (a, b) |ai, bi| if (~ai & bi != 0) return false;
+    return true;
+}
+
+fn applyVexCompare(lhs: [16]u8, rhs: [16]u8, op: Op) [16]u8 {
+    var result: [16]u8 = undefined;
+    switch (op) {
+        .vpcmpeqb => {
+            for (&result, lhs, rhs) |*dst, l, r| dst.* = if (l == r) 0xFF else 0x00;
+        },
+        .vpcmpgtb => {
+            for (&result, lhs, rhs) |*dst, l, r| dst.* = if (@as(i8, @bitCast(l)) > @as(i8, @bitCast(r))) 0xFF else 0x00;
+        },
+        .vpcmpeqw => {
+            for (0..8) |lane| {
+                const off = lane * 2;
+                const l = std.mem.readInt(u16, lhs[off..][0..2], .little);
+                const r = std.mem.readInt(u16, rhs[off..][0..2], .little);
+                const mask: u16 = if (l == r) 0xFFFF else 0x0000;
+                std.mem.writeInt(u16, result[off..][0..2], mask, .little);
+            }
+        },
+        .vpcmpgtw => {
+            for (0..8) |lane| {
+                const off = lane * 2;
+                const l: i16 = @bitCast(std.mem.readInt(u16, lhs[off..][0..2], .little));
+                const r: i16 = @bitCast(std.mem.readInt(u16, rhs[off..][0..2], .little));
+                const mask: u16 = if (l > r) 0xFFFF else 0x0000;
+                std.mem.writeInt(u16, result[off..][0..2], mask, .little);
+            }
+        },
+        .vpcmpeqd => {
+            for (0..4) |lane| {
+                const off = lane * 4;
+                const l = std.mem.readInt(u32, lhs[off..][0..4], .little);
+                const r = std.mem.readInt(u32, rhs[off..][0..4], .little);
+                const mask: u32 = if (l == r) std.math.maxInt(u32) else 0;
+                std.mem.writeInt(u32, result[off..][0..4], mask, .little);
+            }
+        },
+        .vpcmpeqq => {
+            for (0..2) |lane| {
+                const off = lane * 8;
+                const l = std.mem.readInt(u64, lhs[off..][0..8], .little);
+                const r = std.mem.readInt(u64, rhs[off..][0..8], .little);
+                const mask: u64 = if (l == r) std.math.maxInt(u64) else 0;
+                std.mem.writeInt(u64, result[off..][0..8], mask, .little);
+            }
+        },
+        .vpcmpgtd => {
+            for (0..4) |lane| {
+                const off = lane * 4;
+                const l: i32 = @bitCast(std.mem.readInt(u32, lhs[off..][0..4], .little));
+                const r: i32 = @bitCast(std.mem.readInt(u32, rhs[off..][0..4], .little));
+                const mask: u32 = if (l > r) std.math.maxInt(u32) else 0;
+                std.mem.writeInt(u32, result[off..][0..4], mask, .little);
+            }
+        },
+        .vpcmpgtq => {
+            for (0..2) |lane| {
+                const off = lane * 8;
+                const l: i64 = @bitCast(std.mem.readInt(u64, lhs[off..][0..8], .little));
+                const r: i64 = @bitCast(std.mem.readInt(u64, rhs[off..][0..8], .little));
+                const mask: u64 = if (l > r) std.math.maxInt(u64) else 0;
+                std.mem.writeInt(u64, result[off..][0..8], mask, .little);
+            }
+        },
+        else => unreachable,
+    }
+    return result;
+}
+
 fn vexArithmeticForOp(op: Op) VexArithmetic {
     return switch (op) {
         .vaddss, .vaddsd, .vaddps, .vaddpd => .add,
@@ -8437,6 +8548,45 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode_map == 2 and opcode == 0x17 and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.op = .vptest;
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 2 and (opcode == 0x29 or opcode == 0x37) and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x29 => .vpcmpeqq,
+            0x37 => .vpcmpgtq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode_map == 3 and opcode >= 0x08 and opcode <= 0x0B and prefix == 1) {
         const is_scalar = opcode == 0x0A or opcode == 0x0B;
         if (is_scalar and vector_256) return .{};
@@ -8484,6 +8634,32 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         }
         decoded.imm = bytes[pos];
         pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and (opcode == 0x64 or opcode == 0x65 or opcode == 0x66 or opcode == 0x74 or opcode == 0x75 or opcode == 0x76) and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x64 => .vpcmpgtb,
+            0x65 => .vpcmpgtw,
+            0x66 => .vpcmpgtd,
+            0x74 => .vpcmpeqb,
+            0x75 => .vpcmpeqw,
+            0x76 => .vpcmpeqd,
+            else => unreachable,
+        };
         decoded.len = @intCast(pos);
         return decoded;
     }

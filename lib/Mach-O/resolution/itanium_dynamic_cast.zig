@@ -17,6 +17,14 @@ pub const Resolution = struct {
     strategy: Strategy,
 };
 
+/// Returns whether a thrown class can bind to a typed catch clause. The
+/// Itanium ABI permits a catch of any unambiguous public base class, not only
+/// an exact type_info pointer match.
+pub fn isCatchCompatible(state: anytype, thrown_type: u64, catch_type: u64) bool {
+    if (thrown_type == 0 or catch_type == 0) return false;
+    return containsPublicBase(state, thrown_type, catch_type, true, 0);
+}
+
 const TypeKind = enum {
     class,
     single_inheritance,
@@ -199,6 +207,41 @@ fn visitHierarchy(
     }
 }
 
+fn containsPublicBase(
+    state: anytype,
+    type_info: u64,
+    catch_type: u64,
+    public_path: bool,
+    depth: usize,
+) bool {
+    if (depth > MAX_HIERARCHY_DEPTH or type_info == 0) return false;
+    if (public_path and type_info == catch_type) return true;
+
+    return switch (typeKind(state, type_info)) {
+        .class, .unknown => false,
+        .single_inheritance => blk: {
+            const base_type = readPointer(state, type_info +| 16) orelse break :blk false;
+            break :blk containsPublicBase(state, base_type, catch_type, public_path, depth + 1);
+        },
+        .multiple_inheritance => blk: {
+            const header = state.guestMemoryConst(type_info +| 16, 8) orelse break :blk false;
+            const base_count = std.mem.readInt(u32, header[4..8], .little);
+            if (base_count > MAX_BASES_PER_TYPE) break :blk false;
+            var index: u32 = 0;
+            while (index < base_count) : (index += 1) {
+                const entry = type_info +| 24 +| @as(u64, index) * 16;
+                const base_type = readPointer(state, entry) orelse continue;
+                const offset_flags = readPointer(state, entry +| 8) orelse continue;
+                const flags: u8 = @truncate(offset_flags);
+                if (containsPublicBase(state, base_type, catch_type, public_path and (flags & BASE_PUBLIC) != 0, depth + 1)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+    };
+}
+
 fn typeKind(state: anytype, type_info: u64) TypeKind {
     if (readPointer(state, type_info)) |vtable| {
         if (state.metadata.nearestSymbol(vtable)) |symbol| {
@@ -206,9 +249,33 @@ fn typeKind(state: anytype, type_info: u64) TypeKind {
         }
     }
     for (state.metadata.bindings) |binding| {
-        if (binding.address == type_info) return kindFromSymbol(binding.name) orelse .unknown;
+        if (binding.address == type_info) {
+            if (kindFromSymbol(binding.name)) |kind| return kind;
+        }
     }
-    return .unknown;
+    return inferTypeKindFromLayout(state, type_info);
+}
+
+/// libc++abi's type_info vtables often belong to a dylib that is deliberately
+/// not materialized in guest memory. When metadata cannot name that vtable,
+/// distinguish the standard RTTI layouts from their guest-backed fields.
+fn inferTypeKindFromLayout(state: anytype, type_info: u64) TypeKind {
+    const direct_base = readPointer(state, type_info +| 16) orelse return .unknown;
+    if (looksLikeTypeInfo(state, direct_base)) return .single_inheritance;
+
+    const header = state.guestMemoryConst(type_info +| 16, 8) orelse return .unknown;
+    const base_count = std.mem.readInt(u32, header[4..8], .little);
+    if (base_count == 0 or base_count > MAX_BASES_PER_TYPE) return .class;
+    const first_base = readPointer(state, type_info +| 24) orelse return .unknown;
+    return if (looksLikeTypeInfo(state, first_base)) .multiple_inheritance else .class;
+}
+
+fn looksLikeTypeInfo(state: anytype, address: u64) bool {
+    if (address == 0) return false;
+    const name_address = readPointer(state, address +| 8) orelse return false;
+    const name = state.guestCString(name_address, 2) orelse return false;
+    if (name.len == 0) return false;
+    return std.ascii.isPrint(name[0]);
 }
 
 fn kindFromSymbol(symbol: []const u8) ?TypeKind {
@@ -343,4 +410,36 @@ test "Mach-O RTTI bindings resolve public multiple inheritance" {
     ).?;
     try std.testing.expectEqual(destination_object, resolution.address);
     try std.testing.expectEqual(Strategy.hierarchy, resolution.strategy);
+}
+
+test "typed catch accepts a public single-inheritance base" {
+    const thrown_type = 0x300;
+    const public_base = 0x340;
+    const private_base = 0x380;
+    const bindings = [_]TestBinding{
+        .{ .address = thrown_type, .name = "__ZTVN10__cxxabiv120__si_class_type_infoE" },
+        .{ .address = public_base, .name = "__ZTVN10__cxxabiv117__class_type_infoE" },
+        .{ .address = private_base, .name = "__ZTVN10__cxxabiv117__class_type_infoE" },
+    };
+    var state = TestState{ .metadata = .{ .bindings = &bindings } };
+    state.write64(thrown_type + 16, public_base);
+
+    try std.testing.expect(isCatchCompatible(&state, thrown_type, public_base));
+    try std.testing.expect(!isCatchCompatible(&state, public_base, thrown_type));
+    try std.testing.expect(!isCatchCompatible(&state, thrown_type, private_base));
+}
+
+test "typed catch infers single-inheritance RTTI without a libc++abi binding" {
+    const thrown_type = 0x300;
+    const public_base = 0x340;
+    var state = TestState{};
+    state.write64(thrown_type + 8, 0x3c0);
+    state.write64(thrown_type + 16, public_base);
+    state.write64(public_base + 8, 0x3d0);
+    state.mem[0x3c0] = 'N';
+    state.mem[0x3c1] = 0;
+    state.mem[0x3d0] = 'N';
+    state.mem[0x3d1] = 0;
+
+    try std.testing.expect(isCatchCompatible(&state, thrown_type, public_base));
 }
