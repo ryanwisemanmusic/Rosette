@@ -527,6 +527,25 @@ const sub_subpd = @import("SUB/SUBPD.zig");
 const sub_subps = @import("SUB/SUBPS.zig");
 const sub_subsd = @import("SUB/SUBSD.zig");
 const sub_subss = @import("SUB/SUBSS.zig");
+const sub_fsub = @import("SUB/FSUB.zig");
+const sub_fsubp = @import("SUB/FSUBP.zig");
+const sub_fisub = @import("SUB/FISUB.zig");
+const sub_hsubpd = @import("SUB/HSUBPD.zig");
+const sub_hsubps = @import("SUB/HSUBPS.zig");
+const sub_phsubw = @import("SUB/PHSUBW.zig");
+const sub_phsubd = @import("SUB/PHSUBD.zig");
+const sub_phsubsw = @import("SUB/PHSUBSW.zig");
+const sub_psubb = @import("SUB/PSUBB.zig");
+const sub_psubw = @import("SUB/PSUBW.zig");
+const sub_psubd = @import("SUB/PSUBD.zig");
+const sub_psubq = @import("SUB/PSUBQ.zig");
+const sub_psubsb = @import("SUB/PSUBSB.zig");
+const sub_psubsw = @import("SUB/PSUBSW.zig");
+const sub_psubusb = @import("SUB/PSUBUSB.zig");
+const sub_psubusw = @import("SUB/PSUBUSW.zig");
+const sub_sbb = @import("SUB/SBB.zig");
+const sub_vsubph = @import("SUB/VSUBPH.zig");
+const sub_vsubsh = @import("SUB/VSUBSH.zig");
 const test_test = @import("TEST/TEST.zig");
 const test_testui = @import("TEST/TESTUI.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
@@ -1209,6 +1228,25 @@ pub const documented_reference_mnemonics = [_][]const u8{
     "SUBPS",
     "SUBSD",
     "SUBSS",
+    "FSUB",
+    "FSUBP",
+    "FISUB",
+    "HSUBPD",
+    "HSUBPS",
+    "PHSUBW",
+    "PHSUBD",
+    "PHSUBSW",
+    "PSUBB",
+    "PSUBW",
+    "PSUBD",
+    "PSUBQ",
+    "PSUBSB",
+    "PSUBSW",
+    "PSUBUSB",
+    "PSUBUSW",
+    "SBB",
+    "VSUBPH",
+    "VSUBSH",
     "SWAPGS",
     "TEST",
     "TESTUI",
@@ -2127,6 +2165,25 @@ pub const tables = [_]InstructionTable{
     entry(sub_subps.family, sub_subps.path, sub_subps.source),
     entry(sub_subsd.family, sub_subsd.path, sub_subsd.source),
     entry(sub_subss.family, sub_subss.path, sub_subss.source),
+    entry(sub_fsub.family, sub_fsub.path, sub_fsub.source),
+    entry(sub_fsubp.family, sub_fsubp.path, sub_fsubp.source),
+    entry(sub_fisub.family, sub_fisub.path, sub_fisub.source),
+    entry(sub_hsubpd.family, sub_hsubpd.path, sub_hsubpd.source),
+    entry(sub_hsubps.family, sub_hsubps.path, sub_hsubps.source),
+    entry(sub_phsubw.family, sub_phsubw.path, sub_phsubw.source),
+    entry(sub_phsubd.family, sub_phsubd.path, sub_phsubd.source),
+    entry(sub_phsubsw.family, sub_phsubsw.path, sub_phsubsw.source),
+    entry(sub_psubb.family, sub_psubb.path, sub_psubb.source),
+    entry(sub_psubw.family, sub_psubw.path, sub_psubw.source),
+    entry(sub_psubd.family, sub_psubd.path, sub_psubd.source),
+    entry(sub_psubq.family, sub_psubq.path, sub_psubq.source),
+    entry(sub_psubsb.family, sub_psubsb.path, sub_psubsb.source),
+    entry(sub_psubsw.family, sub_psubsw.path, sub_psubsw.source),
+    entry(sub_psubusb.family, sub_psubusb.path, sub_psubusb.source),
+    entry(sub_psubusw.family, sub_psubusw.path, sub_psubusw.source),
+    entry(sub_sbb.family, sub_sbb.path, sub_sbb.source),
+    entry(sub_vsubph.family, sub_vsubph.path, sub_vsubph.source),
+    entry(sub_vsubsh.family, sub_vsubsh.path, sub_vsubsh.source),
     entry(test_test.family, test_test.path, test_test.source),
     entry(test_testui.family, test_testui.path, test_testui.source),
     entry(undef_ud0.family, undef_ud0.path, undef_ud0.source),
