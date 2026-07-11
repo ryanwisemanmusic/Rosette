@@ -45,6 +45,24 @@ const div_fdivp = @import("DIV/fdivp.zig");
 const div_fidiv = @import("DIV/fidiv.zig");
 const div_vdivph = @import("DIV/VDIVPH.zig");
 const div_vdivsh = @import("DIV/VDIVSH.zig");
+const down_convert_vpmovdb = @import("DOWN_CONVERT/VPMOVDB.zig");
+const down_convert_vpmovsdb = @import("DOWN_CONVERT/VPMOVSDB.zig");
+const down_convert_vpmovusdb = @import("DOWN_CONVERT/VPMOVUSDB.zig");
+const down_convert_vpmovdw = @import("DOWN_CONVERT/VPMOVDW.zig");
+const down_convert_vpmovsdw = @import("DOWN_CONVERT/VPMOVSDW.zig");
+const down_convert_vpmovusdw = @import("DOWN_CONVERT/VPMOVUSDW.zig");
+const down_convert_vpmovqb = @import("DOWN_CONVERT/VPMOVQB.zig");
+const down_convert_vpmovsqb = @import("DOWN_CONVERT/VPMOVSQB.zig");
+const down_convert_vpmovusqb = @import("DOWN_CONVERT/VPMOVUSQB.zig");
+const down_convert_vpmovqd = @import("DOWN_CONVERT/VPMOVQD.zig");
+const down_convert_vpmovsqd = @import("DOWN_CONVERT/VPMOVSQD.zig");
+const down_convert_vpmovusqd = @import("DOWN_CONVERT/VPMOVUSQD.zig");
+const down_convert_vpmovqw = @import("DOWN_CONVERT/VPMOVQW.zig");
+const down_convert_vpmovsqw = @import("DOWN_CONVERT/VPMOVSQW.zig");
+const down_convert_vpmovusqw = @import("DOWN_CONVERT/VPMOVUSQW.zig");
+const down_convert_vpmovwb = @import("DOWN_CONVERT/VPMOVWB.zig");
+const down_convert_vpmovswb = @import("DOWN_CONVERT/VPMOVSWB.zig");
+const down_convert_vpmovuswb = @import("DOWN_CONVERT/VPMOVUSWB.zig");
 const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
 const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
 const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
@@ -909,6 +927,24 @@ pub const specs = blk: {
         spec(div_fidiv.meta),
         spec(div_vdivph.meta),
         spec(div_vdivsh.meta),
+        spec(down_convert_vpmovdb.meta),
+        spec(down_convert_vpmovsdb.meta),
+        spec(down_convert_vpmovusdb.meta),
+        spec(down_convert_vpmovdw.meta),
+        spec(down_convert_vpmovsdw.meta),
+        spec(down_convert_vpmovusdw.meta),
+        spec(down_convert_vpmovqb.meta),
+        spec(down_convert_vpmovsqb.meta),
+        spec(down_convert_vpmovusqb.meta),
+        spec(down_convert_vpmovqd.meta),
+        spec(down_convert_vpmovsqd.meta),
+        spec(down_convert_vpmovusqd.meta),
+        spec(down_convert_vpmovqw.meta),
+        spec(down_convert_vpmovsqw.meta),
+        spec(down_convert_vpmovusqw.meta),
+        spec(down_convert_vpmovwb.meta),
+        spec(down_convert_vpmovswb.meta),
+        spec(down_convert_vpmovuswb.meta),
         spec(fix_up_vfixupimmpd.meta),
         spec(fix_up_vfixupimmps.meta),
         spec(fix_up_vfixupimmsd.meta),
@@ -1773,6 +1809,24 @@ pub const proof_reports = [_]proofs.ProofReport{
     div_fidiv.proof_report,
     div_vdivph.proof_report,
     div_vdivsh.proof_report,
+    down_convert_vpmovdb.proof_report,
+    down_convert_vpmovsdb.proof_report,
+    down_convert_vpmovusdb.proof_report,
+    down_convert_vpmovdw.proof_report,
+    down_convert_vpmovsdw.proof_report,
+    down_convert_vpmovusdw.proof_report,
+    down_convert_vpmovqb.proof_report,
+    down_convert_vpmovsqb.proof_report,
+    down_convert_vpmovusqb.proof_report,
+    down_convert_vpmovqd.proof_report,
+    down_convert_vpmovsqd.proof_report,
+    down_convert_vpmovusqd.proof_report,
+    down_convert_vpmovqw.proof_report,
+    down_convert_vpmovsqw.proof_report,
+    down_convert_vpmovusqw.proof_report,
+    down_convert_vpmovwb.proof_report,
+    down_convert_vpmovswb.proof_report,
+    down_convert_vpmovuswb.proof_report,
     fix_up_vfixupimmpd.proof_report,
     fix_up_vfixupimmps.proof_report,
     fix_up_vfixupimmsd.proof_report,

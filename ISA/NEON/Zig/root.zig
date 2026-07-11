@@ -43,6 +43,24 @@ const div_fdivp = @import("DIV/fdivp.zig");
 const div_fidiv = @import("DIV/fidiv.zig");
 const div_vdivph = @import("DIV/VDIVPH.zig");
 const div_vdivsh = @import("DIV/VDIVSH.zig");
+const down_convert_vpmovdb = @import("DOWN_CONVERT/VPMOVDB.zig");
+const down_convert_vpmovsdb = @import("DOWN_CONVERT/VPMOVSDB.zig");
+const down_convert_vpmovusdb = @import("DOWN_CONVERT/VPMOVUSDB.zig");
+const down_convert_vpmovdw = @import("DOWN_CONVERT/VPMOVDW.zig");
+const down_convert_vpmovsdw = @import("DOWN_CONVERT/VPMOVSDW.zig");
+const down_convert_vpmovusdw = @import("DOWN_CONVERT/VPMOVUSDW.zig");
+const down_convert_vpmovqb = @import("DOWN_CONVERT/VPMOVQB.zig");
+const down_convert_vpmovsqb = @import("DOWN_CONVERT/VPMOVSQB.zig");
+const down_convert_vpmovusqb = @import("DOWN_CONVERT/VPMOVUSQB.zig");
+const down_convert_vpmovqd = @import("DOWN_CONVERT/VPMOVQD.zig");
+const down_convert_vpmovsqd = @import("DOWN_CONVERT/VPMOVSQD.zig");
+const down_convert_vpmovusqd = @import("DOWN_CONVERT/VPMOVUSQD.zig");
+const down_convert_vpmovqw = @import("DOWN_CONVERT/VPMOVQW.zig");
+const down_convert_vpmovsqw = @import("DOWN_CONVERT/VPMOVSQW.zig");
+const down_convert_vpmovusqw = @import("DOWN_CONVERT/VPMOVUSQW.zig");
+const down_convert_vpmovwb = @import("DOWN_CONVERT/VPMOVWB.zig");
+const down_convert_vpmovswb = @import("DOWN_CONVERT/VPMOVSWB.zig");
+const down_convert_vpmovuswb = @import("DOWN_CONVERT/VPMOVUSWB.zig");
 const fix_up_vfixupimmpd = @import("FIX_UP/VFIXUPIMMPD.zig");
 const fix_up_vfixupimmps = @import("FIX_UP/VFIXUPIMMPS.zig");
 const fix_up_vfixupimmsd = @import("FIX_UP/VFIXUPIMMSD.zig");
@@ -980,6 +998,24 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(div_fidiv.family, div_fidiv.path, div_fidiv.source),
     mirror(div_vdivph.family, div_vdivph.path, div_vdivph.source),
     mirror(div_vdivsh.family, div_vdivsh.path, div_vdivsh.source),
+    mirror(down_convert_vpmovdb.family, down_convert_vpmovdb.path, down_convert_vpmovdb.source),
+    mirror(down_convert_vpmovsdb.family, down_convert_vpmovsdb.path, down_convert_vpmovsdb.source),
+    mirror(down_convert_vpmovusdb.family, down_convert_vpmovusdb.path, down_convert_vpmovusdb.source),
+    mirror(down_convert_vpmovdw.family, down_convert_vpmovdw.path, down_convert_vpmovdw.source),
+    mirror(down_convert_vpmovsdw.family, down_convert_vpmovsdw.path, down_convert_vpmovsdw.source),
+    mirror(down_convert_vpmovusdw.family, down_convert_vpmovusdw.path, down_convert_vpmovusdw.source),
+    mirror(down_convert_vpmovqb.family, down_convert_vpmovqb.path, down_convert_vpmovqb.source),
+    mirror(down_convert_vpmovsqb.family, down_convert_vpmovsqb.path, down_convert_vpmovsqb.source),
+    mirror(down_convert_vpmovusqb.family, down_convert_vpmovusqb.path, down_convert_vpmovusqb.source),
+    mirror(down_convert_vpmovqd.family, down_convert_vpmovqd.path, down_convert_vpmovqd.source),
+    mirror(down_convert_vpmovsqd.family, down_convert_vpmovsqd.path, down_convert_vpmovsqd.source),
+    mirror(down_convert_vpmovusqd.family, down_convert_vpmovusqd.path, down_convert_vpmovusqd.source),
+    mirror(down_convert_vpmovqw.family, down_convert_vpmovqw.path, down_convert_vpmovqw.source),
+    mirror(down_convert_vpmovsqw.family, down_convert_vpmovsqw.path, down_convert_vpmovsqw.source),
+    mirror(down_convert_vpmovusqw.family, down_convert_vpmovusqw.path, down_convert_vpmovusqw.source),
+    mirror(down_convert_vpmovwb.family, down_convert_vpmovwb.path, down_convert_vpmovwb.source),
+    mirror(down_convert_vpmovswb.family, down_convert_vpmovswb.path, down_convert_vpmovswb.source),
+    mirror(down_convert_vpmovuswb.family, down_convert_vpmovuswb.path, down_convert_vpmovuswb.source),
     mirror(fix_up_vfixupimmpd.family, fix_up_vfixupimmpd.path, fix_up_vfixupimmpd.source),
     mirror(fix_up_vfixupimmps.family, fix_up_vfixupimmps.path, fix_up_vfixupimmps.source),
     mirror(fix_up_vfixupimmsd.family, fix_up_vfixupimmsd.path, fix_up_vfixupimmsd.source),
