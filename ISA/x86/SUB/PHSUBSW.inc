@@ -1,0 +1,38 @@
+// PHSUBSW.inc
+// Horizontal subtract packed word integers with signed saturation.
+
+// Canonical table metadata for registry-wide .inc validation.
+operand_encoding = [
+  { op_en = "DOC", operand_1 = "see preserved_source_contract", operand_2 = "see preserved_source_contract", operand_3 = "N/A", operand_4 = "N/A" },
+]
+semantic = """
+PHSUBSW: horizontal subtract of adjacent 16-bit signed integer pairs within each source, with signed saturation to i16 range.
+Category: simd_integer_horizontal_subtract_saturate.
+"""
+
+name = "PHSUBSW"
+category = "simd_integer_horizontal_subtract_saturate"
+feature = "SSSE3"
+element_type = "i16"
+legacy_width = 64
+lanes_128 = 8
+lanes_256 = 16
+mxcsr_used = false
+
+encodings = [
+  { opcode = "NP 0F 38 07 /r", form = "PHSUBSW mm1, mm2/m64", op_en = "RM", feature = "SSSE3", mode = "V/V", handler = "x86_phsubsw_mm_mmm64" },
+  { opcode = "66 0F 38 07 /r", form = "PHSUBSW xmm1, xmm2/m128", op_en = "RM", feature = "SSSE3", mode = "V/V", handler = "x86_phsubsw_xmm_xmmm128" },
+  { opcode = "VEX.128.66.0F38.WIG 07 /r", form = "VPHSUBSW xmm1, xmm2, xmm3/m128", op_en = "RVM", feature = "AVX", mode = "V/V", handler = "x86_vphsubsw_xmm_xmm_xmmm128" },
+  { opcode = "VEX.256.66.0F38.WIG 07 /r", form = "VPHSUBSW ymm1, ymm2, ymm3/m256", op_en = "RVM", feature = "AVX2", mode = "V/V", handler = "x86_vphsubsw_ymm_ymm_ymmm256" }
+]
+
+operand_encodings = [
+  { op_en = "RM", tuple = "N/A", operand1 = "ModRM:reg (r,w)", operand2 = "ModRM:r/m (r)", operand3 = "N/A", operand4 = "N/A" },
+  { op_en = "RVM", tuple = "N/A", operand1 = "ModRM:reg (w)", operand2 = "VEX.vvvv (r)", operand3 = "ModRM:r/m (r)", operand4 = "N/A" }
+]
+
+simd_fp_exceptions = []
+other_exceptions = ["Type 4 class exception conditions"]
+
+handler = "x86_phsubsw"
+jit_lowering = "arm64_neon_hsub_sw"
