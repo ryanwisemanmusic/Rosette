@@ -451,6 +451,31 @@ const mul_mulps = @import("MUL/MULPS.zig");
 const mul_mulsd = @import("MUL/MULSD.zig");
 const mul_mulss = @import("MUL/MULSS.zig");
 const mul_mulx = @import("MUL/MULX.zig");
+const mul_fmul = @import("MUL/FMUL.zig");
+const mul_fmulp = @import("MUL/FMULP.zig");
+const mul_fimul = @import("MUL/FIMUL.zig");
+const mul_pclmulqdq = @import("MUL/PCLMULQDQ.zig");
+const mul_pmaddubsw = @import("MUL/PMADDUBSW.zig");
+const mul_pmaddwd = @import("MUL/PMADDWD.zig");
+const mul_pmulhrsw = @import("MUL/PMULHRSW.zig");
+const mul_pmulhuw = @import("MUL/PMULHUW.zig");
+const mul_pmulhw = @import("MUL/PMULHW.zig");
+const mul_pmulld = @import("MUL/PMULLD.zig");
+const mul_pmullq = @import("MUL/PMULLQ.zig");
+const mul_pmullw = @import("MUL/PMULLW.zig");
+const mul_pmuludq = @import("MUL/PMULUDQ.zig");
+const mul_vfcmulcph = @import("MUL/VFCMULCPH.zig");
+const mul_vfmulcph = @import("MUL/VFMULCPH.zig");
+const mul_vfcmulcsh = @import("MUL/VFCMULCSH.zig");
+const mul_vfmulcsh = @import("MUL/VFMULCSH.zig");
+const mul_vmulph = @import("MUL/VMULPH.zig");
+const mul_vmulsh = @import("MUL/VMULSH.zig");
+const mul_vpdpbusd = @import("MUL/VPDPBUSD.zig");
+const mul_vpdpbusds = @import("MUL/VPDPBUSDS.zig");
+const mul_vpdpwssd = @import("MUL/VPDPWSSD.zig");
+const mul_vpdpwssds = @import("MUL/VPDPWSSDS.zig");
+const mul_vpmadd52huq = @import("MUL/VPMADD52HUQ.zig");
+const mul_vpmadd52luq = @import("MUL/VPMADD52LUQ.zig");
 const or_or = @import("OR/OR.zig");
 const or_orpd = @import("OR/ORPD.zig");
 const or_orps = @import("OR/ORPS.zig");
@@ -1394,6 +1419,31 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(mul_mulsd.family, mul_mulsd.path, mul_mulsd.source),
     mirror(mul_mulss.family, mul_mulss.path, mul_mulss.source),
     mirror(mul_mulx.family, mul_mulx.path, mul_mulx.source),
+    mirror(mul_fmul.family, mul_fmul.path, mul_fmul.source),
+    mirror(mul_fmulp.family, mul_fmulp.path, mul_fmulp.source),
+    mirror(mul_fimul.family, mul_fimul.path, mul_fimul.source),
+    mirror(mul_pclmulqdq.family, mul_pclmulqdq.path, mul_pclmulqdq.source),
+    mirror(mul_pmaddubsw.family, mul_pmaddubsw.path, mul_pmaddubsw.source),
+    mirror(mul_pmaddwd.family, mul_pmaddwd.path, mul_pmaddwd.source),
+    mirror(mul_pmulhrsw.family, mul_pmulhrsw.path, mul_pmulhrsw.source),
+    mirror(mul_pmulhuw.family, mul_pmulhuw.path, mul_pmulhuw.source),
+    mirror(mul_pmulhw.family, mul_pmulhw.path, mul_pmulhw.source),
+    mirror(mul_pmulld.family, mul_pmulld.path, mul_pmulld.source),
+    mirror(mul_pmullq.family, mul_pmullq.path, mul_pmullq.source),
+    mirror(mul_pmullw.family, mul_pmullw.path, mul_pmullw.source),
+    mirror(mul_pmuludq.family, mul_pmuludq.path, mul_pmuludq.source),
+    mirror(mul_vfcmulcph.family, mul_vfcmulcph.path, mul_vfcmulcph.source),
+    mirror(mul_vfmulcph.family, mul_vfmulcph.path, mul_vfmulcph.source),
+    mirror(mul_vfcmulcsh.family, mul_vfcmulcsh.path, mul_vfcmulcsh.source),
+    mirror(mul_vfmulcsh.family, mul_vfmulcsh.path, mul_vfmulcsh.source),
+    mirror(mul_vmulph.family, mul_vmulph.path, mul_vmulph.source),
+    mirror(mul_vmulsh.family, mul_vmulsh.path, mul_vmulsh.source),
+    mirror(mul_vpdpbusd.family, mul_vpdpbusd.path, mul_vpdpbusd.source),
+    mirror(mul_vpdpbusds.family, mul_vpdpbusds.path, mul_vpdpbusds.source),
+    mirror(mul_vpdpwssd.family, mul_vpdpwssd.path, mul_vpdpwssd.source),
+    mirror(mul_vpdpwssds.family, mul_vpdpwssds.path, mul_vpdpwssds.source),
+    mirror(mul_vpmadd52huq.family, mul_vpmadd52huq.path, mul_vpmadd52huq.source),
+    mirror(mul_vpmadd52luq.family, mul_vpmadd52luq.path, mul_vpmadd52luq.source),
     mirror(or_or.family, or_or.path, or_or.source),
     mirror(or_orpd.family, or_orpd.path, or_orpd.source),
     mirror(or_orps.family, or_orps.path, or_orps.source),

@@ -453,6 +453,31 @@ const mul_mulps = @import("MUL/MULPS.zig");
 const mul_mulsd = @import("MUL/MULSD.zig");
 const mul_mulss = @import("MUL/MULSS.zig");
 const mul_mulx = @import("MUL/MULX.zig");
+const mul_fmul = @import("MUL/FMUL.zig");
+const mul_fmulp = @import("MUL/FMULP.zig");
+const mul_fimul = @import("MUL/FIMUL.zig");
+const mul_pclmulqdq = @import("MUL/PCLMULQDQ.zig");
+const mul_pmaddubsw = @import("MUL/PMADDUBSW.zig");
+const mul_pmaddwd = @import("MUL/PMADDWD.zig");
+const mul_pmulhrsw = @import("MUL/PMULHRSW.zig");
+const mul_pmulhuw = @import("MUL/PMULHUW.zig");
+const mul_pmulhw = @import("MUL/PMULHW.zig");
+const mul_pmulld = @import("MUL/PMULLD.zig");
+const mul_pmullq = @import("MUL/PMULLQ.zig");
+const mul_pmullw = @import("MUL/PMULLW.zig");
+const mul_pmuludq = @import("MUL/PMULUDQ.zig");
+const mul_vfcmulcph = @import("MUL/VFCMULCPH.zig");
+const mul_vfmulcph = @import("MUL/VFMULCPH.zig");
+const mul_vfcmulcsh = @import("MUL/VFCMULCSH.zig");
+const mul_vfmulcsh = @import("MUL/VFMULCSH.zig");
+const mul_vmulph = @import("MUL/VMULPH.zig");
+const mul_vmulsh = @import("MUL/VMULSH.zig");
+const mul_vpdpbusd = @import("MUL/VPDPBUSD.zig");
+const mul_vpdpbusds = @import("MUL/VPDPBUSDS.zig");
+const mul_vpdpwssd = @import("MUL/VPDPWSSD.zig");
+const mul_vpdpwssds = @import("MUL/VPDPWSSDS.zig");
+const mul_vpmadd52huq = @import("MUL/VPMADD52HUQ.zig");
+const mul_vpmadd52luq = @import("MUL/VPMADD52LUQ.zig");
 const or_or = @import("OR/OR.zig");
 const or_orpd = @import("OR/ORPD.zig");
 const or_orps = @import("OR/ORPS.zig");
@@ -1323,6 +1348,31 @@ pub const specs = blk: {
         spec(mul_mulsd.meta),
         spec(mul_mulss.meta),
         spec(mul_mulx.meta),
+        spec(mul_fmul.meta),
+        spec(mul_fmulp.meta),
+        spec(mul_fimul.meta),
+        spec(mul_pclmulqdq.meta),
+        spec(mul_pmaddubsw.meta),
+        spec(mul_pmaddwd.meta),
+        spec(mul_pmulhrsw.meta),
+        spec(mul_pmulhuw.meta),
+        spec(mul_pmulhw.meta),
+        spec(mul_pmulld.meta),
+        spec(mul_pmullq.meta),
+        spec(mul_pmullw.meta),
+        spec(mul_pmuludq.meta),
+        spec(mul_vfcmulcph.meta),
+        spec(mul_vfmulcph.meta),
+        spec(mul_vfcmulcsh.meta),
+        spec(mul_vfmulcsh.meta),
+        spec(mul_vmulph.meta),
+        spec(mul_vmulsh.meta),
+        spec(mul_vpdpbusd.meta),
+        spec(mul_vpdpbusds.meta),
+        spec(mul_vpdpwssd.meta),
+        spec(mul_vpdpwssds.meta),
+        spec(mul_vpmadd52huq.meta),
+        spec(mul_vpmadd52luq.meta),
         spec(or_or.meta),
         spec(or_orpd.meta),
         spec(or_orps.meta),
@@ -2205,6 +2255,31 @@ pub const proof_reports = [_]proofs.ProofReport{
     mul_mulsd.proof_report,
     mul_mulss.proof_report,
     mul_mulx.proof_report,
+    mul_fmul.proof_report,
+    mul_fmulp.proof_report,
+    mul_fimul.proof_report,
+    mul_pclmulqdq.proof_report,
+    mul_pmaddubsw.proof_report,
+    mul_pmaddwd.proof_report,
+    mul_pmulhrsw.proof_report,
+    mul_pmulhuw.proof_report,
+    mul_pmulhw.proof_report,
+    mul_pmulld.proof_report,
+    mul_pmullq.proof_report,
+    mul_pmullw.proof_report,
+    mul_pmuludq.proof_report,
+    mul_vfcmulcph.proof_report,
+    mul_vfmulcph.proof_report,
+    mul_vfcmulcsh.proof_report,
+    mul_vfmulcsh.proof_report,
+    mul_vmulph.proof_report,
+    mul_vmulsh.proof_report,
+    mul_vpdpbusd.proof_report,
+    mul_vpdpbusds.proof_report,
+    mul_vpdpwssd.proof_report,
+    mul_vpdpwssds.proof_report,
+    mul_vpmadd52huq.proof_report,
+    mul_vpmadd52luq.proof_report,
     or_or.proof_report,
     or_orpd.proof_report,
     or_orps.proof_report,
