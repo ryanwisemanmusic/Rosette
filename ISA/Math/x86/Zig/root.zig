@@ -668,6 +668,25 @@ const shift_shrd = @import("SHIFT/SHRD.zig");
 const shift_sarx = @import("SHIFT/SARX.zig");
 const shift_shlx = @import("SHIFT/SHLX.zig");
 const shift_shrx = @import("SHIFT/SHRX.zig");
+const shift_kshiftlb = @import("SHIFT/KSHIFTLB.zig");
+const shift_kshiftld = @import("SHIFT/KSHIFTLD.zig");
+const shift_kshiftlq = @import("SHIFT/KSHIFTLQ.zig");
+const shift_kshiftlw = @import("SHIFT/KSHIFTLW.zig");
+const shift_kshiftrb = @import("SHIFT/KSHIFTRB.zig");
+const shift_kshiftrd = @import("SHIFT/KSHIFTRD.zig");
+const shift_kshiftrq = @import("SHIFT/KSHIFTRQ.zig");
+const shift_kshiftrw = @import("SHIFT/KSHIFTRW.zig");
+const shift_pslld = @import("SHIFT/PSLLD.zig");
+const shift_pslldq = @import("SHIFT/PSLLDQ.zig");
+const shift_psllq = @import("SHIFT/PSLLQ.zig");
+const shift_psllw = @import("SHIFT/PSLLW.zig");
+const shift_psraq = @import("SHIFT/PSRAQ.zig");
+const shift_psrad = @import("SHIFT/PSRAD.zig");
+const shift_psraw = @import("SHIFT/PSRAW.zig");
+const shift_psrld = @import("SHIFT/PSRLD.zig");
+const shift_psrldq = @import("SHIFT/PSRLDQ.zig");
+const shift_psrlq = @import("SHIFT/PSRLQ.zig");
+const shift_psrlw = @import("SHIFT/PSRLW.zig");
 const clear_clac = @import("CLEAR/CLAC.zig");
 const clear_clc = @import("CLEAR/CLC.zig");
 const clear_cld = @import("CLEAR/CLD.zig");
@@ -1634,6 +1653,25 @@ pub const specs = blk: {
         spec(shift_sarx.meta),
         spec(shift_shlx.meta),
         spec(shift_shrx.meta),
+        spec(shift_kshiftlb.meta),
+        spec(shift_kshiftld.meta),
+        spec(shift_kshiftlq.meta),
+        spec(shift_kshiftlw.meta),
+        spec(shift_kshiftrb.meta),
+        spec(shift_kshiftrd.meta),
+        spec(shift_kshiftrq.meta),
+        spec(shift_kshiftrw.meta),
+        spec(shift_pslld.meta),
+        spec(shift_pslldq.meta),
+        spec(shift_psllq.meta),
+        spec(shift_psllw.meta),
+        spec(shift_psraq.meta),
+        spec(shift_psrad.meta),
+        spec(shift_psraw.meta),
+        spec(shift_psrld.meta),
+        spec(shift_psrldq.meta),
+        spec(shift_psrlq.meta),
+        spec(shift_psrlw.meta),
         spec(clear_clac.meta),
         spec(clear_clc.meta),
         spec(clear_cld.meta),
@@ -2612,6 +2650,25 @@ pub const proof_reports = [_]proofs.ProofReport{
     shift_sarx.proof_report,
     shift_shlx.proof_report,
     shift_shrx.proof_report,
+    shift_kshiftlb.proof_report,
+    shift_kshiftld.proof_report,
+    shift_kshiftlq.proof_report,
+    shift_kshiftlw.proof_report,
+    shift_kshiftrb.proof_report,
+    shift_kshiftrd.proof_report,
+    shift_kshiftrq.proof_report,
+    shift_kshiftrw.proof_report,
+    shift_pslld.proof_report,
+    shift_pslldq.proof_report,
+    shift_psllq.proof_report,
+    shift_psllw.proof_report,
+    shift_psraq.proof_report,
+    shift_psrad.proof_report,
+    shift_psraw.proof_report,
+    shift_psrld.proof_report,
+    shift_psrldq.proof_report,
+    shift_psrlq.proof_report,
+    shift_psrlw.proof_report,
     clear_clac.proof_report,
     clear_clc.proof_report,
     clear_cld.proof_report,
@@ -2990,7 +3047,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 639), tableCount());
+    try std.testing.expectEqual(@as(usize, 658), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();

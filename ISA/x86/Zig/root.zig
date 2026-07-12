@@ -668,6 +668,25 @@ const shift_shrd = @import("SHIFT/SHRD.zig");
 const shift_sarx = @import("SHIFT/SARX.zig");
 const shift_shlx = @import("SHIFT/SHLX.zig");
 const shift_shrx = @import("SHIFT/SHRX.zig");
+const shift_kshiftlb = @import("SHIFT/KSHIFTLB.zig");
+const shift_kshiftld = @import("SHIFT/KSHIFTLD.zig");
+const shift_kshiftlq = @import("SHIFT/KSHIFTLQ.zig");
+const shift_kshiftlw = @import("SHIFT/KSHIFTLW.zig");
+const shift_kshiftrb = @import("SHIFT/KSHIFTRB.zig");
+const shift_kshiftrd = @import("SHIFT/KSHIFTRD.zig");
+const shift_kshiftrq = @import("SHIFT/KSHIFTRQ.zig");
+const shift_kshiftrw = @import("SHIFT/KSHIFTRW.zig");
+const shift_pslld = @import("SHIFT/PSLLD.zig");
+const shift_pslldq = @import("SHIFT/PSLLDQ.zig");
+const shift_psllq = @import("SHIFT/PSLLQ.zig");
+const shift_psllw = @import("SHIFT/PSLLW.zig");
+const shift_psraq = @import("SHIFT/PSRAQ.zig");
+const shift_psrad = @import("SHIFT/PSRAD.zig");
+const shift_psraw = @import("SHIFT/PSRAW.zig");
+const shift_psrld = @import("SHIFT/PSRLD.zig");
+const shift_psrldq = @import("SHIFT/PSRLDQ.zig");
+const shift_psrlq = @import("SHIFT/PSRLQ.zig");
+const shift_psrlw = @import("SHIFT/PSRLW.zig");
 const clear_clac = @import("CLEAR/CLAC.zig");
 const clear_clc = @import("CLEAR/CLC.zig");
 const clear_cld = @import("CLEAR/CLD.zig");
@@ -2367,6 +2386,25 @@ pub const tables = [_]InstructionTable{
     entry(shift_sarx.family, shift_sarx.path, shift_sarx.source),
     entry(shift_shlx.family, shift_shlx.path, shift_shlx.source),
     entry(shift_shrx.family, shift_shrx.path, shift_shrx.source),
+    entry(shift_kshiftlb.family, shift_kshiftlb.path, shift_kshiftlb.source),
+    entry(shift_kshiftld.family, shift_kshiftld.path, shift_kshiftld.source),
+    entry(shift_kshiftlq.family, shift_kshiftlq.path, shift_kshiftlq.source),
+    entry(shift_kshiftlw.family, shift_kshiftlw.path, shift_kshiftlw.source),
+    entry(shift_kshiftrb.family, shift_kshiftrb.path, shift_kshiftrb.source),
+    entry(shift_kshiftrd.family, shift_kshiftrd.path, shift_kshiftrd.source),
+    entry(shift_kshiftrq.family, shift_kshiftrq.path, shift_kshiftrq.source),
+    entry(shift_kshiftrw.family, shift_kshiftrw.path, shift_kshiftrw.source),
+    entry(shift_pslld.family, shift_pslld.path, shift_pslld.source),
+    entry(shift_pslldq.family, shift_pslldq.path, shift_pslldq.source),
+    entry(shift_psllq.family, shift_psllq.path, shift_psllq.source),
+    entry(shift_psllw.family, shift_psllw.path, shift_psllw.source),
+    entry(shift_psraq.family, shift_psraq.path, shift_psraq.source),
+    entry(shift_psrad.family, shift_psrad.path, shift_psrad.source),
+    entry(shift_psraw.family, shift_psraw.path, shift_psraw.source),
+    entry(shift_psrld.family, shift_psrld.path, shift_psrld.source),
+    entry(shift_psrldq.family, shift_psrldq.path, shift_psrldq.source),
+    entry(shift_psrlq.family, shift_psrlq.path, shift_psrlq.source),
+    entry(shift_psrlw.family, shift_psrlw.path, shift_psrlw.source),
     entry(clear_clac.family, clear_clac.path, clear_clac.source),
     entry(clear_clc.family, clear_clc.path, clear_clc.source),
     entry(clear_cld.family, clear_cld.path, clear_cld.source),
@@ -2843,7 +2881,7 @@ fn mnemonicFromPath(path: []const u8) []const u8 {
 }
 
 test "x86 ISA tables expose required metadata" {
-    try std.testing.expectEqual(@as(usize, 857), tableCount());
+    try std.testing.expectEqual(@as(usize, 876), tableCount());
     validateAll();
     for (documented_reference_mnemonics) |name| try std.testing.expect(findByName(name) != null);
     const add = (findByName("ADD") orelse return error.MissingAdd).metadata();
