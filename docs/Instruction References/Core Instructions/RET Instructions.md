@@ -1,3 +1,350 @@
+MAXSD — Return Maximum Scalar Double Precision Floating-Point Value
+
+Opcode/Instruction	                                                Op / En	64/32 bit Mode Support	CPUID Feature Flag	Description
+F2 0F 5F /r MAXSD xmm1, xmm2/m64	                                A	    V/V	                    SSE2	            Return the maximum scalar double precision floating-point value between xmm2/m64 and xmm1.
+VEX.LIG.F2.0F.WIG 5F /r VMAXSD xmm1, xmm2, xmm3/m64	                B	    V/V	                    AVX	                Return the maximum scalar double precision floating-point value between xmm3/m64 and xmm2.
+EVEX.LLIG.F2.0F.W1 5F /r VMAXSD xmm1 {k1}{z}, xmm2, xmm3/m64{sae}	C	    V/V	                    AVX512F	            Return the maximum scalar double precision floating-point value between xmm3/m64 and xmm2.  
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	    Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	            ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	            ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Tuple1 Scalar	ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Compares the low double precision floating-point values in the first source operand and the second source operand, and returns the maximum value to the low quadword of the destination operand. The second source operand can be an XMM register or a 64-bit memory location. The first source and destination operands are XMM registers. When the second source operand is a memory operand, only 64 bits are accessed.
+
+If the values being compared are both 0.0s (of either sign), the value in the second source operand is returned. If a value in the second source operand is an SNaN, that SNaN is returned unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second source operand, either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN of either source operand be returned, the action of MAXSD can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN, and OR.
+
+128-bit Legacy SSE version: The destination and first source operand are the same. Bits (MAXVL-1:64) of the corresponding destination register remain unchanged.
+
+VEX.128 and EVEX encoded version: Bits (127:64) of the XMM register destination are copied from corresponding bits in the first source operand. Bits (MAXVL-1:128) of the destination register are zeroed.
+
+EVEX encoded version: The low quadword element of the destination operand is updated according to the writemask.
+
+Software should ensure VMAXSD is encoded with VEX.L=0. Encoding VMAXSD with VEX.L=1 may encounter unpredictable behavior across different processor generations.
+
+Operation:
+
+MAX(SRC1, SRC2)
+{
+    IF ((SRC1 = 0.0) and (SRC2 = 0.0)) THEN DEST := SRC2;
+        ELSE IF (SRC1 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC2 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC1 > SRC2) THEN DEST := SRC1;
+        ELSE DEST := SRC2;
+    FI;
+}
+
+VMAXSD (EVEX Encoded Version):
+
+IF k1[0] or *no writemask*
+    THEN DEST[63:0] := MAX(SRC1[63:0], SRC2[63:0])
+    ELSE
+        IF *merging-masking* ; merging-masking
+            THEN *DEST[63:0] remains unchanged*
+            ELSE ; zeroing-masking
+                DEST[63:0] := 0
+        FI;
+FI;
+DEST[127:64] := SRC1[127:64]
+DEST[MAXVL-1:128] := 0
+
+VMAXSD (VEX.128 Encoded Version):
+
+DEST[63:0] := MAX(SRC1[63:0], SRC2[63:0])
+DEST[127:64] := SRC1[127:64]
+DEST[MAXVL-1:128] := 0
+
+MAXSD (128-bit Legacy SSE Version):
+
+DEST[63:0] := MAX(DEST[63:0], SRC[63:0])
+DEST[MAXVL-1:64] (Unmodified)
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMAXSD __m128d _mm_max_round_sd( __m128d a, __m128d b, int);
+VMAXSD __m128d _mm_mask_max_round_sd(__m128d s, __mmask8 k, __m128d a, __m128d b, int);
+VMAXSD __m128d _mm_maskz_max_round_sd( __mmask8 k, __m128d a, __m128d b, int);
+MAXSD __m128d _mm_max_sd(__m128d a, __m128d b)
+
+SIMD Floating-Point Exceptions:
+
+Invalid (Including QNaN Source Operand), Denormal.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-20, “Type 3 Class Exception Conditions.”
+
+EVEX-encoded instruction, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+MAXSS — Return Maximum Scalar Single Precision Floating-Point Value
+
+Opcode/Instruction	                                                Op / En	64/32 bit Mode Support	CPUID Feature Flag	Description
+F3 0F 5F /r MAXSS xmm1, xmm2/m32	                                A	    V/V	                    SSE	                Return the maximum scalar single precision floating-point value between xmm2/m32 and xmm1.
+VEX.LIG.F3.0F.WIG 5F /r VMAXSS xmm1, xmm2, xmm3/m32	                B	    V/V	                    AVX	                Return the maximum scalar single precision floating-point value between xmm3/m32 and xmm2.
+EVEX.LLIG.F3.0F.W0 5F /r VMAXSS xmm1 {k1}{z}, xmm2, xmm3/m32{sae}	C	    V/V	                    AVX512F	            Return the maximum scalar single precision floating-point value between xmm3/m32 and xmm2.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	    Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	            ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	            ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Tuple1 Scalar	ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Compares the low single precision floating-point values in the first source operand and the second source operand, and returns the maximum value to the low doubleword of the destination operand.
+
+If the values being compared are both 0.0s (of either sign), the value in the second source operand is returned. If a value in the second source operand is an SNaN, that SNaN is returned unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second source operand, either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN from either source operand be returned, the action of MAXSS can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN, and OR.
+
+The second source operand can be an XMM register or a 32-bit memory location. The first source and destination operands are XMM registers.
+
+128-bit Legacy SSE version: The destination and first source operand are the same. Bits (MAXVL:32) of the corresponding destination register remain unchanged.
+
+VEX.128 and EVEX encoded version: The first source operand is an xmm register encoded by VEX.vvvv. Bits (127:32) of the XMM register destination are copied from corresponding bits in the first source operand. Bits (MAXVL:128) of the destination register are zeroed.
+
+EVEX encoded version: The low doubleword element of the destination operand is updated according to the writemask.
+
+Software should ensure VMAXSS is encoded with VEX.L=0. Encoding VMAXSS with VEX.L=1 may encounter unpredictable behavior across different processor generations.
+
+Operation:
+
+MAX(SRC1, SRC2)
+{
+    IF ((SRC1 = 0.0) and (SRC2 = 0.0)) THEN DEST := SRC2;
+        ELSE IF (SRC1 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC2 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC1 > SRC2) THEN DEST := SRC1;
+        ELSE DEST := SRC2;
+    FI;
+}
+
+VMAXSS (EVEX Encoded Version):
+
+IF k1[0] or *no writemask*
+    THEN DEST[31:0] := MAX(SRC1[31:0], SRC2[31:0])
+    ELSE
+        IF *merging-masking* ; merging-masking
+            THEN *DEST[31:0] remains unchanged*
+            ELSE ; zeroing-masking
+                THEN DEST[31:0] := 0
+        FI;
+FI;
+DEST[127:32] := SRC1[127:32]
+DEST[MAXVL-1:128] := 0
+
+VMAXSS (VEX.128 Encoded Version):
+
+DEST[31:0] := MAX(SRC1[31:0], SRC2[31:0])
+DEST[127:32] := SRC1[127:32]
+DEST[MAXVL-1:128] := 0
+
+MAXSS (128-bit Legacy SSE Version):
+
+DEST[31:0] := MAX(DEST[31:0], SRC[31:0])
+DEST[MAXVL-1:32] (Unmodified)
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMAXSS __m128 _mm_max_round_ss( __m128 a, __m128 b, int);
+VMAXSS __m128 _mm_mask_max_round_ss(__m128 s, __mmask8 k, __m128 a, __m128 b, int);
+VMAXSS __m128 _mm_maskz_max_round_ss( __mmask8 k, __m128 a, __m128 b, int);
+MAXSS __m128 _mm_max_ss(__m128 a, __m128 b)
+
+SIMD Floating-Point Exceptions:
+
+Invalid (Including QNaN Source Operand), Denormal.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-20, “Type 3 Class Exception Conditions.”
+
+EVEX-encoded instruction, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+
+MINSD — Return Minimum Scalar Double Precision Floating-Point Value
+
+Opcode/Instruction	                                                Op / En	64/32 bit Mode Support	CPUID Feature Flag	Description
+F2 0F 5D /r MINSD xmm1, xmm2/m64	                                A	    V/V	                    SSE2	            Return the minimum scalar double precision floating-point value between xmm2/m64 and xmm1.
+VEX.LIG.F2.0F.WIG 5D /r VMINSD xmm1, xmm2, xmm3/m64	                B	    V/V	                    AVX	                Return the minimum scalar double precision floating-point value between xmm3/m64 and xmm2.
+EVEX.LLIG.F2.0F.W1 5D /r VMINSD xmm1 {k1}{z}, xmm2, xmm3/m64{sae}	C	    V/V	                    AVX512F         	Return the minimum scalar double precision floating-point value between xmm3/m64 and xmm2.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	    Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	            ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	            ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Tuple1 Scalar	ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Compares the low double precision floating-point values in the first source operand and the second source operand, and returns the minimum value to the low quadword of the destination operand. When the source operand is a memory operand, only the 64 bits are accessed.
+
+If the values being compared are both 0.0s (of either sign), the value in the second source operand is returned. If a value in the second source operand is an SNaN, then SNaN is returned unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second source operand, either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN source operand (from either the first or second source) be returned, the action of MINSD can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN, and OR.
+
+The second source operand can be an XMM register or a 64-bit memory location. The first source and destination operands are XMM registers.
+
+128-bit Legacy SSE version: The destination and first source operand are the same. Bits (MAXVL-1:64) of the corresponding destination register remain unchanged.
+
+VEX.128 and EVEX encoded version: Bits (127:64) of the XMM register destination are copied from corresponding bits in the first source operand. Bits (MAXVL-1:128) of the destination register are zeroed.
+
+EVEX encoded version: The low quadword element of the destination operand is updated according to the writemask.
+
+Software should ensure VMINSD is encoded with VEX.L=0. Encoding VMINSD with VEX.L=1 may encounter unpredictable behavior across different processor generations.
+
+Operation:
+
+MIN(SRC1, SRC2)
+{
+    IF ((SRC1 = 0.0) and (SRC2 = 0.0)) THEN DEST := SRC2;
+        ELSE IF (SRC1 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC2 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC1 < SRC2) THEN DEST := SRC1;
+        ELSE DEST := SRC2;
+    FI;
+}
+
+MINSD (EVEX Encoded Version):
+
+IF k1[0] or *no writemask*
+    THEN DEST[63:0] := MIN(SRC1[63:0], SRC2[63:0])
+    ELSE
+        IF *merging-masking* ; merging-masking
+            THEN *DEST[63:0] remains unchanged*
+            ELSE ; zeroing-masking
+                THEN DEST[63:0] := 0
+        FI;
+FI;
+DEST[127:64] := SRC1[127:64]
+DEST[MAXVL-1:128] := 0
+
+MINSD (VEX.128 Encoded Version):
+
+DEST[63:0] := MIN(SRC1[63:0], SRC2[63:0])
+DEST[127:64] := SRC1[127:64]
+DEST[MAXVL-1:128] := 0
+
+MINSD (128-bit Legacy SSE Version):
+
+DEST[63:0] := MIN(SRC1[63:0], SRC2[63:0])
+DEST[MAXVL-1:64] (Unmodified)
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMINSD __m128d _mm_min_round_sd(__m128d a, __m128d b, int);
+VMINSD __m128d _mm_mask_min_round_sd(__m128d s, __mmask8 k, __m128d a, __m128d b, int);
+VMINSD __m128d _mm_maskz_min_round_sd( __mmask8 k, __m128d a, __m128d b, int);
+MINSD __m128d _mm_min_sd(__m128d a, __m128d b)
+
+SIMD Floating-Point Exceptions:
+
+Invalid (including QNaN Source Operand), Denormal.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-20, “Type 3 Class Exception Conditions.”
+
+EVEX-encoded instruction, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+MINSS — Return Minimum Scalar Single Precision Floating-Point Value
+
+Opcode/Instruction	                                                Op / En	64/32 bit Mode Support	CPUID Feature Flag	Description
+F3 0F 5D /r MINSS xmm1,xmm2/m32	                                    A	    V/V	                    SSE	                Return the minimum scalar single precision floating-point value between xmm2/m32 and xmm1.
+VEX.LIG.F3.0F.WIG 5D /r VMINSS xmm1,xmm2, xmm3/m32	                B	    V/V	                    AVX	                Return the minimum scalar single precision floating-point value between xmm3/m32 and xmm2.
+EVEX.LLIG.F3.0F.W0 5D /r VMINSS xmm1 {k1}{z}, xmm2, xmm3/m32{sae}	C	    V/V	                    AVX512F	            Return the minimum scalar single precision floating-point value between xmm3/m32 and xmm2.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	    Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	            ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	            ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Tuple1 Scalar	ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Compares the low single precision floating-point values in the first source operand and the second source operand and returns the minimum value to the low doubleword of the destination operand.
+
+If the values being compared are both 0.0s (of either sign), the value in the second source operand is returned. If a value in the second operand is an SNaN, that SNaN is returned unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second source operand, either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN in either source operand be returned, the action of MINSD can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN, and OR.
+
+The second source operand can be an XMM register or a 32-bit memory location. The first source and destination operands are XMM registers.
+
+128-bit Legacy SSE version: The destination and first source operand are the same. Bits (MAXVL:32) of the corresponding destination register remain unchanged.
+
+VEX.128 and EVEX encoded version: The first source operand is an xmm register encoded by (E)VEX.vvvv. Bits (127:32) of the XMM register destination are copied from corresponding bits in the first source operand. Bits (MAXVL-1:128) of the destination register are zeroed.
+
+EVEX encoded version: The low doubleword element of the destination operand is updated according to the writemask.
+
+Software should ensure VMINSS is encoded with VEX.L=0. Encoding VMINSS with VEX.L=1 may encounter unpredictable behavior across different processor generations.
+
+Operation:
+
+MIN(SRC1, SRC2)
+{
+    IF ((SRC1 = 0.0) and (SRC2 = 0.0)) THEN DEST := SRC2;
+        ELSE IF (SRC1 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC2 = NaN) THEN DEST := SRC2; FI;
+        ELSE IF (SRC1 < SRC2) THEN DEST := SRC1;
+        ELSE DEST := SRC2;
+    FI;
+}
+
+MINSS (EVEX Encoded Version):
+
+IF k1[0] or *no writemask*
+    THEN DEST[31:0] := MIN(SRC1[31:0], SRC2[31:0])
+    ELSE
+        IF *merging-masking* ; merging-masking
+            THEN *DEST[31:0] remains unchanged*
+            ELSE ; zeroing-masking
+                THEN DEST[31:0] := 0
+        FI;
+FI;
+DEST[127:32] := SRC1[127:32]
+DEST[MAXVL-1:128] := 0
+
+VMINSS (VEX.128 Encoded Version):
+
+DEST[31:0] := MIN(SRC1[31:0], SRC2[31:0])
+DEST[127:32] := SRC1[127:32]
+DEST[MAXVL-1:128] := 0
+
+MINSS (128-bit Legacy SSE Version):
+
+DEST[31:0] := MIN(SRC1[31:0], SRC2[31:0])
+DEST[MAXVL-1:128] (Unmodified)
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMINSS __m128 _mm_min_round_ss( __m128 a, __m128 b, int);
+VMINSS __m128 _mm_mask_min_round_ss(__m128 s, __mmask8 k, __m128 a, __m128 b, int);
+VMINSS __m128 _mm_maskz_min_round_ss( __mmask8 k, __m128 a, __m128 b, int);
+MINSS __m128 _mm_min_ss(__m128 a, __m128 b)
+
+SIMD Floating-Point Exceptions:
+
+Invalid (Including QNaN Source Operand), Denormal.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-19, “Type 2 Class Exception Conditions.”
+
+EVEX-encoded instruction, see Table 2-46, “Type E2 Class Exception Conditions.”
+
+
 RET — Return From Procedure
 
 Opcode*	Instruction	Op/En	64-Bit Mode	    Compat/Leg Mode	    Description
@@ -645,3 +992,419 @@ Same as 64-bit mode exceptions.
 #CP(Far-RET/IRET):
 	If the previous SSP from shadow stack (when returning to CPL <3) or from IA32_PL3_SSP (returning to CPL 3) is not 4 byte aligned.
     If return instruction pointer from stack and shadow stack do not match.
+
+
+VMAXPH — Return Maximum of Packed FP16 Values
+
+
+Opcode/Onstruction	                                                            Op/En	64-Bit Mode	    Compat/Leg Mode	        Description
+EVEX.128.NP.MAP5.W0 5F /r VMAXPH xmm1{k1}{z}, xmm2, xmm3/m128/m16bcst	        A	    V/V	            AVX512-FP16 AVX512VL	Return the maximum packed FP16 values between xmm2 and xmm3/m128/m16bcst and store the result in xmm1 subject to writemask k1.
+EVEX.256.NP.MAP5.W0 5F /r VMAXPH ymm1{k1}{z}, ymm2, ymm3/m256/m16bcst	        A	    V/V	            AVX512-FP16 AVX512VL	Return the maximum packed FP16 values between ymm2 and ymm3/m256/m16bcst and store the result in ymm1 subject to writemask k1.
+EVEX.512.NP.MAP5.W0 5F /r VMAXPH zmm1{k1}{z}, zmm2, zmm3/m512/m16bcst {sae}	    A	    V/V	            AVX512-FP16	            Return the maximum packed FP16 values between zmm2 and zmm3/m512/m16bcst and store the result in zmm1 subject to writemask k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+This instruction performs a SIMD compare of the packed FP16 values in the first source operand and the second source operand and returns the maximum value for each pair of values to the destination operand.
+
+If the values being compared are both 0.0s (of either sign), the value in the second operand (source operand) is returned. If a value in the second operand is an SNaN, then SNaN is forwarded unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second operand (source operand), either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN source operand (from either the first or second operand) be returned, the action of VMAXPH can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN and OR.
+
+EVEX encoded versions: The first source operand (the second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location or a 512/256/128-bit vector broadcast from a 16-bit memory location. The destination operand is a ZMM/YMM/XMM register conditionally updated with writemask k1.
+
+Operation:
+
+def MAX(SRC1, SRC2):
+    IF (SRC1 = 0.0) and (SRC2 = 0.0):
+        DEST := SRC2
+    ELSE IF (SRC1 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC2 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC1 > SRC2):
+        DEST := SRC1
+    ELSE:
+        DEST := SRC2
+
+VMAXPH dest, src1, src2:
+
+VL = 128, 256 or 512
+KL := VL/16
+FOR j := 0 TO KL-1:
+    IF k1[j] OR *no writemask*:
+        IF EVEX.b = 1:
+            tsrc2 := SRC2.fp16[0]
+        ELSE:
+            tsrc2 := SRC2.fp16[j]
+        DEST.fp16[j] := MAX(SRC1.fp16[j], tsrc2)
+    ELSE IF *zeroing*:
+        DEST.fp16[j] := 0
+    // else dest.fp16[j] remains unchanged
+DEST[MAXVL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMAXPH __m128h _mm_mask_max_ph (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VMAXPH __m128h _mm_maskz_max_ph (__mmask8 k, __m128h a, __m128h b);
+VMAXPH __m128h _mm_max_ph (__m128h a, __m128h b);
+VMAXPH __m256h _mm256_mask_max_ph (__m256h src, __mmask16 k, __m256h a, __m256h b);
+VMAXPH __m256h _mm256_maskz_max_ph (__mmask16 k, __m256h a, __m256h b);
+VMAXPH __m256h _mm256_max_ph (__m256h a, __m256h b);
+VMAXPH __m512h _mm512_mask_max_ph (__m512h src, __mmask32 k, __m512h a, __m512h b);
+VMAXPH __m512h _mm512_maskz_max_ph (__mmask32 k, __m512h a, __m512h b);
+VMAXPH __m512h _mm512_max_ph (__m512h a, __m512h b);
+VMAXPH __m512h _mm512_mask_max_round_ph (__m512h src, __mmask32 k, __m512h a, __m512h b, int sae);
+VMAXPH __m512h _mm512_maskz_max_round_ph (__mmask32 k, __m512h a, __m512h b, int sae);
+VMAXPH __m512h _mm512_max_round_ph (__m512h a, __m512h b, int sae);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-46, “Type E2 Class Exception Conditions.”
+
+
+VMAXSH — Return Maximum of Scalar FP16 Values
+
+Opcode/Onstruction	                                                    Op/En	64-Bit Mode	    Compat/Leg Mode	    Description
+EVEX.LLIG.F3.MAP5.W0 5F /r VMAXSH xmm1{k1}{z}, xmm2, xmm3/m16 {sae}	    A	    V/V	            AVX512-FP16	        Return the maximum low FP16 value between xmm3/m16 and xmm2 and store the result in xmm1 subject to writemask k1. Bits 127:16 of xmm2 are copied to xmm1[127:16].
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Scalar	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+This instruction performs a compare of the low packed FP16 values in the first source operand and the second source operand and returns the maximum value for the pair of values to the destination operand.
+
+If the values being compared are both 0.0s (of either sign), the value in the second operand (source operand) is returned. If a value in the second operand is an SNaN, then SNaN is forwarded unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second operand (source operand), either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN source operand (from either the first or second operand) be returned, the action of VMAXSH can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN, and OR.
+
+Bits 127:16 of the destination operand are copied from the corresponding bits of the first source operand. Bits MAXVL-1:128 of the destination operand are zeroed. The low FP16 element of the destination is updated according to the writemask.
+
+Operation:
+
+def MAX(SRC1, SRC2):
+    IF (SRC1 = 0.0) and (SRC2 = 0.0):
+        DEST := SRC2
+    ELSE IF (SRC1 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC2 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC1 > SRC2):
+        DEST := SRC1
+    ELSE:
+        DEST := SRC2
+
+VMAXSH dest, src1, src2:
+
+IF k1[0] OR *no writemask*:
+    DEST.fp16[0] := MAX(SRC1.fp16[0], SRC2.fp16[0])
+ELSE IF *zeroing*:
+    DEST.fp16[0] := 0
+// else dest.fp16[j] remains unchanged
+DEST[127:16] := SRC1[127:16]
+DEST[MAXVL-1:128] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMAXSH __m128h _mm_mask_max_round_sh (__m128h src, __mmask8 k, __m128h a, __m128h b, int sae);
+VMAXSH __m128h _mm_maskz_max_round_sh (__mmask8 k, __m128h a, __m128h b, int sae);
+VMAXSH __m128h _mm_max_round_sh (__m128h a, __m128h b, int sae);
+VMAXSH __m128h _mm_mask_max_sh (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VMAXSH __m128h _mm_maskz_max_sh (__mmask8 k, __m128h a, __m128h b);
+VMAXSH __m128h _mm_max_sh (__m128h a, __m128h b);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+
+
+
+VMINPH — Return Minimum of Packed FP16 Values
+
+Opcode/Onstruction	                                                            Op/En	64-Bit Mode	    Compat/Leg Mode	        Description
+EVEX.128.NP.MAP5.W0 5D /r VMINPH xmm1{k1}{z}, xmm2, xmm3/m128/m16bcst	        A	    V/V	            AVX512-FP16 AVX512VL	Return the minimum packed FP16 values between xmm2 and xmm3/m128/m16bcst and store the result in xmm1 subject to writemask k1.
+EVEX.256.NP.MAP5.W0 5D /r VMINPH ymm1{k1}{z}, ymm2, ymm3/m256/m16bcst	        A	    V/V	            AVX512-FP16 AVX512VL	Return the minimum packed FP16 values between ymm2 and ymm3/m256/m16bcst and store the result in ymm1 subject to writemask k1.
+EVEX.512.NP.MAP5.W0 5D /r VMINPH zmm1{k1}{z}, zmm2, zmm3/m512/m16bcst {sae}	    A	    V/V	            AVX512-FP16	            Return the minimum packed FP16 values between zmm2 and zmm3/m512/m16bcst and store the result in zmm1 subject to writemask k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+This instruction performs a SIMD compare of the packed FP16 values in the first source operand and the second source operand and returns the minimum value for each pair of values to the destination operand.
+
+If the values being compared are both 0.0s (of either sign), the value in the second operand (source operand) is returned. If a value in the second operand is an SNaN, then SNaN is forwarded unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second operand (source operand), either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN source operand (from either the first or second operand) be returned, the action of VMINPH can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN and OR.
+
+EVEX encoded versions: The first source operand (the second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location or a 512/256/128-bit vector broadcast from a 16-bit memory location. The destination operand is a ZMM/YMM/XMM register conditionally updated with writemask k1.
+
+Operation:
+
+def MIN(SRC1, SRC2):
+    IF (SRC1 = 0.0) and (SRC2 = 0.0):
+        DEST := SRC2
+    ELSE IF (SRC1 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC2 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC1 < SRC2):
+        DEST := SRC1
+    ELSE:
+        DEST := SRC2
+
+VMINPH dest, src1, src2:
+
+VL = 128, 256 or 512
+KL := VL/16
+FOR j := 0 TO KL-1:
+    IF k1[j] OR *no writemask*:
+        IF EVEX.b = 1:
+            tsrc2 := SRC2.fp16[0]
+        ELSE:
+            tsrc2 := SRC2.fp16[j]
+        DEST.fp16[j] := MIN(SRC1.fp16[j], tsrc2)
+    ELSE IF *zeroing*:
+        DEST.fp16[j] := 0
+    // else dest.fp16[j] remains unchanged
+DEST[MAXVL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMINPH __m128h _mm_mask_min_ph (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VMINPH __m128h _mm_maskz_min_ph (__mmask8 k, __m128h a, __m128h b);
+VMINPH __m128h _mm_min_ph (__m128h a, __m128h b);
+VMINPH __m256h _mm256_mask_min_ph (__m256h src, __mmask16 k, __m256h a, __m256h b);
+VMINPH __m256h _mm256_maskz_min_ph (__mmask16 k, __m256h a, __m256h b);
+VMINPH __m256h _mm256_min_ph (__m256h a, __m256h b);
+VMINPH __m512h _mm512_mask_min_ph (__m512h src, __mmask32 k, __m512h a, __m512h b);
+VMINPH __m512h _mm512_maskz_min_ph (__mmask32 k, __m512h a, __m512h b);
+VMINPH __m512h _mm512_min_ph (__m512h a, __m512h b);
+VMINPH __m512h _mm512_mask_min_round_ph (__m512h src, __mmask32 k, __m512h a, __m512h b, int sae);
+VMINPH __m512h _mm512_maskz_min_round_ph (__mmask32 k, __m512h a, __m512h b, int sae);
+VMINPH __m512h _mm512_min_round_ph (__m512h a, __m512h b, int sae);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-46, “Type E2 Class Exception Conditions.”
+
+
+
+
+VMINSH — Return Minimum Scalar FP16 Value
+
+Opcode/Onstruction	                                                    Op/En	64-Bit Mode	    Compat/Leg Mode	    Description
+EVEX.LLIG.F3.MAP5.W0 5D /r VMINSH xmm1{k1}{z}, xmm2, xmm3/m16 {sae}	    A	    V/V	            AVX512-FP16	        Return the minimum low FP16 value between xmm3/m16 and xmm2. Stores the result in xmm1 subject to writemask k1. Bits 127:16 of xmm2 are copied to xmm1[127:16].
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Scalar	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+This instruction performs a compare of the low packed FP16 values in the first source operand and the second source operand and returns the minimum value for the pair of values to the destination operand.
+
+If the values being compared are both 0.0s (of either sign), the value in the second operand (source operand) is returned. If a value in the second operand is an SNaN, then SNaN is forwarded unchanged to the destination (that is, a QNaN version of the SNaN is not returned).
+
+If only one value is a NaN (SNaN or QNaN) for this instruction, the second operand (source operand), either a NaN or a valid floating-point value, is written to the result. If instead of this behavior, it is required that the NaN source operand (from either the first or second operand) be returned, the action of VMINSH can be emulated using a sequence of instructions, such as, a comparison followed by AND, ANDN, and OR.
+
+EVEX encoded versions: The first source operand (the second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location or a 512/256/128-bit vector broadcast from a 16-bit memory location. The destination operand is a ZMM/YMM/XMM register conditionally updated with writemask k1.
+
+Bits 127:16 of the destination operand are copied from the corresponding bits of the first source operand. Bits MAXVL-1:128 of the destination operand are zeroed. The low FP16 element of the destination is updated according to the writemask.
+
+Operation:
+
+def MIN(SRC1, SRC2):
+    IF (SRC1 = 0.0) and (SRC2 = 0.0):
+        DEST := SRC2
+    ELSE IF (SRC1 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC2 = NaN):
+        DEST := SRC2
+    ELSE IF (SRC1 < SRC2):
+        DEST := SRC1
+    ELSE:
+        DEST := SRC2
+
+VMINSH dest, src1, src2:
+
+IF k1[0] OR *no writemask*:
+    DEST.fp16[0] := MIN(SRC1.fp16[0], SRC2.fp16[0])
+ELSE IF *zeroing*:
+    DEST.fp16[0] := 0
+// else dest.fp16[j] remains unchanged
+DEST[127:16] := SRC1[127:16]
+DEST[MAXVL-1:128] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VMINSH __m128h _mm_mask_min_round_sh (__m128h src, __mmask8 k, __m128h a, __m128h b, int sae);
+VMINSH __m128h _mm_maskz_min_round_sh (__mmask8 k, __m128h a, __m128h b, int sae);
+VMINSH __m128h _mm_min_round_sh (__m128h a, __m128h b, int sae);
+VMINSH __m128h _mm_mask_min_sh (__m128h src, __mmask8 k, __m128h a, __m128h b);
+VMINSH __m128h _mm_maskz_min_sh (__mmask8 k, __m128h a, __m128h b);
+VMINSH __m128h _mm_min_sh (__m128h a, __m128h b);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+VPOPCNT — Return the Count of Number of Bits Set to 1 in BYTE/WORD/DWORD/QWORD
+
+Opcode/Instruction	                                                Op/En	64/32 bit Mode Support	CPUID Feature Flag	        Description
+EVEX.128.66.0F38.W0 54 /r VPOPCNTB xmm1{k1}{z}, xmm2/m128	        A	    V/V	                    AVX512_BITALG AVX512VL	    Counts the number of bits set to one in xmm2/m128 and puts the result in xmm1 with writemask k1.
+EVEX.256.66.0F38.W0 54 /r VPOPCNTB ymm1{k1}{z}, ymm2/m256	        A	    V/V	                    AVX512_BITALG AVX512VL	    Counts the number of bits set to one in ymm2/m256 and puts the result in ymm1 with writemask k1.
+EVEX.512.66.0F38.W0 54 /r VPOPCNTB zmm1{k1}{z}, zmm2/m512	        A	    V/V	                    AVX512_BITALG	            Counts the number of bits set to one in zmm2/m512 and puts the result in zmm1 with writemask k1.
+EVEX.128.66.0F38.W1 54 /r VPOPCNTW xmm1{k1}{z}, xmm2/m128	        A	    V/V	                    AVX512_BITALG AVX512VL	    Counts the number of bits set to one in xmm2/m128 and puts the result in xmm1 with writemask k1.        
+EVEX.256.66.0F38.W1 54 /r VPOPCNTW ymm1{k1}{z}, ymm2/m256	        A	    V/V	                    AVX512_BITALG AVX512VL	    Counts the number of bits set to one in ymm2/m256 and puts the result in ymm1 with writemask k1.
+EVEX.512.66.0F38.W1 54 /r VPOPCNTW zmm1{k1}{z}, zmm2/m512	        A	    V/V	                    AVX512_BITALG	            Counts the number of bits set to one in zmm2/m512 and puts the result in zmm1 with writemask k1.        
+EVEX.128.66.0F38.W0 55 /r VPOPCNTD xmm1{k1}{z}, xmm2/m128/m32bcst	B	    V/V	                    AVX512_VPOPCNTDQ AVX512VL	Counts the number of bits set to one in xmm2/m128/m32bcst and puts the result in xmm1 with writemask k1.
+EVEX.256.66.0F38.W0 55 /r VPOPCNTD ymm1{k1}{z}, ymm2/m256/m32bcst	B	    V/V	                    AVX512_VPOPCNTDQ AVX512VL	Counts the number of bits set to one in ymm2/m256/m32bcst and puts the result in ymm1 with writemask k1.
+EVEX.512.66.0F38.W0 55 /r VPOPCNTD zmm1{k1}{z}, zmm2/m512/m32bcst	B	    V/V	                    AVX512_VPOPCNTDQ	        Counts the number of bits set to one in zmm2/m512/m32bcst and puts the result in zmm1 with writemask k1.
+EVEX.128.66.0F38.W1 55 /r VPOPCNTQ xmm1{k1}{z}, xmm2/m128/m64bcst	B	    V/V	                    AVX512_VPOPCNTDQ AVX512VL	Counts the number of bits set to one in xmm2/m128/m32bcst and puts the result in xmm1 with writemask k1.
+EVEX.256.66.0F38.W1 55 /r VPOPCNTQ ymm1{k1}{z}, ymm2/m256/m64bcst	B	    V/V	                    AVX512_VPOPCNTDQ AVX512VL	Counts the number of bits set to one in ymm2/m256/m32bcst and puts the result in ymm1 with writemask k1.
+EVEX.512.66.0F38.W1 55 /r VPOPCNTQ zmm1{k1}{z}, zmm2/m512/m64bcst	B	    V/V	                    AVX512_VPOPCNTDQ	        Counts the number of bits set to one in zmm2/m512/m64bcst and puts the result in zmm1 with writemask k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	    Operand 1	    Operand 2	    Operand 3	Operand 4
+A	    Full Mem	ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+B	    Full	    ModRM:reg (w)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+This instruction counts the number of bits set to one in each byte, word, dword or qword element of its source (e.g., zmm2 or memory) and places the results in the destination register (zmm1). This instruction supports memory fault suppression.
+
+Operation:
+
+VPOPCNTB:
+
+(KL, VL) = (16, 128), (32, 256), (64, 512)
+FOR j := 0 TO KL-1:
+    IF MaskBit(j) OR *no writemask*:
+        DEST.byte[j] := POPCNT(SRC.byte[j])
+    ELSE IF *merging-masking*:
+        *DEST.byte[j] remains unchanged*
+    ELSE:
+        DEST.byte[j] := 0
+DEST[MAX_VL-1:VL] := 0
+
+VPOPCNTW:
+
+(KL, VL) = (8, 128), (16, 256), (32, 512)
+FOR j := 0 TO KL-1:
+    IF MaskBit(j) OR *no writemask*:
+        DEST.word[j] := POPCNT(SRC.word[j])
+    ELSE IF *merging-masking*:
+        *DEST.word[j] remains unchanged*
+    ELSE:
+        DEST.word[j] := 0
+DEST[MAX_VL-1:VL] := 0
+
+VPOPCNTD:
+
+(KL, VL) = (4, 128), (8, 256), (16, 512)
+FOR j := 0 TO KL-1:
+    IF MaskBit(j) OR *no writemask*:
+        IF SRC is broadcast memop:
+            t := SRC.dword[0]
+        ELSE:
+            t := SRC.dword[j]
+        DEST.dword[j] := POPCNT(t)
+    ELSE IF *merging-masking*:
+        *DEST..dword[j] remains unchanged*
+    ELSE:
+        DEST..dword[j] := 0
+DEST[MAX_VL-1:VL] := 0
+
+VPOPCNTQ:
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1:
+    IF MaskBit(j) OR *no writemask*:
+        IF SRC is broadcast memop:
+            t := SRC.qword[0]
+        ELSE:
+            t := SRC.qword[j]
+        DEST.qword[j] := POPCNT(t)
+    ELSE IF *merging-masking*:
+        *DEST..qword[j] remains unchanged*
+    ELSE:
+        DEST..qword[j] := 0
+DEST[MAX_VL-1:VL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VPOPCNTW __m128i _mm_popcnt_epi16(__m128i);
+VPOPCNTW __m128i _mm_mask_popcnt_epi16(__m128i, __mmask8, __m128i);
+VPOPCNTW __m128i _mm_maskz_popcnt_epi16(__mmask8, __m128i);
+VPOPCNTW __m256i _mm256_popcnt_epi16(__m256i);
+VPOPCNTW __m256i _mm256_mask_popcnt_epi16(__m256i, __mmask16, __m256i);
+VPOPCNTW __m256i _mm256_maskz_popcnt_epi16(__mmask16, __m256i);
+VPOPCNTW __m512i _mm512_popcnt_epi16(__m512i);
+VPOPCNTW __m512i _mm512_mask_popcnt_epi16(__m512i, __mmask32, __m512i);
+VPOPCNTW __m512i _mm512_maskz_popcnt_epi16(__mmask32, __m512i);
+VPOPCNTQ __m128i _mm_popcnt_epi64(__m128i);
+VPOPCNTQ __m128i _mm_mask_popcnt_epi64(__m128i, __mmask8, __m128i);
+VPOPCNTQ __m128i _mm_maskz_popcnt_epi64(__mmask8, __m128i);
+VPOPCNTQ __m256i _mm256_popcnt_epi64(__m256i);
+VPOPCNTQ __m256i _mm256_mask_popcnt_epi64(__m256i, __mmask8, __m256i);
+VPOPCNTQ __m256i _mm256_maskz_popcnt_epi64(__mmask8, __m256i);
+VPOPCNTQ __m512i _mm512_popcnt_epi64(__m512i);
+VPOPCNTQ __m512i _mm512_mask_popcnt_epi64(__m512i, __mmask8, __m512i);
+VPOPCNTQ __m512i _mm512_maskz_popcnt_epi64(__mmask8, __m512i);
+VPOPCNTD __m128i _mm_popcnt_epi32(__m128i);
+VPOPCNTD __m128i _mm_mask_popcnt_epi32(__m128i, __mmask8, __m128i);
+VPOPCNTD __m128i _mm_maskz_popcnt_epi32(__mmask8, __m128i);
+VPOPCNTD __m256i _mm256_popcnt_epi32(__m256i);
+VPOPCNTD __m256i _mm256_mask_popcnt_epi32(__m256i, __mmask8, __m256i);
+VPOPCNTD __m256i _mm256_maskz_popcnt_epi32(__mmask8, __m256i);
+VPOPCNTD __m512i _mm512_popcnt_epi32(__m512i);
+VPOPCNTD __m512i _mm512_mask_popcnt_epi32(__m512i, __mmask16, __m512i);
+VPOPCNTD __m512i _mm512_maskz_popcnt_epi32(__mmask16, __m512i);
+VPOPCNTB __m128i _mm_popcnt_epi8(__m128i);
+VPOPCNTB __m128i _mm_mask_popcnt_epi8(__m128i, __mmask16, __m128i);
+VPOPCNTB __m128i _mm_maskz_popcnt_epi8(__mmask16, __m128i);
+VPOPCNTB __m256i _mm256_popcnt_epi8(__m256i);
+VPOPCNTB __m256i _mm256_mask_popcnt_epi8(__m256i, __mmask32, __m256i);
+VPOPCNTB __m256i _mm256_maskz_popcnt_epi8(__mmask32, __m256i);
+VPOPCNTB __m512i _mm512_popcnt_epi8(__m512i);
+VPOPCNTB __m512i _mm512_mask_popcnt_epi8(__m512i, __mmask64, __m512i);
+VPOPCNTB __m512i _mm512_maskz_popcnt_epi8(__mmask64, __m512i);
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+See Table 2-49, “Type E4 Class Exception Conditions.”
