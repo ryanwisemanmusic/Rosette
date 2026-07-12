@@ -828,6 +828,16 @@ const perform_vreduceps = @import("PERFORM/VREDUCEPS.zig");
 const perform_vreducesd = @import("PERFORM/VREDUCESD.zig");
 const perform_vreducesh = @import("PERFORM/VREDUCESH.zig");
 const perform_vreducess = @import("PERFORM/VREDUCESS.zig");
+const permute_vperm2f128 = @import("PERMUTE/VPERM2F128.zig");
+const permute_vperm2i128 = @import("PERMUTE/VPERM2I128.zig");
+const permute_vpermb = @import("PERMUTE/VPERMB.zig");
+const permute_vpermd = @import("PERMUTE/VPERMD.zig");
+const permute_vpermw = @import("PERMUTE/VPERMW.zig");
+const permute_vpermilpd = @import("PERMUTE/VPERMILPD.zig");
+const permute_vpermilps = @import("PERMUTE/VPERMILPS.zig");
+const permute_vpermpd = @import("PERMUTE/VPERMPD.zig");
+const permute_vpermps = @import("PERMUTE/VPERMPS.zig");
+const permute_vpermq = @import("PERMUTE/VPERMQ.zig");
 const platform_pconfig = @import("PLATFORM/PCONFIG.zig");
 const prefetch_prefetchw = @import("PREFETCH/PREFETCHW.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/PREFETCHT0.zig");
@@ -1845,6 +1855,16 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(perform_vreducesd.family, perform_vreducesd.path, perform_vreducesd.source),
     mirror(perform_vreducesh.family, perform_vreducesh.path, perform_vreducesh.source),
     mirror(perform_vreducess.family, perform_vreducess.path, perform_vreducess.source),
+    mirror(permute_vperm2f128.family, permute_vperm2f128.path, permute_vperm2f128.source),
+    mirror(permute_vperm2i128.family, permute_vperm2i128.path, permute_vperm2i128.source),
+    mirror(permute_vpermb.family, permute_vpermb.path, permute_vpermb.source),
+    mirror(permute_vpermd.family, permute_vpermd.path, permute_vpermd.source),
+    mirror(permute_vpermw.family, permute_vpermw.path, permute_vpermw.source),
+    mirror(permute_vpermilpd.family, permute_vpermilpd.path, permute_vpermilpd.source),
+    mirror(permute_vpermilps.family, permute_vpermilps.path, permute_vpermilps.source),
+    mirror(permute_vpermpd.family, permute_vpermpd.path, permute_vpermpd.source),
+    mirror(permute_vpermps.family, permute_vpermps.path, permute_vpermps.source),
+    mirror(permute_vpermq.family, permute_vpermq.path, permute_vpermq.source),
     mirror(platform_pconfig.family, platform_pconfig.path, platform_pconfig.source),
     mirror(prefetch_prefetchw.family, prefetch_prefetchw.path, prefetch_prefetchw.source),
     mirror(prefetch_prefetcht0.family, prefetch_prefetcht0.path, prefetch_prefetcht0.source),
