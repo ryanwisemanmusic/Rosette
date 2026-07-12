@@ -864,6 +864,18 @@ const read_rdtscp = @import("READ/RDTSCP.zig");
 const release_tilerelease = @import("RELEASE/tilerelease.zig");
 const reset_hreset = @import("RESET/hreset.zig");
 const resume_rsm = @import("RESUME/rsm.zig");
+const ret_maxsd = @import("RET/MAXSD.zig");
+const ret_maxss = @import("RET/MAXSS.zig");
+const ret_minsd = @import("RET/MINSD.zig");
+const ret_minss = @import("RET/MINSS.zig");
+const ret_vmaxph = @import("RET/VMAXPH.zig");
+const ret_vmaxsh = @import("RET/VMAXSH.zig");
+const ret_vminph = @import("RET/VMINPH.zig");
+const ret_vminsh = @import("RET/VMINSH.zig");
+const ret_vpopcntb = @import("RET/VPOPCNTB.zig");
+const ret_vpopcntw = @import("RET/VPOPCNTW.zig");
+const ret_vpopcntd = @import("RET/VPOPCNTD.zig");
+const ret_vpopcntq = @import("RET/VPOPCNTQ.zig");
 const rpl_arpl = @import("RPL/arpl.zig");
 const select_vpmultishiftqb = @import("SELECT/vpmultishiftqb.zig");
 const send_senduipi = @import("SEND/senduipi.zig");
@@ -1818,6 +1830,18 @@ pub const specs = blk: {
         spec(release_tilerelease.meta),
         spec(reset_hreset.meta),
         spec(resume_rsm.meta),
+        spec(ret_maxsd.meta),
+        spec(ret_maxss.meta),
+        spec(ret_minsd.meta),
+        spec(ret_minss.meta),
+        spec(ret_vmaxph.meta),
+        spec(ret_vmaxsh.meta),
+        spec(ret_vminph.meta),
+        spec(ret_vminsh.meta),
+        spec(ret_vpopcntb.meta),
+        spec(ret_vpopcntw.meta),
+        spec(ret_vpopcntd.meta),
+        spec(ret_vpopcntq.meta),
         spec(rpl_arpl.meta),
         spec(select_vpmultishiftqb.meta),
         spec(send_senduipi.meta),
@@ -2784,6 +2808,18 @@ pub const proof_reports = [_]proofs.ProofReport{
     release_tilerelease.proof_report,
     reset_hreset.proof_report,
     resume_rsm.proof_report,
+    ret_maxsd.proof_report,
+    ret_maxss.proof_report,
+    ret_minsd.proof_report,
+    ret_minss.proof_report,
+    ret_vmaxph.proof_report,
+    ret_vmaxsh.proof_report,
+    ret_vminph.proof_report,
+    ret_vminsh.proof_report,
+    ret_vpopcntb.proof_report,
+    ret_vpopcntw.proof_report,
+    ret_vpopcntd.proof_report,
+    ret_vpopcntq.proof_report,
     rpl_arpl.proof_report,
     select_vpmultishiftqb.proof_report,
     send_senduipi.proof_report,

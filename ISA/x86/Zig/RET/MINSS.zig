@@ -1,0 +1,3 @@
+pub const family = "RET";
+pub const path = "RET/MINSS.inc";
+pub const source = @embedFile("../../RET/MINSS.inc");

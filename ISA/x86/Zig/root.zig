@@ -864,6 +864,18 @@ const read_rdtscp = @import("READ/RDTSCP.zig");
 const release_tilerelease = @import("RELEASE/TILERELEASE.zig");
 const reset_hreset = @import("RESET/HRESET.zig");
 const resume_rsm = @import("RESUME/RSM.zig");
+const ret_maxsd = @import("RET/MAXSD.zig");
+const ret_maxss = @import("RET/MAXSS.zig");
+const ret_minsd = @import("RET/MINSD.zig");
+const ret_minss = @import("RET/MINSS.zig");
+const ret_vmaxph = @import("RET/VMAXPH.zig");
+const ret_vmaxsh = @import("RET/VMAXSH.zig");
+const ret_vminph = @import("RET/VMINPH.zig");
+const ret_vminsh = @import("RET/VMINSH.zig");
+const ret_vpopcntb = @import("RET/VPOPCNTB.zig");
+const ret_vpopcntw = @import("RET/VPOPCNTW.zig");
+const ret_vpopcntd = @import("RET/VPOPCNTD.zig");
+const ret_vpopcntq = @import("RET/VPOPCNTQ.zig");
 const rpl_arpl = @import("RPL/ARPL.zig");
 const select_vpmultishiftqb = @import("SELECT/VPMULTISHIFTQB.zig");
 const send_senduipi = @import("SEND/SENDUIPI.zig");
@@ -2551,6 +2563,18 @@ pub const tables = [_]InstructionTable{
     entry(release_tilerelease.family, release_tilerelease.path, release_tilerelease.source),
     entry(reset_hreset.family, reset_hreset.path, reset_hreset.source),
     entry(resume_rsm.family, resume_rsm.path, resume_rsm.source),
+    entry(ret_maxsd.family, ret_maxsd.path, ret_maxsd.source),
+    entry(ret_maxss.family, ret_maxss.path, ret_maxss.source),
+    entry(ret_minsd.family, ret_minsd.path, ret_minsd.source),
+    entry(ret_minss.family, ret_minss.path, ret_minss.source),
+    entry(ret_vmaxph.family, ret_vmaxph.path, ret_vmaxph.source),
+    entry(ret_vmaxsh.family, ret_vmaxsh.path, ret_vmaxsh.source),
+    entry(ret_vminph.family, ret_vminph.path, ret_vminph.source),
+    entry(ret_vminsh.family, ret_vminsh.path, ret_vminsh.source),
+    entry(ret_vpopcntb.family, ret_vpopcntb.path, ret_vpopcntb.source),
+    entry(ret_vpopcntw.family, ret_vpopcntw.path, ret_vpopcntw.source),
+    entry(ret_vpopcntd.family, ret_vpopcntd.path, ret_vpopcntd.source),
+    entry(ret_vpopcntq.family, ret_vpopcntq.path, ret_vpopcntq.source),
     entry(rpl_arpl.family, rpl_arpl.path, rpl_arpl.source),
     entry(select_vpmultishiftqb.family, select_vpmultishiftqb.path, select_vpmultishiftqb.source),
     entry(send_senduipi.family, send_senduipi.path, send_senduipi.source),

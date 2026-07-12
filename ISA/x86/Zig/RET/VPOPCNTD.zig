@@ -1,0 +1,3 @@
+pub const family = "RET";
+pub const path = "RET/VPOPCNTD.inc";
+pub const source = @embedFile("../../RET/VPOPCNTD.inc");
