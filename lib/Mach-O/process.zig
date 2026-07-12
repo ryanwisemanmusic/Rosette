@@ -38,8 +38,6 @@ test {
     std.testing.refAllDecls(symbol_assembly_context);
 }
 
-extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
-
 const log = std.log.scoped(.macho);
 
 const Regs = x64_decoder.Regs;
@@ -88,6 +86,7 @@ const PAGE_WRITE: u8 = 1 << 1;
 const PAGE_EXECUTE: u8 = 1 << 2;
 const GUEST_SIGILL: u8 = 4;
 const SA_RESETHAND: u32 = 0x0004;
+const SA_NODEFER: u32 = 0x0010;
 const SA_SIGINFO: u32 = 0x0040;
 const GUEST_SIGNAL_ACTION_COUNT: usize = 32;
 const GUEST_SIGNAL_FRAME_DEPTH: usize = 8;
@@ -221,6 +220,7 @@ const BoundImportThunk = struct {
 
 const InternalCompatibilityTargets = struct {
     xenia_cpu_feature_detector_initialize_cpu_info: u64 = 0,
+    xenia_vulkan_provider_vulkan_device: u64 = 0,
     cxxopts_split_option_names: u64 = 0,
     parse_launch_arguments: u64 = 0,
     initialize_logging: u64 = 0,
@@ -528,6 +528,9 @@ pub const MachOState = struct {
         ) orelse 0;
         result.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info = result.metadata.symbolAddressWithPrefix(
             "__ZN2xe3cpu7backend3x6418CPUFeatureDetector17InitializeCPUInfoEv",
+        ) orelse 0;
+        result.internal_targets.xenia_vulkan_provider_vulkan_device = result.metadata.symbolAddressWithPrefix(
+            "__ZNK2xe2ui6vulkan14VulkanProvider13vulkan_deviceEv",
         ) orelse 0;
         result.internal_targets.parse_launch_arguments = result.metadata.symbolAddressWithPrefix(
             "__ZN4cvar20ParseLaunchArguments",
@@ -1164,7 +1167,12 @@ pub const MachOState = struct {
     }
 
     pub fn guestMapFile(self: *MachOState, address: u64, length: u64, prot: u32, flags: u32, host_fd: std.posix.fd_t, offset: u64) bool {
-        if (!self.sparse_memory.mapFile(address, length, prot, flags, host_fd, offset)) return false;
+        const map_fixed: u32 = 0x0010;
+        const mapped = if (flags & map_fixed != 0)
+            self.sparse_memory.mapFixed(address, length, prot, flags, host_fd, offset)
+        else
+            self.sparse_memory.mapFile(address, length, prot, flags, host_fd, offset);
+        if (!mapped) return false;
         _ = self.memory_regions.register(address, length, .{
             .read = prot & 1 != 0,
             .write = prot & 2 != 0,
@@ -1174,8 +1182,30 @@ pub const MachOState = struct {
         return true;
     }
 
+    pub fn guestReserveAddressSpace(self: *MachOState, length: u64) ?u64 {
+        const anon_private: u32 = 0x1000 | 0x2;
+        return self.guestReserveAddressSpaceWithBacking(length, anon_private, -1, 0);
+    }
+
+    pub fn guestReserveAddressSpaceWithBacking(self: *MachOState, length: u64, flags: u32, host_fd: std.posix.fd_t, offset: u64) ?u64 {
+        const address = self.sparse_memory.reserveAnywhereWithBacking(length, flags, host_fd, offset) orelse return null;
+        _ = self.memory_regions.register(address, length, .{ .read = false, .write = false }, .guest_mmap, "sparse guest address-space reservation", self.regs.rip);
+        _ = self.pointer_firewall.register(address, length, .{ .kind = .guest_backed, .may_dereference = false, .owner = "sparse guest address-space reservation" });
+        return address;
+    }
+
     pub fn guestUnmapFile(self: *MachOState, address: u64, length: u64) bool {
         return self.sparse_memory.unmap(address, length);
+    }
+
+    pub fn guestProtectSparseMemory(self: *MachOState, address: u64, length: u64, prot: u32) bool {
+        if (!self.sparse_memory.protect(address, length, prot)) return false;
+        _ = self.memory_regions.register(address, length, .{
+            .read = prot & 1 != 0,
+            .write = prot & 2 != 0,
+            .execute = prot & 4 != 0,
+        }, .guest_mmap, "sparse guest mprotect", self.regs.rip);
+        return true;
     }
 
     pub fn guestCString(self: *const MachOState, addr: u64, max_len: usize) ?[]const u8 {
@@ -1498,7 +1528,7 @@ pub const MachOState = struct {
                                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
                             }
                             self.terminated = true;
-                            std.debug.print("  [handled terminal import] {s}({d})\n", .{ imported.name, exit_code });
+                            std.debug.print("  [terminal import] {s} exit_code={d}\n", .{ imported.name, exit_code });
                         },
                     }
                 }
@@ -2238,7 +2268,11 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "__Unwind_Resume") or std.mem.eql(u8, name, "__Unwind_Resume_or_Rethrow")) {
             if (self.unwinder.resumePhaseTwo(self)) return .control_transferred;
-            std.debug.print("macho-processor: guest requested exception resume without an active phase-2 cleanup chain\n", .{});
+            if (self.recoverOrphanedPhaseTwoResume(name)) return .control_transferred;
+            std.debug.print(
+                "macho-processor: guest requested exception resume without a recoverable phase-2 cleanup chain: symbol={s} exception_arg=0x{x} rip=0x{x} rsp=0x{x} rbp=0x{x}\n",
+                .{ name, self.regs.rdi, self.regs.rip, self.regs.rsp, self.regs.rbp },
+            );
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         }
@@ -2411,7 +2445,9 @@ pub const MachOState = struct {
             return .{ .handled = now };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__16chrono12steady_clock3nowEv")) {
-            return .{ .handled = self.monotonic_nanoseconds };
+            const now = self.monotonic_nanoseconds;
+            self.monotonic_nanoseconds +%= 1_000_000;
+            return .{ .handled = now };
         }
 
         if (std.mem.eql(u8, name, "_open")) {
@@ -2432,27 +2468,14 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "_fstat$INODE64") or std.mem.eql(u8, name, "_fstat")) {
             return .{ .handled = self.fs_forwarder.fstat(self) };
         }
-        if (std.mem.eql(u8, name, "_ftruncate")) {
+        if (std.mem.eql(u8, name, "_ftruncate") or std.mem.eql(u8, name, "_ftruncate64")) {
             return .{ .handled = self.fs_forwarder.ftruncate(self) };
         }
         if (std.mem.eql(u8, name, "_shm_open")) {
-            if (self.verbose_trace) std.debug.print("    [import] shm_open(name=0x{x}, oflag=0x{x}, mode=0x{x})\n", .{ self.regs.rdi, self.regs.rsi, self.regs.rdx });
-            const path = self.guestCString(self.regs.rdi, 4096) orelse return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
-            var path_buffer = std.ArrayList(u8).empty;
-            defer path_buffer.deinit(self.allocator);
-            path_buffer.appendSlice(self.allocator, path) catch return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
-            path_buffer.append(self.allocator, 0) catch return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
-            const host_fd = shm_open(
-                @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
-                @as(c_int, @bitCast(@as(u32, @truncate(self.regs.rsi)))),
-                @as(std.c.mode_t, @intCast(self.regs.rdx & 0xFFFF)),
-            );
-            if (host_fd < 0) return .{ .handled = @bitCast(@as(i64, @as(c_int, host_fd))) };
-            const guest_fd = self.fs_forwarder.fd_manager.register(host_fd, .file) orelse {
-                _ = std.c.close(host_fd);
-                return .{ .handled = @as(u64, @bitCast(@as(i64, -1))) };
-            };
-            return .{ .handled = guest_fd };
+            return .{ .handled = self.fs_forwarder.shmOpen(self) };
+        }
+        if (std.mem.eql(u8, name, "_shm_unlink")) {
+            return .{ .handled = self.fs_forwarder.shmUnlink(self) };
         }
         if (std.mem.eql(u8, name, "_opendir$INODE64") or std.mem.eql(u8, name, "_opendir")) {
             return .{ .handled = self.fs_forwarder.opendir(self) };
@@ -2684,6 +2707,28 @@ pub const MachOState = struct {
 
         if (self.verbose_trace) std.debug.print("    [import] (unhandled) {s}\n", .{name});
         return .{ .unsupported = 0 };
+    }
+
+    fn recoverOrphanedPhaseTwoResume(self: *MachOState, symbol: []const u8) bool {
+        const thrown = self.cxx_exceptions.last_throw orelse {
+            self.unwinder.recordOrphanResume(false);
+            return false;
+        };
+        var inspection = self.unwinder.inspectThrow(self, thrown.type_info_address);
+        const tracked_header = if (thrown.allocation) |allocation| allocation.storage_address else thrown.object_address;
+        const exception_header = if (self.regs.rdi != 0) self.regs.rdi else tracked_header;
+        std.debug.print(
+            "macho-processor: Itanium orphan-resume recovery: symbol={s} supplied_exception=0x{x} tracked_exception=0x{x} frames={d} handler_found={}\n",
+            .{ symbol, self.regs.rdi, tracked_header, inspection.frame_count, inspection.handler != null },
+        );
+        if (!self.unwinder.installPhaseTwo(self, &inspection, exception_header)) {
+            self.unwinder.recordOrphanResume(false);
+            self.last_unwind_inspection = inspection;
+            return false;
+        }
+        self.unwinder.recordOrphanResume(true);
+        self.last_unwind_inspection = inspection;
+        return true;
     }
 
     fn dispatchLibcppLocale(self: *MachOState, name: []const u8) ?ImportHandlerResult {
@@ -3214,6 +3259,18 @@ pub const MachOState = struct {
             std.debug.print("macho-processor: guest ignored signal {d} at rip=0x{x}\n", .{ signal, fault_rip });
             return true;
         }
+        if (action.flags & SA_NODEFER == 0 and self.signalIsActive(signal)) {
+            // POSIX blocks the signal currently being handled unless
+            // SA_NODEFER is requested. Queueing is unnecessary for UD2: the
+            // outer handler already owns the exception and the nested trap is
+            // an assertion in that handler's diagnostic path.
+            self.regs.rip = fault_rip +% instruction_len;
+            std.debug.print(
+                "macho-processor: deferred recursive guest signal {d} at rip=0x{x}; outer handler remains active\n",
+                .{ signal, fault_rip },
+            );
+            return true;
+        }
         if (!self.isExecutableAddress(action.handler) or self.signal_frame_count >= self.signal_frames.len) return false;
 
         const frame = &self.signal_frames[self.signal_frame_count];
@@ -3251,6 +3308,13 @@ pub const MachOState = struct {
             .{ signal, action.handler, fault_rip, frame.siginfo, frame.ucontext },
         );
         return true;
+    }
+
+    fn signalIsActive(self: *const MachOState, signal: u8) bool {
+        for (self.signal_frames[0..self.signal_frame_count]) |frame| {
+            if (frame.signal == signal) return true;
+        }
+        return false;
     }
 
     fn ensureGuestSignalFrameStorage(self: *MachOState, frame: *GuestSignalFrame) bool {
@@ -4373,6 +4437,18 @@ pub const MachOState = struct {
             self.regs.rip == self.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info)
         {
             std.debug.print("macho-processor: modeled x64 CPU feature detection\n", .{});
+            self.regs.rip = self.pop();
+            return true;
+        }
+        // A presentation provider is intentionally absent when the guest's
+        // Vulkan probe finds no compatible surface. Let its caller observe a
+        // null device rather than dereferencing the absent provider as `this`.
+        if (self.internal_targets.xenia_vulkan_provider_vulkan_device != 0 and
+            self.regs.rip == self.internal_targets.xenia_vulkan_provider_vulkan_device and
+            self.regs.rdi == 0)
+        {
+            std.debug.print("macho-processor: Vulkan provider unavailable; returning null Vulkan device\n", .{});
+            self.regs.rax = 0;
             self.regs.rip = self.pop();
             return true;
         }
@@ -6495,6 +6571,16 @@ pub const MachOState = struct {
                 const converted: f64 = @floatFromInt(integer);
                 std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
             },
+            .vcvtss2sd => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                const source_bits = if (d.is_reg_form)
+                    std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
+                else
+                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
+                const converted: f64 = @floatCast(@as(f32, @bitCast(source_bits)));
+                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
+            },
             .vaddss, .vmulss, .vsubss, .vdivss => {
                 self.executeVexScalarF32(d, vexArithmeticForOp(d.op));
             },
@@ -6879,11 +6965,59 @@ pub const MachOState = struct {
                 const addr = arg1;
                 const length = arg2;
                 const prot = arg3;
+                const raw_flags: u32 = @truncate(arg4);
+                const map_flags: std.c.MAP = @bitCast(raw_flags);
+                const offset: i64 = @bitCast(arg6);
 
                 const alignment = PAGE_SIZE;
                 const aligned_length = ((length + alignment - 1) / alignment) * alignment;
 
+                if (length >= 1024 * 1024 * 1024) {
+                    std.debug.print(
+                        "macho-processor: large mmap entry: route=syscall addr=0x{x} length={d} aligned_length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} guest_fd=0x{x} offset={d}\n",
+                        .{ addr, length, aligned_length, prot, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS, arg5, offset },
+                    );
+                }
+
+                if (addr == 0 and prot == 0 and length >= 1024 * 1024 * 1024) {
+                    const host_fd: std.posix.fd_t = if (map_flags.ANONYMOUS)
+                        -1
+                    else
+                        self.fs_forwarder.fd_manager.hostFd(arg5) orelse {
+                            std.debug.print("macho-processor: large mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
+                            self.regs.rax = std.math.maxInt(u64);
+                            return;
+                        };
+                    const reserved = self.guestReserveAddressSpaceWithBacking(aligned_length, raw_flags, host_fd, @bitCast(offset)) orelse {
+                        std.debug.print("macho-processor: large mmap FAILED: route=syscall stage=sparse_reserve\n", .{});
+                        self.regs.rax = std.math.maxInt(u64);
+                        return;
+                    };
+                    std.debug.print("macho-processor: large mmap succeeded: route=syscall guest_base=0x{x} length={d}\n", .{ reserved, aligned_length });
+                    self.regs.rax = reserved;
+                    return;
+                }
+
+                if (addr != 0 and map_flags.FIXED) {
+                    const host_fd: std.posix.fd_t = if (map_flags.ANONYMOUS)
+                        -1
+                    else
+                        self.fs_forwarder.fd_manager.hostFd(arg5) orelse {
+                            std.debug.print("macho-processor: fixed mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
+                            self.regs.rax = std.math.maxInt(u64);
+                            return;
+                        };
+                    if (!self.guestMapFile(addr, aligned_length, @truncate(prot), raw_flags, host_fd, @bitCast(offset))) {
+                        std.debug.print("macho-processor: fixed mmap FAILED: route=syscall stage=sparse_map addr=0x{x} length={d}\n", .{ addr, aligned_length });
+                        self.regs.rax = std.math.maxInt(u64);
+                        return;
+                    }
+                    self.regs.rax = addr;
+                    return;
+                }
+
                 const mapped = if (addr != 0) addr else self.guestAlloc(aligned_length, alignment) orelse {
+                    std.debug.print("macho-processor: mmap FAILED: route=syscall stage=guest_heap length={d} alignment={d}\n", .{ aligned_length, alignment });
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
                 };
@@ -6908,7 +7042,13 @@ pub const MachOState = struct {
                 const address = arg1;
                 const length = ((arg2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
                 const prot = arg3;
+                if (self.guestProtectSparseMemory(address, length, @truncate(prot))) {
+                    std.debug.print("macho-processor: sparse mprotect succeeded: route=syscall address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
+                    self.regs.rax = 0;
+                    return;
+                }
                 if (mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address) == null) {
+                    std.debug.print("macho-processor: mprotect FAILED: route=syscall reason=address_not_mapped address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
                 }
@@ -6923,6 +7063,11 @@ pub const MachOState = struct {
             @intFromEnum(macho_runtime.Syscall.munmap) => {
                 const address = arg1;
                 const length = ((arg2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+                if (self.guestUnmapFile(address, length)) {
+                    std.debug.print("macho-processor: sparse munmap succeeded: route=syscall address=0x{x} length={d}\n", .{ address, length });
+                    self.regs.rax = 0;
+                    return;
+                }
                 self.setPagePermissions(address, length, 0);
                 _ = self.memory_regions.register(address, length, .{ .read = false, .write = false }, .guest_unmapped, "guest munmap", self.regs.rip);
                 self.regs.rax = 0;
@@ -8024,6 +8169,23 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode == 0x5A and !vector_256 and prefix == 2) {
+        var decoded = DecodedInsn{ .op = .vcvtss2sd, .size = .bits32 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if ((opcode == 0x2C or opcode == 0x2D) and !vector_256 and (prefix == 2 or prefix == 3) and (vex & 0x78) == 0x78) {
         var decoded = DecodedInsn{ .size = .bits32 };
         var pos = start_pos + 3;
@@ -8663,6 +8825,24 @@ fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode_map == 1 and opcode == 0x5A) {
+        if (rex_w or vector_256 or prefix != 2) return .{};
+        var decoded = DecodedInsn{ .op = .vcvtss2sd, .size = .bits32 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits32);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode_map == 1 and (opcode == 0x2C or opcode == 0x2D)) {
         if (vector_256 or (prefix != 2 and prefix != 3) or (vex_control & 0x78) != 0x78) return .{};
 
@@ -9025,6 +9205,14 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
 
     if (opcode2 == 0x0B) {
         d.op = .ud2;
+        d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
+    if (opcode2 == 0x18 or opcode2 == 0x0D) {
+        if (pos.* >= bytes.len) return .{};
+        _ = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits8);
+        d.op = .nop;
         d.len = @as(u8, @intCast(pos.*));
         return d;
     }
@@ -10796,6 +10984,24 @@ test "decode VEX signed integer scalar conversions" {
     try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, to_double.sib_base_reg);
 }
 
+test "decode VCVTSS2SD register and memory forms" {
+    const register = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x5A, 0xC1 });
+    try std.testing.expectEqual(Op.vcvtss2sd, register.op);
+    try std.testing.expectEqual(@as(u8, 0), register.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), register.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), register.xmm_src2);
+    try std.testing.expect(register.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), register.len);
+
+    const memory = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x7A, 0x5A, 0x48, 0x10 });
+    try std.testing.expectEqual(Op.vcvtss2sd, memory.op);
+    try std.testing.expectEqual(@as(u8, 1), memory.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), memory.xmm_src);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x10), memory.addr);
+}
+
 test "decode VEX scalar and packed arithmetic" {
     const boundary = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x58, 0xC0 });
     try std.testing.expectEqual(Op.vaddss, boundary.op);
@@ -11209,6 +11415,19 @@ test "decode compiler long NOP with segment override" {
     const decoded = decodeInsn(&[_]u8{ 0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0, 0, 0, 0 });
     try std.testing.expectEqual(Op.nop, decoded.op);
     try std.testing.expectEqual(@as(u8, 11), decoded.len);
+}
+
+test "decode prefetch memory hint as no-op" {
+    const prefetchnta = decodeInsn(&[_]u8{ 0x0F, 0x18, 0x00, 0x5D, 0xC3 });
+    try std.testing.expectEqual(Op.nop, prefetchnta.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, prefetchnta.sib_base_reg);
+    try std.testing.expectEqual(@as(u8, 3), prefetchnta.len);
+
+    const prefetchw = decodeInsn(&[_]u8{ 0x0F, 0x0D, 0x48, 0x20 });
+    try std.testing.expectEqual(Op.nop, prefetchw.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, prefetchw.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x20), prefetchw.addr);
+    try std.testing.expectEqual(@as(u8, 4), prefetchw.len);
 }
 
 test "decode C6 and C7 register immediate forms" {

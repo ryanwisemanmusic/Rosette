@@ -65,6 +65,8 @@ pub const ContractId = enum {
     libcxx_runtime_error_constructor,
     libcxx_runtime_error_what,
     libcxx_runtime_error_destructor,
+    libcxx_thread_detach,
+    libcxx_thread_destructor,
     posix_fileno,
     posix_isatty,
     corefoundation_cfstring_create_with_cstring,
@@ -178,6 +180,22 @@ pub const runtime_error_destructor = Contract{
     .effects = .{ .return_convention = .void, .writes_guest_memory = true },
 };
 
+pub const thread_detach = Contract{
+    .id = .libcxx_thread_detach,
+    .canonical_symbol = "_ZNSt3__16thread6detachEv",
+    .domain = .libcxx,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void },
+};
+
+pub const thread_destructor = Contract{
+    .id = .libcxx_thread_destructor,
+    .canonical_symbol = "_ZNSt3__16threadD1Ev",
+    .domain = .libcxx,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void },
+};
+
 pub const fileno = Contract{
     .id = .posix_fileno,
     .canonical_symbol = "fileno",
@@ -281,6 +299,14 @@ pub fn contractFor(symbol: []const u8) ?Contract {
     {
         return runtime_error_destructor;
     }
+    if (std.mem.eql(u8, normalized, thread_detach.canonical_symbol)) {
+        return thread_detach;
+    }
+    if (std.mem.eql(u8, normalized, thread_destructor.canonical_symbol) or
+        std.mem.eql(u8, normalized, "_ZNSt3__16threadD2Ev"))
+    {
+        return thread_destructor;
+    }
     if (std.mem.eql(u8, normalized, fileno.canonical_symbol)) {
         return fileno;
     }
@@ -360,6 +386,14 @@ pub fn dispatchContract(state: anytype, symbol: []const u8) ?ContractDispatch {
             .handled_void
         else
             .failed,
+        .libcxx_thread_detach => if (executeThreadDetach(state))
+            .handled_void
+        else
+            .failed,
+        .libcxx_thread_destructor => if (executeThreadDestructor(state))
+            .handled_void
+        else
+            .failed,
         .posix_fileno => if (executeFileno(state, state.regs.rdi))
             .{ .handled = state.regs.rax }
         else
@@ -417,6 +451,7 @@ pub fn classifyDomain(symbol: []const u8) Domain {
     if (std.mem.startsWith(u8, normalized, "pthread_") or
         std.mem.startsWith(u8, normalized, "open") or
         std.mem.startsWith(u8, normalized, "close") or
+        std.mem.startsWith(u8, normalized, "shm_") or
         std.mem.startsWith(u8, normalized, "stat") or
         std.mem.startsWith(u8, normalized, "fstat") or
         std.mem.startsWith(u8, normalized, "ftruncate") or
@@ -741,6 +776,20 @@ pub fn executeRuntimeErrorWhat(state: anytype, object: u64) ?u64 {
 pub fn executeRuntimeErrorDestructor(state: anytype, object: u64) bool {
     const object_bytes = state.guestMemory(object, 16) orelse return false;
     @memset(object_bytes, 0);
+    return true;
+}
+
+pub fn executeThreadDetach(state: anytype) bool {
+    // std::thread::detach() is a no-op in single-threaded execution
+    // The thread has already been dispatched via pthread runtime
+    _ = state;
+    return true;
+}
+
+pub fn executeThreadDestructor(state: anytype) bool {
+    // std::thread::~thread() destructor is a no-op in single-threaded execution
+    // If the thread was not joined, it's detached (which we handle as no-op)
+    _ = state;
     return true;
 }
 

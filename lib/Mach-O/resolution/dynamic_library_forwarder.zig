@@ -71,7 +71,35 @@ const GuestLibrary = struct {
 
 const GuestSymbolKind = enum {
     get_instance_proc_addr,
+    get_device_proc_addr,
+    enumerate_instance_extensions,
+    enumerate_instance_layers,
+    enumerate_instance_version,
+    create_instance,
     destroy_instance,
+    enumerate_physical_devices,
+    enumerate_device_extensions,
+    get_physical_device_features,
+    get_physical_device_format_properties,
+    get_physical_device_memory_properties,
+    get_physical_device_properties,
+    get_physical_device_queue_families,
+    get_physical_device_features2,
+    get_physical_device_memory_properties2,
+    get_physical_device_properties2,
+    create_device,
+    get_device_queue,
+    create_metal_surface,
+    destroy_surface,
+    get_surface_capabilities,
+    get_surface_formats,
+    get_surface_present_modes,
+    get_surface_support,
+    destroy_device,
+    create_device_object,
+    allocate_command_buffers,
+    allocate_descriptor_sets,
+    destroy_device_object,
     @"opaque",
 };
 
@@ -79,6 +107,9 @@ const GuestSymbol = struct {
     token: u64 = 0,
     library_token: u64 = 0,
     kind: GuestSymbolKind = .@"opaque",
+    name_length: u8 = 0,
+    name: [95]u8 = [_]u8{0} ** 95,
+    calls: u64 = 0,
 };
 
 pub const Forwarder = struct {
@@ -90,6 +121,9 @@ pub const Forwarder = struct {
     guest_close_count: u64 = 0,
     guest_lookup_count: u64 = 0,
     guest_thunk_calls: u64 = 0,
+    guest_proc_queries: u64 = 0,
+    guest_opaque_calls: u64 = 0,
+    next_vulkan_object: u64 = 0xFFFF_F500_0000_0001,
     considered: u64 = 0,
     forwarded: u64 = 0,
     rejected_not_allowlisted: u64 = 0,
@@ -113,16 +147,33 @@ pub const Forwarder = struct {
         var symbol_buffer: [512]u8 = undefined;
         const symbol_z = nulTerminate(&symbol_buffer, symbol) orelse return 0;
         _ = dlsym(library, symbol_z) orelse return 0;
-        const kind: GuestSymbolKind = if (std.mem.eql(u8, symbol, "vkGetInstanceProcAddr"))
-            .get_instance_proc_addr
-        else if (std.mem.eql(u8, symbol, "vkDestroyInstance"))
-            .destroy_instance
-        else
-            .@"opaque";
+        return self.allocateGuestSymbol(library_token, symbol);
+    }
+
+    fn lookupVulkanProcGuest(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
+        if (self.guestLibrary(library_token) == null) return 0;
+        self.guest_proc_queries +|= 1;
+        const token = self.allocateGuestSymbol(library_token, symbol);
+        std.debug.print(
+            "macho-processor: Vulkan proc query #{d}: {s} -> 0x{x} ({s})\n",
+            .{ self.guest_proc_queries, symbol, token, @tagName(guestSymbolKind(symbol)) },
+        );
+        return token;
+    }
+
+    fn allocateGuestSymbol(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
+        const kind = guestSymbolKind(symbol);
+        for (&self.guest_symbols) |*entry| {
+            if (entry.token == 0 or entry.library_token != library_token) continue;
+            if (entry.name_length != symbol.len) continue;
+            if (std.mem.eql(u8, entry.name[0..entry.name_length], symbol)) return entry.token;
+        }
         for (&self.guest_symbols, 0..) |*entry, index| {
             if (entry.token != 0) continue;
             const token = GUEST_SYMBOL_THUNK_BASE + @as(u64, @intCast(index)) * 16 + 1;
-            entry.* = .{ .token = token, .library_token = library_token, .kind = kind };
+            const name_length: u8 = @intCast(@min(symbol.len, entry.name.len));
+            entry.* = .{ .token = token, .library_token = library_token, .kind = kind, .name_length = name_length };
+            @memcpy(entry.name[0..name_length], symbol[0..name_length]);
             self.guest_lookup_count +|= 1;
             return token;
         }
@@ -134,26 +185,86 @@ pub const Forwarder = struct {
             if (entry.token != token) continue;
             if (self.guestLibrary(entry.library_token) == null) return false;
             self.guest_thunk_calls +|= 1;
+            entry.calls +|= 1;
             switch (entry.kind) {
-                .get_instance_proc_addr => {
+                .get_instance_proc_addr, .get_device_proc_addr => {
                     const symbol = state.guestCString(state.regs.rsi, 512) orelse {
                         state.regs.rax = 0;
                         return true;
                     };
-                    const result = self.lookupGuest(entry.library_token, symbol);
+                    const result = self.lookupVulkanProcGuest(entry.library_token, symbol);
                     if (result != 0) state.registerSyntheticThunk(result, 1, symbol);
                     state.regs.rax = result;
                 },
-                .destroy_instance => state.regs.rax = 0,
+                .enumerate_instance_extensions => state.regs.rax = enumerateInstanceExtensions(state),
+                .enumerate_instance_layers => state.regs.rax = enumerateEmpty(state, state.regs.rdi),
+                .enumerate_instance_version => state.regs.rax = writeApiVersion(state, state.regs.rdi),
+                .create_instance => state.regs.rax = createHandle(state, state.regs.rdx, 0xFFFF_F600_0000_0001),
+                .enumerate_physical_devices => state.regs.rax = enumerateHandle(state, state.regs.rsi, state.regs.rdx, 0xFFFF_F600_0000_0011),
+                .enumerate_device_extensions => state.regs.rax = enumerateDeviceExtensions(state),
+                .get_physical_device_features => writePhysicalDeviceFeatures(state, state.regs.rsi),
+                .get_physical_device_format_properties => writeFormatProperties(state, state.regs.rdx),
+                .get_physical_device_memory_properties => writeMemoryProperties(state, state.regs.rsi),
+                .get_physical_device_properties => writePhysicalDeviceProperties(state, state.regs.rsi),
+                .get_physical_device_queue_families => writeQueueFamilies(state),
+                .get_physical_device_features2 => writePhysicalDeviceFeatures2(state, state.regs.rsi),
+                .get_physical_device_memory_properties2 => writeMemoryProperties2(state, state.regs.rsi),
+                .get_physical_device_properties2 => writePhysicalDeviceProperties2(state, state.regs.rsi),
+                .create_device => state.regs.rax = createHandle(state, state.regs.rcx, 0xFFFF_F600_0000_0021),
+                .get_device_queue => {
+                    if (state.guestMemory(state.regs.rcx, 8) != null) state.write64(state.regs.rcx, 0xFFFF_F600_0000_0031);
+                    state.regs.rax = 0;
+                },
+                .create_metal_surface => state.regs.rax = createHandle(state, state.regs.rcx, 0xFFFF_F600_0000_0041),
+                .get_surface_capabilities => state.regs.rax = writeSurfaceCapabilities(state, state.regs.rdx),
+                .get_surface_formats => state.regs.rax = enumerateSurfaceFormats(state),
+                .get_surface_present_modes => state.regs.rax = enumerateSurfacePresentModes(state),
+                .get_surface_support => state.regs.rax = writeBoolResult(state, state.regs.rcx, true),
+                .destroy_instance, .destroy_surface, .destroy_device => state.regs.rax = 0,
+                .create_device_object => state.regs.rax = self.createVulkanObject(state, state.regs.rcx, entry.name[0..entry.name_length]),
+                .allocate_command_buffers => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 28, entry.name[0..entry.name_length]),
+                .allocate_descriptor_sets => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 24, entry.name[0..entry.name_length]),
+                .destroy_device_object => state.regs.rax = 0,
                 // A non-null lookup remains useful for capability discovery,
                 // but calling an untyped ARM64 function through x86 registers
                 // is unsafe. Keep it contained until its Vulkan ABI signature
                 // has an explicit bridge.
-                .@"opaque" => state.regs.rax = 0,
+                .@"opaque" => {
+                    self.guest_opaque_calls +|= 1;
+                    std.debug.print(
+                        "macho-processor: Vulkan ABI gap: called unmodeled proc {s} (token=0x{x}, call={d}); returning zero\n",
+                        .{ entry.name[0..entry.name_length], entry.token, entry.calls },
+                    );
+                    state.regs.rax = 0;
+                },
             }
             return true;
         }
         return false;
+    }
+
+    fn nextVulkanObject(self: *Forwarder) u64 {
+        const result = self.next_vulkan_object;
+        self.next_vulkan_object +%= 0x10;
+        return result;
+    }
+
+    fn createVulkanObject(self: *Forwarder, state: anytype, output: u64, name: []const u8) u64 {
+        if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
+        const handle = self.nextVulkanObject();
+        state.write64(output, handle);
+        std.debug.print("macho-processor: Vulkan object created: {s} handle=0x{x} output=0x{x}\n", .{ name, handle, output });
+        return 0;
+    }
+
+    fn allocateVulkanObjects(self: *Forwarder, state: anytype, info: u64, output: u64, count_offset: u64, name: []const u8) u64 {
+        if (info == 0 or state.guestMemoryConst(info + count_offset, 4) == null) return vkErrorInitializationFailed();
+        const count = state.read32(info + count_offset);
+        if (count == 0) return 0;
+        if (output == 0 or state.guestMemory(output, @as(u64, count) * 8) == null) return vkErrorInitializationFailed();
+        for (0..count) |index| state.write64(output + @as(u64, @intCast(index)) * 8, self.nextVulkanObject());
+        std.debug.print("macho-processor: Vulkan objects allocated: {s} count={d} output=0x{x}\n", .{ name, count, output });
+        return 0;
     }
 
     pub fn openGuest(self: *Forwarder, path: []const u8, mode: u64) u64 {
@@ -236,20 +347,32 @@ pub const Forwarder = struct {
 
     pub fn logSummary(self: *const Forwarder) void {
         std.debug.print(
-            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} guest_thunk_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d}\n",
+            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} proc_queries={d} guest_thunk_calls={d} opaque_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d}\n",
             .{
                 self.considered,
                 self.forwarded,
                 self.guest_open_count,
                 self.guest_close_count,
                 self.guest_lookup_count,
+                self.guest_proc_queries,
                 self.guest_thunk_calls,
+                self.guest_opaque_calls,
                 self.rejected_not_allowlisted,
                 self.rejected_library,
                 self.rejected_symbol,
                 self.rejected_guest_memory,
             },
         );
+        if (self.guest_proc_queries != 0) {
+            std.debug.print("macho-processor: Vulkan proc inventory:\n", .{});
+            for (&self.guest_symbols) |*entry| {
+                if (entry.token == 0) continue;
+                std.debug.print(
+                    "  token=0x{x} kind={s} calls={d} name={s}\n",
+                    .{ entry.token, @tagName(entry.kind), entry.calls, entry.name[0..entry.name_length] },
+                );
+            }
+        }
     }
 
     fn libraryHandle(self: *Forwarder, dylib: []const u8) ?*anyopaque {
@@ -329,6 +452,276 @@ pub const Forwarder = struct {
         };
     }
 };
+
+fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
+    if (std.mem.eql(u8, symbol, "vkGetInstanceProcAddr")) return .get_instance_proc_addr;
+    if (std.mem.eql(u8, symbol, "vkGetDeviceProcAddr")) return .get_device_proc_addr;
+    if (std.mem.eql(u8, symbol, "vkEnumerateInstanceExtensionProperties")) return .enumerate_instance_extensions;
+    if (std.mem.eql(u8, symbol, "vkEnumerateInstanceLayerProperties")) return .enumerate_instance_layers;
+    if (std.mem.eql(u8, symbol, "vkEnumerateInstanceVersion")) return .enumerate_instance_version;
+    if (std.mem.eql(u8, symbol, "vkCreateInstance")) return .create_instance;
+    if (std.mem.eql(u8, symbol, "vkDestroyInstance")) return .destroy_instance;
+    if (std.mem.eql(u8, symbol, "vkEnumeratePhysicalDevices")) return .enumerate_physical_devices;
+    if (std.mem.eql(u8, symbol, "vkEnumerateDeviceExtensionProperties")) return .enumerate_device_extensions;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceFeatures")) return .get_physical_device_features;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceFormatProperties")) return .get_physical_device_format_properties;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceMemoryProperties")) return .get_physical_device_memory_properties;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceProperties")) return .get_physical_device_properties;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceQueueFamilyProperties")) return .get_physical_device_queue_families;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceFeatures2KHR") or
+        std.mem.eql(u8, symbol, "vkGetPhysicalDeviceFeatures2")) return .get_physical_device_features2;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceMemoryProperties2KHR") or
+        std.mem.eql(u8, symbol, "vkGetPhysicalDeviceMemoryProperties2")) return .get_physical_device_memory_properties2;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceProperties2KHR") or
+        std.mem.eql(u8, symbol, "vkGetPhysicalDeviceProperties2")) return .get_physical_device_properties2;
+    if (std.mem.eql(u8, symbol, "vkCreateDevice")) return .create_device;
+    if (std.mem.eql(u8, symbol, "vkGetDeviceQueue")) return .get_device_queue;
+    if (std.mem.eql(u8, symbol, "vkCreateMetalSurfaceEXT")) return .create_metal_surface;
+    if (std.mem.eql(u8, symbol, "vkDestroySurfaceKHR")) return .destroy_surface;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) return .get_surface_capabilities;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceSurfaceFormatsKHR")) return .get_surface_formats;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceSurfacePresentModesKHR")) return .get_surface_present_modes;
+    if (std.mem.eql(u8, symbol, "vkGetPhysicalDeviceSurfaceSupportKHR")) return .get_surface_support;
+    if (std.mem.eql(u8, symbol, "vkDestroyDevice")) return .destroy_device;
+    const create_objects = [_][]const u8{
+        "vkCreateDescriptorSetLayout",
+        "vkCreatePipelineLayout",
+        "vkCreateShaderModule",
+        "vkCreateRenderPass",
+        "vkCreateSemaphore",
+        "vkCreateCommandPool",
+        "vkCreateDescriptorPool",
+    };
+    for (create_objects) |name| if (std.mem.eql(u8, symbol, name)) return .create_device_object;
+    if (std.mem.eql(u8, symbol, "vkAllocateCommandBuffers")) return .allocate_command_buffers;
+    if (std.mem.eql(u8, symbol, "vkAllocateDescriptorSets")) return .allocate_descriptor_sets;
+    const destroy_objects = [_][]const u8{
+        "vkDestroyDescriptorSetLayout",
+        "vkDestroyPipelineLayout",
+        "vkDestroyShaderModule",
+        "vkDestroyRenderPass",
+        "vkDestroySemaphore",
+        "vkDestroyCommandPool",
+        "vkDestroyDescriptorPool",
+        "vkFreeCommandBuffers",
+        "vkFreeDescriptorSets",
+    };
+    for (destroy_objects) |name| if (std.mem.eql(u8, symbol, name)) return .destroy_device_object;
+    return .@"opaque";
+}
+
+const extension_names = [_][]const u8{
+    "VK_KHR_surface",
+    "VK_EXT_metal_surface",
+    "VK_KHR_portability_enumeration",
+    "VK_KHR_get_physical_device_properties2",
+};
+
+fn enumerateInstanceExtensions(state: anytype) u64 {
+    const count_address = state.regs.rsi;
+    if (state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
+    if (state.regs.rdx == 0) {
+        state.write32(count_address, extension_names.len);
+        return 0;
+    }
+    const requested = state.read32(count_address);
+    const written: u32 = @min(requested, extension_names.len);
+    const properties_size: u64 = 260;
+    const bytes = state.guestMemory(state.regs.rdx, @as(u64, written) * properties_size) orelse return vkErrorInitializationFailed();
+    @memset(bytes, 0);
+    for (extension_names[0..written], 0..) |name, index| {
+        const offset = index * @as(usize, @intCast(properties_size));
+        @memcpy(bytes[offset..][0..name.len], name);
+        std.mem.writeInt(u32, bytes[offset + 256 ..][0..4], 1, .little);
+    }
+    state.write32(count_address, written);
+    return if (written < extension_names.len) 5 else 0; // VK_INCOMPLETE / VK_SUCCESS
+}
+
+fn enumerateEmpty(state: anytype, count_address: u64) u64 {
+    if (state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
+    state.write32(count_address, 0);
+    return 0;
+}
+
+fn writeApiVersion(state: anytype, output: u64) u64 {
+    if (state.guestMemory(output, 4) == null) return vkErrorInitializationFailed();
+    state.write32(output, 0x0040_2000); // Vulkan 1.2.0
+    return 0;
+}
+
+const device_extensions = [_][]const u8{
+    "VK_KHR_swapchain",
+    "VK_KHR_portability_subset",
+    "VK_KHR_maintenance1",
+};
+
+fn enumerateDeviceExtensions(state: anytype) u64 {
+    const count_address = state.regs.rdx;
+    if (state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
+    if (state.regs.rcx == 0) {
+        state.write32(count_address, device_extensions.len);
+        return 0;
+    }
+    const requested = state.read32(count_address);
+    const written: u32 = @min(requested, device_extensions.len);
+    const bytes = state.guestMemory(state.regs.rcx, @as(u64, written) * 260) orelse return vkErrorInitializationFailed();
+    @memset(bytes, 0);
+    for (device_extensions[0..written], 0..) |name, index| {
+        const offset = index * 260;
+        @memcpy(bytes[offset..][0..name.len], name);
+        std.mem.writeInt(u32, bytes[offset + 256 ..][0..4], 1, .little);
+    }
+    state.write32(count_address, written);
+    return if (written < device_extensions.len) 5 else 0;
+}
+
+fn writePhysicalDeviceFeatures(state: anytype, output: u64) void {
+    const bytes = state.guestMemory(output, 220) orelse return;
+    // Xenia requires independentBlend and uses many optional core features.
+    // Advertising the coherent virtual profile keeps feature selection
+    // deterministic; instruction semantics remain enforced by Rosette.
+    var offset: usize = 0;
+    while (offset < bytes.len) : (offset += 4) std.mem.writeInt(u32, bytes[offset..][0..4], 1, .little);
+}
+
+fn writeFormatProperties(state: anytype, output: u64) void {
+    const bytes = state.guestMemory(output, 12) orelse return;
+    std.mem.writeInt(u32, bytes[0..4], 0x0001_FFFF, .little);
+    std.mem.writeInt(u32, bytes[4..8], 0x0001_FFFF, .little);
+    std.mem.writeInt(u32, bytes[8..12], 0x0001_FFFF, .little);
+}
+
+fn writePhysicalDeviceProperties(state: anytype, output: u64) void {
+    // Populate the fixed identity prefix through pipelineCacheUUID. Limits
+    // and sparse properties remain guest-initialized instead of writing past
+    // the fields Rosette substantively models.
+    const bytes = state.guestMemory(output, 292) orelse return;
+    @memset(bytes, 0);
+    std.mem.writeInt(u32, bytes[0..4], 0x0040_2000, .little);
+    std.mem.writeInt(u32, bytes[4..8], 1, .little);
+    std.mem.writeInt(u32, bytes[8..12], 0x106B, .little); // Apple
+    std.mem.writeInt(u32, bytes[12..16], 1, .little);
+    std.mem.writeInt(u32, bytes[16..20], 2, .little); // discrete GPU profile
+    const name = "Rosette Vulkan Metal Adapter";
+    @memcpy(bytes[20..][0..name.len], name);
+}
+
+fn writeMemoryProperties(state: anytype, output: u64) void {
+    const bytes = state.guestMemory(output, 520) orelse return;
+    @memset(bytes, 0);
+    std.mem.writeInt(u32, bytes[0..4], 1, .little);
+    std.mem.writeInt(u32, bytes[4..8], 0x0000_000F, .little); // device-local, visible, coherent, cached
+    std.mem.writeInt(u32, bytes[8..12], 0, .little);
+    std.mem.writeInt(u32, bytes[260..264], 1, .little);
+    std.mem.writeInt(u64, bytes[264..272], 2 * 1024 * 1024 * 1024, .little);
+    std.mem.writeInt(u32, bytes[272..276], 1, .little);
+}
+
+fn writeQueueFamilies(state: anytype) void {
+    const count_address = state.regs.rsi;
+    if (state.guestMemory(count_address, 4) == null) return;
+    if (state.regs.rdx == 0) {
+        state.write32(count_address, 1);
+        return;
+    }
+    if (state.read32(count_address) == 0) return;
+    const bytes = state.guestMemory(state.regs.rdx, 24) orelse return;
+    @memset(bytes, 0);
+    std.mem.writeInt(u32, bytes[0..4], 0x7, .little); // graphics, compute, transfer
+    std.mem.writeInt(u32, bytes[4..8], 1, .little);
+    std.mem.writeInt(u32, bytes[8..12], 64, .little);
+    state.write32(count_address, 1);
+}
+
+fn writePhysicalDeviceFeatures2(state: anytype, output: u64) void {
+    writePhysicalDeviceFeatures(state, output + 16);
+}
+
+fn writeMemoryProperties2(state: anytype, output: u64) void {
+    writeMemoryProperties(state, output + 16);
+}
+
+fn writePhysicalDeviceProperties2(state: anytype, output: u64) void {
+    writePhysicalDeviceProperties(state, output + 16);
+}
+
+fn writeSurfaceCapabilities(state: anytype, output: u64) u64 {
+    const bytes = state.guestMemory(output, 52) orelse return vkErrorInitializationFailed();
+    @memset(bytes, 0);
+    std.mem.writeInt(u32, bytes[0..4], 2, .little);
+    std.mem.writeInt(u32, bytes[4..8], 3, .little);
+    std.mem.writeInt(u32, bytes[16..20], 1, .little);
+    std.mem.writeInt(u32, bytes[20..24], 16384, .little);
+    std.mem.writeInt(u32, bytes[24..28], 16384, .little);
+    std.mem.writeInt(u32, bytes[28..32], 1, .little);
+    std.mem.writeInt(u32, bytes[32..36], 1, .little);
+    std.mem.writeInt(u32, bytes[36..40], 1, .little);
+    std.mem.writeInt(u32, bytes[40..44], 1, .little);
+    std.mem.writeInt(u32, bytes[44..48], 0x1F, .little);
+    return 0;
+}
+
+fn enumerateSurfaceFormats(state: anytype) u64 {
+    if (state.guestMemory(state.regs.rdx, 4) == null) return vkErrorInitializationFailed();
+    if (state.regs.rcx == 0) {
+        state.write32(state.regs.rdx, 1);
+        return 0;
+    }
+    const bytes = state.guestMemory(state.regs.rcx, 8) orelse return vkErrorInitializationFailed();
+    std.mem.writeInt(u32, bytes[0..4], 44, .little); // VK_FORMAT_B8G8R8A8_UNORM
+    std.mem.writeInt(u32, bytes[4..8], 0, .little); // SRGB nonlinear
+    state.write32(state.regs.rdx, 1);
+    return 0;
+}
+
+fn enumerateSurfacePresentModes(state: anytype) u64 {
+    if (state.guestMemory(state.regs.rdx, 4) == null) return vkErrorInitializationFailed();
+    if (state.regs.rcx != 0 and state.read32(state.regs.rdx) != 0) state.write32(state.regs.rcx, 2); // FIFO
+    state.write32(state.regs.rdx, 1);
+    return 0;
+}
+
+fn writeBoolResult(state: anytype, output: u64, value: bool) u64 {
+    if (state.guestMemory(output, 4) == null) return vkErrorInitializationFailed();
+    state.write32(output, @intFromBool(value));
+    return 0;
+}
+
+fn createHandle(state: anytype, output: u64, handle: u64) u64 {
+    if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
+    state.write64(output, handle);
+    return 0;
+}
+
+fn enumerateHandle(state: anytype, count_address: u64, output: u64, handle: u64) u64 {
+    if (count_address == 0 or state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
+    if (output == 0) {
+        state.write32(count_address, 1);
+        return 0;
+    }
+    if (state.read32(count_address) == 0 or state.guestMemory(output, 8) == null) return 5;
+    state.write64(output, handle);
+    state.write32(count_address, 1);
+    return 0;
+}
+
+fn vkErrorInitializationFailed() u64 {
+    return @as(u32, @bitCast(@as(i32, -3)));
+}
+
+test "Vulkan guest symbol classification covers surface bootstrap" {
+    try std.testing.expectEqual(GuestSymbolKind.enumerate_instance_extensions, guestSymbolKind("vkEnumerateInstanceExtensionProperties"));
+    try std.testing.expectEqual(GuestSymbolKind.create_metal_surface, guestSymbolKind("vkCreateMetalSurfaceEXT"));
+    try std.testing.expectEqual(GuestSymbolKind.create_device, guestSymbolKind("vkCreateDevice"));
+    try std.testing.expectEqual(GuestSymbolKind.get_physical_device_features2, guestSymbolKind("vkGetPhysicalDeviceFeatures2"));
+    try std.testing.expectEqual(GuestSymbolKind.get_physical_device_features2, guestSymbolKind("vkGetPhysicalDeviceFeatures2KHR"));
+    try std.testing.expectEqual(GuestSymbolKind.get_physical_device_properties2, guestSymbolKind("vkGetPhysicalDeviceProperties2"));
+    try std.testing.expectEqual(GuestSymbolKind.get_physical_device_memory_properties2, guestSymbolKind("vkGetPhysicalDeviceMemoryProperties2"));
+    try std.testing.expectEqual(GuestSymbolKind.create_device_object, guestSymbolKind("vkCreateDescriptorSetLayout"));
+    try std.testing.expectEqual(GuestSymbolKind.allocate_command_buffers, guestSymbolKind("vkAllocateCommandBuffers"));
+    try std.testing.expectEqual(GuestSymbolKind.destroy_device_object, guestSymbolKind("vkDestroyShaderModule"));
+}
 
 fn normalizeMachOSymbol(symbol: []const u8) []const u8 {
     if (symbol.len != 0 and symbol[0] == '_') return symbol[1..];

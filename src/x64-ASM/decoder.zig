@@ -769,6 +769,7 @@ pub const Op = enum(u16) {
     vcvtsi2ss_xmm_mem,
     vcvtsi2sd_xmm_reg,
     vcvtsi2sd_xmm_mem,
+    vcvtss2sd,
     vaddss,
     vaddsd,
     vaddps,

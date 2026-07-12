@@ -122,6 +122,25 @@ pub const Model = struct {
         return true;
     }
 
+    pub fn initializeStreamBase(self: *Model, state: anytype, kind: Kind, object: u64) bool {
+        if (kind != .basic_istream and kind != .basic_ostream and kind != .basic_iostream) return false;
+        if (state.guestMemory(object, @sizeOf(u64)) == null) return false;
+        const record = self.ensureType(state, kind, 0) orelse return false;
+        state.write64(object, record.vtable);
+        self.markObject(state, object, @sizeOf(u64), kind);
+        self.objects_initialized +|= 1;
+        return true;
+    }
+
+    pub fn initializeStreambufBase(self: *Model, state: anytype, object: u64) bool {
+        if (state.guestMemory(object, @sizeOf(u64)) == null) return false;
+        const record = self.ensureType(state, .basic_streambuf, null) orelse return false;
+        state.write64(object, record.vtable);
+        self.markObject(state, object, @sizeOf(u64), .basic_streambuf);
+        self.objects_initialized +|= 1;
+        return true;
+    }
+
     pub fn initializeIfstream(self: *Model, state: anytype, object: u64) bool {
         if (state.guestMemory(object, IFSTREAM_SIZE) == null) return false;
         const ifstream = self.ensureType(state, .basic_ifstream, @intCast(BASIC_IOS_OFFSET_IN_IFSTREAM)) orelse return false;

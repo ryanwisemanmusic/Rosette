@@ -2,6 +2,9 @@ const std = @import("std");
 const path_translation = @import("path_translation.zig");
 const fd_management = @import("fd_management.zig");
 
+extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
+extern "c" fn shm_unlink(name: [*:0]const u8) c_int;
+
 pub const Forwarder = struct {
     translator: path_translation.Translator,
     fd_manager: fd_management.Manager,
@@ -10,6 +13,9 @@ pub const Forwarder = struct {
     write_count: u64 = 0,
     close_count: u64 = 0,
     mmap_count: u64 = 0,
+    shm_open_count: u64 = 0,
+    shm_fallback_count: u64 = 0,
+    ftruncate_count: u64 = 0,
     stat_count: u64 = 0,
     seek_count: u64 = 0,
     access_count: u64 = 0,
@@ -455,10 +461,114 @@ pub const Forwarder = struct {
     }
 
     pub fn ftruncate(self: *Forwarder, state: anytype) u64 {
+        self.ftruncate_count += 1;
         const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return self.fail(state, .BADF);
         const rc = std.c.ftruncate(host_fd, @bitCast(state.regs.rsi));
-        if (rc != 0) return self.failHost(state, rc);
-        std.debug.print("macho-processor: fs ftruncate: guest_fd={d} host_fd={d} length={d}\n", .{ state.regs.rdi, host_fd, state.regs.rsi });
+        if (rc != 0) {
+            const err = std.c.errno(rc);
+            std.debug.print(
+                "macho-processor: fs ftruncate FAILED: guest_fd={d} host_fd={d} length={d} errno={s}\n",
+                .{ state.regs.rdi, host_fd, state.regs.rsi, @tagName(err) },
+            );
+            return self.fail(state, err);
+        }
+        std.debug.print("macho-processor: fs ftruncate #{d}: guest_fd={d} host_fd={d} length={d}\n", .{ self.ftruncate_count, state.regs.rdi, host_fd, state.regs.rsi });
+        return 0;
+    }
+
+    pub fn shmOpen(self: *Forwarder, state: anytype) u64 {
+        self.shm_open_count += 1;
+        const path = state.guestCString(state.regs.rdi, 4096) orelse return self.fail(state, .FAULT);
+        var path_buffer = std.ArrayList(u8).empty;
+        defer path_buffer.deinit(self.translator.allocator);
+        path_buffer.appendSlice(self.translator.allocator, path) catch return self.fail(state, .NOMEM);
+        path_buffer.append(self.translator.allocator, 0) catch return self.fail(state, .NOMEM);
+
+        const oflag: c_int = @as(c_int, @bitCast(@as(u32, @truncate(state.regs.rsi))));
+        const oflag_bits: std.c.O = @bitCast(@as(u32, @bitCast(oflag)));
+        const mode: std.c.mode_t = @as(std.c.mode_t, @intCast(state.regs.rdx & 0xFFFF));
+        const c_path = @as([*:0]const u8, @ptrCast(path_buffer.items.ptr));
+        var host_fd = shm_open(c_path, oflag, mode);
+        if (host_fd < 0) {
+            const err = std.c.errno(host_fd);
+            std.debug.print(
+                "macho-processor: shm_open FAILED #{d}: name={s} oflag=0x{x} mode=0{o} errno={s}\n",
+                .{ self.shm_open_count, path, @as(u32, @bitCast(oflag)), mode, @tagName(err) },
+            );
+            if (oflag_bits.CREAT) {
+                _ = shm_unlink(c_path);
+                host_fd = shm_open(c_path, oflag, mode);
+                if (host_fd >= 0) {
+                    std.debug.print(
+                        "macho-processor: shm_open recovered after unlink: name={s} -> host_fd={d}\n",
+                        .{ path, host_fd },
+                    );
+                } else {
+                    const retry_err = std.c.errno(host_fd);
+                    std.debug.print(
+                        "macho-processor: shm_open retry FAILED: name={s} errno={s}; trying temp-backed shared memory\n",
+                        .{ path, @tagName(retry_err) },
+                    );
+                    host_fd = self.createTempBackedSharedMemory(path) orelse return self.fail(state, retry_err);
+                }
+            } else {
+                return self.fail(state, err);
+            }
+        }
+        const guest_fd = self.fd_manager.register(host_fd, .shared_memory) orelse {
+            _ = std.c.close(host_fd);
+            return self.fail(state, .NOMEM);
+        };
+        std.debug.print(
+            "macho-processor: shm_open #{d}: name={s} oflag=0x{x} mode=0{o} -> guest_fd={d} host_fd={d}\n",
+            .{ self.shm_open_count, path, @as(u32, @bitCast(oflag)), mode, guest_fd, host_fd },
+        );
+        return guest_fd;
+    }
+
+    fn createTempBackedSharedMemory(self: *Forwarder, guest_name: []const u8) ?c_int {
+        self.shm_fallback_count += 1;
+        var path_buffer: [256]u8 = undefined;
+        const temp_path = std.fmt.bufPrintZ(
+            &path_buffer,
+            "/private/tmp/rosette-shm-{d}-{d}.tmp",
+            .{ std.c.getpid(), self.shm_fallback_count },
+        ) catch return null;
+        const flags = std.c.O{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .EXCL = true,
+            .CLOEXEC = true,
+        };
+        const host_fd = std.c.open(temp_path, flags, @as(std.c.mode_t, 0o600));
+        if (host_fd < 0) {
+            std.debug.print(
+                "macho-processor: temp-backed shm FAILED: guest_name={s} path={s} errno={s}\n",
+                .{ guest_name, temp_path, @tagName(std.c.errno(host_fd)) },
+            );
+            return null;
+        }
+        _ = std.c.unlink(temp_path);
+        std.debug.print(
+            "macho-processor: temp-backed shm #{d}: guest_name={s} path={s} host_fd={d} unlinked=true\n",
+            .{ self.shm_fallback_count, guest_name, temp_path, host_fd },
+        );
+        return host_fd;
+    }
+
+    pub fn shmUnlink(self: *Forwarder, state: anytype) u64 {
+        const path = state.guestCString(state.regs.rdi, 4096) orelse return self.fail(state, .FAULT);
+        var path_buffer = std.ArrayList(u8).empty;
+        defer path_buffer.deinit(self.translator.allocator);
+        path_buffer.appendSlice(self.translator.allocator, path) catch return self.fail(state, .NOMEM);
+        path_buffer.append(self.translator.allocator, 0) catch return self.fail(state, .NOMEM);
+        const rc = shm_unlink(@as([*:0]const u8, @ptrCast(path_buffer.items.ptr)));
+        if (rc != 0) {
+            const err = std.c.errno(rc);
+            std.debug.print("macho-processor: shm_unlink FAILED: name={s} errno={s}\n", .{ path, @tagName(err) });
+            return self.fail(state, err);
+        }
+        std.debug.print("macho-processor: shm_unlink: name={s}\n", .{path});
         return 0;
     }
 
@@ -536,6 +646,12 @@ pub const Forwarder = struct {
         const offset: i64 = @bitCast(state.regs.r9);
         if (length == 0) return @bitCast(@as(i64, -1));
         const map_flags: std.c.MAP = @bitCast(raw_flags);
+        if (length >= 1024 * 1024 * 1024) {
+            std.debug.print(
+                "macho-processor: large mmap entry: route=import addr=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} guest_fd=0x{x} offset={d}\n",
+                .{ state.regs.rdi, length, state.regs.rdx, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS, state.regs.r8, offset },
+            );
+        }
         if (state.regs.rdi != 0 and map_flags.FIXED) {
             // Anonymous mappings deliberately use fd=-1. Do not pass that
             // sentinel through the guest descriptor table: the sparse-memory
@@ -545,11 +661,26 @@ pub const Forwarder = struct {
                 -1
             else
                 self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
-            if (state.regs.rdi % (64 * 1024) != 0) return @bitCast(@as(i64, -1));
+            if (state.regs.rdi % std.heap.page_size_min != 0) return @bitCast(@as(i64, -1));
             return if (state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset)))
                 state.regs.rdi
             else
                 @bitCast(@as(i64, -1));
+        }
+        // Xenia reserves its 32-bit guest address space with a non-fixed,
+        // anonymous PROT_NONE mmap.  This is virtual address space, not a 4 GiB
+        // physical allocation, and must not be served by the bounded guest heap.
+        if (state.regs.rdx == 0 and length >= 1024 * 1024 * 1024) {
+            const host_fd: std.posix.fd_t = if (map_flags.ANONYMOUS)
+                -1
+            else
+                self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
+            const reserved = state.guestReserveAddressSpaceWithBacking(length, raw_flags, host_fd, @bitCast(offset)) orelse {
+                std.debug.print("macho-processor: large mmap FAILED: route=import stage=sparse_reserve\n", .{});
+                return @bitCast(@as(i64, -1));
+            };
+            std.debug.print("macho-processor: large mmap succeeded: route=import guest_base=0x{x} length={d}\n", .{ reserved, length });
+            return reserved;
         }
         const mapped = state.guestHeapAllocate(length, 4096) orelse return @bitCast(@as(i64, -1));
         const destination = state.guestMemory(mapped, length) orelse {
@@ -581,12 +712,13 @@ pub const Forwarder = struct {
 
     pub fn mprotect(self: *Forwarder, state: anytype) u64 {
         _ = self;
+        if (state.guestProtectSparseMemory(state.regs.rdi, state.regs.rsi, @truncate(state.regs.rdx))) return 0;
         return if (state.guestMemory(state.regs.rdi, state.regs.rsi) != null) 0 else @bitCast(@as(i64, -1));
     }
 
     pub fn logSummary(self: *const Forwarder) void {
         std.debug.print(
-            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} access={d} errno_updates={d} last_errno={d}\n",
+            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} shm_open={d} shm_fallback={d} ftruncate={d} access={d} errno_updates={d} last_errno={d}\n",
             .{
                 self.open_count,
                 self.read_count,
@@ -596,6 +728,9 @@ pub const Forwarder = struct {
                 self.stat_count,
                 self.directory_read_count,
                 self.mmap_count,
+                self.shm_open_count,
+                self.shm_fallback_count,
+                self.ftruncate_count,
                 self.access_count,
                 self.errno_updates,
                 self.last_errno,
@@ -719,4 +854,15 @@ test "directory descriptors remain virtual and fstatat propagates ENOENT" {
     state.regs.rcx = std.c.AT.SYMLINK_NOFOLLOW;
     try std.testing.expectEqual(std.math.maxInt(u64), forwarder.fstatat(&state));
     try std.testing.expectEqual(@as(c_int, @intFromEnum(std.c.E.NOENT)), state.guest_errno);
+}
+
+test "temp-backed shared memory fallback produces truncatable fd" {
+    var forwarder = Forwarder.init(std.testing.allocator);
+    defer forwarder.deinit();
+
+    const host_fd = forwarder.createTempBackedSharedMemory("/rosette-test-shm") orelse return error.TestUnexpectedResult;
+    defer _ = std.c.close(host_fd);
+
+    try std.testing.expect(host_fd >= fd_management.STREAM_FD_COUNT);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.ftruncate(host_fd, 64 * 1024));
 }

@@ -10,6 +10,7 @@ pub const FdKind = enum {
     directory,
     pipe,
     socket,
+    shared_memory,
     unknown,
 };
 

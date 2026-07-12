@@ -129,6 +129,11 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "_pthread_cond_wait")) {
             return .{ .handled = self.condvarWait(state) };
         }
+        if (std.mem.eql(u8, name, "_pthread_cond_timedwait") or
+            std.mem.eql(u8, name, "_pthread_cond_timedwait_relative_np"))
+        {
+            return .{ .handled = self.condvarWait(state) };
+        }
         return null;
     }
 

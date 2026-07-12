@@ -504,7 +504,32 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
         }
     }
 
-    std.debug.print("[INSTALL] Step 12: Building shell snippet\n", .{});
+    if (source_root.len != 0) {
+        std.debug.print("[INSTALL] Step 11b: Running system memory optimization\n", .{});
+        const memory_setup_script = std.fs.path.join(allocator, &.{ source_root, "include", "scripts", "optimize-memory.sh" }) catch unreachable;
+        if (fileExists(allocator, memory_setup_script)) {
+            std.debug.print("[INSTALL] Running memory optimization script: {s}\n", .{memory_setup_script});
+            const result: ?std.process.RunResult = std.process.run(allocator, init.io, .{
+                .argv = &.{ "/bin/bash", memory_setup_script },
+            }) catch |err| blk: {
+                std.debug.print("[INSTALL] WARNING: Failed to execute memory optimization script: {s}\n", .{@errorName(err)});
+                std.debug.print("[INSTALL] Memory optimization will need to be run manually\n", .{});
+                break :blk null;
+            };
+            defer if (result) |r| {
+                allocator.free(r.stdout);
+                allocator.free(r.stderr);
+            };
+            if (result) |r| {
+                std.debug.print("[INSTALL] Memory optimization completed: {any}\n", .{r.term});
+            }
+        } else {
+            std.debug.print("[INSTALL] Memory optimization script not found at: {s}\n", .{memory_setup_script});
+            std.debug.print("[INSTALL] Skipping memory optimization step\n", .{});
+        }
+    }
+
+    std.debug.print("[INSTALL] Step 13: Building shell snippet\n", .{});
     const snippet = buildShellSnippet(
         allocator,
         helper_path,
@@ -523,7 +548,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     };
     std.debug.print("[INSTALL] Wrote shell snippet: {s}\n", .{shell_path});
 
-    std.debug.print("[INSTALL] Step 13: Building bash env snippet\n", .{});
+    std.debug.print("[INSTALL] Step 14: Building bash env snippet\n", .{});
     const bash_env_snippet = buildBashEnvSnippet(allocator, helper_path) catch |err| {
         std.debug.print("[INSTALL] ERROR: Failed to build bash env snippet: {s}\n", .{@errorName(err)});
         return err;
@@ -537,7 +562,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     };
     std.debug.print("[INSTALL] Wrote bash env snippet: {s}\n", .{bash_env_path});
 
-    std.debug.print("[INSTALL] Step 14: Installing profile blocks\n", .{});
+    std.debug.print("[INSTALL] Step 15: Installing profile blocks\n", .{});
     const block = buildProfileBlock(allocator) catch |err| {
         std.debug.print("[INSTALL] ERROR: Failed to build profile block: {s}\n", .{@errorName(err)});
         return err;
@@ -549,7 +574,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     std.debug.print("[INSTALL] Installed profile blocks in home: {s}\n", .{home});
 
     if (source_root.len != 0) {
-        std.debug.print("[INSTALL] Step 15: Writing source-root config\n", .{});
+        std.debug.print("[INSTALL] Step 16: Writing source-root config\n", .{});
         const config_path = std.fs.path.join(allocator, &.{ rosette_dir, "source-root" }) catch |err| {
             std.debug.print("[INSTALL] WARNING: Failed to build source-root config path: {s}\n", .{@errorName(err)});
             return;
@@ -564,7 +589,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
         std.debug.print("[INSTALL] Wrote source-root: {s}\n", .{config_path});
     }
 
-    std.debug.print("[INSTALL] Step 16: Printing installation summary\n", .{});
+    std.debug.print("[INSTALL] Step 17: Printing installation summary\n", .{});
     std.debug.print("Rosette shell integration installed.\n", .{});
     std.debug.print("source: {s}\n", .{shell_path});
     std.debug.print("command: {s}\n", .{rosette_path});

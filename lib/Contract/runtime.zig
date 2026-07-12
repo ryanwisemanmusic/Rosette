@@ -480,7 +480,24 @@ pub const FileIoContracts = struct {
                 .description = "Resize an open file",
                 .kind = .posix_file_io,
                 .strategy = .forward_to_host,
-                .matches = &.{MatchPattern{ .exact = "_ftruncate" }},
+                .matches = &.{
+                    MatchPattern{ .exact = "_ftruncate" },
+                    MatchPattern{ .exact = "_ftruncate64" },
+                },
+            },
+            Contract{
+                .name = "shm_open",
+                .description = "Open POSIX shared memory object",
+                .kind = .posix_file_io,
+                .strategy = .forward_to_host,
+                .matches = &.{MatchPattern{ .exact = "_shm_open" }},
+            },
+            Contract{
+                .name = "shm_unlink",
+                .description = "Unlink POSIX shared memory object",
+                .kind = .posix_file_io,
+                .strategy = .forward_to_host,
+                .matches = &.{MatchPattern{ .exact = "_shm_unlink" }},
             },
             Contract{
                 .name = "opendir",

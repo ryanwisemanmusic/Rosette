@@ -48,6 +48,7 @@ pub const Engine = struct {
 
     compact: ?compact_unwind.Index = null,
     active_phase_two: ?ActivePhaseTwo = null,
+    phase_two_checkpoint: ?ActivePhaseTwo = null,
     verbose: bool = false,
     inspections: u64 = 0,
     frames_walked: u64 = 0,
@@ -56,6 +57,8 @@ pub const Engine = struct {
     phase_two_installs: u64 = 0,
     cleanup_installs: u64 = 0,
     resume_calls: u64 = 0,
+    orphan_resume_attempts: u64 = 0,
+    orphan_resume_recoveries: u64 = 0,
 
     pub fn configure(self: *Engine, metadata: anytype) void {
         const section = metadata.sectionNamed("__TEXT", "__unwind_info") orelse return;
@@ -202,6 +205,7 @@ pub const Engine = struct {
             .exception_header = exception_header,
             .next_frame = 0,
         };
+        self.phase_two_checkpoint = self.active_phase_two;
         if (!self.installNextPhaseTwoTarget(state)) {
             self.active_phase_two = null;
             inspection.phase_two_supported = false;
@@ -212,16 +216,32 @@ pub const Engine = struct {
     }
 
     pub fn resumePhaseTwo(self: *Engine, state: anytype) bool {
-        if (self.active_phase_two == null) return false;
+        if (self.active_phase_two == null) {
+            const checkpoint = self.phase_two_checkpoint orelse return false;
+            const handler = checkpoint.inspection.handler orelse return false;
+            // A cursor beyond the handler means phase two completed normally;
+            // reinstalling that handler would duplicate catch side effects.
+            if (checkpoint.next_frame > handler.frame_index) return false;
+            self.active_phase_two = checkpoint;
+            std.debug.print(
+                "macho-processor: Itanium phase-2 transaction restored from checkpoint: next_frame={d} exception=0x{x}\n",
+                .{ checkpoint.next_frame, checkpoint.exception_header },
+            );
+        }
         self.resume_calls +|= 1;
         return self.installNextPhaseTwoTarget(state);
+    }
+
+    pub fn recordOrphanResume(self: *Engine, recovered: bool) void {
+        self.orphan_resume_attempts +|= 1;
+        if (recovered) self.orphan_resume_recoveries +|= 1;
     }
 
     pub fn logSummary(self: *const Engine) void {
         if (self.inspections == 0 and self.compact == null) return;
         std.debug.print(
-            "macho-processor: Itanium unwind summary: metadata={} inspections={d} frames={d} handlers={d} phase_two={d}/{d} cleanups={d} resumes={d}\n",
-            .{ self.compact != null, self.inspections, self.frames_walked, self.handlers_found, self.phase_two_installs, self.phase_two_attempts, self.cleanup_installs, self.resume_calls },
+            "macho-processor: Itanium unwind summary: metadata={} inspections={d} frames={d} handlers={d} phase_two={d}/{d} cleanups={d} resumes={d} orphan_resume_recovered={d}/{d}\n",
+            .{ self.compact != null, self.inspections, self.frames_walked, self.handlers_found, self.phase_two_installs, self.phase_two_attempts, self.cleanup_installs, self.resume_calls, self.orphan_resume_recoveries, self.orphan_resume_attempts },
         );
     }
 
@@ -268,6 +288,7 @@ pub const Engine = struct {
         while (active.next_frame < handler.frame_index) {
             const index = active.next_frame;
             active.next_frame += 1;
+            self.phase_two_checkpoint = active.*;
             const frame = active.inspection.frames[index];
             if (frame.cleanup_landing_pad == 0) continue;
             if (!installContext(state, frame, frame.cleanup_landing_pad, 0, active.exception_header)) return false;
@@ -281,6 +302,8 @@ pub const Engine = struct {
 
         const handler_frame = active.inspection.frames[handler.frame_index];
         if (!installContext(state, handler_frame, handler.landing_pad, handler.selector, active.exception_header)) return false;
+        active.next_frame = handler.frame_index + 1;
+        self.phase_two_checkpoint = active.*;
         self.phase_two_installs +|= 1;
         std.debug.print(
             "macho-processor: Itanium phase-2 handler installed: frame={d} landing_pad=0x{x} selector={d} rbp=0x{x} rsp=0x{x} exception=0x{x}\n",
@@ -458,7 +481,7 @@ fn logLsdaCallSitesForFrame(
                         if ((type_encoding & DW_EH_PE_INDIRECT) != 0 and ct != 0) ct = state.read64(ct);
                         const catch_name = if (ct != 0) (state.guestCString(state.read64(ct +| 8), 256) orelse "<unreadable>") else "<catch_all>";
                         const thrown_name = if (thrown_type != 0) (state.guestCString(state.read64(thrown_type +| 8), 256) orelse "<unreadable>") else "<none>";
-                        const compatible = if (ct != 0) itanium_dynamic_cast.isCatchCompatible(state, thrown_type, ct) else false;
+                        const compatible = ct == 0 or itanium_dynamic_cast.isCatchCompatible(state, thrown_type, ct);
                         std.debug.print(
                             "macho-processor:   [LSDA]   catch type_filter={d} catch_type=0x{x} ({s}) thrown=0x{x} ({s}) compatible={}\n",
                             .{ tf, ct, catch_name, thrown_type, thrown_name, compatible },
@@ -740,6 +763,61 @@ test "phase two installs the frame-walk call-site stack context" {
     try std.testing.expectEqual(@as(u64, 0x1234), state.regs.rip);
     try std.testing.expectEqual(@as(u64, 0xBBBB), state.regs.rbx);
     try std.testing.expectEqual(@as(u64, 0xEEEE), state.regs.r14);
+}
+
+test "phase two resumes from retained cleanup checkpoint" {
+    const FakeState = struct {
+        const Registers = struct {
+            rbp: u64 = 0,
+            rsp: u64 = 0,
+            rax: u64 = 0,
+            rdx: u64 = 0,
+            rip: u64 = 0,
+            rbx: u64 = 0,
+            r12: u64 = 0,
+            r13: u64 = 0,
+            r14: u64 = 0,
+            r15: u64 = 0,
+        };
+        regs: Registers = .{},
+        memory: [64]u8 = [_]u8{0} ** 64,
+
+        fn guestMemoryConst(self: *@This(), address: u64, count: u64) ?[]const u8 {
+            if (address < 0x8000 or address + count > 0x8000 + self.memory.len) return null;
+            const offset: usize = @intCast(address - 0x8000);
+            return self.memory[offset..][0..@intCast(count)];
+        }
+
+        fn read64(self: *@This(), address: u64) u64 {
+            const bytes = self.guestMemoryConst(address, 8) orelse return 0;
+            return std.mem.readInt(u64, bytes[0..8], .little);
+        }
+    };
+
+    var inspection = Inspection{};
+    inspection.frame_count = 2;
+    inspection.frames[0] = .{ .frame_pointer = 0x8010, .stack_pointer = 0x8008, .mode = .rbp_frame, .cleanup_landing_pad = 0x1111 };
+    inspection.frames[1] = .{ .frame_pointer = 0x8020, .stack_pointer = 0x8018, .mode = .rbp_frame };
+    inspection.handler = .{
+        .landing_pad = 0x2222,
+        .selector = 1,
+        .frame_index = 1,
+        .function_start = 0x2000,
+        .frame_pointer = 0x8020,
+        .stack_pointer = 0x8018,
+        .mode = .rbp_frame,
+        .catch_all = false,
+    };
+
+    var state = FakeState{};
+    var engine = Engine{};
+    try std.testing.expect(engine.installPhaseTwo(&state, &inspection, 0x4000));
+    try std.testing.expectEqual(@as(u64, 0x1111), state.regs.rip);
+    engine.active_phase_two = null; // Model an import-boundary state loss.
+    try std.testing.expect(engine.resumePhaseTwo(&state));
+    try std.testing.expectEqual(@as(u64, 0x2222), state.regs.rip);
+    try std.testing.expectEqual(@as(u64, 0x4000), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, 1), state.regs.rdx);
 }
 
 test "LSDA inspection distinguishes cleanup and typed catch landing pads" {

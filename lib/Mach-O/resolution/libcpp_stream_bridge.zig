@@ -5,6 +5,10 @@ const cxx_object_model = @import("cxx_object_model.zig");
 const MAX_STREAMS = 64;
 const FILEBUF_OFFSET_IN_IFSTREAM = cxx_object_model.FILEBUF_OFFSET_IN_IFSTREAM;
 const BASIC_IOS_OFFSET_IN_IFSTREAM = cxx_object_model.BASIC_IOS_OFFSET_IN_IFSTREAM;
+const STRINGSTREAM_OSTREAM_OFFSET: u64 = 16;
+const STRINGSTREAM_BUFFER_OFFSET: u64 = 24;
+const STRINGSTREAM_IOS_OFFSET: u64 = 128;
+const STRINGSTREAM_MIN_SIZE: u64 = STRINGSTREAM_IOS_OFFSET + cxx_object_model.stream_layout.size;
 
 const OPENMODE_APP: u64 = 1 << 0;
 const OPENMODE_ATE: u64 = 1 << 1;
@@ -62,6 +66,26 @@ pub const Bridge = struct {
             else
                 null;
         }
+        if (isBasicIstreamConstructor(name)) {
+            const streambuf = selectStreambufArgument(state);
+            return if (self.constructBaseStream(state, .basic_istream, state.regs.rdi, streambuf))
+                .{ .handled = state.regs.rdi }
+            else
+                null;
+        }
+        if (isBasicIostreamConstructor(name)) {
+            const streambuf = selectStreambufArgument(state);
+            return if (self.constructBaseStream(state, .basic_iostream, state.regs.rdi, streambuf))
+                .{ .handled = state.regs.rdi }
+            else
+                null;
+        }
+        if (isStringStreamConstructor(name)) {
+            return if (self.constructStringStream(state, state.regs.rdi))
+                .{ .handled = state.regs.rdi }
+            else
+                null;
+        }
         if (isBasicOstreamDestructor(name) or isBaseDestructor(name)) {
             self.base_destructors +|= 1;
             return .handled_void;
@@ -92,6 +116,7 @@ pub const Bridge = struct {
         if (isBasicIosFail(name)) return .{ .handled = @intFromBool(self.object_model.fail(state, state.regs.rdi)) };
         if (isBasicIosEof(name)) return .{ .handled = @intFromBool(self.object_model.eof(state, state.regs.rdi)) };
         if (isBasicIosBool(name)) return .{ .handled = @intFromBool(!self.object_model.fail(state, state.regs.rdi)) };
+        if (isUnsignedIntegerInsertion(name)) return .{ .handled = state.regs.rdi };
 
         if (isIfstreamDefaultConstructor(name)) {
             return if (self.constructIfstream(state, state.regs.rdi))
@@ -183,6 +208,9 @@ pub const Bridge = struct {
     pub fn recognizesSymbol(symbol: []const u8) bool {
         const name = normalizeSymbol(symbol);
         return isBasicOstreamConstructor(name) or
+            isBasicIstreamConstructor(name) or
+            isBasicIostreamConstructor(name) or
+            isStringStreamConstructor(name) or
             isBasicOstreamDestructor(name) or
             isStringStreamDestructor(name) or
             isBaseDestructor(name) or
@@ -195,6 +223,7 @@ pub const Bridge = struct {
             isBasicIosFail(name) or
             isBasicIosEof(name) or
             isBasicIosBool(name) or
+            isUnsignedIntegerInsertion(name) or
             isIfstreamDefaultConstructor(name) or
             isIfstreamCStringConstructor(name) or
             isIfstreamDestructor(name) or
@@ -251,6 +280,45 @@ pub const Bridge = struct {
             return false;
         }
         self.constructors +|= 1;
+        return true;
+    }
+
+    fn constructBaseStream(self: *Bridge, state: anytype, kind: cxx_object_model.Kind, object: u64, streambuf: u64) bool {
+        if (streambuf == 0 or state.guestMemoryConst(streambuf, 8) == null) {
+            self.rejected +|= 1;
+            return false;
+        }
+        if (!self.object_model.initializeStreamBase(state, kind, object)) {
+            self.rejected +|= 1;
+            return false;
+        }
+        self.constructors +|= 1;
+        return true;
+    }
+
+    fn constructStringStream(self: *Bridge, state: anytype, object: u64) bool {
+        if (state.guestMemory(object, STRINGSTREAM_MIN_SIZE) == null) {
+            self.rejected +|= 1;
+            return false;
+        }
+        const streambuf = object + STRINGSTREAM_BUFFER_OFFSET;
+        if (!self.object_model.initializeStreambufBase(state, streambuf) or
+            !self.object_model.initializeStreamBase(state, .basic_iostream, object) or
+            !self.object_model.initializeStreamBase(state, .basic_ostream, object + STRINGSTREAM_OSTREAM_OFFSET) or
+            !self.object_model.initializeBasicIos(state, object + STRINGSTREAM_IOS_OFFSET, streambuf))
+        {
+            self.rejected +|= 1;
+            return false;
+        }
+        _ = self.ensure(streambuf) orelse {
+            self.rejected +|= 1;
+            return false;
+        };
+        self.constructors +|= 1;
+        std.debug.print(
+            "macho-processor: modeled libc++ stringstream object=0x{x} ostream=0x{x} streambuf=0x{x} ios=0x{x}\n",
+            .{ object, object + STRINGSTREAM_OSTREAM_OFFSET, streambuf, object + STRINGSTREAM_IOS_OFFSET },
+        );
         return true;
     }
 
@@ -549,6 +617,16 @@ fn isBasicOstreamConstructor(name: []const u8) bool {
         std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEEC2") != null;
 }
 
+fn isBasicIstreamConstructor(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_istreamIcNS_11char_traitsIcEEEC1") != null or
+        std.mem.indexOf(u8, name, "basic_istreamIcNS_11char_traitsIcEEEC2") != null;
+}
+
+fn isBasicIostreamConstructor(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_iostreamIcNS_11char_traitsIcEEEC1") != null or
+        std.mem.indexOf(u8, name, "basic_iostreamIcNS_11char_traitsIcEEEC2") != null;
+}
+
 fn isBasicOstreamDestructor(name: []const u8) bool {
     return std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEED1") != null or
         std.mem.indexOf(u8, name, "basic_ostreamIcNS_11char_traitsIcEEED2") != null;
@@ -559,6 +637,13 @@ fn isStringStreamDestructor(name: []const u8) bool {
         std.mem.indexOf(u8, name, "basic_istringstream") != null or
         std.mem.indexOf(u8, name, "basic_stringstream") != null;
     return family and (std.mem.indexOf(u8, name, "D1Ev") != null or std.mem.indexOf(u8, name, "D2Ev") != null);
+}
+
+fn isStringStreamConstructor(name: []const u8) bool {
+    const family = std.mem.indexOf(u8, name, "basic_ostringstream") != null or
+        std.mem.indexOf(u8, name, "basic_istringstream") != null or
+        std.mem.indexOf(u8, name, "basic_stringstream") != null;
+    return family and (std.mem.indexOf(u8, name, "C1") != null or std.mem.indexOf(u8, name, "C2") != null);
 }
 
 fn isBasicIosMethod(name: []const u8, marker: []const u8) bool {
@@ -600,6 +685,10 @@ fn isBasicIosEof(name: []const u8) bool {
 
 fn isBasicIosBool(name: []const u8) bool {
     return isBasicIosMethod(name, "cvb");
+}
+
+fn isUnsignedIntegerInsertion(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEj");
 }
 
 fn isBaseDestructor(name: []const u8) bool {
@@ -665,6 +754,9 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
     try std.testing.expect(isIfstreamCStringConstructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj")));
     try std.testing.expect(isIfstreamDestructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED2Ev")));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEC1B7v160006Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"));
