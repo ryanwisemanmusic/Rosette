@@ -827,6 +827,16 @@ const perform_vreduceps = @import("PERFORM/VREDUCEPS.zig");
 const perform_vreducesd = @import("PERFORM/VREDUCESD.zig");
 const perform_vreducesh = @import("PERFORM/VREDUCESH.zig");
 const perform_vreducess = @import("PERFORM/VREDUCESS.zig");
+const permute_vperm2f128 = @import("PERMUTE/VPERM2F128.zig");
+const permute_vperm2i128 = @import("PERMUTE/VPERM2I128.zig");
+const permute_vpermb = @import("PERMUTE/VPERMB.zig");
+const permute_vpermd = @import("PERMUTE/VPERMD.zig");
+const permute_vpermw = @import("PERMUTE/VPERMW.zig");
+const permute_vpermilpd = @import("PERMUTE/VPERMILPD.zig");
+const permute_vpermilps = @import("PERMUTE/VPERMILPS.zig");
+const permute_vpermpd = @import("PERMUTE/VPERMPD.zig");
+const permute_vpermps = @import("PERMUTE/VPERMPS.zig");
+const permute_vpermq = @import("PERMUTE/VPERMQ.zig");
 const platform_pconfig = @import("PLATFORM/PCONFIG.zig");
 const prefetch_prefetchw = @import("PREFETCH/prefetchw.zig");
 const prefetch_prefetcht0 = @import("PREFETCH/prefetcht0.zig");
@@ -1771,6 +1781,16 @@ pub const specs = blk: {
         spec(perform_vreducesd.meta),
         spec(perform_vreducesh.meta),
         spec(perform_vreducess.meta),
+        spec(permute_vperm2f128.meta),
+        spec(permute_vperm2i128.meta),
+        spec(permute_vpermb.meta),
+        spec(permute_vpermd.meta),
+        spec(permute_vpermw.meta),
+        spec(permute_vpermilpd.meta),
+        spec(permute_vpermilps.meta),
+        spec(permute_vpermpd.meta),
+        spec(permute_vpermps.meta),
+        spec(permute_vpermq.meta),
         spec(platform_pconfig.meta),
         spec(prefetch_prefetchw.meta),
         spec(prefetch_prefetcht0.meta),
@@ -2727,6 +2747,16 @@ pub const proof_reports = [_]proofs.ProofReport{
     perform_vreducesd.proof_report,
     perform_vreducesh.proof_report,
     perform_vreducess.proof_report,
+    permute_vperm2f128.proof_report,
+    permute_vperm2i128.proof_report,
+    permute_vpermb.proof_report,
+    permute_vpermd.proof_report,
+    permute_vpermw.proof_report,
+    permute_vpermilpd.proof_report,
+    permute_vpermilps.proof_report,
+    permute_vpermpd.proof_report,
+    permute_vpermps.proof_report,
+    permute_vpermq.proof_report,
     platform_pconfig.proof_report,
     prefetch_prefetchw.proof_report,
     prefetch_prefetcht0.proof_report,
