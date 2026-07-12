@@ -669,6 +669,25 @@ const shift_shrd = @import("SHIFT/SHRD.zig");
 const shift_sarx = @import("SHIFT/SARX.zig");
 const shift_shlx = @import("SHIFT/SHLX.zig");
 const shift_shrx = @import("SHIFT/SHRX.zig");
+const shift_kshiftlb = @import("SHIFT/KSHIFTLB.zig");
+const shift_kshiftld = @import("SHIFT/KSHIFTLD.zig");
+const shift_kshiftlq = @import("SHIFT/KSHIFTLQ.zig");
+const shift_kshiftlw = @import("SHIFT/KSHIFTLW.zig");
+const shift_kshiftrb = @import("SHIFT/KSHIFTRB.zig");
+const shift_kshiftrd = @import("SHIFT/KSHIFTRD.zig");
+const shift_kshiftrq = @import("SHIFT/KSHIFTRQ.zig");
+const shift_kshiftrw = @import("SHIFT/KSHIFTRW.zig");
+const shift_pslld = @import("SHIFT/PSLLD.zig");
+const shift_pslldq = @import("SHIFT/PSLLDQ.zig");
+const shift_psllq = @import("SHIFT/PSLLQ.zig");
+const shift_psllw = @import("SHIFT/PSLLW.zig");
+const shift_psraq = @import("SHIFT/PSRAQ.zig");
+const shift_psrad = @import("SHIFT/PSRAD.zig");
+const shift_psraw = @import("SHIFT/PSRAW.zig");
+const shift_psrld = @import("SHIFT/PSRLD.zig");
+const shift_psrldq = @import("SHIFT/PSRLDQ.zig");
+const shift_psrlq = @import("SHIFT/PSRLQ.zig");
+const shift_psrlw = @import("SHIFT/PSRLW.zig");
 const clear_clac = @import("CLEAR/CLAC.zig");
 const clear_clc = @import("CLEAR/CLC.zig");
 const clear_cld = @import("CLEAR/CLD.zig");
@@ -1708,6 +1727,25 @@ pub const mirror_tables = [_]MirrorTable{
     mirror(shift_sarx.family, shift_sarx.path, shift_sarx.source),
     mirror(shift_shlx.family, shift_shlx.path, shift_shlx.source),
     mirror(shift_shrx.family, shift_shrx.path, shift_shrx.source),
+    mirror(shift_kshiftlb.family, shift_kshiftlb.path, shift_kshiftlb.source),
+    mirror(shift_kshiftld.family, shift_kshiftld.path, shift_kshiftld.source),
+    mirror(shift_kshiftlq.family, shift_kshiftlq.path, shift_kshiftlq.source),
+    mirror(shift_kshiftlw.family, shift_kshiftlw.path, shift_kshiftlw.source),
+    mirror(shift_kshiftrb.family, shift_kshiftrb.path, shift_kshiftrb.source),
+    mirror(shift_kshiftrd.family, shift_kshiftrd.path, shift_kshiftrd.source),
+    mirror(shift_kshiftrq.family, shift_kshiftrq.path, shift_kshiftrq.source),
+    mirror(shift_kshiftrw.family, shift_kshiftrw.path, shift_kshiftrw.source),
+    mirror(shift_pslld.family, shift_pslld.path, shift_pslld.source),
+    mirror(shift_pslldq.family, shift_pslldq.path, shift_pslldq.source),
+    mirror(shift_psllq.family, shift_psllq.path, shift_psllq.source),
+    mirror(shift_psllw.family, shift_psllw.path, shift_psllw.source),
+    mirror(shift_psraq.family, shift_psraq.path, shift_psraq.source),
+    mirror(shift_psrad.family, shift_psrad.path, shift_psrad.source),
+    mirror(shift_psraw.family, shift_psraw.path, shift_psraw.source),
+    mirror(shift_psrld.family, shift_psrld.path, shift_psrld.source),
+    mirror(shift_psrldq.family, shift_psrldq.path, shift_psrldq.source),
+    mirror(shift_psrlq.family, shift_psrlq.path, shift_psrlq.source),
+    mirror(shift_psrlw.family, shift_psrlw.path, shift_psrlw.source),
     mirror(clear_clac.family, clear_clac.path, clear_clac.source),
     mirror(clear_clc.family, clear_clc.path, clear_clc.source),
     mirror(clear_cld.family, clear_cld.path, clear_cld.source),
