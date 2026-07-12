@@ -563,6 +563,21 @@ const test_vfpclassss = @import("TEST/VFPCLASSSS.zig");
 const test_vtestpd = @import("TEST/VTESTPD.zig");
 const test_vtestps = @import("TEST/VTESTPS.zig");
 const test_xtest = @import("TEST/XTEST.zig");
+const unpack_kunpckbw = @import("UNPACK/KUNPCKBW.zig");
+const unpack_kunpckwd = @import("UNPACK/KUNPCKWD.zig");
+const unpack_kunpckdq = @import("UNPACK/KUNPCKDQ.zig");
+const unpack_punpckhbw = @import("UNPACK/PUNPCKHBW.zig");
+const unpack_punpckhwd = @import("UNPACK/PUNPCKHWD.zig");
+const unpack_punpckhdq = @import("UNPACK/PUNPCKHDQ.zig");
+const unpack_punpckhqdq = @import("UNPACK/PUNPCKHQDQ.zig");
+const unpack_punpcklbw = @import("UNPACK/PUNPCKLBW.zig");
+const unpack_punpcklwd = @import("UNPACK/PUNPCKLWD.zig");
+const unpack_punpckldq = @import("UNPACK/PUNPCKLDQ.zig");
+const unpack_punpcklqdq = @import("UNPACK/PUNPCKLQDQ.zig");
+const unpack_unpckhpd = @import("UNPACK/UNPCKHPD.zig");
+const unpack_unpckhps = @import("UNPACK/UNPCKHPS.zig");
+const unpack_unpcklpd = @import("UNPACK/UNPCKLPD.zig");
+const unpack_unpcklps = @import("UNPACK/UNPCKLPS.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
 const undef_ud1 = @import("UNDEF/UD1.zig");
 const undef_ud2 = @import("UNDEF/UD2.zig");
@@ -2231,6 +2246,21 @@ pub const tables = [_]InstructionTable{
     entry(test_vtestpd.family, test_vtestpd.path, test_vtestpd.source),
     entry(test_vtestps.family, test_vtestps.path, test_vtestps.source),
     entry(test_xtest.family, test_xtest.path, test_xtest.source),
+    entry(unpack_kunpckbw.family, unpack_kunpckbw.path, unpack_kunpckbw.source),
+    entry(unpack_kunpckwd.family, unpack_kunpckwd.path, unpack_kunpckwd.source),
+    entry(unpack_kunpckdq.family, unpack_kunpckdq.path, unpack_kunpckdq.source),
+    entry(unpack_punpckhbw.family, unpack_punpckhbw.path, unpack_punpckhbw.source),
+    entry(unpack_punpckhwd.family, unpack_punpckhwd.path, unpack_punpckhwd.source),
+    entry(unpack_punpckhdq.family, unpack_punpckhdq.path, unpack_punpckhdq.source),
+    entry(unpack_punpckhqdq.family, unpack_punpckhqdq.path, unpack_punpckhqdq.source),
+    entry(unpack_punpcklbw.family, unpack_punpcklbw.path, unpack_punpcklbw.source),
+    entry(unpack_punpcklwd.family, unpack_punpcklwd.path, unpack_punpcklwd.source),
+    entry(unpack_punpckldq.family, unpack_punpckldq.path, unpack_punpckldq.source),
+    entry(unpack_punpcklqdq.family, unpack_punpcklqdq.path, unpack_punpcklqdq.source),
+    entry(unpack_unpckhpd.family, unpack_unpckhpd.path, unpack_unpckhpd.source),
+    entry(unpack_unpckhps.family, unpack_unpckhps.path, unpack_unpckhps.source),
+    entry(unpack_unpcklpd.family, unpack_unpcklpd.path, unpack_unpcklpd.source),
+    entry(unpack_unpcklps.family, unpack_unpcklps.path, unpack_unpcklps.source),
     entry(undef_ud0.family, undef_ud0.path, undef_ud0.source),
     entry(undef_ud1.family, undef_ud1.path, undef_ud1.source),
     entry(undef_ud2.family, undef_ud2.path, undef_ud2.source),

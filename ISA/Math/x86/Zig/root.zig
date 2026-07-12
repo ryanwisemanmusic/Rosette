@@ -565,6 +565,21 @@ const test_vfpclassss = @import("TEST/VFPCLASSSS.zig");
 const test_vtestpd = @import("TEST/VTESTPD.zig");
 const test_vtestps = @import("TEST/VTESTPS.zig");
 const test_xtest = @import("TEST/XTEST.zig");
+const unpack_kunpckbw = @import("UNPACK/KUNPCKBW.zig");
+const unpack_kunpckwd = @import("UNPACK/KUNPCKWD.zig");
+const unpack_kunpckdq = @import("UNPACK/KUNPCKDQ.zig");
+const unpack_punpckhbw = @import("UNPACK/PUNPCKHBW.zig");
+const unpack_punpckhwd = @import("UNPACK/PUNPCKHWD.zig");
+const unpack_punpckhdq = @import("UNPACK/PUNPCKHDQ.zig");
+const unpack_punpckhqdq = @import("UNPACK/PUNPCKHQDQ.zig");
+const unpack_punpcklbw = @import("UNPACK/PUNPCKLBW.zig");
+const unpack_punpcklwd = @import("UNPACK/PUNPCKLWD.zig");
+const unpack_punpckldq = @import("UNPACK/PUNPCKLDQ.zig");
+const unpack_punpcklqdq = @import("UNPACK/PUNPCKLQDQ.zig");
+const unpack_unpckhpd = @import("UNPACK/UNPCKHPD.zig");
+const unpack_unpckhps = @import("UNPACK/UNPCKHPS.zig");
+const unpack_unpcklpd = @import("UNPACK/UNPCKLPD.zig");
+const unpack_unpcklps = @import("UNPACK/UNPCKLPS.zig");
 const undef_ud0 = @import("UNDEF/UD0.zig");
 const undef_ud1 = @import("UNDEF/UD1.zig");
 const undef_ud2 = @import("UNDEF/UD2.zig");
@@ -1494,6 +1509,21 @@ pub const specs = blk: {
         spec(test_vtestpd.meta),
         spec(test_vtestps.meta),
         spec(test_xtest.meta),
+        spec(unpack_kunpckbw.meta),
+        spec(unpack_kunpckwd.meta),
+        spec(unpack_kunpckdq.meta),
+        spec(unpack_punpckhbw.meta),
+        spec(unpack_punpckhwd.meta),
+        spec(unpack_punpckhdq.meta),
+        spec(unpack_punpckhqdq.meta),
+        spec(unpack_punpcklbw.meta),
+        spec(unpack_punpcklwd.meta),
+        spec(unpack_punpckldq.meta),
+        spec(unpack_punpcklqdq.meta),
+        spec(unpack_unpckhpd.meta),
+        spec(unpack_unpckhps.meta),
+        spec(unpack_unpcklpd.meta),
+        spec(unpack_unpcklps.meta),
         spec(undef_ud0.meta),
         spec(undef_ud1.meta),
         spec(undef_ud2.meta),
@@ -2435,6 +2465,21 @@ pub const proof_reports = [_]proofs.ProofReport{
     test_vtestpd.proof_report,
     test_vtestps.proof_report,
     test_xtest.proof_report,
+    unpack_kunpckbw.proof_report,
+    unpack_kunpckwd.proof_report,
+    unpack_kunpckdq.proof_report,
+    unpack_punpckhbw.proof_report,
+    unpack_punpckhwd.proof_report,
+    unpack_punpckhdq.proof_report,
+    unpack_punpckhqdq.proof_report,
+    unpack_punpcklbw.proof_report,
+    unpack_punpcklwd.proof_report,
+    unpack_punpckldq.proof_report,
+    unpack_punpcklqdq.proof_report,
+    unpack_unpckhpd.proof_report,
+    unpack_unpckhps.proof_report,
+    unpack_unpcklpd.proof_report,
+    unpack_unpcklps.proof_report,
     undef_ud0.proof_report,
     undef_ud1.proof_report,
     undef_ud2.proof_report,
