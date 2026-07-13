@@ -34,6 +34,25 @@ const cmp_cmppd = @import("CMP/CMPPD.zig");
 const cmp_cmpps = @import("CMP/CMPPS.zig");
 const cmp_cmpsd = @import("CMP/CMPSD.zig");
 const cmp_cmpss = @import("CMP/CMPSS.zig");
+const cmp_pcmpeqb = @import("CMP/PCMPEQB.zig");
+const cmp_pcmpeqw = @import("CMP/PCMPEQW.zig");
+const cmp_pcmpeqd = @import("CMP/PCMPEQD.zig");
+const cmp_pcmpeqq = @import("CMP/PCMPEQQ.zig");
+const cmp_pcmpgtb = @import("CMP/PCMPGTB.zig");
+const cmp_pcmpgtw = @import("CMP/PCMPGTW.zig");
+const cmp_pcmpgtd = @import("CMP/PCMPGTD.zig");
+const cmp_pcmpgtq = @import("CMP/PCMPGTQ.zig");
+const cmp_vcmpph = @import("CMP/VCMPPH.zig");
+const cmp_vcmpsh = @import("CMP/VCMPSH.zig");
+const cmp_vcomish = @import("CMP/VCOMISH.zig");
+const cmp_vpcmpb = @import("CMP/VPCMPB.zig");
+const cmp_vpcmpub = @import("CMP/VPCMPUB.zig");
+const cmp_vpcmpd = @import("CMP/VPCMPD.zig");
+const cmp_vpcmpud = @import("CMP/VPCMPUD.zig");
+const cmp_vpcmpq = @import("CMP/VPCMPQ.zig");
+const cmp_vpcmpuq = @import("CMP/VPCMPUQ.zig");
+const cmp_vpcmpw = @import("CMP/VPCMPW.zig");
+const cmp_vpcmpuw = @import("CMP/VPCMPUW.zig");
 const div_div = @import("DIV/DIV.zig");
 const div_divpd = @import("DIV/DIVPD.zig");
 const div_divps = @import("DIV/DIVPS.zig");
@@ -1085,6 +1104,25 @@ pub const specs = blk: {
         spec(cmp_cmpps.meta),
         spec(cmp_cmpsd.meta),
         spec(cmp_cmpss.meta),
+        spec(cmp_pcmpeqb.meta),
+        spec(cmp_pcmpeqw.meta),
+        spec(cmp_pcmpeqd.meta),
+        spec(cmp_pcmpeqq.meta),
+        spec(cmp_pcmpgtb.meta),
+        spec(cmp_pcmpgtw.meta),
+        spec(cmp_pcmpgtd.meta),
+        spec(cmp_pcmpgtq.meta),
+        spec(cmp_vcmpph.meta),
+        spec(cmp_vcmpsh.meta),
+        spec(cmp_vcomish.meta),
+        spec(cmp_vpcmpb.meta),
+        spec(cmp_vpcmpub.meta),
+        spec(cmp_vpcmpd.meta),
+        spec(cmp_vpcmpud.meta),
+        spec(cmp_vpcmpq.meta),
+        spec(cmp_vpcmpuq.meta),
+        spec(cmp_vpcmpw.meta),
+        spec(cmp_vpcmpuw.meta),
         spec(div_div.meta),
         spec(div_divpd.meta),
         spec(div_divps.meta),
@@ -2136,6 +2174,25 @@ pub const proof_reports = [_]proofs.ProofReport{
     cmp_cmpps.proof_report,
     cmp_cmpsd.proof_report,
     cmp_cmpss.proof_report,
+    cmp_pcmpeqb.proof_report,
+    cmp_pcmpeqw.proof_report,
+    cmp_pcmpeqd.proof_report,
+    cmp_pcmpeqq.proof_report,
+    cmp_pcmpgtb.proof_report,
+    cmp_pcmpgtw.proof_report,
+    cmp_pcmpgtd.proof_report,
+    cmp_pcmpgtq.proof_report,
+    cmp_vcmpph.proof_report,
+    cmp_vcmpsh.proof_report,
+    cmp_vcomish.proof_report,
+    cmp_vpcmpb.proof_report,
+    cmp_vpcmpub.proof_report,
+    cmp_vpcmpd.proof_report,
+    cmp_vpcmpud.proof_report,
+    cmp_vpcmpq.proof_report,
+    cmp_vpcmpuq.proof_report,
+    cmp_vpcmpw.proof_report,
+    cmp_vpcmpuw.proof_report,
     div_div.proof_report,
     div_divpd.proof_report,
     div_divps.proof_report,

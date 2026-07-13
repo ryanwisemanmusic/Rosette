@@ -32,6 +32,25 @@ const cmp_cmppd = @import("CMP/CMPPD.zig");
 const cmp_cmpps = @import("CMP/CMPPS.zig");
 const cmp_cmpsd = @import("CMP/CMPSD.zig");
 const cmp_cmpss = @import("CMP/CMPSS.zig");
+const cmp_pcmpeqb = @import("CMP/PCMPEQB.zig");
+const cmp_pcmpeqw = @import("CMP/PCMPEQW.zig");
+const cmp_pcmpeqd = @import("CMP/PCMPEQD.zig");
+const cmp_pcmpeqq = @import("CMP/PCMPEQQ.zig");
+const cmp_pcmpgtb = @import("CMP/PCMPGTB.zig");
+const cmp_pcmpgtw = @import("CMP/PCMPGTW.zig");
+const cmp_pcmpgtd = @import("CMP/PCMPGTD.zig");
+const cmp_pcmpgtq = @import("CMP/PCMPGTQ.zig");
+const cmp_vcmpph = @import("CMP/VCMPPH.zig");
+const cmp_vcmpsh = @import("CMP/VCMPSH.zig");
+const cmp_vcomish = @import("CMP/VCOMISH.zig");
+const cmp_vpcmpb = @import("CMP/VPCMPB.zig");
+const cmp_vpcmpub = @import("CMP/VPCMPUB.zig");
+const cmp_vpcmpd = @import("CMP/VPCMPD.zig");
+const cmp_vpcmpud = @import("CMP/VPCMPUD.zig");
+const cmp_vpcmpq = @import("CMP/VPCMPQ.zig");
+const cmp_vpcmpuq = @import("CMP/VPCMPUQ.zig");
+const cmp_vpcmpw = @import("CMP/VPCMPW.zig");
+const cmp_vpcmpuw = @import("CMP/VPCMPUW.zig");
 const div_div = @import("DIV/DIV.zig");
 const div_divpd = @import("DIV/DIVPD.zig");
 const div_divps = @import("DIV/DIVPS.zig");
@@ -1158,6 +1177,25 @@ pub const mirror_tables = blk: {
         mirror(cmp_cmpps.family, cmp_cmpps.path, cmp_cmpps.source),
         mirror(cmp_cmpsd.family, cmp_cmpsd.path, cmp_cmpsd.source),
         mirror(cmp_cmpss.family, cmp_cmpss.path, cmp_cmpss.source),
+        mirror(cmp_pcmpeqb.family, cmp_pcmpeqb.path, cmp_pcmpeqb.source),
+        mirror(cmp_pcmpeqw.family, cmp_pcmpeqw.path, cmp_pcmpeqw.source),
+        mirror(cmp_pcmpeqd.family, cmp_pcmpeqd.path, cmp_pcmpeqd.source),
+        mirror(cmp_pcmpeqq.family, cmp_pcmpeqq.path, cmp_pcmpeqq.source),
+        mirror(cmp_pcmpgtb.family, cmp_pcmpgtb.path, cmp_pcmpgtb.source),
+        mirror(cmp_pcmpgtw.family, cmp_pcmpgtw.path, cmp_pcmpgtw.source),
+        mirror(cmp_pcmpgtd.family, cmp_pcmpgtd.path, cmp_pcmpgtd.source),
+        mirror(cmp_pcmpgtq.family, cmp_pcmpgtq.path, cmp_pcmpgtq.source),
+        mirror(cmp_vcmpph.family, cmp_vcmpph.path, cmp_vcmpph.source),
+        mirror(cmp_vcmpsh.family, cmp_vcmpsh.path, cmp_vcmpsh.source),
+        mirror(cmp_vcomish.family, cmp_vcomish.path, cmp_vcomish.source),
+        mirror(cmp_vpcmpb.family, cmp_vpcmpb.path, cmp_vpcmpb.source),
+        mirror(cmp_vpcmpub.family, cmp_vpcmpub.path, cmp_vpcmpub.source),
+        mirror(cmp_vpcmpd.family, cmp_vpcmpd.path, cmp_vpcmpd.source),
+        mirror(cmp_vpcmpud.family, cmp_vpcmpud.path, cmp_vpcmpud.source),
+        mirror(cmp_vpcmpq.family, cmp_vpcmpq.path, cmp_vpcmpq.source),
+        mirror(cmp_vpcmpuq.family, cmp_vpcmpuq.path, cmp_vpcmpuq.source),
+        mirror(cmp_vpcmpw.family, cmp_vpcmpw.path, cmp_vpcmpw.source),
+        mirror(cmp_vpcmpuw.family, cmp_vpcmpuw.path, cmp_vpcmpuw.source),
         mirror(div_div.family, div_div.path, div_div.source),
         mirror(div_divpd.family, div_divpd.path, div_divpd.source),
         mirror(div_divps.family, div_divps.path, div_divps.source),
