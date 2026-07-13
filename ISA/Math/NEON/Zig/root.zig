@@ -486,6 +486,33 @@ const output_outs = @import("OUTPUT/OUTS.zig");
 const output_outsb = @import("OUTPUT/OUTSB.zig");
 const output_outsw = @import("OUTPUT/OUTSW.zig");
 const output_outsd = @import("OUTPUT/OUTSD.zig");
+const pack_packsswb = @import("PACK/PACKSSWB.zig");
+const pack_packssdw = @import("PACK/PACKSSDW.zig");
+const pack_packusdw = @import("PACK/PACKUSDW.zig");
+const pack_packuswb = @import("PACK/PACKUSWB.zig");
+const pack_palignr = @import("PACK/PALIGNR.zig");
+const pack_pcmpestri = @import("PACK/PCMPESTRI.zig");
+const pack_pcmpestrm = @import("PACK/PCMPESTRM.zig");
+const pack_pcmpistri = @import("PACK/PCMPISTRI.zig");
+const pack_pcmpistrm = @import("PACK/PCMPISTRM.zig");
+const pack_phminposuw = @import("PACK/PHMINPOSUW.zig");
+const pack_pmovsxbw = @import("PACK/PMOVSXBW.zig");
+const pack_pmovsxbd = @import("PACK/PMOVSXBD.zig");
+const pack_pmovsxbq = @import("PACK/PMOVSXBQ.zig");
+const pack_pmovsxwd = @import("PACK/PMOVSXWD.zig");
+const pack_pmovsxwq = @import("PACK/PMOVSXWQ.zig");
+const pack_pmovsxdq = @import("PACK/PMOVSXDQ.zig");
+const pack_pmovzxbw = @import("PACK/PMOVZXBW.zig");
+const pack_pmovzxbd = @import("PACK/PMOVZXBD.zig");
+const pack_pmovzxbq = @import("PACK/PMOVZXBQ.zig");
+const pack_pmovzxwd = @import("PACK/PMOVZXWD.zig");
+const pack_pmovzxwq = @import("PACK/PMOVZXWQ.zig");
+const pack_pmovzxdq = @import("PACK/PMOVZXDQ.zig");
+const pack_pmuldq = @import("PACK/PMULDQ.zig");
+const pack_pshufb = @import("PACK/PSHUFB.zig");
+const pack_psignb = @import("PACK/PSIGNB.zig");
+const pack_psignw = @import("PACK/PSIGNW.zig");
+const pack_psignd = @import("PACK/PSIGND.zig");
 const pop_pop = @import("POP/POP.zig");
 const pop_popa = @import("POP/POPA.zig");
 const pop_popad = @import("POP/POPAD.zig");
@@ -1498,8 +1525,34 @@ pub const specs = blk: {
         spec(output_outsb.meta),
         spec(output_outsw.meta),
         spec(output_outsd.meta),
+        spec(pack_packsswb.meta),
+        spec(pack_packssdw.meta),
+        spec(pack_packusdw.meta),
+        spec(pack_packuswb.meta),
+        spec(pack_palignr.meta),
+        spec(pack_pcmpestri.meta),
+        spec(pack_pcmpestrm.meta),
+        spec(pack_pcmpistri.meta),
+        spec(pack_pcmpistrm.meta),
+        spec(pack_phminposuw.meta),
+        spec(pack_pmovsxbw.meta),
+        spec(pack_pmovsxbd.meta),
+        spec(pack_pmovsxbq.meta),
+        spec(pack_pmovsxwd.meta),
+        spec(pack_pmovsxwq.meta),
+        spec(pack_pmovsxdq.meta),
+        spec(pack_pmovzxbw.meta),
+        spec(pack_pmovzxbd.meta),
+        spec(pack_pmovzxbq.meta),
+        spec(pack_pmovzxwd.meta),
+        spec(pack_pmovzxwq.meta),
+        spec(pack_pmovzxdq.meta),
+        spec(pack_pmuldq.meta),
+        spec(pack_pshufb.meta),
+        spec(pack_psignb.meta),
+        spec(pack_psignw.meta),
+        spec(pack_psignd.meta),
         spec(pop_pop.meta),
-        spec(pop_popa.meta),
         spec(pop_popad.meta),
         spec(pop_popcnt.meta),
         spec(push_push.meta),
@@ -1527,6 +1580,7 @@ pub const specs = blk: {
         spec(rotate_vprorq.meta),
         spec(rotate_vprorvq.meta),
         spec(save_fsave.meta),
+        spec(pop_popa.meta),
         spec(save_fxsave.meta),
         spec(save_saveprevssp.meta),
         spec(scale_fscale.meta),
@@ -2522,6 +2576,33 @@ pub const proof_reports = [_]proofs.ProofReport{
     output_outsb.proof_report,
     output_outsw.proof_report,
     output_outsd.proof_report,
+    pack_packsswb.proof_report,
+    pack_packssdw.proof_report,
+    pack_packusdw.proof_report,
+    pack_packuswb.proof_report,
+    pack_palignr.proof_report,
+    pack_pcmpestri.proof_report,
+    pack_pcmpestrm.proof_report,
+    pack_pcmpistri.proof_report,
+    pack_pcmpistrm.proof_report,
+    pack_phminposuw.proof_report,
+    pack_pmovsxbw.proof_report,
+    pack_pmovsxbd.proof_report,
+    pack_pmovsxbq.proof_report,
+    pack_pmovsxwd.proof_report,
+    pack_pmovsxwq.proof_report,
+    pack_pmovsxdq.proof_report,
+    pack_pmovzxbw.proof_report,
+    pack_pmovzxbd.proof_report,
+    pack_pmovzxbq.proof_report,
+    pack_pmovzxwd.proof_report,
+    pack_pmovzxwq.proof_report,
+    pack_pmovzxdq.proof_report,
+    pack_pmuldq.proof_report,
+    pack_pshufb.proof_report,
+    pack_psignb.proof_report,
+    pack_psignw.proof_report,
+    pack_psignd.proof_report,
     pop_pop.proof_report,
     pop_popa.proof_report,
     pop_popad.proof_report,
@@ -2550,7 +2631,6 @@ pub const proof_reports = [_]proofs.ProofReport{
     rotate_vprorvd.proof_report,
     rotate_vprorq.proof_report,
     rotate_vprorvq.proof_report,
-    save_fsave.proof_report,
     save_fxsave.proof_report,
     save_saveprevssp.proof_report,
     scale_fscale.proof_report,
@@ -2578,6 +2658,7 @@ pub const proof_reports = [_]proofs.ProofReport{
     sub_psubw.proof_report,
     sub_psubd.proof_report,
     sub_psubq.proof_report,
+    save_fsave.proof_report,
     sub_psubsb.proof_report,
     sub_psubsw.proof_report,
     sub_psubusb.proof_report,

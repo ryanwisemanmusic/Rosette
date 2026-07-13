@@ -484,6 +484,33 @@ const output_outs = @import("OUTPUT/OUTS.zig");
 const output_outsb = @import("OUTPUT/OUTSB.zig");
 const output_outsw = @import("OUTPUT/OUTSW.zig");
 const output_outsd = @import("OUTPUT/OUTSD.zig");
+const pack_packssdw = @import("PACK/PACKSSDW.zig");
+const pack_packsswb = @import("PACK/PACKSSWB.zig");
+const pack_packusdw = @import("PACK/PACKUSDW.zig");
+const pack_packuswb = @import("PACK/PACKUSWB.zig");
+const pack_palignr = @import("PACK/PALIGNR.zig");
+const pack_pcmpestri = @import("PACK/PCMPESTRI.zig");
+const pack_pcmpestrm = @import("PACK/PCMPESTRM.zig");
+const pack_pcmpistri = @import("PACK/PCMPISTRI.zig");
+const pack_pcmpistrm = @import("PACK/PCMPISTRM.zig");
+const pack_phminposuw = @import("PACK/PHMINPOSUW.zig");
+const pack_pmovsxbd = @import("PACK/PMOVSXBD.zig");
+const pack_pmovsxbq = @import("PACK/PMOVSXBQ.zig");
+const pack_pmovsxbw = @import("PACK/PMOVSXBW.zig");
+const pack_pmovsxdq = @import("PACK/PMOVSXDQ.zig");
+const pack_pmovsxwd = @import("PACK/PMOVSXWD.zig");
+const pack_pmovsxwq = @import("PACK/PMOVSXWQ.zig");
+const pack_pmovzxbd = @import("PACK/PMOVZXBD.zig");
+const pack_pmovzxbq = @import("PACK/PMOVZXBQ.zig");
+const pack_pmovzxbw = @import("PACK/PMOVZXBW.zig");
+const pack_pmovzxdq = @import("PACK/PMOVZXDQ.zig");
+const pack_pmovzxwd = @import("PACK/PMOVZXWD.zig");
+const pack_pmovzxwq = @import("PACK/PMOVZXWQ.zig");
+const pack_pmuldq = @import("PACK/PMULDQ.zig");
+const pack_pshufb = @import("PACK/PSHUFB.zig");
+const pack_psignb = @import("PACK/PSIGNB.zig");
+const pack_psignd = @import("PACK/PSIGND.zig");
+const pack_psignw = @import("PACK/PSIGNW.zig");
 const pop_pop = @import("POP/POP.zig");
 const pop_popa = @import("POP/POPA.zig");
 const pop_popad = @import("POP/POPAD.zig");
@@ -1571,6 +1598,33 @@ pub const mirror_tables = blk: {
         mirror(output_outsb.family, output_outsb.path, output_outsb.source),
         mirror(output_outsw.family, output_outsw.path, output_outsw.source),
         mirror(output_outsd.family, output_outsd.path, output_outsd.source),
+        mirror(pack_packssdw.family, pack_packssdw.path, pack_packssdw.source),
+        mirror(pack_packsswb.family, pack_packsswb.path, pack_packsswb.source),
+        mirror(pack_packusdw.family, pack_packusdw.path, pack_packusdw.source),
+        mirror(pack_packuswb.family, pack_packuswb.path, pack_packuswb.source),
+        mirror(pack_palignr.family, pack_palignr.path, pack_palignr.source),
+        mirror(pack_pcmpestri.family, pack_pcmpestri.path, pack_pcmpestri.source),
+        mirror(pack_pcmpestrm.family, pack_pcmpestrm.path, pack_pcmpestrm.source),
+        mirror(pack_pcmpistri.family, pack_pcmpistri.path, pack_pcmpistri.source),
+        mirror(pack_pcmpistrm.family, pack_pcmpistrm.path, pack_pcmpistrm.source),
+        mirror(pack_phminposuw.family, pack_phminposuw.path, pack_phminposuw.source),
+        mirror(pack_pmovsxbd.family, pack_pmovsxbd.path, pack_pmovsxbd.source),
+        mirror(pack_pmovsxbq.family, pack_pmovsxbq.path, pack_pmovsxbq.source),
+        mirror(pack_pmovsxbw.family, pack_pmovsxbw.path, pack_pmovsxbw.source),
+        mirror(pack_pmovsxdq.family, pack_pmovsxdq.path, pack_pmovsxdq.source),
+        mirror(pack_pmovsxwd.family, pack_pmovsxwd.path, pack_pmovsxwd.source),
+        mirror(pack_pmovsxwq.family, pack_pmovsxwq.path, pack_pmovsxwq.source),
+        mirror(pack_pmovzxbd.family, pack_pmovzxbd.path, pack_pmovzxbd.source),
+        mirror(pack_pmovzxbq.family, pack_pmovzxbq.path, pack_pmovzxbq.source),
+        mirror(pack_pmovzxbw.family, pack_pmovzxbw.path, pack_pmovzxbw.source),
+        mirror(pack_pmovzxdq.family, pack_pmovzxdq.path, pack_pmovzxdq.source),
+        mirror(pack_pmovzxwd.family, pack_pmovzxwd.path, pack_pmovzxwd.source),
+        mirror(pack_pmovzxwq.family, pack_pmovzxwq.path, pack_pmovzxwq.source),
+        mirror(pack_pmuldq.family, pack_pmuldq.path, pack_pmuldq.source),
+        mirror(pack_pshufb.family, pack_pshufb.path, pack_pshufb.source),
+        mirror(pack_psignb.family, pack_psignb.path, pack_psignb.source),
+        mirror(pack_psignd.family, pack_psignd.path, pack_psignd.source),
+        mirror(pack_psignw.family, pack_psignw.path, pack_psignw.source),
         mirror(pop_pop.family, pop_pop.path, pop_pop.source),
         mirror(pop_popa.family, pop_popa.path, pop_popa.source),
         mirror(pop_popad.family, pop_popad.path, pop_popad.source),
