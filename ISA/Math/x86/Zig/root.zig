@@ -995,6 +995,33 @@ const scan_scasq = @import("SCAN/scasq.zig");
 const zero_tilezero = @import("ZERO/TILEZERO.zig");
 const zero_vzeroall = @import("ZERO/VZEROALL.zig");
 const zero_vzeroupper = @import("ZERO/VZEROUPPER.zig");
+const store_fbstp = @import("STORE/FBSTP.zig");
+const store_fist = @import("STORE/FIST.zig");
+const store_fistp = @import("STORE/FISTP.zig");
+const store_fisttp = @import("STORE/FISTTP.zig");
+const store_fst = @import("STORE/FST.zig");
+const store_fstcw = @import("STORE/FSTCW.zig");
+const store_fstenv = @import("STORE/FSTENV.zig");
+const store_fstp = @import("STORE/FSTP.zig");
+const store_fstsw = @import("STORE/FSTSW.zig");
+const store_maskmovdqu = @import("STORE/MASKMOVDQU.zig");
+const store_maskmovq = @import("STORE/MASKMOVQ.zig");
+const store_sahf = @import("STORE/SAHF.zig");
+const store_sfence = @import("STORE/SFENCE.zig");
+const store_sgdt = @import("STORE/SGDT.zig");
+const store_sldt = @import("STORE/SLDT.zig");
+const store_smsw = @import("STORE/SMSW.zig");
+const store_stmxcsr = @import("STORE/STMXCSR.zig");
+const store_stos = @import("STORE/STOS.zig");
+const store_str = @import("STORE/STR.zig");
+const store_sttilecfg = @import("STORE/STTILECFG.zig");
+const store_tilestored = @import("STORE/TILESTORED.zig");
+const store_vcompresspd = @import("STORE/VCOMPRESSPD.zig");
+const store_vcompressps = @import("STORE/VCOMPRESSPS.zig");
+const store_vpcompressb = @import("STORE/VPCOMPRESSB.zig");
+const store_vpcompressd = @import("STORE/VPCOMPRESSD.zig");
+const store_vpcompressq = @import("STORE/VPCOMPRESSQ.zig");
+const store_vpcompressw = @import("STORE/VPCOMPRESSW.zig");
 
 pub const specs = blk: {
     @setEvalBranchQuota(5000);
@@ -1992,6 +2019,33 @@ pub const specs = blk: {
         spec(zero_tilezero.meta),
         spec(zero_vzeroall.meta),
         spec(zero_vzeroupper.meta),
+        spec(store_fbstp.meta),
+        spec(store_fist.meta),
+        spec(store_fistp.meta),
+        spec(store_fisttp.meta),
+        spec(store_fst.meta),
+        spec(store_fstcw.meta),
+        spec(store_fstenv.meta),
+        spec(store_fstp.meta),
+        spec(store_fstsw.meta),
+        spec(store_maskmovdqu.meta),
+        spec(store_maskmovq.meta),
+        spec(store_sahf.meta),
+        spec(store_sfence.meta),
+        spec(store_sgdt.meta),
+        spec(store_sldt.meta),
+        spec(store_smsw.meta),
+        spec(store_stmxcsr.meta),
+        spec(store_stos.meta),
+        spec(store_str.meta),
+        spec(store_sttilecfg.meta),
+        spec(store_tilestored.meta),
+        spec(store_vcompresspd.meta),
+        spec(store_vcompressps.meta),
+        spec(store_vpcompressb.meta),
+        spec(store_vpcompressd.meta),
+        spec(store_vpcompressq.meta),
+        spec(store_vpcompressw.meta),
     };
 };
 
@@ -2989,6 +3043,33 @@ pub const proof_reports = [_]proofs.ProofReport{
     zero_tilezero.proof_report,
     zero_vzeroall.proof_report,
     zero_vzeroupper.proof_report,
+    store_fbstp.proof_report,
+    store_fist.proof_report,
+    store_fistp.proof_report,
+    store_fisttp.proof_report,
+    store_fst.proof_report,
+    store_fstcw.proof_report,
+    store_fstenv.proof_report,
+    store_fstp.proof_report,
+    store_fstsw.proof_report,
+    store_maskmovdqu.proof_report,
+    store_maskmovq.proof_report,
+    store_sahf.proof_report,
+    store_sfence.proof_report,
+    store_sgdt.proof_report,
+    store_sldt.proof_report,
+    store_smsw.proof_report,
+    store_stmxcsr.proof_report,
+    store_stos.proof_report,
+    store_str.proof_report,
+    store_sttilecfg.proof_report,
+    store_tilestored.proof_report,
+    store_vcompresspd.proof_report,
+    store_vcompressps.proof_report,
+    store_vpcompressb.proof_report,
+    store_vpcompressd.proof_report,
+    store_vpcompressq.proof_report,
+    store_vpcompressw.proof_report,
 };
 
 pub fn tableCount() usize {
@@ -3047,7 +3128,7 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 658), tableCount());
+    try std.testing.expectEqual(@as(usize, 685), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
     try std.testing.expect(proofCaseCount() >= tableCount() * 2);
     validateAll();
