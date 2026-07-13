@@ -1918,5 +1918,1433 @@ Same exceptions as in protected mode.
 Same exceptions as in protected mode.
 
 
+PCMPEQB/PCMPEQW/PCMPEQD — Compare Packed Data for Equal
 
+Opcode/Instruction	                                                Op/ En	64/32 bit Mode Support	CPUID Feature Flag	Description
+NP 0F 74 /r1 PCMPEQB mm, mm/m64	                                    A	    V/V	                    MMX	                Compare packed bytes in mm/m64 and mm for equality.
+66 0F 74 /r PCMPEQB xmm1, xmm2/m128	                                A	    V/V	                    SSE2	            Compare packed bytes in xmm2/m128 and xmm1 for equality.
+NP 0F 75 /r1 PCMPEQW mm, mm/m64	                                    A	    V/V	                    MMX	                Compare packed words in mm/m64 and mm for equality.
+66 0F 75 /r PCMPEQW xmm1, xmm2/m128	                                A	    V/V	                    SSE2	            Compare packed words in xmm2/m128 and xmm1 for equality.
+NP 0F 76 /r1 PCMPEQD mm, mm/m64	                                    A	    V/V	                    MMX	                Compare packed doublewords in mm/m64 and mm for equality.
+66 0F 76 /r PCMPEQD xmm1, xmm2/m128	                                A	    V/V	                    SSE2	            Compare packed doublewords in xmm2/m128 and xmm1 for equality.
+VEX.128.66.0F.WIG 74 /r VPCMPEQB xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed bytes in xmm3/m128 and xmm2 for equality.
+VEX.128.66.0F.WIG 75 /r VPCMPEQW xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed words in xmm3/m128 and xmm2 for equality.
+VEX.128.66.0F.WIG 76 /r VPCMPEQD xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed doublewords in xmm3/m128 and xmm2 for equality.
+VEX.256.66.0F.WIG 74 /r VPCMPEQB ymm1, ymm2, ymm3 /m256	            B	    V/V	                    AVX2	            Compare packed bytes in ymm3/m256 and ymm2 for equality.
+VEX.256.66.0F.WIG 75 /r VPCMPEQW ymm1, ymm2, ymm3 /m256	            B	    V/V	                    AVX2	            Compare packed words in ymm3/m256 and ymm2 for equality.
+VEX.256.66.0F.WIG 76 /r VPCMPEQD ymm1, ymm2, ymm3 /m256	            B	    V/V	                    AVX2	            Compare packed doublewords in ymm3/m256 and ymm2 for equality.
+EVEX.128.66.0F.W0 76 /r VPCMPEQD k1 {k2}, xmm2, xmm3/m128/m32bcst	C	    V/V	                    AVX512VL AVX512F	Compare Equal between int32 vector xmm2 and int32 vector xmm3/m128/m32bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F.W0 76 /r VPCMPEQD k1 {k2}, ymm2, ymm3/m256/m32bcst	C	    V/V	                    AVX512VL AVX512F	Compare Equal between int32 vector ymm2 and int32 vector ymm3/m256/m32bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F.W0 76 /r VPCMPEQD k1 {k2}, zmm2, zmm3/m512/m32bcst	C	    V/V	                    AVX512F	            Compare Equal between int32 vectors in zmm2 and zmm3/m512/m32bcst, and set destination k1 according to the comparison results under writemask k2.
+EVEX.128.66.0F.WIG 74 /r VPCMPEQB k1 {k2}, xmm2, xmm3 /m128	        D	    V/V	                    AVX512VL AVX512BW	Compare packed bytes in xmm3/m128 and xmm2 for equality and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F.WIG 74 /r VPCMPEQB k1 {k2}, ymm2, ymm3 /m256	        D	    V/V	                    AVX512VL AVX512BW	Compare packed bytes in ymm3/m256 and ymm2 for equality and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F.WIG 74 /r VPCMPEQB k1 {k2}, zmm2, zmm3 /m512	        D	    V/V	                    AVX512BW	        Compare packed bytes in zmm3/m512 and zmm2 for equality and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.128.66.0F.WIG 75 /r VPCMPEQW k1 {k2}, xmm2, xmm3 /m128	        D	    V/V	                    AVX512VL AVX512BW	Compare packed words in xmm3/m128 and xmm2 for equality and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F.WIG 75 /r VPCMPEQW k1 {k2}, ymm2, ymm3 /m256	        D	    V/V	                    AVX512VL AVX512BW	Compare packed words in ymm3/m256 and ymm2 for equality and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F.WIG 75 /r VPCMPEQW k1 {k2}, zmm2, zmm3 /m512	        D	    V/V	                    AVX512BW	        Compare packed words in zmm3/m512 and zmm2 for equality and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+
+1. See note in Section 2.5, “Intel® AVX and Intel® SSE Instruction Exception Classification,” in the Intel® 64 and IA-32 Architectures Software Developer’s Manual, Volume 2A, and Section 23.25.3, “Exception Conditions of Legacy SIMD Instructions Operating on MMX Registers,” in the Intel® 64 and IA-32 Architectures Software Developer’s Manual, Volume 3B.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	        ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	        ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Full	    ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+D	    Full Mem	ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Performs a SIMD compare for equality of the packed bytes, words, or doublewords in the destination operand (first operand) and the source operand (second operand). If a pair of data elements is equal, the corresponding data element in the destination operand is set to all 1s; otherwise, it is set to all 0s.
+
+The (V)PCMPEQB instruction compares the corresponding bytes in the destination and source operands; the (V)PCMPEQW instruction compares the corresponding words in the destination and source operands; and the (V)PCMPEQD instruction compares the corresponding doublewords in the destination and source operands.
+
+In 64-bit mode and not encoded with VEX/EVEX, using a REX prefix in the form of REX.R permits this instruction to access additional registers (XMM8-XMM15).
+
+Legacy SSE instructions: The source operand can be an MMX technology register or a 64-bit memory location. The destination operand can be an MMX technology register.
+
+128-bit Legacy SSE version: The second source operand can be an XMM register or a 128-bit memory location. The first source and destination operands are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM destination register remain unchanged.
+
+VEX.128 encoded version: The second source operand can be an XMM register or a 128-bit memory location. The first source and destination operands are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM register are zeroed.
+
+VEX.256 encoded version: The first source operand is a YMM register. The second source operand is a YMM register or a 256-bit memory location. The destination operand is a YMM register.
+
+EVEX encoded VPCMPEQD: The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location or a 512/256/128-bit vector broadcasted from a 32-bit memory location. The destination operand (first operand) is a mask register updated according to the writemask k2.
+
+EVEX encoded VPCMPEQB/W: The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location. The destination operand (first operand) is a mask register updated according to the writemask k2.
+
+Operation:
+
+PCMPEQB (With 64-bit Operands):
+
+IF DEST[7:0] = SRC[7:0]
+    THEN DEST[7:0) := FFH;
+    ELSE DEST[7:0] := 0; FI;
+(* Continue comparison of 2nd through 7th bytes in DEST and SRC *)
+IF DEST[63:56] = SRC[63:56]
+    THEN DEST[63:56] := FFH;
+    ELSE DEST[63:56] := 0; FI;
+
+COMPARE_BYTES_EQUAL (SRC1, SRC2):
+
+    IF SRC1[7:0] = SRC2[7:0]
+    THEN DEST[7:0] := FFH;
+    ELSE DEST[7:0] := 0; FI;
+(* Continue comparison of 2nd through 15th bytes in SRC1 and SRC2 *)
+    IF SRC1[127:120] = SRC2[127:120]
+    THEN DEST[127:120] := FFH;
+    ELSE DEST[127:120] := 0; FI;
+
+COMPARE_WORDS_EQUAL (SRC1, SRC2):
+
+    IF SRC1[15:0] = SRC2[15:0]
+    THEN DEST[15:0] := FFFFH;
+    ELSE DEST[15:0] := 0; FI;
+(* Continue comparison of 2nd through 7th 16-bit words in SRC1 and SRC2 *)
+    IF SRC1[127:112] = SRC2[127:112]
+    THEN DEST[127:112] := FFFFH;
+    ELSE DEST[127:112] := 0; FI;
+
+COMPARE_DWORDS_EQUAL (SRC1, SRC2):
+
+    IF SRC1[31:0] = SRC2[31:0]
+    THEN DEST[31:0] := FFFFFFFFH;
+    ELSE DEST[31:0] := 0; FI;
+(* Continue comparison of 2nd through 3rd 32-bit dwords in SRC1 and SRC2 *)
+    IF SRC1[127:96] = SRC2[127:96]
+    THEN DEST[127:96] := FFFFFFFFH;
+    ELSE DEST[127:96] := 0; FI;
+
+PCMPEQB (With 128-bit Operands):
+
+DEST[127:0] := COMPARE_BYTES_EQUAL(DEST[127:0],SRC[127:0])
+DEST[MAXVL-1:128] (Unmodified)
+
+VPCMPEQB (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_BYTES_EQUAL(SRC1[127:0],SRC2[127:0])
+DEST[MAXVL-1:128] := 0
+
+VPCMPEQB (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_BYTES_EQUAL(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_BYTES_EQUAL(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPEQB (EVEX Encoded Versions):
+
+(KL, VL) = (16, 128), (32, 256), (64, 512)
+FOR j := 0 TO KL-1
+    i := j * 8
+    IF k2[j] OR *no writemask*
+        THEN
+            /* signed comparison */
+            CMP := SRC1[i+7:i] == SRC2[i+7:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+PCMPEQW (With 64-bit Operands):
+
+IF DEST[15:0] = SRC[15:0]
+    THEN DEST[15:0] := FFFFH;
+    ELSE DEST[15:0] := 0; FI;
+(* Continue comparison of 2nd and 3rd words in DEST and SRC *)
+IF DEST[63:48] = SRC[63:48]
+    THEN DEST[63:48] := FFFFH;
+    ELSE DEST[63:48] := 0; FI;
+
+PCMPEQW (With 128-bit Operands):
+
+DEST[127:0] := COMPARE_WORDS_EQUAL(DEST[127:0],SRC[127:0])
+DEST[MAXVL-1:128] (Unmodified)
+
+VPCMPEQW (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_WORDS_EQUAL(SRC1[127:0],SRC2[127:0])
+DEST[MAXVL-1:128] := 0
+
+VPCMPEQW (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_WORDS_EQUAL(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_WORDS_EQUAL(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPEQW (EVEX Encoded Versions):
+
+(KL, VL) = (8, 128), (16, 256), (32, 512)
+FOR j := 0 TO KL-1
+    i := j * 16
+    IF k2[j] OR *no writemask*
+        THEN
+            /* signed comparison */
+            CMP := SRC1[i+15:i] == SRC2[i+15:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+PCMPEQD (With 64-bit Operands):
+
+IF DEST[31:0] = SRC[31:0]
+    THEN DEST[31:0] := FFFFFFFFH;
+    ELSE DEST[31:0] := 0; FI;
+IF DEST[63:32] = SRC[63:32]
+    THEN DEST[63:32] := FFFFFFFFH;
+    ELSE DEST[63:32] := 0; FI;
+
+PCMPEQD (With 128-bit Operands):
+
+DEST[127:0] := COMPARE_DWORDS_EQUAL(DEST[127:0],SRC[127:0])
+DEST[MAXVL-1:128] (Unmodified)
+VPCMPEQD (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_DWORDS_EQUAL(SRC1[127:0],SRC2[127:0])
+DEST[MAXVL-1:128] := 0
+VPCMPEQD (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_DWORDS_EQUAL(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_DWORDS_EQUAL(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPEQD (EVEX Encoded Versions):
+
+(KL, VL) = (4, 128), (8, 256), (16, 512)
+FOR j := 0 TO KL-1
+    i := j * 32
+    IF k2[j] OR *no writemask*
+        THEN
+            /* signed comparison */
+            IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                THEN CMP := SRC1[i+31:i] = SRC2[31:0];
+                ELSE CMP := SRC1[i+31:i] = SRC2[i+31:i];
+            FI;
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking only
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalents:
+
+VPCMPEQB __mmask64 _mm512_cmpeq_epi8_mask(__m512i a, __m512i b);
+VPCMPEQB __mmask64 _mm512_mask_cmpeq_epi8_mask(__mmask64 k, __m512i a, __m512i b);
+VPCMPEQB __mmask32 _mm256_cmpeq_epi8_mask(__m256i a, __m256i b);
+VPCMPEQB __mmask32 _mm256_mask_cmpeq_epi8_mask(__mmask32 k, __m256i a, __m256i b);
+VPCMPEQB __mmask16 _mm_cmpeq_epi8_mask(__m128i a, __m128i b);
+VPCMPEQB __mmask16 _mm_mask_cmpeq_epi8_mask(__mmask16 k, __m128i a, __m128i b);
+VPCMPEQW __mmask32 _mm512_cmpeq_epi16_mask(__m512i a, __m512i b);
+VPCMPEQW __mmask32 _mm512_mask_cmpeq_epi16_mask(__mmask32 k, __m512i a, __m512i b);
+VPCMPEQW __mmask16 _mm256_cmpeq_epi16_mask(__m256i a, __m256i b);
+VPCMPEQW __mmask16 _mm256_mask_cmpeq_epi16_mask(__mmask16 k, __m256i a, __m256i b);
+VPCMPEQW __mmask8 _mm_cmpeq_epi16_mask(__m128i a, __m128i b);
+VPCMPEQW __mmask8 _mm_mask_cmpeq_epi16_mask(__mmask8 k, __m128i a, __m128i b);
+VPCMPEQD __mmask16 _mm512_cmpeq_epi32_mask( __m512i a, __m512i b);
+VPCMPEQD __mmask16 _mm512_mask_cmpeq_epi32_mask(__mmask16 k, __m512i a, __m512i b);
+VPCMPEQD __mmask8 _mm256_cmpeq_epi32_mask(__m256i a, __m256i b);
+VPCMPEQD __mmask8 _mm256_mask_cmpeq_epi32_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPEQD __mmask8 _mm_cmpeq_epi32_mask(__m128i a, __m128i b);
+VPCMPEQD __mmask8 _mm_mask_cmpeq_epi32_mask(__mmask8 k, __m128i a, __m128i b);
+PCMPEQB __m64 _mm_cmpeq_pi8 (__m64 m1, __m64 m2)
+PCMPEQW __m64 _mm_cmpeq_pi16 (__m64 m1, __m64 m2)
+PCMPEQD __m64 _mm_cmpeq_pi32 (__m64 m1, __m64 m2)
+(V)PCMPEQB __m128i _mm_cmpeq_epi8 ( __m128i a, __m128i b)
+(V)PCMPEQW __m128i _mm_cmpeq_epi16 ( __m128i a, __m128i b)
+(V)PCMPEQD __m128i _mm_cmpeq_epi32 ( __m128i a, __m128i b)
+VPCMPEQB __m256i _mm256_cmpeq_epi8 ( __m256i a, __m256i b)
+VPCMPEQW __m256i _mm256_cmpeq_epi16 ( __m256i a, __m256i b)
+VPCMPEQD __m256i _mm256_cmpeq_epi32 ( __m256i a, __m256i b)
+
+Flags Affected:
+
+None.
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-21, “Type 4 Class Exception Conditions.”
+
+EVEX-encoded VPCMPEQD, see Table 2-49, “Type E4 Class Exception Conditions.”
+
+EVEX-encoded VPCMPEQB/W, see Exceptions Type E4.nb in Table 2-49, “Type E4 Class Exception Conditions.”
+
+
+PCMPEQQ — Compare Packed Qword Data for Equal
+
+Opcode/Instruction	                                                    Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+66 0F 38 29 /r PCMPEQQ xmm1, xmm2/m128	                                A	    V/V	                    SSE4_1	            Compare packed qwords in xmm2/m128 and xmm1 for equality.
+VEX.128.66.0F38.WIG 29 /r VPCMPEQQ xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed quadwords in xmm3/m128 and xmm2 for equality.
+VEX.256.66.0F38.WIG 29 /r VPCMPEQQ ymm1, ymm2, ymm3 /m256	            B	    V/V	                    AVX2	            Compare packed quadwords in ymm3/m256 and ymm2 for equality.
+EVEX.128.66.0F38.W1 29 /r VPCMPEQQ k1 {k2}, xmm2, xmm3/m128/m64bcst	    C	    V/V	                    AVX512VL AVX512F	Compare Equal between int64 vector xmm2 and int64 vector xmm3/m128/m64bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F38.W1 29 /r VPCMPEQQ k1 {k2}, ymm2, ymm3/m256/m64bcst	    C	    V/V	                    AVX512VL AVX512F	Compare Equal between int64 vector ymm2 and int64 vector ymm3/m256/m64bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F38.W1 29 /r VPCMPEQQ k1 {k2}, zmm2, zmm3/m512/m64bcst	    C	    V/V	                    AVX512F	            Compare Equal between int64 vector zmm2 and int64 vector zmm3/m512/m64bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	        ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	        ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Full	    ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Performs an SIMD compare for equality of the packed quadwords in the destination operand (first operand) and the source operand (second operand). If a pair of data elements is equal, the corresponding data element in the destination is set to all 1s; otherwise, it is set to 0s.
+
+128-bit Legacy SSE version: The second source operand can be an XMM register or a 128-bit memory location. The first source and destination operands are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM destination register remain unchanged.
+
+VEX.128 encoded version: The second source operand can be an XMM register or a 128-bit memory location. The first source and destination operands are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM register are zeroed.
+
+VEX.256 encoded version: The first source operand is a YMM register. The second source operand is a YMM register or a 256-bit memory location. The destination operand is a YMM register.
+
+EVEX encoded VPCMPEQQ: The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location or a 512/256/128-bit vector broadcasted from a 64-bit memory location. The destination operand (first operand) is a mask register updated according to the writemask k2.
+
+Operation:
+
+PCMPEQQ (With 128-bit Operands):
+
+IF (DEST[63:0] = SRC[63:0])
+    THEN DEST[63:0] := FFFFFFFFFFFFFFFFH;
+    ELSE DEST[63:0] := 0; FI;
+IF (DEST[127:64] = SRC[127:64])
+    THEN DEST[127:64] := FFFFFFFFFFFFFFFFH;
+    ELSE DEST[127:64] := 0; FI;
+DEST[MAXVL-1:128] (Unmodified)
+
+COMPARE_QWORDS_EQUAL (SRC1, SRC2):
+
+IF SRC1[63:0] = SRC2[63:0]
+THEN DEST[63:0] := FFFFFFFFFFFFFFFFH;
+ELSE DEST[63:0] := 0; FI;
+IF SRC1[127:64] = SRC2[127:64]
+THEN DEST[127:64] := FFFFFFFFFFFFFFFFH;
+ELSE DEST[127:64] := 0; FI;
+
+VPCMPEQQ (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_QWORDS_EQUAL(SRC1,SRC2)
+DEST[MAXVL-1:128] := 0
+
+VPCMPEQQ (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_QWORDS_EQUAL(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_QWORDS_EQUAL(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPEQQ (EVEX Encoded Versions):
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 64
+    IF k2[j] OR *no writemask*
+        THEN
+            IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                THEN CMP := SRC1[i+63:i] = SRC2[63:0];
+                ELSE CMP := SRC1[i+63:i] = SRC2[i+63:i];
+            FI;
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking only
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VPCMPEQQ __mmask8 _mm512_cmpeq_epi64_mask( __m512i a, __m512i b);
+VPCMPEQQ __mmask8 _mm512_mask_cmpeq_epi64_mask(__mmask8 k, __m512i a, __m512i b);
+VPCMPEQQ __mmask8 _mm256_cmpeq_epi64_mask( __m256i a, __m256i b);
+VPCMPEQQ __mmask8 _mm256_mask_cmpeq_epi64_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPEQQ __mmask8 _mm_cmpeq_epi64_mask( __m128i a, __m128i b);
+VPCMPEQQ __mmask8 _mm_mask_cmpeq_epi64_mask(__mmask8 k, __m128i a, __m128i b);
+(V)PCMPEQQ __m128i _mm_cmpeq_epi64(__m128i a, __m128i b);
+VPCMPEQQ __m256i _mm256_cmpeq_epi64( __m256i a, __m256i b);
+
+Flags Affected:
+
+None.
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-21, “Type 4 Class Exception Conditions.”
+
+EVEX-encoded VPCMPEQQ, see Table 2-49, “Type E4 Class Exception Conditions.”
+
+
+PCMPGTB/PCMPGTW/PCMPGTD — Compare Packed Signed Integers for Greater Than
+
+Opcode/Instruction	                                                Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+NP 0F 64 /r1 PCMPGTB mm, mm/m64	                                    A	    V/V	                    MMX	                Compare packed signed byte integers in mm and mm/m64 for greater than.
+66 0F 64 /r PCMPGTB xmm1, xmm2/m128	                                A	    V/V	                    SSE2	            Compare packed signed byte integers in xmm1 and xmm2/m128 for greater than.
+NP 0F 65 /r1 PCMPGTW mm, mm/m64	                                    A	    V/V	                    MMX	                Compare packed signed word integers in mm and mm/m64 for greater than.
+66 0F 65 /r PCMPGTW xmm1, xmm2/m128	                                A	    V/V	                    SSE2	            Compare packed signed word integers in xmm1 and xmm2/m128 for greater than.
+NP 0F 66 /r1 PCMPGTD mm, mm/m64	                                    A	    V/V	                    MMX	                Compare packed signed doubleword integers in mm and mm/m64 for greater than.
+66 0F 66 /r PCMPGTD xmm1, xmm2/m128	                                A	    V/V	                    SSE2	            Compare packed signed doubleword integers in xmm1 and xmm2/m128 for greater than.
+VEX.128.66.0F.WIG 64 /r VPCMPGTB xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed signed byte integers in xmm2 and xmm3/m128 for greater than.
+VEX.128.66.0F.WIG 65 /r VPCMPGTW xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed signed word integers in xmm2 and xmm3/m128 for greater than.
+VEX.128.66.0F.WIG 66 /r VPCMPGTD xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed signed doubleword integers in xmm2 and xmm3/m128 for greater than.
+VEX.256.66.0F.WIG 64 /r VPCMPGTB ymm1, ymm2, ymm3/m256	            B	    V/V	                    AVX2	            Compare packed signed byte integers in ymm2 and ymm3/m256 for greater than.
+VEX.256.66.0F.WIG 65 /r VPCMPGTW ymm1, ymm2, ymm3/m256	            B	    V/V	                    AVX2	            Compare packed signed word integers in ymm2 and ymm3/m256 for greater than.
+VEX.256.66.0F.WIG 66 /r VPCMPGTD ymm1, ymm2, ymm3/m256	            B	    V/V	                    AVX2	            Compare packed signed doubleword integers in ymm2 and ymm3/m256 for greater than.
+EVEX.128.66.0F.W0 66 /r VPCMPGTD k1 {k2}, xmm2, xmm3/m128/m32bcst	C	    V/V	                    AVX512VL AVX512F	Compare Greater between int32 vector xmm2 and int32 vector xmm3/m128/m32bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F.W0 66 /r VPCMPGTD k1 {k2}, ymm2, ymm3/m256/m32bcst	C	    V/V	                    AVX512VL AVX512F	Compare Greater between int32 vector ymm2 and int32 vector ymm3/m256/m32bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F.W0 66 /r VPCMPGTD k1 {k2}, zmm2, zmm3/m512/m32bcst	C	    V/V	                    AVX512F	            Compare Greater between int32 elements in zmm2 and zmm3/m512/m32bcst, and set destination k1 according to the comparison results under writemask. k2.   
+EVEX.128.66.0F.WIG 64 /r VPCMPGTB k1 {k2}, xmm2, xmm3/m128	        D	    V/V	                    AVX512VL AVX512BW	Compare packed signed byte integers in xmm2 and xmm3/m128 for greater than, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F.WIG 64 /r VPCMPGTB k1 {k2}, ymm2, ymm3/m256	        D	    V/V	                    AVX512VL AVX512BW	Compare packed signed byte integers in ymm2 and ymm3/m256 for greater than, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F.WIG 64 /r VPCMPGTB k1 {k2}, zmm2, zmm3/m512	        D	    V/V	                    AVX512BW	        Compare packed signed byte integers in zmm2 and zmm3/m512 for greater than, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.128.66.0F.WIG 65 /r VPCMPGTW k1 {k2}, xmm2, xmm3/m128	        D	    V/V	                    AVX512VL AVX512BW	Compare packed signed word integers in xmm2 and xmm3/m128 for greater than, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F.WIG 65 /r VPCMPGTW k1 {k2}, ymm2, ymm3/m256	        D	    V/V	                    AVX512VL AVX512BW	Compare packed signed word integers in ymm2 and ymm3/m256 for greater than, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F.WIG 65 /r VPCMPGTW k1 {k2}, zmm2, zmm3/m512	        D	    V/V	                    AVX512BW	        Compare packed signed word integers in zmm2 and zmm3/m512 for greater than, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+
+1. See note in Section 2.5, “Intel® AVX and Intel® SSE Instruction Exception Classification,” in the Intel® 64 and IA-32 Architectures Software Developer’s Manual, Volume 2A, and Section 23.25.3, “Exception Conditions of Legacy SIMD Instructions Operating on MMX Registers,” in the Intel® 64 and IA-32 Architectures Software Developer’s Manual, Volume 3B.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	        ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	        ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Full	    ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+D	    Full Mem	ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Performs an SIMD signed compare for the greater value of the packed byte, word, or doubleword integers in the destination operand (first operand) and the source operand (second operand). If a data element in the destination operand is greater than the corresponding date element in the source operand, the corresponding data element in the destination operand is set to all 1s; otherwise, it is set to all 0s.
+
+The PCMPGTB instruction compares the corresponding signed byte integers in the destination and source operands; the PCMPGTW instruction compares the corresponding signed word integers in the destination and source operands; and the PCMPGTD instruction compares the corresponding signed doubleword integers in the destination and source operands.
+
+In 64-bit mode and not encoded with VEX/EVEX, using a REX prefix in the form of REX.R permits this instruction to access additional registers (XMM8-XMM15).
+
+Legacy SSE instructions: The source operand can be an MMX technology register or a 64-bit memory location. The destination operand can be an MMX technology register.
+
+128-bit Legacy SSE version: The second source operand can be an XMM register or a 128-bit memory location. The first source operand and destination operand are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM destination register remain unchanged.
+
+VEX.128 encoded version: The second source operand can be an XMM register or a 128-bit memory location. The first source operand and destination operand are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM register are zeroed.
+
+VEX.256 encoded version: The first source operand is a YMM register. The second source operand is a YMM register or a 256-bit memory location. The destination operand is a YMM register.
+
+EVEX encoded VPCMPGTD: The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location or a 512/256/128-bit vector broadcasted from a 32-bit memory location. The destination operand (first operand) is a mask register updated according to the writemask k2.
+
+EVEX encoded VPCMPGTB/W: The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location. The destination operand (first operand) is a mask register updated according to the writemask k2.
+
+Operation:
+
+PCMPGTB (With 64-bit Operands):
+
+IF DEST[7:0] > SRC[7:0]
+    THEN DEST[7:0) := FFH;
+    ELSE DEST[7:0] := 0; FI;
+(* Continue comparison of 2nd through 7th bytes in DEST and SRC *)
+IF DEST[63:56] > SRC[63:56]
+    THEN DEST[63:56] := FFH;
+    ELSE DEST[63:56] := 0; FI;
+
+COMPARE_BYTES_GREATER (SRC1, SRC2):
+
+    IF SRC1[7:0] > SRC2[7:0]
+    THEN DEST[7:0] := FFH;
+    ELSE DEST[7:0] := 0; FI;
+(* Continue comparison of 2nd through 15th bytes in SRC1 and SRC2 *)
+    IF SRC1[127:120] > SRC2[127:120]
+    THEN DEST[127:120] := FFH;
+    ELSE DEST[127:120] := 0; FI;
+
+COMPARE_WORDS_GREATER (SRC1, SRC2):
+
+    IF SRC1[15:0] > SRC2[15:0]
+    THEN DEST[15:0] := FFFFH;
+    ELSE DEST[15:0] := 0; FI;
+(* Continue comparison of 2nd through 7th 16-bit words in SRC1 and SRC2 *)
+    IF SRC1[127:112] > SRC2[127:112]
+    THEN DEST[127:112] := FFFFH;
+    ELSE DEST[127:112] := 0; FI;
+
+COMPARE_DWORDS_GREATER (SRC1, SRC2):
+
+    IF SRC1[31:0] > SRC2[31:0]
+    THEN DEST[31:0] := FFFFFFFFH;
+    ELSE DEST[31:0] := 0; FI;
+(* Continue comparison of 2nd through 3rd 32-bit dwords in SRC1 and SRC2 *)
+    IF SRC1[127:96] > SRC2[127:96]
+    THEN DEST[127:96] := FFFFFFFFH;
+    ELSE DEST[127:96] := 0; FI;
+
+PCMPGTB (With 128-bit Operands):
+
+DEST[127:0] := COMPARE_BYTES_GREATER(DEST[127:0],SRC[127:0])
+DEST[MAXVL-1:128] (Unmodified)
+
+VPCMPGTB (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_BYTES_GREATER(SRC1,SRC2)
+DEST[MAXVL-1:128] := 0
+
+VPCMPGTB (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_BYTES_GREATER(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_BYTES_GREATER(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPGTB (EVEX Encoded Versions):
+
+(KL, VL) = (16, 128), (32, 256), (64, 512)
+FOR j := 0 TO KL-1
+    i := j * 8
+    IF k2[j] OR *no writemask*
+        THEN
+            /* signed comparison */
+            CMP := SRC1[i+7:i] > SRC2[i+7:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+PCMPGTW (With 64-bit Operands):
+
+IF DEST[15:0] > SRC[15:0]
+    THEN DEST[15:0] := FFFFH;
+    ELSE DEST[15:0] := 0; FI;
+(* Continue comparison of 2nd and 3rd words in DEST and SRC *)
+IF DEST[63:48] > SRC[63:48]
+    THEN DEST[63:48] := FFFFH;
+    ELSE DEST[63:48] := 0; FI;
+
+PCMPGTW (With 128-bit Operands):
+
+DEST[127:0] := COMPARE_WORDS_GREATER(DEST[127:0],SRC[127:0])
+DEST[MAXVL-1:128] (Unmodified)
+
+VPCMPGTW (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_WORDS_GREATER(SRC1,SRC2)
+DEST[MAXVL-1:128] := 0
+
+VPCMPGTW (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_WORDS_GREATER(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_WORDS_GREATER(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPGTW (EVEX Encoded Versions):
+
+(KL, VL) = (8, 128), (16, 256), (32, 512)
+FOR j := 0 TO KL-1
+    i := j * 16
+    IF k2[j] OR *no writemask*
+        THEN
+            /* signed comparison */
+            CMP := SRC1[i+15:i] > SRC2[i+15:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+PCMPGTD (With 64-bit Operands):
+
+IF DEST[31:0] > SRC[31:0]
+    THEN DEST[31:0] := FFFFFFFFH;
+    ELSE DEST[31:0] := 0; FI;
+IF DEST[63:32] > SRC[63:32]
+    THEN DEST[63:32] := FFFFFFFFH;
+    ELSE DEST[63:32] := 0; FI;
+
+PCMPGTD (With 128-bit Operands):
+
+DEST[127:0] := COMPARE_DWORDS_GREATER(DEST[127:0],SRC[127:0])
+DEST[MAXVL-1:128] (Unmodified)
+
+VPCMPGTD (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_DWORDS_GREATER(SRC1,SRC2)
+DEST[MAXVL-1:128] := 0
+
+VPCMPGTD (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_DWORDS_GREATER(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_DWORDS_GREATER(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPGTD (EVEX Encoded Versions):
+
+(KL, VL) = (4, 128), (8, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 32
+    IF k2[j] OR *no writemask*
+                THEN
+                    /* signed comparison */
+                    IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                        THEN CMP := SRC1[i+31:i] > SRC2[31:0];
+                        ELSE CMP := SRC1[i+31:i] > SRC2[i+31:i];
+                    FI;
+                    IF CMP = TRUE
+                        THEN DEST[j] := 1;
+                        ELSE DEST[j] := 0; FI;
+                ELSE
+                        DEST[j] := 0
+                            ; zeroing-masking only
+        I
+            ;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalents:
+
+VPCMPGTB __mmask64 _mm512_cmpgt_epi8_mask(__m512i a, __m512i b);
+VPCMPGTB __mmask64 _mm512_mask_cmpgt_epi8_mask(__mmask64 k, __m512i a, __m512i b);
+VPCMPGTB __mmask32 _mm256_cmpgt_epi8_mask(__m256i a, __m256i b);
+VPCMPGTB __mmask32 _mm256_mask_cmpgt_epi8_mask(__mmask32 k, __m256i a, __m256i b);
+VPCMPGTB __mmask16 _mm_cmpgt_epi8_mask(__m128i a, __m128i b);
+VPCMPGTB __mmask16 _mm_mask_cmpgt_epi8_mask(__mmask16 k, __m128i a, __m128i b);
+VPCMPGTD __mmask16 _mm512_cmpgt_epi32_mask(__m512i a, __m512i b);
+VPCMPGTD __mmask16 _mm512_mask_cmpgt_epi32_mask(__mmask16 k, __m512i a, __m512i b);
+VPCMPGTD __mmask8 _mm256_cmpgt_epi32_mask(__m256i a, __m256i b);
+VPCMPGTD __mmask8 _mm256_mask_cmpgt_epi32_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPGTD __mmask8 _mm_cmpgt_epi32_mask(__m128i a, __m128i b);
+VPCMPGTD __mmask8 _mm_mask_cmpgt_epi32_mask(__mmask8 k, __m128i a, __m128i b);
+VPCMPGTW __mmask32 _mm512_cmpgt_epi16_mask(__m512i a, __m512i b);
+VPCMPGTW __mmask32 _mm512_mask_cmpgt_epi16_mask(__mmask32 k, __m512i a, __m512i b);
+VPCMPGTW __mmask16 _mm256_cmpgt_epi16_mask(__m256i a, __m256i b);
+VPCMPGTW __mmask16 _mm256_mask_cmpgt_epi16_mask(__mmask16 k, __m256i a, __m256i b);
+VPCMPGTW __mmask8 _mm_cmpgt_epi16_mask(__m128i a, __m128i b);
+VPCMPGTW __mmask8 _mm_mask_cmpgt_epi16_mask(__mmask8 k, __m128i a, __m128i b);
+PCMPGTB __m64 _mm_cmpgt_pi8 (__m64 m1, __m64 m2)
+PCMPGTW __m64 _mm_cmpgt_pi16 (__m64 m1, __m64 m2)
+PCMPGTD __m64 _mm_cmpgt_pi32 (__m64 m1, __m64 m2)
+(V)PCMPGTB __m128i _mm_cmpgt_epi8 ( __m128i a, __m128i b)
+(V)PCMPGTW __m128i _mm_cmpgt_epi16 ( __m128i a, __m128i b)
+(V)DCMPGTD __m128i _mm_cmpgt_epi32 ( __m128i a, __m128i b)
+VPCMPGTB __m256i _mm256_cmpgt_epi8 ( __m256i a, __m256i b)
+VPCMPGTW __m256i _mm256_cmpgt_epi16 ( __m256i a, __m256i b)
+VPCMPGTD __m256i _mm256_cmpgt_epi32 ( __m256i a, __m256i b)
+
+Flags Affected:
+
+None.
+
+Numeric Exceptions:
+
+None.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-21, “Type 4 Class Exception Conditions.”
+
+EVEX-encoded VPCMPGTD, see Table 2-49, “Type E4 Class Exception Conditions.”
+
+EVEX-encoded VPCMPGTB/W, see Exceptions Type E4.nb in Table 2-49, “Type E4 Class Exception Conditions.”
+
+
+
+
+
+PCMPGTQ — Compare Packed Data for Greater Than
+
+Opcode/Instruction	                                                    Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+66 0F 38 37 /r PCMPGTQ xmm1,xmm2/m128	                                A	    V/V	                    SSE4_2	            Compare packed signed qwords in xmm2/m128 and xmm1 for greater than.
+VEX.128.66.0F38.WIG 37 /r VPCMPGTQ xmm1, xmm2, xmm3/m128	            B	    V/V	                    AVX	                Compare packed signed qwords in xmm2 and xmm3/m128 for greater than.    
+VEX.256.66.0F38.WIG 37 /r VPCMPGTQ ymm1, ymm2, ymm3/m256	            B	    V/V	                    AVX2	            Compare packed signed qwords in ymm2 and ymm3/m256 for greater than.
+EVEX.128.66.0F38.W1 37 /r VPCMPGTQ k1 {k2}, xmm2, xmm3/m128/m64bcst	    C	    V/V	                    AVX512VL AVX512F	Compare Greater between int64 vector xmm2 and int64 vector xmm3/m128/m64bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.256.66.0F38.W1 37 /r VPCMPGTQ k1 {k2}, ymm2, ymm3/m256/m64bcst	    C	    V/V                     AVX512VL AVX512F	Compare Greater between int64 vector ymm2 and int64 vector ymm3/m256/m64bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+EVEX.512.66.0F38.W1 37 /r VPCMPGTQ k1 {k2}, zmm2, zmm3/m512/m64bcst	    C	    V/V	                    AVX512F	            Compare Greater between int64 vector zmm2 and int64 vector zmm3/m512/m64bcst, and set vector mask k1 to reflect the zero/nonzero status of each element of the result, under writemask.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	        Operand 2	    Operand 3	    Operand 4
+A	    N/A	        ModRM:reg (r, w)	ModRM:r/m (r)	N/A	            N/A
+B	    N/A	        ModRM:reg (w)	    VEX.vvvv (r)	ModRM:r/m (r)	N/A
+C	    Full	    ModRM:reg (w)	    EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Performs an SIMD signed compare for the packed quadwords in the destination operand (first operand) and the source operand (second operand). If the data element in the first (destination) operand is greater than the corresponding element in the second (source) operand, the corresponding data element in the destination is set to all 1s; otherwise, it is set to 0s.
+
+128-bit Legacy SSE version: The second source operand can be an XMM register or a 128-bit memory location. The first source operand and destination operand are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM destination register remain unchanged.
+
+VEX.128 encoded version: The second source operand can be an XMM register or a 128-bit memory location. The first source operand and destination operand are XMM registers. Bits (MAXVL-1:128) of the corresponding YMM register are zeroed.
+
+VEX.256 encoded version: The first source operand is a YMM register. The second source operand is a YMM register or a 256-bit memory location. The destination operand is a YMM register.
+
+EVEX encoded VPCMPGTD/Q: The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register, a 512/256/128-bit memory location or a 512/256/128-bit vector broadcasted from a 64-bit memory location. The destination operand (first operand) is a mask register updated according to the writemask k2.
+
+Operation:
+
+COMPARE_QWORDS_GREATER (SRC1, SRC2):
+
+IF SRC1[63:0] > SRC2[63:0]
+THEN DEST[63:0] := FFFFFFFFFFFFFFFFH;
+ELSE DEST[63:0] := 0; FI;
+IF SRC1[127:64] > SRC2[127:64]
+THEN DEST[127:64] := FFFFFFFFFFFFFFFFH;
+ELSE DEST[127:64] := 0; FI;
+
+VPCMPGTQ (VEX.128 Encoded Version):
+
+DEST[127:0] := COMPARE_QWORDS_GREATER(SRC1,SRC2)
+DEST[MAXVL-1:128] := 0
+
+VPCMPGTQ (VEX.256 Encoded Version):
+
+DEST[127:0] := COMPARE_QWORDS_GREATER(SRC1[127:0],SRC2[127:0])
+DEST[255:128] := COMPARE_QWORDS_GREATER(SRC1[255:128],SRC2[255:128])
+DEST[MAXVL-1:256] := 0
+
+VPCMPGTQ (EVEX Encoded Versions):
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 64
+    IF k2[j] OR *no writemask*
+        THEN
+            /* signed comparison */
+            IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                THEN CMP := SRC1[i+63:i] > SRC2[63:0];
+                ELSE CMP := SRC1[i+63:i] > SRC2[i+63:i];
+            FI;
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking only
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VPCMPGTQ __mmask8 _mm512_cmpgt_epi64_mask( __m512i a, __m512i b);
+VPCMPGTQ __mmask8 _mm512_mask_cmpgt_epi64_mask(__mmask8 k, __m512i a, __m512i b);
+VPCMPGTQ __mmask8 _mm256_cmpgt_epi64_mask( __m256i a, __m256i b);
+VPCMPGTQ __mmask8 _mm256_mask_cmpgt_epi64_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPGTQ __mmask8 _mm_cmpgt_epi64_mask( __m128i a, __m128i b);
+VPCMPGTQ __mmask8 _mm_mask_cmpgt_epi64_mask(__mmask8 k, __m128i a, __m128i b);
+(V)PCMPGTQ __m128i _mm_cmpgt_epi64(__m128i a, __m128i b)
+VPCMPGTQ __m256i _mm256_cmpgt_epi64( __m256i a, __m256i b);
+
+Flags Affected:
+
+None.
+
+SIMD Floating-Point Exceptions:
+
+None.
+
+Other Exceptions:
+
+Non-EVEX-encoded instruction, see Table 2-21, “Type 4 Class Exception Conditions.”
+
+EVEX-encoded VPCMPGTQ, see Table 2-49, “Type E4 Class Exception Conditions.”
+
+
+
+
+
+VCMPPH — Compare Packed FP16 Values
+
+Opcode/Instruction	                                                                Op/En	64/32 bit Mode Support	CPUID Feature Flag	    Description
+EVEX.128.NP.0F3A.W0 C2 /r /ib VCMPPH k1{k2}, xmm2, xmm3/m128/m16bcst, imm8	        A	    V/V	                    AVX512-FP16 AVX512VL	Compare packed FP16 values in xmm3/m128/m16bcst and xmm2 using bits 4:0 of imm8 as a comparison predicate subject to writemask k2, and store the result in mask register k1.
+EVEX.256.NP.0F3A.W0 C2 /r /ib VCMPPH k1{k2}, ymm2, ymm3/m256/m16bcst, imm8	        A	    V/V	                    AVX512-FP16 AVX512VL	Compare packed FP16 values in ymm3/m256/m16bcst and ymm2 using bits 4:0 of imm8 as a comparison predicate subject to writemask k2, and store the result in mask register k1.
+EVEX.512.NP.0F3A.W0 C2 /r /ib VCMPPH k1{k2}, zmm2, zmm3/m512/m16bcst {sae}, imm8	A	    V/V	                    AVX512-FP16	            Compare packed FP16 values in zmm3/m512/m16bcst and zmm2 using bits 4:0 of imm8 as a comparison predicate subject to writemask k2, and store the result in mask register k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	imm8 (r)
+
+Description:
+
+This instruction compares packed FP16 values from source operands and stores the result in the destination mask operand. The comparison predicate operand (immediate byte bits 4:0) specifies the type of comparison performed on each of the pairs of packed values. The destination elements are updated according to the writemask.
+
+Operation:
+
+CASE (imm8 & 0x1F) OF
+0: CMP_OPERATOR := EQ_OQ;
+1: CMP_OPERATOR := LT_OS;
+2: CMP_OPERATOR := LE_OS;
+3: CMP_OPERATOR := UNORD_Q;
+4: CMP_OPERATOR := NEQ_UQ;
+5: CMP_OPERATOR := NLT_US;
+6: CMP_OPERATOR := NLE_US;
+7: CMP_OPERATOR := ORD_Q;
+8: CMP_OPERATOR := EQ_UQ;
+9: CMP_OPERATOR := NGE_US;
+10: CMP_OPERATOR := NGT_US;
+11: CMP_OPERATOR := FALSE_OQ;
+12: CMP_OPERATOR := NEQ_OQ;
+13: CMP_OPERATOR := GE_OS;
+14: CMP_OPERATOR := GT_OS;
+15: CMP_OPERATOR := TRUE_UQ;
+16: CMP_OPERATOR := EQ_OS;
+17: CMP_OPERATOR := LT_OQ;
+18: CMP_OPERATOR := LE_OQ;
+19: CMP_OPERATOR := UNORD_S;
+20: CMP_OPERATOR := NEQ_US;
+21: CMP_OPERATOR := NLT_UQ;
+22: CMP_OPERATOR := NLE_UQ;
+23: CMP_OPERATOR := ORD_S;
+24: CMP_OPERATOR := EQ_US;
+25: CMP_OPERATOR := NGE_UQ;
+26: CMP_OPERATOR := NGT_UQ;
+27: CMP_OPERATOR := FALSE_OS;
+28: CMP_OPERATOR := NEQ_OS;
+29: CMP_OPERATOR := GE_OQ;
+30: CMP_OPERATOR := GT_OQ;
+31: CMP_OPERATOR := TRUE_US;
+ESAC
+
+VCMPPH (EVEX Encoded Versions):
+
+VL = 128, 256 or 512
+KL := VL/16
+FOR j := 0 TO KL-1:
+    IF k2[j] OR *no writemask*:
+        IF EVEX.b = 1:
+            tsrc2 := SRC2.fp16[0]
+        ELSE:
+            tsrc2 := SRC2.fp16[j]
+        DEST.bit[j] := SRC1.fp16[j] CMP_OPERATOR tsrc2
+    ELSE
+        DEST.bit[j] := 0
+DEST[MAXKL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VCMPPH ___mmask8 _mm_cmp_ph_mask (__m128h a, __m128h b, const int imm8);
+VCMPPH ___mmask8 _mm_mask_cmp_ph_mask (__mmask8 k1, __m128h a, __m128h b, const int imm8);
+VCMPPH ___mmask16 _mm256_cmp_ph_mask (__m256h a, __m256h b, const int imm8);
+VCMPPH ___mmask16 _mm256_mask_cmp_ph_mask (__mmask16 k1, __m256h a, __m256h b, const int imm8);
+VCMPPH ___mmask32 _mm512_cmp_ph_mask (__m512h a, __m512h b, const int imm8);
+VCMPPH ___mmask32 _mm512_mask_cmp_ph_mask (__mmask32 k1, __m512h a, __m512h b, const int imm8);
+VCMPPH ___mmask32 _mm512_cmp_round_ph_mask (__m512h a, __m512h b, const int imm8, const int sae);
+VCMPPH ___mmask32 _mm512_mask_cmp_round_ph_mask (__mmask32 k1, __m512h a, __m512h b, const int imm8, const int sae);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-46, “Type E2 Class Exception Conditions.”
+
+
+
+VCMPSH — Compare Scalar FP16 Values
+
+Opcode/Instruction	                                                        Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.LLIG.F3.0F3A.W0 C2 /r /ib VCMPSH k1{k2}, xmm2, xmm3/m16 {sae}, imm8	A	    V/V	                    AVX512-FP16	        Compare low FP16 values in xmm3/m16 and xmm2 using bits 4:0 of imm8 as a comparison predicate subject to writemask k2, and store the result in mask register k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Scalar	ModRM:reg (w)	VEX.vvvv (r)	ModRM:r/m (r)	imm8 (r)
+
+Description:
+
+This instruction compares the FP16 values from the lowest element of the source operands and stores the result in the destination mask operand. The comparison predicate operand (immediate byte bits 4:0) specifies the type of comparison performed on the pair of packed FP16 values. The low destination bit is updated according to the writemask. Bits MAXKL-1:1 of the destination operand are zeroed.
+
+Operation:
+
+CASE (imm8 & 0x1F) OF
+0: CMP_OPERATOR := EQ_OQ;
+1: CMP_OPERATOR := LT_OS;
+2: CMP_OPERATOR := LE_OS;
+3: CMP_OPERATOR := UNORD_Q;
+4: CMP_OPERATOR := NEQ_UQ;
+5: CMP_OPERATOR := NLT_US;
+6: CMP_OPERATOR := NLE_US;
+7: CMP_OPERATOR := ORD_Q;
+8: CMP_OPERATOR := EQ_UQ;
+9: CMP_OPERATOR := NGE_US;
+10: CMP_OPERATOR := NGT_US;
+11: CMP_OPERATOR := FALSE_OQ;
+12: CMP_OPERATOR := NEQ_OQ;
+13: CMP_OPERATOR := GE_OS;
+14: CMP_OPERATOR := GT_OS;
+15: CMP_OPERATOR := TRUE_UQ;
+16: CMP_OPERATOR := EQ_OS;
+17: CMP_OPERATOR := LT_OQ;
+18: CMP_OPERATOR := LE_OQ;
+19: CMP_OPERATOR := UNORD_S;
+20: CMP_OPERATOR := NEQ_US;
+21: CMP_OPERATOR := NLT_UQ;
+22: CMP_OPERATOR := NLE_UQ;
+23: CMP_OPERATOR := ORD_S;
+24: CMP_OPERATOR := EQ_US;
+25: CMP_OPERATOR := NGE_UQ;
+26: CMP_OPERATOR := NGT_UQ;
+27: CMP_OPERATOR := FALSE_OS;
+28: CMP_OPERATOR := NEQ_OS;
+29: CMP_OPERATOR := GE_OQ;
+30: CMP_OPERATOR := GT_OQ;
+31: CMP_OPERATOR := TRUE_US;
+ESAC
+
+VCMPSH (EVEX Encoded Versions):
+
+IF k2[0] OR *no writemask*:
+    DEST.bit[0] := SRC1.fp16[0] CMP_OPERATOR SRC2.fp16[0]
+ELSE
+    DEST.bit[0] := 0
+DEST[MAXKL-1:1] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VCMPSH __mmask8 _mm_cmp_round_sh_mask (__m128h a, __m128h b, const int imm8, const int sae);
+VCMPSH __mmask8 _mm_mask_cmp_round_sh_mask (__mmask8 k1, __m128h a, __m128h b, const int imm8, const int sae);
+VCMPSH __mmask8 _mm_cmp_sh_mask (__m128h a, __m128h b, const int imm8);
+VCMPSH __mmask8 _mm_mask_cmp_sh_mask (__mmask8 k1, __m128h a, __m128h b, const int imm8);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions ¶
+
+EVEX-encoded instructions, see Table 2-47, “Type E3 Class Exception Conditions.”
+
+
+
+VCOMISH — Compare Scalar Ordered FP16 Values and Set EFLAGS
+
+Opcode/Instruction	                                        Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.LLIG.NP.MAP5.W0 2F /r VCOMISH xmm1, xmm2/m16 {sae}     A       V/V                     AVX512-FP16         Compare low FP16 values in xmm1 and xmm2/m16, and set the EFLAGS flags accordingly.
+EVEX.LLIG.NP.MAP5.W0 2F /r VCOMISH xmm1, xmm2/m16 {sae}     A       64/32                   AVX512-FP16         Compare low FP16 values in xmm1 and xmm2/m16, and set the EFLAGS flags accordingly.
+EVEX.LLIG.NP.MAP5.W0 2F /r VCOMISH xmm1, xmm2/m16 {sae}     A       V/V                     AVX512-FP16         Compare low FP16 values in xmm1 and xmm2/m16, and set the EFLAGS flags accordingly.
+EVEX.LLIG.NP.MAP5.W0 2F /r VCOMISH xmm1, xmm2/m16 {sae}     A       64/32                   AVX512-FP16         Compare low FP16 values in xmm1 and xmm2/m16, and set the EFLAGS flags accordingly.
+EVEX.LLIG.NP.MAP5.W0 2F /r VCOMISH xmm1, xmm2/m16 {sae}     A       V/V                     AVX512-FP16         Compare low FP16 values in xmm1 and xmm2/m16, and set the EFLAGS flags accordingly.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple	Operand 1	    Operand 2	    Operand 3	Operand 4
+A	    Scalar	ModRM:reg (r)	ModRM:r/m (r)	N/A	        N/A
+
+Description:
+
+This instruction compares the FP16 values in the low word of operand 1 (first operand) and operand 2 (second operand), and sets the ZF, PF, and CF flags in the EFLAGS register according to the result (unordered, greater than, less than, or equal). The OF, SF and AF flags in the EFLAGS register are set to 0. The unordered result is returned if either source operand is a NaN (QNaN or SNaN).
+
+Operand 1 is an XMM register; operand 2 can be an XMM register or a 16-bit memory location.
+
+The VCOMISH instruction differs from the VUCOMISH instruction in that it signals a SIMD floating-point invalid operation exception (#I) when a source operand is either a QNaN or SNaN. The VUCOMISH instruction signals an invalid numeric exception only if a source operand is an SNaN.
+
+The EFLAGS register is not updated if an unmasked SIMD floating-point exception is generated. EVEX.vvvv is reserved and must be 1111b, otherwise instructions will #UD.
+
+Operation:
+
+VCOMISH SRC1, SRC2:
+
+RESULT := OrderedCompare(SRC1.fp16[0],SRC2.fp16[0])
+IF RESULT is UNORDERED:
+    ZF, PF, CF := 1, 1, 1
+ELSE IF RESULT is GREATER_THAN:
+    ZF, PF, CF := 0, 0, 0
+ELSE IF RESULT is LESS_THAN:
+    ZF, PF, CF := 0, 0, 1
+ELSE: // RESULT is EQUALS
+    ZF, PF, CF := 1, 0, 0
+OF, AF, SF := 0, 0, 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VCOMISH int _mm_comi_round_sh (__m128h a, __m128h b, const int imm8, const int sae);
+VCOMISH int _mm_comi_sh (__m128h a, __m128h b, const int imm8);
+VCOMISH int _mm_comieq_sh (__m128h a, __m128h b);
+VCOMISH int _mm_comige_sh (__m128h a, __m128h b);
+VCOMISH int _mm_comigt_sh (__m128h a, __m128h b);
+VCOMISH int _mm_comile_sh (__m128h a, __m128h b);
+VCOMISH int _mm_comilt_sh (__m128h a, __m128h b);
+VCOMISH int _mm_comineq_sh (__m128h a, __m128h b);
+
+SIMD Floating-Point Exceptions:
+
+Invalid, Denormal.
+
+Other Exceptions:
+
+EVEX-encoded instructions, see Table 2-48, “Type E3NF Class Exception Conditions.”
+
+
+
+
+VPCMPB/VPCMPUB — Compare Packed Byte Values Into Mask
+
+Opcode/Instruction	Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.66.0F3A.W0 3F /r ib VPCMPB k1 {k2}, xmm2, xmm3/m128, imm8	    A	V/V	AVX512VL AVX512BW	Compare packed signed byte values in xmm3/m128 and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W0 3F /r ib VPCMPB k1 {k2}, ymm2, ymm3/m256, imm8	    A	V/V	AVX512VL AVX512BW	Compare packed signed byte values in ymm3/m256 and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W0 3F /r ib VPCMPB k1 {k2}, zmm2, zmm3/m512, imm8	    A	V/V	AVX512BW	Compare packed signed byte values in zmm3/m512 and zmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.128.66.0F3A.W0 3E /r ib VPCMPUB k1 {k2}, xmm2, xmm3/m128, imm8	    A	V/V	AVX512VL AVX512BW	Compare packed unsigned byte values in xmm3/m128 and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W0 3E /r ib VPCMPUB k1 {k2}, ymm2, ymm3/m256, imm8	    A	V/V	AVX512VL AVX512BW	Compare packed unsigned byte values in ymm3/m256 and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W0 3E /r ib VPCMPUB k1 {k2}, zmm2, zmm3/m512, imm8	    A	V/V	AVX512BW	Compare packed unsigned byte values in zmm3/m512 and zmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+Instruction Operand Encoding ¶
+
+Op/En	Tuple Type	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full Mem	ModRM:reg (w)	EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Performs a SIMD compare of the packed byte values in the second source operand and the first source operand and returns the results of the comparison to the mask destination operand. The comparison predicate operand (immediate byte) specifies the type of comparison performed on each pair of packed values in the two source operands. The result of each comparison is a single mask bit result of 1 (comparison true) or 0 (comparison false).
+
+VPCMPB performs a comparison between pairs of signed byte values.
+
+VPCMPUB performs a comparison between pairs of unsigned byte values.
+
+The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register or a 512/256/128-bit memory location. The destination operand (first operand) is a mask register k1. Up to 64/32/16 comparisons are performed with results written to the destination operand under the writemask k2.
+
+The comparison predicate operand is an 8-bit immediate: bits 2:0 define the type of comparison to be performed. Bits 3 through 7 of the immediate are reserved. Compiler can implement the pseudo-op mnemonic listed in Table 5-21.
+
+Pseudo-Op	                                            PCMPM Implementation
+VPCMPEQ* reg1, reg2, reg3	VPCMP* reg1, reg2, reg3,    0
+VPCMPLT* reg1, reg2, reg3	VPCMP*reg1, reg2, reg3,     1
+VPCMPLE* reg1, reg2, reg3	VPCMP* reg1, reg2, reg3,    2
+VPCMPNEQ* reg1, reg2, reg3	VPCMP* reg1, reg2, reg3,    4
+VPPCMPNLT* reg1, reg2, reg3	VPCMP* reg1, reg2, reg3,    5
+VPCMPNLE* reg1, reg2, reg3	VPCMP* reg1, reg2, reg3,    6
+Table 5-21. Pseudo-Op and VPCMP* Implementation
+
+Operation:
+
+CASE (COMPARISON PREDICATE) OF
+    0: OP := EQ;
+    1: OP := LT;
+    2: OP := LE;
+    3: OP := FALSE;
+    4: OP := NEQ;
+    5: OP := NLT;
+    6: OP := NLE;
+    7: OP := TRUE;
+ESAC;
+
+VPCMPB (EVEX encoded versions):
+
+(KL, VL) = (16, 128), (32, 256), (64, 512)
+FOR j := 0 TO KL-1
+    i := j * 8
+    IF k2[j] OR *no writemask*
+        THEN
+            CMP := SRC1[i+7:i] OP SRC2[i+7:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] = 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+VPCMPUB (EVEX encoded versions):
+
+(KL, VL) = (16, 128), (32, 256), (64, 512)
+FOR j := 0 TO KL-1
+    i := j * 8
+    IF k2[j] OR *no writemask*
+        THEN
+            CMP := SRC1[i+7:i] OP SRC2[i+7:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] = 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VPCMPB __mmask64 _mm512_cmp_epi8_mask( __m512i a, __m512i b, int cmp);
+VPCMPB __mmask64 _mm512_mask_cmp_epi8_mask( __mmask64 m, __m512i a, __m512i b, int cmp);
+VPCMPB __mmask32 _mm256_cmp_epi8_mask( __m256i a, __m256i b, int cmp);
+VPCMPB __mmask32 _mm256_mask_cmp_epi8_mask( __mmask32 m, __m256i a, __m256i b, int cmp);
+VPCMPB __mmask16 _mm_cmp_epi8_mask( __m128i a, __m128i b, int cmp);
+VPCMPB __mmask16 _mm_mask_cmp_epi8_mask( __mmask16 m, __m128i a, __m128i b, int cmp);
+VPCMPB __mmask64 _mm512_cmp[eq|ge|gt|le|lt|neq]_epi8_mask( __m512i a, __m512i b);
+VPCMPB __mmask64 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epi8_mask( __mmask64 m, __m512i a, __m512i b);
+VPCMPB __mmask32 _mm256_cmp[eq|ge|gt|le|lt|neq]_epi8_mask( __m256i a, __m256i b);
+VPCMPB __mmask32 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epi8_mask( __mmask32 m, __m256i a, __m256i b);
+VPCMPB __mmask16 _mm_cmp[eq|ge|gt|le|lt|neq]_epi8_mask( __m128i a, __m128i b);
+VPCMPB __mmask16 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epi8_mask( __mmask16 m, __m128i a, __m128i b);
+VPCMPUB __mmask64 _mm512_cmp_epu8_mask( __m512i a, __m512i b, int cmp);
+VPCMPUB __mmask64 _mm512_mask_cmp_epu8_mask( __mmask64 m, __m512i a, __m512i b, int cmp);
+VPCMPUB __mmask32 _mm256_cmp_epu8_mask( __m256i a, __m256i b, int cmp);
+VPCMPUB __mmask32 _mm256_mask_cmp_epu8_mask( __mmask32 m, __m256i a, __m256i b, int cmp);
+VPCMPUB __mmask16 _mm_cmp_epu8_mask( __m128i a, __m128i b, int cmp);
+VPCMPUB __mmask16 _mm_mask_cmp_epu8_mask( __mmask16 m, __m128i a, __m128i b, int cmp);
+VPCMPUB __mmask64 _mm512_cmp[eq|ge|gt|le|lt|neq]_epu8_mask( __m512i a, __m512i b, int cmp);
+VPCMPUB __mmask64 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epu8_mask( __mmask64 m, __m512i a, __m512i b, int cmp);
+VPCMPUB __mmask32 _mm256_cmp[eq|ge|gt|le|lt|neq]_epu8_mask( __m256i a, __m256i b, int cmp);
+VPCMPUB __mmask32 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epu8_mask( __mmask32 m, __m256i a, __m256i b, int cmp);
+VPCMPUB __mmask16 _mm_cmp[eq|ge|gt|le|lt|neq]_epu8_mask( __m128i a, __m128i b, int cmp);
+VPCMPUB __mmask16 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epu8_mask( __mmask16 m, __m128i a, __m128i b, int cmp);
+
+SIMD Floating-Point Exceptions:
+
+None
+
+Other Exceptions:
+
+EVEX-encoded instruction, see Exceptions Type E4.nb in Table 2-49, “Type E4 Class Exception Conditions.”
+
+
+
+VPCMPD/VPCMPUD — Compare Packed Integer Values Into Mask
+
+Opcode/Instruction	                                                            Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.66.0F3A.W0 1F /r ib VPCMPD k1 {k2}, xmm2, xmm3/m128/m32bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed signed doubleword integer values in xmm3/m128/m32bcst and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W0 1F /r ib VPCMPD k1 {k2}, ymm2, ymm3/m256/m32bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed signed doubleword integer values in ymm3/m256/m32bcst and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W0 1F /r ib VPCMPD k1 {k2}, zmm2, zmm3/m512/m32bcst, imm8	    A	    V/V	                    AVX512F	            Compare packed signed doubleword integer values in zmm2 and zmm3/m512/m32bcst using bits 2:0 of imm8 as a comparison predicate. The comparison results are written to the destination k1 under writemask k2.
+EVEX.128.66.0F3A.W0 1E /r ib VPCMPUD k1 {k2}, xmm2, xmm3/m128/m32bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed unsigned doubleword integer values in xmm3/m128/m32bcst and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W0 1E /r ib VPCMPUD k1 {k2}, ymm2, ymm3/m256/m32bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed unsigned doubleword integer values in ymm3/m256/m32bcst and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W0 1E /r ib VPCMPUD k1 {k2}, zmm2, zmm3/m512/m32bcst, imm8	    A	    V/V	                    AVX512F	            Compare packed unsigned doubleword integer values in zmm2 and zmm3/m512/m32bcst using bits 2:0 of imm8 as a comparison predicate. The comparison results are written to the destination k1 under writemask k2.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full	    ModRM:reg (w)	EVEX.vvvv (r)	ModRM:r/m (r)	imm8
+
+Description:
+
+Performs a SIMD compare of the packed integer values in the second source operand and the first source operand and returns the results of the comparison to the mask destination operand. The comparison predicate operand (immediate byte) specifies the type of comparison performed on each pair of packed values in the two source operands. The result of each comparison is a single mask bit result of 1 (comparison true) or 0 (comparison false).
+
+VPCMPD/VPCMPUD performs a comparison between pairs of signed/unsigned doubleword integer values.
+
+The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register or a 512/256/128-bit memory location or a 512-bit vector broadcasted from a 32-bit memory location. The destination operand (first operand) is a mask register k1. Up to 16/8/4 comparisons are performed with results written to the destination operand under the writemask k2.
+
+The comparison predicate operand is an 8-bit immediate: bits 2:0 define the type of comparison to be performed. Bits 3 through 7 of the immediate are reserved. Compiler can implement the pseudo-op mnemonic listed in Table 5-21.
+
+Operation:
+
+CASE (COMPARISON PREDICATE) OF
+    0: OP := EQ;
+    1: OP := LT;
+    2: OP := LE;
+    3: OP := FALSE;
+    4: OP := NEQ;
+    5: OP := NLT;
+    6: OP := NLE;
+    7: OP := TRUE;
+ESAC;
+
+VPCMPD (EVEX encoded versions):
+
+(KL, VL) = (4, 128), (8, 256), (16, 512)
+FOR j := 0 TO KL-1
+    i := j * 32
+    IF k2[j] OR *no writemask*
+        THEN
+            IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                THEN CMP := SRC1[i+31:i] OP SRC2[31:0];
+                ELSE CMP := SRC1[i+31:i] OP SRC2[i+31:i];
+            FI;
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+VPCMPUD (EVEX encoded versions):
+
+(KL, VL) = (4, 128), (8, 256), (16, 512)
+FOR j := 0 TO KL-1
+    i := j * 32
+    IF k2[j] OR *no writemask*
+        THEN
+            IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                THEN CMP := SRC1[i+31:i] OP SRC2[31:0];
+                ELSE CMP := SRC1[i+31:i] OP SRC2[i+31:i];
+            FI;
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking onlyFI;
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VPCMPD __mmask16 _mm512_cmp_epi32_mask( __m512i a, __m512i b, int imm);
+VPCMPD __mmask16 _mm512_mask_cmp_epi32_mask(__mmask16 k, __m512i a, __m512i b, int imm);
+VPCMPD __mmask16 _mm512_cmp[eq|ge|gt|le|lt|neq]_epi32_mask( __m512i a, __m512i b);
+VPCMPD __mmask16 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epi32_mask(__mmask16 k, __m512i a, __m512i b);
+VPCMPUD __mmask16 _mm512_cmp_epu32_mask( __m512i a, __m512i b, int imm);
+VPCMPUD __mmask16 _mm512_mask_cmp_epu32_mask(__mmask16 k, __m512i a, __m512i b, int imm);
+VPCMPUD __mmask16 _mm512_cmp[eq|ge|gt|le|lt|neq]_epu32_mask( __m512i a, __m512i b);
+VPCMPUD __mmask16 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epu32_mask(__mmask16 k, __m512i a, __m512i b);
+VPCMPD __mmask8 _mm256_cmp_epi32_mask( __m256i a, __m256i b, int imm);
+VPCMPD __mmask8 _mm256_mask_cmp_epi32_mask(__mmask8 k, __m256i a, __m256i b, int imm);
+VPCMPD __mmask8 _mm256_cmp[eq|ge|gt|le|lt|neq]_epi32_mask( __m256i a, __m256i b);
+VPCMPD __mmask8 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epi32_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPUD __mmask8 _mm256_cmp_epu32_mask( __m256i a, __m256i b, int imm);
+VPCMPUD __mmask8 _mm256_mask_cmp_epu32_mask(__mmask8 k, __m256i a, __m256i b, int imm);
+VPCMPUD __mmask8 _mm256_cmp[eq|ge|gt|le|lt|neq]_epu32_mask( __m256i a, __m256i b);
+VPCMPUD __mmask8 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epu32_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPD __mmask8 _mm_cmp_epi32_mask( __m128i a, __m128i b, int imm);
+VPCMPD __mmask8 _mm_mask_cmp_epi32_mask(__mmask8 k, __m128i a, __m128i b, int imm);
+VPCMPD __mmask8 _mm_cmp[eq|ge|gt|le|lt|neq]_epi32_mask( __m128i a, __m128i b);
+VPCMPD __mmask8 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epi32_mask(__mmask8 k, __m128i a, __m128i b);
+VPCMPUD __mmask8 _mm_cmp_epu32_mask( __m128i a, __m128i b, int imm);
+VPCMPUD __mmask8 _mm_mask_cmp_epu32_mask(__mmask8 k, __m128i a, __m128i b, int imm);
+VPCMPUD __mmask8 _mm_cmp[eq|ge|gt|le|lt|neq]_epu32_mask( __m128i a, __m128i b);
+VPCMPUD __mmask8 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epu32_mask(__mmask8 k, __m128i a, __m128i b);
+
+SIMD Floating-Point Exceptions:
+
+None
+
+Other Exceptions: 
+
+EVEX-encoded instruction, see Table 2-49, “Type E4 Class Exception Conditions.”
+
+
+VPCMPQ/VPCMPUQ — Compare Packed Integer Values Into Mask
+
+Opcode/Instruction	                                                            Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.66.0F3A.W1 1F /r ib VPCMPQ k1 {k2}, xmm2, xmm3/m128/m64bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed signed quadword integer values in xmm3/m128/m64bcst and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W1 1F /r ib VPCMPQ k1 {k2}, ymm2, ymm3/m256/m64bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed signed quadword integer values in ymm3/m256/m64bcst and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W1 1F /r ib VPCMPQ k1 {k2}, zmm2, zmm3/m512/m64bcst, imm8	    A	    V/V                 	AVX512F	            Compare packed signed quadword integer values in zmm3/m512/m64bcst and zmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.128.66.0F3A.W1 1E /r ib VPCMPUQ k1 {k2}, xmm2, xmm3/m128/m64bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed unsigned quadword integer values in xmm3/m128/m64bcst and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W1 1E /r ib VPCMPUQ k1 {k2}, ymm2, ymm3/m256/m64bcst, imm8	    A	    V/V	                    AVX512VL AVX512F	Compare packed unsigned quadword integer values in ymm3/m256/m64bcst and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W1 1E /r ib VPCMPUQ k1 {k2}, zmm2, zmm3/m512/m64bcst, imm8	    A	    V/V	                    AVX512F	Compare packed unsigned quadword integer values in zmm3/m512/m64bcst and zmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full	    ModRM:reg (w)	EVEX.vvvv (r)	ModRM:r/m (r)	imm8
+
+Description:
+
+Performs a SIMD compare of the packed integer values in the second source operand and the first source operand and returns the results of the comparison to the mask destination operand. The comparison predicate operand (immediate byte) specifies the type of comparison performed on each pair of packed values in the two source operands. The result of each comparison is a single mask bit result of 1 (comparison true) or 0 (comparison false).
+
+VPCMPQ/VPCMPUQ performs a comparison between pairs of signed/unsigned quadword integer values.
+
+The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register or a 512/256/128-bit memory location or a 512-bit vector broadcasted from a 64-bit memory location. The destination operand (first operand) is a mask register k1. Up to 8/4/2 comparisons are performed with results written to the destination operand under the writemask k2.
+
+The comparison predicate operand is an 8-bit immediate: bits 2:0 define the type of comparison to be performed. Bits 3 through 7 of the immediate are reserved. Compiler can implement the pseudo-op mnemonic listed in Table 5-21.
+
+Operation:
+
+CASE (COMPARISON PREDICATE) OF
+    0: OP := EQ;
+    1: OP := LT;
+    2: OP := LE;
+    3: OP := FALSE;
+    4: OP := NEQ;
+    5: OP := NLT;
+    6: OP := NLE;
+    7: OP := TRUE;
+ESAC;
+
+VPCMPQ (EVEX encoded versions):
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 64
+    IF k2[j] OR *no writemask*
+        THEN
+            IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                THEN CMP := SRC1[i+63:i] OP SRC2[63:0];
+                ELSE CMP := SRC1[i+63:i] OP SRC2[i+63:i];
+            FI;
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking only
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+VPCMPUQ (EVEX encoded versions):
+
+(KL, VL) = (2, 128), (4, 256), (8, 512)
+FOR j := 0 TO KL-1
+    i := j * 64
+    IF k2[j] OR *no writemask*
+        THEN
+            IF (EVEX.b = 1) AND (SRC2 *is memory*)
+                THEN CMP := SRC1[i+63:i] OP SRC2[63:0];
+                ELSE CMP := SRC1[i+63:i] OP SRC2[i+63:i];
+            FI;
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] := 0
+                    ; zeroing-masking only
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VPCMPQ __mmask8 _mm512_cmp_epi64_mask( __m512i a, __m512i b, int imm);
+VPCMPQ __mmask8 _mm512_mask_cmp_epi64_mask(__mmask8 k, __m512i a, __m512i b, int imm);
+VPCMPQ __mmask8 _mm512_cmp[eq|ge|gt|le|lt|neq]_epi64_mask( __m512i a, __m512i b);
+VPCMPQ __mmask8 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epi64_mask(__mmask8 k, __m512i a, __m512i b);
+VPCMPUQ __mmask8 _mm512_cmp_epu64_mask( __m512i a, __m512i b, int imm);
+VPCMPUQ __mmask8 _mm512_mask_cmp_epu64_mask(__mmask8 k, __m512i a, __m512i b, int imm);
+VPCMPUQ __mmask8 _mm512_cmp[eq|ge|gt|le|lt|neq]_epu64_mask( __m512i a, __m512i b);
+VPCMPUQ __mmask8 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epu64_mask(__mmask8 k, __m512i a, __m512i b);
+VPCMPQ __mmask8 _mm256_cmp_epi64_mask( __m256i a, __m256i b, int imm);
+VPCMPQ __mmask8 _mm256_mask_cmp_epi64_mask(__mmask8 k, __m256i a, __m256i b, int imm);
+VPCMPQ __mmask8 _mm256_cmp[eq|ge|gt|le|lt|neq]_epi64_mask( __m256i a, __m256i b);
+VPCMPQ __mmask8 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epi64_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPUQ __mmask8 _mm256_cmp_epu64_mask( __m256i a, __m256i b, int imm);
+VPCMPUQ __mmask8 _mm256_mask_cmp_epu64_mask(__mmask8 k, __m256i a, __m256i b, int imm);
+VPCMPUQ __mmask8 _mm256_cmp[eq|ge|gt|le|lt|neq]_epu64_mask( __m256i a, __m256i b);
+VPCMPUQ __mmask8 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epu64_mask(__mmask8 k, __m256i a, __m256i b);
+VPCMPQ __mmask8 _mm_cmp_epi64_mask( __m128i a, __m128i b, int imm);
+VPCMPQ __mmask8 _mm_mask_cmp_epi64_mask(__mmask8 k, __m128i a, __m128i b, int imm);
+VPCMPQ __mmask8 _mm_cmp[eq|ge|gt|le|lt|neq]_epi64_mask( __m128i a, __m128i b);
+VPCMPQ __mmask8 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epi64_mask(__mmask8 k, __m128i a, __m128i b);
+VPCMPUQ __mmask8 _mm_cmp_epu64_mask( __m128i a, __m128i b, int imm);
+VPCMPUQ __mmask8 _mm_mask_cmp_epu64_mask(__mmask8 k, __m128i a, __m128i b, int imm);
+VPCMPUQ __mmask8 _mm_cmp[eq|ge|gt|le|lt|neq]_epu64_mask( __m128i a, __m128i b);
+VPCMPUQ __mmask8 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epu64_mask(__mmask8 k, __m128i a, __m128i b);
+
+SIMD Floating-Point Exceptions:
+
+None
+
+Other Exceptions:
+
+EVEX-encoded instruction, see Table 2-49, “Type E4 Class Exception Conditions.”
+
+
+
+
+VPCMPW/VPCMPUW — Compare Packed Word Values Into Mask
+
+Opcode/Instruction	                                                    Op/En	64/32 bit Mode Support	CPUID Feature Flag	Description
+EVEX.128.66.0F3A.W1 3F /r ib VPCMPW k1 {k2}, xmm2, xmm3/m128, imm8	    A	    V/V	                    AVX512VL AVX512BW	Compare packed signed word integers in xmm3/m128 and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W1 3F /r ib VPCMPW k1 {k2}, ymm2, ymm3/m256, imm8	    A	    V/V	                    AVX512VL AVX512BW	Compare packed signed word integers in ymm3/m256 and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W1 3F /r ib VPCMPW k1 {k2}, zmm2, zmm3/m512, imm8	    A	    V/V	                    AVX512BW	        Compare packed signed word integers in zmm3/m512 and zmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.128.66.0F3A.W1 3E /r ib VPCMPUW k1 {k2}, xmm2, xmm3/m128, imm8	    A	    V/V	                    AVX512VL AVX512BW	Compare packed unsigned word integers in xmm3/m128 and xmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.256.66.0F3A.W1 3E /r ib VPCMPUW k1 {k2}, ymm2, ymm3/m256, imm8	    A	    V/V	                    AVX512VL AVX512BW	Compare packed unsigned word integers in ymm3/m256 and ymm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+EVEX.512.66.0F3A.W1 3E /r ib VPCMPUW k1 {k2}, zmm2, zmm3/m512, imm8	    A	    V/V	                    AVX512BW	        Compare packed unsigned word integers in zmm3/m512 and zmm2 using bits 2:0 of imm8 as a comparison predicate with writemask k2 and leave the result in mask register k1.
+
+Instruction Operand Encoding:
+
+Op/En	Tuple Type	Operand 1	    Operand 2	    Operand 3	    Operand 4
+A	    Full Mem	ModRM:reg (w)	EVEX.vvvv (r)	ModRM:r/m (r)	N/A
+
+Description:
+
+Performs a SIMD compare of the packed integer word in the second source operand and the first source operand and returns the results of the comparison to the mask destination operand. The comparison predicate operand (immediate byte) specifies the type of comparison performed on each pair of packed values in the two source operands. The result of each comparison is a single mask bit result of 1 (comparison true) or 0 (comparison false).
+
+VPCMPW performs a comparison between pairs of signed word values.
+
+VPCMPUW performs a comparison between pairs of unsigned word values.
+
+The first source operand (second operand) is a ZMM/YMM/XMM register. The second source operand can be a ZMM/YMM/XMM register or a 512/256/128-bit memory location. The destination operand (first operand) is a mask register k1. Up to 32/16/8 comparisons are performed with results written to the destination operand under the writemask k2.
+
+The comparison predicate operand is an 8-bit immediate: bits 2:0 define the type of comparison to be performed. Bits 3 through 7 of the immediate are reserved. Compiler can implement the pseudo-op mnemonic listed in Table 5-21.
+
+Operation:
+
+CASE (COMPARISON PREDICATE) OF
+    0: OP := EQ;
+    1: OP := LT;
+    2: OP := LE;
+    3: OP := FALSE;
+    4: OP := NEQ;
+    5: OP := NLT;
+    6: OP := NLE;
+    7: OP := TRUE;
+ESAC;
+VPCMPW (EVEX encoded versions):
+
+(KL, VL) = (8, 128), (16, 256), (32, 512)
+FOR j := 0 TO KL-1
+    i := j * 16
+    IF k2[j] OR *no writemask*
+        THEN
+            ICMP := SRC1[i+15:i] OP SRC2[i+15:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] = 0
+                    ; zeroing-masking only
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+VPCMPUW (EVEX encoded versions):
+
+(KL, VL) = (8, 128), (16, 256), (32, 512)
+FOR j := 0 TO KL-1
+    i := j * 16
+    IF k2[j] OR *no writemask*
+        THEN
+            CMP := SRC1[i+15:i] OP SRC2[i+15:i];
+            IF CMP = TRUE
+                THEN DEST[j] := 1;
+                ELSE DEST[j] := 0; FI;
+        ELSE DEST[j] = 0
+                    ; zeroing-masking only
+    FI;
+ENDFOR
+DEST[MAX_KL-1:KL] := 0
+
+Intel C/C++ Compiler Intrinsic Equivalent:
+
+VPCMPW __mmask32 _mm512_cmp_epi16_mask( __m512i a, __m512i b, int cmp);
+VPCMPW __mmask32 _mm512_mask_cmp_epi16_mask( __mmask32 m, __m512i a, __m512i b, int cmp);
+VPCMPW __mmask16 _mm256_cmp_epi16_mask( __m256i a, __m256i b, int cmp);
+VPCMPW __mmask16 _mm256_mask_cmp_epi16_mask( __mmask16 m, __m256i a, __m256i b, int cmp);
+VPCMPW __mmask8 _mm_cmp_epi16_mask( __m128i a, __m128i b, int cmp);
+VPCMPW __mmask8 _mm_mask_cmp_epi16_mask( __mmask8 m, __m128i a, __m128i b, int cmp);
+VPCMPW __mmask32 _mm512_cmp[eq|ge|gt|le|lt|neq]_epi16_mask( __m512i a, __m512i b);
+VPCMPW __mmask32 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epi16_mask( __mmask32 m, __m512i a, __m512i b);
+VPCMPW __mmask16 _mm256_cmp[eq|ge|gt|le|lt|neq]_epi16_mask( __m256i a, __m256i b);
+VPCMPW __mmask16 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epi16_mask( __mmask16 m, __m256i a, __m256i b);
+VPCMPW __mmask8 _mm_cmp[eq|ge|gt|le|lt|neq]_epi16_mask( __m128i a, __m128i b);
+VPCMPW __mmask8 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epi16_mask( __mmask8 m, __m128i a, __m128i b);
+VPCMPUW __mmask32 _mm512_cmp_epu16_mask( __m512i a, __m512i b, int cmp);
+VPCMPUW __mmask32 _mm512_mask_cmp_epu16_mask( __mmask32 m, __m512i a, __m512i b, int cmp);
+VPCMPUW __mmask16 _mm256_cmp_epu16_mask( __m256i a, __m256i b, int cmp);
+VPCMPUW __mmask16 _mm256_mask_cmp_epu16_mask( __mmask16 m, __m256i a, __m256i b, int cmp);
+VPCMPUW __mmask8 _mm_cmp_epu16_mask( __m128i a, __m128i b, int cmp);
+VPCMPUW __mmask8 _mm_mask_cmp_epu16_mask( __mmask8 m, __m128i a, __m128i b, int cmp);
+VPCMPUW __mmask32 _mm512_cmp[eq|ge|gt|le|lt|neq]_epu16_mask( __m512i a, __m512i b, int cmp);
+VPCMPUW __mmask32 _mm512_mask_cmp[eq|ge|gt|le|lt|neq]_epu16_mask( __mmask32 m, __m512i a, __m512i b, int cmp);
+VPCMPUW __mmask16 _mm256_cmp[eq|ge|gt|le|lt|neq]_epu16_mask( __m256i a, __m256i b, int cmp);
+VPCMPUW __mmask16 _mm256_mask_cmp[eq|ge|gt|le|lt|neq]_epu16_mask( __mmask16 m, __m256i a, __m256i b, int cmp);
+VPCMPUW __mmask8 _mm_cmp[eq|ge|gt|le|lt|neq]_epu16_mask( __m128i a, __m128i b, int cmp);
+VPCMPUW __mmask8 _mm_mask_cmp[eq|ge|gt|le|lt|neq]_epu16_mask( __mmask8 m, __m128i a, __m128i b, int cmp);
+
+SIMD Floating-Point Exceptions:
+
+None
+
+Other Exceptions:
+
+EVEX-encoded instruction, see Exceptions Type E4.nb in Table 2-49, “Type E4 Class Exception Conditions.”
 
