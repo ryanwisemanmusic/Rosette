@@ -16,6 +16,15 @@ pub const PMINUD = @import("PMINUD.zig");
 pub const PMINUQ = @import("PMINUQ.zig");
 pub const SHUFPD = @import("SHUFPD.zig");
 pub const SHUFPS = @import("SHUFPS.zig");
+pub const VPCMPEQD = @import("VPCMPEQD.zig");
+pub const VPCMPEQQ = @import("VPCMPEQQ.zig");
+pub const VPCMPGTD = @import("VPCMPGTD.zig");
+pub const VPCMPGTQ = @import("VPCMPGTQ.zig");
+pub const VPMULLD = @import("VPMULLD.zig");
+pub const VPADDD = @import("VPADDD.zig");
+pub const VPADDQ = @import("VPADDQ.zig");
+pub const VPSUBD = @import("VPSUBD.zig");
+pub const VPSUBQ = @import("VPSUBQ.zig");
 pub const SQRTPD = @import("SQRTPD.zig");
 pub const SQRTPS = @import("SQRTPS.zig");
 pub const VMOVDQA32 = @import("VMOVDQA32.zig");
@@ -95,6 +104,15 @@ pub const metas = [_]types.InstructionMeta{
     VPORQ.meta,
     SUBPD.meta,
     SUBPS.meta,
+    VPADDD.meta,
+    VPADDQ.meta,
+    VPSUBD.meta,
+    VPSUBQ.meta,
+    VPCMPEQD.meta,
+    VPCMPEQQ.meta,
+    VPCMPGTD.meta,
+    VPCMPGTQ.meta,
+    VPMULLD.meta,
     VFMADD132PD.meta,
     VFMADD132PS.meta,
     VFMADD213PD.meta,
