@@ -98,6 +98,97 @@ const full_permute_vpermt2pd = @import("FULL_PERMUTE/VPERMT2PD.zig");
 const full_permute_vpermt2ps = @import("FULL_PERMUTE/VPERMT2PS.zig");
 const full_permute_vpermt2q = @import("FULL_PERMUTE/VPERMT2Q.zig");
 const full_permute_vpermt2w = @import("FULL_PERMUTE/VPERMT2W.zig");
+const fused_vfmadd132pd = @import("FUSED/VFMADD132PD.zig");
+const fused_vfmadd132ph = @import("FUSED/VFMADD132PH.zig");
+const fused_vfmadd132ps = @import("FUSED/VFMADD132PS.zig");
+const fused_vfmadd132sd = @import("FUSED/VFMADD132SD.zig");
+const fused_vfmadd132sh = @import("FUSED/VFMADD132SH.zig");
+const fused_vfmadd132ss = @import("FUSED/VFMADD132SS.zig");
+const fused_vfmadd213pd = @import("FUSED/VFMADD213PD.zig");
+const fused_vfmadd213ph = @import("FUSED/VFMADD213PH.zig");
+const fused_vfmadd213ps = @import("FUSED/VFMADD213PS.zig");
+const fused_vfmadd213sd = @import("FUSED/VFMADD213SD.zig");
+const fused_vfmadd213sh = @import("FUSED/VFMADD213SH.zig");
+const fused_vfmadd213ss = @import("FUSED/VFMADD213SS.zig");
+const fused_vfmadd231pd = @import("FUSED/VFMADD231PD.zig");
+const fused_vfmadd231ph = @import("FUSED/VFMADD231PH.zig");
+const fused_vfmadd231ps = @import("FUSED/VFMADD231PS.zig");
+const fused_vfmadd231sd = @import("FUSED/VFMADD231SD.zig");
+const fused_vfmadd231sh = @import("FUSED/VFMADD231SH.zig");
+const fused_vfmadd231ss = @import("FUSED/VFMADD231SS.zig");
+const fused_vfmaddrnd231pd = @import("FUSED/VFMADDRND231PD.zig");
+const fused_vfmaddsub132pd = @import("FUSED/VFMADDSUB132PD.zig");
+const fused_vfmaddsub132ph = @import("FUSED/VFMADDSUB132PH.zig");
+const fused_vfmaddsub132ps = @import("FUSED/VFMADDSUB132PS.zig");
+const fused_vfmaddsub213pd = @import("FUSED/VFMADDSUB213PD.zig");
+const fused_vfmaddsub213ph = @import("FUSED/VFMADDSUB213PH.zig");
+const fused_vfmaddsub213ps = @import("FUSED/VFMADDSUB213PS.zig");
+const fused_vfmaddsub231pd = @import("FUSED/VFMADDSUB231PD.zig");
+const fused_vfmaddsub231ph = @import("FUSED/VFMADDSUB231PH.zig");
+const fused_vfmaddsub231ps = @import("FUSED/VFMADDSUB231PS.zig");
+const fused_vfmsub132pd = @import("FUSED/VFMSUB132PD.zig");
+const fused_vfmsub132ph = @import("FUSED/VFMSUB132PH.zig");
+const fused_vfmsub132ps = @import("FUSED/VFMSUB132PS.zig");
+const fused_vfmsub132sd = @import("FUSED/VFMSUB132SD.zig");
+const fused_vfmsub132sh = @import("FUSED/VFMSUB132SH.zig");
+const fused_vfmsub132ss = @import("FUSED/VFMSUB132SS.zig");
+const fused_vfmsub213pd = @import("FUSED/VFMSUB213PD.zig");
+const fused_vfmsub213ph = @import("FUSED/VFMSUB213PH.zig");
+const fused_vfmsub213ps = @import("FUSED/VFMSUB213PS.zig");
+const fused_vfmsub213sd = @import("FUSED/VFMSUB213SD.zig");
+const fused_vfmsub213sh = @import("FUSED/VFMSUB213SH.zig");
+const fused_vfmsub213ss = @import("FUSED/VFMSUB213SS.zig");
+const fused_vfmsub231pd = @import("FUSED/VFMSUB231PD.zig");
+const fused_vfmsub231ph = @import("FUSED/VFMSUB231PH.zig");
+const fused_vfmsub231ps = @import("FUSED/VFMSUB231PS.zig");
+const fused_vfmsub231sd = @import("FUSED/VFMSUB231SD.zig");
+const fused_vfmsub231sh = @import("FUSED/VFMSUB231SH.zig");
+const fused_vfmsub231ss = @import("FUSED/VFMSUB231SS.zig");
+const fused_vfmsubadd132pd = @import("FUSED/VFMSUBADD132PD.zig");
+const fused_vfmsubadd132ph = @import("FUSED/VFMSUBADD132PH.zig");
+const fused_vfmsubadd132ps = @import("FUSED/VFMSUBADD132PS.zig");
+const fused_vfmsubadd213pd = @import("FUSED/VFMSUBADD213PD.zig");
+const fused_vfmsubadd213ph = @import("FUSED/VFMSUBADD213PH.zig");
+const fused_vfmsubadd213ps = @import("FUSED/VFMSUBADD213PS.zig");
+const fused_vfmsubadd231pd = @import("FUSED/VFMSUBADD231PD.zig");
+const fused_vfmsubadd231ph = @import("FUSED/VFMSUBADD231PH.zig");
+const fused_vfmsubadd231ps = @import("FUSED/VFMSUBADD231PS.zig");
+const fused_vfnmadd132pd = @import("FUSED/VFNMADD132PD.zig");
+const fused_vfnmadd132ph = @import("FUSED/VFNMADD132PH.zig");
+const fused_vfnmadd132ps = @import("FUSED/VFNMADD132PS.zig");
+const fused_vfnmadd132sd = @import("FUSED/VFNMADD132SD.zig");
+const fused_vfnmadd132sh = @import("FUSED/VFNMADD132SH.zig");
+const fused_vfnmadd132ss = @import("FUSED/VFNMADD132SS.zig");
+const fused_vfnmadd213pd = @import("FUSED/VFNMADD213PD.zig");
+const fused_vfnmadd213ph = @import("FUSED/VFNMADD213PH.zig");
+const fused_vfnmadd213ps = @import("FUSED/VFNMADD213PS.zig");
+const fused_vfnmadd213sd = @import("FUSED/VFNMADD213SD.zig");
+const fused_vfnmadd213sh = @import("FUSED/VFNMADD213SH.zig");
+const fused_vfnmadd213ss = @import("FUSED/VFNMADD213SS.zig");
+const fused_vfnmadd231pd = @import("FUSED/VFNMADD231PD.zig");
+const fused_vfnmadd231ph = @import("FUSED/VFNMADD231PH.zig");
+const fused_vfnmadd231ps = @import("FUSED/VFNMADD231PS.zig");
+const fused_vfnmadd231sd = @import("FUSED/VFNMADD231SD.zig");
+const fused_vfnmadd231sh = @import("FUSED/VFNMADD231SH.zig");
+const fused_vfnmadd231ss = @import("FUSED/VFNMADD231SS.zig");
+const fused_vfnmsub132pd = @import("FUSED/VFNMSUB132PD.zig");
+const fused_vfnmsub132ph = @import("FUSED/VFNMSUB132PH.zig");
+const fused_vfnmsub132ps = @import("FUSED/VFNMSUB132PS.zig");
+const fused_vfnmsub132sd = @import("FUSED/VFNMSUB132SD.zig");
+const fused_vfnmsub132sh = @import("FUSED/VFNMSUB132SH.zig");
+const fused_vfnmsub132ss = @import("FUSED/VFNMSUB132SS.zig");
+const fused_vfnmsub213pd = @import("FUSED/VFNMSUB213PD.zig");
+const fused_vfnmsub213ph = @import("FUSED/VFNMSUB213PH.zig");
+const fused_vfnmsub213ps = @import("FUSED/VFNMSUB213PS.zig");
+const fused_vfnmsub213sd = @import("FUSED/VFNMSUB213SD.zig");
+const fused_vfnmsub213sh = @import("FUSED/VFNMSUB213SH.zig");
+const fused_vfnmsub213ss = @import("FUSED/VFNMSUB213SS.zig");
+const fused_vfnmsub231pd = @import("FUSED/VFNMSUB231PD.zig");
+const fused_vfnmsub231ph = @import("FUSED/VFNMSUB231PH.zig");
+const fused_vfnmsub231ps = @import("FUSED/VFNMSUB231PS.zig");
+const fused_vfnmsub231sd = @import("FUSED/VFNMSUB231SD.zig");
+const fused_vfnmsub231sh = @import("FUSED/VFNMSUB231SH.zig");
+const fused_vfnmsub231ss = @import("FUSED/VFNMSUB231SS.zig");
 const inc_dec_dec = @import("INC-DEC/DEC.zig");
 const inc_dec_inc = @import("INC-DEC/INC.zig");
 const input_in = @import("INPUT/IN.zig");
@@ -1168,6 +1259,97 @@ pub const specs = blk: {
         spec(full_permute_vpermt2ps.meta),
         spec(full_permute_vpermt2q.meta),
         spec(full_permute_vpermt2w.meta),
+        spec(fused_vfmadd132pd.meta),
+        spec(fused_vfmadd132ph.meta),
+        spec(fused_vfmadd132ps.meta),
+        spec(fused_vfmadd132sd.meta),
+        spec(fused_vfmadd132sh.meta),
+        spec(fused_vfmadd132ss.meta),
+        spec(fused_vfmadd213pd.meta),
+        spec(fused_vfmadd213ph.meta),
+        spec(fused_vfmadd213ps.meta),
+        spec(fused_vfmadd213sd.meta),
+        spec(fused_vfmadd213sh.meta),
+        spec(fused_vfmadd213ss.meta),
+        spec(fused_vfmadd231pd.meta),
+        spec(fused_vfmadd231ph.meta),
+        spec(fused_vfmadd231ps.meta),
+        spec(fused_vfmadd231sd.meta),
+        spec(fused_vfmadd231sh.meta),
+        spec(fused_vfmadd231ss.meta),
+        spec(fused_vfmaddrnd231pd.meta),
+        spec(fused_vfmaddsub132pd.meta),
+        spec(fused_vfmaddsub132ph.meta),
+        spec(fused_vfmaddsub132ps.meta),
+        spec(fused_vfmaddsub213pd.meta),
+        spec(fused_vfmaddsub213ph.meta),
+        spec(fused_vfmaddsub213ps.meta),
+        spec(fused_vfmaddsub231pd.meta),
+        spec(fused_vfmaddsub231ph.meta),
+        spec(fused_vfmaddsub231ps.meta),
+        spec(fused_vfmsub132pd.meta),
+        spec(fused_vfmsub132ph.meta),
+        spec(fused_vfmsub132ps.meta),
+        spec(fused_vfmsub132sd.meta),
+        spec(fused_vfmsub132sh.meta),
+        spec(fused_vfmsub132ss.meta),
+        spec(fused_vfmsub213pd.meta),
+        spec(fused_vfmsub213ph.meta),
+        spec(fused_vfmsub213ps.meta),
+        spec(fused_vfmsub213sd.meta),
+        spec(fused_vfmsub213sh.meta),
+        spec(fused_vfmsub213ss.meta),
+        spec(fused_vfmsub231pd.meta),
+        spec(fused_vfmsub231ph.meta),
+        spec(fused_vfmsub231ps.meta),
+        spec(fused_vfmsub231sd.meta),
+        spec(fused_vfmsub231sh.meta),
+        spec(fused_vfmsub231ss.meta),
+        spec(fused_vfmsubadd132pd.meta),
+        spec(fused_vfmsubadd132ph.meta),
+        spec(fused_vfmsubadd132ps.meta),
+        spec(fused_vfmsubadd213pd.meta),
+        spec(fused_vfmsubadd213ph.meta),
+        spec(fused_vfmsubadd213ps.meta),
+        spec(fused_vfmsubadd231pd.meta),
+        spec(fused_vfmsubadd231ph.meta),
+        spec(fused_vfmsubadd231ps.meta),
+        spec(fused_vfnmadd132pd.meta),
+        spec(fused_vfnmadd132ph.meta),
+        spec(fused_vfnmadd132ps.meta),
+        spec(fused_vfnmadd132sd.meta),
+        spec(fused_vfnmadd132sh.meta),
+        spec(fused_vfnmadd132ss.meta),
+        spec(fused_vfnmadd213pd.meta),
+        spec(fused_vfnmadd213ph.meta),
+        spec(fused_vfnmadd213ps.meta),
+        spec(fused_vfnmadd213sd.meta),
+        spec(fused_vfnmadd213sh.meta),
+        spec(fused_vfnmadd213ss.meta),
+        spec(fused_vfnmadd231pd.meta),
+        spec(fused_vfnmadd231ph.meta),
+        spec(fused_vfnmadd231ps.meta),
+        spec(fused_vfnmadd231sd.meta),
+        spec(fused_vfnmadd231sh.meta),
+        spec(fused_vfnmadd231ss.meta),
+        spec(fused_vfnmsub132pd.meta),
+        spec(fused_vfnmsub132ph.meta),
+        spec(fused_vfnmsub132ps.meta),
+        spec(fused_vfnmsub132sd.meta),
+        spec(fused_vfnmsub132sh.meta),
+        spec(fused_vfnmsub132ss.meta),
+        spec(fused_vfnmsub213pd.meta),
+        spec(fused_vfnmsub213ph.meta),
+        spec(fused_vfnmsub213ps.meta),
+        spec(fused_vfnmsub213sd.meta),
+        spec(fused_vfnmsub213sh.meta),
+        spec(fused_vfnmsub213ss.meta),
+        spec(fused_vfnmsub231pd.meta),
+        spec(fused_vfnmsub231ph.meta),
+        spec(fused_vfnmsub231ps.meta),
+        spec(fused_vfnmsub231sd.meta),
+        spec(fused_vfnmsub231sh.meta),
+        spec(fused_vfnmsub231ss.meta),
         spec(inc_dec_dec.meta),
         spec(inc_dec_inc.meta),
         spec(input_in.meta),
@@ -2238,6 +2420,97 @@ pub const proof_reports = [_]proofs.ProofReport{
     full_permute_vpermt2ps.proof_report,
     full_permute_vpermt2q.proof_report,
     full_permute_vpermt2w.proof_report,
+    fused_vfmadd132pd.proof_report,
+    fused_vfmadd132ph.proof_report,
+    fused_vfmadd132ps.proof_report,
+    fused_vfmadd132sd.proof_report,
+    fused_vfmadd132sh.proof_report,
+    fused_vfmadd132ss.proof_report,
+    fused_vfmadd213pd.proof_report,
+    fused_vfmadd213ph.proof_report,
+    fused_vfmadd213ps.proof_report,
+    fused_vfmadd213sd.proof_report,
+    fused_vfmadd213sh.proof_report,
+    fused_vfmadd213ss.proof_report,
+    fused_vfmadd231pd.proof_report,
+    fused_vfmadd231ph.proof_report,
+    fused_vfmadd231ps.proof_report,
+    fused_vfmadd231sd.proof_report,
+    fused_vfmadd231sh.proof_report,
+    fused_vfmadd231ss.proof_report,
+    fused_vfmaddrnd231pd.proof_report,
+    fused_vfmaddsub132pd.proof_report,
+    fused_vfmaddsub132ph.proof_report,
+    fused_vfmaddsub132ps.proof_report,
+    fused_vfmaddsub213pd.proof_report,
+    fused_vfmaddsub213ph.proof_report,
+    fused_vfmaddsub213ps.proof_report,
+    fused_vfmaddsub231pd.proof_report,
+    fused_vfmaddsub231ph.proof_report,
+    fused_vfmaddsub231ps.proof_report,
+    fused_vfmsub132pd.proof_report,
+    fused_vfmsub132ph.proof_report,
+    fused_vfmsub132ps.proof_report,
+    fused_vfmsub132sd.proof_report,
+    fused_vfmsub132sh.proof_report,
+    fused_vfmsub132ss.proof_report,
+    fused_vfmsub213pd.proof_report,
+    fused_vfmsub213ph.proof_report,
+    fused_vfmsub213ps.proof_report,
+    fused_vfmsub213sd.proof_report,
+    fused_vfmsub213sh.proof_report,
+    fused_vfmsub213ss.proof_report,
+    fused_vfmsub231pd.proof_report,
+    fused_vfmsub231ph.proof_report,
+    fused_vfmsub231ps.proof_report,
+    fused_vfmsub231sd.proof_report,
+    fused_vfmsub231sh.proof_report,
+    fused_vfmsub231ss.proof_report,
+    fused_vfmsubadd132pd.proof_report,
+    fused_vfmsubadd132ph.proof_report,
+    fused_vfmsubadd132ps.proof_report,
+    fused_vfmsubadd213pd.proof_report,
+    fused_vfmsubadd213ph.proof_report,
+    fused_vfmsubadd213ps.proof_report,
+    fused_vfmsubadd231pd.proof_report,
+    fused_vfmsubadd231ph.proof_report,
+    fused_vfmsubadd231ps.proof_report,
+    fused_vfnmadd132pd.proof_report,
+    fused_vfnmadd132ph.proof_report,
+    fused_vfnmadd132ps.proof_report,
+    fused_vfnmadd132sd.proof_report,
+    fused_vfnmadd132sh.proof_report,
+    fused_vfnmadd132ss.proof_report,
+    fused_vfnmadd213pd.proof_report,
+    fused_vfnmadd213ph.proof_report,
+    fused_vfnmadd213ps.proof_report,
+    fused_vfnmadd213sd.proof_report,
+    fused_vfnmadd213sh.proof_report,
+    fused_vfnmadd213ss.proof_report,
+    fused_vfnmadd231pd.proof_report,
+    fused_vfnmadd231ph.proof_report,
+    fused_vfnmadd231ps.proof_report,
+    fused_vfnmadd231sd.proof_report,
+    fused_vfnmadd231sh.proof_report,
+    fused_vfnmadd231ss.proof_report,
+    fused_vfnmsub132pd.proof_report,
+    fused_vfnmsub132ph.proof_report,
+    fused_vfnmsub132ps.proof_report,
+    fused_vfnmsub132sd.proof_report,
+    fused_vfnmsub132sh.proof_report,
+    fused_vfnmsub132ss.proof_report,
+    fused_vfnmsub213pd.proof_report,
+    fused_vfnmsub213ph.proof_report,
+    fused_vfnmsub213ps.proof_report,
+    fused_vfnmsub213sd.proof_report,
+    fused_vfnmsub213sh.proof_report,
+    fused_vfnmsub213ss.proof_report,
+    fused_vfnmsub231pd.proof_report,
+    fused_vfnmsub231ph.proof_report,
+    fused_vfnmsub231ps.proof_report,
+    fused_vfnmsub231sd.proof_report,
+    fused_vfnmsub231sh.proof_report,
+    fused_vfnmsub231ss.proof_report,
     inc_dec_dec.proof_report,
     inc_dec_inc.proof_report,
     input_in.proof_report,
