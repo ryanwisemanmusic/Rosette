@@ -32,10 +32,16 @@ static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
   if (![NSThread isMainThread]) {
     if (!g_reported_off_main_thread) {
       fprintf(stderr,
-              "macho-processor: native AppKit bridge rejected an off-main-"
-              "thread call to avoid a runloop deadlock\n");
+              "macho-processor: native AppKit bridge marshaling an off-main-"
+              "thread request to the main runloop\n");
       g_reported_off_main_thread = YES;
     }
+    // A Vulkan Metal-surface request can originate from a guest worker while
+    // the cooperative scheduler has parked the guest UI continuation.  AppKit
+    // and CAMetalLayer must still be touched on the host main runloop.  Do not
+    // silently drop that request: dispatch it synchronously so its completion
+    // is observed before the guest worker is allowed to continue.
+    dispatch_sync(dispatch_get_main_queue(), block);
     return;
   }
   block();

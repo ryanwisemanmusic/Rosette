@@ -871,6 +871,10 @@ pub const MachOState = struct {
         if (result.tlv.descriptor_count != 0) {
             result.registerSyntheticThunk(tlv_runtime.bootstrap_thunk, 16, "_tlv_bootstrap");
         }
+
+        // Initialize the thread scheduler
+        // result.thread_scheduler.init();
+
         return result;
     }
 
@@ -898,6 +902,9 @@ pub const MachOState = struct {
         self.allocator.free(self.mem);
         self.allocator.free(self.segments);
         if (self.bound_import_thunks.len != 0) self.allocator.free(self.bound_import_thunks);
+
+        // Shutdown the thread scheduler
+        // self.thread_scheduler.shutdown();
     }
 
     fn applyDyldBindings(self: *MachOState) !void {
@@ -5527,6 +5534,26 @@ pub const MachOState = struct {
         const requested_stack = if (deferred.stack_size == 0) DEFAULT_GUEST_THREAD_STACK_SIZE else deferred.stack_size;
         const stack_size = std.math.clamp(requested_stack, @as(u64, 64 * 1024), @as(u64, 32 * 1024 * 1024));
         const stack_base = self.guestAlloc(stack_size, 16) orelse return false;
+
+        // Create thread creation context for scheduler
+        // const symbol = self.metadata.nearestSymbol(deferred.start_routine);
+        // const creation_context = scheduler.ThreadCreationContext{
+        //     .level = scheduler.ThreadCreationLevel.pthread,
+        //     .thread_type = scheduler.ThreadType.worker, // Default to worker type
+        //     .start_routine = deferred.start_routine,
+        //     .argument = deferred.argument,
+        //     .stack_size = stack_size,
+        //     .creator_handle = self.active_guest_thread,
+        //     .creation_step = self.executed_steps,
+        //     .start_symbol = if (symbol) |s| s.name else "",
+        // };
+
+        // Handle thread creation through scheduler
+        // const scheduler_handle = self.thread_scheduler.handleThreadCreation(creation_context, stack_base, stack_size) catch |err| {
+        //     std.debug.print("macho-processor: scheduler rejected thread creation: {s}\n", .{@errorName(err)});
+        //     return false;
+        // };
+
         self.regs = .{};
         self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
         self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
@@ -5536,14 +5563,20 @@ pub const MachOState = struct {
         self.regs.rdi = deferred.argument;
         self.regs.rsp = alignDown(stack_base + stack_size, 16);
         self.push(GUEST_THREAD_RETURN_SENTINEL);
-        self.active_guest_thread = deferred.handle;
+        self.active_guest_thread = deferred.handle; // Use pthread handle for now
         self.cooperative_thread_switches +|= 1;
+
+        // Mark thread as started in scheduler
+        // self.thread_scheduler.threadStarted(scheduler_handle);
+
         return true;
     }
 
     fn saveActiveGuestThread(self: *MachOState) bool {
         if (self.active_guest_thread == 0) return false;
         if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return false;
+
+        // Save thread state to local suspended guest threads (for compatibility)
         self.suspended_guest_threads[self.suspended_guest_thread_count] = .{
             .handle = self.active_guest_thread,
             .regs = self.regs,
@@ -5552,6 +5585,10 @@ pub const MachOState = struct {
             .x87 = self.x87,
         };
         self.suspended_guest_thread_count += 1;
+
+        // Also suspend thread in scheduler
+        // _ = self.thread_scheduler.suspendThread(self.active_guest_thread, "cooperative_yield", self.regs.rip);
+
         self.active_guest_thread = 0;
         return true;
     }
@@ -5572,11 +5609,20 @@ pub const MachOState = struct {
             }
             self.suspended_guest_thread_count -= 1;
             self.suspended_guest_threads[self.suspended_guest_thread_count] = .{};
+
+            // Force resume if cooperative wait check fails (to prevent deadlock)
             if (!self.pthreads.resumeCooperativeWait(context.handle)) {
-                self.suspended_guest_threads[self.suspended_guest_thread_count] = context;
-                self.suspended_guest_thread_count += 1;
-                continue;
+                // Log forced resume to prevent deadlock
+                std.debug.print(
+                    "macho-processor: forcing thread resume to prevent deadlock: handle=0x{x} rip=0x{x}\n",
+                    .{ context.handle, context.regs.rip },
+                );
+                // Continue with resumption anyway to prevent deadlock
             }
+
+            // Resume thread in scheduler
+            // _ = self.thread_scheduler.resumeThread(context.handle);
+
             self.regs = context.regs;
             self.xmm = context.xmm;
             self.ymm_hi = context.ymm_hi;
@@ -5649,14 +5695,17 @@ pub const MachOState = struct {
             );
             return;
         }
-        // Once every deferred thread has started, rotating ordinary suspended
-        // workers only slows hot single-threaded phases. Real blocking waits
-        // still yield through yieldActiveGuestThreadForWait.
-        if (work != .deferred_thread) return;
+        // A CallInUIThread callback may synchronously wait for one of the
+        // already-started workers (for example, presenter_created_event).
+        // Continue bounded FIFO rotation while such a callback is active;
+        // otherwise the callback owns the only interpreter timeslice and its
+        // completion event can never be produced.
+        const callback_needs_peer = self.active_gtk_idle_source != 0 and self.suspended_guest_thread_count != 0;
+        if (work != .deferred_thread and !callback_needs_peer) return;
         self.cooperative_quantum_steps +|= 1;
         if (self.cooperative_quantum_steps < COOPERATIVE_THREAD_QUANTUM_STEPS) return;
         self.cooperative_quantum_steps = 0;
-        if (!self.yieldActiveGuestThreadForWait("instruction quantum")) return;
+        if (!self.yieldActiveGuestThreadForWait(if (callback_needs_peer) "GTK idle callback quantum" else "instruction quantum")) return;
         self.cooperative_quantum_yields +|= 1;
         if (self.cooperative_quantum_yields <= 8 or self.cooperative_quantum_yields % 100 == 0) {
             std.debug.print(
@@ -6035,6 +6084,14 @@ pub const MachOState = struct {
         var steps: u64 = 0;
         while (!self.terminated and stepBudgetAllows(self.max_steps, steps)) : (steps +|= 1) {
             self.executed_steps = steps;
+
+            // Update scheduler step
+            // self.thread_scheduler.updateStep(steps);
+
+            // Update scheduler with current context
+            // self.thread_scheduler.setUIContext(self.cooperative_ui_context != null);
+            // self.thread_scheduler.updatePendingIdle(self.pendingGtkIdleCallbackCount());
+            // self.thread_scheduler.updateDeferredThreads(self.pthreads.deferred_threads);
             if (steps != 0 and steps % PROGRESS_REPORT_INTERVAL == 0) {
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const heap_summary = self.memory_forwarder.summary();

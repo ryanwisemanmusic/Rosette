@@ -79,6 +79,9 @@ const Library = struct {
 const GuestLibrary = struct {
     token: u64 = 0,
     handle: ?*anyopaque = null,
+    virtual_vulkan: bool = false,
+    path_length: u16 = 0,
+    path: [1024]u8 = [_]u8{0} ** 1024,
 };
 
 const GuestSymbolKind = enum {
@@ -227,6 +230,8 @@ pub const Forwarder = struct {
     native_vulkan_instance_attempts: u64 = 0,
     native_vulkan_surface_attempts: u64 = 0,
     native_vulkan_failures: u64 = 0,
+    native_vulkan_loader_attempts: u64 = 0,
+    native_vulkan_loader_failures: u64 = 0,
     vulkan_swapchain_image_handles: [4]u64 = [_]u64{0} ** 4,
     vulkan_swapchain_image_count: u32 = 0,
     considered: u64 = 0,
@@ -249,7 +254,16 @@ pub const Forwarder = struct {
     }
 
     pub fn lookupGuest(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
-        const library = self.guestLibrary(library_token) orelse return 0;
+        const entry = self.guestLibraryEntry(library_token) orelse return 0;
+        if (entry.virtual_vulkan) {
+            const token = self.allocateGuestSymbol(library_token, symbol);
+            std.debug.print(
+                "macho-processor: Vulkan guest loader lookup: {s} -> 0x{x} ({s})\n",
+                .{ symbol, token, @tagName(guestSymbolKind(symbol)) },
+            );
+            return token;
+        }
+        const library = entry.handle orelse return 0;
         var symbol_buffer: [512]u8 = undefined;
         const symbol_z = nulTerminate(&symbol_buffer, symbol) orelse return 0;
         _ = dlsym(library, symbol_z) orelse return 0;
@@ -257,7 +271,7 @@ pub const Forwarder = struct {
     }
 
     fn lookupVulkanProcGuest(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
-        if (self.guestLibrary(library_token) == null) return 0;
+        if (self.guestLibraryEntry(library_token) == null) return 0;
         self.guest_proc_queries +|= 1;
         const token = self.allocateGuestSymbol(library_token, symbol);
         std.debug.print(
@@ -289,7 +303,7 @@ pub const Forwarder = struct {
     pub fn dispatchGuestSymbol(self: *Forwarder, state: anytype, token: u64) bool {
         for (&self.guest_symbols) |*entry| {
             if (entry.token != token) continue;
-            if (self.guestLibrary(entry.library_token) == null) return false;
+            if (self.guestLibraryEntry(entry.library_token) == null) return false;
             self.guest_thunk_calls +|= 1;
             entry.calls +|= 1;
             switch (entry.kind) {
@@ -413,7 +427,7 @@ pub const Forwarder = struct {
         if (self.native_vulkan_instance != null) {
             return if (self.native_vulkan_library_token == library_token) 0 else vkErrorInitializationFailedSigned();
         }
-        const library = self.guestLibrary(library_token) orelse return vkErrorInitializationFailedSigned();
+        const library = self.materializeNativeVulkanLibrary(library_token) orelse return vkErrorInitializationFailedSigned();
         const create_address = dlsym(library, "vkCreateInstance") orelse return vkErrorInitializationFailedSigned();
         const create_instance: PfnVkCreateInstance = @ptrCast(@alignCast(create_address));
         const application_info = VkApplicationInfo{
@@ -771,6 +785,22 @@ pub const Forwarder = struct {
     }
 
     pub fn openGuest(self: *Forwarder, path: []const u8, mode: u64) u64 {
+        if (isVulkanLoaderPath(path)) {
+            for (&self.guest_libraries, 0..) |*entry, index| {
+                if (entry.token != 0) continue;
+                const token = GUEST_LIBRARY_HANDLE_BASE + @as(u64, @intCast(index)) * 16 + 1;
+                const path_length: u16 = @intCast(@min(path.len, entry.path.len));
+                entry.* = .{ .token = token, .virtual_vulkan = true, .path_length = path_length };
+                @memcpy(entry.path[0..path_length], path[0..path_length]);
+                self.guest_open_count +|= 1;
+                std.debug.print(
+                    "macho-processor: Vulkan guest loader virtualized: path={s} mode=0x{x} token=0x{x}; native dyld load deferred until Metal surface bind\n",
+                    .{ path, mode, token },
+                );
+                return token;
+            }
+            return 0;
+        }
         var path_buffer: [1024]u8 = undefined;
         const path_z = nulTerminate(&path_buffer, path) orelse return 0;
         const host_mode: c_int = @bitCast(@as(u32, @truncate(mode)));
@@ -790,7 +820,7 @@ pub const Forwarder = struct {
         for (&self.guest_libraries) |*entry| {
             if (entry.token != token) continue;
             if (self.native_vulkan_library_token == token) self.destroyNativeVulkanObjects();
-            const result = if (entry.handle) |handle| dlclose(handle) else -1;
+            const result: c_int = if (entry.handle) |handle| dlclose(handle) else if (entry.virtual_vulkan) 0 else -1;
             entry.* = .{};
             for (&self.guest_symbols) |*symbol| {
                 if (symbol.library_token == token) symbol.* = .{};
@@ -910,8 +940,8 @@ pub const Forwarder = struct {
                 },
             );
             std.debug.print(
-                "macho-processor: native Vulkan presenter backing: instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
-                .{ self.native_vulkan_instance_attempts, self.native_vulkan_surface_attempts, self.native_vulkan_failures, if (self.native_vulkan_instance) |instance| @intFromPtr(instance) else 0, self.native_vulkan_surface, self.native_vulkan_library_token },
+                "macho-processor: native Vulkan presenter backing: loader(attempts/failures)={d}/{d} instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
+                .{ self.native_vulkan_loader_attempts, self.native_vulkan_loader_failures, self.native_vulkan_instance_attempts, self.native_vulkan_surface_attempts, self.native_vulkan_failures, if (self.native_vulkan_instance) |instance| @intFromPtr(instance) else 0, self.native_vulkan_surface, self.native_vulkan_library_token },
             );
             std.debug.print("macho-processor: Vulkan proc inventory:\n", .{});
             for (&self.guest_symbols) |*entry| {
@@ -938,11 +968,44 @@ pub const Forwarder = struct {
         return handle;
     }
 
-    fn guestLibrary(self: *Forwarder, token: u64) ?*anyopaque {
+    fn guestLibraryEntry(self: *Forwarder, token: u64) ?*GuestLibrary {
         for (&self.guest_libraries) |*entry| {
-            if (entry.token == token) return entry.handle;
+            if (entry.token == token) return entry;
         }
         return null;
+    }
+
+    fn guestLibrary(self: *Forwarder, token: u64) ?*anyopaque {
+        const entry = self.guestLibraryEntry(token) orelse return null;
+        return entry.handle;
+    }
+
+    fn materializeNativeVulkanLibrary(self: *Forwarder, token: u64) ?*anyopaque {
+        const entry = self.guestLibraryEntry(token) orelse return null;
+        if (entry.handle) |handle| return handle;
+        if (!entry.virtual_vulkan or entry.path_length == 0) return null;
+        const path = entry.path[0..entry.path_length];
+        var path_buffer: [1024]u8 = undefined;
+        const path_z = nulTerminate(&path_buffer, path) orelse return null;
+        self.native_vulkan_loader_attempts +|= 1;
+        std.debug.print(
+            "macho-processor: native Vulkan loader begin: attempt={d} path={s}; entering host dlopen/dyld initializers\n",
+            .{ self.native_vulkan_loader_attempts, path },
+        );
+        const handle = dlopen(path_z, RTLD_LAZY | RTLD_LOCAL) orelse {
+            self.native_vulkan_loader_failures +|= 1;
+            std.debug.print(
+                "macho-processor: native Vulkan loader failed: attempt={d} path={s}\n",
+                .{ self.native_vulkan_loader_attempts, path },
+            );
+            return null;
+        };
+        entry.handle = handle;
+        std.debug.print(
+            "macho-processor: native Vulkan loader ready: attempt={d} path={s} host_handle=0x{x}\n",
+            .{ self.native_vulkan_loader_attempts, path, @intFromPtr(handle) },
+        );
+        return handle;
     }
 
     fn invoke(self: *Forwarder, state: anytype, signature: Signature, address: *anyopaque) ?Outcome {
@@ -1590,6 +1653,10 @@ fn normalizeMachOSymbol(symbol: []const u8) []const u8 {
     return symbol;
 }
 
+fn isVulkanLoaderPath(path: []const u8) bool {
+    return std.mem.indexOf(u8, path, "libvulkan") != null;
+}
+
 fn specFor(symbol: []const u8) ?Spec {
     for (specs) |spec| {
         if (std.mem.eql(u8, spec.symbol, symbol)) return spec;
@@ -1756,4 +1823,17 @@ test "guest dynamic-library handles are opaque and close exactly once" {
     try std.testing.expectEqual(@as(u64, 1), forwarder.guest_close_count);
     try std.testing.expectEqual(@as(c_int, -1), forwarder.closeGuest(token));
     try std.testing.expectEqual(@as(u64, 0), forwarder.lookupGuest(token, "getpid"));
+}
+
+test "Vulkan guest library remains virtual until native surface binding" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    const token = forwarder.openGuest("/tmp/libvulkan.1.dylib", RTLD_LAZY | RTLD_LOCAL);
+    try std.testing.expect(token >= GUEST_LIBRARY_HANDLE_BASE);
+    const entry = forwarder.guestLibraryEntry(token) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(entry.virtual_vulkan);
+    try std.testing.expect(entry.handle == null);
+    const proc = forwarder.lookupGuest(token, "vkGetInstanceProcAddr");
+    try std.testing.expect(proc >= GUEST_SYMBOL_THUNK_BASE);
+    try std.testing.expectEqual(@as(c_int, 0), forwarder.closeGuest(token));
 }
