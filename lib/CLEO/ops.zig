@@ -109,6 +109,72 @@ pub fn executeAccumulate(comptime bits: usize, meta: types.InstructionMeta, accu
     try types.requireWidth(meta, bits);
     return switch (meta.operation) {
         .vdpbf16ps => wide.dotBF16PS(bits, accum, lhs, rhs),
+        .fma_ps => blk: {
+            const prod = wide.mapBinary(bits, f32, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f32, accum, prod, .add);
+        },
+        .fma_pd => blk: {
+            const prod = wide.mapBinary(bits, f64, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f64, accum, prod, .add);
+        },
+        .fms_ps => blk: {
+            const prod = wide.mapBinary(bits, f32, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f32, prod, accum, .sub);
+        },
+        .fms_pd => blk: {
+            const prod = wide.mapBinary(bits, f64, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f64, prod, accum, .sub);
+        },
+        .fnma_ps => blk: {
+            const prod = wide.mapBinary(bits, f32, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f32, accum, prod, .sub);
+        },
+        .fnma_pd => blk: {
+            const prod = wide.mapBinary(bits, f64, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f64, accum, prod, .sub);
+        },
+        .fnms_ps => blk: {
+            const prod = wide.mapBinary(bits, f32, lhs, rhs, .mul);
+            const sum = wide.mapBinary(bits, f32, prod, accum, .add);
+            const zero = wide.Wide(bits).zero();
+            break :blk wide.mapBinary(bits, f32, zero, sum, .sub);
+        },
+        .fnms_pd => blk: {
+            const prod = wide.mapBinary(bits, f64, lhs, rhs, .mul);
+            const sum = wide.mapBinary(bits, f64, prod, accum, .add);
+            const zero = wide.Wide(bits).zero();
+            break :blk wide.mapBinary(bits, f64, zero, sum, .sub);
+        },
+        .fma_addsub_ps => blk: {
+            const prod = wide.mapBinary(bits, f32, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f32, prod, accum, .addsub);
+        },
+        .fma_addsub_pd => blk: {
+            const prod = wide.mapBinary(bits, f64, lhs, rhs, .mul);
+            break :blk wide.mapBinary(bits, f64, prod, accum, .addsub);
+        },
+        .fma_subadd_ps => blk: {
+            const prod = wide.mapBinary(bits, f32, lhs, rhs, .mul);
+            const lanes = comptime wide.laneCount(bits, f32);
+            var result: [lanes]f32 = undefined;
+            const acc_arr = wide.toArray(bits, f32, accum);
+            const prod_arr = wide.toArray(bits, f32, prod);
+            for (0..lanes) |lane| {
+                result[lane] = if ((lane & 1) == 0) acc_arr[lane] + prod_arr[lane] else acc_arr[lane] - prod_arr[lane];
+            }
+            break :blk wide.fromArray(bits, f32, result);
+        },
+        .fma_subadd_pd => blk: {
+            const prod = wide.mapBinary(bits, f64, lhs, rhs, .mul);
+            const lanes = comptime wide.laneCount(bits, f64);
+            var result: [lanes]f64 = undefined;
+            const acc_arr = wide.toArray(bits, f64, accum);
+            const prod_arr = wide.toArray(bits, f64, prod);
+            for (0..lanes) |lane| {
+                result[lane] = if ((lane & 1) == 0) acc_arr[lane] + prod_arr[lane] else acc_arr[lane] - prod_arr[lane];
+            }
+            break :blk wide.fromArray(bits, f64, result);
+        },
         else => types.SafetyError.UnsupportedInstructionWidth,
     };
 }
@@ -178,6 +244,54 @@ pub fn executeAccumulateMasked(comptime bits: usize, meta: types.InstructionMeta
     if (!meta.supports_masking) return types.SafetyError.UnsupportedInstructionWidth;
     return switch (meta.operation) {
         .vdpbf16ps => wide.dotBF16PSMasked(bits, merge, accum, lhs, rhs, mask, mode),
+        .fma_ps => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f32, merge, computed, mask, mode);
+        },
+        .fma_pd => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f64, merge, computed, mask, mode);
+        },
+        .fms_ps => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f32, merge, computed, mask, mode);
+        },
+        .fms_pd => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f64, merge, computed, mask, mode);
+        },
+        .fnma_ps => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f32, merge, computed, mask, mode);
+        },
+        .fnma_pd => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f64, merge, computed, mask, mode);
+        },
+        .fnms_ps => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f32, merge, computed, mask, mode);
+        },
+        .fnms_pd => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f64, merge, computed, mask, mode);
+        },
+        .fma_addsub_ps => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f32, merge, computed, mask, mode);
+        },
+        .fma_addsub_pd => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f64, merge, computed, mask, mode);
+        },
+        .fma_subadd_ps => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f32, merge, computed, mask, mode);
+        },
+        .fma_subadd_pd => {
+            const computed = try executeAccumulate(bits, meta, accum, lhs, rhs, features);
+            return wide.applyLaneMask(bits, f64, merge, computed, mask, mode);
+        },
         else => types.SafetyError.UnsupportedInstructionWidth,
     };
 }

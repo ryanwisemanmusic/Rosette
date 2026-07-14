@@ -18,6 +18,7 @@ pub const Feature = enum(u8) {
     amx_tile,
     keylocker,
     movdir64b,
+    fma,
     neon,
 };
 
@@ -35,6 +36,7 @@ pub const FeatureSet = struct {
     amx_tile: bool = false,
     keylocker: bool = false,
     movdir64b: bool = false,
+    fma: bool = false,
     neon: bool = false,
 
     pub fn host() FeatureSet {
@@ -65,6 +67,7 @@ pub const FeatureSet = struct {
             .amx_tile = true,
             .keylocker = true,
             .movdir64b = true,
+            .fma = true,
             .neon = true,
         };
     }
@@ -84,6 +87,7 @@ pub const FeatureSet = struct {
             .amx_tile => self.amx_tile,
             .keylocker => self.keylocker,
             .movdir64b => self.movdir64b,
+            .fma => self.fma,
             .neon => self.neon,
         };
     }
@@ -168,6 +172,18 @@ pub const Operation = enum {
     control,
     system_512,
     key_256,
+    fma_ps,
+    fma_pd,
+    fms_ps,
+    fms_pd,
+    fnma_ps,
+    fnma_pd,
+    fnms_ps,
+    fnms_pd,
+    fma_addsub_ps,
+    fma_addsub_pd,
+    fma_subadd_ps,
+    fma_subadd_pd,
 };
 
 pub const Alignment = enum(u16) {
