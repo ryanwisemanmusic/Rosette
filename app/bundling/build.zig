@@ -352,6 +352,18 @@ pub fn build(b: *std.Build) void {
     macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
     macho_processor_mod.addImport("contract", contract_module);
     macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_module);
+    if (is_macos) {
+        macho_processor_mod.addObjectFile(compileCObject(
+            b,
+            target,
+            b.path("../../lib/Mach-O/native_window_bridge.m"),
+            "macho_native_window_bridge.o",
+            &[_][]const u8{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+        ));
+        macho_processor_mod.linkFramework("AppKit", .{});
+        macho_processor_mod.linkFramework("QuartzCore", .{});
+        macho_processor_mod.linkFramework("Metal", .{});
+    }
     b.installArtifact(macho_processor);
 
     // Add WinForms native Cocoa bridge to the exe runner module
