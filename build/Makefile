@@ -21,6 +21,9 @@ ELF_PROCESSOR_BIN := zig-out/bin/elf_processor
 ELF_PROCESSOR_SRC := lib/processor/ELF_processor/main.zig
 MACHO_PROCESSOR_BIN := zig-out/bin/macho_processor
 MACHO_PROCESSOR_SRC := lib/Mach-O/main.zig
+MACHO_NATIVE_WINDOW_SRC := lib/Mach-O/native_window_bridge.m
+MACHO_NATIVE_WINDOW_HEADER := lib/Mach-O/native_window_bridge.h
+MACHO_NATIVE_WINDOW_OBJ := build/macho_native_window_bridge.o
 DYLD_DYLIB := zig-out/lib/rosette-exec.dylib
 SHELL_HELPER_SRC := src/shell/global_config/rosette_shell.zig
 SHELL_HELPER_BIN := zig-out/bin/rosette-shell
@@ -185,7 +188,7 @@ c-fix: c-fix-build
 
 
 clean: exe-runner-cleanup
-	rm -f test_main lib*.dylib lib*.so $(OBJC_OBJ) $(OBJC_GDI_OBJ) $(TRACE_WINDOW_OBJ) $(OBJCXX_OBJ) $(DEFAULT_OBJ) $(EXT_WIN_OBJ) $(CLI_OBJ) $(DEBUG_RUNTIME_OBJ) $(KEYBOARD_OBJ) $(FB_LOGGER_OBJ) $(OBJC_LIB) $(CLI_LIB)
+	rm -f test_main lib*.dylib lib*.so $(OBJC_OBJ) $(OBJC_GDI_OBJ) $(TRACE_WINDOW_OBJ) $(OBJCXX_OBJ) $(DEFAULT_OBJ) $(EXT_WIN_OBJ) $(CLI_OBJ) $(DEBUG_RUNTIME_OBJ) $(KEYBOARD_OBJ) $(FB_LOGGER_OBJ) $(MACHO_NATIVE_WINDOW_OBJ) $(OBJC_LIB) $(CLI_LIB)
 	rm -rf zig-out
 	rm -f snake_game app_testing/basic_snake/snake_game
 
@@ -193,9 +196,13 @@ elf-processor-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
 	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway -Mx64_decoder=src/x64-ASM/decoder.zig -Misa_highway=ISA/highway.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
-macho-processor-build:
+macho-processor-build: $(MACHO_NATIVE_WINDOW_OBJ)
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime -lc -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway -Mx64_decoder=src/x64-ASM/decoder.zig -Misa_highway=ISA/highway.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -femit-bin="$(MACHO_PROCESSOR_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime -lc "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway -Mx64_decoder=src/x64-ASM/decoder.zig -Misa_highway=ISA/highway.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -femit-bin="$(MACHO_PROCESSOR_BIN)"
+
+$(MACHO_NATIVE_WINDOW_OBJ): $(MACHO_NATIVE_WINDOW_SRC) $(MACHO_NATIVE_WINDOW_HEADER)
+	@mkdir -p build/.clang-module-cache
+	@CLANG_MODULE_CACHE_PATH="$(ROOT_DIR)/build/.clang-module-cache" $(CC) $(OBJC_FLAGS) -Wall -Wextra -c "$(MACHO_NATIVE_WINDOW_SRC)" -o "$(MACHO_NATIVE_WINDOW_OBJ)"
 
 elf-processor-dylib:
 	@mkdir -p zig-out/lib
