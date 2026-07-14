@@ -1,0 +1,3 @@
+pub const family = "FUSED";
+pub const path = "FUSED/VFMSUB132PS.inc";
+pub const source = @embedFile("../../FUSED/VFMSUB132PS.inc");
