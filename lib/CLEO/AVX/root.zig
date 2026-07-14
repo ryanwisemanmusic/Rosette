@@ -50,6 +50,43 @@ pub const SHUFPD = @import("SHUFPD.zig");
 pub const SHUFPS = @import("SHUFPS.zig");
 pub const XORPD = @import("XORPD.zig");
 pub const XORPS = @import("XORPS.zig");
+pub const VFMADD132PD = @import("VFMADD132PD.zig");
+pub const VFMADD132PS = @import("VFMADD132PS.zig");
+pub const VFMADD213PD = @import("VFMADD213PD.zig");
+pub const VFMADD213PS = @import("VFMADD213PS.zig");
+pub const VFMADD231PD = @import("VFMADD231PD.zig");
+pub const VFMADD231PS = @import("VFMADD231PS.zig");
+pub const VFMSUB132PD = @import("VFMSUB132PD.zig");
+pub const VFMSUB132PS = @import("VFMSUB132PS.zig");
+pub const VFMSUB213PD = @import("VFMSUB213PD.zig");
+pub const VFMSUB213PS = @import("VFMSUB213PS.zig");
+pub const VFMSUB231PD = @import("VFMSUB231PD.zig");
+pub const VFMSUB231PS = @import("VFMSUB231PS.zig");
+pub const VFNMADD132PD = @import("VFNMADD132PD.zig");
+pub const VFNMADD132PS = @import("VFNMADD132PS.zig");
+pub const VFNMADD213PD = @import("VFNMADD213PD.zig");
+pub const VFNMADD213PS = @import("VFNMADD213PS.zig");
+pub const VFNMADD231PD = @import("VFNMADD231PD.zig");
+pub const VFNMADD231PS = @import("VFNMADD231PS.zig");
+pub const VFNMSUB132PD = @import("VFNMSUB132PD.zig");
+pub const VFNMSUB132PS = @import("VFNMSUB132PS.zig");
+pub const VFNMSUB213PD = @import("VFNMSUB213PD.zig");
+pub const VFNMSUB213PS = @import("VFNMSUB213PS.zig");
+pub const VFNMSUB231PD = @import("VFNMSUB231PD.zig");
+pub const VFNMSUB231PS = @import("VFNMSUB231PS.zig");
+pub const VFMADDSUB132PD = @import("VFMADDSUB132PD.zig");
+pub const VFMADDSUB132PS = @import("VFMADDSUB132PS.zig");
+pub const VFMADDSUB213PD = @import("VFMADDSUB213PD.zig");
+pub const VFMADDSUB213PS = @import("VFMADDSUB213PS.zig");
+pub const VFMADDSUB231PD = @import("VFMADDSUB231PD.zig");
+pub const VFMADDSUB231PS = @import("VFMADDSUB231PS.zig");
+pub const VFMSUBADD132PD = @import("VFMSUBADD132PD.zig");
+pub const VFMSUBADD132PS = @import("VFMSUBADD132PS.zig");
+pub const VFMSUBADD213PD = @import("VFMSUBADD213PD.zig");
+pub const VFMSUBADD213PS = @import("VFMSUBADD213PS.zig");
+pub const VFMSUBADD231PD = @import("VFMSUBADD231PD.zig");
+pub const VFMSUBADD231PS = @import("VFMSUBADD231PS.zig");
+pub const VFMADDRND231PD = @import("VFMADDRND231PD.zig");
 
 const types = @import("../types.zig");
 
@@ -106,6 +143,43 @@ pub const metas = [_]types.InstructionMeta{
     SHUFPS.meta,
     XORPD.meta,
     XORPS.meta,
+    VFMADD132PD.meta,
+    VFMADD132PS.meta,
+    VFMADD213PD.meta,
+    VFMADD213PS.meta,
+    VFMADD231PD.meta,
+    VFMADD231PS.meta,
+    VFMSUB132PD.meta,
+    VFMSUB132PS.meta,
+    VFMSUB213PD.meta,
+    VFMSUB213PS.meta,
+    VFMSUB231PD.meta,
+    VFMSUB231PS.meta,
+    VFNMADD132PD.meta,
+    VFNMADD132PS.meta,
+    VFNMADD213PD.meta,
+    VFNMADD213PS.meta,
+    VFNMADD231PD.meta,
+    VFNMADD231PS.meta,
+    VFNMSUB132PD.meta,
+    VFNMSUB132PS.meta,
+    VFNMSUB213PD.meta,
+    VFNMSUB213PS.meta,
+    VFNMSUB231PD.meta,
+    VFNMSUB231PS.meta,
+    VFMADDSUB132PD.meta,
+    VFMADDSUB132PS.meta,
+    VFMADDSUB213PD.meta,
+    VFMADDSUB213PS.meta,
+    VFMADDSUB231PD.meta,
+    VFMADDSUB231PS.meta,
+    VFMSUBADD132PD.meta,
+    VFMSUBADD132PS.meta,
+    VFMSUBADD213PD.meta,
+    VFMSUBADD213PS.meta,
+    VFMSUBADD231PD.meta,
+    VFMSUBADD231PS.meta,
+    VFMADDRND231PD.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {
