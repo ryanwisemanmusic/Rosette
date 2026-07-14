@@ -48,3 +48,4 @@ app/bundling/app_image/rosette_app_icon.icns
 /build/.zig-cache-direct
 /build/.zig-cache-env
 /patch
+/build/.clang-module-cache
