@@ -27,6 +27,7 @@ const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
 const libcpp_stream_bridge = @import("resolution/libcpp_stream_bridge.zig");
 const vtt_resolution = @import("resolution/vtt_resolver.zig");
 const foreign_object_runtime = @import("resolution/foreign_object_runtime.zig");
+const native_window_runtime = @import("resolution/native_window_runtime.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
 const tlv_runtime = @import("resolution/tlv_runtime.zig");
@@ -76,6 +77,14 @@ const GUEST_THREAD_RETURN_SENTINEL: u64 = 0xFFFF_FA00_0000_0000;
 const GUEST_SIGNAL_RETURN_SENTINEL: u64 = 0xFFFF_F900_0000_0000;
 const GUEST_ATEXIT_RETURN_SENTINEL: u64 = 0xFFFF_F800_0000_0000;
 const DEFAULT_GUEST_THREAD_STACK_SIZE: u64 = 2 * 1024 * 1024;
+// The interpreter executes guest C++ startup code far more slowly than native
+// code; a short slice is necessary for TimerQueue-style workers to reach the
+// mutex/condition handoff before another worker starves.
+const COOPERATIVE_THREAD_QUANTUM_STEPS: u64 = 10_000;
+// GTK idle work is expected to dispatch at the first interpreter boundary
+// after it is scheduled. Any callback that survives substantially longer is
+// starved, regardless of the guest's wall-clock timeout policy.
+const GTK_IDLE_STARVATION_STEPS: u64 = 100_000;
 const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 16;
@@ -120,6 +129,142 @@ const TraceEntry = struct {
     rdx: u64 = 0,
 };
 
+const X87Tag = enum(u2) {
+    valid = 0b00,
+    zero = 0b01,
+    special = 0b10,
+    empty = 0b11,
+};
+
+// The architectural x87 register file is circular.  `top` identifies the
+// physical register exposed as ST(0); tags deliberately use physical indexes.
+const X87State = struct {
+    values: [8]f64 = [_]f64{0.0} ** 8,
+    tags: [8]X87Tag = [_]X87Tag{.empty} ** 8,
+    top: u3 = 0,
+    status: u16 = 0,
+    control: u16 = 0x037F,
+
+    const status_invalid: u16 = 1 << 0;
+    const status_zero_divide: u16 = 1 << 2;
+    const status_stack_fault: u16 = 1 << 6;
+    const status_c1: u16 = 1 << 9;
+    const status_top_mask: u16 = 0x3800;
+
+    fn physical(self: *const X87State, logical: u3) u3 {
+        return @truncate(self.top +% logical);
+    }
+
+    fn statusWord(self: *const X87State) u16 {
+        return (self.status & ~status_top_mask) | (@as(u16, self.top) << 11);
+    }
+
+    fn tagWord(self: *const X87State) u16 {
+        var word: u16 = 0;
+        for (self.tags, 0..) |tag, index| word |= @as(u16, @intFromEnum(tag)) << @intCast(index * 2);
+        return word;
+    }
+
+    fn classify(value: f64) X87Tag {
+        if (value == 0.0) return .zero;
+        if (std.math.isFinite(value)) return .valid;
+        return .special;
+    }
+
+    fn stackFault(self: *X87State, overflow: bool) void {
+        self.status |= status_invalid | status_stack_fault;
+        if (overflow) self.status |= status_c1 else self.status &= ~status_c1;
+    }
+
+    fn reset(self: *X87State) void {
+        self.* = .{};
+    }
+
+    fn push(self: *X87State, value: f64) bool {
+        const next: u3 = @truncate(self.top -% 1);
+        if (self.tags[next] != .empty) {
+            self.stackFault(true);
+            return false;
+        }
+        self.top = next;
+        self.values[next] = value;
+        self.tags[next] = classify(value);
+        return true;
+    }
+
+    fn get(self: *X87State, logical: u3) ?f64 {
+        const index = self.physical(logical);
+        if (self.tags[index] == .empty) {
+            self.stackFault(false);
+            return null;
+        }
+        return self.values[index];
+    }
+
+    fn set(self: *X87State, logical: u3, value: f64) bool {
+        const index = self.physical(logical);
+        if (self.tags[index] == .empty) {
+            self.stackFault(false);
+            return false;
+        }
+        self.values[index] = value;
+        self.tags[index] = classify(value);
+        return true;
+    }
+
+    fn pop(self: *X87State) ?f64 {
+        const index = self.top;
+        if (self.tags[index] == .empty) {
+            self.stackFault(false);
+            return null;
+        }
+        const value = self.values[index];
+        self.tags[index] = .empty;
+        self.top +%= 1;
+        return value;
+    }
+
+    fn exchange(self: *X87State, logical: u3) bool {
+        const other = self.physical(logical);
+        if (self.tags[self.top] == .empty or self.tags[other] == .empty) {
+            self.stackFault(false);
+            return false;
+        }
+        std.mem.swap(f64, &self.values[self.top], &self.values[other]);
+        std.mem.swap(X87Tag, &self.tags[self.top], &self.tags[other]);
+        return true;
+    }
+
+    fn free(self: *X87State, logical: u3) void {
+        self.tags[self.physical(logical)] = .empty;
+    }
+
+    // `operation` uses the architectural operand order already selected by
+    // the decoder: add, multiply, subtract, reverse-subtract, divide, and
+    // reverse-divide respectively.
+    fn binary(self: *X87State, destination: u3, source: u3, operation: u3, pop_result: bool) void {
+        const lhs = self.get(destination) orelse return;
+        const rhs = self.get(source) orelse return;
+        const result: f64 = switch (operation) {
+            0 => lhs + rhs,
+            1 => lhs * rhs,
+            2 => lhs - rhs,
+            3 => rhs - lhs,
+            4 => blk: {
+                if (rhs == 0.0) self.status |= status_zero_divide;
+                break :blk lhs / rhs;
+            },
+            5 => blk: {
+                if (lhs == 0.0) self.status |= status_zero_divide;
+                break :blk rhs / lhs;
+            },
+            else => unreachable,
+        };
+        _ = self.set(destination, result);
+        if (pop_result) _ = self.pop();
+    }
+};
+
 const ImportTraceEntry = struct {
     symbol: []const u8 = "",
     dylib: []const u8 = "",
@@ -162,6 +307,10 @@ const ImportRoute = enum(u8) {
     bzero,
     gtk_main,
     gtk_main_quit,
+    gtk_idle_add,
+    g_source_remove,
+    gtk_events_pending,
+    gtk_main_iteration,
     local_definition,
     libcxx_stream,
     foreign_object,
@@ -179,6 +328,24 @@ const ImportRoute = enum(u8) {
     chkstk,
     sysconf,
 };
+
+fn isGtkIdleAddImport(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_gdk_threads_add_idle") or
+        std.mem.eql(u8, name, "_gdk_threads_add_idle_full") or
+        std.mem.eql(u8, name, "_g_idle_add") or
+        std.mem.eql(u8, name, "_g_idle_add_full");
+}
+
+fn isGtkEventsPendingImport(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_gtk_events_pending") or
+        std.mem.eql(u8, name, "_g_main_context_pending");
+}
+
+fn isGtkMainIterationImport(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_gtk_main_iteration") or
+        std.mem.eql(u8, name, "_gtk_main_iteration_do") or
+        std.mem.eql(u8, name, "_g_main_context_iteration");
+}
 
 const ImportRouteCacheEntry = struct {
     stub_address: u64 = 0,
@@ -258,6 +425,77 @@ const CooperativeUiContext = struct {
     regs: Regs,
     xmm: [16][16]u8,
     ymm_hi: [16][16]u8,
+    x87: X87State,
+};
+
+const MAX_GTK_IDLE_CALLBACKS = 32;
+const GTK_IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
+
+const GtkIdleCallback = struct {
+    source_id: u64 = 0,
+    function: u64 = 0,
+    data: u64 = 0,
+    active: bool = false,
+    tag: []const u8 = "",
+    scheduled_step: u64 = 0,
+    scheduling_thread: u64 = 0,
+    scheduling_rip: u64 = 0,
+};
+
+const GtkIdleDispatchBlock = enum {
+    ready,
+    no_ui_context,
+    no_active_guest_thread,
+    callback_already_running,
+    suspended_queue_full,
+};
+
+const GtkIdleQueueSnapshot = struct {
+    pending: usize = 0,
+    oldest_source: u64 = 0,
+    oldest_callback: u64 = 0,
+    oldest_scheduled_step: u64 = 0,
+    oldest_scheduling_thread: u64 = 0,
+    oldest_scheduling_rip: u64 = 0,
+    oldest_tag: []const u8 = "",
+};
+
+const CooperativeQuantumWork = enum {
+    none,
+    gtk_idle,
+    deferred_thread,
+};
+
+fn cooperativeQuantumWork(pending_idle: usize, idle_callback_running: bool, deferred_threads: u64) CooperativeQuantumWork {
+    if (pending_idle != 0 and !idle_callback_running) return .gtk_idle;
+    if (deferred_threads != 0) return .deferred_thread;
+    return .none;
+}
+
+fn gtkIdleQueueSnapshotFor(callbacks: []const GtkIdleCallback) GtkIdleQueueSnapshot {
+    var snapshot = GtkIdleQueueSnapshot{};
+    for (callbacks) |entry| {
+        if (!entry.active) continue;
+        snapshot.pending += 1;
+        if (snapshot.oldest_source != 0 and entry.source_id >= snapshot.oldest_source) continue;
+        snapshot.oldest_source = entry.source_id;
+        snapshot.oldest_callback = entry.function;
+        snapshot.oldest_scheduled_step = entry.scheduled_step;
+        snapshot.oldest_scheduling_thread = entry.scheduling_thread;
+        snapshot.oldest_scheduling_rip = entry.scheduling_rip;
+        snapshot.oldest_tag = entry.tag;
+    }
+    return snapshot;
+}
+
+const MAX_SUSPENDED_GUEST_THREADS = 16;
+
+const SuspendedGuestThread = struct {
+    handle: u64 = 0,
+    regs: Regs = .{},
+    xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    x87: X87State = .{},
 };
 
 const GuestSignalAction = struct {
@@ -316,6 +554,25 @@ pub const MachOState = struct {
     active_guest_thread: u64 = 0,
     cooperative_thread_switches: u64 = 0,
     cooperative_thread_returns: u64 = 0,
+    cooperative_wait_yields: u64 = 0,
+    cooperative_quantum_yields: u64 = 0,
+    cooperative_quantum_steps: u64 = 0,
+    cooperative_bootstrap_trace_remaining: u8 = 0,
+    gtk_idle_callbacks: [MAX_GTK_IDLE_CALLBACKS]GtkIdleCallback = [_]GtkIdleCallback{.{}} ** MAX_GTK_IDLE_CALLBACKS,
+    gtk_idle_next_source: u64 = 1,
+    gtk_idle_scheduled: u64 = 0,
+    gtk_idle_started: u64 = 0,
+    gtk_idle_completed: u64 = 0,
+    gtk_idle_removed: u64 = 0,
+    gtk_idle_wakeups: u64 = 0,
+    gtk_idle_dispatch_failures: u64 = 0,
+    gtk_idle_starvation_warnings: u64 = 0,
+    active_gtk_idle_source: u64 = 0,
+    active_gtk_idle_callback: u64 = 0,
+    active_gtk_idle_started_step: u64 = 0,
+    suspended_guest_threads: [MAX_SUSPENDED_GUEST_THREADS]SuspendedGuestThread = [_]SuspendedGuestThread{.{}} ** MAX_SUSPENDED_GUEST_THREADS,
+    suspended_guest_thread_count: usize = 0,
+    x87: X87State = .{},
     guest_stdin_pointer_address: u64 = 0,
     guest_stdout_pointer_address: u64 = 0,
     guest_stderr_pointer_address: u64 = 0,
@@ -339,6 +596,8 @@ pub const MachOState = struct {
     libcxx_filesystem: libcpp_filesystem.Bridge = .{},
     libcxx_streams: libcpp_stream_bridge.Bridge = .{},
     foreign_objects: foreign_object_runtime.Runtime = .{},
+    native_window: native_window_runtime.Runtime = .{},
+    native_window_handles_registered: bool = false,
     local_libcpp_stream_targets: std.AutoHashMap(u64, []const u8),
     logging: logging_runtime.Engine = .{},
     pthreads: pthread_runtime.Runtime = .{},
@@ -623,6 +882,7 @@ pub const MachOState = struct {
         self.initializer_resolver.deinit();
         self.vtt_resolver.deinit();
         self.dynamic_forwarder.deinit();
+        self.native_window.deinit();
         self.fs_forwarder.deinit();
         self.memory_forwarder.deinit();
         self.sparse_memory.deinit();
@@ -1001,6 +1261,36 @@ pub const MachOState = struct {
         };
     }
 
+    fn writeExtendedFloat80(destination: []u8, value: f64) void {
+        std.debug.assert(destination.len >= 10);
+        @memset(destination[0..10], 0);
+        const bits: u64 = @bitCast(value);
+        const sign: u16 = if ((bits >> 63) != 0) 0x8000 else 0;
+        const fraction = bits & 0x000F_FFFF_FFFF_FFFF;
+        const exponent: u16 = @truncate((bits >> 52) & 0x7FF);
+        if (exponent == 0 and fraction == 0) return;
+        if (exponent == 0x7FF) {
+            const significand: u64 = if (fraction == 0) 0x8000_0000_0000_0000 else 0xC000_0000_0000_0000;
+            std.mem.writeInt(u64, destination[0..8], significand, .little);
+            std.mem.writeInt(u16, destination[8..10], sign | 0x7FFF, .little);
+            return;
+        }
+        var significand: u64 = 0;
+        var unbiased: i32 = 0;
+        if (exponent == 0) {
+            // A binary64 subnormal has no hidden bit. Normalize its leading
+            // set bit into x87's explicit integer bit at position 63.
+            const shift: u6 = @intCast(@clz(fraction));
+            significand = fraction << shift;
+            unbiased = -1011 - @as(i32, shift);
+        } else {
+            significand = (fraction | (@as(u64, 1) << 52)) << 11;
+            unbiased = @as(i32, exponent) - 1023;
+        }
+        std.mem.writeInt(u64, destination[0..8], significand, .little);
+        std.mem.writeInt(u16, destination[8..10], sign | @as(u16, @intCast(unbiased + 16383)), .little);
+    }
+
     fn ensureGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) bool {
         if (access == .read and self.sparse_memory.bytesConst(address, bytes) != null) return true;
         if (access == .write and self.sparse_memory.bytes(address, bytes, true) != null) return true;
@@ -1147,6 +1437,80 @@ pub const MachOState = struct {
     pub fn registerOpaqueHandle(self: *MachOState, address: u64, owner: []const u8) void {
         _ = self.memory_regions.register(address, 1, .{ .read = false, .write = false }, .objc_handle, owner, self.regs.rip);
         _ = self.pointer_firewall.register(address, 1, .{ .kind = .opaque_identity, .may_dereference = false, .owner = owner });
+    }
+
+    fn registerNativeWindowHandles(self: *MachOState) void {
+        if (self.native_window_handles_registered) return;
+        self.registerOpaqueHandle(native_window_runtime.APPLICATION_TOKEN, "native NSApplication identity");
+        self.registerOpaqueHandle(native_window_runtime.WINDOW_TOKEN, "native NSWindow identity");
+        self.registerOpaqueHandle(native_window_runtime.VIEW_TOKEN, "native NSView identity");
+        self.registerOpaqueHandle(native_window_runtime.METAL_LAYER_TOKEN, "native CAMetalLayer identity");
+        self.native_window_handles_registered = true;
+    }
+
+    pub fn ensureNativeApplication(self: *MachOState) bool {
+        const ready = self.native_window.ensureApplication();
+        if (ready) self.registerNativeWindowHandles();
+        return ready;
+    }
+
+    pub fn ensureNativeWindow(self: *MachOState) bool {
+        const ready = self.native_window.ensureWindow();
+        if (ready) self.registerNativeWindowHandles();
+        return ready;
+    }
+
+    pub fn setNativeWindowTitle(self: *MachOState, title: []const u8) bool {
+        const ready = self.native_window.setTitle(title);
+        if (ready) self.registerNativeWindowHandles();
+        return ready;
+    }
+
+    pub fn setNativeWindowSize(self: *MachOState, width: i32, height: i32) bool {
+        const ready = self.native_window.setSize(width, height);
+        if (ready) self.registerNativeWindowHandles();
+        return ready;
+    }
+
+    pub fn showNativeWindow(self: *MachOState) bool {
+        const ready = self.native_window.show();
+        if (ready) self.registerNativeWindowHandles();
+        return ready;
+    }
+
+    pub fn setNativeWindowFullscreen(self: *MachOState, fullscreen: bool) bool {
+        return self.native_window.setFullscreen(fullscreen);
+    }
+
+    pub fn nativeViewToken(self: *MachOState) u64 {
+        const token = self.native_window.viewToken();
+        if (token != 0) self.registerNativeWindowHandles();
+        return token;
+    }
+
+    pub fn nativeWindowWidth(self: *MachOState) u32 {
+        return self.native_window.width();
+    }
+
+    pub fn nativeWindowHeight(self: *MachOState) u32 {
+        return self.native_window.height();
+    }
+
+    pub fn validateNativeMetalLayerToken(self: *MachOState, token: u64) bool {
+        return self.native_window.validateLayerToken(token);
+    }
+
+    pub fn nativeMetalLayerHostPointer(self: *MachOState) usize {
+        return self.native_window.hostMetalLayer();
+    }
+
+    pub fn noteNativeVulkanSurfaceBound(self: *MachOState, layer_token: u64, guest_surface: u64, host_surface: u64) void {
+        self.native_window.noteSurfaceBound(layer_token, guest_surface, host_surface);
+    }
+
+    fn pumpNativeWindowEvents(self: *MachOState) void {
+        if (self.native_window.application_ensure_attempts == 0) return;
+        _ = self.native_window.pumpEvents();
     }
 
     pub fn registerSyntheticThunk(self: *MachOState, address: u64, size: u64, owner: []const u8) void {
@@ -1724,6 +2088,25 @@ pub const MachOState = struct {
             self.restoreGtkMainLoopCaller("gtk_main_quit");
             return .control_transferred;
         }
+        if (isGtkIdleAddImport(name)) {
+            self.resolving_import_route = .gtk_idle_add;
+            return self.handleGtkIdleAdd(name);
+        }
+        if (std.mem.eql(u8, name, "_g_source_remove")) {
+            self.resolving_import_route = .g_source_remove;
+            return self.handleGSourceRemove();
+        }
+        if (isGtkEventsPendingImport(name)) {
+            self.resolving_import_route = .gtk_events_pending;
+            self.pumpNativeWindowEvents();
+            return .{ .handled = @intFromBool(self.pendingGtkIdleCallbackCount() != 0) };
+        }
+        if (isGtkMainIterationImport(name)) {
+            self.resolving_import_route = .gtk_main_iteration;
+            self.pumpNativeWindowEvents();
+            if (self.startNextGtkIdleCallback(name, false)) return .control_transferred;
+            return .{ .handled = 0 };
+        }
         if (self.metadata.definedSymbolAddress(name)) |target| {
             if (target != imported.stub_address and self.isExecutableAddress(target)) {
                 self.regs.rip = target;
@@ -1787,7 +2170,7 @@ pub const MachOState = struct {
             self.resolving_import_route = .pthread;
             self.import_provider_override = .pthread_runtime;
             self.import_confidence_override = .modeled;
-            return .{ .handled = @intFromBool(self.pthreads.cppMutexTryLock(self.regs.rdi)) };
+            return .{ .handled = @intFromBool(self.pthreads.cppMutexTryLockForThread(self.regs.rdi, self.pthreads.currentThreadHandle(self))) };
         }
 
         if (self.dynamic_forwarder.forward(self, imported.dylib, name)) |resolution| {
@@ -1848,6 +2231,23 @@ pub const MachOState = struct {
             return .{ .handled = handle };
         }
         if (std.mem.eql(u8, name, "_objc_msgSend")) {
+            const selector_name = self.compat.selectorName(self.regs.rsi);
+            const class_name = self.compat.className(self.regs.rdi);
+            if (self.native_window.handleObjcMessage(
+                class_name,
+                self.regs.rdi,
+                selector_name,
+                self.regs.rdx,
+            )) |native_result| {
+                if (native_result.value >= 0xFFFF_0000_0000_0000) {
+                    self.registerNativeWindowHandles();
+                }
+                std.debug.print(
+                    "    [objc/native] msgSend receiver=0x{x} class={s} selector={s} argument=0x{x} -> 0x{x} action={s}\n",
+                    .{ self.regs.rdi, class_name, selector_name, self.regs.rdx, native_result.value, native_result.action },
+                );
+                return .{ .handled = native_result.value };
+            }
             const result = self.compat.sendMessage(self.regs.rdi, self.regs.rsi);
             if (result.value >= 0xFFFF_0000_0000_0000) self.registerOpaqueHandle(result.value, "Objective-C object identity");
             std.debug.print(
@@ -2450,6 +2850,23 @@ pub const MachOState = struct {
             return .{ .handled = now };
         }
 
+        if (std.mem.eql(u8, name, "_nanosleep")) {
+            const req_ptr = self.regs.rdi;
+            const rem_ptr = self.regs.rsi;
+            const req = self.guestMemory(req_ptr, 16) orelse return .{ .handled = @bitCast(@as(i64, -1)) };
+            const tv_sec = std.mem.readInt(i64, req[0..8], .little);
+            const tv_nsec = std.mem.readInt(i64, req[8..16], .little);
+            if (tv_sec < 0 or tv_nsec < 0) return .{ .handled = @bitCast(@as(i64, -1)) };
+            const total_ns: u64 = (@as(u64, @intCast(tv_sec)) * 1_000_000_000) +| @as(u64, @intCast(tv_nsec));
+            self.monotonic_nanoseconds +|= total_ns;
+            if (rem_ptr != 0) {
+                if (self.guestMemory(rem_ptr, 16)) |rem| {
+                    @memset(rem, 0);
+                }
+            }
+            return .{ .handled = 0 };
+        }
+
         if (std.mem.eql(u8, name, "_open")) {
             return .{ .handled = self.fs_forwarder.open(self) };
         }
@@ -2537,6 +2954,18 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "_fcntl")) {
             return .{ .handled = self.fs_forwarder.fcntl(self) };
         }
+        if (std.mem.eql(u8, name, "_socket")) {
+            return .{ .handled = self.fs_forwarder.createSocket(self) };
+        }
+        if (std.mem.eql(u8, name, "_setsockopt")) {
+            return .{ .handled = self.fs_forwarder.setSocketOption(self) };
+        }
+        if (std.mem.eql(u8, name, "_connect")) {
+            return .{ .handled = self.fs_forwarder.connectSocket(self) };
+        }
+        if (std.mem.eql(u8, name, "_send")) {
+            return .{ .handled = self.fs_forwarder.sendSocket(self) };
+        }
         if (std.mem.eql(u8, name, "_pipe")) {
             return .{ .handled = self.fs_forwarder.pipe(self) };
         }
@@ -2575,6 +3004,9 @@ pub const MachOState = struct {
         }
         if (std.mem.endsWith(u8, name, "_fprintf")) {
             return .{ .handled = self.handleFprintf() };
+        }
+        if (std.mem.endsWith(u8, name, "_snprintf")) {
+            return .{ .handled = self.handleSnprintf() };
         }
         if (std.mem.endsWith(u8, name, "_fputs")) {
             return .{ .handled = self.handleFputs() };
@@ -2634,6 +3066,16 @@ pub const MachOState = struct {
             if (self.verbose_trace) std.debug.print("    [import] std::thread::join(object=0x{x})\n", .{self.regs.rdi});
             return .handled_void;
         }
+        if (std.mem.eql(u8, name, "__ZNSt3__16thread20hardware_concurrencyEv")) {
+            const count = std.Thread.getCpuCount() catch 1;
+            if (self.verbose_trace) std.debug.print("    [import] std::thread::hardware_concurrency() -> {d}\n", .{count});
+            return .{ .handled = count };
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__111this_thread6get_idEv")) {
+            const handle = self.pthreads.currentThreadHandle(self);
+            if (self.verbose_trace) std.debug.print("    [import] std::this_thread::get_id() -> 0x{x}\n", .{handle});
+            return .{ .handled = handle };
+        }
         if (std.mem.eql(u8, name, "__ZNSt3__119__thread_local_dataEv")) {
             const allocation = self.guestAlloc(64, 16) orelse return .{ .unsupported = 0 };
             if (self.verbose_trace) std.debug.print("    [import] __thread_local_data() -> 0x{x}\n", .{allocation});
@@ -2657,9 +3099,10 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv")) {
             const output_ptr = self.regs.rdi;
             const stringbuf_ptr = self.regs.rsi;
-            _ = stringbuf_ptr;
-            _ = compat_runtime.initLibcppStringLiteral(self, output_ptr, "");
-            if (self.verbose_trace) std.debug.print("    [import] basic_stringbuf::str() -> empty string at 0x{x}\n", .{output_ptr});
+            if (!self.libcxx_streams.stringbufToString(self, stringbuf_ptr, output_ptr)) {
+                _ = compat_runtime.initLibcppStringLiteral(self, output_ptr, "");
+            }
+            if (self.verbose_trace) std.debug.print("    [import] basic_stringbuf::str() -> modeled string at 0x{x}\n", .{output_ptr});
             return .{ .handled = output_ptr };
         }
 
@@ -2820,6 +3263,17 @@ pub const MachOState = struct {
                 self.restoreGtkMainLoopCaller("gtk_main_quit");
                 break :blk .control_transferred;
             },
+            .gtk_idle_add => self.handleGtkIdleAdd(name),
+            .g_source_remove => self.handleGSourceRemove(),
+            .gtk_events_pending => blk: {
+                self.pumpNativeWindowEvents();
+                break :blk .{ .handled = @intFromBool(self.pendingGtkIdleCallbackCount() != 0) };
+            },
+            .gtk_main_iteration => blk: {
+                self.pumpNativeWindowEvents();
+                if (self.startNextGtkIdleCallback(name, false)) break :blk .control_transferred;
+                break :blk .{ .handled = 0 };
+            },
             .local_definition => blk: {
                 const target = self.metadata.definedSymbolAddress(name) orelse break :blk null;
                 if (target == imported.stub_address or !self.isExecutableAddress(target)) break :blk null;
@@ -2899,6 +3353,19 @@ pub const MachOState = struct {
         };
     }
 
+    fn handleGtkIdleAdd(self: *MachOState, name: []const u8) ImportHandlerResult {
+        const full = std.mem.eql(u8, name, "_g_idle_add_full") or std.mem.eql(u8, name, "_gdk_threads_add_idle_full");
+        const callback = if (full) self.regs.rsi else self.regs.rdi;
+        const data = if (full) self.regs.rdx else self.regs.rsi;
+        const source = self.scheduleGtkIdleCallback(callback, data, name);
+        return .{ .handled = source };
+    }
+
+    fn handleGSourceRemove(self: *MachOState) ImportHandlerResult {
+        const removed = self.removeGtkIdleSource(self.regs.rdi);
+        return .{ .handled = @intFromBool(removed) };
+    }
+
     fn dispatchSharedContract(self: *MachOState, name: []const u8) ?ImportHandlerResult {
         const outcome = contract.dispatchFromAllFamilies(name, self.regs.rdi) orelse return null;
         if (self.contract_verification and !contract.verify.verifyDispatch(name, outcome, self.regs.rdi)) {
@@ -2947,6 +3414,57 @@ pub const MachOState = struct {
         return .{ .handled = destination_address };
     }
 
+    fn isCooperativeWaitImport(name: []const u8) bool {
+        return std.mem.indexOf(u8, name, "condition_variable15__do_timed_wait") != null or
+            std.mem.indexOf(u8, name, "condition_variable4wait") != null or
+            std.mem.indexOf(u8, name, "condition_variable10wait_until") != null or
+            std.mem.eql(u8, name, "_pthread_cond_wait") or
+            std.mem.eql(u8, name, "_pthread_cond_timedwait") or
+            std.mem.eql(u8, name, "_pthread_cond_timedwait_relative_np") or
+            std.mem.eql(u8, name, "_pthread_join");
+    }
+
+    fn handleCooperativeWaitImport(self: *MachOState, imported: macho_metadata.ImportedSymbol, return_address: u64) bool {
+        if (!isCooperativeWaitImport(imported.name)) return false;
+        const condvar_wait = std.mem.eql(u8, imported.name, "_pthread_cond_wait") or
+            std.mem.eql(u8, imported.name, "_pthread_cond_timedwait") or
+            std.mem.eql(u8, imported.name, "_pthread_cond_timedwait_relative_np");
+        if (condvar_wait and !self.pthreads.beginCooperativeCondvarWait(self)) return false;
+        if (!condvar_wait) self.pthreads.collapsed_waits +|= 1;
+        self.regs.rax = 0;
+        if (return_address != 0 and self.isExecutableAddress(return_address)) {
+            _ = self.pop();
+            self.regs.rip = return_address;
+        } else {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            self.terminated = true;
+            return true;
+        }
+        if (self.yieldActiveGuestThreadForWait(imported.name)) {
+            self.resolving_import_route = .pthread;
+            self.import_provider_override = .pthread_runtime;
+        } else if (condvar_wait) {
+            // If this is the only runnable worker, the collapsed wait still
+            // must return with the caller's mutex reacquired.
+            _ = self.pthreads.resumeCooperativeWait(self.active_guest_thread);
+        }
+        return true;
+    }
+
+    // A contended mutex must be retried after the owner gets a time slice.
+    // Unlike condition waits, keep the guest call frame intact so resuming the
+    // worker re-enters pthread_mutex_lock rather than falsely reporting that
+    // it acquired the mutex.
+    fn handleCooperativeMutexContention(self: *MachOState, imported: macho_metadata.ImportedSymbol) bool {
+        if (!std.mem.eql(u8, imported.name, "_pthread_mutex_lock")) return false;
+        const owner = self.pthreads.currentThreadHandle(self);
+        if (!self.pthreads.mutexWouldBlock(self.regs.rdi, owner)) return false;
+        self.pthreads.collapsed_waits +|= 1;
+        return self.yieldActiveGuestThreadForWait("pthread mutex contention");
+    }
+
     fn handleDirectImportCall(self: *MachOState, imported: macho_metadata.ImportedSymbol) void {
         const boundary = x64_decoder.highway.systemBoundary(.macho64, .import, imported.stub_address, imported.name);
         if (boundary.disposition != .forward) {
@@ -2957,6 +3475,8 @@ pub const MachOState = struct {
             return;
         }
         const return_address = self.read64(self.regs.rsp);
+        if (self.handleCooperativeMutexContention(imported)) return;
+        if (self.handleCooperativeWaitImport(imported, return_address)) return;
         switch (self.handleImport(imported)) {
             .handled => |result| {
                 self.regs.rax = result;
@@ -3737,6 +4257,74 @@ pub const MachOState = struct {
         const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
         const arguments = [_]u64{ self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9 };
         return self.handlePrintfLike(file, self.regs.rsi, &arguments);
+    }
+
+    fn handleSnprintf(self: *MachOState) u64 {
+        const destination = self.regs.rdi;
+        const capacity: usize = @intCast(self.regs.rsi);
+        const format = self.guestCString(self.regs.rdx, 1 << 20) orelse return @bitCast(@as(i64, -1));
+        var output = std.ArrayList(u8).empty;
+        defer output.deinit(self.allocator);
+        const arguments = [_]u64{ self.regs.rcx, self.regs.r8, self.regs.r9 };
+        var argument_index: usize = 0;
+        var stack_argument = self.regs.rsp + 8;
+        var index: usize = 0;
+        while (index < format.len) : (index += 1) {
+            if (format[index] != '%') {
+                output.append(self.allocator, format[index]) catch return @bitCast(@as(i64, -1));
+                continue;
+            }
+            index += 1;
+            if (index >= format.len) break;
+            if (format[index] == '%') {
+                output.append(self.allocator, '%') catch return @bitCast(@as(i64, -1));
+                continue;
+            }
+            while (index < format.len and (format[index] == '-' or format[index] == '+' or format[index] == ' ' or format[index] == '#' or format[index] == '0')) : (index += 1) {}
+            while (index < format.len and std.ascii.isDigit(format[index])) : (index += 1) {}
+            if (index < format.len and format[index] == '.') {
+                index += 1;
+                while (index < format.len and std.ascii.isDigit(format[index])) : (index += 1) {}
+            }
+            while (index < format.len and (format[index] == 'l' or format[index] == 'h' or format[index] == 'z' or format[index] == 't' or format[index] == 'j')) : (index += 1) {}
+            if (index >= format.len) break;
+            const argument = self.nextVarArg(&arguments, &argument_index, &stack_argument);
+            switch (format[index]) {
+                's' => output.appendSlice(self.allocator, self.guestCString(argument, 1 << 20) orelse "(null)") catch return @bitCast(@as(i64, -1)),
+                'c' => output.append(self.allocator, @truncate(argument)) catch return @bitCast(@as(i64, -1)),
+                'd', 'i' => {
+                    const rendered = std.fmt.allocPrint(self.allocator, "{d}", .{@as(i64, @bitCast(argument))}) catch return @bitCast(@as(i64, -1));
+                    defer self.allocator.free(rendered);
+                    output.appendSlice(self.allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                'u' => {
+                    const rendered = std.fmt.allocPrint(self.allocator, "{d}", .{argument}) catch return @bitCast(@as(i64, -1));
+                    defer self.allocator.free(rendered);
+                    output.appendSlice(self.allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                'x', 'X', 'p' => {
+                    const rendered = std.fmt.allocPrint(self.allocator, "{x}", .{argument}) catch return @bitCast(@as(i64, -1));
+                    defer self.allocator.free(rendered);
+                    if (format[index] == 'p') output.appendSlice(self.allocator, "0x") catch return @bitCast(@as(i64, -1));
+                    output.appendSlice(self.allocator, rendered) catch return @bitCast(@as(i64, -1));
+                },
+                // Floating-point varargs are carried in XMM registers. Preserve a
+                // valid numeric field until the formatter gains full width and
+                // precision handling rather than exposing an unresolved import.
+                'f', 'F', 'e', 'E', 'g', 'G', 'a', 'A' => output.append(self.allocator, '0') catch return @bitCast(@as(i64, -1)),
+                else => {
+                    output.append(self.allocator, '%') catch return @bitCast(@as(i64, -1));
+                    output.append(self.allocator, format[index]) catch return @bitCast(@as(i64, -1));
+                },
+            }
+        }
+        if (capacity != 0) {
+            const target = self.guestMemory(destination, capacity) orelse return @bitCast(@as(i64, -1));
+            const written = @min(output.items.len, capacity - 1);
+            @memcpy(target[0..written], output.items[0..written]);
+            target[written] = 0;
+        }
+        return output.items.len;
     }
 
     fn handlePrintfLike(self: *MachOState, file_opt: ?*GuestFile, format_address: u64, arguments: []const u64) u64 {
@@ -4610,9 +5198,11 @@ pub const MachOState = struct {
         self.write64(split_buffer + 16, range.new_end);
         self.page_entry_bulk_initializations +|= 1;
         self.page_entry_bulk_bytes +|= range.byte_count;
+        const return_address = self.read64(self.regs.rsp);
+        const caller = self.metadata.nearestSymbol(return_address);
         std.debug.print(
-            "macho-processor: bulk default construction: PageEntry count={d} bytes={d} range=0x{x}-0x{x}\n",
-            .{ count, range.byte_count, end, range.new_end },
+            "macho-processor: bulk default construction: PageEntry count={d} bytes={d} range=0x{x}-0x{x} return={s}+0x{x}\n",
+            .{ count, range.byte_count, end, range.new_end, if (caller) |resolved| resolved.name else "<unknown>", if (caller) |resolved| resolved.offset else 0 },
         );
         self.regs.rip = self.pop();
         return !self.terminated;
@@ -4866,6 +5456,21 @@ pub const MachOState = struct {
             return false;
         }
         self.recordTrace(decoded);
+        if (self.cooperative_bootstrap_trace_remaining != 0) {
+            const symbol = self.metadata.nearestSymbol(self.regs.rip);
+            std.debug.print(
+                "macho-processor: GTK worker bootstrap: active=0x{x} rip=0x{x} {s}+0x{x} op={s} len={d}\n",
+                .{
+                    self.active_guest_thread,
+                    self.regs.rip,
+                    if (symbol) |resolved| resolved.name else "<unknown>",
+                    if (symbol) |resolved| resolved.offset else 0,
+                    @tagName(decoded.op),
+                    decoded.len,
+                },
+            );
+            self.cooperative_bootstrap_trace_remaining -= 1;
+        }
         if (self.verbose_trace) log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
         if (self.shouldTraceRIP(self.regs.rip)) {
             const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
@@ -4896,6 +5501,7 @@ pub const MachOState = struct {
             .regs = self.regs,
             .xmm = self.xmm,
             .ymm_hi = self.ymm_hi,
+            .x87 = self.x87,
         };
         self.foreign_objects.main_loop_entries +|= 1;
         self.foreign_objects.main_loop_depth +|= 1;
@@ -4924,6 +5530,8 @@ pub const MachOState = struct {
         self.regs = .{};
         self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
         self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
+        self.x87 = .{};
+        self.cooperative_bootstrap_trace_remaining = 24;
         self.regs.rip = deferred.start_routine;
         self.regs.rdi = deferred.argument;
         self.regs.rsp = alignDown(stack_base + stack_size, 16);
@@ -4933,17 +5541,276 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn saveActiveGuestThread(self: *MachOState) bool {
+        if (self.active_guest_thread == 0) return false;
+        if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return false;
+        self.suspended_guest_threads[self.suspended_guest_thread_count] = .{
+            .handle = self.active_guest_thread,
+            .regs = self.regs,
+            .xmm = self.xmm,
+            .ymm_hi = self.ymm_hi,
+            .x87 = self.x87,
+        };
+        self.suspended_guest_thread_count += 1;
+        self.active_guest_thread = 0;
+        return true;
+    }
+
+    // Suspended workers are a FIFO queue.  A LIFO pop would immediately resume
+    // the same worker that just yielded once all deferred threads had started.
+    fn resumeSuspendedGuestThread(self: *MachOState) bool {
+        if (self.suspended_guest_thread_count == 0) return false;
+        var attempts = self.suspended_guest_thread_count;
+        while (attempts > 0) : (attempts -= 1) {
+            const context = self.suspended_guest_threads[0];
+            if (self.suspended_guest_thread_count > 1) {
+                std.mem.copyForwards(
+                    SuspendedGuestThread,
+                    self.suspended_guest_threads[0 .. self.suspended_guest_thread_count - 1],
+                    self.suspended_guest_threads[1..self.suspended_guest_thread_count],
+                );
+            }
+            self.suspended_guest_thread_count -= 1;
+            self.suspended_guest_threads[self.suspended_guest_thread_count] = .{};
+            if (!self.pthreads.resumeCooperativeWait(context.handle)) {
+                self.suspended_guest_threads[self.suspended_guest_thread_count] = context;
+                self.suspended_guest_thread_count += 1;
+                continue;
+            }
+            self.regs = context.regs;
+            self.xmm = context.xmm;
+            self.ymm_hi = context.ymm_hi;
+            self.x87 = context.x87;
+            self.active_guest_thread = context.handle;
+            self.cooperative_thread_switches +|= 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn yieldActiveGuestThreadForWait(self: *MachOState, reason: []const u8) bool {
+        if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return false;
+        if (self.pthreads.deferred_threads == 0 and self.suspended_guest_thread_count == 0 and self.pendingGtkIdleCallbackCount() == 0) return false;
+        const waiter = self.active_guest_thread;
+        if (!self.saveActiveGuestThread()) return false;
+        var worker: u64 = 0;
+        if (self.startNextGtkIdleCallback(reason, true)) {
+            worker = self.active_guest_thread;
+        } else if (self.pthreads.takeNewestDeferred()) |next| {
+            if (!self.startDeferredGuestThread(next)) {
+                _ = self.resumeSuspendedGuestThread();
+                return false;
+            }
+            worker = next.handle;
+        } else {
+            if (!self.resumeSuspendedGuestThread()) return false;
+            worker = self.active_guest_thread;
+        }
+        self.cooperative_wait_yields +|= 1;
+        if (self.cooperative_wait_yields <= 16 or self.cooperative_wait_yields % 100 == 0) {
+            std.debug.print(
+                "macho-processor: cooperative wait yield #{d}: waiter=0x{x} -> worker=0x{x} reason={s} deferred_remaining={d} suspended={d} gtk_idle_pending={d}\n",
+                .{ self.cooperative_wait_yields, waiter, worker, reason, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.pendingGtkIdleCallbackCount() },
+            );
+        }
+        return true;
+    }
+
+    // GTK idle scheduling is a wake-up, not merely queue bookkeeping. Dispatch
+    // newly queued UI work at the first safe interpreter boundary even after
+    // every pthread worker has started. This is the path used by Xenia's
+    // CallInUIThread presenter creation handoff.
+    //
+    // Guest startup code may also wait by spinning on atomics before it reaches
+    // a pthread or libc++ condition-variable call. Give not-yet-started workers
+    // a bounded execution slice so one spinner cannot starve their producers.
+    fn maybeYieldActiveGuestThreadForQuantum(self: *MachOState) void {
+        if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return;
+        const pending_idle = self.pendingGtkIdleCallbackCount();
+        const work = cooperativeQuantumWork(pending_idle, self.active_gtk_idle_source != 0, self.pthreads.deferred_threads);
+        if (work == .gtk_idle) {
+            const scheduling_thread = self.active_guest_thread;
+            self.cooperative_quantum_steps = 0;
+            if (!self.yieldActiveGuestThreadForWait("GTK idle wake")) {
+                self.gtk_idle_dispatch_failures +|= 1;
+                const block = self.gtkIdleDispatchBlock();
+                if (self.gtk_idle_dispatch_failures <= 8 or self.gtk_idle_dispatch_failures % 100 == 0) {
+                    std.debug.print(
+                        "macho-processor: GTK idle wake blocked: failure={d} reason={s} active=0x{x} pending={d} suspended={d}/{d}\n",
+                        .{ self.gtk_idle_dispatch_failures, @tagName(block), scheduling_thread, pending_idle, self.suspended_guest_thread_count, self.suspended_guest_threads.len },
+                    );
+                }
+                return;
+            }
+            self.gtk_idle_wakeups +|= 1;
+            std.debug.print(
+                "macho-processor: GTK idle wake dispatched: wake={d} from_thread=0x{x} source={d} pending={d}\n",
+                .{ self.gtk_idle_wakeups, scheduling_thread, self.active_gtk_idle_source, self.pendingGtkIdleCallbackCount() },
+            );
+            return;
+        }
+        // Once every deferred thread has started, rotating ordinary suspended
+        // workers only slows hot single-threaded phases. Real blocking waits
+        // still yield through yieldActiveGuestThreadForWait.
+        if (work != .deferred_thread) return;
+        self.cooperative_quantum_steps +|= 1;
+        if (self.cooperative_quantum_steps < COOPERATIVE_THREAD_QUANTUM_STEPS) return;
+        self.cooperative_quantum_steps = 0;
+        if (!self.yieldActiveGuestThreadForWait("instruction quantum")) return;
+        self.cooperative_quantum_yields +|= 1;
+        if (self.cooperative_quantum_yields <= 8 or self.cooperative_quantum_yields % 100 == 0) {
+            std.debug.print(
+                "macho-processor: cooperative quantum yield #{d}: active=0x{x} deferred={d} suspended={d}\n",
+                .{ self.cooperative_quantum_yields, self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count },
+            );
+        }
+    }
+
     fn finishActiveGuestThread(self: *MachOState) void {
         if (self.active_guest_thread != 0) {
-            self.pthreads.markCompleted(self.active_guest_thread);
-            self.cooperative_thread_returns +|= 1;
-            std.debug.print("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
-            self.active_guest_thread = 0;
+            if (self.isGtkIdleCallbackHandle(self.active_guest_thread)) {
+                const source = self.active_gtk_idle_source;
+                const callback = self.active_gtk_idle_callback;
+                const duration = self.executed_steps -| self.active_gtk_idle_started_step;
+                self.gtk_idle_completed +|= 1;
+                std.debug.print(
+                    "macho-processor: GTK idle callback completed: source={d} callback=0x{x} duration_steps={d} completed={d} pending={d}\n",
+                    .{ source, callback, duration, self.gtk_idle_completed, self.pendingGtkIdleCallbackCount() },
+                );
+                self.active_guest_thread = 0;
+                self.active_gtk_idle_source = 0;
+                self.active_gtk_idle_callback = 0;
+                self.active_gtk_idle_started_step = 0;
+            } else {
+                self.pthreads.markCompleted(self.active_guest_thread);
+                self.cooperative_thread_returns +|= 1;
+                std.debug.print("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
+                self.active_guest_thread = 0;
+            }
         }
+        if (self.startNextGtkIdleCallback("idle-return", false)) return;
         if (self.pthreads.takeNewestDeferred()) |next| {
             if (self.startDeferredGuestThread(next)) return;
         }
+        if (self.resumeSuspendedGuestThread()) return;
         self.restoreGtkMainLoopCaller("all cooperative guest threads returned");
+    }
+
+    fn scheduleGtkIdleCallback(self: *MachOState, function: u64, data: u64, tag: []const u8) u64 {
+        if (function == 0 or !self.isExecutableAddress(function)) {
+            std.debug.print(
+                "macho-processor: GTK idle rejected: callback=0x{x} executable={} tag={s}\n",
+                .{ function, self.isExecutableAddress(function), tag },
+            );
+            return 0;
+        }
+        for (&self.gtk_idle_callbacks) |*entry| {
+            if (entry.active) continue;
+            const source = self.gtk_idle_next_source;
+            self.gtk_idle_next_source +|= 1;
+            entry.* = .{
+                .source_id = source,
+                .function = function,
+                .data = data,
+                .active = true,
+                .tag = tag,
+                .scheduled_step = self.executed_steps,
+                .scheduling_thread = self.active_guest_thread,
+                .scheduling_rip = self.regs.rip,
+            };
+            self.gtk_idle_scheduled +|= 1;
+            std.debug.print(
+                "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
+                .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingGtkIdleCallbackCount() },
+            );
+            return source;
+        }
+        std.debug.print(
+            "macho-processor: GTK idle rejected: queue full callback=0x{x} data=0x{x} tag={s}\n",
+            .{ function, data, tag },
+        );
+        return 0;
+    }
+
+    fn pendingGtkIdleCallbackCount(self: *const MachOState) usize {
+        var count: usize = 0;
+        for (&self.gtk_idle_callbacks) |*entry| {
+            if (entry.active) count += 1;
+        }
+        return count;
+    }
+
+    fn gtkIdleQueueSnapshot(self: *const MachOState) GtkIdleQueueSnapshot {
+        return gtkIdleQueueSnapshotFor(&self.gtk_idle_callbacks);
+    }
+
+    fn gtkIdleDispatchBlock(self: *const MachOState) GtkIdleDispatchBlock {
+        if (self.cooperative_ui_context == null) return .no_ui_context;
+        if (self.active_guest_thread == 0) return .no_active_guest_thread;
+        if (self.active_gtk_idle_source != 0) return .callback_already_running;
+        if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return .suspended_queue_full;
+        return .ready;
+    }
+
+    fn removeGtkIdleSource(self: *MachOState, source: u64) bool {
+        for (&self.gtk_idle_callbacks) |*entry| {
+            if (!entry.active or entry.source_id != source) continue;
+            entry.* = .{};
+            self.gtk_idle_removed +|= 1;
+            std.debug.print("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.pendingGtkIdleCallbackCount() });
+            return true;
+        }
+        return false;
+    }
+
+    fn startNextGtkIdleCallback(self: *MachOState, reason: []const u8, active_already_saved: bool) bool {
+        self.pumpNativeWindowEvents();
+        const context = self.cooperative_ui_context orelse return false;
+        for (&self.gtk_idle_callbacks) |*entry| {
+            if (!entry.active) continue;
+            if (!self.isExecutableAddress(entry.function)) {
+                std.debug.print(
+                    "macho-processor: GTK idle dropped non-executable callback: source={d} callback=0x{x} tag={s}\n",
+                    .{ entry.source_id, entry.function, entry.tag },
+                );
+                entry.* = .{};
+                continue;
+            }
+            if (!active_already_saved and self.active_guest_thread != 0 and !self.saveActiveGuestThread()) return false;
+            const source = entry.source_id;
+            const function = entry.function;
+            const data = entry.data;
+            const tag = entry.tag;
+            const scheduled_step = entry.scheduled_step;
+            const scheduling_thread = entry.scheduling_thread;
+            const scheduling_rip = entry.scheduling_rip;
+            entry.* = .{};
+            self.regs = context.regs;
+            self.xmm = context.xmm;
+            self.ymm_hi = context.ymm_hi;
+            self.x87 = context.x87;
+            self.regs.rip = function;
+            self.regs.rdi = data;
+            self.regs.rsp = alignDown(context.regs.rsp, 16);
+            self.push(GUEST_THREAD_RETURN_SENTINEL);
+            self.active_guest_thread = GTK_IDLE_CALLBACK_HANDLE_BASE + source;
+            self.active_gtk_idle_source = source;
+            self.active_gtk_idle_callback = function;
+            self.active_gtk_idle_started_step = self.executed_steps;
+            self.gtk_idle_started +|= 1;
+            self.cooperative_thread_switches +|= 1;
+            std.debug.print(
+                "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
+                .{ source, function, data, tag, reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingGtkIdleCallbackCount() },
+            );
+            return true;
+        }
+        return false;
+    }
+
+    fn isGtkIdleCallbackHandle(self: *const MachOState, handle: u64) bool {
+        _ = self;
+        return handle >= GTK_IDLE_CALLBACK_HANDLE_BASE and handle < GTK_IDLE_CALLBACK_HANDLE_BASE + MAX_GTK_IDLE_CALLBACKS + 1024;
     }
 
     fn restoreGtkMainLoopCaller(self: *MachOState, reason: []const u8) void {
@@ -4951,8 +5818,13 @@ pub const MachOState = struct {
         self.regs = context.regs;
         self.xmm = context.xmm;
         self.ymm_hi = context.ymm_hi;
+        self.x87 = context.x87;
         self.cooperative_ui_context = null;
         self.active_guest_thread = 0;
+        self.active_gtk_idle_source = 0;
+        self.active_gtk_idle_callback = 0;
+        self.active_gtk_idle_started_step = 0;
+        self.suspended_guest_thread_count = 0;
         self.foreign_objects.main_loop_depth -|= 1;
         const return_address = self.pop();
         if (return_address == 0 or !self.isExecutableAddress(return_address)) {
@@ -4965,6 +5837,92 @@ pub const MachOState = struct {
         }
         self.regs.rip = return_address;
         std.debug.print("macho-processor: GTK cooperative main loop exited: {s}\n", .{reason});
+    }
+
+    fn logCooperativeSchedulerSummary(self: *const MachOState) void {
+        if (self.cooperative_thread_switches == 0 and self.cooperative_wait_yields == 0) return;
+        std.debug.print(
+            "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} quantum_yields={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
+            .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_quantum_yields, self.suspended_guest_thread_count, self.active_guest_thread, self.gtk_idle_scheduled, self.gtk_idle_started, self.gtk_idle_completed, self.gtk_idle_removed, self.pendingGtkIdleCallbackCount(), self.gtk_idle_wakeups, self.gtk_idle_dispatch_failures, self.gtk_idle_starvation_warnings },
+        );
+    }
+
+    fn logCooperativeHeartbeat(self: *MachOState) void {
+        if (self.cooperative_ui_context == null) return;
+        const symbol = self.metadata.nearestSymbol(self.regs.rip);
+        const idle = self.gtkIdleQueueSnapshot();
+        const idle_age = if (idle.pending != 0) self.executed_steps -| idle.oldest_scheduled_step else 0;
+        const dispatch_block = self.gtkIdleDispatchBlock();
+        std.debug.print(
+            "macho-processor: GTK cooperative heartbeat: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} deferred={d} suspended={d} switches={d} wait_yields={d} quantum_yields={d} waits={d} gtk_idle(scheduled/started/completed/pending)={d}/{d}/{d}/{d} active_idle(source/callback/age)={d}/0x{x}/{d} oldest_pending(source/callback/age/thread/rip/tag)={d}/0x{x}/{d}/0x{x}/0x{x}/{s} dispatch={s}\n",
+            .{
+                self.executed_steps,
+                self.active_guest_thread,
+                self.regs.rip,
+                if (symbol) |resolved| resolved.name else "<unknown>",
+                if (symbol) |resolved| resolved.offset else 0,
+                self.pthreads.deferred_threads,
+                self.suspended_guest_thread_count,
+                self.cooperative_thread_switches,
+                self.cooperative_wait_yields,
+                self.cooperative_quantum_yields,
+                self.pthreads.collapsed_waits,
+                self.gtk_idle_scheduled,
+                self.gtk_idle_started,
+                self.gtk_idle_completed,
+                idle.pending,
+                self.active_gtk_idle_source,
+                self.active_gtk_idle_callback,
+                if (self.active_gtk_idle_source != 0) self.executed_steps -| self.active_gtk_idle_started_step else 0,
+                idle.oldest_source,
+                idle.oldest_callback,
+                idle_age,
+                idle.oldest_scheduling_thread,
+                idle.oldest_scheduling_rip,
+                idle.oldest_tag,
+                @tagName(dispatch_block),
+            },
+        );
+        if (idle.pending != 0 and idle_age >= GTK_IDLE_STARVATION_STEPS and dispatch_block != .callback_already_running) {
+            self.gtk_idle_starvation_warnings +|= 1;
+            std.debug.print(
+                "macho-processor: GTK IDLE STARVATION: warning={d} source={d} callback=0x{x} tag={s} queued_for={d} steps scheduling_thread=0x{x} scheduling_rip=0x{x} active=0x{x} block={s} suspended={d}/{d}\n",
+                .{ self.gtk_idle_starvation_warnings, idle.oldest_source, idle.oldest_callback, idle.oldest_tag, idle_age, idle.oldest_scheduling_thread, idle.oldest_scheduling_rip, self.active_guest_thread, @tagName(dispatch_block), self.suspended_guest_thread_count, self.suspended_guest_threads.len },
+            );
+        }
+    }
+
+    // Once the Xenia PageEntry tables have been allocated, setup can spend a
+    // long time in memory-manager code without crossing another import
+    // boundary. Keep a compact, high-frequency checkpoint so a stalled
+    // backing-map or heap pass is observable in the next external run.
+    fn logMemoryInitializationProgress(self: *const MachOState, steps: u64) void {
+        const symbol = self.metadata.nearestSymbol(self.regs.rip);
+        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+        const return_symbol = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
+        std.debug.print(
+            "macho-processor: memory initialization progress: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} return=0x{x} {s}+0x{x} page_entry(runs/bytes)={d}/{d} sparse(reserved/mappings/activations)={d}/{d}/{d} heap=0x{x} coop(deferred/suspended/quantum_yields/wait_yields)={d}/{d}/{d}/{d}\n",
+            .{
+                steps,
+                self.active_guest_thread,
+                self.regs.rip,
+                if (symbol) |resolved| resolved.name else "<unknown>",
+                if (symbol) |resolved| resolved.offset else 0,
+                return_address,
+                if (return_symbol) |resolved| resolved.name else "<unknown>",
+                if (return_symbol) |resolved| resolved.offset else 0,
+                self.page_entry_bulk_initializations,
+                self.page_entry_bulk_bytes,
+                self.sparse_memory.total_reserved,
+                self.sparse_memory.mappings.items.len,
+                self.sparse_memory.activations.items.len,
+                self.heap_next,
+                self.pthreads.deferred_threads,
+                self.suspended_guest_thread_count,
+                self.cooperative_quantum_yields,
+                self.cooperative_wait_yields,
+            },
+        );
     }
 
     fn handleSyntheticRuntimeThunk(self: *MachOState) bool {
@@ -5136,8 +6094,14 @@ pub const MachOState = struct {
                     .thread_id = self.active_guest_thread,
                 });
                 self.pthreads.diagnoseStuck(steps, self.regs.rip);
+                self.pumpNativeWindowEvents();
+                self.logCooperativeHeartbeat();
             }
             if (!self.step()) break;
+            self.maybeYieldActiveGuestThreadForQuantum();
+            if (self.page_entry_bulk_initializations != 0 and steps != 0 and steps % 250_000 == 0) {
+                self.logMemoryInitializationProgress(steps);
+            }
         }
         if (self.max_steps != 0 and steps >= self.max_steps) {
             log.warn("reached max steps ({d})", .{self.max_steps});
@@ -5499,6 +6463,49 @@ pub const MachOState = struct {
             .cmc => self.regs.rflags ^= RFL_CF,
             .clc => self.regs.rflags &= ~RFL_CF,
             .stc => self.regs.rflags |= RFL_CF,
+
+            .fild_mem16 => _ = self.x87.push(@floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(self.readMemVal(d.addr, .bits16))))))),
+            .fild_mem32 => _ = self.x87.push(@floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(self.readMemVal(d.addr, .bits32))))))),
+            .fild_mem64 => _ = self.x87.push(@floatFromInt(@as(i64, @bitCast(self.readMemVal(d.addr, .bits64))))),
+            .fld_mem32 => _ = self.x87.push(@as(f64, @floatCast(@as(f32, @bitCast(@as(u32, @truncate(self.readMemVal(d.addr, .bits32)))))))),
+            .fld_mem64 => _ = self.x87.push(@bitCast(self.readMemVal(d.addr, .bits64))),
+            .fstp_mem80 => {
+                const output = self.guestMemory(d.addr, 10) orelse {
+                    self.terminateForGuestAccess(d.addr, 10, .write, "fstp_mem80");
+                    return;
+                };
+                if (self.x87.pop()) |value| writeExtendedFloat80(output, value) else @memset(output[0..10], 0);
+            },
+            .fstp_mem32 => {
+                if (self.x87.pop()) |value| {
+                    self.writeMemVal(d.addr, .bits32, @as(u64, @as(u32, @bitCast(@as(f32, @floatCast(value))))));
+                }
+            },
+            .fstp_mem64 => {
+                if (self.x87.pop()) |value| self.writeMemVal(d.addr, .bits64, @as(u64, @bitCast(value)));
+            },
+            .fld_st => {
+                if (self.x87.get(@truncate(d.imm))) |value| _ = self.x87.push(value);
+            },
+            .fstp_st => {
+                if (self.x87.get(0)) |value| {
+                    _ = self.x87.set(@truncate(d.imm), value);
+                    _ = self.x87.pop();
+                }
+            },
+            .fxch_st => _ = self.x87.exchange(@truncate(d.imm)),
+            .ffree_st => self.x87.free(@truncate(d.imm)),
+            .fninit => self.x87.reset(),
+            .fnstsw_ax => self.setReg(.al_ax_eax_rax, .bits16, self.x87.statusWord()),
+            .fnstcw_mem16 => self.writeMemVal(d.addr, .bits16, self.x87.control),
+            .fldcw_mem16 => self.x87.control = @truncate(self.readMemVal(d.addr, .bits16)),
+            .x87_binary => self.x87.binary(
+                @truncate((d.imm >> 3) & 7),
+                @truncate((d.imm >> 6) & 7),
+                @truncate(d.imm),
+                (d.imm & (1 << 9)) != 0,
+            ),
+            .fucomip_st => self.executeFucomip(@truncate(d.imm)),
 
             .mov_reg8_mem8 => {
                 self.setReg(d.dst_reg, .bits8, self.readMemVal(d.addr, .bits8));
@@ -6740,6 +7747,20 @@ pub const MachOState = struct {
         }
     }
 
+    fn executeFucomip(self: *MachOState, source: u3) void {
+        const lhs = self.x87.get(0) orelse return;
+        const rhs = self.x87.get(source) orelse return;
+        self.regs.rflags &= ~(RFL_ZF | RFL_PF | RFL_CF);
+        if (std.math.isNan(lhs) or std.math.isNan(rhs)) {
+            self.regs.rflags |= RFL_ZF | RFL_PF | RFL_CF;
+        } else if (lhs < rhs) {
+            self.regs.rflags |= RFL_CF;
+        } else if (lhs == rhs) {
+            self.regs.rflags |= RFL_ZF;
+        }
+        _ = self.x87.pop();
+    }
+
     fn executeBitScan(self: *MachOState, d: DecodedInsn) void {
         const is_memory = switch (d.op) {
             .bsf_reg_mem, .bsr_reg_mem, .tzcnt_reg_mem, .lzcnt_reg_mem => true,
@@ -7486,12 +8507,15 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.initializer_resolver.logSummary();
     if (!initializers_ok) {
         state.import_resolver.logSummary();
+        state.foreign_objects.logSummary();
+        state.native_window.logSummary();
         state.dynamic_forwarder.logSummary();
         state.fs_forwarder.logSummary();
         state.libcxx_filesystem.logSummary();
         state.libcxx_streams.logSummary();
         state.logging.logSummary();
         state.pthreads.logSummary();
+        state.logCooperativeSchedulerSummary();
         state.memory_forwarder.logSummary();
         state.launch_options.logSummary();
         state.startup.logSummary();
@@ -7515,12 +8539,15 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.logDecodeCacheSummary();
     state.logPerformanceAccelerationSummary();
     state.import_resolver.logSummary();
+    state.foreign_objects.logSummary();
+    state.native_window.logSummary();
     state.dynamic_forwarder.logSummary();
     state.fs_forwarder.logSummary();
     state.libcxx_filesystem.logSummary();
     state.libcxx_streams.logSummary();
     state.logging.logSummary();
     state.pthreads.logSummary();
+    state.logCooperativeSchedulerSummary();
     state.memory_forwarder.logSummary();
     state.launch_options.logSummary();
     state.startup.logSummary();
@@ -7813,6 +8840,59 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
             return decodeMovMemImm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
         },
 
+        0xD8, 0xD9, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF => {
+            if (pos + 2 > bytes.len) return .{};
+            var x87 = DecodedInsn{};
+            var modrm_pos = pos + 1;
+            const rm = readModRM(&x87, bytes, &modrm_pos, rex_r, rex_x, rex_b, .bits64);
+            const group = @intFromEnum(rm.reg) & 7;
+            if (opcode == 0xD8 or opcode == 0xDC or opcode == 0xDE) {
+                if (!x87.is_reg_form) return .{};
+                const operation = x87BinaryOperation(opcode, group) orelse return .{};
+                const stack_index: u64 = rm.addr & 7;
+                const destination: u64 = if (opcode == 0xD8) 0 else stack_index;
+                const source: u64 = if (opcode == 0xD8) stack_index else 0;
+                x87.op = .x87_binary;
+                x87.imm = @as(u64, operation) | (destination << 3) | (source << 6) | (if (opcode == 0xDE) @as(u64, 1) << 9 else 0);
+                x87.len = @intCast(modrm_pos);
+                return x87;
+            }
+            if (x87.is_reg_form) {
+                x87.imm = rm.addr & 7;
+                x87.len = @intCast(modrm_pos);
+                if (opcode == 0xD9 and group == 0) x87.op = .fld_st else if (opcode == 0xD9 and group == 1) x87.op = .fxch_st else if (opcode == 0xDB and bytes[pos + 1] == 0xE3) x87.op = .fninit else if (opcode == 0xDD and group == 0) x87.op = .ffree_st else if (opcode == 0xDD and group == 3) x87.op = .fstp_st else if (opcode == 0xDF and bytes[pos + 1] == 0xE0) x87.op = .fnstsw_ax else if (opcode == 0xDF and bytes[pos + 1] >= 0xE8 and bytes[pos + 1] <= 0xEF) x87.op = .fucomip_st else return .{};
+                return x87;
+            }
+            x87.addr = rm.addr;
+            x87.len = @intCast(modrm_pos);
+            switch (opcode) {
+                0xD9 => switch (group) {
+                    0 => x87.op = .fld_mem32,
+                    3 => x87.op = .fstp_mem32,
+                    5 => x87.op = .fldcw_mem16,
+                    7 => x87.op = .fnstcw_mem16,
+                    else => return .{},
+                },
+                0xDB => switch (group) {
+                    5 => x87.op = .fild_mem32,
+                    7 => x87.op = .fstp_mem80,
+                    else => return .{},
+                },
+                0xDD => switch (group) {
+                    0 => x87.op = .fld_mem64,
+                    3 => x87.op = .fstp_mem64,
+                    else => return .{},
+                },
+                0xDF => switch (group) {
+                    0 => x87.op = .fild_mem16,
+                    5 => x87.op = .fild_mem64,
+                    else => return .{},
+                },
+                else => unreachable,
+            }
+            return x87;
+        },
+
         0xCC => {
             d.op = .hlt;
             d.len = @as(u8, @intCast(pos + 1));
@@ -8049,6 +9129,32 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
     }
 
     return d;
+}
+
+// The D8 family targets ST(0); DC and DE target ST(i).  Their reversed
+// subtract/divide encodings use the opposite operand order.
+fn x87BinaryOperation(opcode: u8, group: u8) ?u3 {
+    return switch (opcode) {
+        0xD8 => switch (group) {
+            0 => 0, // FADD ST(0), ST(i)
+            1 => 1, // FMUL ST(0), ST(i)
+            4 => 2, // FSUB ST(0), ST(i)
+            5 => 3, // FSUBR ST(0), ST(i)
+            6 => 4, // FDIV ST(0), ST(i)
+            7 => 5, // FDIVR ST(0), ST(i)
+            else => null,
+        },
+        0xDC, 0xDE => switch (group) {
+            0 => 0, // FADD[P] ST(i), ST(0)
+            1 => 1, // FMUL[P] ST(i), ST(0)
+            4 => 3, // FSUBR[P] ST(i), ST(0)
+            5 => 2, // FSUB[P] ST(i), ST(0)
+            6 => 5, // FDIVR[P] ST(i), ST(0)
+            7 => 4, // FDIV[P] ST(i), ST(0)
+            else => null,
+        },
+        else => null,
+    };
 }
 
 fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
@@ -9211,7 +10317,9 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
 
     if (opcode2 == 0x18 or opcode2 == 0x0D) {
         if (pos.* >= bytes.len) return .{};
-        _ = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits8);
+        const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits8);
+        if (d.is_reg_form) return .{};
+        d.addr = rm.addr;
         d.op = .nop;
         d.len = @as(u8, @intCast(pos.*));
         return d;
@@ -11428,6 +12536,117 @@ test "decode prefetch memory hint as no-op" {
     try std.testing.expectEqual(RegId.al_ax_eax_rax, prefetchw.sib_base_reg);
     try std.testing.expectEqual(@as(u64, 0x20), prefetchw.addr);
     try std.testing.expectEqual(@as(u8, 4), prefetchw.len);
+}
+
+test "decode x87 integer load and extended store used by chrono timeout path" {
+    const load = decodeInsn(&[_]u8{ 0xDF, 0x6D, 0xC8, 0xDB, 0x7D, 0xD0 });
+    try std.testing.expectEqual(Op.fild_mem64, load.op);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -56))), load.addr);
+    try std.testing.expectEqual(@as(u8, 3), load.len);
+
+    const store = decodeInsn(&[_]u8{ 0xDB, 0x7D, 0xD0, 0x31, 0xC0 });
+    try std.testing.expectEqual(Op.fstp_mem80, store.op);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, store.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -48))), store.addr);
+    try std.testing.expectEqual(@as(u8, 3), store.len);
+}
+
+test "x87 stack tracks physical tags and status TOP" {
+    var x87 = X87State{};
+    try std.testing.expectEqual(@as(u16, 0xFFFF), x87.tagWord());
+    try std.testing.expectEqual(@as(u16, 0), x87.statusWord());
+
+    try std.testing.expect(x87.push(1.0));
+    try std.testing.expect(x87.push(2.0));
+    try std.testing.expectEqual(@as(u3, 6), x87.top);
+    try std.testing.expectEqual(@as(u16, 0x0FFF), x87.tagWord());
+    try std.testing.expectEqual(@as(u16, 0x3000), x87.statusWord() & 0x3800);
+    try std.testing.expectEqual(@as(f64, 2.0), x87.get(0).?);
+    try std.testing.expectEqual(@as(f64, 1.0), x87.get(1).?);
+
+    _ = x87.pop();
+    try std.testing.expectEqual(@as(u3, 7), x87.top);
+    try std.testing.expectEqual(X87Tag.empty, x87.tags[6]);
+    try std.testing.expectEqual(X87Tag.valid, x87.tags[7]);
+}
+
+test "x87 stack faults preserve TOP and report overflow or underflow" {
+    var x87 = X87State{};
+    try std.testing.expect(x87.push(0.0));
+    try std.testing.expect(x87.push(1.0));
+    try std.testing.expect(x87.push(2.0));
+    try std.testing.expect(x87.push(3.0));
+    try std.testing.expect(x87.push(4.0));
+    try std.testing.expect(x87.push(5.0));
+    try std.testing.expect(x87.push(6.0));
+    try std.testing.expect(x87.push(7.0));
+    const top_before = x87.top;
+    try std.testing.expect(!x87.push(8.0));
+    try std.testing.expectEqual(top_before, x87.top);
+    try std.testing.expect((x87.statusWord() & 0x0241) == 0x0241);
+
+    x87.reset();
+    try std.testing.expect(x87.pop() == null);
+    try std.testing.expect((x87.statusWord() & 0x0241) == 0x0041);
+}
+
+test "decode x87 memory and stack forms" {
+    const fild16 = decodeInsn(&[_]u8{ 0xDF, 0x00 });
+    try std.testing.expectEqual(Op.fild_mem16, fild16.op);
+    try std.testing.expectEqual(@as(u8, 2), fild16.len);
+
+    const fld64 = decodeInsn(&[_]u8{ 0xDD, 0x00 });
+    try std.testing.expectEqual(Op.fld_mem64, fld64.op);
+    const fstp32 = decodeInsn(&[_]u8{ 0xD9, 0x18 });
+    try std.testing.expectEqual(Op.fstp_mem32, fstp32.op);
+    const fld_st3 = decodeInsn(&[_]u8{ 0xD9, 0xC3 });
+    try std.testing.expectEqual(Op.fld_st, fld_st3.op);
+    try std.testing.expectEqual(@as(u64, 3), fld_st3.imm);
+    const fnstsw = decodeInsn(&[_]u8{ 0xDF, 0xE0 });
+    try std.testing.expectEqual(Op.fnstsw_ax, fnstsw.op);
+
+    const fmulp = decodeInsn(&[_]u8{ 0xDE, 0xC9 });
+    try std.testing.expectEqual(Op.x87_binary, fmulp.op);
+    try std.testing.expectEqual(@as(u64, 0x209), fmulp.imm);
+
+    const fucomip = decodeInsn(&[_]u8{ 0xDF, 0xE9 });
+    try std.testing.expectEqual(Op.fucomip_st, fucomip.op);
+    try std.testing.expectEqual(@as(u64, 1), fucomip.imm);
+}
+
+test "x87 FMULP writes ST(i) before popping ST(0)" {
+    var x87 = X87State{};
+    try std.testing.expect(x87.push(3.0));
+    try std.testing.expect(x87.push(4.0));
+    x87.binary(1, 0, 1, true);
+    try std.testing.expectEqual(@as(u3, 7), x87.top);
+    try std.testing.expectEqual(@as(f64, 12.0), x87.get(0).?);
+    try std.testing.expectEqual(X87Tag.empty, x87.tags[6]);
+}
+
+test "GTK idle wake preempts a running worker after all pthreads have started" {
+    try std.testing.expectEqual(CooperativeQuantumWork.gtk_idle, cooperativeQuantumWork(1, false, 0));
+    try std.testing.expectEqual(CooperativeQuantumWork.gtk_idle, cooperativeQuantumWork(1, false, 3));
+    try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(1, true, 0));
+    try std.testing.expectEqual(CooperativeQuantumWork.deferred_thread, cooperativeQuantumWork(0, false, 1));
+    try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(0, false, 0));
+}
+
+test "GTK idle diagnostics retain the oldest queued callback provenance" {
+    const callbacks = [_]GtkIdleCallback{
+        .{ .source_id = 7, .function = 0x7000, .active = true, .tag = "newer", .scheduled_step = 90, .scheduling_thread = 0x77, .scheduling_rip = 0x777 },
+        .{},
+        .{ .source_id = 3, .function = 0x3000, .active = true, .tag = "presenter", .scheduled_step = 40, .scheduling_thread = 0x33, .scheduling_rip = 0x333 },
+    };
+    const snapshot = gtkIdleQueueSnapshotFor(&callbacks);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.pending);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.oldest_source);
+    try std.testing.expectEqual(@as(u64, 0x3000), snapshot.oldest_callback);
+    try std.testing.expectEqual(@as(u64, 40), snapshot.oldest_scheduled_step);
+    try std.testing.expectEqual(@as(u64, 0x33), snapshot.oldest_scheduling_thread);
+    try std.testing.expectEqual(@as(u64, 0x333), snapshot.oldest_scheduling_rip);
+    try std.testing.expectEqualStrings("presenter", snapshot.oldest_tag);
 }
 
 test "decode C6 and C7 register immediate forms" {

@@ -56,6 +56,9 @@ const Thread = struct {
     state: ThreadState = .runnable,
     blocked_since_step: u64 = 0,
     blocked_reason: []const u8 = "",
+    waiting_condvar: u64 = 0,
+    waiting_mutex: u64 = 0,
+    numeric_id: u64 = 0,
 };
 
 const Mutex = struct {
@@ -85,11 +88,14 @@ pub const Runtime = struct {
     scheduled_threads: u64 = 0,
     completed_threads: u64 = 0,
     blocked_threads: u64 = 0,
+    scheduler_yields: u64 = 0,
+    thread_id_queries: u64 = 0,
+    next_numeric_thread_id: u64 = 2,
     main_thread_handle: u64 = CURRENT_THREAD_HANDLE,
     last_diagnostic_step: u64 = 0,
 
     pub fn dispatch(self: *Runtime, state: anytype, name: []const u8) ?Outcome {
-        if (std.mem.eql(u8, name, "_pthread_self")) return .{ .handled = CURRENT_THREAD_HANDLE };
+        if (std.mem.eql(u8, name, "_pthread_self")) return .{ .handled = self.currentThreadHandle(state) };
         if (std.mem.eql(u8, name, "_pthread_equal")) return .{ .handled = @intFromBool(state.regs.rdi == state.regs.rsi) };
         if (std.mem.eql(u8, name, "_pthread_threadid_np")) return .{ .handled = self.threadId(state) };
         if (std.mem.eql(u8, name, "_pthread_attr_init")) return .{ .handled = self.attributeInit(state) };
@@ -99,8 +105,13 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "_pthread_join")) return .{ .handled = self.join(state) };
         if (std.mem.eql(u8, name, "_pthread_cancel")) return .{ .handled = self.cancel(state.regs.rdi) };
         if (std.mem.eql(u8, name, "_pthread_setname_np") or
-            std.mem.eql(u8, name, "_pthread_setschedparam") or
-            std.mem.eql(u8, name, "_pthread_yield_np")) return .{ .handled = 0 };
+            std.mem.eql(u8, name, "_pthread_setschedparam")) return .{ .handled = 0 };
+        if (std.mem.eql(u8, name, "_pthread_yield_np") or
+            std.mem.eql(u8, name, "_sched_yield"))
+        {
+            self.scheduler_yields +|= 1;
+            return .{ .handled = 0 };
+        }
         if (std.mem.eql(u8, name, "_pthread_getname_np")) return .{ .handled = self.getName(state) };
         if (std.mem.eql(u8, name, "_pthread_getschedparam")) return .{ .handled = self.getSchedule(state) };
         if (std.mem.eql(u8, name, "_pthread_getspecific")) return .{ .handled = 0 };
@@ -110,9 +121,9 @@ pub const Runtime = struct {
         }
         if (std.mem.eql(u8, name, "_pthread_mutex_init")) return .{ .handled = self.mutexInit(state) };
         if (std.mem.eql(u8, name, "_pthread_mutex_destroy")) return .{ .handled = self.mutexDestroy(state.regs.rdi) };
-        if (std.mem.eql(u8, name, "_pthread_mutex_lock")) return .{ .handled = self.mutexLock(state.regs.rdi) };
-        if (std.mem.eql(u8, name, "_pthread_mutex_trylock")) return .{ .handled = self.mutexTryLock(state.regs.rdi) };
-        if (std.mem.eql(u8, name, "_pthread_mutex_unlock")) return .{ .handled = self.mutexUnlock(state.regs.rdi) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_lock")) return .{ .handled = self.mutexLockForThread(state.regs.rdi, self.currentThreadHandle(state)) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_trylock")) return .{ .handled = self.mutexTryLockForThread(state.regs.rdi, self.currentThreadHandle(state)) };
+        if (std.mem.eql(u8, name, "_pthread_mutex_unlock")) return .{ .handled = self.mutexUnlockForThread(state.regs.rdi, self.currentThreadHandle(state)) };
         if (std.mem.eql(u8, name, "_pthread_cond_init")) return .{ .handled = initializeOpaque(state, state.regs.rdi, 48) };
         if (std.mem.eql(u8, name, "_pthread_cond_destroy")) return .{ .handled = 0 };
         if (std.mem.eql(u8, name, "_pthread_cond_signal")) {
@@ -140,7 +151,7 @@ pub const Runtime = struct {
     pub fn logSummary(self: *const Runtime) void {
         if (self.created_threads == 0 and self.mutex_locks == 0 and self.collapsed_waits == 0 and self.tls_sets == 0) return;
         std.debug.print(
-            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits)={d}/{d}/{d} tls_sets={d}\n",
+            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits)={d}/{d}/{d} tls_sets={d} thread_id_queries={d}\n",
             .{
                 self.created_threads,
                 self.deferred_threads,
@@ -156,6 +167,7 @@ pub const Runtime = struct {
                 self.condition_broadcasts,
                 self.collapsed_waits,
                 self.tls_sets,
+                self.thread_id_queries,
             },
         );
     }
@@ -194,10 +206,7 @@ pub const Runtime = struct {
     }
 
     pub fn takeNewestDeferred(self: *Runtime) ?DeferredThread {
-        var index = self.threads.len;
-        while (index != 0) {
-            index -= 1;
-            const thread = &self.threads[index];
+        for (&self.threads) |*thread| {
             if (!thread.active or thread.started or thread.cancelled or thread.state != .runnable) continue;
             thread.started = true;
             thread.state = .runnable;
@@ -219,6 +228,76 @@ pub const Runtime = struct {
         if (thread.state == .completed) return;
         thread.state = .completed;
         self.completed_threads +|= 1;
+    }
+
+    pub fn currentThreadHandle(self: *const Runtime, state: anytype) u64 {
+        _ = self;
+        const State = @TypeOf(state.*);
+        if (comptime @hasField(State, "active_gtk_idle_source")) {
+            if (state.active_gtk_idle_source != 0) return CURRENT_THREAD_HANDLE;
+        }
+        if (comptime @hasField(State, "active_guest_thread")) {
+            if (state.active_guest_thread != 0) return state.active_guest_thread;
+        }
+        return CURRENT_THREAD_HANDLE;
+    }
+
+    pub fn mutexWouldBlock(self: *Runtime, address: u64, owner: u64) bool {
+        const mutex = self.mutexForAddress(address, false) orelse return false;
+        return mutex.depth != 0 and mutex.owner_thread != 0 and mutex.owner_thread != owner;
+    }
+
+    /// Models the atomic release performed by pthread_cond_wait before the
+    /// caller blocks.  The Mach-O interpreter uses this at the import
+    /// boundary, rather than returning from the wait while the caller still
+    /// owns its mutex.
+    pub fn beginCooperativeCondvarWait(self: *Runtime, state: anytype) bool {
+        const handle = self.currentThreadHandle(state);
+        const cond_addr = state.regs.rdi;
+        const mutex_addr = state.regs.rsi;
+        const cv = self.condvarInit(cond_addr) orelse return false;
+
+        // POSIX requires the mutex to be released as part of entering the
+        // wait. Ignore an untracked mutex here: libc++ mutexes may be first
+        // observed through their condition-variable path.
+        _ = self.mutexUnlockForThread(mutex_addr, handle);
+        cv.waiters +|= 1;
+        self.collapsed_waits +|= 1;
+
+        if (self.threadForHandle(handle)) |thread| {
+            if (thread.state != .waiting_condvar) self.blocked_threads +|= 1;
+            thread.state = .waiting_condvar;
+            thread.blocked_reason = "pthread_cond_wait";
+            thread.waiting_condvar = cond_addr;
+            thread.waiting_mutex = mutex_addr;
+        }
+        if (self.collapsed_waits <= 8 or self.collapsed_waits % 1000 == 0) {
+            std.debug.print(
+                "macho-processor: cooperative condvar wait #{d} cond=0x{x} released_mutex=0x{x} thread=0x{x} waiters={d}\n",
+                .{ self.collapsed_waits, cond_addr, mutex_addr, handle, cv.waiters },
+            );
+        }
+        return true;
+    }
+
+    /// Reacquires a mutex before a condition-waiting worker returns to guest
+    /// code. Returning false tells the cooperative scheduler to run another
+    /// worker, preserving POSIX's return-with-lock-held contract.
+    pub fn resumeCooperativeWait(self: *Runtime, handle: u64) bool {
+        const thread = self.threadForHandle(handle) orelse return true;
+        if (thread.state != .waiting_condvar) return true;
+        if (thread.waiting_mutex != 0 and self.mutexTryLockForThread(thread.waiting_mutex, handle) != 0) {
+            return false;
+        }
+        if (thread.waiting_condvar != 0) {
+            if (self.condvarForAddress(thread.waiting_condvar)) |cv| cv.waiters -|= 1;
+        }
+        thread.state = .runnable;
+        thread.blocked_reason = "";
+        thread.waiting_condvar = 0;
+        thread.waiting_mutex = 0;
+        self.blocked_threads -|= 1;
+        return true;
     }
 
     fn attributeInit(self: *Runtime, state: anytype) u64 {
@@ -257,6 +336,7 @@ pub const Runtime = struct {
             thread.* = .{
                 .active = true,
                 .handle = handle,
+                .numeric_id = self.allocateNumericThreadId(),
                 .start_routine = state.regs.rdx,
                 .argument = state.regs.rcx,
                 .stack_size = self.stackSize(state.regs.rsi),
@@ -266,8 +346,8 @@ pub const Runtime = struct {
             self.created_threads +|= 1;
             self.deferred_threads +|= 1;
             std.debug.print(
-                "macho-processor: pthread runtime: deferred guest thread #{d} handle=0x{x} start=0x{x} arg=0x{x} stack={d}\n",
-                .{ self.created_threads, handle, thread.start_routine, thread.argument, thread.stack_size },
+                "macho-processor: pthread runtime: deferred guest thread #{d} handle=0x{x} numeric_id={d} start=0x{x} arg=0x{x} stack={d}\n",
+                .{ self.created_threads, handle, thread.numeric_id, thread.start_routine, thread.argument, thread.stack_size },
             );
             return 0;
         }
@@ -307,8 +387,12 @@ pub const Runtime = struct {
     }
 
     fn mutexLock(self: *Runtime, address: u64) u64 {
+        return self.mutexLockForThread(address, CURRENT_THREAD_HANDLE);
+    }
+
+    fn mutexLockForThread(self: *Runtime, address: u64, owner: u64) u64 {
         const mutex = self.mutexForAddress(address, true) orelse return 12;
-        if (mutex.depth > 0 and mutex.owner_thread != 0) {
+        if (mutex.depth > 0 and mutex.owner_thread != 0 and mutex.owner_thread != owner) {
             mutex.contention_count +|= 1;
             self.mutex_contentions +|= 1;
             if (mutex.contention_count <= 8 or mutex.contention_count % 100 == 0) {
@@ -317,15 +401,23 @@ pub const Runtime = struct {
                     .{ mutex.contention_count, address, mutex.depth, mutex.owner_thread },
                 );
             }
+            // The Mach-O cooperative scheduler retries the import after it
+            // schedules the current owner. Do not transfer ownership here.
+            return 0;
         }
         mutex.depth +|= 1;
-        mutex.owner_thread = CURRENT_THREAD_HANDLE;
+        mutex.owner_thread = owner;
         self.mutex_locks +|= 1;
         return 0;
     }
 
     fn mutexUnlock(self: *Runtime, address: u64) u64 {
+        return self.mutexUnlockForThread(address, CURRENT_THREAD_HANDLE);
+    }
+
+    fn mutexUnlockForThread(self: *Runtime, address: u64, owner: u64) u64 {
         const mutex = self.mutexForAddress(address, false) orelse return 22;
+        if (mutex.depth != 0 and mutex.owner_thread != owner) return 1;
         if (mutex.depth != 0) {
             mutex.depth -= 1;
             if (mutex.depth == 0) mutex.owner_thread = 0;
@@ -335,6 +427,10 @@ pub const Runtime = struct {
     }
 
     fn mutexTryLock(self: *Runtime, address: u64) u64 {
+        return self.mutexTryLockForThread(address, CURRENT_THREAD_HANDLE);
+    }
+
+    fn mutexTryLockForThread(self: *Runtime, address: u64, owner: u64) u64 {
         const mutex = self.mutexForAddress(address, true) orelse return 12;
         if (mutex.depth != 0) {
             mutex.contention_count +|= 1;
@@ -342,13 +438,17 @@ pub const Runtime = struct {
             return 16; // EBUSY
         }
         mutex.depth = 1;
-        mutex.owner_thread = CURRENT_THREAD_HANDLE;
+        mutex.owner_thread = owner;
         self.mutex_locks +|= 1;
         return 0;
     }
 
     pub fn cppMutexTryLock(self: *Runtime, address: u64) bool {
         return self.mutexTryLock(address) == 0;
+    }
+
+    pub fn cppMutexTryLockForThread(self: *Runtime, address: u64, owner: u64) bool {
+        return self.mutexTryLockForThread(address, owner) == 0;
     }
 
     fn condvarInit(self: *Runtime, address: u64) ?*CondVar {
@@ -391,25 +491,46 @@ pub const Runtime = struct {
     }
 
     fn condvarWait(self: *Runtime, state: anytype) u64 {
-        self.collapsed_waits +|= 1;
-        const cond_addr = state.regs.rdi;
-        const mutex_addr = state.regs.rsi;
-        const cv = self.condvarInit(cond_addr) orelse return 12;
-        cv.waiters +|= 1;
-        if (self.collapsed_waits <= 8 or self.collapsed_waits % 1000 == 0) {
+        if (!self.beginCooperativeCondvarWait(state)) return 12;
+        // A non-cooperative caller cannot yield to another guest worker, so
+        // collapse its wait only after restoring the mutex invariant.
+        _ = self.resumeCooperativeWait(self.currentThreadHandle(state));
+        return 0;
+    }
+
+    fn threadId(self: *Runtime, state: anytype) u64 {
+        if (state.regs.rsi == 0 or state.guestMemory(state.regs.rsi, 8) == null) return 22;
+        const handle = if (state.regs.rdi == 0) self.currentThreadHandle(state) else state.regs.rdi;
+        const numeric_id = self.numericThreadId(handle);
+        state.write64(state.regs.rsi, numeric_id);
+        self.thread_id_queries +|= 1;
+        if (self.thread_id_queries <= 16 or self.thread_id_queries % 256 == 0) {
             std.debug.print(
-                "macho-processor: pthread condvar wait #{d} cond=0x{x} mutex=0x{x} waiters={d} (single guest execution thread, wait collapsed)\n",
-                .{ self.collapsed_waits, cond_addr, mutex_addr, cv.waiters },
+                "macho-processor: pthread thread id query #{d}: handle=0x{x} -> numeric_id={d}\n",
+                .{ self.thread_id_queries, handle, numeric_id },
             );
         }
         return 0;
     }
 
-    fn threadId(self: *Runtime, state: anytype) u64 {
-        _ = self;
-        if (state.regs.rsi == 0 or state.guestMemory(state.regs.rsi, 8) == null) return 22;
-        state.write64(state.regs.rsi, if (state.regs.rdi == 0 or state.regs.rdi == CURRENT_THREAD_HANDLE) 1 else state.regs.rdi & 0xFFFF);
-        return 0;
+    fn allocateNumericThreadId(self: *Runtime) u64 {
+        const result = self.next_numeric_thread_id;
+        self.next_numeric_thread_id +|= 1;
+        return result;
+    }
+
+    fn numericThreadId(self: *Runtime, handle: u64) u64 {
+        if (handle == 0 or handle == CURRENT_THREAD_HANDLE) return 1;
+        for (&self.threads) |*thread| {
+            if (thread.active and thread.handle == handle) {
+                if (thread.numeric_id == 0) thread.numeric_id = self.allocateNumericThreadId();
+                return thread.numeric_id;
+            }
+        }
+        if (handle >= SYNTHETIC_THREAD_BASE and handle < SYNTHETIC_THREAD_BASE + 0x10000) {
+            return 2 + ((handle - SYNTHETIC_THREAD_BASE) / 0x10);
+        }
+        return handle;
     }
 
     fn getName(self: *Runtime, state: anytype) u64 {
@@ -529,10 +650,10 @@ test "pthread mutex contention tracking" {
         }
     }{ .regs = .{ .rdi = mutex_addr } };
     _ = runtime.dispatch(&test_state, "_pthread_mutex_init");
-    _ = runtime.mutexLock(mutex_addr);
-    _ = runtime.mutexLock(mutex_addr);
+    _ = runtime.mutexLockForThread(mutex_addr, CURRENT_THREAD_HANDLE);
+    _ = runtime.mutexLockForThread(mutex_addr, SYNTHETIC_THREAD_BASE);
     try std.testing.expectEqual(@as(u64, 1), runtime.mutex_contentions);
-    try std.testing.expectEqual(@as(u64, 2), runtime.mutex_locks);
+    try std.testing.expectEqual(@as(u64, 1), runtime.mutex_locks);
 }
 
 test "pthread mutex try-lock reports busy and succeeds after unlock" {
@@ -544,7 +665,87 @@ test "pthread mutex try-lock reports busy and succeeds after unlock" {
     try std.testing.expect(runtime.cppMutexTryLock(address));
 }
 
+test "cooperative condition wait releases and reacquires its mutex" {
+    const worker: u64 = SYNTHETIC_THREAD_BASE;
+    const mutex: u64 = 0x3000;
+    var runtime = Runtime{};
+    runtime.threads[0] = .{ .active = true, .handle = worker, .started = true };
+    _ = runtime.mutexLockForThread(mutex, worker);
+
+    var state = struct {
+        active_guest_thread: u64 = worker,
+        regs: struct { rdi: u64 = 0x4000, rsi: u64 = mutex, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
+            _ = self;
+            return null;
+        }
+        fn write64(self: *@This(), _: u64, _: u64) void {
+            _ = self;
+        }
+        fn write32(self: *@This(), _: u64, _: u32) void {
+            _ = self;
+        }
+    }{};
+
+    try std.testing.expect(runtime.beginCooperativeCondvarWait(&state));
+    try std.testing.expectEqual(@as(u64, 0), runtime.mutexes[0].depth);
+    try std.testing.expectEqual(ThreadState.waiting_condvar, runtime.threads[0].state);
+    try std.testing.expect(runtime.resumeCooperativeWait(worker));
+    try std.testing.expectEqual(@as(u64, 1), runtime.mutexes[0].depth);
+    try std.testing.expectEqual(worker, runtime.mutexes[0].owner_thread);
+    try std.testing.expectEqual(ThreadState.runnable, runtime.threads[0].state);
+}
+
 test "thread state transitions" {
     var runtime = Runtime{};
     try std.testing.expectEqual(@as(u64, 0), runtime.activeCount());
+}
+
+test "pthread_threadid_np assigns stable numeric ids" {
+    const worker: u64 = SYNTHETIC_THREAD_BASE;
+    var runtime = Runtime{};
+    runtime.threads[0] = .{ .active = true, .handle = worker, .started = true, .numeric_id = runtime.allocateNumericThreadId() };
+
+    var state = struct {
+        active_guest_thread: u64 = worker,
+        mem: [16]u8 = [_]u8{0} ** 16,
+        regs: struct { rdi: u64 = 0, rsi: u64 = 8, rdx: u64 = 0, rcx: u64 = 0 } = .{ .rsi = 8 },
+        fn guestMemory(self: *@This(), address: u64, size: u64) ?[]u8 {
+            if (address + size > self.mem.len) return null;
+            return self.mem[@intCast(address)..@intCast(address + size)];
+        }
+        fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+        }
+        fn write32(self: *@This(), _: u64, _: u32) void {
+            _ = self;
+        }
+    }{};
+
+    try std.testing.expectEqual(@as(u64, 0), runtime.threadId(&state));
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, state.mem[8..16], .little));
+    state.regs.rdi = CURRENT_THREAD_HANDLE;
+    try std.testing.expectEqual(@as(u64, 0), runtime.threadId(&state));
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, state.mem[8..16], .little));
+}
+
+test "POSIX scheduler yield is modeled as a successful scheduling hint" {
+    var runtime = Runtime{};
+    var test_state = struct {
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
+            _ = self;
+            return null;
+        }
+        fn write64(self: *@This(), _: u64, _: u64) void {
+            _ = self;
+        }
+        fn write32(self: *@This(), _: u64, _: u32) void {
+            _ = self;
+        }
+    }{};
+
+    try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&test_state, "_sched_yield").?.handled);
+    try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&test_state, "_pthread_yield_np").?.handled);
+    try std.testing.expectEqual(@as(u64, 2), runtime.scheduler_yields);
 }

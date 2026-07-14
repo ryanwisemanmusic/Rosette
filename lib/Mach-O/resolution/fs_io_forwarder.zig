@@ -4,6 +4,10 @@ const fd_management = @import("fd_management.zig");
 
 extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
 extern "c" fn shm_unlink(name: [*:0]const u8) c_int;
+extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
+extern "c" fn setsockopt(fd: c_int, level: c_int, option: c_int, value: ?*const anyopaque, length: u32) c_int;
+extern "c" fn connect(fd: c_int, address: *const anyopaque, length: u32) c_int;
+extern "c" fn send(fd: c_int, buffer: *const anyopaque, length: usize, flags: c_int) isize;
 
 pub const Forwarder = struct {
     translator: path_translation.Translator,
@@ -460,12 +464,71 @@ pub const Forwarder = struct {
         return @intCast(std.c.fcntl(host_fd, cmd, @as(c_int, @intCast(state.regs.rdx))));
     }
 
+    pub fn createSocket(self: *Forwarder, state: anytype) u64 {
+        const created = socket(@intCast(state.regs.rdi), @intCast(state.regs.rsi), @intCast(state.regs.rdx));
+        return self.fd_manager.register(created, .socket) orelse @bitCast(@as(i64, -1));
+    }
+
+    pub fn setSocketOption(self: *Forwarder, state: anytype) u64 {
+        const host_fd = self.fd_manager.hostFdWithKind(state.regs.rdi, .socket) orelse return @bitCast(@as(i64, -1));
+        const length: u32 = @truncate(state.regs.r8);
+        const value = if (length == 0) null else (state.guestMemoryConst(state.regs.rcx, length) orelse return @bitCast(@as(i64, -1))).ptr;
+        const result = setsockopt(host_fd, @intCast(state.regs.rsi), @intCast(state.regs.rdx), value, length);
+        return @bitCast(@as(i64, result));
+    }
+
+    pub fn connectSocket(self: *Forwarder, state: anytype) u64 {
+        const host_fd = self.fd_manager.hostFdWithKind(state.regs.rdi, .socket) orelse return @bitCast(@as(i64, -1));
+        const length: u32 = @truncate(state.regs.rdx);
+        const address = state.guestMemoryConst(state.regs.rsi, length) orelse return @bitCast(@as(i64, -1));
+        return @bitCast(@as(i64, connect(host_fd, address.ptr, length)));
+    }
+
+    pub fn sendSocket(self: *Forwarder, state: anytype) u64 {
+        const host_fd = self.fd_manager.hostFdWithKind(state.regs.rdi, .socket) orelse return @bitCast(@as(i64, -1));
+        const length: usize = @intCast(state.regs.rdx);
+        if (length == 0) return 0;
+        const bytes = state.guestMemoryConst(state.regs.rsi, length) orelse return @bitCast(@as(i64, -1));
+        return @bitCast(@as(i64, send(host_fd, bytes.ptr, length, @intCast(state.regs.rcx))));
+    }
+
     pub fn ftruncate(self: *Forwarder, state: anytype) u64 {
         self.ftruncate_count += 1;
-        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return self.fail(state, .BADF);
-        const rc = std.c.ftruncate(host_fd, @bitCast(state.regs.rsi));
+        const entry = self.fd_manager.lookup(state.regs.rdi) orelse return self.fail(state, .BADF);
+        const host_fd = entry.host_fd;
+        const requested_size: i64 = std.math.cast(i64, state.regs.rsi) orelse {
+            std.debug.print(
+                "macho-processor: fs ftruncate rejected: guest_fd={d} host_fd={d} length=0x{x} reason=size_exceeds_signed_off_t\n",
+                .{ state.regs.rdi, host_fd, state.regs.rsi },
+            );
+            return self.fail(state, .INVAL);
+        };
+        const rc = std.c.ftruncate(host_fd, requested_size);
         if (rc != 0) {
             const err = std.c.errno(rc);
+            // macOS POSIX shared-memory objects can reject the 4.5 GiB
+            // backing store used by Xenia even though a sparse regular file
+            // supports it. Keep the guest descriptor stable, but replace its
+            // host backing before any MAP_SHARED views are established.
+            if (entry.kind == .shared_memory and state.regs.rsi >= 1024 * 1024 * 1024) {
+                if (self.createTempBackedSharedMemory("large-shm-resize-fallback")) |fallback_fd| {
+                    if (std.c.ftruncate(fallback_fd, requested_size) == 0) {
+                        entry.host_fd = fallback_fd;
+                        _ = std.c.close(host_fd);
+                        std.debug.print(
+                            "macho-processor: fs ftruncate fallback: guest_fd={d} old_host_fd={d} replacement_host_fd={d} length={d} primary_errno={s}\n",
+                            .{ state.regs.rdi, host_fd, fallback_fd, state.regs.rsi, @tagName(err) },
+                        );
+                        return 0;
+                    }
+                    const fallback_err = std.c.errno(-1);
+                    _ = std.c.close(fallback_fd);
+                    std.debug.print(
+                        "macho-processor: fs ftruncate fallback FAILED: guest_fd={d} length={d} primary_errno={s} fallback_errno={s}\n",
+                        .{ state.regs.rdi, state.regs.rsi, @tagName(err), @tagName(fallback_err) },
+                    );
+                }
+            }
             std.debug.print(
                 "macho-processor: fs ftruncate FAILED: guest_fd={d} host_fd={d} length={d} errno={s}\n",
                 .{ state.regs.rdi, host_fd, state.regs.rsi, @tagName(err) },
@@ -646,9 +709,10 @@ pub const Forwarder = struct {
         const offset: i64 = @bitCast(state.regs.r9);
         if (length == 0) return @bitCast(@as(i64, -1));
         const map_flags: std.c.MAP = @bitCast(raw_flags);
-        if (length >= 1024 * 1024 * 1024) {
+        const trace_mapping = length >= 1024 * 1024 * 1024 or (map_flags.FIXED and length >= 64 * 1024 * 1024);
+        if (trace_mapping) {
             std.debug.print(
-                "macho-processor: large mmap entry: route=import addr=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} guest_fd=0x{x} offset={d}\n",
+                "macho-processor: large/fixed mmap entry: route=import addr=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} guest_fd=0x{x} offset={d}\n",
                 .{ state.regs.rdi, length, state.regs.rdx, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS, state.regs.r8, offset },
             );
         }
@@ -662,10 +726,15 @@ pub const Forwarder = struct {
             else
                 self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
             if (state.regs.rdi % std.heap.page_size_min != 0) return @bitCast(@as(i64, -1));
-            return if (state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset)))
-                state.regs.rdi
-            else
-                @bitCast(@as(i64, -1));
+            const mapped = state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset));
+            if (trace_mapping) {
+                const outcome: []const u8 = if (mapped) "succeeded" else "FAILED";
+                std.debug.print(
+                    "macho-processor: large/fixed mmap {s}: route=import addr=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset={d}\n",
+                    .{ outcome, state.regs.rdi, length, state.regs.rdx, raw_flags, host_fd, offset },
+                );
+            }
+            return if (mapped) state.regs.rdi else @bitCast(@as(i64, -1));
         }
         // Xenia reserves its 32-bit guest address space with a non-fixed,
         // anonymous PROT_NONE mmap.  This is virtual address space, not a 4 GiB
@@ -865,4 +934,29 @@ test "temp-backed shared memory fallback produces truncatable fd" {
 
     try std.testing.expect(host_fd >= fd_management.STREAM_FD_COUNT);
     try std.testing.expectEqual(@as(c_int, 0), std.c.ftruncate(host_fd, 64 * 1024));
+}
+
+test "large shared-memory resize replaces constrained backing" {
+    const TestState = struct {
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        guest_errno: c_int = 0,
+
+        fn setGuestErrno(self: *@This(), value: c_int) void {
+            self.guest_errno = value;
+        }
+    };
+
+    var forwarder = Forwarder.init(std.testing.allocator);
+    defer forwarder.deinit();
+    const constrained_fd = std.c.open("/private/tmp", std.c.O{ .DIRECTORY = true }, @as(std.c.mode_t, 0));
+    if (constrained_fd < 0) return error.TestUnexpectedResult;
+    const guest_fd = forwarder.fd_manager.register(constrained_fd, .shared_memory) orelse return error.TestUnexpectedResult;
+    var state = TestState{ .regs = .{ .rdi = guest_fd, .rsi = 0x1_2000_0000 } };
+
+    try std.testing.expectEqual(@as(u64, 0), forwarder.ftruncate(&state));
+    const replacement_fd = forwarder.fd_manager.hostFd(guest_fd).?;
+    try std.testing.expect(replacement_fd != constrained_fd);
+    var stat: std.c.Stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fstat(replacement_fd, &stat));
+    try std.testing.expectEqual(@as(i64, 0x1_2000_0000), stat.size);
 }

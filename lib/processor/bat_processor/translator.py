@@ -45,6 +45,7 @@ class BatTranslator:
     #  Parsing
     # ------------------------------------------------------------------ #
 
+# Take a blob of script text and transform it into structured command dicts
     def parse(self, text: str):
         self.commands = [self._parse_line(l) for l in text.splitlines()]
         self.commands = [c for c in self.commands if c is not None]

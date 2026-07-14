@@ -9,6 +9,10 @@ const STRINGSTREAM_OSTREAM_OFFSET: u64 = 16;
 const STRINGSTREAM_BUFFER_OFFSET: u64 = 24;
 const STRINGSTREAM_IOS_OFFSET: u64 = 128;
 const STRINGSTREAM_MIN_SIZE: u64 = STRINGSTREAM_IOS_OFFSET + cxx_object_model.stream_layout.size;
+const STRINGSTREAM_TEXT_CAPACITY: usize = 512;
+const CURRENT_THREAD_HANDLE: u64 = 0x7FFF_1000;
+const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
+const GTK_IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
 
 const OPENMODE_APP: u64 = 1 << 0;
 const OPENMODE_ATE: u64 = 1 << 1;
@@ -31,6 +35,11 @@ const Stream = struct {
     last_read_count: i64 = 0,
     eof: bool = false,
     failed: bool = false,
+    trace_reads_remaining: u8 = 0,
+    patch_toml: bool = false,
+    string_length: usize = 0,
+    string_truncated: bool = false,
+    string_storage: [STRINGSTREAM_TEXT_CAPACITY]u8 = [_]u8{0} ** STRINGSTREAM_TEXT_CAPACITY,
 };
 
 pub const Bridge = struct {
@@ -86,6 +95,12 @@ pub const Bridge = struct {
             else
                 null;
         }
+        if (isBasicFilebufConstructor(name) or isBasicStreambufConstructor(name)) {
+            return if (self.constructFilebuf(state, state.regs.rdi))
+                .{ .handled = state.regs.rdi }
+            else
+                null;
+        }
         if (isBasicOstreamDestructor(name) or isBaseDestructor(name)) {
             self.base_destructors +|= 1;
             return .handled_void;
@@ -116,7 +131,12 @@ pub const Bridge = struct {
         if (isBasicIosFail(name)) return .{ .handled = @intFromBool(self.object_model.fail(state, state.regs.rdi)) };
         if (isBasicIosEof(name)) return .{ .handled = @intFromBool(self.object_model.eof(state, state.regs.rdi)) };
         if (isBasicIosBool(name)) return .{ .handled = @intFromBool(!self.object_model.fail(state, state.regs.rdi)) };
-        if (isUnsignedIntegerInsertion(name)) return .{ .handled = state.regs.rdi };
+        if (isThreadIdInsertion(name)) return .{ .handled = self.insertThreadId(state, state.regs.rdi, state.regs.rsi) };
+        if (isPointerInsertion(name)) return .{ .handled = self.insertPointer(state, state.regs.rdi, state.regs.rsi) };
+        if (isCStringInsertion(name)) return .{ .handled = self.insertCString(state, state.regs.rdi, state.regs.rsi) };
+        if (isIntegerInsertion(name)) return .{ .handled = self.insertInteger(state, state.regs.rdi, state.regs.rsi, isSignedIntegerInsertion(name)) };
+        if (isStringbufStr(name)) return if (self.stringbufToString(state, state.regs.rsi, state.regs.rdi)) .{ .handled = state.regs.rdi } else null;
+        if (isStringStreamStr(name)) return if (self.streamObjectToString(state, state.regs.rsi, state.regs.rdi)) .{ .handled = state.regs.rdi } else null;
 
         if (isIfstreamDefaultConstructor(name)) {
             return if (self.constructIfstream(state, state.regs.rdi))
@@ -127,6 +147,12 @@ pub const Bridge = struct {
         if (isIfstreamCStringConstructor(name)) {
             if (!self.constructIfstream(state, state.regs.rdi)) return null;
             _ = self.openCString(state, fs, state.regs.rdi + FILEBUF_OFFSET_IN_IFSTREAM, state.regs.rsi, state.regs.rdx);
+            return .{ .handled = state.regs.rdi };
+        }
+        if (isIfstreamFilesystemPathConstructor(name)) {
+            if (!self.constructIfstream(state, state.regs.rdi)) return null;
+            const view = compat_runtime.libcppStringView(state, state.regs.rsi) orelse return null;
+            _ = self.openPath(state, fs, state.regs.rdi + FILEBUF_OFFSET_IN_IFSTREAM, view.address, view.length, state.regs.rdx);
             return .{ .handled = state.regs.rdi };
         }
         if (isIfstreamDestructor(name)) {
@@ -211,6 +237,8 @@ pub const Bridge = struct {
             isBasicIstreamConstructor(name) or
             isBasicIostreamConstructor(name) or
             isStringStreamConstructor(name) or
+            isBasicFilebufConstructor(name) or
+            isBasicStreambufConstructor(name) or
             isBasicOstreamDestructor(name) or
             isStringStreamDestructor(name) or
             isBaseDestructor(name) or
@@ -223,9 +251,15 @@ pub const Bridge = struct {
             isBasicIosFail(name) or
             isBasicIosEof(name) or
             isBasicIosBool(name) or
-            isUnsignedIntegerInsertion(name) or
+            isThreadIdInsertion(name) or
+            isPointerInsertion(name) or
+            isCStringInsertion(name) or
+            isIntegerInsertion(name) or
+            isStringbufStr(name) or
+            isStringStreamStr(name) or
             isIfstreamDefaultConstructor(name) or
             isIfstreamCStringConstructor(name) or
+            isIfstreamFilesystemPathConstructor(name) or
             isIfstreamDestructor(name) or
             std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj") or
             std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEE4openEPKcj") or
@@ -283,6 +317,102 @@ pub const Bridge = struct {
         return true;
     }
 
+    pub fn constructFilebuf(self: *Bridge, state: anytype, object: u64) bool {
+        if (!self.object_model.initializeStreambufBase(state, object)) {
+            self.rejected +|= 1;
+            return false;
+        }
+        const stream = self.ensure(object) orelse {
+            self.rejected +|= 1;
+            return false;
+        };
+        closeStream(stream);
+        stream.fd = -1;
+        stream.buffer = 0;
+        stream.buffer_size = 0;
+        stream.last_read_count = 0;
+        stream.eof = false;
+        stream.failed = false;
+        stream.trace_reads_remaining = 0;
+        self.resetStringBuffer(stream);
+        self.constructors +|= 1;
+        return true;
+    }
+
+    pub fn stringbufToString(self: *Bridge, state: anytype, stringbuf: u64, output: u64) bool {
+        const stream = self.findFlexible(stringbuf) orelse return false;
+        return compat_runtime.initLibcppStringFromSlice(state, output, stream.string_storage[0..stream.string_length]);
+    }
+
+    pub fn streamObjectToString(self: *Bridge, state: anytype, object: u64, output: u64) bool {
+        const stream = self.streamForOstream(state, object) orelse return false;
+        return compat_runtime.initLibcppStringFromSlice(state, output, stream.string_storage[0..stream.string_length]);
+    }
+
+    fn insertThreadId(self: *Bridge, state: anytype, ostream: u64, raw_id: u64) u64 {
+        var buffer: [32]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&buffer, "{d}", .{displayThreadId(raw_id)}) catch return ostream;
+        _ = self.appendToOstream(state, ostream, rendered);
+        return ostream;
+    }
+
+    fn insertInteger(self: *Bridge, state: anytype, ostream: u64, value: u64, signed: bool) u64 {
+        var buffer: [32]u8 = undefined;
+        const rendered = if (signed)
+            std.fmt.bufPrint(&buffer, "{d}", .{@as(i64, @bitCast(value))}) catch return ostream
+        else
+            std.fmt.bufPrint(&buffer, "{d}", .{value}) catch return ostream;
+        _ = self.appendToOstream(state, ostream, rendered);
+        return ostream;
+    }
+
+    fn insertPointer(self: *Bridge, state: anytype, ostream: u64, value: u64) u64 {
+        var buffer: [32]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&buffer, "0x{x}", .{value}) catch return ostream;
+        _ = self.appendToOstream(state, ostream, rendered);
+        return ostream;
+    }
+
+    fn insertCString(self: *Bridge, state: anytype, ostream: u64, address: u64) u64 {
+        const text = state.guestCString(address, 4096) orelse return ostream;
+        _ = self.appendToOstream(state, ostream, text);
+        return ostream;
+    }
+
+    fn appendToOstream(self: *Bridge, state: anytype, ostream: u64, text: []const u8) bool {
+        const stream = self.streamForOstream(state, ostream) orelse return false;
+        const remaining_capacity = STRINGSTREAM_TEXT_CAPACITY - stream.string_length;
+        const written = @min(remaining_capacity, text.len);
+        if (written != 0) {
+            @memcpy(stream.string_storage[stream.string_length..][0..written], text[0..written]);
+            stream.string_length += written;
+        }
+        if (written < text.len) stream.string_truncated = true;
+        return true;
+    }
+
+    fn streamForOstream(self: *Bridge, state: anytype, object: u64) ?*Stream {
+        if (self.find(object)) |stream| return stream;
+        if (state.guestMemoryConst(object + cxx_object_model.stream_layout.rdbuf_offset, 8) != null) {
+            const streambuf = self.object_model.rdbuf(state, object);
+            if (streambuf != 0) {
+                if (self.findFlexible(streambuf)) |stream| return stream;
+            }
+        }
+        if (object >= STRINGSTREAM_OSTREAM_OFFSET) {
+            const container = object - STRINGSTREAM_OSTREAM_OFFSET;
+            if (self.find(container + STRINGSTREAM_BUFFER_OFFSET)) |stream| return stream;
+        }
+        if (self.find(object + STRINGSTREAM_BUFFER_OFFSET)) |stream| return stream;
+        return self.findFlexible(object);
+    }
+
+    fn resetStringBuffer(_: *Bridge, stream: *Stream) void {
+        stream.string_length = 0;
+        stream.string_truncated = false;
+        @memset(&stream.string_storage, 0);
+    }
+
     fn constructBaseStream(self: *Bridge, state: anytype, kind: cxx_object_model.Kind, object: u64, streambuf: u64) bool {
         if (streambuf == 0 or state.guestMemoryConst(streambuf, 8) == null) {
             self.rejected +|= 1;
@@ -310,10 +440,11 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         }
-        _ = self.ensure(streambuf) orelse {
+        const stream = self.ensure(streambuf) orelse {
             self.rejected +|= 1;
             return false;
         };
+        self.resetStringBuffer(stream);
         self.constructors +|= 1;
         std.debug.print(
             "macho-processor: modeled libc++ stringstream object=0x{x} ostream=0x{x} streambuf=0x{x} ios=0x{x}\n",
@@ -453,9 +584,12 @@ pub const Bridge = struct {
         stream.fd = fd;
         stream.eof = false;
         stream.failed = false;
+        stream.patch_toml = std.mem.endsWith(u8, translated, ".patch.toml");
+        stream.trace_reads_remaining = if (stream.patch_toml) 4 else 0;
         if (stream.ios_object != 0) _ = self.object_model.clear(state, stream.ios_object, 0);
         if (mode & OPENMODE_ATE != 0) _ = std.c.lseek(fd, 0, std.c.SEEK.END);
         std.debug.print("macho-processor: libc++ filebuf open: {s} mode=0x{x} fd={d}\n", .{ translated, mode, fd });
+        if (stream.patch_toml) self.tracePatchTomlOpen(fd, translated);
         return object;
     }
 
@@ -495,6 +629,7 @@ pub const Bridge = struct {
             return -1;
         }
         stream.last_read_count = @intCast(result);
+        self.tracePatchRead(stream, "read", bytes[0..@intCast(result)]);
         if (result < bytes.len) {
             @memset(bytes[@intCast(result)..], 0);
         }
@@ -529,6 +664,7 @@ pub const Bridge = struct {
         var byte: [1]u8 = undefined;
         const result = std.c.read(stream.fd, &byte, 1);
         if (result != 1) return -1;
+        self.tracePatchRead(stream, "read-byte", byte[0..1]);
         return byte[0];
     }
 
@@ -540,7 +676,57 @@ pub const Bridge = struct {
         const result = std.c.read(stream.fd, &byte, 1);
         if (result != 1) return -1;
         if (std.c.lseek(stream.fd, -1, std.c.SEEK.CUR) < 0) return -1;
+        self.tracePatchRead(stream, "peek", byte[0..1]);
         return byte[0];
+    }
+
+    fn tracePatchRead(self: *Bridge, stream: *Stream, operation: []const u8, bytes: []const u8) void {
+        _ = self;
+        if (stream.patch_toml and bytes.len != 0 and !std.unicode.utf8ValidateSlice(bytes)) {
+            std.debug.print(
+                "macho-processor: libc++ patch stream invalid UTF-8 chunk: fd={d} operation={s} bytes={d}\n",
+                .{ stream.fd, operation, bytes.len },
+            );
+        }
+        if (stream.trace_reads_remaining == 0 or bytes.len == 0) return;
+        stream.trace_reads_remaining -= 1;
+        const shown = @min(bytes.len, 32);
+        var hex: [64]u8 = undefined;
+        const alphabet = "0123456789abcdef";
+        for (bytes[0..shown], 0..) |byte, index| {
+            hex[index * 2] = alphabet[byte >> 4];
+            hex[index * 2 + 1] = alphabet[byte & 0x0f];
+        }
+        std.debug.print(
+            "macho-processor: libc++ patch stream {s}: fd={d} bytes={d} first={s}\n",
+            .{ operation, stream.fd, bytes.len, hex[0 .. shown * 2] },
+        );
+    }
+
+    fn tracePatchTomlOpen(_: *Bridge, fd: std.c.fd_t, path: []const u8) void {
+        const original = std.c.lseek(fd, 0, std.c.SEEK.CUR);
+        if (original < 0) return;
+        _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+        var buffer: [8192]u8 = undefined;
+        const result = std.c.read(fd, &buffer, buffer.len);
+        _ = std.c.lseek(fd, original, std.c.SEEK.SET);
+        if (result < 0) {
+            std.debug.print("macho-processor: libc++ patch TOML preflight failed: {s} read_errno\n", .{path});
+            return;
+        }
+        const bytes = buffer[0..@intCast(result)];
+        var ascii = true;
+        for (bytes) |byte| {
+            if (byte >= 0x80) {
+                ascii = false;
+                break;
+            }
+        }
+        const utf8 = std.unicode.utf8ValidateSlice(bytes);
+        std.debug.print(
+            "macho-processor: libc++ patch TOML preflight: {s} bytes={d} ascii={} utf8={} sampled={}\n",
+            .{ path, bytes.len, ascii, utf8, result == buffer.len },
+        );
     }
 
     fn available(self: *Bridge, object: u64) i64 {
@@ -646,6 +832,16 @@ fn isStringStreamConstructor(name: []const u8) bool {
     return family and (std.mem.indexOf(u8, name, "C1") != null or std.mem.indexOf(u8, name, "C2") != null);
 }
 
+fn isBasicFilebufConstructor(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_filebufIcNS_11char_traitsIcEEEC1") != null or
+        std.mem.indexOf(u8, name, "basic_filebufIcNS_11char_traitsIcEEEC2") != null;
+}
+
+fn isBasicStreambufConstructor(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEEC1") != null or
+        std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEEC2") != null;
+}
+
 fn isBasicIosMethod(name: []const u8, marker: []const u8) bool {
     return std.mem.indexOf(u8, name, "basic_iosIcNS_11char_traitsIcEEE") != null and
         std.mem.indexOf(u8, name, marker) != null;
@@ -687,8 +883,59 @@ fn isBasicIosBool(name: []const u8) bool {
     return isBasicIosMethod(name, "cvb");
 }
 
+fn isThreadIdInsertion(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_ostream") != null and
+        (std.mem.indexOf(u8, name, "NS_6thread2idE") != null or
+            std.mem.indexOf(u8, name, "NS_11__thread_idE") != null);
+}
+
+fn isPointerInsertion(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv");
+}
+
+fn isCStringInsertion(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_ostream") != null and
+        std.mem.indexOf(u8, name, "PKc") != null and
+        std.mem.indexOf(u8, name, "ls") != null;
+}
+
+fn isIntegerInsertion(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEb") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEi") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEj") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEl") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEm") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEx") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEy");
+}
+
+fn isSignedIntegerInsertion(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEi") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEl") or
+        std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEx");
+}
+
+fn isStringbufStr(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv") != null;
+}
+
+fn isStringStreamStr(name: []const u8) bool {
+    const family = std.mem.indexOf(u8, name, "basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEE3str") != null or
+        std.mem.indexOf(u8, name, "basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEE3str") != null;
+    return family and std.mem.indexOf(u8, name, "Ev") != null;
+}
+
+fn displayThreadId(raw_id: u64) u64 {
+    if (raw_id == 0 or raw_id == CURRENT_THREAD_HANDLE) return 1;
+    if (raw_id >= GTK_IDLE_CALLBACK_HANDLE_BASE) return 1;
+    if (raw_id >= SYNTHETIC_THREAD_BASE and raw_id < SYNTHETIC_THREAD_BASE + 0x10000) {
+        return 2 + ((raw_id - SYNTHETIC_THREAD_BASE) / 0x10);
+    }
+    return raw_id;
+}
+
 fn isUnsignedIntegerInsertion(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEj");
+    return isIntegerInsertion(name) and !isSignedIntegerInsertion(name);
 }
 
 fn isBaseDestructor(name: []const u8) bool {
@@ -708,6 +955,12 @@ fn isIfstreamDefaultConstructor(name: []const u8) bool {
 fn isIfstreamCStringConstructor(name: []const u8) bool {
     return std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj") or
         std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC2EPKcj");
+}
+
+fn isIfstreamFilesystemPathConstructor(name: []const u8) bool {
+    return (std.mem.indexOf(u8, name, "basic_ifstreamIcNS_11char_traitsIcEEEC1") != null or
+        std.mem.indexOf(u8, name, "basic_ifstreamIcNS_11char_traitsIcEEEC2") != null) and
+        std.mem.indexOf(u8, name, "__fs10filesystem4path") != null;
 }
 
 fn isIfstreamDestructor(name: []const u8) bool {
@@ -757,6 +1010,13 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEC1B7v160006Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__1lsB7v160006IcNS_11char_traitsIcEEERNS_13basic_ostreamIT_T0_EES7_NS_6thread2idE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__1lsB7v160006IcNS_11char_traitsIcEEERNS_13basic_ostreamIT_T0_EES7_NS_11__thread_idE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNKSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEE3strB7v160006Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1B7v160006ERKNS_4__fs10filesystem4pathEj"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"));
@@ -765,8 +1025,8 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
 
 test "stream bridge forwards guest file operations through typed host calls" {
     const TestState = struct {
-        mem: [1024]u8 = [_]u8{0} ** 1024,
-        next_alloc: u64 = 768,
+        mem: [4096]u8 = [_]u8{0} ** 4096,
+        next_alloc: u64 = 2048,
         regs: struct {
             rdi: u64 = 0,
             rsi: u64 = 0,
@@ -870,7 +1130,37 @@ test "stream bridge forwards guest file operations through typed host calls" {
     try std.testing.expectEqual(@as(u64, 0), compat_runtime.libcppStringView(&state, string_object).?.length);
 
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj"));
-    try std.testing.expect(!Bridge.recognizesSymbol("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1B7v160006ERKNS_4__fs10filesystem4pathEj"));
+
+    var stringstream_bridge = Bridge{};
+    defer stringstream_bridge.deinit();
+    const stringstream: u64 = 512;
+    const streambuf_for_stringstream = stringstream + STRINGSTREAM_BUFFER_OFFSET;
+    const output_string: u64 = 768;
+    state.regs = .{ .rdi = stringstream };
+    try std.testing.expect(stringstream_bridge.dispatch(&state, &fs, "__ZNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEC1B7v160006Ev") != null);
+    state.regs = .{ .rdi = stringstream + STRINGSTREAM_OSTREAM_OFFSET, .rsi = SYNTHETIC_THREAD_BASE + 0x10 };
+    try std.testing.expect(stringstream_bridge.dispatch(&state, &fs, "__ZNSt3__1lsB7v160006IcNS_11char_traitsIcEEERNS_13basic_ostreamIT_T0_EES7_NS_6thread2idE") != null);
+    state.regs = .{ .rdi = output_string, .rsi = streambuf_for_stringstream };
+    try std.testing.expect(stringstream_bridge.dispatch(&state, &fs, "__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv") != null);
+    const thread_id_text = compat_runtime.libcppStringView(&state, output_string).?;
+    const thread_id_bytes = state.guestMemoryConst(thread_id_text.address, thread_id_text.length).?;
+    try std.testing.expectEqualStrings("3", thread_id_bytes);
+
+    var ostringstream_bridge = Bridge{};
+    defer ostringstream_bridge.deinit();
+    const ostringstream: u64 = 1024;
+    const ostringstream_output: u64 = 1280;
+    state.regs = .{ .rdi = ostringstream };
+    try std.testing.expect(ostringstream_bridge.dispatch(&state, &fs, "__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEC1B7v160006Ev") != null);
+    state.regs = .{ .rdi = ostringstream, .rsi = SYNTHETIC_THREAD_BASE + 0x20 };
+    try std.testing.expect(ostringstream_bridge.dispatch(&state, &fs, "__ZNSt3__1lsB7v160006IcNS_11char_traitsIcEEERNS_13basic_ostreamIT_T0_EES7_NS_11__thread_idE") != null);
+    state.regs = .{ .rdi = ostringstream_output, .rsi = ostringstream };
+    try std.testing.expect(ostringstream_bridge.dispatch(&state, &fs, "__ZNKSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEE3strB7v160006Ev") != null);
+    const ostringstream_text = compat_runtime.libcppStringView(&state, ostringstream_output).?;
+    const ostringstream_bytes = state.guestMemoryConst(ostringstream_text.address, ostringstream_text.length).?;
+    try std.testing.expectEqualStrings("4", ostringstream_bytes);
 
     var ostream_bridge = Bridge{};
     defer ostream_bridge.deinit();

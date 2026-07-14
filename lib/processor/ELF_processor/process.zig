@@ -65,6 +65,8 @@ pub const ElfState = struct {
     image_high: u64 = 0,
     regs: ElfRegs = .{},
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    x87_integer_top: i64 = 0,
+    x87_integer_valid: bool = false,
     terminated: bool = false,
     exit_code: u64 = 0,
     faulted: bool = false,
@@ -543,6 +545,23 @@ pub const ElfState = struct {
         }
     }
 
+    fn writeExtendedInt80(destination: []u8, value: i64) void {
+        std.debug.assert(destination.len >= 10);
+        @memset(destination[0..10], 0);
+        if (value == 0) return;
+
+        const negative = value < 0;
+        const raw: u64 = @bitCast(value);
+        const magnitude = if (negative) (~raw +% 1) else raw;
+        const leading: u6 = @intCast(@clz(magnitude));
+        const msb_index: u6 = 63 - leading;
+        const significand = magnitude << (63 - msb_index);
+        const exponent: u16 = 16383 + @as(u16, msb_index);
+        const sign_exponent: u16 = (if (negative) @as(u16, 0x8000) else 0) | exponent;
+        std.mem.writeInt(u64, destination[0..8], significand, .little);
+        std.mem.writeInt(u16, destination[8..10], sign_exponent, .little);
+    }
+
     fn readMem128(self: *const ElfState, addr: u64) [16]u8 {
         var value = [_]u8{0} ** 16;
         const off = self.addrToOffset(addr) orelse return value;
@@ -959,6 +978,26 @@ pub const ElfState = struct {
             .cmc => self.regs.rflags ^= RFL_CF,
             .clc => self.regs.rflags &= ~RFL_CF,
             .stc => self.regs.rflags |= RFL_CF,
+
+            .fild_mem16, .fld_mem32, .fld_mem64, .fstp_mem32, .fstp_mem64, .fld_st, .fstp_st, .fxch_st, .ffree_st, .fninit, .fnstsw_ax, .fnstcw_mem16, .fldcw_mem16, .x87_binary, .fucomip_st => {},
+
+            .fild_mem32 => {
+                self.x87_integer_top = @bitCast(@as(i64, @bitCast(@as(u64, self.readMemVal(d.addr, .bits32)))));
+                self.x87_integer_valid = true;
+            },
+            .fild_mem64 => {
+                self.x87_integer_top = @bitCast(self.readMemVal(d.addr, .bits64));
+                self.x87_integer_valid = true;
+            },
+            .fstp_mem80 => {
+                const output = self.guestMemory(d.addr, 10) orelse return;
+                if (self.x87_integer_valid) {
+                    writeExtendedInt80(output, self.x87_integer_top);
+                } else {
+                    @memset(output[0..10], 0);
+                }
+                self.x87_integer_valid = false;
+            },
 
             // ── mov reg, mem ──
             .mov_reg8_mem8 => {

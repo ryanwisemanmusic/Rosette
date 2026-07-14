@@ -76,6 +76,13 @@ pub const Runtime = struct {
         return self.intern(&self.classes, &self.class_count, name);
     }
 
+    pub fn className(self: *const Runtime, handle: u64) []const u8 {
+        for (self.classes[0..self.class_count]) |entry| {
+            if (entry.handle == handle) return entry.name;
+        }
+        return "<unknown-class>";
+    }
+
     pub fn selectorNamed(self: *Runtime, name: []const u8) u64 {
         return self.intern(&self.selectors, &self.selector_count, name);
     }

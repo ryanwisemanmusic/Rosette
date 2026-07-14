@@ -166,6 +166,10 @@ pub const Manager = struct {
         };
         if (inside_reservation) {
             self.appendActivation(guest_base, memory, prot_raw) catch return false;
+            std.debug.print(
+                "macho-processor: sparse fixed mmap attached backing: guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x} activations={d}\n",
+                .{ guest_base, length, prot_raw, flags_raw, host_fd, offset, self.activations.items.len },
+            );
         } else {
             self.mappings.append(self.allocator, .{
                 .guest_base = guest_base,

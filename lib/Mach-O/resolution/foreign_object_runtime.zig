@@ -22,6 +22,8 @@ const ObjectEntry = struct {
     address: u64 = 0,
     type_id: u64 = 0,
     references: u64 = 0,
+    parent: u64 = 0,
+    getter_name: []const u8 = "",
 };
 
 pub const Runtime = struct {
@@ -63,13 +65,60 @@ pub const Runtime = struct {
             self.references +|= 1;
             return .handled_void;
         }
+        if (std.mem.eql(u8, name, "gtk_init_check")) {
+            return .{ .handled = @intFromBool(ensureNativeApplication(state)) };
+        }
         if (isConstructor(name)) {
-            return .{ .handled = self.createObject(state, constructorTypeName(name)) orelse 0 };
+            const object = self.createObject(state, constructorTypeName(name), 0, "") orelse 0;
+            if (std.mem.eql(u8, name, "gtk_window_new") and object != 0 and !ensureNativeWindow(state)) {
+                self.rejected +|= 1;
+                return .{ .handled = 0 };
+            }
+            return .{ .handled = object };
+        }
+        if (std.mem.eql(u8, name, "gtk_window_set_title")) {
+            const title = state.guestCString(state.regs.rsi, 4096) orelse "Xenia Canary (Rosette)";
+            _ = setNativeWindowTitle(state, title);
+            self.mutations +|= 1;
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "gtk_widget_set_size_request")) {
+            const width: i32 = @bitCast(@as(u32, @truncate(state.regs.rsi)));
+            const height: i32 = @bitCast(@as(u32, @truncate(state.regs.rdx)));
+            if (width > 0 and height > 0) _ = setNativeWindowSize(state, width, height);
+            self.mutations +|= 1;
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "gtk_widget_show_all") or
+            std.mem.eql(u8, name, "gtk_window_activate_focus"))
+        {
+            _ = showNativeWindow(state);
+            self.mutations +|= 1;
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "gtk_window_fullscreen") or
+            std.mem.eql(u8, name, "gtk_window_unfullscreen"))
+        {
+            _ = setNativeWindowFullscreen(state, std.mem.eql(u8, name, "gtk_window_fullscreen"));
+            self.mutations +|= 1;
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "gtk_widget_get_allocation")) {
+            writeNativeAllocation(state, state.regs.rsi);
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "gdk_window_get_width")) {
+            return .{ .handled = nativeWindowWidth(state) };
+        }
+        if (std.mem.eql(u8, name, "gdk_window_get_height")) {
+            return .{ .handled = nativeWindowHeight(state) };
+        }
+        if (std.mem.eql(u8, name, "gdk_quartz_window_get_nsview")) {
+            return .{ .handled = nativeViewToken(state) };
         }
         if (isPointerGetter(name)) {
-            return .{ .handled = self.createObject(state, name) orelse 0 };
+            return .{ .handled = self.associatedObject(state, name, state.regs.rdi) orelse 0 };
         }
-        if (std.mem.eql(u8, name, "gtk_init_check")) return .{ .handled = 1 };
         if (std.mem.eql(u8, name, "g_signal_connect_data")) return .{ .handled = self.calls };
         if (isBooleanQuery(name)) return .{ .handled = @intFromBool(self.isObject(state.regs.rdi)) };
         if (std.mem.eql(u8, name, "gtk_main_level")) {
@@ -106,7 +155,7 @@ pub const Runtime = struct {
         );
     }
 
-    fn createObject(self: *Runtime, state: anytype, type_name: []const u8) ?u64 {
+    fn createObject(self: *Runtime, state: anytype, type_name: []const u8, parent: u64, getter_name: []const u8) ?u64 {
         if (self.object_count >= self.objects.len) {
             self.rejected +|= 1;
             return null;
@@ -125,10 +174,19 @@ pub const Runtime = struct {
             .address = address,
             .type_id = type_id,
             .references = 1,
+            .parent = parent,
+            .getter_name = getter_name,
         };
         self.object_count += 1;
         self.allocations +|= 1;
         return address;
+    }
+
+    fn associatedObject(self: *Runtime, state: anytype, getter_name: []const u8, parent: u64) ?u64 {
+        for (self.objects[0..self.object_count]) |object| {
+            if (object.parent == parent and std.mem.eql(u8, object.getter_name, getter_name)) return object.address;
+        }
+        return self.createObject(state, getter_name, parent, getter_name);
     }
 
     fn typeFor(self: *Runtime, state: anytype, name: []const u8) ?u64 {
@@ -168,6 +226,72 @@ pub const Runtime = struct {
     }
 };
 
+fn StateType(comptime StatePointer: type) type {
+    return @typeInfo(StatePointer).pointer.child;
+}
+
+fn ensureNativeApplication(state: anytype) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "ensureNativeApplication")) return state.ensureNativeApplication();
+    return true;
+}
+
+fn ensureNativeWindow(state: anytype) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "ensureNativeWindow")) return state.ensureNativeWindow();
+    return true;
+}
+
+fn setNativeWindowTitle(state: anytype, title: []const u8) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "setNativeWindowTitle")) return state.setNativeWindowTitle(title);
+    return true;
+}
+
+fn setNativeWindowSize(state: anytype, width: i32, height: i32) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "setNativeWindowSize")) return state.setNativeWindowSize(width, height);
+    return true;
+}
+
+fn showNativeWindow(state: anytype) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "showNativeWindow")) return state.showNativeWindow();
+    return true;
+}
+
+fn setNativeWindowFullscreen(state: anytype, fullscreen: bool) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "setNativeWindowFullscreen")) return state.setNativeWindowFullscreen(fullscreen);
+    return true;
+}
+
+fn nativeViewToken(state: anytype) u64 {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "nativeViewToken")) return state.nativeViewToken();
+    return 0;
+}
+
+fn nativeWindowWidth(state: anytype) u32 {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "nativeWindowWidth")) return state.nativeWindowWidth();
+    return 1280;
+}
+
+fn nativeWindowHeight(state: anytype) u32 {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "nativeWindowHeight")) return state.nativeWindowHeight();
+    return 720;
+}
+
+fn writeNativeAllocation(state: anytype, output: u64) void {
+    if (output == 0 or state.guestMemory(output, 16) == null) return;
+    state.write32(output, 0);
+    state.write32(output + 4, 0);
+    state.write32(output + 8, nativeWindowWidth(state));
+    state.write32(output + 12, nativeWindowHeight(state));
+}
+
 fn normalize(symbol: []const u8) []const u8 {
     return if (symbol.len != 0 and symbol[0] == '_') symbol[1..] else symbol;
 }
@@ -205,7 +329,11 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
     const State = struct {
         memory: [1024]u8 = [_]u8{0} ** 1024,
         next: u64 = 64,
-        regs: struct { rdi: u64 = 0 } = .{},
+        regs: struct {
+            rdi: u64 = 0,
+            rsi: u64 = 0,
+            rdx: u64 = 0,
+        } = .{},
 
         fn guestAlloc(self: *@This(), size: u64, alignment: u64) ?u64 {
             const address = std.mem.alignForward(u64, self.next, alignment);
@@ -216,6 +344,15 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
         fn guestMemory(self: *@This(), address: u64, size: u64) ?[]u8 {
             if (address + size > self.memory.len) return null;
             return self.memory[@intCast(address)..@intCast(address + size)];
+        }
+        fn guestCString(self: *@This(), address: u64, maximum: usize) ?[]const u8 {
+            if (address >= self.memory.len) return null;
+            const bytes = self.memory[@intCast(address)..@min(self.memory.len, @as(usize, @intCast(address)) + maximum)];
+            const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+            return bytes[0..end];
+        }
+        fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.memory[@intCast(address)..][0..4], value, .little);
         }
         fn write64(self: *@This(), address: u64, value: u64) void {
             std.mem.writeInt(u64, self.memory[@intCast(address)..][0..8], value, .little);
@@ -236,6 +373,16 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
     state.regs.rdi = object;
     try std.testing.expectEqual(object, runtime.dispatch(&state, "_g_object_ref_sink").?.handled);
     try std.testing.expectEqual(object, runtime.dispatch(&state, "_g_type_check_instance_cast").?.handled);
+
+    const first_window = runtime.dispatch(&state, "_gtk_widget_get_window").?.handled;
+    const second_window = runtime.dispatch(&state, "_gtk_widget_get_window").?.handled;
+    try std.testing.expect(first_window != 0);
+    try std.testing.expectEqual(first_window, second_window);
+
+    state.regs.rsi = 800;
+    try std.testing.expect(runtime.dispatch(&state, "_gtk_widget_get_allocation").? == .handled_void);
+    try std.testing.expectEqual(@as(u32, 1280), std.mem.readInt(u32, state.memory[808..812], .little));
+    try std.testing.expectEqual(@as(u32, 720), std.mem.readInt(u32, state.memory[812..816], .little));
 
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "_gtk_main_level").?.handled);
     try std.testing.expect(runtime.dispatch(&state, "_gtk_main").? == .handled_void);
