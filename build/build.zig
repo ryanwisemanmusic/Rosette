@@ -7,11 +7,16 @@ const reference_include = "../.rosette/include";
 pub fn build(b: *std.Build) void {
     var target_query = b.standardTargetOptionsQueryOnly(.{});
     const host_os = target_query.os_tag orelse builtin.target.os.tag;
+    const macos_sdk_root = b.graph.environ_map.get("SDKROOT") orelse
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
     if (host_os == .macos) {
         const deployment: std.SemanticVersion = .{ .major = 13, .minor = 0, .patch = 0 };
         target_query.os_tag = .macos;
         target_query.os_version_min = .{ .semver = deployment };
         target_query.os_version_max = .{ .semver = deployment };
+        if (b.sysroot == null) {
+            b.sysroot = macos_sdk_root;
+        }
     }
     const target = b.resolveTargetQuery(target_query);
     const optimize = b.standardOptimizeOption(.{});
@@ -1086,6 +1091,17 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_processor_mod.addImport("contract", contract_mod);
         macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        if (is_macos) {
+            macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
+            macho_processor_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
+            macho_processor_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/native_window_bridge.m"),
+                .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+            });
+            macho_processor_mod.linkFramework("AppKit", .{});
+            macho_processor_mod.linkFramework("QuartzCore", .{});
+            macho_processor_mod.linkFramework("Metal", .{});
+        }
         const macho_processor = b.addExecutable(.{
             .name = "macho_processor",
             .root_module = macho_processor_mod,
@@ -1104,6 +1120,17 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_processor_test_mod.addImport("contract", contract_mod);
         macho_processor_test_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        if (is_macos) {
+            macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
+            macho_processor_test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
+            macho_processor_test_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/native_window_bridge.m"),
+                .flags = &.{ "-fobjc-arc", "-fno-modules", "-Wall", "-Wextra" },
+            });
+            macho_processor_test_mod.linkFramework("AppKit", .{});
+            macho_processor_test_mod.linkFramework("QuartzCore", .{});
+            macho_processor_test_mod.linkFramework("Metal", .{});
+        }
         const macho_processor_test = b.addTest(.{ .root_module = macho_processor_test_mod });
         check_step.dependOn(&macho_processor_test.step);
     }
