@@ -1,0 +1,1 @@
+CLEO stands for Cross-Lane Extended Operations. This was created for the sake of taking 256-bit and over instructions and breaking them down into 128-bit compliant NEON instructions. Since many of the CPU flavored instructions: AVX, AVX2, AVX512, SSE:: require large bits for their operations,  NEON needs the proper context to handle things.
