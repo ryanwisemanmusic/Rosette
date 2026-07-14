@@ -184,6 +184,13 @@ pub const Operation = enum {
     fma_addsub_pd,
     fma_subadd_ps,
     fma_subadd_pd,
+    padd,
+    psub,
+    pcmpeq,
+    pcmpgt,
+    pmull,
+    psubs,
+    psubus,
 };
 
 pub const Alignment = enum(u16) {

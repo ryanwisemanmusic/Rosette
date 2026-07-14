@@ -178,7 +178,7 @@ pub export fn cleo_validate_registry() c_int {
 }
 
 test "CLEO root validates wide AVX lowering layer" {
-    try std.testing.expectEqual(@as(usize, 127), registry.tableCount());
+    try std.testing.expectEqual(@as(usize, 245), registry.tableCount());
     validateAll();
     try exerciseAll();
 }

@@ -13,7 +13,10 @@ pub const BinaryOp = enum {
     bit_and,
     bit_andnot,
     cmp,
+    cmpgt,
     addsub,
+    subs,
+    subus,
 };
 
 pub const UnaryOp = enum {
@@ -139,6 +142,18 @@ fn applyBinaryScalar(comptime T: type, lhs: T, rhs: T, comptime op: BinaryOp, la
         .cmp => blk: {
             const IntT = std.meta.Int(.unsigned, @bitSizeOf(T));
             break :blk @bitCast(if (lhs == rhs) ~@as(IntT, 0) else @as(IntT, 0));
+        },
+        .cmpgt => blk: {
+            const IntT = std.meta.Int(.unsigned, @bitSizeOf(T));
+            break :blk @bitCast(if (lhs > rhs) ~@as(IntT, 0) else @as(IntT, 0));
+        },
+        .subs => blk: {
+            const WideT = std.meta.Int(.signed, @bitSizeOf(T) * 2);
+            const big: WideT = @as(WideT, lhs) - @as(WideT, rhs);
+            break :blk @intCast(std.math.clamp(big, std.math.minInt(T), std.math.maxInt(T)));
+        },
+        .subus => blk: {
+            break :blk if (lhs >= rhs) lhs - rhs else @as(T, 0);
         },
         .addsub => if ((lane & 1) == 0)
             (if (@typeInfo(T) == .float) lhs - rhs else lhs -% rhs)

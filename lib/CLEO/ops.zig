@@ -62,7 +62,24 @@ pub fn executeBinary(comptime bits: usize, meta: types.InstructionMeta, lhs: wid
         .pmin_unsigned => executeIntegerMinMax(bits, meta, lhs, rhs, false, .min),
         .pmax_signed => executeIntegerMinMax(bits, meta, lhs, rhs, true, .max),
         .pmax_unsigned => executeIntegerMinMax(bits, meta, lhs, rhs, false, .max),
+        .padd => executeIntegerBinary(bits, meta, lhs, rhs, .add),
+        .psub => executeIntegerBinary(bits, meta, lhs, rhs, .sub),
+        .pcmpeq => executeIntegerBinary(bits, meta, lhs, rhs, .cmp),
+        .pcmpgt => executeIntegerBinary(bits, meta, lhs, rhs, .cmpgt),
+        .pmull => executeIntegerBinary(bits, meta, lhs, rhs, .mul),
+        .psubs => executeIntegerBinary(bits, meta, lhs, rhs, .subs),
+        .psubus => executeIntegerBinary(bits, meta, lhs, rhs, .subus),
         else => types.SafetyError.UnsupportedInstructionWidth,
+    };
+}
+
+fn executeIntegerBinary(comptime bits: usize, meta: types.InstructionMeta, lhs: wide.Wide(bits), rhs: wide.Wide(bits), comptime op: wide.BinaryOp) types.SafetyError!wide.Wide(bits) {
+    return switch (meta.element_bits) {
+        8 => wide.mapBinary(bits, i8, lhs, rhs, op),
+        16 => wide.mapBinary(bits, i16, lhs, rhs, op),
+        32 => wide.mapBinary(bits, i32, lhs, rhs, op),
+        64 => wide.mapBinary(bits, i64, lhs, rhs, op),
+        else => types.SafetyError.InvalidElementWidth,
     };
 }
 
@@ -209,7 +226,24 @@ pub fn executeBinaryMasked(comptime bits: usize, meta: types.InstructionMeta, me
         .pmin_unsigned => executeIntegerMinMaxMasked(bits, meta, merge, lhs, rhs, mask, mode, false, .min),
         .pmax_signed => executeIntegerMinMaxMasked(bits, meta, merge, lhs, rhs, mask, mode, true, .max),
         .pmax_unsigned => executeIntegerMinMaxMasked(bits, meta, merge, lhs, rhs, mask, mode, false, .max),
+        .padd => executeIntegerBinaryMasked(bits, meta, merge, lhs, rhs, mask, mode, .add),
+        .psub => executeIntegerBinaryMasked(bits, meta, merge, lhs, rhs, mask, mode, .sub),
+        .pcmpeq => executeIntegerBinaryMasked(bits, meta, merge, lhs, rhs, mask, mode, .cmp),
+        .pcmpgt => executeIntegerBinaryMasked(bits, meta, merge, lhs, rhs, mask, mode, .cmpgt),
+        .pmull => executeIntegerBinaryMasked(bits, meta, merge, lhs, rhs, mask, mode, .mul),
+        .psubs => executeIntegerBinaryMasked(bits, meta, merge, lhs, rhs, mask, mode, .subs),
+        .psubus => executeIntegerBinaryMasked(bits, meta, merge, lhs, rhs, mask, mode, .subus),
         else => types.SafetyError.UnsupportedInstructionWidth,
+    };
+}
+
+fn executeIntegerBinaryMasked(comptime bits: usize, meta: types.InstructionMeta, merge: wide.Wide(bits), lhs: wide.Wide(bits), rhs: wide.Wide(bits), mask: u64, mode: wide.MaskMode, comptime op: wide.BinaryOp) types.SafetyError!wide.Wide(bits) {
+    return switch (meta.element_bits) {
+        8 => wide.mapBinaryMasked(bits, i8, merge, lhs, rhs, mask, mode, op),
+        16 => wide.mapBinaryMasked(bits, i16, merge, lhs, rhs, mask, mode, op),
+        32 => wide.mapBinaryMasked(bits, i32, merge, lhs, rhs, mask, mode, op),
+        64 => wide.mapBinaryMasked(bits, i64, merge, lhs, rhs, mask, mode, op),
+        else => types.SafetyError.InvalidElementWidth,
     };
 }
 
