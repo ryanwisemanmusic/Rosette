@@ -9,7 +9,7 @@ pub const SchedulingDecision = enum {
     /// Yield the current thread
     yield,
     /// Suspend the current thread
-    suspend,
+    @"suspend",
     /// Preempt the current thread
     preempt,
     /// Exit the scheduler
@@ -20,31 +20,31 @@ pub const SchedulingDecision = enum {
 pub const SchedulingContext = struct {
     /// Current step
     current_step: u64,
-    
+
     /// Current thread handle
     current_thread: u64,
-    
+
     /// Current thread RIP
     current_rip: u64,
-    
+
     /// Number of active threads
     active_threads: usize,
-    
+
     /// Number of suspended threads
     suspended_threads: usize,
-    
+
     /// Number of waiting threads
     waiting_threads: usize,
-    
+
     /// Pending GTK idle callbacks
     pending_idle: usize,
-    
+
     /// Deferred threads count
     deferred_threads: u64,
-    
+
     /// Load factor (0.0 to 1.0)
     load_factor: f64,
-    
+
     /// Whether in UI context
     in_ui_context: bool,
 };
@@ -53,37 +53,37 @@ pub const SchedulingContext = struct {
 pub const PolicyConfig = struct {
     /// Default scheduling mode
     default_mode: thread_interceptor.SchedulingMode = .cooperative,
-    
+
     /// Whether to enable preemption
     enable_preemption: bool = false,
-    
+
     /// Preemption interval (steps)
     preemption_interval: u64 = 50000,
-    
+
     /// Whether to enable priority scheduling
     enable_priority: bool = true,
-    
+
     /// Whether to enable adaptive scheduling
     enable_adaptive: bool = true,
-    
+
     /// Load threshold for adaptive mode switching
     load_threshold: f64 = 0.7,
-    
+
     /// Maximum quantum for cooperative threads
     max_quantum: u64 = 50000,
-    
+
     /// Minimum quantum for cooperative threads
     min_quantum: u64 = 1000,
-    
+
     /// Whether to enable starvation prevention
     enable_starvation_prevention: bool = true,
-    
+
     /// Starvation threshold (steps)
     starvation_threshold: u64 = 100000,
-    
+
     /// Whether to favor UI threads
     favor_ui_threads: bool = true,
-    
+
     /// UI thread priority boost
     ui_priority_boost: i2 = 1,
 };
@@ -92,32 +92,32 @@ pub const PolicyConfig = struct {
 pub const SchedulerPolicy = struct {
     /// Policy configuration
     config: PolicyConfig = .{},
-    
+
     /// Statistics
     scheduling_decisions: u64 = 0,
     yields: u64 = 0,
     suspensions: u64 = 0,
     preemptions: u64 = 0,
     mode_switches: u64 = 0,
-    
+
     /// Current scheduling mode
     current_mode: thread_interceptor.SchedulingMode = .cooperative,
-    
+
     /// Steps since last mode switch
     steps_since_mode_switch: u64 = 0,
-    
+
     /// Make scheduling decision
     pub fn makeDecision(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext) SchedulingDecision {
         self.scheduling_decisions +|= 1;
-        
+
         // Check for adaptive mode switching
         if (self.config.enable_adaptive) {
             self.adaptiveModeSwitch(context);
         }
-        
+
         // Get current thread entry
         const current_entry = registry.findByHandle(context.current_thread);
-        
+
         // Apply policy based on current mode
         const decision = switch (self.current_mode) {
             .cooperative => self.cooperativePolicy(registry, context, current_entry),
@@ -127,18 +127,18 @@ pub const SchedulerPolicy = struct {
             .priority => self.priorityPolicy(registry, context, current_entry),
             .round_robin => self.roundRobinPolicy(registry, context, current_entry),
         };
-        
+
         // Update statistics
         switch (decision) {
             .yield => self.yields +|= 1,
-            .suspend => self.suspensions +|= 1,
+            .@"suspend" => self.suspensions +|= 1,
             .preempt => self.preemptions +|= 1,
             else => {},
         }
-        
+
         return decision;
     }
-    
+
     /// Cooperative scheduling policy
     fn cooperativePolicy(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: ?*thread_registry.ThreadEntry) SchedulingDecision {
         // Check if current thread should yield
@@ -147,17 +147,17 @@ pub const SchedulerPolicy = struct {
             if (e.quantum_remaining == 0) {
                 return .yield;
             }
-            
+
             // Yield if there's pending UI work and this is not a UI thread
             if (context.pending_idle > 0 and e.thread_type != .ui and self.config.favor_ui_threads) {
                 return .yield;
             }
-            
+
             // Yield if there are suspended threads and this thread has run long enough
             if (context.suspended_threads > 0 and e.execution_steps > self.config.max_quantum) {
                 return .yield;
             }
-            
+
             // Yield for starvation prevention
             if (self.config.enable_starvation_prevention) {
                 if (self.shouldPreventStarvation(registry, context, e)) {
@@ -165,63 +165,64 @@ pub const SchedulerPolicy = struct {
                 }
             }
         }
-        
+
         // Run current thread
         return .run;
     }
-    
+
     /// Preemptive scheduling policy
     fn preemptivePolicy(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: ?*thread_registry.ThreadEntry) SchedulingDecision {
         _ = registry;
-        
+        _ = context;
+
         // Preempt based on time slice
         if (entry) |e| {
             if (e.execution_steps % self.config.preemption_interval == 0) {
                 return .preempt;
             }
         }
-        
+
         return .run;
     }
-    
+
     /// Hybrid scheduling policy
     fn hybridPolicy(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: ?*thread_registry.ThreadEntry) SchedulingDecision {
         // Combine cooperative and preemptive policies
         const coop_decision = self.cooperativePolicy(registry, context, entry);
-        
+
         if (coop_decision == .yield) {
             return .yield;
         }
-        
+
         // Add preemption points
         if (entry) |e| {
             if (e.execution_steps % (self.config.preemption_interval * 2) == 0) {
                 return .preempt;
             }
         }
-        
+
         return .run;
     }
-    
+
     /// FIFO scheduling policy
     fn fifoPolicy(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: ?*thread_registry.ThreadEntry) SchedulingDecision {
         _ = self;
         _ = context;
         _ = entry;
-        
+
         // Run threads to completion unless they explicitly yield
         // Check if there are suspended threads that should run first
         if (registry.suspended_head != registry.suspended_tail) {
             return .yield;
         }
-        
+
         return .run;
     }
-    
+
     /// Priority-based scheduling policy
     fn priorityPolicy(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: ?*thread_registry.ThreadEntry) SchedulingDecision {
         _ = registry;
-        
+
         if (entry) |e| {
             // Boost UI thread priority
             if (self.config.favor_ui_threads and e.thread_type == .ui) {
@@ -230,91 +231,90 @@ pub const SchedulerPolicy = struct {
                     return .run;
                 }
             }
-            
+
             // Check if there's a higher priority thread waiting
             if (context.pending_idle > 0 and e.thread_type != .ui) {
                 return .yield;
             }
         }
-        
+
         return .run;
     }
-    
+
     /// Round-robin scheduling policy
     fn roundRobinPolicy(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: ?*thread_registry.ThreadEntry) SchedulingDecision {
+        _ = self;
         _ = context;
-        
+
         if (entry) |e| {
             // Fixed quantum for all threads
             if (e.quantum_remaining == 0) {
                 return .yield;
             }
         }
-        
+
         // Rotate through suspended threads
         if (registry.suspended_head != registry.suspended_tail) {
             return .yield;
         }
-        
+
         return .run;
     }
-    
+
     /// Adaptive mode switching based on load
     fn adaptiveModeSwitch(self: *SchedulerPolicy, context: SchedulingContext) void {
         self.steps_since_mode_switch +|= 1;
-        
+
         // Don't switch too frequently
         if (self.steps_since_mode_switch < 10000) return;
-        
-        const target_mode = if (context.load_factor > self.config.load_threshold)
+
+        const target_mode: thread_interceptor.SchedulingMode = if (context.load_factor > self.config.load_threshold)
             if (context.in_ui_context) .hybrid else .preemptive
         else
             .cooperative;
-        
+
         if (target_mode != self.current_mode) {
             self.current_mode = target_mode;
             self.mode_switches +|= 1;
             self.steps_since_mode_switch = 0;
-            
+
             std.debug.print(
                 "scheduler: adaptive mode switch: new_mode={s} load_factor={d:.2} active_threads={d}\n",
                 .{ @tagName(self.current_mode), context.load_factor, context.active_threads },
             );
         }
     }
-    
+
     /// Check if thread should yield for starvation prevention
     fn shouldPreventStarvation(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: *thread_registry.ThreadEntry) bool {
         // Check for suspended threads that have been waiting too long
         var stuck_count: usize = 0;
         for (&registry.entries) |*e| {
             if (!e.active or e.state != .suspended) continue;
-            
+
             const wait_duration = context.current_step -| e.creation_step;
             if (wait_duration > self.config.starvation_threshold) {
                 stuck_count += 1;
             }
         }
-        
+
         // If there are stuck threads, yield to let them run
         if (stuck_count > 0) {
             return true;
         }
-        
+
         // Check if current thread has been running too long
         if (entry.execution_steps > self.config.starvation_threshold) {
             return true;
         }
-        
+
         return false;
     }
-    
+
     /// Select next thread to run
     pub fn selectNextThread(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext) ?u64 {
-        _ = self;
-        
         // Priority order: UI threads > suspended threads > other threads
-        
+
         // First, check for suspended UI threads
         if (context.pending_idle > 0 and self.config.favor_ui_threads) {
             // UI threads get priority
@@ -324,30 +324,32 @@ pub const SchedulerPolicy = struct {
                 }
             }
         }
-        
-        // Next, check suspended queue (FIFO)
-        if (registry.nextSuspended()) |handle| {
-            return handle;
-        }
-        
-        // Finally, check for any runnable thread
+
+        // Prefer an already-runnable peer over the thread that was just added
+        // to the suspended FIFO by a cooperative yield. Otherwise a yield can
+        // immediately select itself and starve the peer it intended to run.
         for (&registry.entries) |*entry| {
             if (entry.active and entry.state == .running and entry.handle != context.current_thread) {
                 return entry.handle;
             }
         }
-        
+
+        // Finally, resume the oldest suspended context.
+        if (registry.nextSuspended()) |handle| {
+            return handle;
+        }
+
         return null;
     }
-    
+
     /// Migrate thread to different scheduling mode
     pub fn migrateThreadMode(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, handle: u64, new_mode: thread_interceptor.SchedulingMode) bool {
         const entry = registry.findByHandle(handle) orelse return false;
-        
+
         if (entry.scheduling_mode == new_mode) return true;
-        
+
         entry.scheduling_mode = new_mode;
-        
+
         // Adjust quantum based on new mode
         switch (new_mode) {
             .cooperative => {
@@ -363,25 +365,25 @@ pub const SchedulerPolicy = struct {
                 entry.quantum = self.config.max_quantum;
             },
         }
-        
+
         entry.quantum_remaining = entry.quantum;
-        
+
         std.debug.print(
             "scheduler: thread mode migration: handle=0x{x} old_mode={s} new_mode={s} quantum={d}\n",
             .{ entry.handle, @tagName(entry.scheduling_mode), @tagName(new_mode), entry.quantum },
         );
-        
+
         return true;
     }
-    
+
     /// Update thread priority
     pub fn updateThreadPriority(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, handle: u64, new_priority: thread_interceptor.ThreadPriority) bool {
         const entry = registry.findByHandle(handle) orelse return false;
-        
+
         if (entry.priority == new_priority) return true;
-        
+
         entry.priority = new_priority;
-        
+
         // Adjust quantum based on priority
         const priority_multiplier: u64 = switch (new_priority) {
             .very_low => 1,
@@ -391,22 +393,22 @@ pub const SchedulerPolicy = struct {
             .very_high => 16,
             .realtime => 32,
         };
-        
+
         entry.quantum = @min(self.config.max_quantum, self.config.min_quantum * priority_multiplier);
         entry.quantum_remaining = entry.quantum;
-        
+
         std.debug.print(
             "scheduler: thread priority update: handle=0x{x} old_priority={s} new_priority={s} quantum={d}\n",
             .{ entry.handle, @tagName(entry.priority), @tagName(new_priority), entry.quantum },
         );
-        
+
         return true;
     }
-    
+
     /// Log policy statistics
     pub fn logSummary(self: *const SchedulerPolicy) void {
         if (self.scheduling_decisions == 0) return;
-        
+
         std.debug.print(
             "scheduler: policy: decisions={d} yields={d} suspensions={d} preemptions={d} mode_switches={d} current_mode={s}\n",
             .{ self.scheduling_decisions, self.yields, self.suspensions, self.preemptions, self.mode_switches, @tagName(self.current_mode) },
@@ -418,7 +420,7 @@ test "scheduler policy basic decision making" {
     var policy = SchedulerPolicy{};
     var registry = thread_registry.ThreadRegistry{};
     registry.init();
-    
+
     const context = SchedulingContext{
         .current_step = 10000,
         .current_thread = 0x7fff2000,
@@ -431,7 +433,7 @@ test "scheduler policy basic decision making" {
         .load_factor = 0.5,
         .in_ui_context = false,
     };
-    
+
     const decision = policy.makeDecision(&registry, context);
     try std.testing.expectEqual(@as(SchedulingDecision, .run), decision);
 }
@@ -443,10 +445,10 @@ test "scheduler policy adaptive mode switching" {
             .load_threshold = 0.7,
         },
     };
-    
+
     var registry = thread_registry.ThreadRegistry{};
     registry.init();
-    
+
     const high_load_context = SchedulingContext{
         .current_step = 10000,
         .current_thread = 0x7fff2000,
@@ -459,13 +461,13 @@ test "scheduler policy adaptive mode switching" {
         .load_factor = 0.8,
         .in_ui_context = false,
     };
-    
+
     // Simulate enough steps to allow mode switch
     policy.steps_since_mode_switch = 10001;
-    
+
     const decision1 = policy.makeDecision(&registry, high_load_context);
     _ = decision1;
-    
+
     // After high load, should switch to preemptive
     try std.testing.expectEqual(@as(thread_interceptor.SchedulingMode, .preemptive), policy.current_mode);
 }

@@ -4,6 +4,7 @@ pub const thread_interceptor = @import("thread_interceptor.zig");
 pub const thread_registry = @import("thread_registry.zig");
 pub const scheduler_policy = @import("scheduler_policy.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const ui_handoff = @import("ui_handoff.zig");
 
 // Re-export main types for convenience
 pub const ThreadCreationLevel = thread_interceptor.ThreadCreationLevel;
@@ -20,6 +21,9 @@ pub const SchedulingDecision = scheduler_policy.SchedulingDecision;
 pub const PolicyConfig = scheduler_policy.PolicyConfig;
 pub const SchedulerPolicy = scheduler_policy.SchedulerPolicy;
 pub const GlobalScheduler = scheduler.GlobalScheduler;
+pub const UiHandoffTracker = ui_handoff.UiHandoffTracker;
+pub const UiHandoffPhase = ui_handoff.Phase;
+pub const UiHandoffHealth = ui_handoff.Health;
 
 // Global functions
 pub const getGlobalScheduler = scheduler.getGlobalScheduler;
@@ -32,11 +36,12 @@ test "scheduler module integration" {
     _ = thread_registry;
     _ = scheduler_policy;
     _ = scheduler;
-    
+    _ = ui_handoff;
+
     // Test global functions
     initGlobalScheduler();
     defer shutdownGlobalScheduler();
-    
+
     const scheduler_instance = getGlobalScheduler();
     try std.testing.expect(scheduler_instance.initialized);
 }

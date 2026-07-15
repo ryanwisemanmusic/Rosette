@@ -85,29 +85,29 @@ pub const ThreadLifecycleState = enum(u8) {
     /// Thread was cancelled
     cancelled = 6,
     /// Thread encountered an error
-    error = 7,
+    @"error" = 7,
 };
 
 /// Stack management for different thread types
 pub const StackPolicy = struct {
     /// Default stack size for this thread type
     default_size: u64 = 512 * 1024, // 512KB default
-    
+
     /// Minimum stack size
     min_size: u64 = 64 * 1024, // 64KB minimum
-    
+
     /// Maximum stack size
     max_size: u64 = 32 * 1024 * 1024, // 32MB maximum
-    
+
     /// Stack alignment requirement
     alignment: u64 = 16,
-    
+
     /// Whether to guard stack pages
     guard_pages: bool = true,
-    
+
     /// Stack growth direction (true = down, false = up)
     grows_down: bool = true,
-    
+
     /// Create default stack policy for thread type
     pub fn forThreadType(thread_type: ThreadType) StackPolicy {
         return switch (thread_type) {
@@ -155,31 +155,31 @@ pub const StackPolicy = struct {
 pub const ThreadCreationContext = struct {
     /// Level at which thread was created
     level: ThreadCreationLevel,
-    
+
     /// Detected thread type
     thread_type: ThreadType,
-    
+
     /// Start routine address
     start_routine: u64,
-    
+
     /// Argument to pass to start routine
     argument: u64,
-    
+
     /// Requested stack size
     stack_size: u64,
-    
+
     /// Creating thread handle
     creator_handle: u64,
-    
+
     /// Creation timestamp (steps)
     creation_step: u64,
-    
+
     /// Symbol name of start routine (if available)
     start_symbol: []const u8 = "",
-    
+
     /// Whether this is a recursive thread creation
     is_recursive: bool = false,
-    
+
     /// Depth of recursive creation
     recursion_depth: u32 = 0,
 };
@@ -191,7 +191,7 @@ pub const InterceptionResult = enum {
     /// Deny thread creation
     deny,
     /// Defer thread creation (add to queue)
-    defer,
+    @"defer",
     /// Redirect to different start routine
     redirect,
 };
@@ -200,71 +200,71 @@ pub const InterceptionResult = enum {
 pub const ThreadInterceptor = struct {
     const MAX_INTERCEPT_POINTS = 128;
     const MAX_CREATION_CONTEXTS = 64;
-    
+
     /// Whether interception is enabled
     enabled: bool = false,
-    
+
     /// Total threads intercepted
     total_intercepted: u64 = 0,
-    
+
     /// Threads allowed
     allowed_count: u64 = 0,
-    
+
     /// Threads denied
     denied_count: u64 = 0,
-    
+
     /// Threads deferred
     deferred_count: u64 = 0,
-    
+
     /// Threads redirected
     redirected_count: u64 = 0,
-    
+
     /// Creation context history
     creation_contexts: [MAX_CREATION_CONTEXTS]?ThreadCreationContext = [_]?ThreadCreationContext{null} ** MAX_CREATION_CONTEXTS,
-    
+
     /// Current context index
     context_index: usize = 0,
-    
+
     /// Recursive creation detection
     max_recursion_depth: u32 = 0,
-    
+
     /// Enable thread interception
     pub fn enable(self: *ThreadInterceptor) void {
         self.enabled = true;
     }
-    
+
     /// Disable thread interception
     pub fn disable(self: *ThreadInterceptor) void {
         self.enabled = false;
     }
-    
+
     /// Intercept thread creation
     pub fn intercept(self: *ThreadInterceptor, context: ThreadCreationContext) InterceptionResult {
         if (!self.enabled) return .allow;
-        
+
         self.total_intercepted +|= 1;
-        
+
         // Record creation context
         self.recordCreationContext(context);
-        
+
         // Track recursive creation
         if (context.is_recursive) {
             if (context.recursion_depth > self.max_recursion_depth) {
                 self.max_recursion_depth = context.recursion_depth;
             }
         }
-        
+
         // Apply interception policy based on thread type and level
         const result = self.applyInterceptionPolicy(context);
-        
+
         // Update statistics
         switch (result) {
             .allow => self.allowed_count +|= 1,
             .deny => self.denied_count +|= 1,
-            .defer => self.deferred_count +|= 1,
+            .@"defer" => self.deferred_count +|= 1,
             .redirect => self.redirected_count +|= 1,
         }
-        
+
         // Log significant interceptions
         if (self.total_intercepted <= 16 or self.total_intercepted % 100 == 0) {
             std.debug.print(
@@ -272,10 +272,10 @@ pub const ThreadInterceptor = struct {
                 .{ self.total_intercepted, @tagName(context.level), @tagName(context.thread_type), @tagName(result), context.start_routine, context.creator_handle, context.recursion_depth },
             );
         }
-        
+
         return result;
     }
-    
+
     /// Determine thread type from creation context
     pub fn detectThreadType(context: ThreadCreationContext) ThreadType {
         // Heuristics for thread type detection
@@ -284,8 +284,9 @@ pub const ThreadInterceptor = struct {
             if (std.mem.indexOf(u8, context.start_symbol, "worker") != null) {
                 return .worker;
             }
-            if (std.mem.indexOf(u8, context.start_symbol, "ui") != null or 
-                std.mem.indexOf(u8, context.start_symbol, "gtk") != null) {
+            if (std.mem.indexOf(u8, context.start_symbol, "ui") != null or
+                std.mem.indexOf(u8, context.start_symbol, "gtk") != null)
+            {
                 return .ui;
             }
             if (std.mem.indexOf(u8, context.start_symbol, "io") != null) {
@@ -298,22 +299,22 @@ pub const ThreadInterceptor = struct {
                 return .network;
             }
         }
-        
+
         // Default to worker for unknown threads
         return .worker;
     }
-    
+
     /// Record creation context for analysis
     fn recordCreationContext(self: *ThreadInterceptor, context: ThreadCreationContext) void {
         self.creation_contexts[self.context_index] = context;
         self.context_index = (self.context_index + 1) % MAX_CREATION_CONTEXTS;
     }
-    
+
     /// Apply interception policy based on context
     fn applyInterceptionPolicy(self: *ThreadInterceptor, context: ThreadCreationContext) InterceptionResult {
         // Policy: Allow all thread creations by default
         // This can be extended with more sophisticated policies
-        
+
         // Example: Limit recursive creation depth
         if (context.is_recursive and context.recursion_depth > 8) {
             std.debug.print(
@@ -322,15 +323,15 @@ pub const ThreadInterceptor = struct {
             );
             return .deny;
         }
-        
+
         // Example: Defer low-priority background threads during high load
         if (context.thread_type == .background and self.total_intercepted > 1000) {
-            return .defer;
+            return .@"defer";
         }
-        
+
         return .allow;
     }
-    
+
     /// Log interception statistics
     pub fn logSummary(self: *const ThreadInterceptor) void {
         if (self.total_intercepted == 0) return;
@@ -344,7 +345,7 @@ pub const ThreadInterceptor = struct {
 test "thread interceptor basic functionality" {
     var interceptor = ThreadInterceptor{};
     interceptor.enable();
-    
+
     const context = ThreadCreationContext{
         .level = .pthread,
         .thread_type = .worker,
@@ -355,7 +356,7 @@ test "thread interceptor basic functionality" {
         .creation_step = 1000,
         .start_symbol = "worker_thread",
     };
-    
+
     const result = interceptor.intercept(context);
     try std.testing.expectEqual(@as(InterceptionResult, .allow), result);
     try std.testing.expectEqual(@as(u64, 1), interceptor.total_intercepted);
@@ -365,10 +366,10 @@ test "thread interceptor basic functionality" {
 test "stack policy for thread types" {
     const main_policy = StackPolicy.forThreadType(.main);
     try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), main_policy.default_size);
-    
+
     const worker_policy = StackPolicy.forThreadType(.worker);
     try std.testing.expectEqual(@as(u64, 1 * 1024 * 1024), worker_policy.default_size);
-    
+
     const timer_policy = StackPolicy.forThreadType(.timer);
     try std.testing.expectEqual(@as(u64, 256 * 1024), timer_policy.default_size);
 }
