@@ -4,6 +4,10 @@ SHIM_DIR := $(INCLUDE_DIR)/shims/win32
 MACOS_SHIM_DIR := $(INCLUDE_DIR)/shims/macos
 WIN32_DIR := $(INCLUDE_DIR)/win32
 
+CREDENTIALS := /Users/ryanwiseman/Downloads/DevKeysCerts/rosette.signing.env
+-include $(CREDENTIALS)
+export
+
 CC ?= clang
 CXX ?= clang++
 CFLAGS ?= -Wall -Wextra -Wno-ignored-attributes
@@ -11,7 +15,6 @@ ZIG_VERSION ?= 0.16.0
 ZIG_CACHE_DIR ?= build/.zig-cache
 ZIG_GLOBAL_CACHE_DIR ?= build/.zig-cache/global
 ZIG_BUILD_ENV := ZIG_LOCAL_CACHE_DIR=$(ZIG_CACHE_DIR) ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR)
-ROSETTE_RUNTIME_OPTIMIZE ?= ReleaseFast
 ZIG_LIB := zig-out/lib/librosette_zig.a
 EXE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
 ASSEMBLER_RUNNER_BIN := zig-out/bin/rosette_assembler_runner
@@ -21,8 +24,6 @@ ELF_PROCESSOR_BIN := zig-out/bin/elf_processor
 ELF_PROCESSOR_SRC := lib/processor/ELF_processor/main.zig
 MACHO_PROCESSOR_BIN := zig-out/bin/macho_processor
 MACHO_PROCESSOR_SRC := lib/Mach-O/main.zig
-MACHO_NATIVE_WINDOW_SRC := lib/Mach-O/native_window_bridge.m
-MACHO_NATIVE_WINDOW_HEADER := lib/Mach-O/native_window_bridge.h
 MACHO_NATIVE_WINDOW_OBJ := build/macho_native_window_bridge.o
 DYLD_DYLIB := zig-out/lib/rosette-exec.dylib
 SHELL_HELPER_SRC := src/shell/global_config/rosette_shell.zig
@@ -58,10 +59,32 @@ EXE_GATE_RUNNER_SRC := src/tooling/exe_parser/rosette_exe_runner.zig
 EXE_GATE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
 
 # Entitlements for codesigning (JIT, unsigned-executable-memory, etc.)
-ENTITLEMENTS := build/rosette.entitlements
-CODESIGN_IDENTITY ?= -
+ifneq ($(APPLE_DEVELOPER_ID),)
+    CODESIGN_IDENTITY ?= $(APPLE_DEVELOPER_ID)
+    INSTALLER_SIGN_IDENTITY ?= $(APPLE_INSTALLER_ID)
+    CODESIGN_EXTRA_FLAGS ?= --timestamp --options runtime
+    BUILD_TYPE := "Official Release"
+else
+    CODESIGN_IDENTITY ?= -
+    INSTALLER_SIGN_IDENTITY ?= -
 CODESIGN_EXTRA_FLAGS ?=
-NOTARY_PROFILE ?=
+    BUILD_TYPE := "Developer Build (Ad-hoc)"
+endif
+
+# Environment files may preserve literal quote characters around an identity.
+# Remove them before passing the value to codesign; unlike patsubst this also
+# works when the identity contains spaces.
+CODESIGN_IDENTITY := $(subst ",,$(CODESIGN_IDENTITY))
+
+# Timestamping is required only for the publish/notarize workflow. Keeping it
+# separate lets `make app-all` produce locally testable signed artifacts.
+RELEASE_BUILD ?= 0
+DMG_CODESIGN_FLAGS := $(if $(filter 1,$(RELEASE_BUILD)),--timestamp,)
+
+RELEASE_ENTITLEMENTS := build/rosette-release.entitlements
+ADHOC_ENTITLEMENTS := build/rosette-adhoc.entitlements
+ENTITLEMENTS := $(if $(filter -,$(CODESIGN_IDENTITY)),$(ADHOC_ENTITLEMENTS),$(RELEASE_ENTITLEMENTS))
+NOTARY_PROFILE ?= rosette-notary
 NOTARYTOOL ?= xcrun notarytool
 STAPLER ?= xcrun stapler
 
@@ -106,7 +129,7 @@ FB_LOGGER_OBJ := fb_logger.o
 OBJC_FLAGS := -fobjc-arc -fmodules
 OBJC_FRAMEWORKS := -framework Cocoa -framework Foundation
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build compat-router-build-x86_64 shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse app-wrapper installer uninstaller app-all notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -153,6 +176,17 @@ ifneq ($(wildcard .rosette/include/win32/win32.mk),)
 headers-check: win32-check-all
 endif
 
+# Check to ensure that we are properly signing the application
+.PHONY: verify-creds
+verify-creds:
+	@echo 'Build Type: $(BUILD_TYPE)'
+	@echo 'CODESIGN_IDENTITY: $(CODESIGN_IDENTITY)'
+	@echo 'CODESIGN_EXTRA_FLAGS: $(CODESIGN_EXTRA_FLAGS)'
+	@echo 'APPLE_DEVELOPER_ID: $(APPLE_DEVELOPER_ID)'
+	@echo 'APPLE_TEAM_ID: $(APPLE_TEAM_ID)'
+	@echo 'APPLE_ID: $(APPLE_ID)'
+	@echo 'APP_PASSWORD: [HIDDEN]'
+
 .PHONY: zig-build
 zig-build: zig-build-all
 
@@ -188,21 +222,18 @@ c-fix: c-fix-build
 
 
 clean: exe-runner-cleanup
-	rm -f test_main lib*.dylib lib*.so $(OBJC_OBJ) $(OBJC_GDI_OBJ) $(TRACE_WINDOW_OBJ) $(OBJCXX_OBJ) $(DEFAULT_OBJ) $(EXT_WIN_OBJ) $(CLI_OBJ) $(DEBUG_RUNTIME_OBJ) $(KEYBOARD_OBJ) $(FB_LOGGER_OBJ) $(MACHO_NATIVE_WINDOW_OBJ) $(OBJC_LIB) $(CLI_LIB)
+	rm -f test_main lib*.dylib lib*.so $(OBJC_OBJ) $(OBJC_GDI_OBJ) $(TRACE_WINDOW_OBJ) $(OBJCXX_OBJ) $(DEFAULT_OBJ) $(EXT_WIN_OBJ) $(CLI_OBJ) $(DEBUG_RUNTIME_OBJ) $(KEYBOARD_OBJ) $(FB_LOGGER_OBJ) $(OBJC_LIB) $(CLI_LIB)
 	rm -rf zig-out
 	rm -f snake_game app_testing/basic_snake/snake_game
 
 elf-processor-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway -Mx64_decoder=src/x64-ASM/decoder.zig -Misa_highway=ISA/highway.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
-macho-processor-build: $(MACHO_NATIVE_WINDOW_OBJ)
+macho-processor-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime -lc "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway -Mx64_decoder=src/x64-ASM/decoder.zig -Misa_highway=ISA/highway.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -femit-bin="$(MACHO_PROCESSOR_BIN)"
-
-$(MACHO_NATIVE_WINDOW_OBJ): $(MACHO_NATIVE_WINDOW_SRC) $(MACHO_NATIVE_WINDOW_HEADER)
-	@mkdir -p build/.clang-module-cache
-	@CLANG_MODULE_CACHE_PATH="$(ROOT_DIR)/build/.clang-module-cache" $(CC) $(OBJC_FLAGS) -Wall -Wextra -c "$(MACHO_NATIVE_WINDOW_SRC)" -o "$(MACHO_NATIVE_WINDOW_OBJ)"
+	@"$(CC)" -fobjc-arc -fno-modules -Wall -Wextra -c lib/Mach-O/native_window_bridge.m -o "$(MACHO_NATIVE_WINDOW_OBJ)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime -lc -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -femit-bin="$(MACHO_PROCESSOR_BIN)"
 
 elf-processor-dylib:
 	@mkdir -p zig-out/lib
@@ -230,11 +261,7 @@ compat-router-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
 	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_kernel_process_guard --dep exit_diagnostics -Mroot="$(COMPAT_ROUTER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(COMPAT_ROUTER_BIN)"
 
-compat-router-build-x86_64:
-	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc -Dtarget=x86_64-macos --dep entrypoint_kernel_process_guard --dep exit_diagnostics -Mroot="$(COMPAT_ROUTER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(COMPAT_ROUTER_BIN)"
-
-shell-helper-build: assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build-x86_64
+shell-helper-build: c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
 	@mkdir -p zig-out/bin build/.zig-cache/global
 	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
@@ -268,11 +295,25 @@ app-wrapper: mscoree-native shell-helper-build
 	@rm -rf \
 		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/app_testing" \
 		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/assets/exe_examples" \
-		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/include/assets/exe_examples"
+		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
+		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder"
+	@if find "app/bundling/zig-out/Rosette.app" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
+		echo "error: app_testing or bundled example payload entered Rosette.app"; \
+		exit 1; \
+	fi
 	@rm -rf program/app/Rosette.app
 	@cp -R app/bundling/zig-out/Rosette.app program/app/
-	@if find "program/app/Rosette.app" \( -type d -name app_testing -o -type d -name exe_examples \) -print -quit | grep -q .; then \
-		echo "error: source-only prodder content entered Rosette.app"; \
+	@rm -rf \
+		"program/app/Rosette.app/Contents/Resources/rosette-runtime/app_testing" \
+		"program/app/Rosette.app/Contents/Resources/rosette-runtime/assets/exe_examples" \
+		"program/app/Rosette.app/Contents/Resources/rosette-runtime/include/assets/exe_examples" \
+		"program/app/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder"
+	@if find "program/app/Rosette.app" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
+		 echo "error: app_testing or bundled example payload entered the distributable Rosette.app"; \
+		 exit 1; \
+	fi
+	@if [ -e "program/app/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
+		echo "error: development test helper entered the distributable Rosette.app"; \
 		exit 1; \
 	fi
 	@rm -rf "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
@@ -284,6 +325,7 @@ app-wrapper: mscoree-native shell-helper-build
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app/Contents/MacOS/rosette_mscoree_window_helper"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-cli"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette_assembler_runner"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette_exe_runner"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-shell"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "program/app/Rosette.app/Contents/MacOS/rosette-router"
@@ -302,8 +344,12 @@ installer: app-wrapper
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
 	@rm -rf "app/dmg/installer/zig-out/Rosette Installer.app"
 	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/dmg/installer/build.zig -Dpayload-app=program/app/Rosette.app 2>&1
-	@if find "app/dmg/installer/zig-out/Rosette Installer.app" \( -type d -name app_testing -o -type d -name exe_examples \) -print -quit | grep -q .; then \
-		echo "error: source-only prodder content entered Rosette Installer.app"; \
+	@if find "app/dmg/installer/zig-out/Rosette Installer.app" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
+		echo "error: app_testing or bundled example payload entered Rosette Installer.app"; \
+		exit 1; \
+	fi
+	@if [ -e "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/Resources/rosette-runtime/tools/test_prodder" ]; then \
+		echo "error: development test helper entered Rosette Installer.app"; \
 		exit 1; \
 	fi
 	@echo "Signing Rosette Installer.app..."
@@ -312,6 +358,7 @@ installer: app-wrapper
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app/Contents/MacOS/rosette_mscoree_window_helper"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/RosetteMscoreeWindow.app"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette-cli"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette_assembler_runner"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette_exe_runner"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette-shell"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) --entitlements "$(ENTITLEMENTS)" "app/dmg/installer/zig-out/Rosette Installer.app/Contents/Resources/Rosette.app/Contents/MacOS/rosette-router"
@@ -331,8 +378,12 @@ installer: app-wrapper
 		-volname "Rosette Installer" \
 		-fs HFS+ -format UDZO \
 		-o program/installer/RosetteInstaller.dmg 2>&1
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "program/installer/RosetteInstaller.dmg"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(DMG_CODESIGN_FLAGS) "program/installer/RosetteInstaller.dmg"
 	@codesign --verify --verbose=2 "program/installer/RosetteInstaller.dmg"
+	@if [ "$(RELEASE_BUILD)" = "1" ] && ! codesign -dv --verbose=4 "program/installer/RosetteInstaller.dmg" 2>&1 | grep -q '^Timestamp='; then \
+		echo "error: release DMG was signed without a secure timestamp"; \
+		exit 1; \
+	fi
 	@rm -rf /tmp/rosette-installer-dmg
 	@echo "Created: program/installer/RosetteInstaller.dmg"
 
@@ -355,13 +406,27 @@ uninstaller:
 		-volname "Rosette Uninstaller" \
 		-fs HFS+ -format UDZO \
 		-o program/uninstaller/RosetteUninstaller.dmg 2>&1
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "program/uninstaller/RosetteUninstaller.dmg"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(DMG_CODESIGN_FLAGS) "program/uninstaller/RosetteUninstaller.dmg"
 	@codesign --verify --verbose=2 "program/uninstaller/RosetteUninstaller.dmg"
+	@if [ "$(RELEASE_BUILD)" = "1" ] && ! codesign -dv --verbose=4 "program/uninstaller/RosetteUninstaller.dmg" 2>&1 | grep -q '^Timestamp='; then \
+		echo "error: release DMG was signed without a secure timestamp"; \
+		exit 1; \
+	fi
 	@rm -rf /tmp/rosette-uninstaller-dmg
 	@echo "Created: program/uninstaller/RosetteUninstaller.dmg"
 
+# Developer-ID builds are notarized and stapled as part of the normal app-all
+# workflow. Ad-hoc source builds remain local-only and do not contact Apple.
+ifeq ($(CODESIGN_IDENTITY),-)
 app-all: app-wrapper installer uninstaller
-	@echo "All Rosette app artifacts built."
+	@echo "Built local ad-hoc artifacts (not for external distribution)."
+else
+app-all: notarize-app-all
+	@echo "Built signed, notarized, stapled Rosette release artifacts."
+endif
+
+# Compatibility alias for release automation.
+release: app-all
 
 notarize-installer:
 	@if [ "$(CODESIGN_IDENTITY)" = "-" ]; then \
@@ -374,7 +439,7 @@ notarize-installer:
 		echo "Example: make notarize-installer CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' CODESIGN_EXTRA_FLAGS='--timestamp --options runtime' NOTARY_PROFILE=rosette-notary"; \
 		exit 1; \
 	fi
-	@$(MAKE) installer CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" CODESIGN_EXTRA_FLAGS="$(CODESIGN_EXTRA_FLAGS)"
+	@$(MAKE) installer RELEASE_BUILD=1 CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" CODESIGN_EXTRA_FLAGS="$(CODESIGN_EXTRA_FLAGS)"
 	@echo "Submitting RosetteInstaller.dmg for notarization..."
 	@$(NOTARYTOOL) submit "program/installer/RosetteInstaller.dmg" --keychain-profile "$(NOTARY_PROFILE)" --wait
 	@$(STAPLER) staple "program/installer/RosetteInstaller.dmg"
@@ -392,7 +457,7 @@ notarize-uninstaller:
 		echo "Example: make notarize-uninstaller CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' CODESIGN_EXTRA_FLAGS='--timestamp --options runtime' NOTARY_PROFILE=rosette-notary"; \
 		exit 1; \
 	fi
-	@$(MAKE) uninstaller CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" CODESIGN_EXTRA_FLAGS="$(CODESIGN_EXTRA_FLAGS)"
+	@$(MAKE) uninstaller RELEASE_BUILD=1 CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" CODESIGN_EXTRA_FLAGS="$(CODESIGN_EXTRA_FLAGS)"
 	@echo "Submitting RosetteUninstaller.dmg for notarization..."
 	@$(NOTARYTOOL) submit "program/uninstaller/RosetteUninstaller.dmg" --keychain-profile "$(NOTARY_PROFILE)" --wait
 	@$(STAPLER) staple "program/uninstaller/RosetteUninstaller.dmg"
