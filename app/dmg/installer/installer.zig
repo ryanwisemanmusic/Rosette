@@ -14,6 +14,18 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--copy")) {
+        if (args.len < 4) return usage(args[0]);
+        _ = try copyPayload(init.io, allocator, args[2], args[3]);
+        return;
+    }
+
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--configure")) {
+        if (args.len < 3) return usage(args[0]);
+        try configureInstall(init.io, allocator, args[2]);
+        return;
+    }
+
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--register")) {
         if (args.len < 3) return usage(args[0]);
         try registerApp(init.io, args[2]);
@@ -29,12 +41,21 @@ fn usage(exe_name: []const u8) void {
         \\
         \\Usage:
         \\  {s} --install <payload-Rosette.app> <destination-directory>
+        \\  {s} --copy <payload-Rosette.app> <destination-directory>
+        \\  {s} --configure <installed-Rosette.app>
         \\  {s} --register <installed-Rosette.app>
         \\
-    , .{ exe_name, exe_name });
+    , .{ exe_name, exe_name, exe_name, exe_name });
 }
 
 fn installApp(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8, destination_dir: []const u8) !void {
+    const target_app = try copyPayload(io, allocator, payload_app, destination_dir);
+    try configureInstall(io, allocator, target_app);
+    std.debug.print("Installation complete: {s}\n", .{target_app});
+    std.debug.print("Try from an assignment folder: make run or ./program\n", .{});
+}
+
+fn copyPayload(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8, destination_dir: []const u8) ![]const u8 {
     const target_app = try std.fs.path.join(allocator, &.{ destination_dir, "Rosette.app" });
 
     std.debug.print("Verifying Rosette payload helpers...\n", .{});
@@ -47,8 +68,15 @@ fn installApp(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8,
     try runCmd(io, &[_][]const u8{ "rm", "-rf", target_app });
 
     std.debug.print("Copying Rosette.app...\n", .{});
-    try runCmd(io, &[_][]const u8{ "cp", "-R", payload_app, destination_dir });
+    // `ditto` is Apple's bundle-aware copy tool.  In particular, it preserves
+    // symlinks and bundle metadata that `cp -R` can mishandle when the source
+    // is a mounted DMG.
+    try runCmd(io, &[_][]const u8{ "/usr/bin/ditto", payload_app, target_app });
 
+    return target_app;
+}
+
+fn configureInstall(io: std.Io, allocator: std.mem.Allocator, target_app: []const u8) !void {
     std.debug.print("Registering file associations...\n", .{});
     registerApp(io, target_app) catch |err| {
         std.debug.print("Finder registration skipped: {s}\n", .{@errorName(err)});
@@ -61,9 +89,6 @@ fn installApp(io: std.Io, allocator: std.mem.Allocator, payload_app: []const u8,
     std.debug.print("  installing ~/.rosette/bin/rosette-router for traced Rosetta 2 fallback routing\n", .{});
     std.debug.print("  installing default ~/.rosette/config.toml with dump_results=\"auto\"\n", .{});
     try installShell(io, allocator, target_app);
-
-    std.debug.print("Installation complete: {s}\n", .{target_app});
-    std.debug.print("Try from an assignment folder: make run or ./program\n", .{});
 }
 
 fn installShell(io: std.Io, allocator: std.mem.Allocator, app_path: []const u8) !void {

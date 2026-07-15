@@ -132,7 +132,61 @@
     [self.removeButton setEnabled:NO];
     [self.progress startAnimation:nil];
     [self appendLine:@"Starting removal..."];
-    [self runHelper:helper arguments:@[ @"--remove", target ] completionTitle:@"Done"];
+    if ([self shouldUseAuthorizationForTarget:target]) {
+        [self appendLine:@"Waiting for administrator authorization..."];
+        [self runAuthorizedRemoveWithHelper:helper target:target];
+    } else {
+        [self runHelper:helper arguments:@[ @"--remove", target ] completionTitle:@"Done"];
+    }
+}
+
+- (BOOL)shouldUseAuthorizationForTarget:(NSString *)target {
+    // /Applications is normally owned by root.  Checking its parent also
+    // handles a bundle selected in another protected location.
+    NSString *parent = [target stringByDeletingLastPathComponent];
+    return [target hasPrefix:@"/Applications/"] ||
+        ![[NSFileManager defaultManager] isWritableFileAtPath:parent];
+}
+
+- (void)runAuthorizedRemoveWithHelper:(NSString *)helper target:(NSString *)target {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *command = [NSString stringWithFormat:@"%@ --remove %@ 2>&1",
+                             [self shellQuoted:helper], [self shellQuoted:target]];
+        NSString *source = [NSString stringWithFormat:@"do shell script %@ with administrator privileges",
+                            [self appleScriptQuoted:command]];
+        NSTask *task = [[NSTask alloc] init];
+        [task setExecutableURL:[NSURL fileURLWithPath:@"/usr/bin/osascript"]];
+        [task setArguments:@[ @"-e", source ]];
+        NSPipe *pipe = [NSPipe pipe];
+        [task setStandardOutput:pipe];
+        [task setStandardError:pipe];
+
+        NSError *error = nil;
+        if (![task launchAndReturnError:&error]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.progress stopAnimation:nil];
+                [self.removeButton setEnabled:YES];
+                [self appendLine:[NSString stringWithFormat:@"error: could not start authorization prompt: %@", error.localizedDescription]];
+            });
+            return;
+        }
+
+        NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+        [task waitUntilExit];
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        int status = [task terminationStatus];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.progress stopAnimation:nil];
+            [self appendLine:output.length > 0 ? output : @"helper completed"];
+            if (status == 0) {
+                [self.removeButton setTitle:@"Done"];
+                [self.removeButton setAction:@selector(closeUninstaller:)];
+            } else {
+                [self appendLine:@"error: administrator authorization was cancelled or removal failed"];
+            }
+            [self.removeButton setEnabled:YES];
+        });
+    });
 }
 
 - (void)runHelper:(NSString *)helper arguments:(NSArray<NSString *> *)arguments completionTitle:(NSString *)completionTitle {
@@ -186,6 +240,18 @@
     NSString *text = [line hasSuffix:@"\n"] ? line : [line stringByAppendingString:@"\n"];
     [[self.logView textStorage] appendAttributedString:[[NSAttributedString alloc] initWithString:text]];
     [self.logView scrollRangeToVisible:NSMakeRange([[self.logView string] length], 0)];
+}
+
+- (NSString *)shellQuoted:(NSString *)value {
+    NSString *escaped = [value stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"];
+    return [NSString stringWithFormat:@"'%@'", escaped];
+}
+
+- (NSString *)appleScriptQuoted:(NSString *)value {
+    NSMutableString *escaped = [value mutableCopy];
+    [escaped replaceOccurrencesOfString:@"\\" withString:@"\\\\" options:0 range:NSMakeRange(0, escaped.length)];
+    [escaped replaceOccurrencesOfString:@"\"" withString:@"\\\"" options:0 range:NSMakeRange(0, escaped.length)];
+    return [NSString stringWithFormat:@"\"%@\"", escaped];
 }
 
 @end

@@ -340,7 +340,7 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
     [self startAuthorizationPollForMarker:marker];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *command = [NSString stringWithFormat:@"/bin/echo authorized > %@ && %@ --install %@ %@ 2>&1",
+        NSString *command = [NSString stringWithFormat:@"/bin/echo authorized > %@ && %@ --copy %@ %@ 2>&1",
                              [self shellQuoted:marker],
                              [self shellQuoted:helper],
                              [self shellQuoted:payload],
@@ -371,9 +371,45 @@ typedef NS_ENUM(NSInteger, InstallerStep) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [[NSFileManager defaultManager] removeItemAtPath:marker error:nil];
             if (status == 0) {
-                [self showDoneStepWithMessage:[self doneMessageForDestination:destination output:output]];
+                [self.statusText setStringValue:@"Copy complete. Registering Rosette and installing per-user shell integration..."];
+                [self runDirectConfigureWithHelper:helper destination:destination copyOutput:output];
             } else {
                 [self showError:output.length > 0 ? output : @"Administrator authorization was cancelled or failed."];
+            }
+        });
+    });
+}
+
+- (void)runDirectConfigureWithHelper:(NSString *)helper destination:(NSString *)destination copyOutput:(NSString *)copyOutput {
+    NSString *target = [destination stringByAppendingPathComponent:@"Rosette.app"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSTask *task = [[NSTask alloc] init];
+        [task setExecutableURL:[NSURL fileURLWithPath:helper]];
+        [task setArguments:@[ @"--configure", target ]];
+        NSPipe *pipe = [NSPipe pipe];
+        [task setStandardOutput:pipe];
+        [task setStandardError:pipe];
+
+        NSError *error = nil;
+        if (![task launchAndReturnError:&error]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showError:[NSString stringWithFormat:@"Rosette was copied, but setup could not start: %@", error.localizedDescription]];
+            });
+            return;
+        }
+
+        NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+        [task waitUntilExit];
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        int status = [task terminationStatus];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (status == 0) {
+                NSString *combined = copyOutput.length > 0 && output.length > 0
+                    ? [NSString stringWithFormat:@"%@\n%@", copyOutput, output]
+                    : (copyOutput.length > 0 ? copyOutput : output);
+                [self showDoneStepWithMessage:[self doneMessageForDestination:destination output:combined]];
+            } else {
+                [self showError:[NSString stringWithFormat:@"Rosette was copied, but setup failed with status %d.\n%@", status, output ?: @""]];
             }
         });
     });
