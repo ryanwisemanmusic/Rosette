@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const is_macos = target.result.os.tag == .macos;
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     const bundle_step = b.step("bundle", "Build Rosette.app bundle");
     const check_step = b.step("check", "Check Rosette app sources");
