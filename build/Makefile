@@ -15,6 +15,8 @@ ZIG_VERSION ?= 0.16.0
 ZIG_CACHE_DIR ?= build/.zig-cache
 ZIG_GLOBAL_CACHE_DIR ?= build/.zig-cache/global
 ZIG_BUILD_ENV := ZIG_LOCAL_CACHE_DIR=$(ZIG_CACHE_DIR) ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR)
+# Always use release fast since running with safety on means ~180k instructions per second
+# Safety on is only useful if you want run time to take 5x times longer
 ROSETTE_RUNTIME_OPTIMIZE ?= ReleaseFast
 ZIG_LIB := zig-out/lib/librosette_zig.a
 EXE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
@@ -234,7 +236,7 @@ elf-processor-build:
 macho-processor-build:
 	@mkdir -p zig-out/bin build/.zig-cache/global
 	@"$(CC)" -fobjc-arc -fno-modules -Wall -Wextra -c lib/Mach-O/native_window_bridge.m -o "$(MACHO_NATIVE_WINDOW_OBJ)"
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime -lc -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -femit-bin="$(MACHO_PROCESSOR_BIN)"
+	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime --dep scheduler -lc -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -Mscheduler=lib/scheduler/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -femit-bin="$(MACHO_PROCESSOR_BIN)"
 
 elf-processor-dylib:
 	@mkdir -p zig-out/lib
