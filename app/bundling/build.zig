@@ -196,6 +196,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const scheduler_module = b.createModule(.{
+        .root_source_file = b.path("../../lib/scheduler/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const exit_diagnostics_module = b.createModule(.{
         .root_source_file = b.path("../../src/tooling/exit_diagnostics/root.zig"),
         .target = target,
@@ -352,6 +357,7 @@ pub fn build(b: *std.Build) void {
     macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
     macho_processor_mod.addImport("contract", contract_module);
     macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_module);
+    macho_processor_mod.addImport("scheduler", scheduler_module);
     if (is_macos) {
         macho_processor_mod.addObjectFile(compileCObject(
             b,
