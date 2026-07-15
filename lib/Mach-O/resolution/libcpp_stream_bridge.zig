@@ -54,6 +54,7 @@ pub const Bridge = struct {
     peeks: u64 = 0,
     buffer_changes: u64 = 0,
     base_destructors: u64 = 0,
+    thread_id_insertions: u64 = 0,
     rejected: u64 = 0,
     ifstream_vtable: u64 = 0,
     filebuf_vtable: u64 = 0,
@@ -351,8 +352,16 @@ pub const Bridge = struct {
 
     fn insertThreadId(self: *Bridge, state: anytype, ostream: u64, raw_id: u64) u64 {
         var buffer: [32]u8 = undefined;
-        const rendered = std.fmt.bufPrint(&buffer, "{d}", .{displayThreadId(raw_id)}) catch return ostream;
-        _ = self.appendToOstream(state, ostream, rendered);
+        const displayed_id = displayThreadId(raw_id);
+        const rendered = std.fmt.bufPrint(&buffer, "{d}", .{displayed_id}) catch return ostream;
+        const appended = self.appendToOstream(state, ostream, rendered);
+        self.thread_id_insertions +|= 1;
+        if (self.thread_id_insertions <= 16 or !appended) {
+            std.debug.print(
+                "scheduler: libc++ thread id insertion #{d}: raw=0x{x} displayed={d} ostream=0x{x} appended={}\n",
+                .{ self.thread_id_insertions, raw_id, displayed_id, ostream, appended },
+            );
+        }
         return ostream;
     }
 
@@ -886,7 +895,8 @@ fn isBasicIosBool(name: []const u8) bool {
 fn isThreadIdInsertion(name: []const u8) bool {
     return std.mem.indexOf(u8, name, "basic_ostream") != null and
         (std.mem.indexOf(u8, name, "NS_6thread2idE") != null or
-            std.mem.indexOf(u8, name, "NS_11__thread_idE") != null);
+            std.mem.indexOf(u8, name, "NS_11__thread_idE") != null or
+            (std.mem.indexOf(u8, name, "thread") != null and std.mem.indexOf(u8, name, "idE") != null));
 }
 
 fn isPointerInsertion(name: []const u8) bool {

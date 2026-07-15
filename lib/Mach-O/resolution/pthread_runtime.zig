@@ -37,6 +37,22 @@ pub const DeferredThread = struct {
     state: ThreadState,
 };
 
+pub const ThreadSnapshot = struct {
+    slot: usize,
+    handle: u64,
+    numeric_id: u64,
+    start_routine: u64,
+    stack_size: u64,
+    state: ThreadState,
+    started: bool,
+    joined: bool,
+    cancelled: bool,
+    blocked_since_step: u64,
+    blocked_reason: []const u8,
+    waiting_condvar: u64,
+    waiting_mutex: u64,
+};
+
 const CondVar = struct {
     active: bool = false,
     address: u64 = 0,
@@ -205,6 +221,39 @@ pub const Runtime = struct {
         return count;
     }
 
+    pub fn snapshotAt(self: *const Runtime, slot: usize) ?ThreadSnapshot {
+        if (slot >= self.threads.len) return null;
+        const thread = self.threads[slot];
+        if (!thread.active) return null;
+        return .{
+            .slot = slot,
+            .handle = thread.handle,
+            .numeric_id = thread.numeric_id,
+            .start_routine = thread.start_routine,
+            .stack_size = thread.stack_size,
+            .state = thread.state,
+            .started = thread.started,
+            .joined = thread.joined,
+            .cancelled = thread.cancelled,
+            .blocked_since_step = thread.blocked_since_step,
+            .blocked_reason = thread.blocked_reason,
+            .waiting_condvar = thread.waiting_condvar,
+            .waiting_mutex = thread.waiting_mutex,
+        };
+    }
+
+    pub fn snapshotForHandle(self: *const Runtime, handle: u64) ?ThreadSnapshot {
+        for (0..self.threads.len) |slot| {
+            const snapshot = self.snapshotAt(slot) orelse continue;
+            if (snapshot.handle == handle) return snapshot;
+        }
+        return null;
+    }
+
+    pub fn tableCapacity(self: *const Runtime) usize {
+        return self.threads.len;
+    }
+
     pub fn takeNewestDeferred(self: *Runtime) ?DeferredThread {
         for (&self.threads) |*thread| {
             if (!thread.active or thread.started or thread.cancelled or thread.state != .runnable) continue;
@@ -231,15 +280,14 @@ pub const Runtime = struct {
     }
 
     pub fn currentThreadHandle(self: *const Runtime, state: anytype) u64 {
-        _ = self;
         const State = @TypeOf(state.*);
-        if (comptime @hasField(State, "active_gtk_idle_source")) {
-            if (state.active_gtk_idle_source != 0) return CURRENT_THREAD_HANDLE;
+        if (comptime @hasDecl(State, "currentCooperativeThreadHandle")) {
+            return state.currentCooperativeThreadHandle();
         }
         if (comptime @hasField(State, "active_guest_thread")) {
             if (state.active_guest_thread != 0) return state.active_guest_thread;
         }
-        return CURRENT_THREAD_HANDLE;
+        return self.main_thread_handle;
     }
 
     pub fn mutexWouldBlock(self: *Runtime, address: u64, owner: u64) bool {
@@ -267,6 +315,7 @@ pub const Runtime = struct {
         if (self.threadForHandle(handle)) |thread| {
             if (thread.state != .waiting_condvar) self.blocked_threads +|= 1;
             thread.state = .waiting_condvar;
+            thread.blocked_since_step = schedulerStep(state);
             thread.blocked_reason = "pthread_cond_wait";
             thread.waiting_condvar = cond_addr;
             thread.waiting_mutex = mutex_addr;
@@ -341,6 +390,7 @@ pub const Runtime = struct {
                 .argument = state.regs.rcx,
                 .stack_size = self.stackSize(state.regs.rsi),
                 .state = .runnable,
+                .blocked_since_step = schedulerStep(state),
             };
             state.write64(state.regs.rdi, handle);
             self.created_threads +|= 1;
@@ -358,6 +408,7 @@ pub const Runtime = struct {
         const thread = self.threadForHandle(state.regs.rdi) orelse return 3;
         if (thread.state != .completed) {
             thread.state = .waiting_join;
+            thread.blocked_since_step = schedulerStep(state);
             thread.blocked_reason = "pthread_join waiting";
             self.blocked_threads +|= 1;
         }
@@ -593,6 +644,12 @@ fn initializeOpaque(state: anytype, address: u64, size: u64) u64 {
     return 0;
 }
 
+fn schedulerStep(state: anytype) u64 {
+    const State = @TypeOf(state.*);
+    if (comptime @hasField(State, "executed_steps")) return state.executed_steps;
+    return 0;
+}
+
 test "pthread runtime records deferred guest threads" {
     const TestState = struct {
         memory: [256]u8 = [_]u8{0} ** 256,
@@ -699,6 +756,22 @@ test "cooperative condition wait releases and reacquires its mutex" {
 test "thread state transitions" {
     var runtime = Runtime{};
     try std.testing.expectEqual(@as(u64, 0), runtime.activeCount());
+}
+
+test "cooperative execution owner overrides ambient UI callback state" {
+    const worker: u64 = SYNTHETIC_THREAD_BASE + 0x30;
+    var runtime = Runtime{};
+    var state = struct {
+        active_guest_thread: u64 = worker,
+
+        pub fn currentCooperativeThreadHandle(self: *const @This()) u64 {
+            return self.active_guest_thread;
+        }
+    }{};
+
+    try std.testing.expectEqual(worker, runtime.currentThreadHandle(&state));
+    state.active_guest_thread = CURRENT_THREAD_HANDLE;
+    try std.testing.expectEqual(CURRENT_THREAD_HANDLE, runtime.currentThreadHandle(&state));
 }
 
 test "pthread_threadid_np assigns stable numeric ids" {

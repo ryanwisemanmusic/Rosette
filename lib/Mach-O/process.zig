@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const macho = @import("macho.zig");
 const fat = @import("fat.zig");
 const x64_decoder = @import("x64_decoder");
@@ -34,6 +35,7 @@ const tlv_runtime = @import("resolution/tlv_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
 const symbol_assembly_context = @import("resolution/symbol_assembly_context.zig");
 const contract = @import("contract");
+const scheduler = @import("scheduler");
 
 test {
     std.testing.refAllDecls(symbol_assembly_context);
@@ -467,6 +469,7 @@ const CooperativeQuantumWork = enum {
 };
 
 fn cooperativeQuantumWork(pending_idle: usize, idle_callback_running: bool, deferred_threads: u64) CooperativeQuantumWork {
+    if (idle_callback_running) return .none;
     if (pending_idle != 0 and !idle_callback_running) return .gtk_idle;
     if (deferred_threads != 0) return .deferred_thread;
     return .none;
@@ -492,6 +495,8 @@ const MAX_SUSPENDED_GUEST_THREADS = 16;
 
 const SuspendedGuestThread = struct {
     handle: u64 = 0,
+    suspended_step: u64 = 0,
+    reason: []const u8 = "",
     regs: Regs = .{},
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
@@ -556,6 +561,7 @@ pub const MachOState = struct {
     cooperative_thread_returns: u64 = 0,
     cooperative_wait_yields: u64 = 0,
     cooperative_quantum_yields: u64 = 0,
+    ui_callback_retained_quanta: u64 = 0,
     cooperative_quantum_steps: u64 = 0,
     cooperative_bootstrap_trace_remaining: u8 = 0,
     gtk_idle_callbacks: [MAX_GTK_IDLE_CALLBACKS]GtkIdleCallback = [_]GtkIdleCallback{.{}} ** MAX_GTK_IDLE_CALLBACKS,
@@ -570,6 +576,7 @@ pub const MachOState = struct {
     active_gtk_idle_source: u64 = 0,
     active_gtk_idle_callback: u64 = 0,
     active_gtk_idle_started_step: u64 = 0,
+    ui_handoff: scheduler.UiHandoffTracker = .{},
     suspended_guest_threads: [MAX_SUSPENDED_GUEST_THREADS]SuspendedGuestThread = [_]SuspendedGuestThread{.{}} ** MAX_SUSPENDED_GUEST_THREADS,
     suspended_guest_thread_count: usize = 0,
     x87: X87State = .{},
@@ -5523,6 +5530,7 @@ pub const MachOState = struct {
             "macho-processor: GTK cooperative main loop entered: guest_thread=0x{x} start=0x{x} deferred_remaining={d}\n",
             .{ deferred.handle, deferred.start_routine, self.pthreads.deferred_threads },
         );
+        self.logThreadTable("GTK main loop entered");
         return true;
     }
 
@@ -5566,25 +5574,36 @@ pub const MachOState = struct {
         self.active_guest_thread = deferred.handle; // Use pthread handle for now
         self.cooperative_thread_switches +|= 1;
 
+        if (self.ui_handoff.isActive()) {
+            self.ui_handoff.workerStarted(deferred.handle, self.executed_steps);
+            self.logThreadTable("UI handoff worker started");
+        }
+
         // Mark thread as started in scheduler
         // self.thread_scheduler.threadStarted(scheduler_handle);
 
         return true;
     }
 
-    fn saveActiveGuestThread(self: *MachOState) bool {
+    fn saveActiveGuestThread(self: *MachOState, reason: []const u8) bool {
         if (self.active_guest_thread == 0) return false;
         if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return false;
 
         // Save thread state to local suspended guest threads (for compatibility)
         self.suspended_guest_threads[self.suspended_guest_thread_count] = .{
             .handle = self.active_guest_thread,
+            .suspended_step = self.executed_steps,
+            .reason = reason,
             .regs = self.regs,
             .xmm = self.xmm,
             .ymm_hi = self.ymm_hi,
             .x87 = self.x87,
         };
         self.suspended_guest_thread_count += 1;
+
+        if (self.ui_handoff.ownsCallbackHandle(self.active_guest_thread)) {
+            self.ui_handoff.callbackSuspended(self.executed_steps);
+        }
 
         // Also suspend thread in scheduler
         // _ = self.thread_scheduler.suspendThread(self.active_guest_thread, "cooperative_yield", self.regs.rip);
@@ -5599,12 +5618,24 @@ pub const MachOState = struct {
         if (self.suspended_guest_thread_count == 0) return false;
         var attempts = self.suspended_guest_thread_count;
         while (attempts > 0) : (attempts -= 1) {
-            const context = self.suspended_guest_threads[0];
-            if (self.suspended_guest_thread_count > 1) {
+            var selected_index: usize = 0;
+            if (self.ui_handoff.shouldPreferCallback(self.executed_steps, COOPERATIVE_THREAD_QUANTUM_STEPS)) {
+                for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
+                    if (!self.ui_handoff.ownsCallbackHandle(candidate.handle)) continue;
+                    selected_index = index;
+                    std.debug.print(
+                        "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d}\n",
+                        .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps },
+                    );
+                    break;
+                }
+            }
+            const context = self.suspended_guest_threads[selected_index];
+            if (selected_index + 1 < self.suspended_guest_thread_count) {
                 std.mem.copyForwards(
                     SuspendedGuestThread,
-                    self.suspended_guest_threads[0 .. self.suspended_guest_thread_count - 1],
-                    self.suspended_guest_threads[1..self.suspended_guest_thread_count],
+                    self.suspended_guest_threads[selected_index .. self.suspended_guest_thread_count - 1],
+                    self.suspended_guest_threads[selected_index + 1 .. self.suspended_guest_thread_count],
                 );
             }
             self.suspended_guest_thread_count -= 1;
@@ -5629,6 +5660,12 @@ pub const MachOState = struct {
             self.x87 = context.x87;
             self.active_guest_thread = context.handle;
             self.cooperative_thread_switches +|= 1;
+            if (self.ui_handoff.ownsCallbackHandle(context.handle)) {
+                self.ui_handoff.callbackResumed(self.executed_steps);
+                self.logThreadTable("UI callback resumed");
+            } else if (self.ui_handoff.isActive()) {
+                self.ui_handoff.workerStarted(context.handle, self.executed_steps);
+            }
             return true;
         }
         return false;
@@ -5638,7 +5675,7 @@ pub const MachOState = struct {
         if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return false;
         if (self.pthreads.deferred_threads == 0 and self.suspended_guest_thread_count == 0 and self.pendingGtkIdleCallbackCount() == 0) return false;
         const waiter = self.active_guest_thread;
-        if (!self.saveActiveGuestThread()) return false;
+        if (!self.saveActiveGuestThread(reason)) return false;
         var worker: u64 = 0;
         if (self.startNextGtkIdleCallback(reason, true)) {
             worker = self.active_guest_thread;
@@ -5659,6 +5696,9 @@ pub const MachOState = struct {
                 .{ self.cooperative_wait_yields, waiter, worker, reason, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.pendingGtkIdleCallbackCount() },
             );
         }
+        if (self.ui_handoff.isActive() or self.cooperative_wait_yields <= 8) {
+            self.logThreadTable(reason);
+        }
         return true;
     }
 
@@ -5673,7 +5713,32 @@ pub const MachOState = struct {
     fn maybeYieldActiveGuestThreadForQuantum(self: *MachOState) void {
         if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return;
         const pending_idle = self.pendingGtkIdleCallbackCount();
-        const work = cooperativeQuantumWork(pending_idle, self.active_gtk_idle_source != 0, self.pthreads.deferred_threads);
+        const idle_callback_running = self.active_gtk_idle_source != 0;
+
+        // A UI callback owns the UI context until it returns or reaches an
+        // explicit cooperative wait import. pthread_join, condition-variable
+        // waits and mutex contention all yield through
+        // handleCooperativeWaitImport/handleCooperativeMutexContention. Merely
+        // creating a pthread is not a reason to preempt the callback while it
+        // is still doing ordinary work such as formatting presenter logs.
+        if (idle_callback_running) {
+            if (self.pthreads.deferred_threads != 0) {
+                self.cooperative_quantum_steps +|= 1;
+                if (self.cooperative_quantum_steps >= COOPERATIVE_THREAD_QUANTUM_STEPS) {
+                    self.cooperative_quantum_steps = 0;
+                    self.ui_callback_retained_quanta +|= 1;
+                    if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
+                        std.debug.print(
+                            "scheduler: retained active UI callback: quantum={d} callback_handle=0x{x} rip=0x{x} deferred_workers={d}; worker dispatch waits for callback return or explicit synchronization\n",
+                            .{ self.ui_callback_retained_quanta, self.active_guest_thread, self.regs.rip, self.pthreads.deferred_threads },
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
+        const work = cooperativeQuantumWork(pending_idle, idle_callback_running, self.pthreads.deferred_threads);
         if (work == .gtk_idle) {
             const scheduling_thread = self.active_guest_thread;
             self.cooperative_quantum_steps = 0;
@@ -5695,17 +5760,11 @@ pub const MachOState = struct {
             );
             return;
         }
-        // A CallInUIThread callback may synchronously wait for one of the
-        // already-started workers (for example, presenter_created_event).
-        // Continue bounded FIFO rotation while such a callback is active;
-        // otherwise the callback owns the only interpreter timeslice and its
-        // completion event can never be produced.
-        const callback_needs_peer = self.active_gtk_idle_source != 0 and self.suspended_guest_thread_count != 0;
-        if (work != .deferred_thread and !callback_needs_peer) return;
+        if (work != .deferred_thread) return;
         self.cooperative_quantum_steps +|= 1;
         if (self.cooperative_quantum_steps < COOPERATIVE_THREAD_QUANTUM_STEPS) return;
         self.cooperative_quantum_steps = 0;
-        if (!self.yieldActiveGuestThreadForWait(if (callback_needs_peer) "GTK idle callback quantum" else "instruction quantum")) return;
+        if (!self.yieldActiveGuestThreadForWait("instruction quantum")) return;
         self.cooperative_quantum_yields +|= 1;
         if (self.cooperative_quantum_yields <= 8 or self.cooperative_quantum_yields % 100 == 0) {
             std.debug.print(
@@ -5722,10 +5781,12 @@ pub const MachOState = struct {
                 const callback = self.active_gtk_idle_callback;
                 const duration = self.executed_steps -| self.active_gtk_idle_started_step;
                 self.gtk_idle_completed +|= 1;
+                self.ui_handoff.completed(self.executed_steps);
                 std.debug.print(
                     "macho-processor: GTK idle callback completed: source={d} callback=0x{x} duration_steps={d} completed={d} pending={d}\n",
                     .{ source, callback, duration, self.gtk_idle_completed, self.pendingGtkIdleCallbackCount() },
                 );
+                self.logThreadTable("GTK idle callback completed");
                 self.active_guest_thread = 0;
                 self.active_gtk_idle_source = 0;
                 self.active_gtk_idle_callback = 0;
@@ -5768,10 +5829,12 @@ pub const MachOState = struct {
                 .scheduling_rip = self.regs.rip,
             };
             self.gtk_idle_scheduled +|= 1;
+            self.ui_handoff.queued(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
             std.debug.print(
                 "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
                 .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingGtkIdleCallbackCount() },
             );
+            self.logThreadTable("GTK idle scheduled");
             return source;
         }
         std.debug.print(
@@ -5825,7 +5888,7 @@ pub const MachOState = struct {
                 entry.* = .{};
                 continue;
             }
-            if (!active_already_saved and self.active_guest_thread != 0 and !self.saveActiveGuestThread()) return false;
+            if (!active_already_saved and self.active_guest_thread != 0 and !self.saveActiveGuestThread("GTK idle dispatch")) return false;
             const source = entry.source_id;
             const function = entry.function;
             const data = entry.data;
@@ -5847,11 +5910,13 @@ pub const MachOState = struct {
             self.active_gtk_idle_callback = function;
             self.active_gtk_idle_started_step = self.executed_steps;
             self.gtk_idle_started +|= 1;
+            self.ui_handoff.callbackStarted(self.active_guest_thread, self.executed_steps);
             self.cooperative_thread_switches +|= 1;
             std.debug.print(
                 "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
                 .{ source, function, data, tag, reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingGtkIdleCallbackCount() },
             );
+            self.logThreadTable("GTK idle callback started");
             return true;
         }
         return false;
@@ -5860,6 +5925,87 @@ pub const MachOState = struct {
     fn isGtkIdleCallbackHandle(self: *const MachOState, handle: u64) bool {
         _ = self;
         return handle >= GTK_IDLE_CALLBACK_HANDLE_BASE and handle < GTK_IDLE_CALLBACK_HANDLE_BASE + MAX_GTK_IDLE_CALLBACKS + 1024;
+    }
+
+    pub fn currentCooperativeThreadHandle(self: *const MachOState) u64 {
+        if (self.active_guest_thread == 0 or self.isGtkIdleCallbackHandle(self.active_guest_thread)) {
+            return self.pthreads.main_thread_handle;
+        }
+        return self.active_guest_thread;
+    }
+
+    fn threadNumericId(self: *const MachOState, handle: u64) u64 {
+        if (handle == 0 or handle == self.pthreads.main_thread_handle or self.isGtkIdleCallbackHandle(handle)) return 1;
+        if (self.pthreads.snapshotForHandle(handle)) |snapshot| return snapshot.numeric_id;
+        return 0;
+    }
+
+    fn threadRole(self: *const MachOState, handle: u64, address: u64) []const u8 {
+        if (self.isGtkIdleCallbackHandle(handle)) return "ui_callback";
+        if (handle == self.pthreads.main_thread_handle) return "main_ui";
+        const symbol = self.metadata.nearestSymbol(address) orelse return "worker";
+        if (std.mem.indexOf(u8, symbol.name, "WindowedAppContext") != null or
+            std.mem.indexOf(u8, symbol.name, "CallInUIThread") != null or
+            std.mem.indexOf(u8, symbol.name, "gtk") != null or
+            std.mem.indexOf(u8, symbol.name, "GTK") != null)
+        {
+            return "ui_worker";
+        }
+        if (std.mem.indexOf(u8, symbol.name, "Timer") != null or std.mem.indexOf(u8, symbol.name, "timer") != null) return "timer";
+        if (std.mem.indexOf(u8, symbol.name, "logging") != null or std.mem.indexOf(u8, symbol.name, "Logger") != null) return "logging";
+        if (std.mem.indexOf(u8, symbol.name, "io") != null or std.mem.indexOf(u8, symbol.name, "IO") != null) return "io";
+        return "worker";
+    }
+
+    fn contextContainsHandle(self: *const MachOState, handle: u64) bool {
+        if (self.active_guest_thread == handle) return true;
+        for (self.suspended_guest_threads[0..self.suspended_guest_thread_count]) |context| {
+            if (context.handle == handle) return true;
+        }
+        return false;
+    }
+
+    fn logThreadTable(self: *const MachOState, reason: []const u8) void {
+        std.debug.print(
+            "scheduler: THREAD TABLE BEGIN reason={s} step={d} active=0x{x} contexts(active/suspended)={d}/{d} pthread_entries={d} deferred={d} ui_phase={s}\n",
+            .{ reason, self.executed_steps, self.active_guest_thread, @intFromBool(self.active_guest_thread != 0), self.suspended_guest_thread_count, self.pthreads.created_threads, self.pthreads.deferred_threads, @tagName(self.ui_handoff.phase) },
+        );
+        std.debug.print("scheduler: CTX  slot handle             tid role         state      age_steps rip                symbol/reason\n", .{});
+        if (self.active_guest_thread != 0) {
+            const symbol = self.metadata.nearestSymbol(self.regs.rip);
+            std.debug.print(
+                "scheduler: CTX  run  0x{x:0>16} {d: >3} {s: <12} running    {d: >9} 0x{x:0>16} {s}\n",
+                .{ self.active_guest_thread, self.threadNumericId(self.active_guest_thread), self.threadRole(self.active_guest_thread, self.regs.rip), 0, self.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>" },
+            );
+        }
+        for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |context, index| {
+            const symbol = self.metadata.nearestSymbol(context.regs.rip);
+            std.debug.print(
+                "scheduler: CTX  q{d:0>2}  0x{x:0>16} {d: >3} {s: <12} suspended  {d: >9} 0x{x:0>16} {s} | {s}\n",
+                .{ index, context.handle, self.threadNumericId(context.handle), self.threadRole(context.handle, context.regs.rip), self.executed_steps -| context.suspended_step, context.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>", context.reason },
+            );
+        }
+        std.debug.print("scheduler: REG  slot handle             tid role         pthread_state context stored start              blocked_for wait\n", .{});
+        for (0..self.pthreads.tableCapacity()) |slot| {
+            const snapshot = self.pthreads.snapshotAt(slot) orelse continue;
+            const start_symbol = self.metadata.nearestSymbol(snapshot.start_routine);
+            std.debug.print(
+                "scheduler: REG  {d:0>2}   0x{x:0>16} {d: >3} {s: <12} {s: <13} {s: <7} {s: <6} 0x{x:0>16} {d: >11} {s}\n",
+                .{
+                    slot,
+                    snapshot.handle,
+                    snapshot.numeric_id,
+                    self.threadRole(snapshot.handle, snapshot.start_routine),
+                    @tagName(snapshot.state),
+                    if (snapshot.handle == self.active_guest_thread) "active" else if (self.contextContainsHandle(snapshot.handle)) "queue" else "none",
+                    if (snapshot.started) "yes" else "no",
+                    snapshot.start_routine,
+                    if (snapshot.state == .runnable or snapshot.blocked_since_step == 0) 0 else self.executed_steps -| snapshot.blocked_since_step,
+                    if (snapshot.blocked_reason.len != 0) snapshot.blocked_reason else if (start_symbol) |resolved| resolved.name else "<unknown>",
+                },
+            );
+        }
+        std.debug.print("scheduler: THREAD TABLE END reason={s}\n", .{reason});
     }
 
     fn restoreGtkMainLoopCaller(self: *MachOState, reason: []const u8) void {
@@ -5873,6 +6019,7 @@ pub const MachOState = struct {
         self.active_gtk_idle_source = 0;
         self.active_gtk_idle_callback = 0;
         self.active_gtk_idle_started_step = 0;
+        self.ui_handoff.reset();
         self.suspended_guest_thread_count = 0;
         self.foreign_objects.main_loop_depth -|= 1;
         const return_address = self.pop();
@@ -5939,6 +6086,23 @@ pub const MachOState = struct {
                 .{ self.gtk_idle_starvation_warnings, idle.oldest_source, idle.oldest_callback, idle.oldest_tag, idle_age, idle.oldest_scheduling_thread, idle.oldest_scheduling_rip, self.active_guest_thread, @tagName(dispatch_block), self.suspended_guest_thread_count, self.suspended_guest_threads.len },
             );
         }
+        if (self.ui_handoff.isActive()) {
+            std.debug.print(
+                "scheduler: UI handoff heartbeat: generation={d} phase={s} source={d} callback_handle=0x{x} worker=0x{x} no_progress={d} suspend/resume/worker_slices={d}/{d}/{d}\n",
+                .{
+                    self.ui_handoff.generation,
+                    @tagName(self.ui_handoff.phase),
+                    self.ui_handoff.source_id,
+                    self.ui_handoff.callback_handle,
+                    self.ui_handoff.worker_handle,
+                    self.executed_steps -| self.ui_handoff.last_progress_step,
+                    self.ui_handoff.callback_suspensions,
+                    self.ui_handoff.callback_resumptions,
+                    self.ui_handoff.worker_slices,
+                },
+            );
+        }
+        self.ui_handoff.diagnose(self.executed_steps, GTK_IDLE_STARVATION_STEPS);
     }
 
     // Once the Xenia PageEntry tables have been allocated, setup can spend a
@@ -12686,6 +12850,7 @@ test "GTK idle wake preempts a running worker after all pthreads have started" {
     try std.testing.expectEqual(CooperativeQuantumWork.gtk_idle, cooperativeQuantumWork(1, false, 0));
     try std.testing.expectEqual(CooperativeQuantumWork.gtk_idle, cooperativeQuantumWork(1, false, 3));
     try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(1, true, 0));
+    try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(0, true, 1));
     try std.testing.expectEqual(CooperativeQuantumWork.deferred_thread, cooperativeQuantumWork(0, false, 1));
     try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(0, false, 0));
 }
@@ -12731,6 +12896,12 @@ test "decode C7 memory immediate sign extends to 64 bits" {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
+
+    const executable_path = std.process.executablePathAlloc(init.io, allocator) catch null;
+    std.debug.print(
+        "scheduler: runtime integration active version=ui-handoff-v2 optimize={s} executable={s}\n",
+        .{ @tagName(builtin.mode), if (executable_path) |path| path else "<unavailable>" },
+    );
 
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
