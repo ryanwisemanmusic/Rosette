@@ -69,8 +69,20 @@ pub const TraceEntry = struct {
     len: u64 = 0,
     rsp: u64 = 0,
     rax: u64 = 0,
+    rbx: u64 = 0,
     rcx: u64 = 0,
     rdx: u64 = 0,
+    rsi: u64 = 0,
+    rdi: u64 = 0,
+    rbp: u64 = 0,
+    r8: u64 = 0,
+    r9: u64 = 0,
+    r10: u64 = 0,
+    r11: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
 };
 
 pub const TerminalInstruction = struct {
@@ -156,7 +168,12 @@ pub const DependencyCall = struct {
 pub const ControlTransferFailure = struct {
     kind: []const u8 = "",
     instruction_address: u64 = 0,
+    instruction_bytes: [16]u8 = [_]u8{0} ** 16,
+    instruction_byte_count: u8 = 0,
+    decoded_operation: []const u8 = "",
+    decoded_length: u8 = 0,
     operand_address: u64 = 0,
+    operand_value: u64 = 0,
     target_address: u64 = 0,
     return_address: u64 = 0,
     caller_symbol: []const u8 = "",
@@ -184,9 +201,13 @@ pub const CxxExceptionReport = struct {
     message: []const u8 = "",
     unwinder_available: bool = false,
     unwind_frames: usize = 0,
+    cleanup_frames: usize = 0,
+    frame_chain_valid: bool = true,
     handler_found: bool = false,
     handler_address: u64 = 0,
     phase_two_supported: bool = false,
+    phase_two_installed: bool = false,
+    cleanups_exhausted_without_handler: bool = false,
 };
 
 pub const ExitReport = struct {
@@ -338,8 +359,12 @@ pub fn logExitReport(report: ExitReport) void {
         }
         std.debug.print("    unwinder_available={}\n", .{exception.unwinder_available});
         std.debug.print(
-            "    unwind_frames={d} handler_found={} handler=0x{x} phase_two_supported={}\n",
-            .{ exception.unwind_frames, exception.handler_found, exception.handler_address, exception.phase_two_supported },
+            "    unwind_frames={d} cleanup_frames={d} frame_chain_valid={} handler_found={} handler=0x{x}\n",
+            .{ exception.unwind_frames, exception.cleanup_frames, exception.frame_chain_valid, exception.handler_found, exception.handler_address },
+        );
+        std.debug.print(
+            "    phase_two_supported={} phase_two_installed={} cleanups_exhausted_without_handler={}\n",
+            .{ exception.phase_two_supported, exception.phase_two_installed, exception.cleanups_exhausted_without_handler },
         );
     }
 
@@ -366,6 +391,19 @@ pub fn logExitReport(report: ExitReport) void {
             "    kind={s} instruction=0x{x} operand=0x{x} target=0x{x} return=0x{x}\n",
             .{ failure.kind, failure.instruction_address, failure.operand_address, failure.target_address, failure.return_address },
         );
+        if (failure.instruction_byte_count != 0) {
+            std.debug.print(
+                "    decoded={s} len={d} bytes={any}\n",
+                .{
+                    if (failure.decoded_operation.len != 0) failure.decoded_operation else "<unavailable>",
+                    failure.decoded_length,
+                    failure.instruction_bytes[0..failure.instruction_byte_count],
+                },
+            );
+        }
+        if (failure.operand_address != 0) {
+            std.debug.print("    indirect operand: [0x{x}] = 0x{x}\n", .{ failure.operand_address, failure.operand_value });
+        }
         if (failure.caller_symbol.len != 0) {
             std.debug.print("    caller={s}+0x{x}\n", .{ failure.caller_symbol, failure.caller_offset });
         }
@@ -401,14 +439,18 @@ pub fn logExitReport(report: ExitReport) void {
     if (trace.len > 0) {
         std.debug.print("  \x1b[33mlast {d} instructions (oldest first):\x1b[0m\n", .{trace.len});
         for (trace, 0..) |entry, i| {
-            std.debug.print("    [{d:>3}] rip=0x{x:<16} op={s:<20} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}\n", .{
+            std.debug.print("    [{d:>3}] rip=0x{x:<16} op={s:<20} rsp=0x{x} rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} rbp=0x{x}\n", .{
                 i,
                 entry.rip,
                 entry.op,
                 entry.rsp,
                 entry.rax,
+                entry.rbx,
                 entry.rcx,
                 entry.rdx,
+                entry.rsi,
+                entry.rdi,
+                entry.rbp,
             });
         }
     }
