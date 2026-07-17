@@ -1,0 +1,1 @@
+x86 (32-bit and 64-bit) uses what is known as a shadow stack, which is a security mechanism to prevent malicious code from being accepted. Keep in mind, we are doing x86 to NEON which means that we do have to deal with matters of security and modeling how its behaviors work. 

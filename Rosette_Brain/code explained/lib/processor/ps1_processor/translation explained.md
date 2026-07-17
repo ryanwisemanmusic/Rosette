@@ -1,0 +1,3 @@
+.ps1 (PowerShell v1) files are used to run PowerShell scripts. Given how in-depth Microsoft's scripting is for PowerShell, this means that documenting exactly what needs to be translated will make this .md file extensive. Whilst .sh files are most common because of their ability to be compatible across systems, it is still important to handle these files when they pop up in source code
+
+#TODO: Convert .ps1 file processor from Python to Zig
