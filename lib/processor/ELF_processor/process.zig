@@ -11,14 +11,384 @@ const x64_linux_runtime = @import("x64_linux_runtime");
 const x64_syscalls = @import("x64_syscalls");
 const exit_diagnostics = @import("exit_diagnostics");
 
-const SYS_close = x64_syscalls.SYS_close;
-const SYS_creat = x64_syscalls.SYS_creat;
-const SYS_exit = x64_syscalls.SYS_exit;
-const SYS_arch_prctl = x64_syscalls.SYS_arch_prctl;
-const SYS_gettid = x64_syscalls.SYS_gettid;
-const SYS_open = x64_syscalls.SYS_open;
-const SYS_read = x64_syscalls.SYS_read;
-const SYS_write = x64_syscalls.SYS_write;
+const SYS_read = x64_syscalls.SYS_read; // 0
+const SYS_write = x64_syscalls.SYS_write; // 1
+const SYS_open = x64_syscalls.SYS_open; // 2
+const SYS_close = x64_syscalls.SYS_close; // 3
+const SYS_stat = x64_syscalls.SYS_stat; // 4
+const SYS_fstat = x64_syscalls.SYS_fstat; // 5
+const SYS_lstat = x64_syscalls.SYS_lstat; // 6
+const SYS_poll = x64_syscalls.SYS_poll; // 7
+const SYS_lseek = x64_syscalls.SYS_lseek; // 8
+const SYS_mmap = x64_syscalls.SYS_mmap; // 9
+const SYS_mprotect = x64_syscalls.SYS_mprotect; // 10
+const SYS_munmap = x64_syscalls.SYS_munmap; // 11
+const SYS_brk = x64_syscalls.SYS_brk; // 12
+const SYS_rt_sigaction = x64_syscalls.SYS_rt_sigaction; // 13
+const SYS_rt_sigprocmask = x64_syscalls.SYS_rt_sigprocmask; // 14
+const SYS_rt_sigreturn = x64_syscalls.SYS_rt_sigreturn; // 15
+const SYS_ioctl = x64_syscalls.SYS_ioctl; // 16
+const SYS_pread64 = x64_syscalls.SYS_pread64; // 17
+const SYS_pwrite64 = x64_syscalls.SYS_pwrite64; // 18
+const SYS_readv = x64_syscalls.SYS_readv; // 19
+const SYS_writev = x64_syscalls.SYS_writev; // 20
+const SYS_access = x64_syscalls.SYS_access; // 21
+const SYS_pipe = x64_syscalls.SYS_pipe; // 22
+const SYS_select = x64_syscalls.SYS_select; // 23
+const SYS_sched_yield = x64_syscalls.SYS_sched_yield; // 24
+const SYS_mremap = x64_syscalls.SYS_mremap; // 25
+const SYS_msync = x64_syscalls.SYS_msync; // 26
+const SYS_mincore = x64_syscalls.SYS_mincore; // 27
+const SYS_madvise = x64_syscalls.SYS_madvise; // 28
+const SYS_shmget = x64_syscalls.SYS_shmget; // 29
+const SYS_shmat = x64_syscalls.SYS_shmat; // 30
+const SYS_shmctl = x64_syscalls.SYS_shmctl; // 31
+const SYS_dup = x64_syscalls.SYS_dup; // 32
+const SYS_dup2 = x64_syscalls.SYS_dup2; // 33
+const SYS_pause = x64_syscalls.SYS_pause; // 34
+const SYS_nanosleep = x64_syscalls.SYS_nanosleep; // 35
+const SYS_getitimer = x64_syscalls.SYS_getitimer; // 36
+const SYS_alarm = x64_syscalls.SYS_alarm; // 37
+const SYS_setitimer = x64_syscalls.SYS_setitimer; // 38
+const SYS_getpid = x64_syscalls.SYS_getpid; // 39
+const SYS_sendfile = x64_syscalls.SYS_sendfile; // 40
+const SYS_socket = x64_syscalls.SYS_socket; // 41
+const SYS_connect = x64_syscalls.SYS_connect; // 42
+const SYS_accept = x64_syscalls.SYS_accept; // 43
+const SYS_sendto = x64_syscalls.SYS_sendto; // 44
+const SYS_recvfrom = x64_syscalls.SYS_recvfrom; // 45
+const SYS_sendmsg = x64_syscalls.SYS_sendmsg; // 46
+const SYS_recvmsg = x64_syscalls.SYS_recvmsg; // 47
+const SYS_shutdown = x64_syscalls.SYS_shutdown; // 48
+const SYS_bind = x64_syscalls.SYS_bind; // 49
+const SYS_listen = x64_syscalls.SYS_listen; // 50
+const SYS_getsockname = x64_syscalls.SYS_getsockname; // 51
+const SYS_getpeername = x64_syscalls.SYS_getpeername; // 52
+const SYS_socketpair = x64_syscalls.SYS_socketpair; // 53
+const SYS_setsockopt = x64_syscalls.SYS_setsockopt; // 54
+const SYS_getsockopt = x64_syscalls.SYS_getsockopt; // 55
+const SYS_clone = x64_syscalls.SYS_clone; // 56
+const SYS_fork = x64_syscalls.SYS_fork; // 57
+const SYS_vfork = x64_syscalls.SYS_vfork; // 58
+const SYS_execve = x64_syscalls.SYS_execve; // 59
+const SYS_exit = x64_syscalls.SYS_exit; // 60
+const SYS_wait4 = x64_syscalls.SYS_wait4; // 61
+const SYS_kill = x64_syscalls.SYS_kill; // 62
+const SYS_uname = x64_syscalls.SYS_uname; // 63
+const SYS_semget = x64_syscalls.SYS_semget; // 64
+const SYS_semop = x64_syscalls.SYS_semop; // 65
+const SYS_semctl = x64_syscalls.SYS_semctl; // 66
+const SYS_shmdt = x64_syscalls.SYS_shmdt; // 67
+const SYS_msgget = x64_syscalls.SYS_msgget; // 68
+const SYS_msgsnd = x64_syscalls.SYS_msgsnd; // 69
+const SYS_msgrcv = x64_syscalls.SYS_msgrcv; // 70
+const SYS_msgctl = x64_syscalls.SYS_msgctl; // 71
+const SYS_fcntl = x64_syscalls.SYS_fcntl; // 72
+const SYS_flock = x64_syscalls.SYS_flock; // 73
+const SYS_fsync = x64_syscalls.SYS_fsync; // 74
+const SYS_fdatasync = x64_syscalls.SYS_fdatasync; // 75
+const SYS_truncate = x64_syscalls.SYS_truncate; // 76
+const SYS_ftruncate = x64_syscalls.SYS_ftruncate; // 77
+const SYS_getdents = x64_syscalls.SYS_getdents; // 78
+const SYS_getcwd = x64_syscalls.SYS_getcwd; // 79
+const SYS_chdir = x64_syscalls.SYS_chdir; // 80
+const SYS_fchdir = x64_syscalls.SYS_fchdir; // 81
+const SYS_rename = x64_syscalls.SYS_rename; // 82
+const SYS_mkdir = x64_syscalls.SYS_mkdir; // 83
+const SYS_rmdir = x64_syscalls.SYS_rmdir; // 84
+const SYS_creat = x64_syscalls.SYS_creat; // 85
+const SYS_link = x64_syscalls.SYS_link; // 86
+const SYS_unlink = x64_syscalls.SYS_unlink; // 87
+const SYS_symlink = x64_syscalls.SYS_symlink; // 88
+const SYS_readlink = x64_syscalls.SYS_readlink; // 89
+const SYS_chmod = x64_syscalls.SYS_chmod; // 90
+const SYS_fchmod = x64_syscalls.SYS_fchmod; // 91
+const SYS_chown = x64_syscalls.SYS_chown; // 92
+const SYS_fchown = x64_syscalls.SYS_fchown; // 93
+const SYS_lchown = x64_syscalls.SYS_lchown; // 94
+const SYS_umask = x64_syscalls.SYS_umask; // 95
+const SYS_gettimeofday = x64_syscalls.SYS_gettimeofday; // 96
+const SYS_getrlimit = x64_syscalls.SYS_getrlimit; // 97
+const SYS_getrusage = x64_syscalls.SYS_getrusage; // 98
+const SYS_sysinfo = x64_syscalls.SYS_sysinfo; // 99
+const SYS_times = x64_syscalls.SYS_times; // 100
+const SYS_ptrace = x64_syscalls.SYS_ptrace; // 101
+const SYS_getuid = x64_syscalls.SYS_getuid; // 102
+const SYS_syslog = x64_syscalls.SYS_syslog; // 103
+const SYS_getgid = x64_syscalls.SYS_getgid; // 104
+const SYS_setuid = x64_syscalls.SYS_setuid; // 105
+const SYS_setgid = x64_syscalls.SYS_setgid; // 106
+const SYS_geteuid = x64_syscalls.SYS_geteuid; // 107
+const SYS_getegid = x64_syscalls.SYS_getegid; // 108
+const SYS_setpgid = x64_syscalls.SYS_setpgid; // 109
+const SYS_getppid = x64_syscalls.SYS_getppid; // 110
+const SYS_getpgrp = x64_syscalls.SYS_getpgrp; // 111
+const SYS_setsid = x64_syscalls.SYS_setsid; // 112
+const SYS_setreuid = x64_syscalls.SYS_setreuid; // 113
+const SYS_setregid = x64_syscalls.SYS_setregid; // 114
+const SYS_getgroups = x64_syscalls.SYS_getgroups; // 115
+const SYS_setgroups = x64_syscalls.SYS_setgroups; // 116
+const SYS_setresuid = x64_syscalls.SYS_setresuid; // 117
+const SYS_getresuid = x64_syscalls.SYS_getresuid; // 118
+const SYS_setresgid = x64_syscalls.SYS_setresgid; // 119
+const SYS_getresgid = x64_syscalls.SYS_getresgid; // 120
+const SYS_getpgid = x64_syscalls.SYS_getpgid; // 121
+const SYS_setfsuid = x64_syscalls.SYS_setfsuid; // 122
+const SYS_setfsgid = x64_syscalls.SYS_setfsgid; // 123
+const SYS_getsid = x64_syscalls.SYS_getsid; // 124
+const SYS_capget = x64_syscalls.SYS_capget; // 125
+const SYS_capset = x64_syscalls.SYS_capset; // 126
+const SYS_rt_sigpending = x64_syscalls.SYS_rt_sigpending; // 127
+const SYS_rt_sigtimedwait = x64_syscalls.SYS_rt_sigtimedwait; // 128
+const SYS_rt_sigqueueinfo = x64_syscalls.SYS_rt_sigqueueinfo; // 129
+const SYS_rt_sigsuspend = x64_syscalls.SYS_rt_sigsuspend; // 130
+const SYS_sigaltstack = x64_syscalls.SYS_sigaltstack; // 131
+const SYS_utime = x64_syscalls.SYS_utime; // 132
+const SYS_mknod = x64_syscalls.SYS_mknod; // 133
+const SYS_uselib = x64_syscalls.SYS_uselib; // 134
+const SYS_personality = x64_syscalls.SYS_personality; // 135
+const SYS_ustat = x64_syscalls.SYS_ustat; // 136
+const SYS_statfs = x64_syscalls.SYS_statfs; // 137
+const SYS_fstatfs = x64_syscalls.SYS_fstatfs; // 138
+const SYS_sysfs = x64_syscalls.SYS_sysfs; // 139
+const SYS_getpriority = x64_syscalls.SYS_getpriority; // 140
+const SYS_setpriority = x64_syscalls.SYS_setpriority; // 141
+const SYS_sched_setparam = x64_syscalls.SYS_sched_setparam; // 142
+const SYS_sched_getparam = x64_syscalls.SYS_sched_getparam; // 143
+const SYS_sched_setscheduler = x64_syscalls.SYS_sched_setscheduler; // 144
+const SYS_sched_getscheduler = x64_syscalls.SYS_sched_getscheduler; // 145
+const SYS_sched_get_priority_max = x64_syscalls.SYS_sched_get_priority_max; // 146
+const SYS_sched_get_priority_min = x64_syscalls.SYS_sched_get_priority_min; // 147
+const SYS_sched_rr_get_interval = x64_syscalls.SYS_sched_rr_get_interval; // 148
+const SYS_mlock = x64_syscalls.SYS_mlock; // 149
+const SYS_munlock = x64_syscalls.SYS_munlock; // 150
+const SYS_mlockall = x64_syscalls.SYS_mlockall; // 151
+const SYS_munlockall = x64_syscalls.SYS_munlockall; // 152
+const SYS_vhangup = x64_syscalls.SYS_vhangup; // 153
+const SYS_modify_ldt = x64_syscalls.SYS_modify_ldt; // 154
+const SYS_pivot_root = x64_syscalls.SYS_pivot_root; // 155
+const SYS__sysctl = x64_syscalls.SYS__sysctl; // 156
+const SYS_prctl = x64_syscalls.SYS_prctl; // 157
+const SYS_arch_prctl = x64_syscalls.SYS_arch_prctl; // 158
+const SYS_adjtimex = x64_syscalls.SYS_adjtimex; // 159
+const SYS_setrlimit = x64_syscalls.SYS_setrlimit; // 160
+const SYS_chroot = x64_syscalls.SYS_chroot; // 161
+const SYS_sync = x64_syscalls.SYS_sync; // 162
+const SYS_acct = x64_syscalls.SYS_acct; // 163
+const SYS_settimeofday = x64_syscalls.SYS_settimeofday; // 164
+const SYS_mount = x64_syscalls.SYS_mount; // 165
+const SYS_umount2 = x64_syscalls.SYS_umount2; // 166
+const SYS_swapon = x64_syscalls.SYS_swapon; // 167
+const SYS_swapoff = x64_syscalls.SYS_swapoff; // 168
+const SYS_reboot = x64_syscalls.SYS_reboot; // 169
+const SYS_sethostname = x64_syscalls.SYS_sethostname; // 170
+const SYS_setdomainname = x64_syscalls.SYS_setdomainname; // 171
+const SYS_iopl = x64_syscalls.SYS_iopl; // 172
+const SYS_ioperm = x64_syscalls.SYS_ioperm; // 173
+const SYS_create_module = x64_syscalls.SYS_create_module; // 174
+const SYS_init_module = x64_syscalls.SYS_init_module; // 175
+const SYS_delete_module = x64_syscalls.SYS_delete_module; // 176
+const SYS_get_kernel_syms = x64_syscalls.SYS_get_kernel_syms; // 177
+const SYS_query_module = x64_syscalls.SYS_query_module; // 178
+const SYS_quotactl = x64_syscalls.SYS_quotactl; // 179
+const SYS_nfsservctl = x64_syscalls.SYS_nfsservctl; // 180
+const SYS_getpmsg = x64_syscalls.SYS_getpmsg; // 181
+const SYS_putpmsg = x64_syscalls.SYS_putpmsg; // 182
+const SYS_afs_syscall = x64_syscalls.SYS_afs_syscall; // 183
+const SYS_tuxcall = x64_syscalls.SYS_tuxcall; // 184
+const SYS_security = x64_syscalls.SYS_security; // 185
+const SYS_gettid = x64_syscalls.SYS_gettid; // 186
+const SYS_readahead = x64_syscalls.SYS_readahead; // 187
+const SYS_setxattr = x64_syscalls.SYS_setxattr; // 188
+const SYS_lsetxattr = x64_syscalls.SYS_lsetxattr; // 189
+const SYS_fsetxattr = x64_syscalls.SYS_fsetxattr; // 190
+const SYS_getxattr = x64_syscalls.SYS_getxattr; // 191
+const SYS_lgetxattr = x64_syscalls.SYS_lgetxattr; // 192
+const SYS_fgetxattr = x64_syscalls.SYS_fgetxattr; // 193
+const SYS_listxattr = x64_syscalls.SYS_listxattr; // 194
+const SYS_llistxattr = x64_syscalls.SYS_llistxattr; // 195
+const SYS_flistxattr = x64_syscalls.SYS_flistxattr; // 196
+const SYS_removexattr = x64_syscalls.SYS_removexattr; // 197
+const SYS_lremovexattr = x64_syscalls.SYS_lremovexattr; // 198
+const SYS_fremovexattr = x64_syscalls.SYS_fremovexattr; // 199
+const SYS_tkill = x64_syscalls.SYS_tkill; // 200
+const SYS_time = x64_syscalls.SYS_time; // 201
+const SYS_futex = x64_syscalls.SYS_futex; // 202
+const SYS_sched_setaffinity = x64_syscalls.SYS_sched_setaffinity; // 203
+const SYS_sched_getaffinity = x64_syscalls.SYS_sched_getaffinity; // 204
+const SYS_set_thread_area = x64_syscalls.SYS_set_thread_area; // 205
+const SYS_io_setup = x64_syscalls.SYS_io_setup; // 206
+const SYS_io_destroy = x64_syscalls.SYS_io_destroy; // 207
+const SYS_io_getevents = x64_syscalls.SYS_io_getevents; // 208
+const SYS_io_submit = x64_syscalls.SYS_io_submit; // 209
+const SYS_io_cancel = x64_syscalls.SYS_io_cancel; // 210
+const SYS_get_thread_area = x64_syscalls.SYS_get_thread_area; // 211
+const SYS_lookup_dcookie = x64_syscalls.SYS_lookup_dcookie; // 212
+const SYS_epoll_create = x64_syscalls.SYS_epoll_create; // 213
+const SYS_epoll_ctl_old = x64_syscalls.SYS_epoll_ctl_old; // 214
+const SYS_epoll_wait_old = x64_syscalls.SYS_epoll_wait_old; // 215
+const SYS_remap_file_pages = x64_syscalls.SYS_remap_file_pages; // 216
+const SYS_getdents64 = x64_syscalls.SYS_getdents64; // 217
+const SYS_set_tid_address = x64_syscalls.SYS_set_tid_address; // 218
+const SYS_restart_syscall = x64_syscalls.SYS_restart_syscall; // 219
+const SYS_semtimedop = x64_syscalls.SYS_semtimedop; // 220
+const SYS_fadvise64 = x64_syscalls.SYS_fadvise64; // 221
+const SYS_timer_create = x64_syscalls.SYS_timer_create; // 222
+const SYS_timer_settime = x64_syscalls.SYS_timer_settime; // 223
+const SYS_timer_gettime = x64_syscalls.SYS_timer_gettime; // 224
+const SYS_timer_getoverrun = x64_syscalls.SYS_timer_getoverrun; // 225
+const SYS_timer_delete = x64_syscalls.SYS_timer_delete; // 226
+const SYS_clock_settime = x64_syscalls.SYS_clock_settime; // 227
+const SYS_clock_gettime = x64_syscalls.SYS_clock_gettime; // 228
+const SYS_clock_getres = x64_syscalls.SYS_clock_getres; // 229
+const SYS_clock_nanosleep = x64_syscalls.SYS_clock_nanosleep; // 230
+const SYS_exit_group = x64_syscalls.SYS_exit_group; // 231
+const SYS_epoll_wait = x64_syscalls.SYS_epoll_wait; // 232
+const SYS_epoll_ctl = x64_syscalls.SYS_epoll_ctl; // 233
+const SYS_tgkill = x64_syscalls.SYS_tgkill; // 234
+const SYS_utimes = x64_syscalls.SYS_utimes; // 235
+const SYS_vserver = x64_syscalls.SYS_vserver; // 236
+const SYS_mbind = x64_syscalls.SYS_mbind; // 237
+const SYS_set_mempolicy = x64_syscalls.SYS_set_mempolicy; // 238
+const SYS_get_mempolicy = x64_syscalls.SYS_get_mempolicy; // 239
+const SYS_mq_open = x64_syscalls.SYS_mq_open; // 240
+const SYS_mq_unlink = x64_syscalls.SYS_mq_unlink; // 241
+const SYS_mq_timedsend = x64_syscalls.SYS_mq_timedsend; // 242
+const SYS_mq_timedreceive = x64_syscalls.SYS_mq_timedreceive; // 243
+const SYS_mq_notify = x64_syscalls.SYS_mq_notify; // 244
+const SYS_mq_getsetattr = x64_syscalls.SYS_mq_getsetattr; // 245
+const SYS_kexec_load = x64_syscalls.SYS_kexec_load; // 246
+const SYS_waitid = x64_syscalls.SYS_waitid; // 247
+const SYS_add_key = x64_syscalls.SYS_add_key; // 248
+const SYS_request_key = x64_syscalls.SYS_request_key; // 249
+const SYS_keyctl = x64_syscalls.SYS_keyctl; // 250
+const SYS_ioprio_set = x64_syscalls.SYS_ioprio_set; // 251
+const SYS_ioprio_get = x64_syscalls.SYS_ioprio_get; // 252
+const SYS_inotify_init = x64_syscalls.SYS_inotify_init; // 253
+const SYS_inotify_add_watch = x64_syscalls.SYS_inotify_add_watch; // 254
+const SYS_inotify_rm_watch = x64_syscalls.SYS_inotify_rm_watch; // 255
+const SYS_migrate_pages = x64_syscalls.SYS_migrate_pages; // 256
+const SYS_openat = x64_syscalls.SYS_openat; // 257
+const SYS_mkdirat = x64_syscalls.SYS_mkdirat; // 258
+const SYS_mknodat = x64_syscalls.SYS_mknodat; // 259
+const SYS_fchownat = x64_syscalls.SYS_fchownat; // 260
+const SYS_futimesat = x64_syscalls.SYS_futimesat; // 261
+const SYS_newfstatat = x64_syscalls.SYS_newfstatat; // 262
+const SYS_unlinkat = x64_syscalls.SYS_unlinkat; // 263
+const SYS_renameat = x64_syscalls.SYS_renameat; // 264
+const SYS_linkat = x64_syscalls.SYS_linkat; // 265
+const SYS_symlinkat = x64_syscalls.SYS_symlinkat; // 266
+const SYS_readlinkat = x64_syscalls.SYS_readlinkat; // 267
+const SYS_fchmodat = x64_syscalls.SYS_fchmodat; // 268
+const SYS_faccessat = x64_syscalls.SYS_faccessat; // 269
+const SYS_pselect6 = x64_syscalls.SYS_pselect6; // 270
+const SYS_ppoll = x64_syscalls.SYS_ppoll; // 271
+const SYS_unshare = x64_syscalls.SYS_unshare; // 272
+const SYS_set_robust_list = x64_syscalls.SYS_set_robust_list; // 273
+const SYS_get_robust_list = x64_syscalls.SYS_get_robust_list; // 274
+const SYS_splice = x64_syscalls.SYS_splice; // 275
+const SYS_tee = x64_syscalls.SYS_tee; // 276
+const SYS_sync_file_range = x64_syscalls.SYS_sync_file_range; // 277
+const SYS_vmsplice = x64_syscalls.SYS_vmsplice; // 278
+const SYS_move_pages = x64_syscalls.SYS_move_pages; // 279
+const SYS_utimensat = x64_syscalls.SYS_utimensat; // 280
+const SYS_epoll_pwait = x64_syscalls.SYS_epoll_pwait; // 281
+const SYS_signalfd = x64_syscalls.SYS_signalfd; // 282
+const SYS_timerfd_create = x64_syscalls.SYS_timerfd_create; // 283
+const SYS_eventfd = x64_syscalls.SYS_eventfd; // 284
+const SYS_fallocate = x64_syscalls.SYS_fallocate; // 285
+const SYS_timerfd_settime = x64_syscalls.SYS_timerfd_settime; // 286
+const SYS_timerfd_gettime = x64_syscalls.SYS_timerfd_gettime; // 287
+const SYS_accept4 = x64_syscalls.SYS_accept4; // 288
+const SYS_signalfd4 = x64_syscalls.SYS_signalfd4; // 289
+const SYS_eventfd2 = x64_syscalls.SYS_eventfd2; // 290
+const SYS_epoll_create1 = x64_syscalls.SYS_epoll_create1; // 291
+const SYS_dup3 = x64_syscalls.SYS_dup3; // 292
+const SYS_pipe2 = x64_syscalls.SYS_pipe2; // 293
+const SYS_inotify_init1 = x64_syscalls.SYS_inotify_init1; // 294
+const SYS_preadv = x64_syscalls.SYS_preadv; // 295
+const SYS_pwritev = x64_syscalls.SYS_pwritev; // 296
+const SYS_rt_tgsigqueueinfo = x64_syscalls.SYS_rt_tgsigqueueinfo; // 297
+const SYS_perf_event_open = x64_syscalls.SYS_perf_event_open; // 298
+const SYS_recvmmsg = x64_syscalls.SYS_recvmmsg; // 299
+const SYS_fanotify_init = x64_syscalls.SYS_fanotify_init; // 300
+const SYS_fanotify_mark = x64_syscalls.SYS_fanotify_mark; // 301
+const SYS_prlimit64 = x64_syscalls.SYS_prlimit64; // 302
+const SYS_name_to_handle_at = x64_syscalls.SYS_name_to_handle_at; // 303
+const SYS_open_by_handle_at = x64_syscalls.SYS_open_by_handle_at; // 304
+const SYS_clock_adjtime = x64_syscalls.SYS_clock_adjtime; // 305
+const SYS_syncfs = x64_syscalls.SYS_syncfs; // 306
+const SYS_sendmmsg = x64_syscalls.SYS_sendmmsg; // 307
+const SYS_setns = x64_syscalls.SYS_setns; // 308
+const SYS_getcpu = x64_syscalls.SYS_getcpu; // 309
+const SYS_process_vm_readv = x64_syscalls.SYS_process_vm_readv; // 310
+const SYS_process_vm_writev = x64_syscalls.SYS_process_vm_writev; // 311
+const SYS_kcmp = x64_syscalls.SYS_kcmp; // 312
+const SYS_finit_module = x64_syscalls.SYS_finit_module; // 313
+const SYS_sched_setattr = x64_syscalls.SYS_sched_setattr; // 314
+const SYS_sched_getattr = x64_syscalls.SYS_sched_getattr; // 315
+const SYS_renameat2 = x64_syscalls.SYS_renameat2; // 316
+const SYS_seccomp = x64_syscalls.SYS_seccomp; // 317
+const SYS_getrandom = x64_syscalls.SYS_getrandom; // 318
+const SYS_memfd_create = x64_syscalls.SYS_memfd_create; // 319
+const SYS_kexec_file_load = x64_syscalls.SYS_kexec_file_load; // 320
+const SYS_bpf = x64_syscalls.SYS_bpf; // 321
+const SYS_execveat = x64_syscalls.SYS_execveat; // 322
+const SYS_userfaultfd = x64_syscalls.SYS_userfaultfd; // 323
+const SYS_membarrier = x64_syscalls.SYS_membarrier; // 324
+const SYS_mlock2 = x64_syscalls.SYS_mlock2; // 325
+const SYS_copy_file_range = x64_syscalls.SYS_copy_file_range; // 326
+const SYS_preadv2 = x64_syscalls.SYS_preadv2; // 327
+const SYS_pwritev2 = x64_syscalls.SYS_pwritev2; // 328
+const SYS_pkey_mprotect = x64_syscalls.SYS_pkey_mprotect; // 329
+const SYS_pkey_alloc = x64_syscalls.SYS_pkey_alloc; // 330
+const SYS_pkey_free = x64_syscalls.SYS_pkey_free; // 331
+const SYS_statx = x64_syscalls.SYS_statx; // 332
+const SYS_io_pgetevents = x64_syscalls.SYS_io_pgetevents; // 333
+const SYS_rseq = x64_syscalls.SYS_rseq; // 334
+const SYS_pidfd_send_signal = x64_syscalls.SYS_pidfd_send_signal; // 424
+const SYS_io_uring_setup = x64_syscalls.SYS_io_uring_setup; // 425
+const SYS_io_uring_enter = x64_syscalls.SYS_io_uring_enter; // 426
+const SYS_io_uring_register = x64_syscalls.SYS_io_uring_register; // 427
+const SYS_open_tree = x64_syscalls.SYS_open_tree; // 428
+const SYS_move_mount = x64_syscalls.SYS_move_mount; // 429
+const SYS_fsopen = x64_syscalls.SYS_fsopen; // 430
+const SYS_fsconfig = x64_syscalls.SYS_fsconfig; // 431
+const SYS_fsmount = x64_syscalls.SYS_fsmount; // 432
+const SYS_fspick = x64_syscalls.SYS_fspick; // 433
+const SYS_pidfd_open = x64_syscalls.SYS_pidfd_open; // 434
+const SYS_clone3 = x64_syscalls.SYS_clone3; // 435
+const SYS_close_range = x64_syscalls.SYS_close_range; // 436
+const SYS_openat2 = x64_syscalls.SYS_openat2; // 437
+const SYS_pidfd_getfd = x64_syscalls.SYS_pidfd_getfd; // 438
+const SYS_faccessat2 = x64_syscalls.SYS_faccessat2; // 439
+const SYS_process_madvise = x64_syscalls.SYS_process_madvise; // 440
+const SYS_epoll_pwait2 = x64_syscalls.SYS_epoll_pwait2; // 441
+const SYS_mount_setattr = x64_syscalls.SYS_mount_setattr; // 442
+const SYS_quotactl_fd = x64_syscalls.SYS_quotactl_fd; // 443
+const SYS_landlock_create_ruleset = x64_syscalls.SYS_landlock_create_ruleset; // 444
+const SYS_landlock_add_rule = x64_syscalls.SYS_landlock_add_rule; // 445
+const SYS_landlock_restrict_self = x64_syscalls.SYS_landlock_restrict_self; // 446
+const SYS_memfd_secret = x64_syscalls.SYS_memfd_secret; // 447
+const SYS_process_mrelease = x64_syscalls.SYS_process_mrelease; // 448
+const SYS_futex_waitv = x64_syscalls.SYS_futex_waitv; // 449
+const SYS_set_mempolicy_home_node = x64_syscalls.SYS_set_mempolicy_home_node; // 450
+const SYS_cachestat = x64_syscalls.SYS_cachestat; // 451
+const SYS_fchmodat2 = x64_syscalls.SYS_fchmodat2; // 452
+const SYS_map_shadow_stack = x64_syscalls.SYS_map_shadow_stack; // 453
+const SYS_futex_wake = x64_syscalls.SYS_futex_wake; // 454
+const SYS_futex_wait = x64_syscalls.SYS_futex_wait; // 455
+const SYS_futex_requeue = x64_syscalls.SYS_futex_requeue; // 456
+const SYS_statmount = x64_syscalls.SYS_statmount; // 457
+const SYS_listmount = x64_syscalls.SYS_listmount; // 458
+const SYS_lsm_get_self_attr = x64_syscalls.SYS_lsm_get_self_attr; // 459
+const SYS_lsm_set_self_attr = x64_syscalls.SYS_lsm_set_self_attr; // 460
+const SYS_lsm_list_modules = x64_syscalls.SYS_lsm_list_modules; // 461
+const SYS_mseal = x64_syscalls.SYS_mseal; // 462
+const SYS_setxattrat = x64_syscalls.SYS_setxattrat; // 463
+const SYS_getxattrat = x64_syscalls.SYS_getxattrat; // 464
+const SYS_listxattrat = x64_syscalls.SYS_listxattrat; // 465
+const SYS_removexattrat = x64_syscalls.SYS_removexattrat; // 466
 
 // ─── RFLAGS bit positions ───
 const RFL_CF = x64_decoder.RFL_CF;
@@ -793,6 +1163,34 @@ pub const ElfState = struct {
         }
     }
 
+    fn executeBtrRegister(self: *ElfState, d: DecodedInsn) void {
+        const width = @as(u64, @intFromEnum(d.size));
+        const bit_index = self.regVal(d.src_reg, d.size) & (width - 1);
+        const mask = @as(u64, 1) << @as(u6, @intCast(bit_index));
+        const value = self.regVal(d.dst_reg, d.size);
+        self.setFlag(RFL_CF, value & mask != 0);
+        self.setReg(d.dst_reg, d.size, value & ~mask);
+    }
+
+    fn executeBtrMemory(self: *ElfState, d: DecodedInsn) void {
+        const width = @as(i64, @intFromEnum(d.size));
+        const byte_width = @divExact(width, 8);
+        const raw_index = self.regVal(d.src_reg, d.size);
+        const bit_index: i64 = switch (d.size) {
+            .bits16 => @as(i16, @bitCast(@as(u16, @truncate(raw_index)))),
+            .bits32 => @as(i32, @bitCast(@as(u32, @truncate(raw_index)))),
+            .bits64 => @bitCast(raw_index),
+            .bits8 => unreachable,
+        };
+        const element_offset = @divFloor(bit_index, width);
+        const element_address = d.addr +% @as(u64, @bitCast(element_offset * byte_width));
+        const bit_in_element: u6 = @intCast(@mod(bit_index, width));
+        const mask = @as(u64, 1) << bit_in_element;
+        const value = self.readMemVal(element_address, d.size);
+        self.setFlag(RFL_CF, value & mask != 0);
+        self.writeMemVal(element_address, d.size, value & ~mask);
+    }
+
     fn bitWidth(size: Size) u7 {
         return switch (size) {
             .bits8 => 8,
@@ -1308,6 +1706,9 @@ pub const ElfState = struct {
             .not_mem8, .not_mem16, .not_mem32, .not_mem64 => {
                 self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
             },
+
+            .btr_reg_reg => self.executeBtrRegister(d),
+            .btr_mem_reg => self.executeBtrMemory(d),
 
             // ── cmp r/m, reg (opcode 0x39) ──
             .cmp_mem8_reg8, .cmp_mem16_reg16, .cmp_mem32_reg32, .cmp_mem64_reg64 => self.executeHighwayMemoryBinary(d, .cmp, .register_to_memory),
@@ -1839,7 +2240,7 @@ pub const ElfState = struct {
             .setcc_mem8 => {
                 self.writeMemVal(d.addr, .bits8, if (evalCond(self.regs.rflags, d.cond)) 1 else 0);
             },
-            .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .cmpxchg_reg32_reg32, .cmpxchg_reg64_reg64 => {
+            .cmpxchg_mem8_reg8, .cmpxchg_mem16_reg16, .cmpxchg_mem32_reg32, .cmpxchg_mem64_reg64, .cmpxchg_reg8_reg8, .cmpxchg_reg16_reg16, .cmpxchg_reg32_reg32, .cmpxchg_reg64_reg64, .cmpxchg8b_mem, .cmpxchg16b_mem => {
                 const size = d.size;
                 const accum = self.regVal(.al_ax_eax_rax, size);
                 const old = if (d.is_reg_form) self.regVal(d.dst_reg, size) else self.readMemVal(d.addr, size);
@@ -2196,6 +2597,9 @@ pub const ElfState = struct {
             .vmovapd_ymm_mem,
             .vmovapd_mem_ymm,
             .vzeroupper,
+            .pmovmskb,
+            .vpmovmskb,
+            .vpmovmskb_ymm,
             .vcvtsi2ss_xmm_reg,
             .vcvtsi2ss_xmm_mem,
             .vcvtsi2sd_xmm_reg,
@@ -3906,22 +4310,45 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                     if (mod_v != 3) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                     return DecodedInsn{ .op = .xorps_xmm_xmm, .xmm_dst = xmmRegIndex(reg, rexR(rex)), .xmm_src = xmmRegIndex(rm, rexB(rex)), .len = @intCast(pos) };
                 },
-                0xB1 => {
-                    // CMPXCHG r/m16/32/64, r16/32/64. Register destination is
-                    // not needed yet; the runtime lock path uses memory.
+                0xB0, 0xB1 => {
+                    // CMPXCHG r/m8,r8 (0F B0) or r/m16/32/64,r16/32/64
+                    // (0F B1). libc++ uses the byte form for lock-free enum
+                    // atomics, including Xenia's timer queue state.
                     if (pos >= bytes.len) return .{};
                     const modrm = bytes[pos];
                     pos += 1;
                     const mod_v = modrm >> 6;
                     const reg = (modrm >> 3) & 7;
                     const rm = modrm & 7;
-                    const size: Size = if (rex_w) .bits64 else .bits32;
-                    if (has_66 or mod_v == 3) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    const size: Size = if (op2 == 0xB0)
+                        .bits8
+                    else if (rex_w)
+                        .bits64
+                    else if (has_66)
+                        .bits16
+                    else
+                        .bits32;
+                    if (mod_v == 3) {
+                        return DecodedInsn{
+                            .op = switch (size) {
+                                .bits8 => .cmpxchg_reg8_reg8,
+                                .bits16 => .cmpxchg_reg16_reg16,
+                                .bits32 => .cmpxchg_reg32_reg32,
+                                .bits64 => .cmpxchg_reg64_reg64,
+                            },
+                            .size = size,
+                            .src_reg = modRmReg(reg, rex),
+                            .dst_reg = regId(rm, rexB(rex)),
+                            .is_reg_form = true,
+                            .len = @intCast(pos),
+                        };
+                    }
                     const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
                     return switch (size) {
+                        .bits8 => DecodedInsn{ .op = .cmpxchg_mem8_reg8, .size = size, .src_reg = modRmReg(reg, rex), .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
+                        .bits16 => DecodedInsn{ .op = .cmpxchg_mem16_reg16, .size = size, .src_reg = modRmReg(reg, rex), .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
                         .bits32 => DecodedInsn{ .op = .cmpxchg_mem32_reg32, .size = size, .src_reg = modRmReg(reg, rex), .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
                         .bits64 => DecodedInsn{ .op = .cmpxchg_mem64_reg64, .size = size, .src_reg = modRmReg(reg, rex), .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) },
-                        else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
                     };
                 },
                 0xC1 => {
@@ -4511,6 +4938,23 @@ test "decode lock cmpxchg memory and setne memory" {
     try testing.expectEqual(Cond.ne, d.cond);
     try testing.expect(d.sib_has_base);
     try testing.expectEqual(RegId.ch_bp_ebp_rbp, d.sib_base_reg);
+}
+
+test "decode lock cmpxchg byte and word atomics" {
+    const byte_memory = decodeInsn(&[_]u8{ 0xF0, 0x0F, 0xB0, 0x11 });
+    try testing.expectEqual(Op.cmpxchg_mem8_reg8, byte_memory.op);
+    try testing.expectEqual(Size.bits8, byte_memory.size);
+    try testing.expectEqual(RegId.dl_dx_edx_rdx, byte_memory.src_reg);
+    try testing.expectEqual(RegId.cl_cx_ecx_rcx, byte_memory.sib_base_reg);
+
+    const word_memory = decodeInsn(&[_]u8{ 0xF0, 0x66, 0x0F, 0xB1, 0x11 });
+    try testing.expectEqual(Op.cmpxchg_mem16_reg16, word_memory.op);
+    try testing.expectEqual(Size.bits16, word_memory.size);
+
+    const byte_register = decodeInsn(&[_]u8{ 0x0F, 0xB0, 0xD1 });
+    try testing.expectEqual(Op.cmpxchg_reg8_reg8, byte_register.op);
+    try testing.expect(byte_register.is_reg_form);
+    try testing.expectEqual(RegId.cl_cx_ecx_rcx, byte_register.dst_reg);
 }
 
 test "execute cmpxchg memory success path" {
