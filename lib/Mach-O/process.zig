@@ -12,14 +12,17 @@ const import_resolution = @import("resolution/import_engine.zig");
 const initialization_resolution = @import("resolution/initialization_engine.zig");
 const memory_transaction = @import("resolution/memory_transaction.zig");
 const dynamic_library_forwarder = @import("resolution/dynamic_library_forwarder.zig");
+const lazy_import_stub = @import("resolution/lazy_import_stub.zig");
 const smart_stub_generator = @import("resolution/smart_stub_generator.zig");
 const cxx_exception_diagnostics = @import("resolution/cxx_exception_diagnostics.zig");
+const spirv_cross_diagnostics = @import("resolution/spirv_cross_diagnostics.zig");
 const fs_io_forwarder = @import("resolution/fs_io_forwarder.zig");
 const memory_management_forwarder = @import("resolution/memory_management_forwarder.zig");
 const sparse_virtual_memory = @import("resolution/sparse_virtual_memory.zig");
 const memory_provenance = @import("resolution/memory_provenance.zig");
 const pointer_firewall = @import("resolution/pointer_firewall.zig");
 const semantic_fault_classifier = @import("resolution/semantic_fault_classifier.zig");
+const libcpp_shared_control_block = @import("resolution/libcpp_shared_control_block.zig");
 const launch_argument_accelerator = @import("resolution/launch_argument_accelerator.zig");
 const startup_observer = @import("resolution/startup_observer.zig");
 const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
@@ -30,7 +33,12 @@ const vtt_resolution = @import("resolution/vtt_resolver.zig");
 const foreign_object_runtime = @import("resolution/foreign_object_runtime.zig");
 const native_window_runtime = @import("resolution/native_window_runtime.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
+const x64_backend_diagnostics = @import("resolution/x64_backend_diagnostics.zig");
+const guest_assertion_recovery = @import("resolution/guest_assertion_recovery.zig");
+const atomic_compare_exchange = @import("resolution/atomic_compare_exchange.zig");
+const diagnostic_throttle = @import("resolution/diagnostic_throttle.zig");
 const pthread_runtime = @import("resolution/pthread_runtime.zig");
+const runtime_output = @import("resolution/runtime_output.zig");
 const tlv_runtime = @import("resolution/tlv_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
 const symbol_assembly_context = @import("resolution/symbol_assembly_context.zig");
@@ -62,13 +70,18 @@ const RFL_OF = x64_decoder.RFL_OF;
 const RFL_DF: u32 = 1 << 10;
 
 const STACK_SIZE: u64 = 8 * 1024 * 1024;
-const MEM_SIZE: u64 = 512 * 1024 * 1024;
+const MEM_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+fn envMemSizeMb() ?u64 {
+    const env = std.c.getenv("ROSETTE_MEM_SIZE_MB") orelse return null;
+    const len = std.mem.len(env);
+    return std.fmt.parseInt(u64, env[0..len], 10) catch null;
+}
 const MEM_BASE: u64 = 0x0;
 const PAGE_SIZE: u64 = 4096;
 const TRACE_BUFFER_LEN: usize = 256;
 const IMPORT_TRACE_BUFFER_LEN: usize = 64;
 const MEMORY_TRACE_BUFFER_LEN: usize = 64;
-const STUB_ENTRY_SIZE: u64 = 10;
 const UNSUPPORTED_RUNTIME_EXIT_CODE: u64 = 125;
 const GUEST_FILE_BASE: u64 = 0xFFFF_FF10_0000_0000;
 const GUEST_FILE_MAX: usize = 32;
@@ -105,6 +118,31 @@ const DARWIN_SIGACTION_SIZE: u64 = 16;
 const DARWIN_SIGINFO_SIZE: u64 = 128;
 const DARWIN_UCONTEXT_SIZE: u64 = 56;
 const DARWIN_MCONTEXT_SIZE: u64 = 184;
+const PROFILE_ACCOUNT_INFO_BYTES: u64 = 0x17C;
+const PROFILE_ENCRYPTED_ACCOUNT_BYTES: u64 = PROFILE_ACCOUNT_INFO_BYTES + 0x18;
+const TOML_CODEPOINT_CAPACITY: usize = 32;
+const TOML_CODEPOINT_STRIDE: usize = 24;
+const TOML_READER_ISTREAM_OFFSET: u64 = 8;
+const TOML_CODEPOINTS_OFFSET: u64 = 0x30;
+const TOML_CODEPOINT_CURRENT_OFFSET: u64 = 0x330;
+const TOML_CODEPOINT_COUNT_OFFSET: u64 = 0x338;
+const TOML_UTF8_READER_MIN_SIZE: u64 = 0x350;
+
+const TomlAsciiBlock = struct {
+    reader: u64,
+    length: u6,
+    bytes: [TOML_CODEPOINT_CAPACITY]u8 = [_]u8{0} ** TOML_CODEPOINT_CAPACITY,
+    validated: bool = false,
+};
+
+const TomlCodepointRepair = struct {
+    scalar_repairs: u8 = 0,
+    raw_repairs: u8 = 0,
+    first_bad_index: ?u8 = null,
+    first_bad_scalar: u32 = 0,
+    first_bad_raw: u8 = 0,
+    first_expected: u8 = 0,
+};
 
 const GuestAccess = enum {
     read,
@@ -122,13 +160,26 @@ const GuestAccessDescription = struct {
 const MachSegment = macho.MachSegment;
 
 const TraceEntry = struct {
+    thread_handle: u64 = 0,
     rip: u64 = 0,
     op: Op = .invalid,
     len: u8 = 0,
     rsp: u64 = 0,
     rax: u64 = 0,
+    rbx: u64 = 0,
     rcx: u64 = 0,
     rdx: u64 = 0,
+    rsi: u64 = 0,
+    rdi: u64 = 0,
+    rbp: u64 = 0,
+    r8: u64 = 0,
+    r9: u64 = 0,
+    r10: u64 = 0,
+    r11: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
 };
 
 const X87Tag = enum(u2) {
@@ -329,6 +380,7 @@ const ImportRoute = enum(u8) {
     calloc,
     chkstk,
     sysconf,
+    strtoul,
 };
 
 fn isGtkIdleAddImport(name: []const u8) bool {
@@ -405,6 +457,10 @@ const InternalCompatibilityTargets = struct {
     libcxx_basic_ifstream_destructor_2: u64 = 0,
     libcxx_getline: u64 = 0,
     libcxx_getline_delimiter: u64 = 0,
+    libcxx_basic_string_substr: u64 = 0,
+    profile_manager_load_account: u64 = 0,
+    profile_manager_dismount_profile: u64 = 0,
+    profile_account_insert_or_assign: u64 = 0,
     print_config_to_log: u64 = 0,
     imgui_default_malloc: u64 = 0,
     imgui_default_free: u64 = 0,
@@ -412,6 +468,7 @@ const InternalCompatibilityTargets = struct {
     imgui_mem_free: u64 = 0,
     imgui_settings_push_back: u64 = 0,
     page_entry_construct_at_end: u64 = 0,
+    libcpp_atomic_bool_control_block_vtable: u64 = 0,
 };
 
 const InitializerCheckpoint = struct {
@@ -462,18 +519,14 @@ const GtkIdleQueueSnapshot = struct {
     oldest_tag: []const u8 = "",
 };
 
-const CooperativeQuantumWork = enum {
-    none,
-    gtk_idle,
-    deferred_thread,
+const RunnableSuspendedSnapshot = struct {
+    runnable: usize = 0,
+    blocked: usize = 0,
+    oldest_handle: u64 = 0,
+    oldest_rip: u64 = 0,
+    oldest_step: u64 = 0,
+    oldest_reason: []const u8 = "",
 };
-
-fn cooperativeQuantumWork(pending_idle: usize, idle_callback_running: bool, deferred_threads: u64) CooperativeQuantumWork {
-    if (idle_callback_running) return .none;
-    if (pending_idle != 0 and !idle_callback_running) return .gtk_idle;
-    if (deferred_threads != 0) return .deferred_thread;
-    return .none;
-}
 
 fn gtkIdleQueueSnapshotFor(callbacks: []const GtkIdleCallback) GtkIdleQueueSnapshot {
     var snapshot = GtkIdleQueueSnapshot{};
@@ -491,7 +544,7 @@ fn gtkIdleQueueSnapshotFor(callbacks: []const GtkIdleCallback) GtkIdleQueueSnaps
     return snapshot;
 }
 
-const MAX_SUSPENDED_GUEST_THREADS = 16;
+const MAX_SUSPENDED_GUEST_THREADS = 64;
 
 const SuspendedGuestThread = struct {
     handle: u64 = 0,
@@ -509,6 +562,10 @@ const GuestSignalAction = struct {
     flags: u32 = 0,
 };
 
+const GuestAssertionClass = guest_assertion_recovery.Class;
+const classifyGuestAssertion = guest_assertion_recovery.classify;
+const timerQueueStateName = guest_assertion_recovery.timerQueueStateName;
+
 const GuestSignalFrame = struct {
     signal: u8 = 0,
     instruction_len: u8 = 0,
@@ -516,10 +573,40 @@ const GuestSignalFrame = struct {
     siginfo: u64 = 0,
     mcontext: u64 = 0,
     ucontext: u64 = 0,
+    assertion_class: GuestAssertionClass = .none,
+};
+
+const ProfileAccountStage = enum {
+    idle,
+    loading,
+    host_opened,
+    reading,
+    open_failed,
+    short_read,
+    decrypt_failed,
+    decrypted,
+    inserting,
+    completed,
+};
+
+const ProfileAccountFlow = struct {
+    active: bool = false,
+    manager: u64 = 0,
+    xuid: u64 = 0,
+    return_address: u64 = 0,
+    started_step: u64 = 0,
+    stage: ProfileAccountStage = .idle,
+    account_guest_fd: u64 = std.math.maxInt(u64),
+    requested_bytes: u64 = 0,
+    bytes_read: u64 = 0,
+    attempts: u64 = 0,
+    successes: u64 = 0,
+    failures: u64 = 0,
 };
 
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     mem: []u8,
     mem_base: u64,
     mem_size: u64,
@@ -540,12 +627,32 @@ pub const MachOState = struct {
     stack_size: u64 = 0,
     guest_fds: [16]i32 = .{-1} ** 16,
     next_guest_fd: u64 = 3,
-    monotonic_nanoseconds: u64 = 1_000_000_000,
+    guest_time: scheduler.GuestTimeService = .{},
+    concise_output: bool = false,
+    diagnostic_output_fd: i32 = 1,
     ios_xalloc_next: u64 = 4,
     verbose_trace: bool = false,
     contract_verification: bool = false,
     max_steps: u64 = 0,
     guest_assertion_count: u64 = 0,
+    last_guest_assertion_class: GuestAssertionClass = .none,
+    last_guest_assertion_step: u64 = 0,
+    last_guest_assertion_return: u64 = 0,
+    atomic_cmpxchg8: atomic_compare_exchange.Stats = .{},
+    classified_ud2_recoveries: u64 = 0,
+    breakpoint_cleanup_recoveries: u64 = 0,
+    diagnostic_throttler: diagnostic_throttle.Tracker = .{},
+    libcpp_shared_control_blocks: libcpp_shared_control_block.Stats = .{},
+    toml_ascii_fast_paths: u64 = 0,
+    libcxx_string_substr_fast_paths: u64 = 0,
+    profile_host_preflight_checks: u64 = 0,
+    profile_account_flow: ProfileAccountFlow = .{},
+    toml_ascii_entry: ?u64 = null,
+    toml_read_next_entry: ?u64 = null,
+    toml_ascii_block: ?TomlAsciiBlock = null,
+    toml_fault_diagnostics_dumped: bool = false,
+    patch_db_empty_array_recoveries: u64 = 0,
+    stalled_instruction_reports: u64 = 0,
     initializer_abort_requested: bool = false,
     cxxopts_split_accelerations: u64 = 0,
     positional_options_captured: bool = false,
@@ -561,6 +668,13 @@ pub const MachOState = struct {
     cooperative_thread_returns: u64 = 0,
     cooperative_wait_yields: u64 = 0,
     cooperative_quantum_yields: u64 = 0,
+    cooperative_rotation_yields: u64 = 0,
+    cooperative_sleep_yields: u64 = 0,
+    cooperative_preserved_register_resumes: u64 = 0,
+    cooperative_wait_result_resumes: u64 = 0,
+    cooperative_self_resumes: u64 = 0,
+    cooperative_starvation_warnings: u64 = 0,
+    last_cooperative_starvation_step: u64 = 0,
     ui_callback_retained_quanta: u64 = 0,
     cooperative_quantum_steps: u64 = 0,
     cooperative_bootstrap_trace_remaining: u8 = 0,
@@ -607,7 +721,9 @@ pub const MachOState = struct {
     native_window_handles_registered: bool = false,
     local_libcpp_stream_targets: std.AutoHashMap(u64, []const u8),
     logging: logging_runtime.Engine = .{},
+    backend_diagnostics: x64_backend_diagnostics.Engine = .{},
     pthreads: pthread_runtime.Runtime = .{},
+    scheduler_log: scheduler.SchedulerEventLog = .{},
     tlv: tlv_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
     memory_forwarder: memory_management_forwarder.Manager,
@@ -619,6 +735,7 @@ pub const MachOState = struct {
     symbol_assembly: symbol_assembly_context.Tracker,
     symbol_assembly_catalog: ?symbol_assembly_context.Catalog = null,
     cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
+    spirv_cross: spirv_cross_diagnostics.Tracker = .{},
     unwinder: itanium_unwinder.Engine = .{},
     dynamic_casts: itanium_dynamic_cast.Engine = .{},
     last_unwind_inspection: ?itanium_unwinder.Inspection = null,
@@ -642,6 +759,9 @@ pub const MachOState = struct {
     pending_stub_slot: ?u32 = null,
     pending_stub_entry_rip: ?u64 = null,
     pending_import_stub_rip: ?u64 = null,
+    stub_helper_start: u64 = 0,
+    stub_helper_end: u64 = 0,
+    lazy_import_direct_dispatches: u64 = 0,
     helper_cluster_start: ?u64 = null,
     helper_cluster_end: ?u64 = null,
     import_trace_entries: [IMPORT_TRACE_BUFFER_LEN]ImportTraceEntry = [_]ImportTraceEntry{ImportTraceEntry{}} ** IMPORT_TRACE_BUFFER_LEN,
@@ -664,7 +784,7 @@ pub const MachOState = struct {
     executable_min: u64,
     executable_max: u64,
 
-    pub fn init(allocator: std.mem.Allocator, binary_data: []const u8) !MachOState {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, binary_data: []const u8) !MachOState {
         var state = try macho.load(allocator, binary_data);
         errdefer state.deinit();
         var metadata = try macho_metadata.Metadata.init(allocator, binary_data);
@@ -696,7 +816,8 @@ pub const MachOState = struct {
 
         const required_mem = image_size + STACK_SIZE;
         const mem_size_aligned = alignUp(required_mem, PAGE_SIZE) catch MEM_SIZE;
-        const final_mem_size = @max(mem_size_aligned, MEM_SIZE);
+        const env_mem = if (envMemSizeMb()) |mb| mb * 1024 * 1024 else MEM_SIZE;
+        const final_mem_size = @max(mem_size_aligned, @max(MEM_SIZE, env_mem));
 
         const mem = try allocator.alloc(u8, @intCast(final_mem_size));
         @memset(mem, 0);
@@ -738,6 +859,7 @@ pub const MachOState = struct {
         @memset(page_permissions, PAGE_READ | PAGE_WRITE);
         var result = MachOState{
             .allocator = allocator,
+            .io = io,
             .mem = mem,
             .mem_base = image_base,
             .mem_size = final_mem_size,
@@ -839,6 +961,18 @@ pub const MachOState = struct {
         result.internal_targets.libcxx_getline_delimiter = result.metadata.symbolAddressWithPrefix(
             "__ZNSt3__17getlineB7v160006IcNS_11char_traitsIcEENS_9allocatorIcEEEERNS_13basic_istreamIT_T0_EES9_RNS_12basic_stringIS6_S7_T1_EES6_",
         ) orelse 0;
+        result.internal_targets.libcxx_basic_string_substr = result.metadata.symbolAddressWithPrefix(
+            "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6substrB7v160006Emm",
+        ) orelse 0;
+        result.internal_targets.profile_manager_load_account = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe6kernel3xam14ProfileManager11LoadAccountE",
+        ) orelse 0;
+        result.internal_targets.profile_manager_dismount_profile = result.metadata.symbolAddressWithPrefix(
+            "__ZN2xe6kernel3xam14ProfileManager15DismountProfileE",
+        ) orelse 0;
+        result.internal_targets.profile_account_insert_or_assign = result.metadata.symbolAddressWithPrefix(
+            "__ZNSt3__13mapIyN2xe6kernel3xam16X_XAMACCOUNTINFOENS_4lessIyEENS_9allocatorINS_4pairIKyS4_EEEEE16insert_or_assign",
+        ) orelse 0;
         result.internal_targets.print_config_to_log = result.metadata.symbolAddressWithPrefix(
             "__ZN6config16PrintConfigToLog",
         ) orelse 0;
@@ -860,6 +994,22 @@ pub const MachOState = struct {
         result.internal_targets.page_entry_construct_at_end = result.metadata.symbolAddressWithPrefix(
             "__ZNSt3__114__split_bufferIN2xe9PageEntryERNS_9allocatorIS2_EEE18__construct_at_endEm",
         ) orelse 0;
+        result.internal_targets.libcpp_atomic_bool_control_block_vtable = result.metadata.symbolAddressWithPrefix(
+            libcpp_shared_control_block.atomic_bool_vtable_symbol_prefix,
+        ) orelse 0;
+        if (result.metadata.sectionNamed("__TEXT", "__stub_helper")) |section| {
+            result.stub_helper_start = section.address;
+            result.stub_helper_end = section.address +| section.size;
+        }
+        // Resolve the narrowly targeted toml++ fast path once at load time.
+        // Looking up a symbol for every guest instruction turns startup into a
+        // full symbol-table scan hot loop.
+        result.toml_ascii_entry = result.metadata.symbolAddressWithPrefix(
+            "__ZN4toml2v34impl8is_asciiEPKcm",
+        );
+        result.toml_read_next_entry = result.metadata.symbolAddressWithPrefix(
+            "__ZN4toml2v34impl11utf8_readerINSt3__113basic_istreamIcNS3_11char_traitsIcEEEEE9read_nextEv",
+        );
         var defined_symbols = result.metadata.definedSymbolIterator();
         while (defined_symbols.next()) |entry| {
             if (!libcpp_stream_bridge.Bridge.recognizesSymbol(entry.key_ptr.*)) continue;
@@ -886,6 +1036,8 @@ pub const MachOState = struct {
     }
 
     pub fn deinit(self: *MachOState) void {
+        self.scheduler_log.close();
+        self.guest_time.deinit(self.allocator);
         self.closeGuestFiles();
         self.libcxx_streams.deinit();
         self.local_libcpp_stream_targets.deinit();
@@ -914,6 +1066,27 @@ pub const MachOState = struct {
         // self.thread_scheduler.shutdown();
     }
 
+    pub fn scheduleGuestWaitDeadline(
+        self: *MachOState,
+        thread: u64,
+        wait_object: u64,
+        wait_generation: u64,
+        deadline_ns: u64,
+    ) u64 {
+        return self.guest_time.schedule(self.allocator, deadline_ns, thread, wait_object, wait_generation) catch {
+            self.scheduler_log.emit(.{
+                .kind = .deadlock,
+                .step = self.executed_steps,
+                .thread = thread,
+                .object = wait_object,
+                .generation = wait_generation,
+                .deadline_ns = deadline_ns,
+                .reason = "deadline_registration_failed",
+            });
+            return 0;
+        };
+    }
+
     fn applyDyldBindings(self: *MachOState) !void {
         var stubs = std.StringHashMap(u64).init(self.allocator);
         defer stubs.deinit();
@@ -928,6 +1101,8 @@ pub const MachOState = struct {
 
         var applied: usize = 0;
         var callable_got_bindings: usize = 0;
+        var writable_callable_bindings: usize = 0;
+        var capstone_callback_bindings: usize = 0;
         var bridged_abi_data_bindings: usize = 0;
         var deferred_abi_data_bindings: usize = 0;
         var stack_guard_address: u64 = 0;
@@ -989,6 +1164,14 @@ pub const MachOState = struct {
             _ = self.memory_regions.register(binding.address, @sizeOf(u64), .{ .read = true, .write = true }, .import_got, binding.name, self.regs.rip);
             applied += 1;
             if (std.mem.eql(u8, section.name, "__got")) callable_got_bindings += 1;
+            if (isWritableDataSection(section)) writable_callable_bindings += 1;
+            if (self.capstoneCallbackSlotName(binding.address)) |slot_name| {
+                capstone_callback_bindings += 1;
+                std.debug.print(
+                    "macho-processor: Capstone runtime callback binding: slot={s} address=0x{x} import={s} target=0x{x} section={s} repaired_null={}\n",
+                    .{ slot_name, binding.address, binding.name, target, section.name, existing == 0 },
+                );
+            }
         }
 
         self.bound_import_thunks = try thunks.toOwnedSlice(self.allocator);
@@ -999,13 +1182,28 @@ pub const MachOState = struct {
         if (self.vtt_resolver.totalDeferred() > 0) {
             const resolved = blk: {
                 var count: usize = 0;
+                var sentinel_count: usize = 0;
                 for (self.vtt_resolver.deferred.items) |*item| {
                     if (item.resolved) continue;
                     if (vtt_resolution.VttBindingResolver.lookupSymbol(item.symbol)) |value| {
                         self.write64(item.address, value);
                         item.resolved = true;
                         count += 1;
+                    } else {
+                        self.write64(item.address, item.address);
+                        item.resolved = true;
+                        sentinel_count += 1;
+                        std.debug.print(
+                            "macho-processor: VTT sentinel applied: address=0x{x} symbol={s} (dlsym returned null)\n",
+                            .{ item.address, item.symbol },
+                        );
                     }
+                }
+                if (sentinel_count > 0) {
+                    std.debug.print(
+                        "macho-processor: {d} unresolved VTT binding(s) filled with self-referencing sentinel\n",
+                        .{sentinel_count},
+                    );
                 }
                 self.vtt_resolver.resolved_count = count;
                 break :blk count;
@@ -1020,8 +1218,8 @@ pub const MachOState = struct {
         }
 
         std.debug.print(
-            "macho-processor: applied {d} dyld data binding(s), including {d} callable GOT pointer(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d} VTT resolved={d}\n",
-            .{ applied, callable_got_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings, self.vtt_resolver.resolved_count },
+            "macho-processor: applied {d} dyld data binding(s), including {d} callable GOT pointer(s), {d} writable function pointer(s), and {d}/5 Capstone runtime callback(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d} VTT resolved={d}\n",
+            .{ applied, callable_got_bindings, writable_callable_bindings, capstone_callback_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings, self.vtt_resolver.resolved_count },
         );
     }
 
@@ -1030,13 +1228,67 @@ pub const MachOState = struct {
         symbol_name: []const u8,
         has_import_stub: bool,
     ) bool {
+        // A dyld pointer binding for a symbol that also has an import stub is
+        // a function pointer regardless of whether the compiler placed the
+        // slot in __got, __const or writable __data. Capstone's cs_mem_* slots
+        // are the important writable case: leaving them zero makes cs_open
+        // return CS_ERR_MEMSETUP (8).
+        if (has_import_stub) return true;
         if (std.mem.eql(u8, section.name, "__got")) return has_import_stub;
         if (!std.mem.eql(u8, section.name, "__const")) return false;
-        if (has_import_stub) return true;
         if (!std.mem.startsWith(u8, symbol_name, "__Z")) return false;
 
         if (isAbiDataSymbol(symbol_name)) return false;
         return true;
+    }
+
+    fn isWritableDataSection(section: macho_metadata.Section) bool {
+        return std.mem.eql(u8, section.segment_name, "__DATA") and
+            !std.mem.eql(u8, section.name, "__got");
+    }
+
+    fn capstoneCallbackSlotName(self: *const MachOState, address: u64) ?[]const u8 {
+        const slots = [_][]const u8{
+            "_cs_mem_malloc",
+            "_cs_mem_calloc",
+            "_cs_mem_realloc",
+            "_cs_mem_free",
+            "_cs_vsnprintf",
+        };
+        for (slots) |slot| {
+            if (self.metadata.definedSymbolAddress(slot) == address) return slot;
+        }
+        return null;
+    }
+
+    fn dumpCapstoneCallbackState(self: *const MachOState, reason: []const u8) void {
+        const slots = [_][]const u8{
+            "_cs_mem_malloc",
+            "_cs_mem_calloc",
+            "_cs_mem_realloc",
+            "_cs_mem_free",
+            "_cs_vsnprintf",
+        };
+        var present: usize = 0;
+        var nonzero: usize = 0;
+        std.debug.print("  Capstone runtime callback state ({s}):\n", .{reason});
+        for (slots) |slot| {
+            const address = self.metadata.definedSymbolAddress(slot) orelse {
+                std.debug.print("    {s}: symbol_missing\n", .{slot});
+                continue;
+            };
+            present += 1;
+            const target = self.read64(address);
+            if (target != 0) nonzero += 1;
+            if (self.metadata.importAtStub(target)) |imported| {
+                std.debug.print("    {s}: address=0x{x} target=0x{x} import={s}@{s}\n", .{ slot, address, target, imported.name, imported.dylib });
+            } else if (self.metadata.nearestSymbol(target)) |symbol| {
+                std.debug.print("    {s}: address=0x{x} target=0x{x} symbol={s}+0x{x}\n", .{ slot, address, target, symbol.name, symbol.offset });
+            } else {
+                std.debug.print("    {s}: address=0x{x} target=0x{x} unresolved={}\n", .{ slot, address, target, target != 0 });
+            }
+        }
+        std.debug.print("    summary: symbols={d}/5 nonzero={d}/5 cs_open_requires_all_nonzero=true\n", .{ present, nonzero });
     }
 
     fn isAbiDataSymbol(symbol_name: []const u8) bool {
@@ -1111,7 +1363,7 @@ pub const MachOState = struct {
     }
 
     fn isExecutableAddress(self: *const MachOState, address: u64) bool {
-        return self.translateGuest(address, 1, .execute) != null;
+        return self.sparse_memory.isExecutable(address, 1) or self.translateGuest(address, 1, .execute) != null;
     }
 
     fn diagnosticSymbol(self: *const MachOState, address: u64) ?exit_diagnostics.SymbolizedAddress {
@@ -1308,6 +1560,7 @@ pub const MachOState = struct {
     fn ensureGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) bool {
         if (access == .read and self.sparse_memory.bytesConst(address, bytes) != null) return true;
         if (access == .write and self.sparse_memory.bytes(address, bytes, true) != null) return true;
+        if (access == .execute and self.sparse_memory.isExecutable(address, bytes)) return true;
         if (self.translateGuest(address, bytes, access) != null) return true;
         self.terminateForGuestAccess(address, bytes, access, instruction);
         return false;
@@ -1315,6 +1568,25 @@ pub const MachOState = struct {
 
     fn terminateForGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) void {
         if (self.terminal_memory_failure != null) return;
+        if (!self.toml_fault_diagnostics_dumped) {
+            if (self.metadata.nearestSymbol(self.regs.rip)) |symbol| {
+                const toml_symbol = std.mem.indexOf(u8, symbol.name, "toml") != null;
+                const patch_db_symbol = std.mem.indexOf(u8, symbol.name, "PatchDB") != null or
+                    std.mem.indexOf(u8, symbol.name, "patcher") != null;
+                if (toml_symbol or patch_db_symbol) {
+                    self.toml_fault_diagnostics_dumped = true;
+                    std.debug.print(
+                        "macho-processor: TOML/PatchDB guest access fault: rip=0x{x} symbol={s}+0x{x} address=0x{x} bytes={d} access={s}; dumping stream and schema state before termination\n",
+                        .{ self.regs.rip, symbol.name, symbol.offset, address, bytes, @tagName(access) },
+                    );
+                    self.libcxx_streams.dumpPatchTomlDiagnostics("TOML/PatchDB guest memory fault");
+                    if (patch_db_symbol and address < 0x1000) {
+                        self.libcxx_streams.dumpPatchPostParseDiagnosis("near-null access in PatchDB::ReadPatchFile");
+                    }
+                }
+            }
+        }
+        if (address < 0x1000) self.dumpTerminalAddressProvenance(address);
         const description = self.describeGuestAccess(address, bytes, access);
         const policy = description.pointer_policy;
         const fault: []const u8 = if (policy != null and !policy.?.may_dereference)
@@ -1336,6 +1608,99 @@ pub const MachOState = struct {
         self.terminated = true;
         self.exit_code = 127;
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.memory_access_violation);
+    }
+
+    fn dumpTerminalAddressProvenance(self: *const MachOState, effective_address: u64) void {
+        const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse return;
+        const decoded = decodeInsn(bytes);
+        if (!decoded.sib_has_base and !decoded.sib_has_index and !decoded.rip_relative) {
+            std.debug.print(
+                "macho-processor: near-null address provenance: rip=0x{x} op={s} effective=0x{x}; decoder exposed no base/index expression\n",
+                .{ self.regs.rip, @tagName(decoded.op), effective_address },
+            );
+            return;
+        }
+
+        const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
+        const base_value = if (decoded.sib_has_base) x64_decoder.regVal(&self.regs, decoded.sib_base_reg, address_size) else 0;
+        const index_value = if (decoded.sib_has_index) x64_decoder.regVal(&self.regs, decoded.sib_index_reg, address_size) else 0;
+        const scaled_index = index_value << @as(u6, decoded.sib_scale);
+        const rip_component = if (decoded.rip_relative) self.regs.rip + decoded.len else 0;
+        std.debug.print(
+            "macho-processor: near-null address provenance: rip=0x{x} op={s} effective=0x{x} displacement=0x{x} base({s})=0x{x} index({s},scale={d})=0x{x} rip_component=0x{x}\n",
+            .{
+                self.regs.rip,
+                @tagName(decoded.op),
+                effective_address,
+                decoded.addr,
+                if (decoded.sib_has_base) @tagName(decoded.sib_base_reg) else "<none>",
+                base_value,
+                if (decoded.sib_has_index) @tagName(decoded.sib_index_reg) else "<none>",
+                @as(u8, 1) << decoded.sib_scale,
+                scaled_index,
+                rip_component,
+            },
+        );
+
+        if (decoded.sib_has_base) self.dumpRegisterTransition(decoded.sib_base_reg, base_value, "base");
+        if (decoded.sib_has_index) self.dumpRegisterTransition(decoded.sib_index_reg, index_value, "index");
+    }
+
+    fn dumpRegisterTransition(self: *const MachOState, register: RegId, terminal_value: u64, role: []const u8) void {
+        const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        const fault_thread = self.active_guest_thread;
+        var after = terminal_value;
+        var same_thread_entries: usize = 0;
+        var excluded_entries: usize = 0;
+        var reverse_index = count;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const index = if (self.trace_filled)
+                (self.trace_index + reverse_index) % TRACE_BUFFER_LEN
+            else
+                reverse_index;
+            const entry = self.trace_entries[index];
+            if (entry.thread_handle != fault_thread) {
+                excluded_entries += 1;
+                continue;
+            }
+            same_thread_entries += 1;
+            const before = traceRegisterValue(entry, register);
+            if (before != after) {
+                const symbol = self.metadata.nearestSymbol(entry.rip);
+                std.debug.print(
+                    "macho-processor: near-null {s} register transition: thread=0x{x} register={s} before=0x{x} after=0x{x} caused_by=0x{x} {s}+0x{x} op={s} same_thread_distance={d} cross_thread_entries_excluded={d}\n",
+                    .{ role, fault_thread, @tagName(register), before, after, entry.rip, if (symbol) |resolved| resolved.name else "<unknown>", if (symbol) |resolved| resolved.offset else 0, @tagName(entry.op), same_thread_entries, excluded_entries },
+                );
+                return;
+            }
+            after = before;
+        }
+        std.debug.print(
+            "macho-processor: near-null {s} register transition: thread=0x{x} register={s} remained 0x{x} throughout {d} retained same-thread instructions; excluded {d} cross-thread entries\n",
+            .{ role, fault_thread, @tagName(register), terminal_value, same_thread_entries, excluded_entries },
+        );
+    }
+
+    fn traceRegisterValue(entry: TraceEntry, register: RegId) u64 {
+        return switch (@intFromEnum(register)) {
+            0 => entry.rax,
+            1 => entry.rcx,
+            2 => entry.rdx,
+            3 => entry.rbx,
+            4 => entry.rsp,
+            5 => entry.rbp,
+            6 => entry.rsi,
+            7 => entry.rdi,
+            8 => entry.r8,
+            9 => entry.r9,
+            10 => entry.r10,
+            11 => entry.r11,
+            12 => entry.r12,
+            13 => entry.r13,
+            14 => entry.r14,
+            15 => entry.r15,
+        };
     }
 
     fn recordMemoryAccess(self: *MachOState, address: u64, size: Size, access: []const u8, value: u64) void {
@@ -1560,6 +1925,62 @@ pub const MachOState = struct {
         return true;
     }
 
+    pub fn guestMapAnywhereWithBacking(self: *MachOState, length: u64, prot: u32, flags: u32, host_fd: std.posix.fd_t, offset: u64) ?u64 {
+        const address = self.sparse_memory.mapAnywhereWithBacking(length, prot, flags, host_fd, offset) orelse return null;
+        const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return null;
+        _ = self.memory_regions.register(address, effective_length, .{
+            .read = prot & 1 != 0,
+            .write = prot & 2 != 0,
+            .execute = prot & 4 != 0,
+        }, .guest_mmap, "OS-selected sparse guest mmap", self.regs.rip);
+        _ = self.pointer_firewall.register(address, length, .{
+            .kind = .guest_backed,
+            .may_dereference = true,
+            .may_execute = prot & 4 != 0,
+            .owner = "OS-selected sparse guest mmap",
+        });
+        return address;
+    }
+
+    pub fn guestMapBackendWithBacking(self: *MachOState, length: u64, prot: u32, flags: u32, host_fd: std.posix.fd_t, offset: u64) ?u64 {
+        const backend_indirection_size: u64 = 0x1FFF_FFFF;
+        const backend_code_size: u64 = 0x0FFF_FFFF;
+        const executable = prot & 4 != 0;
+        const preferred_base: ?u64 = if (!executable and length == backend_indirection_size)
+            0x8000_0000
+        else if (executable and length == backend_code_size)
+            0xA000_0000
+        else
+            null;
+        const maximum_end: ?u64 = if (preferred_base != null) 0x1_0000_0000 else null;
+        const address = self.sparse_memory.mapAnywhereWithHintAndBacking(
+            length,
+            prot,
+            flags,
+            host_fd,
+            offset,
+            preferred_base,
+            maximum_end,
+        ) orelse return null;
+        const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return null;
+        _ = self.memory_regions.register(address, effective_length, .{
+            .read = prot & 1 != 0,
+            .write = prot & 2 != 0,
+            .execute = prot & 4 != 0,
+        }, .guest_mmap, "low-window backend sparse mmap", self.regs.rip);
+        _ = self.pointer_firewall.register(address, effective_length, .{
+            .kind = .guest_backed,
+            .may_dereference = true,
+            .may_execute = prot & 4 != 0,
+            .owner = "low-window backend sparse mmap",
+        });
+        std.debug.print(
+            "macho-processor: x64 backend placement contract: requested_length={d} effective_length={d} preferred_base=0x{x} result=0x{x} result_end=0x{x} executable={} below_4g={} pointer_truncation_safe={}\n",
+            .{ length, effective_length, preferred_base orelse 0, address, address +| effective_length, executable, address +| effective_length <= 0x1_0000_0000, !executable or address < 0x1_0000_0000 },
+        );
+        return address;
+    }
+
     pub fn guestReserveAddressSpace(self: *MachOState, length: u64) ?u64 {
         const anon_private: u32 = 0x1000 | 0x2;
         return self.guestReserveAddressSpaceWithBacking(length, anon_private, -1, 0);
@@ -1578,7 +1999,8 @@ pub const MachOState = struct {
 
     pub fn guestProtectSparseMemory(self: *MachOState, address: u64, length: u64, prot: u32) bool {
         if (!self.sparse_memory.protect(address, length, prot)) return false;
-        _ = self.memory_regions.register(address, length, .{
+        const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return false;
+        _ = self.memory_regions.register(address, effective_length, .{
             .read = prot & 1 != 0,
             .write = prot & 2 != 0,
             .execute = prot & 4 != 0,
@@ -1678,14 +2100,47 @@ pub const MachOState = struct {
     fn emitGuestLog(self: *MachOState, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
         const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
         const message = self.guestMemoryConst(address, length) orelse return false;
+        self.observeBackendGuestLog(message);
         const raw_char: u8 = @truncate(prefix_char_raw);
         const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
         var prefix_buffer: [32]u8 = undefined;
         const prefix = std.fmt.bufPrint(&prefix_buffer, "[xenia] {c}> ", .{prefix_char}) catch return false;
 
-        _ = hostWriteFdAll(1, prefix);
-        _ = hostWriteFdAll(1, message);
-        if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(1, "\n");
+        _ = hostWriteFdAll(self.diagnostic_output_fd, prefix);
+        _ = hostWriteFdAll(self.diagnostic_output_fd, message);
+        if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.diagnostic_output_fd, "\n");
+
+        if (std.mem.startsWith(u8, message, "HostPathDevice::ResolvePath(User_")) {
+            const storage_root = self.fs_forwarder.storageRoot();
+            std.debug.print(
+                "macho-processor: profile resolution trace: Xenia is resolving an internal User_<profile-id>: device; storage_root={s}; this is before any host open syscall\n",
+                .{if (storage_root.len != 0) storage_root else "<not configured>"},
+            );
+            if (profileIdFromUserDevice(message)) |profile_id| {
+                self.logProfileHostPreflight(profile_id);
+            }
+        }
+        if (std.mem.indexOf(u8, message, "Failed to open Account file: C000000F") != null) {
+            if (self.profile_account_flow.active) self.profile_account_flow.stage = .open_failed;
+            std.debug.print(
+                "macho-processor: profile resolution failure: X_STATUS_NO_SUCH_FILE (0xC000000F); the Xenia User_<profile-id>: device has no Account-file backing path. Check the following fs open/status diagnostics for a host-path attempt; if none follows, the missing mapping is inside Xenia's virtual device layer.\n",
+                .{},
+            );
+        }
+        if (std.mem.indexOf(u8, message, "Failed to decrypt account data file for XUID") != null) {
+            if (self.profile_account_flow.active) self.profile_account_flow.stage = .decrypt_failed;
+            std.debug.print(
+                "macho-processor: profile crypto diagnosis: both retail and devkit Account HMAC/RC4 verification paths rejected the 404-byte payload; this is a real Account failure, unlike a success-path device dismount\n",
+                .{},
+            );
+        }
+        if (std.mem.startsWith(u8, message, "Unregistered device: User_")) {
+            const stage = self.profile_account_flow.stage;
+            std.debug.print(
+                "macho-processor: profile device lifecycle: temporary User_<profile-id>: mount was unregistered at stage={s}; interpretation={s}\n",
+                .{ @tagName(stage), if (stage == .decrypted or stage == .inserting or stage == .completed) "expected LoadAccount cleanup after successful Account decryption; the decoded account remains eligible for accounts_ insertion" else "early cleanup associated with an incomplete Account load" },
+            );
+        }
 
         if (self.guest_log_mirror_fd >= 0) {
             _ = hostWriteFdAll(self.guest_log_mirror_fd, prefix);
@@ -1696,6 +2151,217 @@ pub const MachOState = struct {
         }
         self.guest_log_line_count +|= 1;
         return true;
+    }
+
+    fn logProfileHostPreflight(self: *MachOState, profile_id: []const u8) void {
+        self.profile_host_preflight_checks +|= 1;
+        const storage_root = self.fs_forwarder.storageRoot();
+        if (storage_root.len == 0) {
+            std.debug.print(
+                "macho-processor: profile host preflight #{d}: profile={s} unavailable because no storage root is configured\n",
+                .{ self.profile_host_preflight_checks, profile_id },
+            );
+            return;
+        }
+
+        var path_buffer: [4096]u8 = undefined;
+        const account_path = std.fmt.bufPrint(
+            &path_buffer,
+            "{s}/content/{s}/FFFE07D1/00010000/{s}/Account",
+            .{ storage_root, profile_id, profile_id },
+        ) catch {
+            std.debug.print(
+                "macho-processor: profile host preflight #{d}: profile={s} expected Account path exceeds diagnostic buffer\n",
+                .{ self.profile_host_preflight_checks, profile_id },
+            );
+            return;
+        };
+        const file_stat = std.Io.Dir.cwd().statFile(self.io, account_path, .{}) catch |err| {
+            std.debug.print(
+                "macho-processor: profile host preflight #{d}: profile={s} account={s} host_status={s}; VFS failure may be genuine\n",
+                .{ self.profile_host_preflight_checks, profile_id, account_path, @errorName(err) },
+            );
+            return;
+        };
+        std.debug.print(
+            "macho-processor: profile host preflight #{d}: profile={s} account={s} host_status=present kind={s} bytes={d}; a later C000000F without an Account open is a guest VFS path-resolution failure\n",
+            .{ self.profile_host_preflight_checks, profile_id, account_path, @tagName(file_stat.kind), file_stat.size },
+        );
+    }
+
+    fn observeProfileAccountFlow(self: *MachOState) void {
+        const load_entry = self.internal_targets.profile_manager_load_account;
+        if (load_entry != 0 and self.regs.rip == load_entry) {
+            const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+            self.profile_account_flow.active = true;
+            self.profile_account_flow.manager = self.regs.rdi;
+            self.profile_account_flow.xuid = self.regs.rsi;
+            self.profile_account_flow.return_address = return_address;
+            self.profile_account_flow.started_step = self.executed_steps;
+            self.profile_account_flow.stage = .loading;
+            self.profile_account_flow.account_guest_fd = std.math.maxInt(u64);
+            self.profile_account_flow.requested_bytes = 0;
+            self.profile_account_flow.bytes_read = 0;
+            self.profile_account_flow.attempts +|= 1;
+            const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
+            std.debug.print(
+                "macho-processor: profile Account flow #{d} started: manager=0x{x} xuid={x:0>16} return=0x{x} {s}+0x{x} step={d}\n",
+                .{ self.profile_account_flow.attempts, self.regs.rdi, self.regs.rsi, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.executed_steps },
+            );
+            return;
+        }
+
+        if (!self.profile_account_flow.active) return;
+
+        const dismount_entry = self.internal_targets.profile_manager_dismount_profile;
+        if (dismount_entry != 0 and self.regs.rip == dismount_entry) {
+            const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+            const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
+            if (caller) |symbol| {
+                if (classifyProfileDismountCaller(symbol.name, symbol.offset)) |stage| self.profile_account_flow.stage = stage;
+            }
+            std.debug.print(
+                "macho-processor: profile temporary dismount: xuid={x:0>16} stage={s} caller=0x{x} {s}+0x{x} bytes_read={d} minimum_account_bytes={d} interpretation={s}\n",
+                .{ self.profile_account_flow.xuid, @tagName(self.profile_account_flow.stage), return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, if (self.profile_account_flow.stage == .decrypted) "expected success-path cleanup before accounts_ insertion" else "early LoadAccount cleanup" },
+            );
+            return;
+        }
+
+        const insert_entry = self.internal_targets.profile_account_insert_or_assign;
+        if (insert_entry != 0 and self.regs.rip == insert_entry) {
+            self.profile_account_flow.stage = .inserting;
+            const key = if (self.guestMemoryConst(self.regs.rsi, 8) != null) self.read64(self.regs.rsi) else 0;
+            std.debug.print(
+                "macho-processor: profile accounts_ insertion checkpoint: map=0x{x} key_ptr=0x{x} key={x:0>16} account=0x{x} expected_xuid={x:0>16} key_matches={}\n",
+                .{ self.regs.rdi, self.regs.rsi, key, self.regs.rdx, self.profile_account_flow.xuid, key == self.profile_account_flow.xuid },
+            );
+            return;
+        }
+
+        if (self.profile_account_flow.return_address != 0 and
+            self.regs.rip == self.profile_account_flow.return_address)
+        {
+            const succeeded = self.regs.rax & 1 != 0;
+            if (succeeded) {
+                self.profile_account_flow.successes +|= 1;
+                self.profile_account_flow.stage = .completed;
+            } else {
+                self.profile_account_flow.failures +|= 1;
+            }
+            std.debug.print(
+                "macho-processor: profile Account flow completed: xuid={x:0>16} success={} final_stage={s} bytes_read={d}/{d} elapsed_steps={d}; device dismount before this return is {s}\n",
+                .{ self.profile_account_flow.xuid, succeeded, @tagName(self.profile_account_flow.stage), self.profile_account_flow.bytes_read, self.profile_account_flow.requested_bytes, self.executed_steps -| self.profile_account_flow.started_step, if (succeeded) "normal and the decoded account is now in accounts_" else "associated with an earlier load failure" },
+            );
+            self.profile_account_flow.active = false;
+            self.profile_account_flow.account_guest_fd = std.math.maxInt(u64);
+        }
+    }
+
+    fn noteProfileAccountOpen(self: *MachOState, path: []const u8, guest_fd: u64) void {
+        const account_path = std.mem.eql(u8, path, "Account") or
+            std.mem.endsWith(u8, path, "/Account") or
+            std.mem.endsWith(u8, path, "\\Account");
+        if (!self.profile_account_flow.active or !account_path) return;
+        if (guest_fd == std.math.maxInt(u64)) {
+            self.profile_account_flow.stage = .open_failed;
+            return;
+        }
+        self.profile_account_flow.stage = .host_opened;
+        self.profile_account_flow.account_guest_fd = guest_fd;
+        std.debug.print(
+            "macho-processor: profile Account host descriptor bound: xuid={x:0>16} guest_fd={d} stage=host_opened\n",
+            .{ self.profile_account_flow.xuid, guest_fd },
+        );
+    }
+
+    fn noteProfileAccountRead(self: *MachOState, guest_fd: u64, requested: u64, result: i64, offset: u64) void {
+        if (!self.profile_account_flow.active or guest_fd != self.profile_account_flow.account_guest_fd) return;
+        self.profile_account_flow.requested_bytes +|= requested;
+        if (result > 0) self.profile_account_flow.bytes_read +|= @intCast(result);
+        self.profile_account_flow.stage = .reading;
+        std.debug.print(
+            "macho-processor: profile Account read checkpoint: xuid={x:0>16} guest_fd={d} offset={d} requested={d} returned={d} cumulative={d} minimum={d} complete_encrypted_file={}\n",
+            .{ self.profile_account_flow.xuid, guest_fd, offset, requested, result, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, self.profile_account_flow.bytes_read >= PROFILE_ENCRYPTED_ACCOUNT_BYTES },
+        );
+    }
+
+    fn observeBackendGuestLog(self: *MachOState, message: []const u8) void {
+        const observation = self.backend_diagnostics.observeLine(message, self.executed_steps) orelse return;
+        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+        const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
+        std.debug.print(
+            "macho-processor: x64 backend event #{d}: event={s} phase={s}->{s} step={d} delta={d} active=0x{x} caller=0x{x} {s}+0x{x}\n",
+            .{
+                observation.sequence,
+                @tagName(observation.event),
+                @tagName(observation.previous_phase),
+                @tagName(observation.phase),
+                observation.step,
+                observation.delta_steps,
+                self.active_guest_thread,
+                return_address,
+                if (caller) |symbol| symbol.name else "<unknown>",
+                if (caller) |symbol| symbol.offset else 0,
+            },
+        );
+
+        if (observation.event == .indirection_table_failed) {
+            const mapping = self.backend_diagnostics.last_mapping;
+            if (!mapping.valid) {
+                std.debug.print(
+                    "macho-processor: x64 code-cache warning correlation: no mmap call was observed after backend initialization began; allocation may have used an unmodeled route\n",
+                    .{},
+                );
+            } else {
+                std.debug.print(
+                    "macho-processor: x64 code-cache warning correlation: latest mmap route={s} address=0x{x} length={d} prot=0x{x} flags=0x{x} result_known={} succeeded={} result=0x{x} stage={s}\n",
+                    .{ mapping.route, mapping.address, mapping.length, mapping.prot, mapping.flags, mapping.result_known, mapping.succeeded, mapping.result, if (mapping.stage.len != 0) mapping.stage else "<pending>" },
+                );
+                if (mapping.address == 0) {
+                    std.debug.print(
+                        "macho-processor: x64 code-cache warning interpretation: the macOS guest requested OS-selected placement (address=0), so the guest's 0x80000000-0x9fffffff warning text does not describe the actual mmap hint used on this path\n",
+                        .{},
+                    );
+                }
+            }
+        }
+        if (observation.event == .backend_initialize_succeeded and self.backend_diagnostics.capstone_assertions != 0) {
+            std.debug.print(
+                "macho-processor: x64 backend recovery evidence: initialization reached completed-successfully after {d} Capstone constructor assertion(s); backend object existence is proven, while Capstone-dependent diagnostics remain degraded\n",
+                .{self.backend_diagnostics.capstone_assertions},
+            );
+        }
+    }
+
+    pub fn backendMemoryDiagnosticsActive(self: *const MachOState) bool {
+        return self.backend_diagnostics.mappingWindowActive();
+    }
+
+    pub fn noteBackendMmapAttempt(self: *MachOState, route: []const u8, address: u64, length: u64, prot: u64, flags: u64, fixed: bool, anonymous: bool) void {
+        if (!self.backend_diagnostics.noteMmapAttempt(route, address, length, prot, flags, fixed, anonymous, self.executed_steps)) return;
+        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+        const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
+        std.debug.print(
+            "macho-processor: x64 backend mmap attempt #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} caller=0x{x} {s}+0x{x}\n",
+            .{ self.backend_diagnostics.mmap_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, flags, fixed, anonymous, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0 },
+        );
+    }
+
+    pub fn noteBackendMmapResult(self: *MachOState, succeeded: bool, result: u64, stage: []const u8) void {
+        if (!self.backend_diagnostics.last_mapping.valid or self.backend_diagnostics.last_mapping.step != self.executed_steps) return;
+        self.backend_diagnostics.noteMmapResult(succeeded, result, stage);
+        std.debug.print(
+            "macho-processor: x64 backend mmap result: attempt={d} succeeded={} result=0x{x} stage={s}\n",
+            .{ self.backend_diagnostics.mmap_attempts_during_backend, succeeded, result, stage },
+        );
+    }
+
+    pub fn noteBackendMprotect(self: *MachOState, route: []const u8, address: u64, length: u64, prot: u64, succeeded: bool) void {
+        if (!self.backend_diagnostics.noteMprotectAttempt()) return;
+        std.debug.print(
+            "macho-processor: x64 backend mprotect #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} succeeded={}\n",
+            .{ self.backend_diagnostics.mprotect_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, succeeded },
+        );
     }
 
     fn allocGuestFile(self: *MachOState, fd: i32, kind: GuestFileKind) ?u64 {
@@ -1757,22 +2423,6 @@ pub const MachOState = struct {
         }
     }
 
-    fn isStubPushJmpEntry(self: *const MachOState, rip: u64) ?struct { slot: u32, target: u64 } {
-        const bytes = self.guestMemoryConst(rip, STUB_ENTRY_SIZE) orelse return null;
-        if (bytes.len < STUB_ENTRY_SIZE) return null;
-        if (bytes[0] != 0x68 or bytes[5] != 0xE9) return null;
-        const slot = std.mem.readInt(u32, bytes[1..5], .little);
-        const rel = std.mem.readInt(i32, bytes[6..10], .little);
-        const target = @as(u64, @bitCast(@as(i64, @as(i64, @intCast(rip + STUB_ENTRY_SIZE)) + rel)));
-        return .{ .slot = slot, .target = target };
-    }
-
-    fn isSharedStubHelper(self: *const MachOState, rip: u64) bool {
-        const bytes = self.guestMemoryConst(rip, 16) orelse return false;
-        if (bytes.len < 16) return false;
-        return bytes[0] == 0x4C and bytes[1] == 0x8D and bytes[7] == 0x41 and bytes[8] == 0x53 and bytes[9] == 0xFF and bytes[10] == 0x25;
-    }
-
     fn inHelperCluster(self: *const MachOState, rip: u64) bool {
         if (self.helper_cluster_start) |start| {
             const end = self.helper_cluster_end orelse start;
@@ -1788,10 +2438,11 @@ pub const MachOState = struct {
         var found_start: ?u64 = null;
         var count: usize = 0;
         while (count < 4096) : (count += 1) {
-            if (scan < STUB_ENTRY_SIZE) break;
-            scan -= STUB_ENTRY_SIZE;
-            if (self.isStubPushJmpEntry(scan)) |stub| {
-                if (stub.target == helper_rip) {
+            if (scan < lazy_import_stub.entry_size) break;
+            scan -= lazy_import_stub.entry_size;
+            const bytes = self.guestMemoryConst(scan, lazy_import_stub.entry_size) orelse break;
+            if (lazy_import_stub.decodeEntry(scan, bytes)) |stub| {
+                if (stub.shared_helper == helper_rip) {
                     found_start = scan;
                     continue;
                 }
@@ -1802,9 +2453,10 @@ pub const MachOState = struct {
         var end = start;
         count = 0;
         while (count < 4096) : (count += 1) {
-            if (self.isStubPushJmpEntry(end)) |stub| {
-                if (stub.target == helper_rip) {
-                    end += STUB_ENTRY_SIZE;
+            const bytes = self.guestMemoryConst(end, lazy_import_stub.entry_size) orelse break;
+            if (lazy_import_stub.decodeEntry(end, bytes)) |stub| {
+                if (stub.shared_helper == helper_rip) {
+                    end += lazy_import_stub.entry_size;
                     continue;
                 }
             }
@@ -1831,15 +2483,24 @@ pub const MachOState = struct {
     }
 
     fn handleStubHelperTransition(self: *MachOState) bool {
-        if (self.isStubPushJmpEntry(self.regs.rip)) |stub| {
-            self.pending_stub_slot = stub.slot;
+        // Lazy helper decoding used to touch guest memory for every interpreted
+        // instruction. All classic helper entries live in __stub_helper, so the
+        // overwhelmingly common path can reject them without translation or
+        // byte decoding.
+        if (self.regs.rip < self.stub_helper_start or self.regs.rip >= self.stub_helper_end) {
+            return false;
+        }
+        const entry_bytes = self.guestMemoryConst(self.regs.rip, lazy_import_stub.entry_size);
+        if (if (entry_bytes) |bytes| lazy_import_stub.decodeEntry(self.regs.rip, bytes) else null) |stub| {
+            self.pending_stub_slot = stub.bind_slot;
             self.pending_stub_entry_rip = self.regs.rip;
-            if (self.verbose_trace) log.info("stub-entry: rip=0x{x} slot=0x{x} shared_helper=0x{x}", .{ self.regs.rip, stub.slot, stub.target });
-            self.regs.rip = stub.target;
+            if (self.verbose_trace) log.info("stub-entry: rip=0x{x} slot=0x{x} shared_helper=0x{x}", .{ self.regs.rip, stub.bind_slot, stub.shared_helper });
+            self.regs.rip = stub.shared_helper;
             return true;
         }
 
-        if (self.pending_stub_slot != null and self.isSharedStubHelper(self.regs.rip)) {
+        const helper_bytes = self.guestMemoryConst(self.regs.rip, 16);
+        if (self.pending_stub_slot != null and (if (helper_bytes) |bytes| lazy_import_stub.isSharedHelper(bytes) else false)) {
             const slot = self.pending_stub_slot.?;
             const entry_rip = self.pending_stub_entry_rip orelse self.regs.rip;
             const synthetic_return = self.read64(self.regs.rsp);
@@ -1919,7 +2580,7 @@ pub const MachOState = struct {
                 self.regs.rip = synthetic_return;
             } else {
                 log.warn("stub-helper conservative fallback: helper_rip=0x{x} slot=0x{x} entry_rip=0x{x}; synthetic_return invalid (0x{x}), skipping helper entry", .{ self.regs.rip, slot, entry_rip, synthetic_return });
-                self.regs.rip = entry_rip + STUB_ENTRY_SIZE;
+                self.regs.rip = entry_rip + lazy_import_stub.entry_size;
             }
             return true;
         }
@@ -2151,6 +2812,15 @@ pub const MachOState = struct {
                 .handled_void => .handled_void,
             };
         }
+        if (self.pthreads.dispatchCppSynchronization(self, name)) |resolution| {
+            self.resolving_import_route = .pthread;
+            self.import_provider_override = .pthread_runtime;
+            self.import_confidence_override = .modeled;
+            return switch (resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
+            };
+        }
         if (import_resolution.dispatchContract(self, name)) |resolution| {
             self.resolving_import_route = .import_contract;
             return switch (resolution) {
@@ -2178,13 +2848,6 @@ pub const MachOState = struct {
                 .handled => |value| .{ .handled = value },
                 .handled_void => .handled_void,
             };
-        }
-
-        if (std.mem.eql(u8, name, "__ZNSt3__15mutex8try_lockEv")) {
-            self.resolving_import_route = .pthread;
-            self.import_provider_override = .pthread_runtime;
-            self.import_confidence_override = .modeled;
-            return .{ .handled = @intFromBool(self.pthreads.cppMutexTryLockForThread(self.regs.rdi, self.pthreads.currentThreadHandle(self))) };
         }
 
         if (self.dynamic_forwarder.forward(self, imported.dylib, name)) |resolution| {
@@ -2281,10 +2944,144 @@ pub const MachOState = struct {
             const function_name = self.guestCString(self.regs.rdi, 1024) orelse "<unknown>";
             const file_name = self.guestCString(self.regs.rsi, 4096) orelse "<unknown>";
             const expression = self.guestCString(self.regs.rcx, 4096) orelse "<unknown>";
-            std.debug.print(
-                "macho-processor: guest assertion #{d}: {s}:{d} {s}: {s}\n",
-                .{ self.guest_assertion_count, file_name, self.regs.rdx, function_name, expression },
+            const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+            const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
+            const assertion_class = classifyGuestAssertion(file_name, function_name, expression);
+            self.last_guest_assertion_class = assertion_class;
+            self.last_guest_assertion_step = self.executed_steps;
+            self.last_guest_assertion_return = return_address;
+            const backend_binding = x64_backend_diagnostics.Engine.classifyAssertion(file_name, self.regs.rdx, function_name);
+            self.backend_diagnostics.noteAssertion(backend_binding, self.executed_steps, return_address);
+            const assertion_symbol = if (caller) |symbol| return_address -| symbol.offset else return_address;
+            const assertion_variant = (self.regs.rdx << 8) | @intFromEnum(assertion_class);
+            const assertion_observation = self.diagnostic_throttler.observe(
+                .guest_assertion,
+                assertion_symbol,
+                assertion_variant,
             );
+            if (assertion_observation.disposition == .checkpoint) {
+                std.debug.print(
+                    "macho-processor: repeated guest assertion checkpoint: symbol={s} occurrence={d} suppressed_since_previous={d} total_assertions={d}\n",
+                    .{ if (caller) |symbol| symbol.name else function_name, assertion_observation.occurrence, assertion_observation.suppressed_since_emit, self.guest_assertion_count },
+                );
+            } else if (assertion_observation.disposition == .detail) {
+                std.debug.print(
+                    "macho-processor: guest assertion #{d}: {s}:{d} {s}: {s}\n",
+                    .{ self.guest_assertion_count, file_name, self.regs.rdx, function_name, expression },
+                );
+                std.debug.print(
+                    "  assertion context: step={d} phase={s} active=0x{x} return=0x{x} caller={s}+0x{x} rsp=0x{x} rbp=0x{x}\n",
+                    .{ self.executed_steps, @tagName(self.startup.phase), self.active_guest_thread, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.regs.rsp, self.regs.rbp },
+                );
+                if (backend_binding != .none) {
+                    std.debug.print(
+                        "  x64 backend assertion binding: kind={s} backend_phase={s}\n",
+                        .{ @tagName(backend_binding), @tagName(self.backend_diagnostics.phase) },
+                    );
+                    if (backend_binding == .x64_backend_capstone) {
+                        std.debug.print(
+                            "  x64 backend assertion cause: source line 139 is the failure branch of cs_open(CS_ARCH_X86, CS_MODE_64, &capstone_handle_); this indicates Capstone initialization failure inside an existing X64Backend constructor, not absence of the backend object\n",
+                            .{},
+                        );
+                        std.debug.print(
+                            "  x64 backend assertion impact: Capstone-backed disassembly/introspection is unreliable until proven otherwise; subsequent backend/code-cache/processor success events will be logged as independent readiness evidence\n",
+                            .{},
+                        );
+                        self.dumpCapstoneCallbackState("cs_open assertion");
+                    } else if (backend_binding == .x64_backend_low32_thunk) {
+                        const mapping = self.backend_diagnostics.last_mapping;
+                        std.debug.print(
+                            "  x64 backend assertion cause: source line 438 requires resolve_function_thunk_ to fit in uint32_t because every indirection-table entry stores a 32-bit host-code pointer; the generated code cache was placed above the low 4 GiB window\n",
+                            .{},
+                        );
+                        std.debug.print(
+                            "  x64 backend assertion impact: continuing would truncate the thunk address and seed every default indirection with an invalid target; backend executable mappings must be rejected unless their end is at or below 0x100000000\n",
+                            .{},
+                        );
+                        std.debug.print(
+                            "  x64 backend low-address correlation: latest_mmap(valid/succeeded)={}/{} requested_address=0x{x} length={d} result=0x{x} result_high32=0x{x} stage={s}\n",
+                            .{ mapping.valid, mapping.succeeded, mapping.address, mapping.length, mapping.result, mapping.result >> 32, if (mapping.stage.len != 0) mapping.stage else "<pending>" },
+                        );
+                    }
+                    self.dumpGuestStack();
+                }
+                if (assertion_class == .timer_queue_wait_item_state) {
+                    std.debug.print(
+                        "  timer queue assertion cause: TimerThreadMain expected WaitItem::State::kDisarmed before its compiler-emitted UD2; this is the primary invariant failure, and a following Processor::OnThreadBreakpointHit assertion is secondary signal-handler fallout\n",
+                        .{},
+                    );
+                    std.debug.print(
+                        "  timer queue assertion context: cooperative active_thread=0x{x} deferred_threads={d} suspended_threads={d} pending_idle={d}; inspect wait-item arm/disarm transitions before treating the breakpoint handler as the root cause\n",
+                        .{ self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, gtkIdleQueueSnapshotFor(&self.gtk_idle_callbacks).pending },
+                    );
+                    if (guest_assertion_recovery.timerQueueSnapshot(self, self.regs.rbp)) |snapshot| {
+                        std.debug.print(
+                            "  timer queue state snapshot: frame_state[{s}]={d} at 0x{x} shared_ptr_slot=0x{x} wait_item=0x{x} object_state={s} due_ns={?d} interval_ns={?d}\n",
+                            .{ timerQueueStateName(snapshot.frame_state), snapshot.frame_state, snapshot.frame_state_address, snapshot.shared_ptr_address, snapshot.wait_item, if (snapshot.object_state) |state| timerQueueStateName(state) else "<unmapped>", snapshot.due_nanoseconds, snapshot.interval_nanoseconds },
+                        );
+                        if (snapshot.object_state) |object_state| {
+                            if (object_state != snapshot.frame_state) {
+                                std.debug.print(
+                                    "  timer queue state divergence: compare_exchange expected-output={s}({d}) but live wait_item state={s}({d}); this distinguishes decoder/CAS corruption from a genuinely concurrent state transition\n",
+                                    .{ timerQueueStateName(snapshot.frame_state), snapshot.frame_state, timerQueueStateName(object_state), object_state },
+                                );
+                            }
+                        }
+                    } else {
+                        std.debug.print(
+                            "  timer queue state snapshot unavailable: rbp=0x{x}; retaining the assertion as non-recoverable because the modeled CAS state cannot be proven\n",
+                            .{self.regs.rbp},
+                        );
+                    }
+                } else if (assertion_class == .breakpoint_untracked_thread) {
+                    std.debug.print(
+                        "  breakpoint assertion cause: Processor::OnThreadBreakpointHit could not find the current modeled thread in Xenia's thread_debug_infos_ map; the backend exists, but this SIGILL arrived on a Rosette-cooperatively scheduled thread that Xenia's debugger registry does not track\n",
+                        .{},
+                    );
+                    std.debug.print(
+                        "  breakpoint assertion impact: this is a secondary failure while handling an earlier UD2. Any subsequent __Unwind_Resume(nullptr) belongs to the failed breakpoint-handler cleanup path and must not be mistaken for the original application fault\n",
+                        .{},
+                    );
+                } else if (assertion_class == .export_ordinal_bounds) {
+                    std.debug.print(
+                        "  export ordinal bounds assertion: an export_entry->ordinal >= export_table.size(); the ordinal value exceeds the registered export count\n",
+                        .{},
+                    );
+                    const saved = [_]u64{ self.regs.rbx, self.regs.r12, self.regs.r13, self.regs.r14, self.regs.r15 };
+                    var found_pair = false;
+                    for (saved) |a| {
+                        if (a > 65535) continue;
+                        for (saved) |b| {
+                            if (b > 65535 or b < a) continue;
+                            const ordinal = a;
+                            const size = b;
+                            if (ordinal < size) continue;
+                            found_pair = true;
+                            if (ordinal < 256 or (size < 256 and ordinal - size <= 16)) {
+                                std.debug.print(
+                                    "  export ordinal bounds ROOT CAUSE: ordinal={d} >= table_size={d}; values are small and consistent — this is a guest-side export table sizing issue (the export table needs more entries or the ordinal needs updating)\n",
+                                    .{ ordinal, size },
+                                );
+                            } else {
+                                std.debug.print(
+                                    "  export ordinal bounds ROOT CAUSE: ordinal={d} >= table_size={d}; values are large or unexpected — this is likely emulator-level memory corruption or a data-structure initialization failure\n",
+                                    .{ ordinal, size },
+                                );
+                            }
+                        }
+                    }
+                    if (!found_pair) {
+                        std.debug.print(
+                            "  export ordinal bounds: no plausible ordinal/size pair found in callee-saved registers (rbx/r12-r15); the values were either computed per-call and not preserved, or the register state was already clobbered\n",
+                            .{},
+                        );
+                        std.debug.print(
+                            "  export ordinal bounds raw register state: rbx=0x{x} r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n",
+                            .{ self.regs.rbx, self.regs.r12, self.regs.r13, self.regs.r14, self.regs.r15 },
+                        );
+                    }
+                }
+            }
             if (self.initializer_resolver.current()) |initializer| {
                 std.debug.print(
                     "  assertion owner: initializer [{d}/{d}] {s}\n",
@@ -2327,6 +3124,66 @@ pub const MachOState = struct {
             @memcpy(destination[0..source.len], source);
             destination[source.len] = 0;
             return .{ .handled = self.regs.rdi };
+        }
+        if (std.mem.eql(u8, name, "_strtoul")) {
+            self.resolving_import_route = .strtoul;
+            const nptr = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .handled = 0 };
+            const endptr_ptr = self.regs.rsi;
+            const base_raw = self.regs.rdx;
+            if (base_raw > 36) {
+                if (endptr_ptr != 0) self.write64(endptr_ptr, self.regs.rdi);
+                return .{ .handled = 0 };
+            }
+            const base: u8 = @intCast(base_raw);
+            var i: usize = 0;
+            while (i < nptr.len and switch (nptr[i]) {
+                ' ', '\t', '\n', '\r', '\x0c' => true,
+                else => false,
+            }) i += 1;
+            var negate = false;
+            if (i < nptr.len) {
+                if (nptr[i] == '-') {
+                    negate = true;
+                    i += 1;
+                } else if (nptr[i] == '+') i += 1;
+            }
+            var effective_base: u8 = base;
+            if (effective_base == 0 or effective_base == 16) {
+                if (i + 2 < nptr.len and nptr[i] == '0' and (nptr[i + 1] | 32) == 'x') {
+                    effective_base = 16;
+                    i += 2;
+                }
+            }
+            if (effective_base == 0 and i < nptr.len and nptr[i] == '0') effective_base = 8;
+            if (effective_base == 0) effective_base = 10;
+            const start = i;
+            var result: u64 = 0;
+            var overflow = false;
+            while (i < nptr.len) {
+                const c = nptr[i];
+                const digit: u64 = switch (c) {
+                    '0'...'9' => c - '0',
+                    'a'...'z' => c - 'a' + 10,
+                    'A'...'Z' => c - 'A' + 10,
+                    else => break,
+                };
+                if (digit >= effective_base) break;
+                const next = result * effective_base;
+                overflow = overflow or (effective_base > 0 and next / effective_base != result);
+                result = next;
+                const next2 = result +% digit;
+                overflow = overflow or next2 < result;
+                result = next2;
+                i += 1;
+            }
+            if (i == start) {
+                if (endptr_ptr != 0) self.write64(endptr_ptr, 0);
+                return .{ .handled = 0 };
+            }
+            if (endptr_ptr != 0) self.write64(endptr_ptr, self.regs.rdi + i);
+            if (overflow) return .{ .handled = std.math.maxInt(u64) };
+            if (negate) return .{ .handled = @bitCast(@as(i64, -@as(i64, @bitCast(result)))) };
+            return .{ .handled = result };
         }
         if (std.mem.eql(u8, name, "_getenv")) {
             const key = self.guestCString(self.regs.rdi, 256) orelse return .{ .handled = 0 };
@@ -2375,6 +3232,10 @@ pub const MachOState = struct {
                 .{ self.regs.rdi, self.regs.rsi, source.len, ok },
             );
             return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
+        }
+        if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc") != null) {
+            const ok = compat_runtime.resizeLibcppString(self, self.regs.rdi, self.regs.rsi, @truncate(self.regs.rdx));
+            return if (ok) .handled_void else .{ .unsupported = 0 };
         }
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc") != null) {
             const value = [_]u8{@truncate(self.regs.rsi)};
@@ -2494,8 +3355,7 @@ pub const MachOState = struct {
             return .{ .handled = slot };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__16chrono12system_clock3nowEv")) {
-            const epoch_nanoseconds: u64 = 1_719_000_000 * 1_000_000_000;
-            return .{ .handled = epoch_nanoseconds + self.monotonic_nanoseconds };
+            return .{ .handled = self.guest_time.wallNow() };
         }
         if (std.mem.indexOf(u8, name, "recursive_mutexC1Ev") != null or
             std.mem.indexOf(u8, name, "recursive_mutexC2Ev") != null)
@@ -2607,7 +3467,16 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "___cxa_end_catch")) {
             const object_address = self.cxx_exceptions.endCatch();
-            if (object_address) |object| std.debug.print("macho-processor: __cxa_end_catch object=0x{x}\n", .{object});
+            if (object_address) |object| {
+                std.debug.print("macho-processor: __cxa_end_catch object=0x{x}\n", .{object});
+                const spirv_resolution = self.spirv_cross.noteCatch(object);
+                if (spirv_resolution == .expected_dummy_probe_caught) {
+                    std.debug.print(
+                        "macho-processor: SPIRV-Cross dummy-module probe resolved: object=0x{x} entry_point_expected=false handler_completed=true; this exception is verified startup history, not a hang cause\n",
+                        .{object},
+                    );
+                }
+            }
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "___cxa_get_exception_ptr")) {
@@ -2633,8 +3502,17 @@ pub const MachOState = struct {
                 "macho-processor: guest raised C++ exception object=0x{x} type_info=0x{x} destructor=0x{x}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx },
             );
+            var toml_parse_error = false;
+            var exception_type_name: []const u8 = "";
+            var exception_message: []const u8 = "";
             if (self.cxxExceptionTypeName(thrown.type_info_address)) |type_name| {
+                exception_type_name = type_name;
                 std.debug.print("macho-processor: C++ exception ABI type name: {s}\n", .{type_name});
+                if (std.mem.indexOf(u8, type_name, "toml") != null and
+                    std.mem.indexOf(u8, type_name, "parse_error") != null)
+                {
+                    toml_parse_error = true;
+                }
             }
             if (self.metadata.nearestSymbol(thrown.type_info_address)) |symbol| {
                 std.debug.print("macho-processor: C++ exception type: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
@@ -2659,14 +3537,39 @@ pub const MachOState = struct {
                 }
             }
             if (self.cxxExceptionMessage(thrown.object_address)) |message| {
+                exception_message = message;
                 std.debug.print("macho-processor: C++ exception message: {s}\n", .{message});
+                if (std.mem.indexOf(u8, message, "invalid utf-8") != null or
+                    std.mem.indexOf(u8, message, "invalid UTF-8") != null or
+                    std.mem.indexOf(u8, message, "utf-8") != null)
+                {
+                    toml_parse_error = true;
+                }
+            }
+            if (toml_parse_error) {
+                self.libcxx_streams.dumpPatchTomlDiagnostics("toml parse_error throw");
             }
             var inspection = self.unwinder.inspectThrow(self, thrown.type_info_address);
             const exception_header = if (thrown.allocation) |allocation|
                 allocation.storage_address
             else
                 thrown.object_address;
-            if (self.unwinder.installPhaseTwo(self, &inspection, exception_header)) {
+            const phase_two_installed = self.unwinder.installPhaseTwo(self, &inspection, exception_header);
+            const spirv_classification = self.spirv_cross.noteThrow(thrown.object_address, .{
+                .type_name = exception_type_name,
+                .message = exception_message,
+                .verification_frame_seen = spirv_cross_diagnostics.verificationFrameSeen(&self.metadata, inspection),
+                .handler_found = inspection.handler != null,
+                .phase_two_installed = phase_two_installed,
+                .catch_completed = false,
+            });
+            if (spirv_classification == .expected_dummy_probe_unwinding) {
+                std.debug.print(
+                    "macho-processor: SPIRV-Cross dummy-module probe recognized: object=0x{x} missing_entry_point=true verification_frame=true handler=0x{x} phase_two_installed=true; awaiting expected catch completion\n",
+                    .{ thrown.object_address, if (inspection.handler) |handler| handler.landing_pad else 0 },
+                );
+            }
+            if (phase_two_installed) {
                 self.last_unwind_inspection = inspection;
                 return .control_transferred;
             }
@@ -2681,8 +3584,53 @@ pub const MachOState = struct {
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         }
         if (std.mem.eql(u8, name, "__Unwind_Resume") or std.mem.eql(u8, name, "__Unwind_Resume_or_Rethrow")) {
+            const outer_assertion = if (self.signal_frame_count != 0)
+                self.signal_frames[self.signal_frame_count - 1].assertion_class
+            else
+                GuestAssertionClass.none;
+            if (guest_assertion_recovery.shouldEscapeNullBreakpointUnwind(
+                self.regs.rdi,
+                self.last_guest_assertion_class,
+                outer_assertion,
+                self.signal_frame_count,
+            )) {
+                std.debug.print(
+                    "macho-processor: suppressing null __Unwind_Resume from nested breakpoint-handler fallout: outer_assertion={s} inner_assertion={s} signal_depth={d}; restoring outer signal context\n",
+                    .{ @tagName(outer_assertion), @tagName(self.last_guest_assertion_class), self.signal_frame_count },
+                );
+                if (self.finishGuestSignalReturn()) {
+                    self.breakpoint_cleanup_recoveries +|= 1;
+                    self.last_guest_assertion_class = .none;
+                    return .control_transferred;
+                }
+            }
             if (self.unwinder.resumePhaseTwo(self)) return .control_transferred;
+            if (self.unwinder.exhaustedWithoutHandler()) {
+                std.debug.print(
+                    "macho-processor: Itanium phase-2 stopped after all verified cleanup pads; no matching LSDA catch exists for the guest exception\n",
+                    .{},
+                );
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
+                return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+            }
             if (self.recoverOrphanedPhaseTwoResume(name)) return .control_transferred;
+            if (self.regs.rdi != 0 or self.cxx_exceptions.last_throw != null) {
+                const exception_header = if (self.regs.rdi != 0) self.regs.rdi else if (self.cxx_exceptions.last_throw) |thrown| if (thrown.allocation) |allocation| allocation.storage_address else thrown.object_address else 0;
+                std.debug.print(
+                    "macho-processor: Itanium host _Unwind_Resume fallback rejected: header=0x{x}; host addresses cannot be installed as guest RIP\n",
+                    .{exception_header},
+                );
+            }
+            if (self.regs.rdi == 0 and self.last_guest_assertion_class == .breakpoint_untracked_thread) {
+                std.debug.print(
+                    "macho-processor: breakpoint cleanup chain diagnosis: __Unwind_Resume received a null exception argument after Processor::OnThreadBreakpointHit asserted on an untracked modeled thread; no C++ throw object exists to resume, so exit 125 is secondary handler-cleanup termination\n",
+                    .{},
+                );
+                std.debug.print(
+                    "macho-processor: breakpoint cleanup chain origin: assertion_step={d} assertion_return=0x{x} active_thread=0x{x} signal_depth={d} deferred_threads={d} suspended_threads={d}\n",
+                    .{ self.last_guest_assertion_step, self.last_guest_assertion_return, self.active_guest_thread, self.signal_frame_count, self.pthreads.deferred_threads, self.suspended_guest_thread_count },
+                );
+            }
             std.debug.print(
                 "macho-processor: guest requested exception resume without a recoverable phase-2 cleanup chain: symbol={s} exception_arg=0x{x} rip=0x{x} rsp=0x{x} rbp=0x{x}\n",
                 .{ name, self.regs.rdi, self.regs.rip, self.regs.rsp, self.regs.rbp },
@@ -2832,18 +3780,19 @@ pub const MachOState = struct {
 
         if (std.mem.endsWith(u8, name, "_clock_gettime")) {
             if (self.guestMemory(self.regs.rsi, 16) == null) return .{ .unsupported = 14 };
-            self.write64(self.regs.rsi, self.monotonic_nanoseconds / 1_000_000_000);
-            self.write64(self.regs.rsi + 8, self.monotonic_nanoseconds % 1_000_000_000);
-            self.monotonic_nanoseconds +%= 1_000_000;
+            const now = self.guest_time.now();
+            self.write64(self.regs.rsi, now / 1_000_000_000);
+            self.write64(self.regs.rsi + 8, now % 1_000_000_000);
+            _ = self.guest_time.advanceBy(1_000_000);
             return .{ .handled = 0 };
         }
 
         if (std.mem.endsWith(u8, name, "_gettimeofday")) {
             if (self.guestMemory(self.regs.rdi, 16) == null) return .{ .unsupported = 14 };
-            const epoch_seconds: u64 = 1_719_000_000;
-            self.write64(self.regs.rdi, epoch_seconds + self.monotonic_nanoseconds / 1_000_000_000);
-            self.write64(self.regs.rdi + 8, (self.monotonic_nanoseconds % 1_000_000_000) / 1000);
-            self.monotonic_nanoseconds +%= 1_000_000;
+            const wall_now = self.guest_time.wallNow();
+            self.write64(self.regs.rdi, wall_now / 1_000_000_000);
+            self.write64(self.regs.rdi + 8, (wall_now % 1_000_000_000) / 1000);
+            _ = self.guest_time.advanceBy(1_000_000);
             return .{ .handled = 0 };
         }
 
@@ -2859,8 +3808,8 @@ pub const MachOState = struct {
             return .{ .handled = now };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__16chrono12steady_clock3nowEv")) {
-            const now = self.monotonic_nanoseconds;
-            self.monotonic_nanoseconds +%= 1_000_000;
+            const now = self.guest_time.now();
+            _ = self.guest_time.advanceBy(1_000_000);
             return .{ .handled = now };
         }
 
@@ -2872,7 +3821,7 @@ pub const MachOState = struct {
             const tv_nsec = std.mem.readInt(i64, req[8..16], .little);
             if (tv_sec < 0 or tv_nsec < 0) return .{ .handled = @bitCast(@as(i64, -1)) };
             const total_ns: u64 = (@as(u64, @intCast(tv_sec)) * 1_000_000_000) +| @as(u64, @intCast(tv_nsec));
-            self.monotonic_nanoseconds +|= total_ns;
+            _ = self.guest_time.advanceBy(total_ns);
             if (rem_ptr != 0) {
                 if (self.guestMemory(rem_ptr, 16)) |rem| {
                     @memset(rem, 0);
@@ -2882,7 +3831,10 @@ pub const MachOState = struct {
         }
 
         if (std.mem.eql(u8, name, "_open")) {
-            return .{ .handled = self.fs_forwarder.open(self) };
+            const path = self.guestCString(self.regs.rdi, 4096) orelse "";
+            const result = self.fs_forwarder.open(self);
+            self.noteProfileAccountOpen(path, result);
+            return .{ .handled = result };
         }
         if (std.mem.eql(u8, name, "_write")) {
             return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.write(self))) };
@@ -2894,7 +3846,10 @@ pub const MachOState = struct {
             return .{ .handled = self.fs_forwarder.fstatat(self) };
         }
         if (std.mem.eql(u8, name, "_openat")) {
-            return .{ .handled = self.fs_forwarder.openat(self) };
+            const path = self.guestCString(self.regs.rsi, 4096) orelse "";
+            const result = self.fs_forwarder.openat(self);
+            self.noteProfileAccountOpen(path, result);
+            return .{ .handled = result };
         }
         if (std.mem.eql(u8, name, "_fstat$INODE64") or std.mem.eql(u8, name, "_fstat")) {
             return .{ .handled = self.fs_forwarder.fstat(self) };
@@ -2921,7 +3876,11 @@ pub const MachOState = struct {
             return .{ .handled = self.fs_forwarder.readdir(self) };
         }
         if (std.mem.eql(u8, name, "_read")) {
-            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.read(self))) };
+            const guest_fd = self.regs.rdi;
+            const requested = self.regs.rdx;
+            const result = self.fs_forwarder.read(self);
+            self.noteProfileAccountRead(guest_fd, requested, result, 0);
+            return .{ .handled = @bitCast(result) };
         }
         if (std.mem.eql(u8, name, "_readv")) {
             return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readv(self))) };
@@ -2930,7 +3889,12 @@ pub const MachOState = struct {
             return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.writev(self))) };
         }
         if (std.mem.eql(u8, name, "_pread$INODE64") or std.mem.eql(u8, name, "_pread")) {
-            return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.pread(self))) };
+            const guest_fd = self.regs.rdi;
+            const requested = self.regs.rdx;
+            const offset = self.regs.rcx;
+            const result = self.fs_forwarder.pread(self);
+            self.noteProfileAccountRead(guest_fd, requested, result, offset);
+            return .{ .handled = @bitCast(result) };
         }
         if (std.mem.eql(u8, name, "_pwrite$INODE64") or std.mem.eql(u8, name, "_pwrite")) {
             return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.pwrite(self))) };
@@ -3030,6 +3994,26 @@ pub const MachOState = struct {
         }
         if (std.mem.endsWith(u8, name, "_fflush")) {
             return .{ .handled = self.handleFflush() };
+        }
+        if (std.mem.endsWith(u8, name, "_abort")) {
+            self.terminated = true;
+            self.exit_code = 1;
+            std.debug.print("macho-processor: guest called abort()\n", .{});
+            return .control_transferred;
+        }
+        if (std.mem.eql(u8, name, "__tlv_atexit")) {
+            _ = self.compat.registerAtexit(self.regs.rdi, self.regs.rsi, self.regs.rdx);
+            return .{ .handled = 0 };
+        }
+        if (std.mem.endsWith(u8, name, "_ffs")) {
+            const value = @as(u32, @truncate(self.regs.rdi));
+            const result: u64 = if (value == 0) 0 else @as(u64, @ctz(value)) + 1;
+            return .{ .handled = result };
+        }
+        if (std.mem.endsWith(u8, name, "_pthread_exit")) {
+            self.terminated = true;
+            self.exit_code = 0;
+            return .control_transferred;
         }
         if (std.mem.endsWith(u8, name, "_ftell")) {
             return .{ .handled = self.handleFtell() };
@@ -3173,11 +4157,23 @@ pub const MachOState = struct {
         };
         var inspection = self.unwinder.inspectThrow(self, thrown.type_info_address);
         const tracked_header = if (thrown.allocation) |allocation| allocation.storage_address else thrown.object_address;
-        const exception_header = if (self.regs.rdi != 0) self.regs.rdi else tracked_header;
+        // Some personality routines tail-call __Unwind_Resume after restoring
+        // a signal context that no longer preserves RDI. The allocation header
+        // recorded at __cxa_throw is still the ABI-correct exception pointer,
+        // so do not discard an otherwise recoverable phase-two transaction.
+        const supplied_header = self.regs.rdi;
+        const supplied_is_tracked = supplied_header == tracked_header or supplied_header == thrown.object_address;
+        const use_tracked_header = supplied_header == 0 or !supplied_is_tracked;
+        const exception_header = if (use_tracked_header) tracked_header else supplied_header;
         std.debug.print(
-            "macho-processor: Itanium orphan-resume recovery: symbol={s} supplied_exception=0x{x} tracked_exception=0x{x} frames={d} handler_found={}\n",
-            .{ symbol, self.regs.rdi, tracked_header, inspection.frame_count, inspection.handler != null },
+            "macho-processor: Itanium orphan-resume reconstruction: symbol={s} supplied_header=0x{x} tracked_header=0x{x} using_tracked={} rip=0x{x} rsp=0x{x} frames={d} handler_found={}\n",
+            .{ symbol, supplied_header, tracked_header, use_tracked_header, self.regs.rip, self.regs.rsp, inspection.frame_count, inspection.handler != null },
         );
+        if (exception_header == 0) {
+            self.unwinder.recordOrphanResume(false);
+            self.last_unwind_inspection = inspection;
+            return false;
+        }
         if (!self.unwinder.installPhaseTwo(self, &inspection, exception_header)) {
             self.unwinder.recordOrphanResume(false);
             self.last_unwind_inspection = inspection;
@@ -3364,6 +4360,7 @@ pub const MachOState = struct {
             .calloc => .{ .handled = self.memory_forwarder.allocateZeroed(self, self.regs.rdi, self.regs.rsi) orelse 0 },
             .chkstk => .{ .handled = self.regs.rax },
             .sysconf => .{ .handled = guestSysconf(@bitCast(@as(u32, @truncate(self.regs.rdi)))) },
+            .strtoul => self.handleImportSlow(imported),
         };
     }
 
@@ -3438,12 +4435,54 @@ pub const MachOState = struct {
             std.mem.eql(u8, name, "_pthread_join");
     }
 
+    fn isCooperativeYieldImport(name: []const u8) bool {
+        return std.mem.eql(u8, name, "_pthread_yield_np") or std.mem.eql(u8, name, "_sched_yield");
+    }
+
+    fn handleCooperativeYieldImport(self: *MachOState, imported: macho_metadata.ImportedSymbol, return_address: u64) bool {
+        if (!isCooperativeYieldImport(imported.name)) return false;
+        self.pthreads.noteSchedulerYield();
+        self.regs.rax = 0;
+        if (return_address == 0 or !self.isExecutableAddress(return_address)) {
+            self.faulted = true;
+            self.exit_code = 127;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+            self.terminated = true;
+            return true;
+        }
+        _ = self.pop();
+        self.regs.rip = return_address;
+        const previous_thread = self.active_guest_thread;
+        const switched = self.yieldActiveGuestThreadForWait(imported.name);
+        self.resolving_import_route = .pthread;
+        self.import_provider_override = .pthread_runtime;
+        if (self.pthreads.scheduler_yields <= 8 or self.pthreads.scheduler_yields % 1000 == 0) {
+            std.debug.print(
+                "scheduler: explicit guest yield #{d}: import={s} from=0x{x} to=0x{x} switched={} suspended={d} deferred={d}\n",
+                .{ self.pthreads.scheduler_yields, imported.name, previous_thread, self.active_guest_thread, switched, self.suspended_guest_thread_count, self.pthreads.deferred_threads },
+            );
+        }
+        return true;
+    }
+
     fn handleCooperativeWaitImport(self: *MachOState, imported: macho_metadata.ImportedSymbol, return_address: u64) bool {
         if (!isCooperativeWaitImport(imported.name)) return false;
-        const condvar_wait = std.mem.eql(u8, imported.name, "_pthread_cond_wait") or
+        const cpp_condvar_wait = std.mem.indexOf(u8, imported.name, "condition_variable15__do_timed_wait") != null or
+            std.mem.indexOf(u8, imported.name, "condition_variable4wait") != null or
+            std.mem.indexOf(u8, imported.name, "condition_variable10wait_until") != null;
+        const pthread_condvar_wait = std.mem.eql(u8, imported.name, "_pthread_cond_wait") or
             std.mem.eql(u8, imported.name, "_pthread_cond_timedwait") or
             std.mem.eql(u8, imported.name, "_pthread_cond_timedwait_relative_np");
-        if (condvar_wait and !self.pthreads.beginCooperativeCondvarWait(self)) return false;
+        const condvar_wait = cpp_condvar_wait or pthread_condvar_wait;
+        const timed_condvar_wait = std.mem.indexOf(u8, imported.name, "condition_variable15__do_timed_wait") != null or
+            std.mem.indexOf(u8, imported.name, "condition_variable10wait_until") != null or
+            std.mem.eql(u8, imported.name, "_pthread_cond_timedwait") or
+            std.mem.eql(u8, imported.name, "_pthread_cond_timedwait_relative_np");
+        if (cpp_condvar_wait) {
+            if (!self.pthreads.beginCooperativeCppCondvarWait(self, timed_condvar_wait)) return false;
+        } else if (pthread_condvar_wait and !self.pthreads.beginCooperativeCondvarWait(self, timed_condvar_wait)) {
+            return false;
+        }
         if (!condvar_wait) self.pthreads.collapsed_waits +|= 1;
         self.regs.rax = 0;
         if (return_address != 0 and self.isExecutableAddress(return_address)) {
@@ -3462,7 +4501,7 @@ pub const MachOState = struct {
         } else if (condvar_wait) {
             // If this is the only runnable worker, the collapsed wait still
             // must return with the caller's mutex reacquired.
-            _ = self.pthreads.resumeCooperativeWait(self.active_guest_thread);
+            _ = self.resumeSuspendedGuestThread();
         }
         return true;
     }
@@ -3472,7 +4511,11 @@ pub const MachOState = struct {
     // worker re-enters pthread_mutex_lock rather than falsely reporting that
     // it acquired the mutex.
     fn handleCooperativeMutexContention(self: *MachOState, imported: macho_metadata.ImportedSymbol) bool {
-        if (!std.mem.eql(u8, imported.name, "_pthread_mutex_lock")) return false;
+        if (!std.mem.eql(u8, imported.name, "_pthread_mutex_lock") and
+            !std.mem.eql(u8, imported.name, "__ZNSt3__15mutex4lockEv"))
+        {
+            return false;
+        }
         const owner = self.pthreads.currentThreadHandle(self);
         if (!self.pthreads.mutexWouldBlock(self.regs.rdi, owner)) return false;
         self.pthreads.collapsed_waits +|= 1;
@@ -3489,10 +4532,14 @@ pub const MachOState = struct {
             return;
         }
         const return_address = self.read64(self.regs.rsp);
+        if (self.handleCooperativeYieldImport(imported, return_address)) return;
         if (self.handleCooperativeMutexContention(imported)) return;
         if (self.handleCooperativeWaitImport(imported, return_address)) return;
+        const virtual_sleep_calls_before = self.dynamic_forwarder.virtualSleepCallCount();
+        var import_completed = false;
         switch (self.handleImport(imported)) {
             .handled => |result| {
+                import_completed = true;
                 self.regs.rax = result;
                 if (self.verbose_trace) {
                     std.debug.print(
@@ -3502,6 +4549,7 @@ pub const MachOState = struct {
                 }
             },
             .handled_void => {
+                import_completed = true;
                 if (self.verbose_trace) {
                     std.debug.print(
                         "  [handled void direct import] {s} from {s}; stub=0x{x} return=0x{x}\n",
@@ -3544,6 +4592,17 @@ pub const MachOState = struct {
         if (return_address != 0 and self.isExecutableAddress(return_address)) {
             _ = self.pop();
             self.regs.rip = return_address;
+            if (import_completed and self.dynamic_forwarder.virtualSleepCallCount() != virtual_sleep_calls_before) {
+                const sleeping_thread = self.active_guest_thread;
+                const switched = self.yieldActiveGuestThreadForWait("libc++ virtual sleep");
+                if (switched) self.cooperative_sleep_yields +|= 1;
+                if (switched and (self.cooperative_sleep_yields <= 16 or self.cooperative_sleep_yields % 100 == 0)) {
+                    std.debug.print(
+                        "scheduler: virtual sleep scheduling boundary #{d}: sleeper=0x{x} resumed=0x{x} switched={} suspended={d} deferred={d}\n",
+                        .{ self.cooperative_sleep_yields, sleeping_thread, self.active_guest_thread, switched, self.suspended_guest_thread_count, self.pthreads.deferred_threads },
+                    );
+                }
+            }
         } else {
             self.faulted = true;
             self.exit_code = 127;
@@ -3784,6 +4843,78 @@ pub const MachOState = struct {
         return 0;
     }
 
+    fn tryRecoverClassifiedAssertionUd2(self: *MachOState, instruction_len: u8) bool {
+        if (self.last_guest_assertion_class != .timer_queue_wait_item_state) return false;
+        const step_delta = self.executed_steps -| self.last_guest_assertion_step;
+        const address_delta = if (self.regs.rip >= self.last_guest_assertion_return)
+            self.regs.rip - self.last_guest_assertion_return
+        else
+            self.last_guest_assertion_return - self.regs.rip;
+        const snapshot = guest_assertion_recovery.timerQueueSnapshot(self, self.regs.rbp) orelse return false;
+        const action = guest_assertion_recovery.timerQueueAction(
+            step_delta,
+            address_delta,
+            snapshot.frame_state,
+            snapshot.object_state,
+        );
+        switch (action) {
+            .none => return false,
+            .replay_false_negative_idle_cas => {
+                const replay_rip = guest_assertion_recovery.applyIdleCasReplay(
+                    self,
+                    snapshot,
+                    self.last_guest_assertion_return,
+                ) orelse return false;
+                self.classified_ud2_recoveries +|= 1;
+                const owner = self.metadata.nearestSymbol(self.last_guest_assertion_return);
+                const owner_address = if (owner) |symbol| self.last_guest_assertion_return -| symbol.offset else self.last_guest_assertion_return;
+                const observation = self.diagnostic_throttler.observe(
+                    .classified_ud2_recovery,
+                    owner_address,
+                    @intFromEnum(action),
+                );
+                if (observation.disposition == .detail) {
+                    std.debug.print(
+                        "macho-processor: classified UD2 recovery #{d}: timer queue strong CAS false-negative frame/live=kIdle; owner={s} wait_item=0x{x} state kIdle->kInCallback replay=0x{x} callback_pending=true step_delta={d} address_delta={d}\n",
+                        .{ self.classified_ud2_recoveries, if (owner) |symbol| symbol.name else "<unknown>", snapshot.wait_item, replay_rip, step_delta, address_delta },
+                    );
+                } else if (observation.disposition == .checkpoint) {
+                    std.debug.print(
+                        "macho-processor: repeated classified UD2 recovery checkpoint: owner={s} case=idle_cas_false_negative occurrence={d} suppressed_since_previous={d} total_recoveries={d}\n",
+                        .{ if (owner) |symbol| symbol.name else "<unknown>", observation.occurrence, observation.suppressed_since_emit, self.classified_ud2_recoveries },
+                    );
+                }
+                self.last_guest_assertion_class = .none;
+                self.regs.rip = replay_rip;
+                return true;
+            },
+            .quarantine_callback_owned_duplicate => {
+                self.classified_ud2_recoveries +|= 1;
+                const owner = self.metadata.nearestSymbol(self.last_guest_assertion_return);
+                const owner_address = if (owner) |symbol| self.last_guest_assertion_return -| symbol.offset else self.last_guest_assertion_return;
+                const observation = self.diagnostic_throttler.observe(
+                    .classified_ud2_recovery,
+                    owner_address,
+                    (@as(u64, @intFromEnum(action)) << 8) | snapshot.frame_state,
+                );
+                if (observation.disposition == .detail) {
+                    std.debug.print(
+                        "macho-processor: classified UD2 recovery #{d}: duplicate timer queue reference owner={s} frame/live={s}; wait_item=0x{x} action=quarantine_duplicate resume=0x{x} step_delta={d} address_delta={d}\n",
+                        .{ self.classified_ud2_recoveries, if (owner) |symbol| symbol.name else "<unknown>", timerQueueStateName(snapshot.frame_state), snapshot.wait_item, self.regs.rip +% instruction_len, step_delta, address_delta },
+                    );
+                } else if (observation.disposition == .checkpoint) {
+                    std.debug.print(
+                        "macho-processor: repeated classified UD2 recovery checkpoint: owner={s} case=callback_owned_duplicate state={s} occurrence={d} suppressed_since_previous={d} total_recoveries={d}\n",
+                        .{ if (owner) |symbol| symbol.name else "<unknown>", timerQueueStateName(snapshot.frame_state), observation.occurrence, observation.suppressed_since_emit, self.classified_ud2_recoveries },
+                    );
+                }
+                self.last_guest_assertion_class = .none;
+                self.regs.rip +%= instruction_len;
+                return true;
+            },
+        }
+    }
+
     fn deliverGuestSignal(self: *MachOState, signal: u8, fault_rip: u64, instruction_len: u8) bool {
         const signal_index = guestSignalIndex(signal) orelse return false;
         const action = self.signal_actions[signal_index];
@@ -3803,6 +4934,12 @@ pub const MachOState = struct {
                 "macho-processor: deferred recursive guest signal {d} at rip=0x{x}; outer handler remains active\n",
                 .{ signal, fault_rip },
             );
+            if (self.last_guest_assertion_class == .breakpoint_untracked_thread) {
+                std.debug.print(
+                    "macho-processor: recursive signal provenance: Processor::OnThreadBreakpointHit asserted because the active modeled thread was absent from Xenia's debugger registry; this nested UD2 is handler fallout, not a second independent backend failure\n",
+                    .{},
+                );
+            }
             return true;
         }
         if (!self.isExecutableAddress(action.handler) or self.signal_frame_count >= self.signal_frames.len) return false;
@@ -3821,6 +4958,7 @@ pub const MachOState = struct {
         frame.signal = signal;
         frame.instruction_len = instruction_len;
         frame.fault_rip = fault_rip;
+        frame.assertion_class = self.last_guest_assertion_class;
         self.signal_frame_count += 1;
         self.push(GUEST_SIGNAL_RETURN_SENTINEL);
         if (self.terminated) {
@@ -3837,10 +4975,31 @@ pub const MachOState = struct {
         }
         self.regs.rip = action.handler;
         self.guest_signal_deliveries +|= 1;
+        const backend_correlated = self.backend_diagnostics.signalCorrelates(self.executed_steps, fault_rip);
+        if (backend_correlated) self.backend_diagnostics.noteSignalDelivery();
         std.debug.print(
             "macho-processor: delivered guest signal {d} to 0x{x}; fault_rip=0x{x} siginfo=0x{x} ucontext=0x{x}\n",
             .{ signal, action.handler, fault_rip, frame.siginfo, frame.ucontext },
         );
+        if (backend_correlated) {
+            std.debug.print(
+                "macho-processor: guest signal correlation: signal={d} fault_rip=0x{x} is linked to backend assertion kind={s} assertion_return=0x{x} step_delta={d}\n",
+                .{ signal, fault_rip, @tagName(self.backend_diagnostics.last_backend_assertion_binding), self.backend_diagnostics.last_backend_assertion_rip, self.executed_steps -| self.backend_diagnostics.last_backend_assertion_step },
+            );
+        }
+        const assertion_distance = if (fault_rip >= self.last_guest_assertion_return)
+            fault_rip - self.last_guest_assertion_return
+        else
+            self.last_guest_assertion_return - fault_rip;
+        if (self.last_guest_assertion_class != .none and
+            self.executed_steps -| self.last_guest_assertion_step <= 4096 and
+            assertion_distance <= 16)
+        {
+            std.debug.print(
+                "macho-processor: guest signal assertion provenance: signal={d} fault_rip=0x{x} assertion={s} assertion_return=0x{x} address_delta={d} step_delta={d}\n",
+                .{ signal, fault_rip, @tagName(self.last_guest_assertion_class), self.last_guest_assertion_return, assertion_distance, self.executed_steps -| self.last_guest_assertion_step },
+            );
+        }
         return true;
     }
 
@@ -3901,6 +5060,13 @@ pub const MachOState = struct {
             );
             self.regs.rip = resume_rip;
         }
+        if (self.backend_diagnostics.signalReturnCorrelates(frame.fault_rip)) {
+            self.backend_diagnostics.noteSignalReturn();
+            std.debug.print(
+                "macho-processor: guest signal correlation resolved: signal={d} backend_assertion={s} fault_rip=0x{x} resume_rip=0x{x}; execution continued\n",
+                .{ frame.signal, @tagName(self.backend_diagnostics.last_backend_assertion_binding), frame.fault_rip, self.regs.rip },
+            );
+        }
         if (self.verbose_trace) {
             std.debug.print(
                 "macho-processor: guest signal {d} returned; fault_rip=0x{x} resume_rip=0x{x}\n",
@@ -3916,6 +5082,79 @@ pub const MachOState = struct {
         self.terminated = true;
     }
 
+    fn recoverLibcppSharedControlBlockCall(
+        self: *MachOState,
+        instruction_address: u64,
+        operand_address: u64,
+    ) ?u64 {
+        const caller = self.metadata.nearestSymbol(instruction_address) orelse return null;
+        const object = self.regs.rdi;
+        const object_bytes = self.guestMemoryConst(object, 3 * @sizeOf(u64));
+        const vtable_symbol = self.internal_targets.libcpp_atomic_bool_control_block_vtable;
+        const address_point = std.math.add(
+            u64,
+            vtable_symbol,
+            libcpp_shared_control_block.vtable_address_point_offset,
+        ) catch 0;
+        const slot_address = std.math.add(
+            u64,
+            address_point,
+            libcpp_shared_control_block.on_zero_shared_slot_offset,
+        ) catch 0;
+        const vtable_mapped = vtable_symbol != 0 and self.guestMemoryConst(vtable_symbol, 5 * @sizeOf(u64)) != null;
+        const slot_target = if (vtable_mapped) self.read64(slot_address) else 0;
+        const decision = libcpp_shared_control_block.assess(.{
+            .operation = "call_mem64",
+            .caller_symbol = caller.name,
+            .operand_address = operand_address,
+            .object_address = object,
+            .current_vptr = if (object_bytes != null) self.read64(object) else 0,
+            .strong_count = if (object_bytes != null) self.read64(object + 8) else 0,
+            .weak_count = if (object_bytes != null) self.read64(object + 16) else 0,
+            .vtable_symbol_address = vtable_symbol,
+            .slot_target = slot_target,
+            .object_mapped = object_bytes != null,
+            .vtable_mapped = vtable_mapped,
+            .target_executable = self.isExecutableAddress(slot_target),
+        });
+        self.libcpp_shared_control_blocks.record(decision);
+        switch (decision) {
+            .not_applicable => return null,
+            .rejected => |reason| {
+                std.debug.print(
+                    "macho-processor: libc++ shared control-block recovery rejected: object=0x{x} operand=0x{x} vptr=0x{x} strong=0x{x} weak=0x{x} reason={s}\n",
+                    .{
+                        object,
+                        operand_address,
+                        if (object_bytes != null) self.read64(object) else 0,
+                        if (object_bytes != null) self.read64(object + 8) else 0,
+                        if (object_bytes != null) self.read64(object + 16) else 0,
+                        reason,
+                    },
+                );
+                return null;
+            },
+            .recover => |recovery| {
+                self.write64(object, recovery.address_point);
+                std.debug.print(
+                    "macho-processor: libc++ shared control-block vptr restored: object=0x{x} vtable_symbol=0x{x} address_point=0x{x} slot=0x{x} target=0x{x} strong=0x{x} weak=0x{x} caller={s}+0x{x}; continuing verified __on_zero_shared dispatch\n",
+                    .{
+                        object,
+                        vtable_symbol,
+                        recovery.address_point,
+                        recovery.slot_address,
+                        recovery.target,
+                        self.read64(object + 8),
+                        self.read64(object + 16),
+                        caller.name,
+                        caller.offset,
+                    },
+                );
+                return recovery.target;
+            },
+        }
+    }
+
     fn terminateForInvalidControlTransfer(self: *MachOState, context: ControlTransferContext) void {
         var failure = exit_diagnostics.ControlTransferFailure{
             .kind = context.kind,
@@ -3927,6 +5166,19 @@ pub const MachOState = struct {
             .target_mapped = self.addrToOffset(context.target_address) != null,
             .target_executable = self.isExecutableAddress(context.target_address),
         };
+        if (self.guestMemoryConst(context.instruction_address, 16)) |bytes| {
+            const byte_count: usize = @min(bytes.len, failure.instruction_bytes.len);
+            @memcpy(failure.instruction_bytes[0..byte_count], bytes[0..byte_count]);
+            failure.instruction_byte_count = @intCast(byte_count);
+            const decoded = decodeInsn(bytes[0..byte_count]);
+            failure.decoded_operation = @tagName(decoded.op);
+            failure.decoded_length = decoded.len;
+        }
+        if (context.operand_address != 0) {
+            if (self.guestMemoryConst(context.operand_address, 8)) |_| {
+                failure.operand_value = self.read64(context.operand_address);
+            }
+        }
         if (self.metadata.nearestSymbol(context.instruction_address)) |caller| {
             failure.caller_symbol = caller.name;
             failure.caller_offset = caller.offset;
@@ -3957,10 +5209,338 @@ pub const MachOState = struct {
                 if (failure.candidate_import.len != 0) failure.candidate_import else "<none>",
             },
         );
+        if (failure.instruction_byte_count != 0) {
+            std.debug.print(
+                "macho-processor: transfer decode: op={s} len={d} bytes={any} indirect=[0x{x}]=0x{x} mapped={} executable={} import_image={s}\n",
+                .{
+                    failure.decoded_operation,
+                    failure.decoded_length,
+                    failure.instruction_bytes[0..failure.instruction_byte_count],
+                    failure.operand_address,
+                    failure.operand_value,
+                    failure.target_mapped,
+                    failure.target_executable,
+                    if (failure.candidate_image.len != 0) failure.candidate_image else "<none>",
+                },
+            );
+        }
+        self.logCrashDiagnostics(context);
         self.faulted = true;
         self.exit_code = 127;
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
         self.terminated = true;
+    }
+
+    /// Log extensive crash diagnostics around an invalid control transfer.
+    /// Called before the process is marked as faulted.
+    fn logCrashDiagnostics(self: *MachOState, context: ControlTransferContext) void {
+        std.debug.print("macho-processor: CRASH DIAGNOSTICS BEGIN\n", .{});
+
+        // 1. Thread info
+        const thread_handle = self.active_guest_thread;
+        const thread_id = self.threadNumericId(thread_handle);
+        const thread_role = self.threadRole(thread_handle, self.regs.rip);
+        std.debug.print(
+            "macho-processor:   thread: handle=0x{x} numeric_id={d} role={s} rip=0x{x} rsp=0x{x} rbp=0x{x}\n",
+            .{ thread_handle, thread_id, thread_role, self.regs.rip, self.regs.rsp, self.regs.rbp },
+        );
+
+        // 2. Full register dump
+        std.debug.print(
+            "macho-processor:   regs: rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n" ++ "macho-processor:         rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n" ++ "macho-processor:         r8=0x{x}  r9=0x{x}  r10=0x{x} r11=0x{x}\n" ++ "macho-processor:         r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n" ++ "macho-processor:         rip=0x{x} rflags=0x{x}\n",
+            .{
+                self.regs.rax, self.regs.rbx,    self.regs.rcx, self.regs.rdx,
+                self.regs.rsi, self.regs.rdi,    self.regs.rbp, self.regs.rsp,
+                self.regs.r8,  self.regs.r9,     self.regs.r10, self.regs.r11,
+                self.regs.r12, self.regs.r13,    self.regs.r14, self.regs.r15,
+                self.regs.rip, self.regs.rflags,
+            },
+        );
+
+        // 3. Instruction context (re-decode showing addressing mode)
+        {
+            const insn_bytes = self.guestMemoryConst(context.instruction_address, 16);
+            if (insn_bytes) |bytes| {
+                const dec = decodeInsn(bytes[0..@min(bytes.len, 15)]);
+                const addrmode = if (dec.rip_relative)
+                    "rip_relative"
+                else if (dec.sib_has_index)
+                    "sib_indexed"
+                else
+                    "direct";
+                const dst_reg = @tagName(dec.dst_reg);
+                std.debug.print(
+                    "macho-processor:   instr decode: op={s} addr_mode={s} addr=0x{x} dst_reg={s}\n",
+                    .{ @tagName(dec.op), addrmode, dec.addr, dst_reg },
+                );
+                if (dec.sib_has_index) {
+                    const idx_reg = @tagName(dec.sib_index_reg);
+                    const base_reg = if (dec.sib_has_base) @tagName(dec.sib_base_reg) else "none";
+                    std.debug.print(
+                        "macho-processor:     sib: index={s} scale={d} base={s}\n",
+                        .{ idx_reg, dec.sib_scale, base_reg },
+                    );
+                }
+            }
+        }
+
+        // 4. Operand memory region info and nearby jump table dump
+        if (context.operand_address != 0) {
+            const op_offset = self.addrToOffset(context.operand_address);
+            const op_mapped = op_offset != null;
+            if (op_mapped) {
+                const op_sym = self.metadata.nearestSymbol(context.operand_address);
+                const op_value = self.read64(context.operand_address);
+                std.debug.print(
+                    "macho-processor:   operand 0x{x}: mapped=yes offset=0x{x} value=0x{x}\n",
+                    .{ context.operand_address, op_offset.?, op_value },
+                );
+                // Show nearest symbol with stale-match warning
+                if (op_sym) |s| {
+                    const stale = if (s.offset > 1024) " (STALE MATCH: offset > 1024)" else "";
+                    std.debug.print(
+                        "macho-processor:   nearest symbol: {s}+0x{x}{s}\n",
+                        .{ s.name, s.offset, stale },
+                    );
+                }
+            } else {
+                std.debug.print(
+                    "macho-processor:   operand 0x{x}: mapped=no offset=<none>\n",
+                    .{context.operand_address},
+                );
+            }
+
+            // Segment/region info for operand address
+            {
+                var found_seg = false;
+                for (self.segments) |seg| {
+                    if (context.operand_address >= seg.vmaddr and context.operand_address < seg.vmaddr + seg.vmsize) {
+                        const rel_off = context.operand_address - seg.vmaddr;
+                        std.debug.print(
+                            "macho-processor:   address region: Mach-O segment {s} [0x{x}-0x{x}] offset_in_segment=0x{x} prot=",
+                            .{ seg.name, seg.vmaddr, seg.vmaddr + seg.vmsize - 1, rel_off },
+                        );
+                        if (seg.initprot & 1 != 0) {
+                            std.debug.print("r", .{});
+                        } else {
+                            std.debug.print("-", .{});
+                        }
+                        if (seg.initprot & 2 != 0) {
+                            std.debug.print("w", .{});
+                        } else {
+                            std.debug.print("-", .{});
+                        }
+                        if (seg.initprot & 4 != 0) {
+                            std.debug.print("x", .{});
+                        } else {
+                            std.debug.print("-", .{});
+                        }
+                        std.debug.print("\n", .{});
+                        found_seg = true;
+                        break;
+                    }
+                }
+                if (!found_seg) {
+                    // Not in a Mach-O segment; check if it's a sparse mapping
+                    const in_sparse = self.sparse_memory.contains(context.operand_address, 8);
+                    std.debug.print(
+                        "macho-processor:   address region: outside Mach-O segments sparse_mapped={}\n",
+                        .{in_sparse},
+                    );
+                }
+            }
+
+            // Dump nearby entries (16 qwords: 8 before, the operand, 8 after)
+            std.debug.print("macho-processor:   jump table dump [0x{x} +/- 64 bytes]:\n", .{context.operand_address});
+            const dump_start = context.operand_address -| 64;
+            const dump_end = context.operand_address + 72;
+            var dump_addr = dump_start;
+            while (dump_addr < dump_end) : (dump_addr += 8) {
+                const marker = if (dump_addr == context.operand_address) " <-- OPERAND" else "";
+                if (self.addrToOffset(dump_addr)) |_| {
+                    const val = self.read64(dump_addr);
+                    const val_sym = self.metadata.nearestSymbol(val);
+                    std.debug.print(
+                        "macho-processor:     [0x{x}]=0x{x}{s}",
+                        .{ dump_addr, val, marker },
+                    );
+                    if (val_sym) |s| {
+                        std.debug.print(" {s}+0x{x}", .{ s.name, s.offset });
+                    }
+                    std.debug.print("\n", .{});
+                } else {
+                    std.debug.print("macho-processor:     [0x{x}]=<unmapped>{s}\n", .{ dump_addr, marker });
+                }
+            }
+
+            // Corruption pattern analysis on jump table entries
+            {
+                var hi32_const: ?u32 = null;
+                var hi32_all_same = true;
+                var lo32_prev: ?u32 = null;
+                var lo32_step: ?i64 = null;
+                var lo32_arith_prog = true;
+                var lo32_counts: u32 = 0;
+                var lo32_all_small = true;
+
+                var scan_addr = context.operand_address -| 64;
+                const scan_end = context.operand_address + 72;
+                while (scan_addr < scan_end) : (scan_addr += 8) {
+                    if (self.addrToOffset(scan_addr) == null) continue;
+                    const val = self.read64(scan_addr);
+                    if (val == 0) continue; // skip zero entries for pattern analysis
+                    const hi32 = @as(u32, @truncate(val >> 32));
+                    const lo32 = @as(u32, @truncate(val));
+                    lo32_counts += 1;
+                    if (lo32 >= 0x1000000000) lo32_all_small = false;
+
+                    // Hi32 constancy check
+                    if (hi32_const) |h| {
+                        if (h != hi32) hi32_all_same = false;
+                    } else {
+                        hi32_const = hi32;
+                    }
+
+                    // Lo32 arithmetic progression check
+                    if (lo32_prev) |p| {
+                        const diff = @as(i64, lo32) - @as(i64, p);
+                        if (lo32_step) |known_step| {
+                            if (diff != known_step) lo32_arith_prog = false;
+                        } else {
+                            lo32_step = diff;
+                        }
+                    }
+                    lo32_prev = lo32;
+                }
+
+                // Print hi32 analysis
+                if (lo32_counts > 1 and hi32_const != null and hi32_all_same) {
+                    const hi = hi32_const.?;
+                    std.debug.print(
+                        "macho-processor:   corruption pattern: all entries have constant high 32 bits = 0x{x}",
+                        .{hi},
+                    );
+                    if (hi == 0xfffffc00) {
+                        std.debug.print(" (kernel-space range, possible sign-extended 32-bit address)\n", .{});
+                    } else if (hi == 0x00000000) {
+                        std.debug.print(" (entries are valid 32-bit addresses in low 4GB)\n", .{});
+                    } else if (hi == 0xffffffff) {
+                        std.debug.print(" (possible -1 / invalid pattern)\n", .{});
+                    } else if (hi == 0x00007fff) {
+                        std.debug.print(" (possible userspace address on macOS)\n", .{});
+                    } else {
+                        std.debug.print("\n", .{});
+                    }
+
+                    // Interpret the entries as 32-bit pointers
+                    std.debug.print("macho-processor:   interpreting as 32-bit pointer table:\n", .{});
+                    scan_addr = context.operand_address -| 64;
+                    while (scan_addr < scan_end) : (scan_addr += 8) {
+                        if (self.addrToOffset(scan_addr) == null) continue;
+                        const val = self.read64(scan_addr);
+                        if (val == 0) continue;
+                        const lo32 = @as(u32, @truncate(val));
+                        const lo_sym = self.metadata.nearestSymbol(lo32);
+                        const lo_small = if (lo32 < 0x1000) " (looks like a small offset, not a pointer)" else "";
+                        if (lo_sym) |s| {
+                            std.debug.print(
+                                "macho-processor:     0x{x} -> 0x{x} (lo32) {s}+0x{x}{s}\n",
+                                .{ scan_addr, lo32, s.name, s.offset, lo_small },
+                            );
+                        } else {
+                            std.debug.print(
+                                "macho-processor:     0x{x} -> 0x{x} (lo32){s}\n",
+                                .{ scan_addr, lo32, lo_small },
+                            );
+                        }
+                    }
+                }
+
+                // Print lo32 arithmetic progression analysis
+                if (lo32_counts > 1 and lo32_arith_prog and lo32_step != null) {
+                    const step_val = lo32_step.?;
+                    std.debug.print(
+                        "macho-processor:   corruption pattern: lo32 entries form arithmetic progression (step={d}, decreasing={}). Table was shifted by one entry (read as wrong-type entries).\n",
+                        .{ @abs(step_val), step_val < 0 },
+                    );
+                }
+
+                // Print lo32 small offset warning
+                if (lo32_counts > 1 and lo32_all_small) {
+                    std.debug.print(
+                        "macho-processor:   corruption pattern: all lo32 values are small (< 4GB). Entries may be 32-bit offsets, not addresses.\n",
+                        .{},
+                    );
+                }
+            }
+        }
+
+        // 5. Suspended thread table snapshot
+        if (self.suspended_guest_thread_count > 0) {
+            std.debug.print("macho-processor:   suspended threads ({d}):\n", .{self.suspended_guest_thread_count});
+            for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |st, i| {
+                const st_sym = self.metadata.nearestSymbol(st.regs.rip);
+                std.debug.print(
+                    "macho-processor:     [{d}] handle=0x{x} rip=0x{x} rsp=0x{x} reason={s} suspended_step={d}",
+                    .{ i, st.handle, st.regs.rip, st.regs.rsp, st.reason, st.suspended_step },
+                );
+                if (st_sym) |s| {
+                    std.debug.print(" {s}+0x{x}", .{ s.name, s.offset });
+                }
+                std.debug.print("\n", .{});
+            }
+        }
+
+        // 6. Guest backtrace (walk stack via rbp chain)
+        std.debug.print("macho-processor:   guest backtrace (rbp chain):\n", .{});
+        var frame_rbp = self.regs.rbp;
+        var frame_rip = self.regs.rip;
+        var frame_depth: usize = 0;
+        while (frame_depth < 16) : (frame_depth += 1) {
+            const frame_sym = self.metadata.nearestSymbol(frame_rip);
+            std.debug.print(
+                "macho-processor:     #{d} rip=0x{x} rbp=0x{x}",
+                .{ frame_depth, frame_rip, frame_rbp },
+            );
+            if (frame_sym) |s| {
+                std.debug.print(" {s}+0x{x}", .{ s.name, s.offset });
+            }
+            std.debug.print("\n", .{});
+            // Walk to next frame: saved rbp is at [rbp], saved return address is at [rbp+8]
+            if (frame_rbp == 0 or self.addrToOffset(frame_rbp) == null) break;
+            const next_rbp = self.read64(frame_rbp);
+            const next_rip_offset = frame_rbp + 8;
+            if (next_rbp == 0 or next_rbp <= frame_rbp) {
+                // rbp chain broken; try reading return address at known stack slot
+                if (self.addrToOffset(next_rip_offset) != null) {
+                    frame_rip = self.read64(next_rip_offset);
+                    break;
+                }
+                break;
+            }
+            if (self.addrToOffset(next_rip_offset) == null) break;
+            frame_rip = self.read64(next_rip_offset);
+            frame_rbp = next_rbp;
+        }
+
+        // 7. Scheduler counters
+        std.debug.print(
+            "macho-processor:   scheduler: active=0x{x} suspended={d} switches={d} returns={d}" ++ " wait_yields={d} quantum_yields={d} rotation_yields={d}" ++ " preserved_resumes={d} wait_resumes={d} self_resumes={d}" ++ " starvation_warnings={d}\n",
+            .{
+                self.active_guest_thread,
+                self.suspended_guest_thread_count,
+                self.cooperative_thread_switches,
+                self.cooperative_thread_returns,
+                self.cooperative_wait_yields,
+                self.cooperative_quantum_yields,
+                self.cooperative_rotation_yields,
+                self.cooperative_preserved_register_resumes,
+                self.cooperative_wait_result_resumes,
+                self.cooperative_self_resumes,
+                self.cooperative_starvation_warnings,
+            },
+        );
+        std.debug.print("macho-processor: CRASH DIAGNOSTICS END\n", .{});
     }
 
     fn handleOpen(self: *MachOState) u64 {
@@ -4447,13 +6027,26 @@ pub const MachOState = struct {
 
     fn recordTrace(self: *MachOState, decoded: DecodedInsn) void {
         self.trace_entries[self.trace_index] = .{
+            .thread_handle = self.active_guest_thread,
             .rip = self.regs.rip,
             .op = decoded.op,
             .len = decoded.len,
             .rsp = self.regs.rsp,
             .rax = self.regs.rax,
+            .rbx = self.regs.rbx,
             .rcx = self.regs.rcx,
             .rdx = self.regs.rdx,
+            .rsi = self.regs.rsi,
+            .rdi = self.regs.rdi,
+            .rbp = self.regs.rbp,
+            .r8 = self.regs.r8,
+            .r9 = self.regs.r9,
+            .r10 = self.regs.r10,
+            .r11 = self.regs.r11,
+            .r12 = self.regs.r12,
+            .r13 = self.regs.r13,
+            .r14 = self.regs.r14,
+            .r15 = self.regs.r15,
         };
         self.trace_index = (self.trace_index + 1) % TRACE_BUFFER_LEN;
         if (self.trace_index == 0) self.trace_filled = true;
@@ -4478,8 +6071,9 @@ pub const MachOState = struct {
             else
                 i;
             const entry = self.trace_entries[idx];
-            log.err("trace[{d}]: rip=0x{x} op={s} len={d} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
+            log.err("trace[{d}]: thread=0x{x} rip=0x{x} op={s} len={d} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
                 i,
+                entry.thread_handle,
                 entry.rip,
                 @tagName(entry.op),
                 entry.len,
@@ -4582,6 +6176,34 @@ pub const MachOState = struct {
         } else {
             self.regs.rflags &= ~flag;
         }
+    }
+
+    fn executeBtrRegister(self: *MachOState, d: DecodedInsn) void {
+        const width = @as(u64, @intFromEnum(d.size));
+        const bit_index = self.regVal(d.src_reg, d.size) & (width - 1);
+        const mask = @as(u64, 1) << @as(u6, @intCast(bit_index));
+        const value = self.regVal(d.dst_reg, d.size);
+        self.setFlag(RFL_CF, value & mask != 0);
+        self.setReg(d.dst_reg, d.size, value & ~mask);
+    }
+
+    fn executeBtrMemory(self: *MachOState, d: DecodedInsn) void {
+        const width = @as(i64, @intFromEnum(d.size));
+        const byte_width = @divExact(width, 8);
+        const raw_index = self.regVal(d.src_reg, d.size);
+        const bit_index: i64 = switch (d.size) {
+            .bits16 => @as(i16, @bitCast(@as(u16, @truncate(raw_index)))),
+            .bits32 => @as(i32, @bitCast(@as(u32, @truncate(raw_index)))),
+            .bits64 => @bitCast(raw_index),
+            .bits8 => unreachable,
+        };
+        const element_offset = @divFloor(bit_index, width);
+        const element_address = d.addr +% @as(u64, @bitCast(element_offset * byte_width));
+        const bit_in_element: u6 = @intCast(@mod(bit_index, width));
+        const mask = @as(u64, 1) << bit_in_element;
+        const value = self.readMemVal(element_address, d.size);
+        self.setFlag(RFL_CF, value & mask != 0);
+        self.writeMemVal(element_address, d.size, value & ~mask);
     }
 
     fn terminateForMemoryAccess(self: *MachOState, check: x64_decoder.highway.MemoryCheck, instruction: []const u8) void {
@@ -4718,7 +6340,7 @@ pub const MachOState = struct {
         self.initializer_checkpoint = .{
             .heap_next = self.heap_next,
             .compat = self.compat,
-            .monotonic_nanoseconds = self.monotonic_nanoseconds,
+            .monotonic_nanoseconds = self.guest_time.now(),
             .ios_xalloc_next = self.ios_xalloc_next,
             .cxxopts_split_accelerations = self.cxxopts_split_accelerations,
             .guest_errno_address = self.guest_errno_address,
@@ -4730,7 +6352,7 @@ pub const MachOState = struct {
         const complete = self.initializer_memory.rollback(self.mem);
         self.heap_next = checkpoint.heap_next;
         self.compat = checkpoint.compat;
-        self.monotonic_nanoseconds = checkpoint.monotonic_nanoseconds;
+        self.guest_time.monotonic_ns = checkpoint.monotonic_nanoseconds;
         self.ios_xalloc_next = checkpoint.ios_xalloc_next;
         self.cxxopts_split_accelerations = checkpoint.cxxopts_split_accelerations;
         self.guest_errno_address = checkpoint.guest_errno_address;
@@ -4802,7 +6424,7 @@ pub const MachOState = struct {
 
         var steps: u64 = 0;
         while (!self.terminated and !self.initializer_abort_requested and
-            self.regs.rip != INITIALIZER_RETURN_SENTINEL and steps < INITIALIZER_STEP_LIMIT) : (steps += 1)
+            self.regs.rip != INITIALIZER_RETURN_SENTINEL and steps < INITIALIZER_STEP_LIMIT) : (steps +|= 1)
         {
             if (!self.step()) break;
         }
@@ -5029,7 +6651,90 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn handleLibcppBasicStringSubstr(self: *MachOState) bool {
+        const entry = self.internal_targets.libcxx_basic_string_substr;
+        if (entry == 0 or self.regs.rip != entry) return false;
+
+        const destination = self.regs.rdi;
+        const source_object = self.regs.rsi;
+        const position = self.regs.rdx;
+        const count = self.regs.rcx;
+        const source_view = compat_runtime.libcppStringView(self, source_object) orelse {
+            std.debug.print(
+                "macho-processor: libc++ basic_string::substr rejected unreadable source object=0x{x} destination=0x{x}\n",
+                .{ source_object, destination },
+            );
+            return false;
+        };
+        if (source_view.length > 1 << 20 or
+            self.guestMemoryConst(source_view.address, source_view.length) == null)
+        {
+            std.debug.print(
+                "macho-processor: libc++ basic_string::substr rejected corrupt source: object=0x{x} data=0x{x} length={d} pos={d} count={d}\n",
+                .{ source_object, source_view.address, source_view.length, position, count },
+            );
+            return false;
+        }
+        if (position > source_view.length) {
+            // Preserve libc++'s std::out_of_range path instead of converting a
+            // programming error into a different string.
+            std.debug.print(
+                "macho-processor: libc++ basic_string::substr out-of-range delegated to guest: source_length={d} pos={d} count={d}\n",
+                .{ source_view.length, position, count },
+            );
+            return false;
+        }
+
+        const source_bytes = self.guestMemoryConst(source_view.address, source_view.length).?;
+        const profile_device = std.mem.startsWith(u8, source_bytes, "User_") and
+            std.mem.endsWith(u8, source_bytes, ":");
+        var preview_buffer: [256]u8 = undefined;
+        const preview_length = @min(source_bytes.len, preview_buffer.len);
+        @memcpy(preview_buffer[0..preview_length], source_bytes[0..preview_length]);
+        const preview = preview_buffer[0..preview_length];
+        const result_length = compat_runtime.substringLibcppString(
+            self,
+            destination,
+            source_object,
+            position,
+            count,
+        ) orelse return false;
+        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
+        const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
+        const vfs_resolution = if (caller) |symbol|
+            std.mem.indexOf(u8, symbol.name, "VirtualFileSystem11ResolvePath") != null
+        else
+            false;
+        self.libcxx_string_substr_fast_paths +|= 1;
+        if (self.libcxx_string_substr_fast_paths <= 16 or vfs_resolution or profile_device) {
+            std.debug.print(
+                "macho-processor: libc++ basic_string::substr fast path #{d}: source_object=0x{x} destination=0x{x} source_length={d} pos={d} count={d} result_length={d} caller=0x{x} {s}+0x{x} source='{s}'\n",
+                .{ self.libcxx_string_substr_fast_paths, source_object, destination, source_view.length, position, count, result_length, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, preview },
+            );
+        }
+        if (vfs_resolution) {
+            std.debug.print(
+                "macho-processor: VFS relative-path checkpoint: mount_length={d} normalized_length={d} relative_length={d} root_resolution={}; HostPathDevice must receive only this suffix, never the User_<profile-id>: prefix\n",
+                .{ position, source_view.length, result_length, result_length == 0 },
+            );
+        }
+        if (profile_device and position == source_view.length and result_length == 0) {
+            std.debug.print(
+                "macho-processor: profile device root normalized successfully: source='{s}' pos==size and substr result is empty; ResolvePath should now return the mounted HostPathDevice root before Account child lookup\n",
+                .{preview},
+            );
+            if (profileIdFromUserDevice(preview)) |profile_id| {
+                self.logProfileHostPreflight(profile_id);
+            }
+        }
+
+        self.regs.rax = destination;
+        self.regs.rip = self.pop();
+        return true;
+    }
+
     fn handleInternalCompatibility(self: *MachOState) bool {
+        if (self.handleLibcppBasicStringSubstr()) return true;
         if (self.handleLocalLibcppStreamCompatibility()) return true;
         // Xenia's backend dispatches through a host-populated CPU feature
         // detector. Under guest execution that dispatch table has no host
@@ -5350,9 +7055,14 @@ pub const MachOState = struct {
     }
 
     fn decodeAt(self: *MachOState) ?DecodedInsn {
-        const off = self.translateGuest(self.regs.rip, 1, .execute) orelse {
-            self.terminateForGuestAccess(self.regs.rip, 1, .execute, "instruction_fetch");
-            return null;
+        const instruction_bytes: []const u8 = if (self.sparse_memory.executableBytesConst(self.regs.rip, 16)) |sparse_code|
+            sparse_code
+        else blk: {
+            const off = self.translateGuest(self.regs.rip, 1, .execute) orelse {
+                self.terminateForGuestAccess(self.regs.rip, 1, .execute, "instruction_fetch");
+                return null;
+            };
+            break :blk self.mem[off..];
         };
         const cache_hash = self.regs.rip *% 0x9E37_79B9_7F4A_7C15;
         const cache_index: usize = @intCast(cache_hash >> DECODE_CACHE_HASH_SHIFT);
@@ -5362,7 +7072,7 @@ pub const MachOState = struct {
             break :blk entry.decoded;
         } else blk: {
             self.decode_cache_misses += 1;
-            const decoded = decodeInsn(self.mem[off..]);
+            const decoded = decodeInsn(instruction_bytes);
             entry.* = .{
                 .rip = self.regs.rip,
                 .code_generation = self.code_generation,
@@ -5387,7 +7097,209 @@ pub const MachOState = struct {
         return d;
     }
 
+    /// toml++'s `is_ascii(const char*, size_t)` is a pure, bounded predicate.
+    /// Xenia's debug build emits an AVX implementation for it.  A valid
+    /// 32-byte patch-file read was repeatedly observed executing that loop for
+    /// tens of millions of guest steps, even though the source buffer and
+    /// length were both verified.  Execute the ABI-equivalent predicate here
+    /// so the parser receives the same result without relying on that faulty
+    /// guest AVX loop.
+    fn handleTomlAsciiFastPath(self: *MachOState) bool {
+        const entry = self.toml_ascii_entry orelse return false;
+        if (self.regs.rip != entry) return false;
+
+        const raw_length = self.regs.rsi;
+        const data_ptr = self.regs.rdi;
+
+        // basic_istream::read() is modeled, but gcount() may execute from a
+        // locally-linked libc++ body. The stream bridge mirrors __gc_ into
+        // guest memory so raw_length is normally the exact block size. Any
+        // mismatch is diagnostic evidence.
+        // For .patch.toml files findPatchTomlByteCount() yields the correct
+        // block size. For all other file types (profiles, etc.) that suffer
+        // from the same buffer_.__size_ corruption, we cannot know the correct
+        // block length; return ascii=false to force the parser's slow path
+        // (codepoint-by-codepoint stream reads) which bypasses the corrupted
+        // size entirely.
+        const expected_length = self.libcxx_streams.findPatchTomlByteCount();
+        const length_mismatch = raw_length > 1024 * 1024 or
+            (expected_length != null and raw_length != expected_length.?);
+        const safe_length: u64 = if (length_mismatch) expected_length orelse 0 else raw_length;
+        const have_bytes = if (length_mismatch and expected_length == null)
+            null
+        else
+            self.guestMemoryConst(data_ptr, safe_length);
+        const ascii = if (have_bytes) |bytes| isAsciiBytes(bytes) else false;
+        if (have_bytes == null and raw_length > 1024 * 1024) {
+            std.debug.print(
+                "macho-processor: toml++ is_ascii fast path UNCERTAIN: pointer=0x{x} raw_bytes={d} forced_ascii=false; parser will use slow path\n",
+                .{ data_ptr, raw_length },
+            );
+        } else if (have_bytes == null) {
+            std.debug.print(
+                "macho-processor: toml++ is_ascii fast path rejected unreadable input: pointer=0x{x} raw_bytes={d} capped={d}\n",
+                .{ data_ptr, raw_length, safe_length },
+            );
+        } else if (length_mismatch) {
+            std.debug.print(
+                "macho-processor: toml++ is_ascii ABI LENGTH MISMATCH: pointer=0x{x} raw={d} expected={?d} bounded={d} ascii={}; no guest parser fields were modified\n",
+                .{ data_ptr, raw_length, expected_length, safe_length, ascii },
+            );
+            self.libcxx_streams.dumpPatchTomlDiagnostics("is_ascii length mismatch");
+        }
+
+        // In this toml++ build, is_ascii() is called by read_next_block()
+        // with its 32-byte raw buffer on the caller's stack. Capture the
+        // verified bytes and the owning reader now, then validate the emitted
+        // utf8_codepoint block at the next read_next() entry. Every address is
+        // checked against both guest memory and the active patch istream.
+        if (!length_mismatch and ascii and safe_length <= TOML_CODEPOINT_CAPACITY and self.regs.rbp >= 0x128) {
+            const reader_slot = self.regs.rbp - 0x128;
+            if (self.guestMemoryConst(reader_slot, 8) != null) {
+                const reader = self.read64(reader_slot);
+                if (reader != 0 and self.guestMemoryConst(reader, TOML_UTF8_READER_MIN_SIZE) != null) {
+                    const istream = self.read64(reader + TOML_READER_ISTREAM_OFFSET);
+                    if (self.libcxx_streams.isActivePatchTomlIstream(istream)) {
+                        var block = TomlAsciiBlock{ .reader = reader, .length = @intCast(safe_length) };
+                        @memcpy(block.bytes[0..block.length], have_bytes.?[0..block.length]);
+                        self.toml_ascii_block = block;
+                        std.debug.print(
+                            "macho-processor: toml++ ASCII codepoint checkpoint armed: reader=0x{x} istream=0x{x} bytes={d} caller_rbp=0x{x}\n",
+                            .{ reader, istream, safe_length, self.regs.rbp },
+                        );
+                    }
+                }
+            }
+        }
+
+        self.regs.rax = @intFromBool(ascii);
+        self.regs.rip = self.pop();
+        self.toml_ascii_fast_paths +|= 1;
+        if (self.toml_ascii_fast_paths <= 8 or self.toml_ascii_fast_paths % 256 == 0) {
+            std.debug.print(
+                "macho-processor: toml++ is_ascii fast path #{d}: pointer=0x{x} bytes={d} ascii={} return=0x{x}\n",
+                .{ self.toml_ascii_fast_paths, data_ptr, safe_length, ascii, self.regs.rip },
+            );
+        }
+        return true;
+    }
+
+    fn handleTomlReadNextIntegrity(self: *MachOState) void {
+        const entry = self.toml_read_next_entry orelse return;
+        if (self.regs.rip != entry) return;
+        const pending = self.toml_ascii_block orelse return;
+        if (pending.validated or self.regs.rdi != pending.reader) return;
+
+        const reader = pending.reader;
+        const expected = pending.bytes[0..pending.length];
+        const storage_length: u64 = @as(u64, pending.length) * @as(u64, TOML_CODEPOINT_STRIDE);
+        const storage = self.guestMemory(reader + TOML_CODEPOINTS_OFFSET, storage_length) orelse {
+            std.debug.print(
+                "macho-processor: toml++ ASCII codepoint checkpoint FAILED: reader=0x{x} storage is not writable bytes={d}\n",
+                .{ reader, storage_length },
+            );
+            self.libcxx_streams.dumpPatchTomlDiagnostics("codepoint block unavailable");
+            if (self.toml_ascii_block) |*block| block.validated = true;
+            return;
+        };
+
+        const guest_current = self.read64(reader + TOML_CODEPOINT_CURRENT_OFFSET);
+        const guest_count = self.read64(reader + TOML_CODEPOINT_COUNT_OFFSET);
+        const report = repairAsciiCodepointBlock(storage, expected);
+        if (guest_count != pending.length) {
+            self.write64(reader + TOML_CODEPOINT_COUNT_OFFSET, pending.length);
+        }
+
+        std.debug.print(
+            "macho-processor: toml++ ASCII codepoint checkpoint: reader=0x{x} current={d} guest_count={d} expected_count={d} scalar_repairs={d} raw_repairs={d} first_bad_index={?d} first_bad_scalar=U+{x:0>4} first_bad_raw=0x{x:0>2} expected=0x{x:0>2}\n",
+            .{ reader, guest_current, guest_count, pending.length, report.scalar_repairs, report.raw_repairs, report.first_bad_index, report.first_bad_scalar, report.first_bad_raw, report.first_expected },
+        );
+        if (guest_current > pending.length or guest_count != pending.length or report.scalar_repairs != 0 or report.raw_repairs != 0) {
+            std.debug.print(
+                "macho-processor: toml++ codepoint integrity mismatch repaired from host-validated ASCII bytes; current index was left unchanged\n",
+                .{},
+            );
+            self.libcxx_streams.dumpPatchTomlDiagnostics("ASCII codepoint integrity mismatch");
+        }
+        if (self.toml_ascii_block) |*block| block.validated = true;
+    }
+
+    fn handlePatchDbEmptyPatchArray(self: *MachOState) bool {
+        if (self.regs.rdi != 0 or !self.libcxx_streams.latestPatchSchemaHasEmptyPatchSet()) return false;
+        const symbol = self.metadata.nearestSymbol(self.regs.rip) orelse return false;
+        if (std.mem.indexOf(u8, symbol.name, "PatchDB13ReadPatchFile") == null or symbol.offset != 0x419) return false;
+        const bytes = self.guestMemoryConst(self.regs.rip, 14) orelse return false;
+        if (!isPatchDbNullIsArraySequence(bytes)) return false;
+
+        self.patch_db_empty_array_recoveries +|= 1;
+        self.libcxx_streams.logEmptyPatchCompatibility("empty-patch compatibility");
+        std.debug.print(
+            "macho-processor: PatchDB empty-patch compatibility #{d}: rip=0x{x} {s}+0x{x} patch_node=0x0; skipping null virtual is_array() call and selecting Xenia's existing non-array return path at 0x{x}\n",
+            .{ self.patch_db_empty_array_recoveries, self.regs.rip, symbol.name, symbol.offset, self.regs.rip + 14 },
+        );
+        std.debug.print(
+            "macho-processor: PatchDB compatibility semantics: equivalent source guard is if (!patch_array || !patch_array->is_array()) return patch_file; parser output and decoded instruction semantics were not modified\n",
+            .{},
+        );
+        self.regs.rax = 0;
+        self.setFlagsLogic(0, .bits8);
+        self.regs.rip += 14;
+        return true;
+    }
+
+    fn logStalledInstructionDetails(self: *MachOState) void {
+        const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse {
+            std.debug.print("macho-processor: stuck-pc decode unavailable: rip=0x{x} instruction bytes are unreadable\n", .{self.regs.rip});
+            return;
+        };
+        const decoded = decodeInsn(bytes);
+        const symbol = self.metadata.nearestSymbol(self.regs.rip);
+        self.stalled_instruction_reports +|= 1;
+        std.debug.print(
+            "macho-processor: stuck-pc decode #{d}: rip=0x{x} {s}+0x{x} op={s} len={d} bytes={any} regs(rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp/rflags)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}\n",
+            .{
+                self.stalled_instruction_reports,
+                self.regs.rip,
+                if (symbol) |entry| entry.name else "<unknown>",
+                if (symbol) |entry| entry.offset else 0,
+                @tagName(decoded.op),
+                decoded.len,
+                bytes,
+                self.regs.rax,
+                self.regs.rbx,
+                self.regs.rcx,
+                self.regs.rdx,
+                self.regs.rsi,
+                self.regs.rdi,
+                self.regs.rbp,
+                self.regs.rsp,
+                self.regs.rflags,
+            },
+        );
+        self.dumpRecentTrace();
+        std.debug.print(
+            "macho-processor: unchanged execution-state capture complete; execution remains active and scheduler recovery is still permitted\n",
+            .{},
+        );
+    }
+
+    fn executionFingerprint(self: *const MachOState) u64 {
+        var hash: u64 = 0x9e37_79b9_7f4a_7c15;
+        const values = [_]u64{
+            self.regs.rax,    self.regs.rbx, self.regs.rcx, self.regs.rdx,
+            self.regs.rsi,    self.regs.rdi, self.regs.rbp, self.regs.rsp,
+            self.regs.r8,     self.regs.r9,  self.regs.r10, self.regs.r11,
+            self.regs.r12,    self.regs.r13, self.regs.r14, self.regs.r15,
+            self.regs.rflags,
+        };
+        for (values) |value| {
+            hash ^= value +% 0x9e37_79b9_7f4a_7c15 +% (hash << 6) +% (hash >> 2);
+        }
+        return if (hash == 0) 1 else hash;
+    }
+
     fn step(self: *MachOState) bool {
+        self.observeProfileAccountFlow();
         if (self.regs.rip == GUEST_ATEXIT_RETURN_SENTINEL) {
             return self.continueGuestExit();
         }
@@ -5406,6 +7318,9 @@ pub const MachOState = struct {
         if (self.handleStubHelperTransition()) {
             return !self.terminated;
         }
+        self.handleTomlReadNextIntegrity();
+        if (self.handleTomlAsciiFastPath()) return !self.terminated;
+        if (self.handlePatchDbEmptyPatchArray()) return !self.terminated;
         if (!self.isExecutableAddress(self.regs.rip)) {
             if (self.pending_control_transfer) |context| {
                 self.terminateForInvalidControlTransfer(context);
@@ -5572,10 +7487,11 @@ pub const MachOState = struct {
         self.regs.rsp = alignDown(stack_base + stack_size, 16);
         self.push(GUEST_THREAD_RETURN_SENTINEL);
         self.active_guest_thread = deferred.handle; // Use pthread handle for now
+        self.pthreads.markRunning(deferred.handle);
         self.cooperative_thread_switches +|= 1;
 
         if (self.ui_handoff.isActive()) {
-            self.ui_handoff.workerStarted(deferred.handle, self.executed_steps);
+            self.ui_handoff.workerStarted(deferred.handle, self.regs.rip, self.executed_steps);
             self.logThreadTable("UI handoff worker started");
         }
 
@@ -5600,6 +7516,15 @@ pub const MachOState = struct {
             .x87 = self.x87,
         };
         self.suspended_guest_thread_count += 1;
+        self.pthreads.markContextSuspended(self.active_guest_thread);
+        self.scheduler_log.emit(.{
+            .kind = .thread_blocked,
+            .step = self.executed_steps,
+            .thread = self.active_guest_thread,
+            .runnable = self.pthreads.activeCount(),
+            .blocked = self.pthreads.blocked_threads,
+            .reason = reason,
+        });
 
         if (self.ui_handoff.ownsCallbackHandle(self.active_guest_thread)) {
             self.ui_handoff.callbackSuspended(self.executed_steps);
@@ -5616,18 +7541,31 @@ pub const MachOState = struct {
     // the same worker that just yielded once all deferred threads had started.
     fn resumeSuspendedGuestThread(self: *MachOState) bool {
         if (self.suspended_guest_thread_count == 0) return false;
+        const completed_handoff_thread = self.ui_handoff.completionResumeHandle();
         var attempts = self.suspended_guest_thread_count;
         while (attempts > 0) : (attempts -= 1) {
             var selected_index: usize = 0;
-            if (self.ui_handoff.shouldPreferCallback(self.executed_steps, COOPERATIVE_THREAD_QUANTUM_STEPS)) {
-                for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
-                    if (!self.ui_handoff.ownsCallbackHandle(candidate.handle)) continue;
-                    selected_index = index;
-                    std.debug.print(
-                        "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d}\n",
-                        .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps },
-                    );
-                    break;
+            if (attempts == self.suspended_guest_thread_count) {
+                if (completed_handoff_thread != 0) {
+                    for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
+                        if (candidate.handle != completed_handoff_thread) continue;
+                        selected_index = index;
+                        std.debug.print(
+                            "scheduler: UI handoff completion-affinity resume: generation={d} scheduling_thread=0x{x} skipped_fifo_entries={d} callback_completed_step={d} step={d}\n",
+                            .{ self.ui_handoff.generation, candidate.handle, index, self.ui_handoff.completed_step, self.executed_steps },
+                        );
+                        break;
+                    }
+                } else if (self.ui_handoff.shouldPreferCallback(self.executed_steps, COOPERATIVE_THREAD_QUANTUM_STEPS)) {
+                    for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
+                        if (!self.ui_handoff.ownsCallbackHandle(candidate.handle)) continue;
+                        selected_index = index;
+                        std.debug.print(
+                            "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d}\n",
+                            .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps },
+                        );
+                        break;
+                    }
                 }
             }
             const context = self.suspended_guest_threads[selected_index];
@@ -5641,14 +7579,14 @@ pub const MachOState = struct {
             self.suspended_guest_thread_count -= 1;
             self.suspended_guest_threads[self.suspended_guest_thread_count] = .{};
 
-            // Force resume if cooperative wait check fails (to prevent deadlock)
-            if (!self.pthreads.resumeCooperativeWait(context.handle)) {
-                // Log forced resume to prevent deadlock
-                std.debug.print(
-                    "macho-processor: forcing thread resume to prevent deadlock: handle=0x{x} rip=0x{x}\n",
-                    .{ context.handle, context.regs.rip },
-                );
-                // Continue with resumption anyway to prevent deadlock
+            const resume_decision = self.pthreads.resumeCooperativeContext(context.handle, self.guest_time.now());
+            if (resume_decision == null) {
+                // An unsignaled ordinary condvar wait must stay blocked. Put
+                // it at the back of the FIFO and allow another runnable
+                // worker or a timed wait to make progress.
+                self.suspended_guest_threads[self.suspended_guest_thread_count] = context;
+                self.suspended_guest_thread_count += 1;
+                continue;
             }
 
             // Resume thread in scheduler
@@ -5658,13 +7596,45 @@ pub const MachOState = struct {
             self.xmm = context.xmm;
             self.ymm_hi = context.ymm_hi;
             self.x87 = context.x87;
+            const saved_rax = self.regs.rax;
+            self.regs.rax = resume_decision.?.restoredRax(saved_rax);
+            if (resume_decision.?.cancel_deadline_sequence != 0) {
+                _ = self.guest_time.cancel(resume_decision.?.cancel_deadline_sequence);
+            }
+            if (resume_decision.?.rax_override != null) {
+                self.cooperative_wait_result_resumes +|= 1;
+            } else {
+                self.cooperative_preserved_register_resumes +|= 1;
+            }
             self.active_guest_thread = context.handle;
+            self.pthreads.markRunning(context.handle);
             self.cooperative_thread_switches +|= 1;
-            if (self.ui_handoff.ownsCallbackHandle(context.handle)) {
-                self.ui_handoff.callbackResumed(self.executed_steps);
+            self.scheduler_log.emit(.{
+                .kind = .thread_resumed,
+                .step = self.executed_steps,
+                .thread = context.handle,
+                .runnable = self.pthreads.activeCount(),
+                .blocked = self.pthreads.blocked_threads,
+                .reason = context.reason,
+            });
+            const resume_count = self.cooperative_preserved_register_resumes + self.cooperative_wait_result_resumes;
+            if (resume_count <= 16 or resume_count % 1000 == 0) {
+                std.debug.print(
+                    "scheduler: guest context resume #{d}: thread=0x{x} reason={s} suspended_step={d} rip=0x{x} rsp=0x{x} rax(saved/restored)=0x{x}/0x{x} policy={s}\n",
+                    .{ resume_count, context.handle, context.reason, context.suspended_step, self.regs.rip, self.regs.rsp, saved_rax, self.regs.rax, if (resume_decision.?.rax_override != null) "wait_result_override" else "preserve_all_registers" },
+                );
+            }
+            if (context.handle == completed_handoff_thread and self.ui_handoff.completionResumed(context.handle, self.executed_steps)) {
+                std.debug.print(
+                    "scheduler: UI handoff dependency resolved: resumed scheduling_thread=0x{x} after callback cleanup; FIFO fallback remains available for unrelated workers\n",
+                    .{context.handle},
+                );
+                self.logThreadTable("UI handoff scheduling thread resumed");
+            } else if (self.ui_handoff.ownsCallbackHandle(context.handle)) {
+                self.ui_handoff.callbackResumed(self.regs.rip, self.executed_steps);
                 self.logThreadTable("UI callback resumed");
             } else if (self.ui_handoff.isActive()) {
-                self.ui_handoff.workerStarted(context.handle, self.executed_steps);
+                self.ui_handoff.workerStarted(context.handle, self.regs.rip, self.executed_steps);
             }
             return true;
         }
@@ -5686,10 +7656,71 @@ pub const MachOState = struct {
             }
             worker = next.handle;
         } else {
-            if (!self.resumeSuspendedGuestThread()) return false;
+            if (!self.resumeSuspendedGuestThread()) {
+                // If every modeled context is blocked and the only remaining
+                // dependency is a timed condition wait, advance virtual time
+                // to the earliest deadline. Never do this while another
+                // runnable worker can still deliver the real notification.
+                const deadline = self.pthreads.earliestWaitDeadline() orelse {
+                    self.scheduler_log.emit(.{
+                        .kind = .deadlock,
+                        .step = self.executed_steps,
+                        .thread = waiter,
+                        .runnable = 0,
+                        .blocked = self.pthreads.blocked_threads,
+                        .reason = reason,
+                    });
+                    return false;
+                };
+                _ = self.guest_time.advanceTo(deadline);
+                var emitted_deadline = false;
+                while (self.guest_time.popDue()) |timer| {
+                    emitted_deadline = true;
+                    self.scheduler_log.emit(.{
+                        .kind = .timer_due,
+                        .step = self.executed_steps,
+                        .thread = timer.thread,
+                        .object = timer.wait_object,
+                        .generation = timer.wait_generation,
+                        .deadline_ns = timer.deadline_ns,
+                        .blocked = self.pthreads.blocked_threads,
+                        .reason = "idle_advance_to_deadline",
+                    });
+                }
+                if (!emitted_deadline) {
+                    self.scheduler_log.emit(.{
+                        .kind = .timer_due,
+                        .step = self.executed_steps,
+                        .thread = waiter,
+                        .deadline_ns = deadline,
+                        .blocked = self.pthreads.blocked_threads,
+                        .reason = "unregistered_wait_deadline",
+                    });
+                }
+                if (!self.resumeSuspendedGuestThread()) return false;
+            }
             worker = self.active_guest_thread;
         }
+        if (worker == waiter) {
+            self.cooperative_self_resumes +|= 1;
+            if (self.cooperative_self_resumes <= 8 or self.cooperative_self_resumes % 1000 == 0) {
+                std.debug.print(
+                    "scheduler: cooperative yield found no alternate runnable context: thread=0x{x} reason={s} suspended={d} deferred={d} self_resumes={d}\n",
+                    .{ waiter, reason, self.suspended_guest_thread_count, self.pthreads.deferred_threads, self.cooperative_self_resumes },
+                );
+            }
+            return false;
+        }
         self.cooperative_wait_yields +|= 1;
+        self.scheduler_log.emit(.{
+            .kind = .context_switch,
+            .step = self.executed_steps,
+            .thread = waiter,
+            .peer = worker,
+            .runnable = self.pthreads.activeCount(),
+            .blocked = self.pthreads.blocked_threads,
+            .reason = reason,
+        });
         if (self.cooperative_wait_yields <= 16 or self.cooperative_wait_yields % 100 == 0) {
             std.debug.print(
                 "macho-processor: cooperative wait yield #{d}: waiter=0x{x} -> worker=0x{x} reason={s} deferred_remaining={d} suspended={d} gtk_idle_pending={d}\n",
@@ -5713,7 +7744,9 @@ pub const MachOState = struct {
     fn maybeYieldActiveGuestThreadForQuantum(self: *MachOState) void {
         if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return;
         const pending_idle = self.pendingGtkIdleCallbackCount();
-        const idle_callback_running = self.active_gtk_idle_source != 0;
+        const idle_callback_inflight = self.active_gtk_idle_source != 0;
+        const idle_callback_running = idle_callback_inflight and
+            self.isGtkIdleCallbackHandle(self.active_guest_thread);
 
         // A UI callback owns the UI context until it returns or reaches an
         // explicit cooperative wait import. pthread_join, condition-variable
@@ -5738,7 +7771,18 @@ pub const MachOState = struct {
             return;
         }
 
-        const work = cooperativeQuantumWork(pending_idle, idle_callback_running, self.pthreads.deferred_threads);
+        const work = scheduler.chooseCooperativeWork(.{
+            .pending_idle = pending_idle,
+            // An in-flight callback may be suspended on a real dependency.
+            // Preserve its UI ownership, but keep rotating runnable workers
+            // until the callback itself is selected again. Starting another
+            // idle callback here would overwrite the in-flight callback's
+            // source and handoff state.
+            .callback_inflight = idle_callback_inflight,
+            .idle_callback_running = idle_callback_running,
+            .deferred_threads = self.pthreads.deferred_threads,
+            .suspended_threads = self.suspended_guest_thread_count,
+        });
         if (work == .gtk_idle) {
             const scheduling_thread = self.active_guest_thread;
             self.cooperative_quantum_steps = 0;
@@ -5760,16 +7804,27 @@ pub const MachOState = struct {
             );
             return;
         }
-        if (work != .deferred_thread) return;
+        if (work != .deferred_thread and work != .suspended_thread) return;
         self.cooperative_quantum_steps +|= 1;
         if (self.cooperative_quantum_steps < COOPERATIVE_THREAD_QUANTUM_STEPS) return;
         self.cooperative_quantum_steps = 0;
-        if (!self.yieldActiveGuestThreadForWait("instruction quantum")) return;
+        const previous_thread = self.active_guest_thread;
+        const reason = if (work == .suspended_thread) "runnable rotation quantum" else "deferred thread quantum";
+        self.scheduler_log.emit(.{
+            .kind = .quantum_expired,
+            .step = self.executed_steps,
+            .thread = previous_thread,
+            .runnable = self.pthreads.activeCount(),
+            .blocked = self.pthreads.blocked_threads,
+            .reason = reason,
+        });
+        if (!self.yieldActiveGuestThreadForWait(reason)) return;
         self.cooperative_quantum_yields +|= 1;
+        if (work == .suspended_thread) self.cooperative_rotation_yields +|= 1;
         if (self.cooperative_quantum_yields <= 8 or self.cooperative_quantum_yields % 100 == 0) {
             std.debug.print(
-                "macho-processor: cooperative quantum yield #{d}: active=0x{x} deferred={d} suspended={d}\n",
-                .{ self.cooperative_quantum_yields, self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count },
+                "macho-processor: cooperative quantum yield #{d}: work={s} from=0x{x} to=0x{x} deferred={d} suspended={d} runnable_rotations={d}\n",
+                .{ self.cooperative_quantum_yields, @tagName(work), previous_thread, self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.cooperative_rotation_yields },
             );
         }
     }
@@ -5910,7 +7965,7 @@ pub const MachOState = struct {
             self.active_gtk_idle_callback = function;
             self.active_gtk_idle_started_step = self.executed_steps;
             self.gtk_idle_started +|= 1;
-            self.ui_handoff.callbackStarted(self.active_guest_thread, self.executed_steps);
+            self.ui_handoff.callbackStarted(self.active_guest_thread, self.regs.rip, self.executed_steps);
             self.cooperative_thread_switches +|= 1;
             std.debug.print(
                 "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
@@ -5963,6 +8018,25 @@ pub const MachOState = struct {
             if (context.handle == handle) return true;
         }
         return false;
+    }
+
+    fn runnableSuspendedSnapshot(self: *const MachOState) RunnableSuspendedSnapshot {
+        var result = RunnableSuspendedSnapshot{};
+        for (self.suspended_guest_threads[0..self.suspended_guest_thread_count]) |context| {
+            const thread = self.pthreads.snapshotForHandle(context.handle);
+            const runnable = if (thread) |snapshot| snapshot.state == .runnable else true;
+            if (!runnable) {
+                result.blocked += 1;
+                continue;
+            }
+            result.runnable += 1;
+            if (result.oldest_handle != 0 and context.suspended_step >= result.oldest_step) continue;
+            result.oldest_handle = context.handle;
+            result.oldest_rip = context.regs.rip;
+            result.oldest_step = context.suspended_step;
+            result.oldest_reason = context.reason;
+        }
+        return result;
     }
 
     fn logThreadTable(self: *const MachOState, reason: []const u8) void {
@@ -6038,8 +8112,8 @@ pub const MachOState = struct {
     fn logCooperativeSchedulerSummary(self: *const MachOState) void {
         if (self.cooperative_thread_switches == 0 and self.cooperative_wait_yields == 0) return;
         std.debug.print(
-            "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} quantum_yields={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
-            .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_quantum_yields, self.suspended_guest_thread_count, self.active_guest_thread, self.gtk_idle_scheduled, self.gtk_idle_started, self.gtk_idle_completed, self.gtk_idle_removed, self.pendingGtkIdleCallbackCount(), self.gtk_idle_wakeups, self.gtk_idle_dispatch_failures, self.gtk_idle_starvation_warnings },
+            "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
+            .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.gtk_idle_scheduled, self.gtk_idle_started, self.gtk_idle_completed, self.gtk_idle_removed, self.pendingGtkIdleCallbackCount(), self.gtk_idle_wakeups, self.gtk_idle_dispatch_failures, self.gtk_idle_starvation_warnings },
         );
     }
 
@@ -6048,9 +8122,11 @@ pub const MachOState = struct {
         const symbol = self.metadata.nearestSymbol(self.regs.rip);
         const idle = self.gtkIdleQueueSnapshot();
         const idle_age = if (idle.pending != 0) self.executed_steps -| idle.oldest_scheduled_step else 0;
+        const suspended = self.runnableSuspendedSnapshot();
+        const suspended_age = if (suspended.oldest_handle != 0) self.executed_steps -| suspended.oldest_step else 0;
         const dispatch_block = self.gtkIdleDispatchBlock();
         std.debug.print(
-            "macho-processor: GTK cooperative heartbeat: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} deferred={d} suspended={d} switches={d} wait_yields={d} quantum_yields={d} waits={d} gtk_idle(scheduled/started/completed/pending)={d}/{d}/{d}/{d} active_idle(source/callback/age)={d}/0x{x}/{d} oldest_pending(source/callback/age/thread/rip/tag)={d}/0x{x}/{d}/0x{x}/0x{x}/{s} dispatch={s}\n",
+            "macho-processor: GTK cooperative heartbeat: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} deferred={d} suspended(total/runnable/blocked)={d}/{d}/{d} oldest_runnable(handle/rip/age/reason)=0x{x}/0x{x}/{d}/{s} switches={d} wait_yields={d} quantum_yields={d} runnable_rotations={d} waits={d} gtk_idle(scheduled/started/completed/pending)={d}/{d}/{d}/{d} active_idle(source/callback/age)={d}/0x{x}/{d} oldest_pending(source/callback/age/thread/rip/tag)={d}/0x{x}/{d}/0x{x}/0x{x}/{s} dispatch={s}\n",
             .{
                 self.executed_steps,
                 self.active_guest_thread,
@@ -6059,9 +8135,16 @@ pub const MachOState = struct {
                 if (symbol) |resolved| resolved.offset else 0,
                 self.pthreads.deferred_threads,
                 self.suspended_guest_thread_count,
+                suspended.runnable,
+                suspended.blocked,
+                suspended.oldest_handle,
+                suspended.oldest_rip,
+                suspended_age,
+                suspended.oldest_reason,
                 self.cooperative_thread_switches,
                 self.cooperative_wait_yields,
                 self.cooperative_quantum_yields,
+                self.cooperative_rotation_yields,
                 self.pthreads.collapsed_waits,
                 self.gtk_idle_scheduled,
                 self.gtk_idle_started,
@@ -6079,6 +8162,18 @@ pub const MachOState = struct {
                 @tagName(dispatch_block),
             },
         );
+        if (suspended.runnable != 0 and suspended_age >= GTK_IDLE_STARVATION_STEPS and
+            self.executed_steps -| self.last_cooperative_starvation_step >= GTK_IDLE_STARVATION_STEPS)
+        {
+            self.last_cooperative_starvation_step = self.executed_steps;
+            self.cooperative_starvation_warnings +|= 1;
+            const oldest_symbol = self.metadata.nearestSymbol(suspended.oldest_rip);
+            std.debug.print(
+                "scheduler: RUNNABLE CONTEXT STARVATION: warning={d} handle=0x{x} rip=0x{x} {s}+0x{x} age={d} reason={s} active=0x{x} runnable/blocked={d}/{d}; round-robin quantum rotation should cap this near {d} steps\n",
+                .{ self.cooperative_starvation_warnings, suspended.oldest_handle, suspended.oldest_rip, if (oldest_symbol) |resolved| resolved.name else "<unknown>", if (oldest_symbol) |resolved| resolved.offset else 0, suspended_age, suspended.oldest_reason, self.active_guest_thread, suspended.runnable, suspended.blocked, COOPERATIVE_THREAD_QUANTUM_STEPS * @as(u64, @intCast(suspended.runnable + 1)) },
+            );
+            self.logThreadTable("runnable context starvation");
+        }
         if (idle.pending != 0 and idle_age >= GTK_IDLE_STARVATION_STEPS and dispatch_block != .callback_already_running) {
             self.gtk_idle_starvation_warnings +|= 1;
             std.debug.print(
@@ -6088,13 +8183,15 @@ pub const MachOState = struct {
         }
         if (self.ui_handoff.isActive()) {
             std.debug.print(
-                "scheduler: UI handoff heartbeat: generation={d} phase={s} source={d} callback_handle=0x{x} worker=0x{x} no_progress={d} suspend/resume/worker_slices={d}/{d}/{d}\n",
+                "scheduler: UI handoff heartbeat: generation={d} phase={s} source={d} callback_handle=0x{x} callback_rip=0x{x} worker=0x{x} worker_rip=0x{x} no_progress={d} suspend/resume/worker_slices={d}/{d}/{d}\n",
                 .{
                     self.ui_handoff.generation,
                     @tagName(self.ui_handoff.phase),
                     self.ui_handoff.source_id,
                     self.ui_handoff.callback_handle,
+                    self.ui_handoff.callback_rip,
                     self.ui_handoff.worker_handle,
+                    self.ui_handoff.worker_rip,
                     self.executed_steps -| self.ui_handoff.last_progress_step,
                     self.ui_handoff.callback_suspensions,
                     self.ui_handoff.callback_resumptions,
@@ -6102,7 +8199,7 @@ pub const MachOState = struct {
                 },
             );
         }
-        self.ui_handoff.diagnose(self.executed_steps, GTK_IDLE_STARVATION_STEPS);
+        self.ui_handoff.diagnose(self.executed_steps, GTK_IDLE_STARVATION_STEPS, self.active_guest_thread, self.regs.rip, self.suspended_guest_thread_count);
     }
 
     // Once the Xenia PageEntry tables have been allocated, setup can spend a
@@ -6224,6 +8321,7 @@ pub const MachOState = struct {
 
     fn handleDynamicLibraryThunk(self: *MachOState) bool {
         const thunk_address = self.regs.rip;
+        const virtual_sleep_calls_before = self.dynamic_forwarder.virtualSleepCallCount();
         if (!self.dynamic_forwarder.dispatchGuestSymbol(self, thunk_address)) return false;
         const return_address = self.pop();
         if (self.verbose_trace) {
@@ -6240,6 +8338,17 @@ pub const MachOState = struct {
             });
         } else {
             self.regs.rip = return_address;
+            if (self.dynamic_forwarder.virtualSleepCallCount() != virtual_sleep_calls_before) {
+                const sleeping_thread = self.active_guest_thread;
+                const switched = self.yieldActiveGuestThreadForWait("libc++ virtual sleep thunk");
+                if (switched) self.cooperative_sleep_yields +|= 1;
+                if (switched and (self.cooperative_sleep_yields <= 16 or self.cooperative_sleep_yields % 100 == 0)) {
+                    std.debug.print(
+                        "scheduler: virtual sleep thunk scheduling boundary #{d}: sleeper=0x{x} resumed=0x{x} suspended={d} deferred={d}\n",
+                        .{ self.cooperative_sleep_yields, sleeping_thread, self.active_guest_thread, self.suspended_guest_thread_count, self.pthreads.deferred_threads },
+                    );
+                }
+            }
         }
         return true;
     }
@@ -6313,14 +8422,29 @@ pub const MachOState = struct {
                     .pthread_waits_collapsed = self.pthreads.collapsed_waits,
                     .pthread_blocked = self.pthreads.blocked_threads,
                     .thread_id = self.active_guest_thread,
+                    .execution_fingerprint = self.executionFingerprint(),
                 });
+                if (self.startup.takeStallDiagnostic()) self.logStalledInstructionDetails();
                 self.pthreads.diagnoseStuck(steps, self.regs.rip);
                 self.pumpNativeWindowEvents();
                 self.logCooperativeHeartbeat();
             }
+            if (self.concise_output and steps != 0 and steps % 100_000_000 == 0) {
+                var progress_buffer: [96]u8 = undefined;
+                const progress = std.fmt.bufPrint(&progress_buffer, "Instruction count: {d}\n", .{steps}) catch "";
+                _ = hostWriteFdAll(1, progress);
+                self.scheduler_log.emit(.{
+                    .kind = .runnable_count,
+                    .step = steps,
+                    .thread = self.active_guest_thread,
+                    .runnable = self.pthreads.activeCount(),
+                    .blocked = self.pthreads.blocked_threads,
+                    .reason = "progress_checkpoint",
+                });
+            }
             if (!self.step()) break;
             self.maybeYieldActiveGuestThreadForQuantum();
-            if (self.page_entry_bulk_initializations != 0 and steps != 0 and steps % 250_000 == 0) {
+            if (self.page_entry_bulk_initializations != 0 and steps != 0 and steps % 1_000_000 == 0) {
                 self.logMemoryInitializationProgress(steps);
             }
         }
@@ -6375,6 +8499,50 @@ pub const MachOState = struct {
         std.debug.print(
             "macho-processor: bulk construction acceleration: page_entry_runs={d} bytes={d}\n",
             .{ self.page_entry_bulk_initializations, self.page_entry_bulk_bytes },
+        );
+        if (self.lazy_import_direct_dispatches != 0) {
+            std.debug.print(
+                "macho-processor: lazy import safety: typed_direct_dispatches={d} dyld_stub_binder_entries=0\n",
+                .{self.lazy_import_direct_dispatches},
+            );
+        }
+        if (self.patch_db_empty_array_recoveries != 0) {
+            std.debug.print(
+                "macho-processor: PatchDB empty-patch compatibility: recoveries={d}\n",
+                .{self.patch_db_empty_array_recoveries},
+            );
+        }
+        if (self.libcxx_string_substr_fast_paths != 0 or self.profile_host_preflight_checks != 0) {
+            std.debug.print(
+                "macho-processor: libc++ path slicing: substr_fast_paths={d} profile_host_preflights={d}\n",
+                .{ self.libcxx_string_substr_fast_paths, self.profile_host_preflight_checks },
+            );
+        }
+        if (self.profile_account_flow.attempts != 0) {
+            std.debug.print(
+                "macho-processor: profile Account lifecycle: attempts={d} successes={d} failures={d} active={} final_stage={s} last_xuid={x:0>16} last_bytes_read={d}/{d}\n",
+                .{ self.profile_account_flow.attempts, self.profile_account_flow.successes, self.profile_account_flow.failures, self.profile_account_flow.active, @tagName(self.profile_account_flow.stage), self.profile_account_flow.xuid, self.profile_account_flow.bytes_read, self.profile_account_flow.requested_bytes },
+            );
+        }
+        if (self.atomic_cmpxchg8.operations != 0 or self.classified_ud2_recoveries != 0 or self.breakpoint_cleanup_recoveries != 0) {
+            std.debug.print(
+                "macho-processor: atomic/UD2 robustness: cmpxchg8(operations/successes/failures)={d}/{d}/{d} classified_ud2_recoveries={d} breakpoint_cleanup_recoveries={d} ownership={s}\n",
+                .{ self.atomic_cmpxchg8.operations, self.atomic_cmpxchg8.successes, self.atomic_cmpxchg8.failures, self.classified_ud2_recoveries, self.breakpoint_cleanup_recoveries, if (self.atomic_cmpxchg8.indicatesDecoderGap(self.classified_ud2_recoveries)) "rosette_decoder_gap" else "no_decoder_gap_observed" },
+            );
+        }
+        self.diagnostic_throttler.logSummary();
+        self.logSharedControlBlockSummary();
+    }
+
+    fn logSharedControlBlockSummary(self: *const MachOState) void {
+        if (self.libcpp_shared_control_blocks.candidates == 0) return;
+        std.debug.print(
+            "macho-processor: libc++ shared control-block robustness: candidates={d} verified_vptr_restorations={d} rejected={d}\n",
+            .{
+                self.libcpp_shared_control_blocks.candidates,
+                self.libcpp_shared_control_blocks.recoveries,
+                self.libcpp_shared_control_blocks.rejected,
+            },
         );
     }
 
@@ -6596,6 +8764,12 @@ pub const MachOState = struct {
                 .destructor_symbol = self.diagnosticSymbol(thrown.destructor_address),
                 .throw_site = self.diagnosticSymbol(thrown.caller_address),
                 .message = self.cxxExceptionMessage(thrown.object_address) orelse "",
+                .catch_completed = self.cxx_exceptions.last_throw_caught,
+                .active_catches = self.cxx_exceptions.active_catch_count,
+                .classification = if (self.spirv_cross.last_classification != .unrelated)
+                    self.spirv_cross.lastLabel()
+                else
+                    "general_cxx_exception",
             };
             if (thrown.allocation) |allocation| {
                 exception_report.allocation_matched = true;
@@ -6605,17 +8779,25 @@ pub const MachOState = struct {
             if (self.last_unwind_inspection) |inspection| {
                 exception_report.unwinder_available = inspection.metadata_frames != 0;
                 exception_report.unwind_frames = inspection.frame_count;
+                exception_report.cleanup_frames = inspection.cleanup_frames;
+                exception_report.frame_chain_valid = inspection.frame_chain_valid;
                 if (inspection.handler) |handler| {
                     exception_report.handler_found = true;
                     exception_report.handler_address = handler.landing_pad;
                 }
                 exception_report.phase_two_supported = inspection.phase_two_supported;
+                exception_report.phase_two_installed = inspection.phase_two_installed;
+                exception_report.cleanups_exhausted_without_handler = self.unwinder.exhaustedWithoutHandler();
             }
             report.cxx_exception = exception_report;
-            report.detail = if (exception_report.phase_two_supported)
-                "Rosette installed a verified Itanium phase-two landing-pad context before the later diagnostic stop."
-            else
-                "Rosette completed Itanium phase-one frame and catch inspection; this frame was not safe for phase-two context installation.";
+            if (!exception_report.catch_completed) {
+                report.detail = if (exception_report.cleanups_exhausted_without_handler)
+                    "Rosette executed every verified Itanium cleanup landing pad, but the active LSDA route contains no matching catch handler."
+                else if (exception_report.phase_two_supported)
+                    "Rosette installed a verified Itanium phase-two landing-pad context before the later diagnostic stop."
+                else
+                    "Rosette completed Itanium phase-one frame and catch inspection; this frame was not safe for phase-two context installation.";
+            }
         }
 
         const memory_trace_count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
@@ -6662,13 +8844,26 @@ pub const MachOState = struct {
                     i;
                 const entry = self.trace_entries[idx];
                 trace_buf[i] = .{
+                    .thread_handle = entry.thread_handle,
                     .rip = entry.rip,
                     .op = @tagName(entry.op),
                     .len = entry.len,
                     .rsp = entry.rsp,
                     .rax = entry.rax,
+                    .rbx = entry.rbx,
                     .rcx = entry.rcx,
                     .rdx = entry.rdx,
+                    .rsi = entry.rsi,
+                    .rdi = entry.rdi,
+                    .rbp = entry.rbp,
+                    .r8 = entry.r8,
+                    .r9 = entry.r9,
+                    .r10 = entry.r10,
+                    .r11 = entry.r11,
+                    .r12 = entry.r12,
+                    .r13 = entry.r13,
+                    .r14 = entry.r14,
+                    .r15 = entry.r15,
                 };
             }
             report.last_instructions = trace_buf[0..trace_count];
@@ -6678,8 +8873,30 @@ pub const MachOState = struct {
     }
 
     pub fn execute(self: *MachOState, d: DecodedInsn) void {
+        // Detect LOCK prefix (0xF0) from raw instruction bytes at RIP.
+        // The LOCK prefix is consumed here rather than threaded through the
+        // decoder's 20+ sub-decode functions. This is reliable because 0xF0
+        // must be the first byte when present (Intel Vol.2 §2.1.1: LOCK
+        // precedes all other prefixes including REX and segment overrides).
+        if (self.guestMemoryConst(self.regs.rip, 1)) |bytes| {
+            if (bytes[0] == 0xF0) d.lock = true;
+        }
+        if (d.lock) {
+            // Full sequential-consistency barrier: ensures all prior loads and
+            // stores complete before the LOCK-prefixed RMW executes, which
+            // matches x86 LOCK# signal semantics for both single-thread and
+            // cross-thread ordering.
+            @fence(.seq_cst);
+        }
         switch (d.op) {
-            .invalid => unreachable,
+            .invalid => {
+                std.debug.print("macho-processor: undecoded instruction at rip=0x{x} opcode_prefix=0x{x}\n", .{ self.regs.rip, self.readMemVal(self.regs.rip, .bits8) });
+                self.faulted = true;
+                self.exit_code = 1;
+                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
+                self.terminated = true;
+                return;
+            },
             .nop => {},
             .cmc => self.regs.rflags ^= RFL_CF,
             .clc => self.regs.rflags &= ~RFL_CF,
@@ -7037,6 +9254,9 @@ pub const MachOState = struct {
                 self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
             },
 
+            .btr_reg_reg => self.executeBtrRegister(d),
+            .btr_mem_reg => self.executeBtrMemory(d),
+
             .push_reg => {
                 self.push(self.regVal(d.dst_reg, .bits64));
             },
@@ -7116,9 +9336,21 @@ pub const MachOState = struct {
             },
             .call_mem64 => {
                 const from_rip = self.regs.rip;
-                const target = self.readMemVal(d.addr, .bits64);
                 const return_addr = self.regs.rip + d.len;
+                // Do not record a terminal page-zero read before a narrowly
+                // verified virtual-dispatch recovery has inspected the real
+                // C++ object. readMemVal() is intentionally terminal on an
+                // unmapped operand, so recovery must precede that side effect.
+                const operand_mapped = self.guestMemoryConst(d.addr, @sizeOf(u64)) != null;
+                var target: u64 = if (operand_mapped) self.readMemVal(d.addr, .bits64) else 0;
                 if (target == 0) {
+                    target = self.recoverLibcppSharedControlBlockCall(from_rip, d.addr) orelse 0;
+                }
+                if (target == 0) {
+                    if (!operand_mapped) {
+                        self.terminateForGuestAccess(d.addr, @sizeOf(u64), .read, "call_mem64");
+                        return;
+                    }
                     self.logControlFlow("call_mem64_null", from_rip, target, d.len, return_addr);
                     self.terminateForInvalidControlTransfer(.{
                         .kind = "call_mem64_null",
@@ -7186,30 +9418,68 @@ pub const MachOState = struct {
                 }
             },
             .jmp_mem64 => {
+                const stub_rip = self.regs.rip;
                 const target = self.readMemVal(d.addr, .bits64);
-                if (target == 0) {
-                    if (self.metadata.importAtStub(self.regs.rip)) |imported| {
+                const imported = self.metadata.importAtStub(stub_rip);
+                if (imported != null and isCooperativeYieldImport(imported.?.name)) {
+                    self.pending_import_stub_rip = null;
+                    self.lazy_import_direct_dispatches +|= 1;
+                    const import = imported.?;
+                    self.handleDirectImportCall(import);
+                    return;
+                }
+                const target_is_lazy_helper = target >= self.stub_helper_start and target < self.stub_helper_end;
+                switch (lazy_import_stub.chooseDispatch(imported != null, target, target_is_lazy_helper)) {
+                    .typed_import => {
                         self.pending_import_stub_rip = null;
-                        self.handleDirectImportCall(imported);
-                    } else {
-                        self.logControlFlow("jmp_mem64_null", self.regs.rip, target, d.len, null);
+                        self.lazy_import_direct_dispatches +|= 1;
+                        const import = imported.?;
+                        const observation = self.diagnostic_throttler.observe(
+                            .lazy_import_dispatch,
+                            stub_rip,
+                            target,
+                        );
+                        if (observation.disposition == .detail) {
+                            std.debug.print(
+                                "macho-processor: lazy import direct dispatch #{d}: thread=0x{x} stub=0x{x} pointer=0x{x} pointer_value=0x{x} import={s} return=0x{x} step={d}; dyld_stub_binder bypassed=true\n",
+                                .{ self.lazy_import_direct_dispatches, self.active_guest_thread, stub_rip, d.addr, target, import.name, self.read64(self.regs.rsp), self.executed_steps },
+                            );
+                            if (target != 0) {
+                                if (self.metadata.nearestSymbol(target)) |symbol| {
+                                    std.debug.print(
+                                        "macho-processor: lazy import pointer classification: target=0x{x} symbol={s}+0x{x} action=typed_import\n",
+                                        .{ target, symbol.name, symbol.offset },
+                                    );
+                                }
+                            }
+                        } else if (observation.disposition == .checkpoint) {
+                            std.debug.print(
+                                "macho-processor: repeated lazy import checkpoint: import={s} stub=0x{x} occurrence={d} suppressed_since_previous={d} total_direct_dispatches={d}\n",
+                                .{ import.name, stub_rip, observation.occurrence, observation.suppressed_since_emit, self.lazy_import_direct_dispatches },
+                            );
+                        }
+                        self.handleDirectImportCall(import);
+                    },
+                    .invalid_null_target => {
+                        self.logControlFlow("jmp_mem64_null", stub_rip, target, d.len, null);
                         self.terminateForInvalidControlTransfer(.{
                             .kind = "jmp_mem64_null",
-                            .instruction_address = self.regs.rip,
+                            .instruction_address = stub_rip,
                             .operand_address = d.addr,
                             .target_address = target,
                         });
-                    }
-                } else {
-                    self.pending_import_stub_rip = if (self.metadata.importAtStub(self.regs.rip) != null) self.regs.rip else null;
-                    self.pending_control_transfer = .{
-                        .kind = "jmp_mem64",
-                        .instruction_address = self.regs.rip,
-                        .operand_address = d.addr,
-                        .target_address = target,
-                    };
-                    self.logControlFlow("jmp_mem64", self.regs.rip, target, d.len, null);
-                    self.regs.rip = target;
+                    },
+                    .follow_target => {
+                        self.pending_import_stub_rip = null;
+                        self.pending_control_transfer = .{
+                            .kind = "jmp_mem64",
+                            .instruction_address = stub_rip,
+                            .operand_address = d.addr,
+                            .target_address = target,
+                        };
+                        self.logControlFlow("jmp_mem64", stub_rip, target, d.len, null);
+                        self.regs.rip = target;
+                    },
                 }
             },
 
@@ -7418,8 +9688,10 @@ pub const MachOState = struct {
             },
             .imul_reg64_reg64_imm8, .imul_reg32_reg32_imm8 => {
                 const sz = if (d.op == .imul_reg64_reg64_imm8) Size.bits64 else Size.bits32;
-                const a = self.regVal(d.dst_reg, sz);
-                const r = a *% d.imm;
+                // Three-operand IMUL reads r/m as its source and does not use
+                // the old destination value. Using dst here corrupts pointer
+                // and index scaling whenever source and destination differ.
+                const r = threeOperandImulResult(&self.regs, d, sz);
                 self.setReg(d.dst_reg, sz, r);
             },
             .imul_reg64_mem64_imm8, .imul_reg32_mem32_imm8 => {
@@ -7525,49 +9797,83 @@ pub const MachOState = struct {
                 }
             },
 
-            .cmpxchg_mem32_reg32 => {
-                const expected = self.regVal(.al_ax_eax_rax, .bits32);
-                const actual = self.readMemVal(d.addr, .bits32);
-                if (expected == actual) {
-                    self.writeMemVal(d.addr, .bits32, self.regVal(d.src_reg, .bits32));
-                    self.setFlag(RFL_ZF, true);
-                } else {
-                    self.setReg(.al_ax_eax_rax, .bits32, actual);
-                    self.setFlag(RFL_ZF, false);
+            .cmpxchg_mem8_reg8,
+            .cmpxchg_mem16_reg16,
+            .cmpxchg_mem32_reg32,
+            .cmpxchg_mem64_reg64,
+            .cmpxchg_reg8_reg8,
+            .cmpxchg_reg16_reg16,
+            .cmpxchg_reg32_reg32,
+            .cmpxchg_reg64_reg64,
+            => {
+                const size = d.size;
+                const expected = self.regVal(.al_ax_eax_rax, size);
+                const actual = if (d.is_reg_form)
+                    self.regVal(d.dst_reg, size)
+                else
+                    self.readMemVal(d.addr, size);
+                const replacement = self.regVal(d.src_reg, size);
+                const outcome = atomic_compare_exchange.evaluate(expected, actual, replacement);
+                const matched = outcome.matched;
+                if (size == .bits8) {
+                    self.atomic_cmpxchg8.record(matched);
+                    if (self.atomic_cmpxchg8.operations <= 16 or (!matched and self.atomic_cmpxchg8.failures <= 16)) {
+                        const symbol = self.metadata.nearestSymbol(self.regs.rip);
+                        const adjacent = if (!d.is_reg_form) self.guestMemoryConst(d.addr, 4) else null;
+                        const adjacent_value = if (adjacent) |bytes| std.mem.readInt(u32, bytes[0..4], .little) else 0;
+                        std.debug.print(
+                            "macho-processor: atomic cmpxchg8 #{d}: rip=0x{x} {s}+0x{x} target={s}0x{x} expected=0x{x:0>2} actual=0x{x:0>2} replacement=0x{x:0>2} matched={} adjacent32_mapped={} adjacent32=0x{x:0>8}\n",
+                            .{ self.atomic_cmpxchg8.operations, self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, if (d.is_reg_form) "register:" else "memory:", if (d.is_reg_form) @intFromEnum(d.dst_reg) else d.addr, expected, actual, replacement, matched, adjacent != null, adjacent_value },
+                        );
+                    }
                 }
-            },
-            .cmpxchg_mem64_reg64 => {
-                const expected = self.regs.rax;
-                const actual = self.readMemVal(d.addr, .bits64);
-                if (expected == actual) {
-                    self.writeMemVal(d.addr, .bits64, self.regVal(d.src_reg, .bits64));
-                    self.setFlag(RFL_ZF, true);
+                self.regs.rflags &= ~(RFL_ZF | RFL_CF);
+                self.regs.rflags |= if (matched) RFL_ZF else RFL_CF;
+                if (matched) {
+                    if (d.is_reg_form) {
+                        self.setReg(d.dst_reg, size, outcome.destination);
+                    } else {
+                        self.writeMemVal(d.addr, size, outcome.destination);
+                    }
                 } else {
-                    self.regs.rax = actual;
-                    self.setFlag(RFL_ZF, false);
+                    self.setReg(.al_ax_eax_rax, size, outcome.accumulator);
                 }
             },
 
-            .cmpxchg_reg32_reg32 => {
-                const expected = self.regVal(.al_ax_eax_rax, .bits32);
-                const actual = self.regVal(d.dst_reg, .bits32);
-                if (expected == actual) {
-                    self.setReg(d.dst_reg, .bits32, self.regVal(d.src_reg, .bits32));
-                    self.setFlag(RFL_ZF, true);
+            .cmpxchg8b_mem, .cmpxchg16b_mem => {
+                const is_16b = d.op == .cmpxchg16b_mem;
+                // CMPXCHG8B compares EDX:EAX with m64; CMPXCHG16B compares RDX:RAX with m128
+                const expected_lo = self.regVal(.al_ax_eax_rax, .bits32);
+                const expected_hi = self.regVal(.dl_dx_edx_rdx, if (is_16b) .bits64 else .bits32);
+                const replacement_lo = self.regVal(.cl_cx_ecx_rcx, if (is_16b) .bits64 else .bits32);
+                const replacement_hi = self.regVal(.bl_bx_ebx_rbx, if (is_16b) .bits64 else .bits32);
+
+                const total_bytes: usize = if (is_16b) 16 else 8;
+                const actual_lo = self.readMemVal(d.addr, if (is_16b) .bits64 else .bits32);
+                const actual_hi = if (is_16b) self.readMemVal(d.addr + 8, .bits64) else 0;
+
+                const matched = expected_lo == actual_lo and expected_hi == actual_hi;
+
+                if (matched) {
+                    self.writeMemVal(d.addr, if (is_16b) .bits64 else .bits32, replacement_lo);
+                    if (is_16b) self.writeMemVal(d.addr + 8, .bits64, replacement_hi);
                 } else {
-                    self.setReg(.al_ax_eax_rax, .bits32, actual);
-                    self.setFlag(RFL_ZF, false);
+                    self.setReg(.al_ax_eax_rax, if (is_16b) .bits64 else .bits32, actual_lo);
+                    self.setReg(.dl_dx_edx_rdx, if (is_16b) .bits64 else .bits32, actual_hi);
                 }
-            },
-            .cmpxchg_reg64_reg64 => {
-                const expected = self.regs.rax;
-                const actual = self.regVal(d.dst_reg, .bits64);
-                if (expected == actual) {
-                    self.setReg(d.dst_reg, .bits64, self.regVal(d.src_reg, .bits64));
-                    self.setFlag(RFL_ZF, true);
-                } else {
-                    self.regs.rax = actual;
-                    self.setFlag(RFL_ZF, false);
+
+                self.regs.rflags &= ~RFL_ZF;
+                self.regs.rflags |= if (matched) RFL_ZF else 0;
+
+                if (total_bytes == 8) {
+                    self.atomic_cmpxchg8.record(matched);
+                    if (self.atomic_cmpxchg8.operations <= 16 or (!matched and self.atomic_cmpxchg8.failures <= 16)) {
+                        const symbol = self.metadata.nearestSymbol(self.regs.rip);
+                        std.debug.print(
+                            "macho-processor: atomic cmpxchg8b #{d}: rip=0x{x} {s}+0x{x} target=0x{x} expected=0x{x:0>8}:0x{x:0>8} actual=0x{x:0>8}:0x{x:0>8} replacement=0x{x:0>8}:0x{x:0>8} matched={}\n",
+                            .{ self.atomic_cmpxchg8.operations, self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, d.addr, expected_hi, expected_lo, actual_hi, actual_lo, replacement_hi, replacement_lo, matched },
+                        );
+                    }
                 }
             },
 
@@ -7893,6 +10199,23 @@ pub const MachOState = struct {
                 const source: f64 = @bitCast(source_bits);
                 self.setReg(d.dst_reg, d.size, convertVexFloatToSigned(f64, source, d.size, d.op == .vcvttsd2si));
             },
+            .pmovmskb, .vpmovmskb => {
+                var mask: u32 = 0;
+                for (self.xmm[d.xmm_src], 0..) |byte, i| {
+                    if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(i);
+                }
+                self.setReg(d.dst_reg, .bits32, mask);
+            },
+            .vpmovmskb_ymm => {
+                var mask: u32 = 0;
+                for (self.xmm[d.xmm_src], 0..) |byte, i| {
+                    if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(i);
+                }
+                for (self.ymm_hi[d.xmm_src], 0..) |byte, i| {
+                    if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(i + 16);
+                }
+                self.setReg(d.dst_reg, .bits32, mask);
+            },
             .vandps, .vandpd, .vandnps, .vandnpd, .vorps, .vorpd, .vxorps, .vxorpd, .vpor, .vpand, .vpandn, .vpxor => {
                 self.executeVexBitwise(d, vexBitwiseForOp(d.op));
             },
@@ -7917,6 +10240,13 @@ pub const MachOState = struct {
             },
 
             .ud2 => {
+                if (self.tryRecoverClassifiedAssertionUd2(d.len)) return;
+                const symbol = self.metadata.nearestSymbol(self.regs.rip);
+                const assertion_age = self.executed_steps -| self.last_guest_assertion_step;
+                std.debug.print(
+                    "macho-processor: UD2 encounter: rip=0x{x} {s}+0x{x} active=0x{x} signal_depth={d} assertion={s} assertion_age={d} assertion_return=0x{x} bytes=0f0b\n",
+                    .{ self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(self.last_guest_assertion_class), assertion_age, self.last_guest_assertion_return },
+                );
                 if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len)) return;
                 std.debug.print("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});
                 self.faulted = true;
@@ -8210,9 +10540,29 @@ pub const MachOState = struct {
                 const raw_flags: u32 = @truncate(arg4);
                 const map_flags: std.c.MAP = @bitCast(raw_flags);
                 const offset: i64 = @bitCast(arg6);
+                self.noteBackendMmapAttempt("syscall", addr, length, prot, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS);
 
                 const alignment = PAGE_SIZE;
                 const aligned_length = ((length + alignment - 1) / alignment) * alignment;
+
+                if (self.backendMemoryDiagnosticsActive() and addr == 0 and map_flags.ANONYMOUS and length >= 64 * 1024 * 1024) {
+                    const mapped = self.guestMapBackendWithBacking(length, @truncate(prot), raw_flags, -1, @bitCast(offset)) orelse {
+                        std.debug.print(
+                            "macho-processor: x64 backend sparse mmap FAILED: route=syscall address=0x0 length={d} prot=0x{x} flags=0x{x}\n",
+                            .{ length, prot, raw_flags },
+                        );
+                        self.noteBackendMmapResult(false, 0, "syscall_backend_sparse_anywhere");
+                        self.regs.rax = std.math.maxInt(u64);
+                        return;
+                    };
+                    std.debug.print(
+                        "macho-processor: x64 backend sparse mmap succeeded: route=syscall guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} heap_bypassed=true\n",
+                        .{ mapped, length, prot, raw_flags },
+                    );
+                    self.noteBackendMmapResult(true, mapped, "syscall_backend_sparse_anywhere");
+                    self.regs.rax = mapped;
+                    return;
+                }
 
                 if (length >= 1024 * 1024 * 1024) {
                     std.debug.print(
@@ -8227,15 +10577,18 @@ pub const MachOState = struct {
                     else
                         self.fs_forwarder.fd_manager.hostFd(arg5) orelse {
                             std.debug.print("macho-processor: large mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
+                            self.noteBackendMmapResult(false, 0, "syscall_large_fd_translation");
                             self.regs.rax = std.math.maxInt(u64);
                             return;
                         };
                     const reserved = self.guestReserveAddressSpaceWithBacking(aligned_length, raw_flags, host_fd, @bitCast(offset)) orelse {
                         std.debug.print("macho-processor: large mmap FAILED: route=syscall stage=sparse_reserve\n", .{});
+                        self.noteBackendMmapResult(false, 0, "syscall_sparse_reserve");
                         self.regs.rax = std.math.maxInt(u64);
                         return;
                     };
                     std.debug.print("macho-processor: large mmap succeeded: route=syscall guest_base=0x{x} length={d}\n", .{ reserved, aligned_length });
+                    self.noteBackendMmapResult(true, reserved, "syscall_sparse_reserve");
                     self.regs.rax = reserved;
                     return;
                 }
@@ -8246,28 +10599,34 @@ pub const MachOState = struct {
                     else
                         self.fs_forwarder.fd_manager.hostFd(arg5) orelse {
                             std.debug.print("macho-processor: fixed mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
+                            self.noteBackendMmapResult(false, 0, "syscall_fixed_fd_translation");
                             self.regs.rax = std.math.maxInt(u64);
                             return;
                         };
                     if (!self.guestMapFile(addr, aligned_length, @truncate(prot), raw_flags, host_fd, @bitCast(offset))) {
                         std.debug.print("macho-processor: fixed mmap FAILED: route=syscall stage=sparse_map addr=0x{x} length={d}\n", .{ addr, aligned_length });
+                        self.noteBackendMmapResult(false, 0, "syscall_fixed_sparse_map");
                         self.regs.rax = std.math.maxInt(u64);
                         return;
                     }
+                    self.noteBackendMmapResult(true, addr, "syscall_fixed_sparse_map");
                     self.regs.rax = addr;
                     return;
                 }
 
                 const mapped = if (addr != 0) addr else self.guestAlloc(aligned_length, alignment) orelse {
                     std.debug.print("macho-processor: mmap FAILED: route=syscall stage=guest_heap length={d} alignment={d}\n", .{ aligned_length, alignment });
+                    self.noteBackendMmapResult(false, 0, "syscall_guest_heap_allocate");
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
                 };
                 const off = mappedOffset(self.mem_base, self.mem_size, self.mapped_min, mapped) orelse {
+                    self.noteBackendMmapResult(false, 0, "syscall_address_translation");
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
                 };
                 if (off + aligned_length > self.mem_size) {
+                    self.noteBackendMmapResult(false, 0, "syscall_backing_bounds");
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
                 }
@@ -8278,6 +10637,7 @@ pub const MachOState = struct {
                     .write = prot & 0x02 != 0,
                     .execute = prot & 0x04 != 0,
                 }, .guest_mmap, "guest mmap", self.regs.rip);
+                self.noteBackendMmapResult(true, mapped, "syscall_guest_mapping");
                 self.regs.rax = mapped;
             },
             @intFromEnum(macho_runtime.Syscall.mprotect) => {
@@ -8286,11 +10646,13 @@ pub const MachOState = struct {
                 const prot = arg3;
                 if (self.guestProtectSparseMemory(address, length, @truncate(prot))) {
                     std.debug.print("macho-processor: sparse mprotect succeeded: route=syscall address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
+                    self.noteBackendMprotect("syscall", address, length, prot, true);
                     self.regs.rax = 0;
                     return;
                 }
                 if (mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address) == null) {
                     std.debug.print("macho-processor: mprotect FAILED: route=syscall reason=address_not_mapped address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
+                    self.noteBackendMprotect("syscall", address, length, prot, false);
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
                 }
@@ -8300,6 +10662,7 @@ pub const MachOState = struct {
                     .write = prot & 0x02 != 0,
                     .execute = prot & 0x04 != 0,
                 }, .guest_mmap, "guest mprotect", self.regs.rip);
+                self.noteBackendMprotect("syscall", address, length, prot, true);
                 self.regs.rax = 0;
             },
             @intFromEnum(macho_runtime.Syscall.munmap) => {
@@ -8421,6 +10784,136 @@ fn signalHandlerMadeProgress(frame: GuestSignalFrame, resume_rip: u64, fault_byt
     return fault_bytes[0] != 0x0F or fault_bytes[1] != 0x0B;
 }
 
+fn isAsciiBytes(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte & 0x80 != 0) return false;
+    }
+    return true;
+}
+
+fn profileIdFromUserDevice(message: []const u8) ?[]const u8 {
+    const marker = "User_";
+    const marker_index = std.mem.indexOf(u8, message, marker) orelse return null;
+    const start = marker_index + marker.len;
+    const relative_end = std.mem.indexOfScalar(u8, message[start..], ':') orelse return null;
+    const profile_id = message[start .. start + relative_end];
+    if (profile_id.len != 16) return null;
+    for (profile_id) |character| {
+        if (!std.ascii.isHex(character)) return null;
+    }
+    return profile_id;
+}
+
+fn classifyProfileDismountCaller(symbol_name: []const u8, offset: u64) ?ProfileAccountStage {
+    if (std.mem.indexOf(u8, symbol_name, "ProfileManager11LoadAccount") == null) return null;
+    // Current Xenia has three DismountProfile call sites in LoadAccount:
+    // open validation, short-read validation, and post-decryption cleanup.
+    if (offset >= 0x700) return .decrypted;
+    if (offset >= 0x600) return .short_read;
+    return .open_failed;
+}
+
+test "profile device diagnostic extracts only a valid 16 digit XUID" {
+    try std.testing.expectEqualStrings(
+        "E0300000728022C4",
+        profileIdFromUserDevice("HostPathDevice::ResolvePath(User_E0300000728022C4:)").?,
+    );
+    try std.testing.expect(profileIdFromUserDevice("HostPathDevice::ResolvePath(User_short:)") == null);
+    try std.testing.expect(profileIdFromUserDevice("HostPathDevice::ResolvePath(User_E0300000728022CZ:)") == null);
+}
+
+test "profile dismount classifier distinguishes cleanup from load failures" {
+    const load_symbol = "__ZN2xe6kernel3xam14ProfileManager11LoadAccountEy";
+    try std.testing.expectEqual(@as(?ProfileAccountStage, .open_failed), classifyProfileDismountCaller(load_symbol, 0x483));
+    try std.testing.expectEqual(@as(?ProfileAccountStage, .short_read), classifyProfileDismountCaller(load_symbol, 0x646));
+    try std.testing.expectEqual(@as(?ProfileAccountStage, .decrypted), classifyProfileDismountCaller(load_symbol, 0x762));
+    try std.testing.expect(classifyProfileDismountCaller("OtherFunction", 0x762) == null);
+    try std.testing.expectEqual(@as(u64, 404), PROFILE_ENCRYPTED_ACCOUNT_BYTES);
+}
+
+fn repairAsciiCodepointBlock(storage: []u8, expected: []const u8) TomlCodepointRepair {
+    var report = TomlCodepointRepair{};
+    const available = @min(expected.len, storage.len / TOML_CODEPOINT_STRIDE);
+    for (expected[0..available], 0..) |byte, index| {
+        const start = index * TOML_CODEPOINT_STRIDE;
+        const scalar = std.mem.readInt(u32, storage[start..][0..4], .little);
+        const raw = storage[start + 4];
+        if (scalar != byte or raw != byte) {
+            if (report.first_bad_index == null) {
+                report.first_bad_index = @intCast(index);
+                report.first_bad_scalar = scalar;
+                report.first_bad_raw = raw;
+                report.first_expected = byte;
+            }
+            if (scalar != byte) {
+                std.mem.writeInt(u32, storage[start..][0..4], byte, .little);
+                report.scalar_repairs +|= 1;
+            }
+            if (raw != byte) {
+                storage[start + 4] = byte;
+                report.raw_repairs +|= 1;
+            }
+        }
+    }
+    return report;
+}
+
+fn isPatchDbNullIsArraySequence(bytes: []const u8) bool {
+    const expected = [_]u8{
+        0x48, 0x8B, 0x07, // mov rax, [rdi]
+        0xFF, 0x50, 0x38, // call [rax+0x38] (node::is_array)
+        0xA8, 0x01, // test al, 1
+        0x0F, 0x85, 0x18, 0x00, 0x00, 0x00, // jne array path
+    };
+    return std.mem.eql(u8, bytes, &expected);
+}
+
+test "PatchDB empty-patch compatibility recognizes only the null virtual-call sequence" {
+    const sequence = [_]u8{ 0x48, 0x8B, 0x07, 0xFF, 0x50, 0x38, 0xA8, 0x01, 0x0F, 0x85, 0x18, 0x00, 0x00, 0x00 };
+    try std.testing.expect(isPatchDbNullIsArraySequence(&sequence));
+    var changed = sequence;
+    changed[5] = 0x40;
+    try std.testing.expect(!isPatchDbNullIsArraySequence(&changed));
+}
+
+fn threeOperandImulResult(regs: *const Regs, instruction: DecodedInsn, size: Size) u64 {
+    return x64_decoder.regVal(regs, instruction.src_reg, size) *% instruction.imm;
+}
+
+test "three-operand IMUL uses the source register rather than the old destination" {
+    var regs = Regs{};
+    x64_decoder.setReg(&regs, .al_ax_eax_rax, .bits64, 99);
+    x64_decoder.setReg(&regs, .cl_cx_ecx_rcx, .bits64, 3);
+
+    const instruction = DecodedInsn{
+        .op = .imul_reg64_reg64_imm8,
+        .dst_reg = .al_ax_eax_rax,
+        .src_reg = .cl_cx_ecx_rcx,
+        .imm = 24,
+    };
+
+    try std.testing.expectEqual(@as(u64, 72), threeOperandImulResult(&regs, instruction, .bits64));
+}
+
+test "TOML ASCII codepoint integrity repair restores scalar and raw bytes" {
+    const expected = "A\n\"";
+    var storage = [_]u8{0} ** (expected.len * TOML_CODEPOINT_STRIDE);
+    for (expected, 0..) |byte, index| {
+        const start = index * TOML_CODEPOINT_STRIDE;
+        std.mem.writeInt(u32, storage[start..][0..4], byte, .little);
+        storage[start + 4] = byte;
+    }
+    std.mem.writeInt(u32, storage[TOML_CODEPOINT_STRIDE..][0..4], 0, .little);
+    storage[TOML_CODEPOINT_STRIDE + 4] = 0xff;
+
+    const report = repairAsciiCodepointBlock(&storage, expected);
+    try std.testing.expectEqual(@as(u8, 1), report.scalar_repairs);
+    try std.testing.expectEqual(@as(u8, 1), report.raw_repairs);
+    try std.testing.expectEqual(@as(?u8, 1), report.first_bad_index);
+    try std.testing.expectEqual(@as(u32, '\n'), std.mem.readInt(u32, storage[TOML_CODEPOINT_STRIDE..][0..4], .little));
+    try std.testing.expectEqual(@as(u8, '\n'), storage[TOML_CODEPOINT_STRIDE + 4]);
+}
+
 /// A guest handler can observe a SIGILL/UD2 assertion and return without
 /// editing the saved machine context.  Re-entering the same UD2 would only
 /// redeliver the signal, so treat that acknowledged assertion as resolved.
@@ -8536,6 +11029,11 @@ test "guest SIGILL return requires a changed RIP or patched UD2 bytes" {
     try std.testing.expect(!signalHandlerMadeProgress(frame, 0x4000, &.{ 0x0F, 0x0B }));
 }
 
+test "toml++ ASCII fast path predicate accepts ASCII and rejects UTF-8 multibyte bytes" {
+    try std.testing.expect(isAsciiBytes("title_name = \"Halo 3\""));
+    try std.testing.expect(!isAsciiBytes(&.{ 0x74, 0xC3, 0xA9 }));
+}
+
 test "guest SIGILL handler return resolves an unchanged UD2 by advancing" {
     const ud2_frame = GuestSignalFrame{ .signal = GUEST_SIGILL, .instruction_len = 2, .fault_rip = 0x4000 };
     try std.testing.expectEqual(@as(?u64, 0x4002), resolveGuestSignalReturn(ud2_frame, 0x4000, &.{ 0x0F, 0x0B }));
@@ -8626,6 +11124,10 @@ test "advertised AVX profile passes baseline VEX decoder audit" {
 }
 
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
+    var output = runtime_output.Controller.init(allocator);
+    defer output.deinit();
+    output.human("Loading Mach-O...\n", .{});
+
     const file_data = try std.Io.Dir.cwd().readFileAlloc(io, options.path, allocator, .unlimited);
     defer allocator.free(file_data);
 
@@ -8634,8 +11136,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         return 1;
     };
 
-    var state = try MachOState.init(allocator, slice);
+    var state = try MachOState.init(io, allocator, slice);
     defer state.deinit();
+    state.concise_output = output.concise;
+    state.diagnostic_output_fd = output.diagnosticsFd();
+    state.scheduler_log.open(allocator);
+    state.pthreads.attachEventLog(&state.scheduler_log);
+    output.human("Loading imports...\n", .{});
     state.cpu_profile = selectedCpuProfile();
     state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");
     state.unwinder.verbose = state.verbose_trace or environmentFlag("ROSETTE_MACHO_UNWIND_VERBOSE");
@@ -8719,10 +11226,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.guest_fds[1] = 1;
     state.guest_fds[2] = 2;
 
+    output.human("Initializing pthread runtime...\n", .{});
     state.setupMachOState(options.path, options.args);
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
 
     state.startup.enter(.static_init, state.executed_steps);
+    output.human("Initializing guest runtime...\n", .{});
     std.debug.print("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
     const initializers_ok = state.runInitializers();
     state.initializer_resolver.logSummary();
@@ -8735,11 +11244,14 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.libcxx_filesystem.logSummary();
         state.libcxx_streams.logSummary();
         state.logging.logSummary();
+        state.backend_diagnostics.logSummary();
         state.pthreads.logSummary();
         state.logCooperativeSchedulerSummary();
         state.memory_forwarder.logSummary();
         state.launch_options.logSummary();
         state.startup.logSummary();
+        state.cxx_exceptions.logSummary();
+        state.spirv_cross.logSummary();
         state.unwinder.logSummary();
         state.dynamic_casts.logSummary();
         state.diagnostic_text.logSummary();
@@ -8752,9 +11264,22 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     }
 
     state.startup.enter(.main_enter, state.executed_steps);
+    output.human("Loading guest program...\n", .{});
     std.debug.print("macho-processor: starting execution at 0x{x}, rsp=0x{x}\n", .{ state.regs.rip, state.regs.rsp });
 
     state.run();
+
+    output.human("\nStatus:\n", .{});
+    output.human("✓ Mach-O loaded\n", .{});
+    output.human("✓ Imports initialized\n", .{});
+    if (state.exit_code == 0 and !state.faulted) {
+        output.human("✓ Guest execution completed\n", .{});
+    } else {
+        output.human("✗ Guest execution stopped (exit code {d})\n", .{state.exit_code});
+    }
+    if (state.pthreads.blocked_threads != 0) {
+        output.human("✗ Waiting guest threads: {d}\n", .{state.pthreads.blocked_threads});
+    }
 
     std.debug.print("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
     state.logDecodeCacheSummary();
@@ -8767,6 +11292,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.libcxx_filesystem.logSummary();
     state.libcxx_streams.logSummary();
     state.logging.logSummary();
+    state.backend_diagnostics.logSummary();
     state.pthreads.logSummary();
     state.logCooperativeSchedulerSummary();
     state.memory_forwarder.logSummary();
@@ -8776,6 +11302,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.smart_stubs.logSummary();
     state.symbol_assembly.logSummary();
     state.cxx_exceptions.logSummary();
+    state.spirv_cross.logSummary();
     state.unwinder.logSummary();
     state.dynamic_casts.logSummary();
     state.diagnostic_text.logSummary();
@@ -9643,6 +12170,17 @@ fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         }
         decoded.op = if (prefix == 0) .vucomiss else .vucomisd;
         decoded.len = @intCast(compare_pos);
+        return decoded;
+    }
+
+    if (opcode == 0xD7 and prefix == 1 and (vex & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.dst_reg = rm.reg;
+        decoded.xmm_src = @intCast(rm.addr);
+        decoded.op = if (vector_256) .vpmovmskb_ymm else .vpmovmskb;
+        decoded.len = @intCast(pos);
         return decoded;
     }
 
@@ -10606,6 +13144,21 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
         return decodeCmpxchg(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
+    if (opcode2 == 0xB3) {
+        if (pos.* >= bytes.len) return .{};
+        const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, d.size);
+        d.src_reg = rm.reg;
+        if (d.is_reg_form) {
+            d.dst_reg = @enumFromInt(rm.addr);
+            d.op = .btr_reg_reg;
+        } else {
+            d.addr = rm.addr;
+            d.op = .btr_mem_reg;
+        }
+        d.len = @intCast(pos.*);
+        return d;
+    }
+
     if (opcode2 == 0xB6 or opcode2 == 0xB7) {
         return decodeMovzx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
@@ -10721,6 +13274,26 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
         return d;
     }
 
+    if (opcode2 == 0xD7) {
+        if (!has_66) {
+            d.op = .nop;
+            d.len = @as(u8, @intCast(pos.* + 1));
+            return d;
+        }
+        if (pos.* >= bytes.len) return .{};
+        const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+        if (!d.is_reg_form) {
+            d.op = .nop;
+            d.len = @as(u8, @intCast(pos.*));
+            return d;
+        }
+        d.xmm_src = @intFromEnum(@as(RegId, @enumFromInt(@as(u8, @intCast(rm.addr)))));
+        d.dst_reg = rm.reg;
+        d.op = .pmovmskb;
+        d.len = @as(u8, @intCast(pos.*));
+        return d;
+    }
+
     if (opcode2 == 0xE6) {
         d.op = .nop;
         d.len = @as(u8, @intCast(pos.* + 2));
@@ -10752,6 +13325,21 @@ fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b
         d.op = .nop;
         d.len = @as(u8, @intCast(pos.* + 1));
         return d;
+    }
+
+    if (opcode2 == 0xC7) {
+        if (pos.* >= bytes.len) return .{};
+        const modrm_byte = bytes[pos.*];
+        const reg = (modrm_byte >> 3) & 7;
+        if (reg == 1) {
+            const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits64);
+            if (d.is_reg_form) return .{};
+            d.addr = rm.addr;
+            d.op = if (rex_w) .cmpxchg16b_mem else .cmpxchg8b_mem;
+            d.len = @intCast(pos.*);
+            return d;
+        }
+        return .{};
     }
 
     return .{};
@@ -11654,28 +14242,40 @@ fn decodeImulTwoOp(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
 }
 
 fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
-    _ = opcode2;
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
-    const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    // 0F B0 is always the byte form.  0F B1 follows the operand-size
+    // attribute. Treating B0 as B1/32 corrupts the three bytes adjacent to
+    // std::atomic<uint8_t> and makes a successful compare-exchange appear to
+    // fail when the neighbouring bytes are nonzero.
+    const sz: Size = if (opcode2 == 0xB0)
+        .bits8
+    else if (rex_w)
+        .bits64
+    else if (has_66)
+        .bits16
+    else
+        .bits32;
     const modrm = bytes[pos];
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (is_mem) {
         d.op = switch (sz) {
+            .bits8 => .cmpxchg_mem8_reg8,
+            .bits16 => .cmpxchg_mem16_reg16,
             .bits32 => .cmpxchg_mem32_reg32,
             .bits64 => .cmpxchg_mem64_reg64,
-            else => .cmpxchg_mem32_reg32,
         };
         d.addr = rm.addr;
         d.src_reg = rm.reg;
     } else {
         d.op = switch (sz) {
+            .bits8 => .cmpxchg_reg8_reg8,
+            .bits16 => .cmpxchg_reg16_reg16,
             .bits32 => .cmpxchg_reg32_reg32,
             .bits64 => .cmpxchg_reg64_reg64,
-            else => .cmpxchg_reg32_reg32,
         };
         d.dst_reg = @enumFromInt(rm.addr);
         d.src_reg = rm.reg;
@@ -12602,6 +15202,21 @@ test "decode bit scan and count instructions without losing ModRM" {
     try std.testing.expectEqual(@as(u8, 5), lzcnt.len);
 }
 
+test "decode BTR register forms without consuming following instructions" {
+    const exact_failure = decodeInsn(&[_]u8{ 0x0F, 0xB3, 0xC8, 0x89, 0x85 });
+    try std.testing.expectEqual(Op.btr_reg_reg, exact_failure.op);
+    try std.testing.expectEqual(Size.bits32, exact_failure.size);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, exact_failure.dst_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, exact_failure.src_reg);
+    try std.testing.expectEqual(@as(u8, 3), exact_failure.len);
+
+    const rex_w = decodeInsn(&[_]u8{ 0x4D, 0x0F, 0xB3, 0xC8 });
+    try std.testing.expectEqual(Op.btr_reg_reg, rex_w.op);
+    try std.testing.expectEqual(Size.bits64, rex_w.size);
+    try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, rex_w.dst_reg);
+    try std.testing.expectEqual(RegId.r9b_r9w_r9d_r9, rex_w.src_reg);
+}
+
 test "decode BSWAP register family" {
     const initializer_bswap = decodeInsn(&[_]u8{ 0x0F, 0xC8 });
     try std.testing.expectEqual(Op.bswap_reg, initializer_bswap.op);
@@ -12702,6 +15317,26 @@ test "decode CMPXCHG ModRM register form without aliasing memory" {
     try std.testing.expect(register.is_reg_form);
 }
 
+test "decode CMPXCHG byte and word forms without widening atomics" {
+    const byte_memory = decodeInsn(&[_]u8{ 0xF0, 0x0F, 0xB0, 0x11 });
+    try std.testing.expectEqual(Op.cmpxchg_mem8_reg8, byte_memory.op);
+    try std.testing.expectEqual(Size.bits8, byte_memory.size);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, byte_memory.src_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, byte_memory.sib_base_reg);
+    try std.testing.expect(!byte_memory.is_reg_form);
+
+    const word_memory = decodeInsn(&[_]u8{ 0xF0, 0x66, 0x0F, 0xB1, 0x11 });
+    try std.testing.expectEqual(Op.cmpxchg_mem16_reg16, word_memory.op);
+    try std.testing.expectEqual(Size.bits16, word_memory.size);
+
+    const byte_register = decodeInsn(&[_]u8{ 0x0F, 0xB0, 0xD1 });
+    try std.testing.expectEqual(Op.cmpxchg_reg8_reg8, byte_register.op);
+    try std.testing.expectEqual(Size.bits8, byte_register.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, byte_register.dst_reg);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, byte_register.src_reg);
+    try std.testing.expect(byte_register.is_reg_form);
+}
+
 test "dyld data bindings materialize callable constant and GOT slots" {
     const constant_section = macho_metadata.Section{
         .name = "__const",
@@ -12715,6 +15350,9 @@ test "dyld data bindings materialize callable constant and GOT slots" {
     };
     var got_section = constant_section;
     got_section.name = "__got";
+    var data_section = constant_section;
+    data_section.name = "__data";
+    data_section.segment_name = "__DATA";
 
     try std.testing.expect(MachOState.isCallableConstantBinding(
         constant_section,
@@ -12724,6 +15362,9 @@ test "dyld data bindings materialize callable constant and GOT slots" {
     try std.testing.expect(MachOState.isCallableConstantBinding(constant_section, "_strcmp", true));
     try std.testing.expect(!MachOState.isCallableConstantBinding(constant_section, "__ZTVN10__cxxabiv117__class_type_infoE", false));
     try std.testing.expect(MachOState.isCallableConstantBinding(got_section, "_strcmp", true));
+    try std.testing.expect(MachOState.isCallableConstantBinding(data_section, "_calloc", true));
+    try std.testing.expect(!MachOState.isCallableConstantBinding(data_section, "_ordinary_data", false));
+    try std.testing.expect(MachOState.isWritableDataSection(data_section));
     try std.testing.expect(!MachOState.isCallableConstantBinding(got_section, "___stack_chk_guard", false));
     try std.testing.expect(MachOState.isAbiDataSymbol("__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE"));
     try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE"));
@@ -12847,12 +15488,13 @@ test "x87 FMULP writes ST(i) before popping ST(0)" {
 }
 
 test "GTK idle wake preempts a running worker after all pthreads have started" {
-    try std.testing.expectEqual(CooperativeQuantumWork.gtk_idle, cooperativeQuantumWork(1, false, 0));
-    try std.testing.expectEqual(CooperativeQuantumWork.gtk_idle, cooperativeQuantumWork(1, false, 3));
-    try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(1, true, 0));
-    try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(0, true, 1));
-    try std.testing.expectEqual(CooperativeQuantumWork.deferred_thread, cooperativeQuantumWork(0, false, 1));
-    try std.testing.expectEqual(CooperativeQuantumWork.none, cooperativeQuantumWork(0, false, 0));
+    try std.testing.expectEqual(scheduler.CooperativeWork.gtk_idle, scheduler.chooseCooperativeWork(.{ .pending_idle = 1 }));
+    try std.testing.expectEqual(scheduler.CooperativeWork.gtk_idle, scheduler.chooseCooperativeWork(.{ .pending_idle = 1, .deferred_threads = 3 }));
+    try std.testing.expectEqual(scheduler.CooperativeWork.none, scheduler.chooseCooperativeWork(.{ .pending_idle = 1, .idle_callback_running = true }));
+    try std.testing.expectEqual(scheduler.CooperativeWork.none, scheduler.chooseCooperativeWork(.{ .idle_callback_running = true, .deferred_threads = 1, .suspended_threads = 2 }));
+    try std.testing.expectEqual(scheduler.CooperativeWork.deferred_thread, scheduler.chooseCooperativeWork(.{ .deferred_threads = 1, .suspended_threads = 2 }));
+    try std.testing.expectEqual(scheduler.CooperativeWork.suspended_thread, scheduler.chooseCooperativeWork(.{ .suspended_threads = 2 }));
+    try std.testing.expectEqual(scheduler.CooperativeWork.none, scheduler.chooseCooperativeWork(.{}));
 }
 
 test "GTK idle diagnostics retain the oldest queued callback provenance" {
@@ -12897,11 +15539,13 @@ test "decode C7 memory immediate sign extends to 64 bits" {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
-    const executable_path = std.process.executablePathAlloc(init.io, allocator) catch null;
-    std.debug.print(
-        "scheduler: runtime integration active version=ui-handoff-v2 optimize={s} executable={s}\n",
-        .{ @tagName(builtin.mode), if (executable_path) |path| path else "<unavailable>" },
-    );
+    if (environmentFlag("ROSETTE_MACHO_VERBOSE_STDOUT")) {
+        const executable_path = std.process.executablePathAlloc(init.io, allocator) catch null;
+        std.debug.print(
+            "scheduler: runtime integration active version=ui-handoff-v2 optimize={s} executable={s}\n",
+            .{ @tagName(builtin.mode), if (executable_path) |path| path else "<unavailable>" },
+        );
+    }
 
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
