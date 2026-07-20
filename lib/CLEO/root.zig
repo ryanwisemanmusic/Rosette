@@ -35,7 +35,7 @@ pub fn exerciseAll() !void {
 }
 
 fn exerciseAvx256() !void {
-    const features = types.FeatureSet.cleoEmulated();
+    const features = types.FeatureSet.all();
     const lhs = wide.fromArray(256, f32, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
     const rhs = wide.fromArray(256, f32, .{ 10, 20, 30, 40, 50, 60, 70, 80 });
     const add = try AVX.ADDPS.execute(256, lhs, rhs, features);
@@ -71,7 +71,7 @@ fn exerciseAvx256() !void {
 }
 
 fn exerciseAvx512() !void {
-    const features = types.FeatureSet.cleoEmulated();
+    const features = types.FeatureSet.all();
     const lhs = wide.fromArray(512, f64, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
     const rhs = wide.fromArray(512, f64, .{ 8, 7, 6, 5, 4, 3, 2, 1 });
     const sum = try AVX512F.ADDPD.execute(512, lhs, rhs, features);
@@ -100,7 +100,7 @@ fn exerciseAvx512() !void {
 }
 
 fn exerciseAvx2Moves() !void {
-    const features = types.FeatureSet.cleoEmulated();
+    const features = types.FeatureSet.all();
     const value = wide.Wide(256).splatByte(0xA5);
     const moved = try AVX2.MOVDQU.move(256, value, features);
     try std.testing.expect(value.equal(moved));
@@ -111,7 +111,7 @@ fn exerciseAvx2Moves() !void {
 }
 
 fn exerciseMinMaxDotAndCrypto() !void {
-    const features = types.FeatureSet.cleoEmulated();
+    const features = types.FeatureSet.all();
 
     const signed_lhs = wide.fromArray(256, i8, .{ -3, 4, -1, 8, 12, -9, 0, 7, 1, 2, 3, 4, -5, -6, 7, 8, 9, -10, 11, 12, 13, 14, -15, 16, 17, 18, 19, -20, 21, 22, 23, 24 });
     const signed_rhs = wide.fromArray(256, i8, .{ 3, -4, 2, 7, -12, 9, 1, -7, 2, 1, 4, 3, 5, -7, 8, 7, -9, 10, 10, 13, 12, 15, 15, -16, 16, 19, 18, 20, -21, 21, 24, 23 });
@@ -145,7 +145,7 @@ fn exerciseMinMaxDotAndCrypto() !void {
 }
 
 fn exerciseSystemWidths() !void {
-    const features = types.FeatureSet.cleoEmulated();
+    const features = types.FeatureSet.all();
     const key = wide.Wide(256).splatByte(0xCC);
     const moved_key = try SYSTEM.LOADIWKEY.move(256, key, features);
     try std.testing.expect(key.equal(moved_key));
@@ -181,4 +181,25 @@ test "CLEO root validates wide AVX lowering layer" {
     try std.testing.expectEqual(@as(usize, 245), registry.tableCount());
     validateAll();
     try exerciseAll();
+}
+
+test "CLEO broadcast load replicates scalar across all lanes" {
+    const ADDPS512 = @import("AVX512F/ADDPS.zig");
+    const features = types.FeatureSet.all();
+    const scalar_bytes = [_]u8{ 0x00, 0x00, 0x80, 0x3f }; // f32 1.0
+    const result = try ADDPS512.loadBroadcast(512, scalar_bytes[0..], features);
+    const lanes: [16]f32 = wide.toArray(512, f32, result);
+    for (lanes) |lane| try std.testing.expectEqual(@as(f32, 1.0), lane);
+}
+
+test "CLEO broadcast load then execute produces correct result" {
+    const ADDPS512 = @import("AVX512F/ADDPS.zig");
+    const features = types.FeatureSet.all();
+    const ones: f32 = 1.0;
+    const one_bytes = std.mem.asBytes(&ones);
+    const lhs = wide.broadcast(512, f32, @as(f32, 2.0));
+    const rhs = try ADDPS512.loadBroadcast(512, one_bytes[0..], features);
+    const result = try ADDPS512.execute(512, lhs, rhs, features);
+    const lanes: [16]f32 = wide.toArray(512, f32, result);
+    for (lanes) |lane| try std.testing.expectEqual(@as(f32, 3.0), lane);
 }

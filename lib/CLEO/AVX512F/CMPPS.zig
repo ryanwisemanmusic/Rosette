@@ -47,6 +47,10 @@ pub fn move(comptime bits: usize, value: wide.Wide(bits), features: types.Featur
     return instruction.move(bits, meta, value, features);
 }
 
+pub fn loadBroadcast(comptime bits: usize, src: []const u8, features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    return instruction.broadcastLoad(bits, meta, src, features);
+}
+
 pub fn movMask(comptime bits: usize, value: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!u32 {
     return instruction.movMask(bits, meta, value, features);
 }

@@ -20,4 +20,5 @@ pub const executeMasked = Impl.executeMasked;
 pub const executeMaskedImmediate = Impl.executeMaskedImmediate;
 pub const executeAccumulateMasked = Impl.executeAccumulateMasked;
 pub const move = Impl.move;
+pub const loadBroadcast = Impl.loadBroadcast;
 pub const movMask = Impl.movMask;

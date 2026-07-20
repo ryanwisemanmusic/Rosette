@@ -42,7 +42,10 @@ pub const FeatureSet = struct {
     pub fn host() FeatureSet {
         var result = FeatureSet{};
         switch (builtin.target.cpu.arch) {
-            .aarch64 => result.neon = true,
+            .aarch64 => {
+                result.neon = true;
+                result.fma = true;
+            },
             .x86_64 => {
                 result.sse = true;
                 result.sse2 = true;
@@ -53,6 +56,23 @@ pub const FeatureSet = struct {
     }
 
     pub fn cleoEmulated() FeatureSet {
+        var result = host();
+        switch (builtin.target.cpu.arch) {
+            .aarch64 => {
+                result.sse = true;
+                result.sse2 = true;
+            },
+            .x86_64 => {
+                result.avx = true;
+                result.avx2 = true;
+                result.fma = true;
+            },
+            else => {},
+        }
+        return result;
+    }
+
+    pub fn all() FeatureSet {
         return .{
             .sse = true,
             .sse2 = true,
@@ -345,8 +365,9 @@ pub fn requireWidth(meta: InstructionMeta, comptime bits: usize) SafetyError!voi
 
 test "CLEO feature masks separate host and emulated support" {
     const emulated = FeatureSet.cleoEmulated();
-    try std.testing.expect(emulated.contains(.avx512f));
-    try std.testing.expect(emulated.contains(.neon));
+    try std.testing.expect(emulated.contains(.sse));
+    try std.testing.expect(emulated.contains(.sse2));
     try std.testing.expect(emulated.mask() != 0);
-    _ = FeatureSet.host();
+    const host = FeatureSet.host();
+    try std.testing.expect(host.contains(.neon) or host.contains(.sse));
 }

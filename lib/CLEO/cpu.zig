@@ -31,7 +31,7 @@ pub fn emulatedFeatureMask() u64 {
 
 test "CLEO CPU report exposes host and emulated masks" {
     const report = detect();
-    try std.testing.expect(report.canEmulate(.avx));
-    try std.testing.expect(report.canEmulate(.avx512f));
+    try std.testing.expect(report.canEmulate(.sse));
+    try std.testing.expect(report.canEmulate(.sse2));
     try std.testing.expect(report.cleo_emulated.mask() != 0);
 }

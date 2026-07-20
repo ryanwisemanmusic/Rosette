@@ -1,3 +1,4 @@
+const std = @import("std");
 const types = @import("types.zig");
 const wide = @import("wide.zig");
 
@@ -49,11 +50,26 @@ pub fn executeBinary(comptime bits: usize, meta: types.InstructionMeta, lhs: wid
         .andn_pd => wide.mapBinary(bits, u64, lhs, rhs, .bit_andnot),
         .cmp_ps => wide.mapBinary(bits, f32, lhs, rhs, .cmp),
         .cmp_pd => wide.mapBinary(bits, f64, lhs, rhs, .cmp),
-        .blend_ps => wide.blendImmediate(bits, u32, lhs, rhs, 0),
-        .blend_pd => wide.blendImmediate(bits, u64, lhs, rhs, 0),
-        .shuf_ps => wide.shuffleImmediatePS(bits, lhs, rhs, 0),
-        .shuf_pd => wide.shuffleImmediatePD(bits, lhs, rhs, 0),
-        .dpps => wide.dotProductPS(bits, lhs, rhs, 0),
+        .blend_ps => blk: {
+            std.debug.print("cleo: {s} called via execute() with imm=0 (did you mean executeImmediate?)\n", .{@tagName(meta.operation)});
+            break :blk wide.blendImmediate(bits, u32, lhs, rhs, 0);
+        },
+        .blend_pd => blk: {
+            std.debug.print("cleo: {s} called via execute() with imm=0 (did you mean executeImmediate?)\n", .{@tagName(meta.operation)});
+            break :blk wide.blendImmediate(bits, u64, lhs, rhs, 0);
+        },
+        .shuf_ps => blk: {
+            std.debug.print("cleo: {s} called via execute() with imm=0 (did you mean executeImmediate?)\n", .{@tagName(meta.operation)});
+            break :blk wide.shuffleImmediatePS(bits, lhs, rhs, 0);
+        },
+        .shuf_pd => blk: {
+            std.debug.print("cleo: {s} called via execute() with imm=0 (did you mean executeImmediate?)\n", .{@tagName(meta.operation)});
+            break :blk wide.shuffleImmediatePD(bits, lhs, rhs, 0);
+        },
+        .dpps => blk: {
+            std.debug.print("cleo: {s} called via execute() with imm=0 (did you mean executeImmediate?)\n", .{@tagName(meta.operation)});
+            break :blk wide.dotProductPS(bits, lhs, rhs, 0);
+        },
         .aesenc => wide.aesRound(bits, lhs, rhs, .enc),
         .aesdec => wide.aesRound(bits, lhs, rhs, .dec),
         .aesenclast => wide.aesRound(bits, lhs, rhs, .enc_last),
@@ -359,6 +375,21 @@ pub fn loadForInstruction(comptime bits: usize, meta: types.InstructionMeta, src
     try types.requireFeature(meta, features);
     try types.requireWidth(meta, bits);
     return wide.loadBytesAligned(bits, src, meta.alignment);
+}
+
+pub fn loadBroadcastForInstruction(comptime bits: usize, meta: types.InstructionMeta, src: []const u8, features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    if (!meta.supports_broadcast) return types.SafetyError.UnsupportedInstructionWidth;
+    try types.validateMeta(meta);
+    try types.requireFeature(meta, features);
+    try types.requireWidth(meta, bits);
+    const elem_bytes: usize = meta.element_bits / 8;
+    if (src.len < elem_bytes) return types.SafetyError.BufferTooSmall;
+    var result = wide.Wide(bits).zero();
+    const lanes = bits / meta.element_bits;
+    for (0..lanes) |lane| {
+        @memcpy(result.bytes[(lane * elem_bytes)..][0..elem_bytes], src[0..elem_bytes]);
+    }
+    return result;
 }
 
 pub fn storeForInstruction(comptime bits: usize, meta: types.InstructionMeta, dst: []u8, value: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!void {

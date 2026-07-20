@@ -66,6 +66,12 @@ pub fn laneCount(comptime bits: usize, comptime T: type) usize {
     return types.laneCount(bits, T);
 }
 
+pub fn broadcast(comptime bits: usize, comptime T: type, scalar: T) Wide(bits) {
+    const lanes = comptime laneCount(bits, T);
+    const arr: [lanes]T = [_]T{scalar} ** lanes;
+    return fromArray(bits, T, arr);
+}
+
 pub fn fromArray(comptime bits: usize, comptime T: type, array: [laneCount(bits, T)]T) Wide(bits) {
     var result = Wide(bits).zero();
     @memcpy(result.bytes[0..], std.mem.asBytes(&array));
@@ -529,6 +535,21 @@ test "CLEO computes square roots lane-wise" {
     const src = fromArray(256, f32, .{ 4, 9, 16, 25, 36, 49, 64, 81 });
     const out = mapUnary(256, f32, src, .sqrt);
     try std.testing.expectEqual([_]f32{ 2, 3, 4, 5, 6, 7, 8, 9 }, toArray(256, f32, out));
+}
+
+test "CLEO broadcasts f32 scalar to all 256-bit lanes" {
+    const scalar: f32 = 3.14;
+    const result = broadcast(256, f32, scalar);
+    const lanes = toArray(256, f32, result);
+    try std.testing.expectEqual(@as(f32, 3.14), lanes[0]);
+    try std.testing.expectEqual(@as(f32, 3.14), lanes[7]);
+}
+
+test "CLEO broadcasts u64 scalar to all 512-bit lanes" {
+    const scalar: u64 = 0xDEADBEEF;
+    const result = broadcast(512, u64, scalar);
+    const lanes = toArray(512, u64, result);
+    for (lanes) |lane| try std.testing.expectEqual(scalar, lane);
 }
 
 test "CLEO shuffles packed double lanes and applies AVX512 masks" {

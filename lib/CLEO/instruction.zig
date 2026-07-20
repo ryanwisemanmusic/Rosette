@@ -46,6 +46,10 @@ pub fn accumulateMasked(comptime bits: usize, meta: types.InstructionMeta, merge
     return ops.executeAccumulateMasked(bits, meta, merge, accum, lhs, rhs, mask, mode, features);
 }
 
+pub fn broadcastLoad(comptime bits: usize, meta: types.InstructionMeta, src: []const u8, features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    return ops.loadBroadcastForInstruction(bits, meta, src, features);
+}
+
 pub fn move(comptime bits: usize, meta: types.InstructionMeta, value: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
     return ops.executeMove(bits, meta, value, features);
 }
