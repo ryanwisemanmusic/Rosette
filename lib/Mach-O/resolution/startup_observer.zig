@@ -46,6 +46,16 @@ pub const Snapshot = struct {
     diagnostic_text_runs: u64 = 0,
     diagnostic_text_lines: u64 = 0,
     thread_id: u64 = 0,
+    /// Digest of volatile execution state (normally registers). A non-zero
+    /// value distinguishes a progressing hot loop from an unchanged PC.
+    execution_fingerprint: u64 = 0,
+};
+
+pub const StallPolicy = struct {
+    min_repeated_samples: u64 = 3,
+    min_same_state_steps: u64 = 15_000_000,
+    min_same_state_ns: u64 = 10 * std.time.ns_per_s,
+    diagnostic_cooldown_ns: u64 = 30 * std.time.ns_per_s,
 };
 
 pub const Observer = struct {
@@ -59,6 +69,14 @@ pub const Observer = struct {
     heartbeat_last_wall: u64 = 0,
     stuck_pc_symbol: []const u8 = "",
     stuck_pc_count: u64 = 0,
+    stuck_thread_id: u64 = 0,
+    stuck_rip: u64 = 0,
+    stuck_execution_fingerprint: u64 = 0,
+    stuck_state_start_step: u64 = 0,
+    stuck_state_start_wall: u64 = 0,
+    last_stall_diagnostic_wall: u64 = 0,
+    stall_diagnostic_due: bool = false,
+    stall_policy: StallPolicy = .{},
     timing_stack: [16]PhaseTiming = undefined,
     timing_depth: usize = 0,
 
@@ -94,12 +112,30 @@ pub const Observer = struct {
         const steps_per_sec = calculateStepsPerSecond(step_delta, interval_ns);
         self.heartbeat_last_wall = now;
 
-        if (std.mem.eql(u8, self.stuck_pc_symbol, snapshot.symbol)) {
+        const same_execution_state = self.stuck_thread_id == snapshot.thread_id and
+            self.stuck_rip == snapshot.rip and
+            (snapshot.execution_fingerprint == 0 or
+                self.stuck_execution_fingerprint == snapshot.execution_fingerprint);
+        if (same_execution_state) {
             self.stuck_pc_count += 1;
         } else {
             self.stuck_pc_symbol = snapshot.symbol;
             self.stuck_pc_count = 1;
+            self.stuck_thread_id = snapshot.thread_id;
+            self.stuck_rip = snapshot.rip;
+            self.stuck_execution_fingerprint = snapshot.execution_fingerprint;
+            self.stuck_state_start_step = snapshot.step;
+            self.stuck_state_start_wall = now;
         }
+
+        const same_state_steps = snapshot.step -| self.stuck_state_start_step;
+        const same_state_ns = now -| self.stuck_state_start_wall;
+        const cooldown_elapsed = self.last_stall_diagnostic_wall == 0 or
+            now -| self.last_stall_diagnostic_wall >= self.stall_policy.diagnostic_cooldown_ns;
+        self.stall_diagnostic_due = self.stuck_pc_count >= self.stall_policy.min_repeated_samples and
+            same_state_steps >= self.stall_policy.min_same_state_steps and
+            same_state_ns >= self.stall_policy.min_same_state_ns and
+            cooldown_elapsed;
 
         const phase_str = @tagName(self.phase);
         std.debug.print(
@@ -122,12 +158,21 @@ pub const Observer = struct {
                 snapshot.pthread_waits_collapsed,
             },
         );
-        if (self.stuck_pc_count >= 3) {
+        if (self.stall_diagnostic_due) {
+            self.last_stall_diagnostic_wall = now;
             std.debug.print(
-                "info(macho): stuck-pc warning: {s} for {d} heartbeats ({d}M steps) at {d}steps/s\n",
-                .{ snapshot.symbol, self.stuck_pc_count, self.stuck_pc_count * step_delta / 1_000_000, steps_per_sec },
+                "info(macho): unchanged execution-state warning: thread=0x{x} rip=0x{x} {s}+0x{x} samples={d} same_state_steps={d} same_state_ms={d} at {d}steps/s\n",
+                .{ snapshot.thread_id, snapshot.rip, snapshot.symbol, snapshot.symbol_offset, self.stuck_pc_count, same_state_steps, same_state_ns / std.time.ns_per_ms, steps_per_sec },
             );
         }
+    }
+
+    /// Consume a diagnostic request. Stall observation is intentionally
+    /// non-fatal; callers may capture detail without changing guest behavior.
+    pub fn takeStallDiagnostic(self: *Observer) bool {
+        const due = self.stall_diagnostic_due;
+        self.stall_diagnostic_due = false;
+        return due;
     }
 
     pub fn checkpoint(self: *Observer, snapshot: Snapshot) void {
@@ -262,9 +307,14 @@ test "observer phase transition timing" {
     try std.testing.expectEqual(@as(usize, 2), observer.timing_depth);
 }
 
-test "observer stuck-pc detection fires after 3 heartbeats with same symbol" {
-    var observer = Observer{};
-    const s = Snapshot{
+test "observer stall tracking requires unchanged execution state" {
+    var observer = Observer{ .stall_policy = .{
+        .min_repeated_samples = 3,
+        .min_same_state_steps = 0,
+        .min_same_state_ns = 0,
+        .diagnostic_cooldown_ns = 0,
+    } };
+    var s = Snapshot{
         .step = 1000,
         .rip = 0x1000,
         .symbol = "construct_at_PageEntry",
@@ -282,6 +332,7 @@ test "observer stuck-pc detection fires after 3 heartbeats with same symbol" {
         .logging_lines = 0,
         .pthread_created = 0,
         .pthread_waits_collapsed = 0,
+        .execution_fingerprint = 7,
     };
     observer.heartbeat(s);
     try std.testing.expectEqual(@as(u64, 1), observer.stuck_pc_count);
@@ -289,4 +340,11 @@ test "observer stuck-pc detection fires after 3 heartbeats with same symbol" {
     try std.testing.expectEqual(@as(u64, 2), observer.stuck_pc_count);
     observer.heartbeat(s);
     try std.testing.expectEqual(@as(u64, 3), observer.stuck_pc_count);
+    try std.testing.expect(observer.takeStallDiagnostic());
+
+    s.step += 1;
+    s.execution_fingerprint = 8;
+    observer.heartbeat(s);
+    try std.testing.expectEqual(@as(u64, 1), observer.stuck_pc_count);
+    try std.testing.expect(!observer.takeStallDiagnostic());
 }

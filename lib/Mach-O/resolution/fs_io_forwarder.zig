@@ -45,6 +45,10 @@ pub const Forwarder = struct {
         std.debug.print("macho-processor: fs forwarding storage root: {s}\n", .{storage_root});
     }
 
+    pub fn storageRoot(self: *const Forwarder) []const u8 {
+        return self.translator.storage_root;
+    }
+
     pub fn resolveHostPath(self: *Forwarder, guest_path: []const u8, temporary: []u8) ?[]const u8 {
         const translation = self.translator.translate(guest_path, temporary) orelse return null;
         if (translation.translated.len == 0) return null;
@@ -69,10 +73,18 @@ pub const Forwarder = struct {
             @bitCast(@as(u32, @truncate(state.regs.rsi))),
             @as(c_int, @intCast(state.regs.rdx & 0xFFFF)),
         );
-        if (host_fd < 0) return self.failHost(state, host_fd);
+        if (host_fd < 0) {
+            if (isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
+                std.debug.print(
+                    "macho-processor: fs open FAILED: guest_path={s} host_path={s} flags=0x{x} mode=0{o} errno={s}\n",
+                    .{ path, translated_path, state.regs.rsi, state.regs.rdx & 0xFFFF, @tagName(std.c.errno(host_fd)) },
+                );
+            }
+            return self.failHost(state, host_fd);
+        }
         const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
-        if (shouldTrace(self.open_count)) {
-            std.debug.print("macho-processor: fs open #{d}: {s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, translated_path, guest_fd, host_fd });
+        if (shouldTrace(self.open_count) or isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
+            std.debug.print("macho-processor: fs open #{d}: guest_path={s} host_path={s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, path, translated_path, guest_fd, host_fd });
         }
         return guest_fd;
     }
@@ -97,10 +109,18 @@ pub const Forwarder = struct {
             @bitCast(@as(u32, @truncate(state.regs.rdx))),
             @as(c_int, @intCast(state.regs.rcx & 0xFFFF)),
         );
-        if (host_fd < 0) return self.failHost(state, host_fd);
+        if (host_fd < 0) {
+            if (isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
+                std.debug.print(
+                    "macho-processor: fs openat FAILED: dir_guest_fd={d} guest_path={s} host_path={s} flags=0x{x} errno={s}\n",
+                    .{ state.regs.rdi, path, translated_path, state.regs.rdx, @tagName(std.c.errno(host_fd)) },
+                );
+            }
+            return self.failHost(state, host_fd);
+        }
         const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
-        if (shouldTrace(self.open_count)) {
-            std.debug.print("macho-processor: fs openat #{d}: {s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, translated_path, guest_fd, host_fd });
+        if (shouldTrace(self.open_count) or isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
+            std.debug.print("macho-processor: fs openat #{d}: dir_guest_fd={d} guest_path={s} host_path={s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, state.regs.rdi, path, translated_path, guest_fd, host_fd });
         }
         return guest_fd;
     }
@@ -109,11 +129,22 @@ pub const Forwarder = struct {
         self.read_count += 1;
         const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return -1;
         const bytes = state.guestMemory(state.regs.rsi, state.regs.rdx) orelse return -1;
-        const rc = std.c.read(host_fd, bytes.ptr, bytes.len);
-        if (shouldTrace(self.read_count)) {
-            std.debug.print("macho-processor: fs read #{d}: guest_fd={d} requested={d} result={d}\n", .{ self.read_count, state.regs.rdi, bytes.len, rc });
+        while (true) {
+            const rc = std.c.read(host_fd, bytes.ptr, bytes.len);
+            if (rc >= 0) {
+                if (shouldTrace(self.read_count)) {
+                    std.debug.print("macho-processor: fs read #{d}: guest_fd={d} requested={d} result={d}\n", .{ self.read_count, state.regs.rdi, bytes.len, rc });
+                }
+                return @intCast(rc);
+            }
+            const err = std.c.errno(rc);
+            if (err != .INTR and err != .AGAIN) {
+                if (shouldTrace(self.read_count)) {
+                    std.debug.print("macho-processor: fs read #{d} FAILED: guest_fd={d} errno={s}\n", .{ self.read_count, state.regs.rdi, @tagName(err) });
+                }
+                return @bitCast(self.fail(state, err));
+            }
         }
-        return if (rc < 0) -1 else @intCast(rc);
     }
 
     pub fn pread(self: *Forwarder, state: anytype) i64 {
@@ -121,8 +152,12 @@ pub const Forwarder = struct {
         const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return -1;
         const bytes = state.guestMemory(state.regs.rsi, state.regs.rdx) orelse return -1;
         const offset: i64 = @bitCast(state.regs.rcx);
-        const rc = std.c.pread(host_fd, bytes.ptr, bytes.len, offset);
-        return if (rc < 0) -1 else @intCast(rc);
+        while (true) {
+            const rc = std.c.pread(host_fd, bytes.ptr, bytes.len, offset);
+            if (rc >= 0) return @intCast(rc);
+            const err = std.c.errno(rc);
+            if (err != .INTR and err != .AGAIN) return @bitCast(self.fail(state, err));
+        }
     }
 
     pub fn readv(self: *Forwarder, state: anytype) i64 {
@@ -709,12 +744,45 @@ pub const Forwarder = struct {
         const offset: i64 = @bitCast(state.regs.r9);
         if (length == 0) return @bitCast(@as(i64, -1));
         const map_flags: std.c.MAP = @bitCast(raw_flags);
-        const trace_mapping = length >= 1024 * 1024 * 1024 or (map_flags.FIXED and length >= 64 * 1024 * 1024);
+        const backend_trace = if (comptime @hasDecl(@TypeOf(state.*), "backendMemoryDiagnosticsActive"))
+            state.backendMemoryDiagnosticsActive()
+        else
+            false;
+        if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapAttempt")) {
+            state.noteBackendMmapAttempt("import", state.regs.rdi, length, state.regs.rdx, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS);
+        }
+        // Xenia's native x64 backend uses this window as an address hint for
+        // its code-cache indirection table.  The hint is semantically
+        // significant even though it is not MAP_FIXED: the backend rejects a
+        // table outside the 32-bit reachability window.  Preserve it in the
+        // guest virtual-address model instead of falling through to the
+        // unrelated general heap.
+        const x64_code_cache_hint = state.regs.rdi >= 0x8000_0000 and state.regs.rdi < 0xA000_0000;
+        const trace_mapping = backend_trace or x64_code_cache_hint or length >= 1024 * 1024 * 1024 or (map_flags.FIXED and length >= 64 * 1024 * 1024);
         if (trace_mapping) {
             std.debug.print(
                 "macho-processor: large/fixed mmap entry: route=import addr=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} guest_fd=0x{x} offset={d}\n",
                 .{ state.regs.rdi, length, state.regs.rdx, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS, state.regs.r8, offset },
             );
+        }
+        if (comptime @hasDecl(@TypeOf(state.*), "guestMapBackendWithBacking")) {
+            const backend_sparse_threshold = 64 * 1024 * 1024;
+            if (backend_trace and state.regs.rdi == 0 and map_flags.ANONYMOUS and length >= backend_sparse_threshold) {
+                const mapped = state.guestMapBackendWithBacking(length, @truncate(state.regs.rdx), raw_flags, -1, @bitCast(offset)) orelse {
+                    std.debug.print(
+                        "macho-processor: x64 backend sparse mmap FAILED: route=import address=0x0 length={d} prot=0x{x} flags=0x{x}; bounded guest heap fallback is intentionally disabled for large backend VM regions\n",
+                        .{ length, state.regs.rdx, raw_flags },
+                    );
+                    if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "backend_sparse_anywhere");
+                    return @bitCast(@as(i64, -1));
+                };
+                std.debug.print(
+                    "macho-processor: x64 backend sparse mmap succeeded: route=import guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} heap_bypassed=true\n",
+                    .{ mapped, length, state.regs.rdx, raw_flags },
+                );
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, mapped, "backend_sparse_anywhere");
+                return mapped;
+            }
         }
         if (state.regs.rdi != 0 and map_flags.FIXED) {
             // Anonymous mappings deliberately use fd=-1. Do not pass that
@@ -724,8 +792,14 @@ pub const Forwarder = struct {
             const host_fd: std.posix.fd_t = if (map_flags.ANONYMOUS)
                 -1
             else
-                self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
-            if (state.regs.rdi % std.heap.page_size_min != 0) return @bitCast(@as(i64, -1));
+                self.fd_manager.hostFd(state.regs.r8) orelse {
+                    if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "fixed_fd_translation");
+                    return @bitCast(@as(i64, -1));
+                };
+            if (state.regs.rdi % std.heap.page_size_min != 0) {
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "fixed_alignment");
+                return @bitCast(@as(i64, -1));
+            }
             const mapped = state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset));
             if (trace_mapping) {
                 const outcome: []const u8 = if (mapped) "succeeded" else "FAILED";
@@ -734,7 +808,33 @@ pub const Forwarder = struct {
                     .{ outcome, state.regs.rdi, length, state.regs.rdx, raw_flags, host_fd, offset },
                 );
             }
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(mapped, if (mapped) state.regs.rdi else 0, "fixed_sparse_map");
             return if (mapped) state.regs.rdi else @bitCast(@as(i64, -1));
+        }
+        if (x64_code_cache_hint) {
+            const host_fd: std.posix.fd_t = if (map_flags.ANONYMOUS)
+                -1
+            else
+                self.fd_manager.hostFd(state.regs.r8) orelse {
+                    std.debug.print(
+                        "macho-processor: x64 code-cache hint rejected: reason=guest_fd_translation address=0x{x} length={d} guest_fd=0x{x}\n",
+                        .{ state.regs.rdi, length, state.regs.r8 },
+                    );
+                    return @bitCast(@as(i64, -1));
+                };
+            if (state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset))) {
+                std.debug.print(
+                    "macho-processor: x64 code-cache hint mapped: guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d}\n",
+                    .{ state.regs.rdi, length, state.regs.rdx, raw_flags, host_fd },
+                );
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, state.regs.rdi, "code_cache_hint_sparse_map");
+                return state.regs.rdi;
+            }
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "code_cache_hint_sparse_map");
+            std.debug.print(
+                "macho-processor: x64 code-cache hint unavailable: guest_base=0x{x} length={d} prot=0x{x} flags=0x{x}; falling back to ordinary mmap placement\n",
+                .{ state.regs.rdi, length, state.regs.rdx, raw_flags },
+            );
         }
         // Xenia reserves its 32-bit guest address space with a non-fixed,
         // anonymous PROT_NONE mmap.  This is virtual address space, not a 4 GiB
@@ -746,28 +846,43 @@ pub const Forwarder = struct {
                 self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
             const reserved = state.guestReserveAddressSpaceWithBacking(length, raw_flags, host_fd, @bitCast(offset)) orelse {
                 std.debug.print("macho-processor: large mmap FAILED: route=import stage=sparse_reserve\n", .{});
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "sparse_reserve");
                 return @bitCast(@as(i64, -1));
             };
             std.debug.print("macho-processor: large mmap succeeded: route=import guest_base=0x{x} length={d}\n", .{ reserved, length });
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, reserved, "sparse_reserve");
             return reserved;
         }
-        const mapped = state.guestHeapAllocate(length, 4096) orelse return @bitCast(@as(i64, -1));
+        const mapped = state.guestHeapAllocate(length, 4096) orelse {
+            if (backend_trace) {
+                std.debug.print(
+                    "macho-processor: x64 backend mmap FAILED: route=import stage=guest_heap_allocate address=0x{x} length={d} heap allocation could not satisfy backend request\n",
+                    .{ state.regs.rdi, length },
+                );
+            }
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "guest_heap_allocate");
+            return @bitCast(@as(i64, -1));
+        };
         const destination = state.guestMemory(mapped, length) orelse {
             state.guestHeapRelease(mapped);
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "guest_heap_backing");
             return @bitCast(@as(i64, -1));
         };
         @memset(destination, 0);
         if (!map_flags.ANONYMOUS and state.regs.r8 != std.math.maxInt(u64)) {
             const host_fd = self.fd_manager.hostFd(state.regs.r8) orelse {
                 state.guestHeapRelease(mapped);
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "file_fd_translation");
                 return @bitCast(@as(i64, -1));
             };
             const rc = std.c.pread(host_fd, destination.ptr, destination.len, offset);
             if (rc < 0) {
                 state.guestHeapRelease(mapped);
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "file_pread");
                 return @bitCast(@as(i64, -1));
             }
         }
+        if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, mapped, "guest_heap_allocate");
         return mapped;
     }
 
@@ -781,8 +896,17 @@ pub const Forwarder = struct {
 
     pub fn mprotect(self: *Forwarder, state: anytype) u64 {
         _ = self;
-        if (state.guestProtectSparseMemory(state.regs.rdi, state.regs.rsi, @truncate(state.regs.rdx))) return 0;
-        return if (state.guestMemory(state.regs.rdi, state.regs.rsi) != null) 0 else @bitCast(@as(i64, -1));
+        const sparse_succeeded = state.guestProtectSparseMemory(state.regs.rdi, state.regs.rsi, @truncate(state.regs.rdx));
+        const result: u64 = if (sparse_succeeded)
+            0
+        else if (state.guestMemory(state.regs.rdi, state.regs.rsi) != null)
+            0
+        else
+            @bitCast(@as(i64, -1));
+        if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMprotect")) {
+            state.noteBackendMprotect("import", state.regs.rdi, state.regs.rsi, state.regs.rdx, result == 0);
+        }
+        return result;
     }
 
     pub fn logSummary(self: *const Forwarder) void {
@@ -870,6 +994,13 @@ fn isMacOSMetadataEntry(name: []const u8) bool {
         std.mem.eql(u8, name, ".localized") or
         std.mem.eql(u8, name, "Icon\r") or
         std.mem.startsWith(u8, name, "._");
+}
+
+fn isDiagnosticPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".patch.toml") or
+        std.mem.indexOf(u8, path, "User_") != null or
+        std.mem.indexOf(u8, path, "Account") != null or
+        std.mem.indexOf(u8, path, "/content/") != null;
 }
 
 fn shouldTrace(count: u64) bool {

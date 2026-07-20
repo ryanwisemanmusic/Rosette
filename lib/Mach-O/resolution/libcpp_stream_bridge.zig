@@ -2,7 +2,9 @@ const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
 const cxx_object_model = @import("cxx_object_model.zig");
 
-const MAX_STREAMS = 64;
+const MAX_STREAMS = 256; // was 64 — raised for IO-5
+const PATCH_TOML_TRACE_CAPACITY = 128;
+const MAX_REASONABLE_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB safety cap (was 1MB — raised for IO-3)
 const FILEBUF_OFFSET_IN_IFSTREAM = cxx_object_model.FILEBUF_OFFSET_IN_IFSTREAM;
 const BASIC_IOS_OFFSET_IN_IFSTREAM = cxx_object_model.BASIC_IOS_OFFSET_IN_IFSTREAM;
 const STRINGSTREAM_OSTREAM_OFFSET: u64 = 16;
@@ -10,6 +12,11 @@ const STRINGSTREAM_BUFFER_OFFSET: u64 = 24;
 const STRINGSTREAM_IOS_OFFSET: u64 = 128;
 const STRINGSTREAM_MIN_SIZE: u64 = STRINGSTREAM_IOS_OFFSET + cxx_object_model.stream_layout.size;
 const STRINGSTREAM_TEXT_CAPACITY: usize = 512;
+
+/// libc++ stream layout version — offsets are validated against libc++ 16 (v160006).
+/// Update these when targeting a different libc++ version.
+const LIBCPP_STREAM_LAYOUT_VERSION: u32 = 16;
+const LIBCPP_STREAM_LAYOUT_NOTE: []const u8 = "libc++ v160006 specific; adjust for libstdc++ or other versions";
 const CURRENT_THREAD_HANDLE: u64 = 0x7FFF_1000;
 const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
 const GTK_IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
@@ -19,6 +26,10 @@ const OPENMODE_ATE: u64 = 1 << 1;
 const OPENMODE_IN: u64 = 1 << 3;
 const OPENMODE_OUT: u64 = 1 << 4;
 const OPENMODE_TRUNC: u64 = 1 << 5;
+// libc++ 16 stores basic_istream::__gc_ immediately after the vptr.  Guest
+// code may call the locally-linked gcount() body instead of the import stub,
+// so modeled read() calls must keep this ABI field synchronized.
+const BASIC_ISTREAM_GCOUNT_OFFSET = cxx_object_model.BASIC_ISTREAM_GCOUNT_OFFSET;
 
 pub const Outcome = union(enum) {
     handled: u64,
@@ -35,11 +46,189 @@ const Stream = struct {
     last_read_count: i64 = 0,
     eof: bool = false,
     failed: bool = false,
-    trace_reads_remaining: u8 = 0,
+    last_read_offset: i64 = -1,
+    last_read_size: u64 = 0,
+    tracked_pos: u64 = 0,
+    generation: u64 = 0,
+    last_io_sequence: u64 = 0,
     patch_toml: bool = false,
+    patch_toml_eof_logged: bool = false,
+    patch_toml_schema: PatchTomlSchema = .{},
+    patch_toml_trace: [PATCH_TOML_TRACE_CAPACITY]PatchTomlOp = [_]PatchTomlOp{.{}} ** PATCH_TOML_TRACE_CAPACITY,
+    patch_toml_trace_next: u16 = 0,
+    patch_toml_trace_full: bool = false,
+    path_length: u16 = 0,
+    path: [512]u8 = [_]u8{0} ** 512,
     string_length: usize = 0,
     string_truncated: bool = false,
     string_storage: [STRINGSTREAM_TEXT_CAPACITY]u8 = [_]u8{0} ** STRINGSTREAM_TEXT_CAPACITY,
+};
+
+const PatchTomlOp = struct {
+    operation: [12]u8 = [_]u8{0} ** 12,
+    op_len: u4 = 0,
+    offset: i64 = 0,
+    size: u64 = 0,
+    content_first: [4]u8 = [_]u8{0} ** 4,
+    content_hash: u64 = 0,
+    sequence: u64 = 0,
+};
+
+const PatchTomlSchema = struct {
+    bytes: u64 = 0,
+    lines: u64 = 0,
+    title_name_assignments: u32 = 0,
+    title_id_assignments: u32 = 0,
+    hash_assignments: u32 = 0,
+    patch_array_headers: u32 = 0,
+    truncated_lines: u32 = 0,
+    complete: bool = false,
+};
+
+const PatchTomlSchemaScanner = struct {
+    schema: PatchTomlSchema = .{},
+    prefix: [256]u8 = [_]u8{0} ** 256,
+    prefix_length: usize = 0,
+    line_truncated: bool = false,
+
+    fn feed(self: *PatchTomlSchemaScanner, bytes: []const u8) void {
+        self.schema.bytes +|= bytes.len;
+        for (bytes) |byte| {
+            if (byte == '\n') {
+                self.finishLine();
+                continue;
+            }
+            if (self.prefix_length < self.prefix.len) {
+                self.prefix[self.prefix_length] = byte;
+                self.prefix_length += 1;
+            } else {
+                self.line_truncated = true;
+            }
+        }
+    }
+
+    fn finish(self: *PatchTomlSchemaScanner) PatchTomlSchema {
+        if (self.prefix_length != 0 or self.line_truncated) self.finishLine();
+        self.schema.complete = true;
+        return self.schema;
+    }
+
+    fn finishLine(self: *PatchTomlSchemaScanner) void {
+        self.schema.lines +|= 1;
+        if (self.line_truncated) self.schema.truncated_lines +|= 1;
+        const line = std.mem.trim(u8, self.prefix[0..self.prefix_length], " \t\r");
+        if (line.len != 0 and line[0] != '#') {
+            if (isAssignment(line, "title_name")) self.schema.title_name_assignments +|= 1;
+            if (isAssignment(line, "title_id")) self.schema.title_id_assignments +|= 1;
+            if (isAssignment(line, "hash")) self.schema.hash_assignments +|= 1;
+            if (isExactPatchArrayHeader(line)) self.schema.patch_array_headers +|= 1;
+        }
+        self.prefix_length = 0;
+        self.line_truncated = false;
+    }
+};
+
+fn isAssignment(line: []const u8, key: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, key)) return false;
+    const suffix = std.mem.trim(u8, line[key.len..], " \t");
+    return suffix.len != 0 and suffix[0] == '=';
+}
+
+fn isExactPatchArrayHeader(line: []const u8) bool {
+    const marker = "[[patch]]";
+    if (!std.mem.startsWith(u8, line, marker)) return false;
+    const suffix = std.mem.trim(u8, line[marker.len..], " \t");
+    return suffix.len == 0 or suffix[0] == '#';
+}
+
+test "patch TOML schema scanner distinguishes absent patch arrays from nested data arrays" {
+    var empty_patch_scanner = PatchTomlSchemaScanner{};
+    empty_patch_scanner.feed(
+        "title_name = \"Geometry Wars: Evolved\"\n" ++
+            "title_id = \"584108FF\"\n" ++
+            "hash = []\n",
+    );
+    const empty_patch = empty_patch_scanner.finish();
+    try std.testing.expectEqual(@as(u32, 1), empty_patch.title_name_assignments);
+    try std.testing.expectEqual(@as(u32, 1), empty_patch.title_id_assignments);
+    try std.testing.expectEqual(@as(u32, 1), empty_patch.hash_assignments);
+    try std.testing.expectEqual(@as(u32, 0), empty_patch.patch_array_headers);
+
+    var populated_scanner = PatchTomlSchemaScanner{};
+    populated_scanner.feed("[[patch]] # primary\n[[patch.be32]]\n[[patch]]\n");
+    const populated = populated_scanner.finish();
+    try std.testing.expectEqual(@as(u32, 2), populated.patch_array_headers);
+
+    var bridge = Bridge{};
+    var stream = Stream{
+        .active = true,
+        .patch_toml = true,
+        .generation = 7,
+        .patch_toml_schema = empty_patch,
+    };
+    const path = "patches/584108FF.patch.toml";
+    stream.path_length = @intCast(path.len);
+    @memcpy(stream.path[0..path.len], path);
+    bridge.rememberPatchSchema(&stream);
+    stream.active = false;
+    try std.testing.expect(bridge.latestPatchSchemaHasEmptyPatchSet());
+    try std.testing.expectEqual(@as(u64, 7), bridge.last_patch_schema_generation);
+    try std.testing.expectEqualStrings(path, bridge.last_patch_path[0..bridge.last_patch_path_length]);
+}
+
+const Utf8Invalid = struct {
+    offset: u64,
+    byte: u8,
+    reason: []const u8,
+};
+
+const Utf8Scanner = struct {
+    expected: u3 = 0,
+    codepoint: u32 = 0,
+    minimum: u32 = 0,
+    sequence_start: u64 = 0,
+
+    fn feed(self: *Utf8Scanner, byte: u8, offset: u64) ?Utf8Invalid {
+        if (self.expected == 0) {
+            if (byte < 0x80) return null;
+            self.sequence_start = offset;
+            if (byte >= 0xC2 and byte <= 0xDF) {
+                self.expected = 1;
+                self.codepoint = byte & 0x1F;
+                self.minimum = 0x80;
+                return null;
+            }
+            if (byte >= 0xE0 and byte <= 0xEF) {
+                self.expected = 2;
+                self.codepoint = byte & 0x0F;
+                self.minimum = 0x800;
+                return null;
+            }
+            if (byte >= 0xF0 and byte <= 0xF4) {
+                self.expected = 3;
+                self.codepoint = byte & 0x07;
+                self.minimum = 0x10000;
+                return null;
+            }
+            return .{ .offset = offset, .byte = byte, .reason = "invalid leading byte" };
+        }
+        if (byte & 0xC0 != 0x80) {
+            self.expected = 0;
+            return .{ .offset = offset, .byte = byte, .reason = "expected continuation byte" };
+        }
+        self.codepoint = (self.codepoint << 6) | (byte & 0x3F);
+        self.expected -= 1;
+        if (self.expected != 0) return null;
+        if (self.codepoint < self.minimum) return .{ .offset = self.sequence_start, .byte = byte, .reason = "overlong sequence" };
+        if (self.codepoint >= 0xD800 and self.codepoint <= 0xDFFF) return .{ .offset = self.sequence_start, .byte = byte, .reason = "UTF-16 surrogate" };
+        if (self.codepoint > 0x10FFFF) return .{ .offset = self.sequence_start, .byte = byte, .reason = "code point out of range" };
+        return null;
+    }
+
+    fn finish(self: *const Utf8Scanner) ?Utf8Invalid {
+        if (self.expected == 0) return null;
+        return .{ .offset = self.sequence_start, .byte = 0, .reason = "truncated sequence at end of file" };
+    }
 };
 
 pub const Bridge = struct {
@@ -56,9 +245,16 @@ pub const Bridge = struct {
     base_destructors: u64 = 0,
     thread_id_insertions: u64 = 0,
     rejected: u64 = 0,
+    next_generation: u64 = 1,
+    io_sequence: u64 = 0,
     ifstream_vtable: u64 = 0,
     filebuf_vtable: u64 = 0,
     basic_ios_vtable: u64 = 0,
+    last_patch_schema_valid: bool = false,
+    last_patch_schema_generation: u64 = 0,
+    last_patch_schema: PatchTomlSchema = .{},
+    last_patch_path_length: u16 = 0,
+    last_patch_path: [512]u8 = [_]u8{0} ** 512,
 
     pub fn deinit(self: *Bridge) void {
         for (&self.streams) |*stream| closeStream(stream);
@@ -181,14 +377,28 @@ pub const Bridge = struct {
             return .{ .handled = @intFromBool(self.isOpen(state.regs.rdi)) };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE4readEPcl")) {
-            _ = self.readInto(state, state.regs.rdi, state.regs.rsi, state.regs.rdx);
+            const istream = state.regs.rdi;
+            const result = self.readInto(state, istream, state.regs.rsi, state.regs.rdx, true);
+            self.mirrorGuestGcount(state, istream, result);
             return .{ .handled = state.regs.rdi };
         }
         if (std.mem.eql(u8, name, "_ZNKSt3__113basic_istreamIcNS_11char_traitsIcEEE6gcountEv")) {
-            return .{ .handled = @bitCast(self.gcount(state.regs.rdi)) };
+            const result = self.gcount(state.regs.rdi);
+            if (self.findFlexible(state.regs.rdi)) |stream| {
+                if (stream.patch_toml) {
+                    std.debug.print(
+                        "macho-processor: libc++ patch gcount import: object=0x{x} generation={d} host_count={d} guest_field=0x{x}\n",
+                        .{ state.regs.rdi, stream.generation, result, state.read64(state.regs.rdi + BASIC_ISTREAM_GCOUNT_OFFSET) },
+                    );
+                }
+            }
+            return .{ .handled = @bitCast(result) };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsgetnEPcl")) {
-            return .{ .handled = @bitCast(self.readInto(state, state.regs.rdi, state.regs.rsi, state.regs.rdx)) };
+            // xsgetn is the low-level stream-buffer primitive.  A short read
+            // is its normal EOF signal; only basic_istream::read is allowed
+            // to translate that result into failbit.
+            return .{ .handled = @bitCast(self.readInto(state, state.regs.rdi, state.regs.rsi, state.regs.rdx, false)) };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5tellgEv")) {
             return .{ .handled = @bitCast(self.seek(state.regs.rdi, 0, std.c.SEEK.CUR)) };
@@ -334,7 +544,8 @@ pub const Bridge = struct {
         stream.last_read_count = 0;
         stream.eof = false;
         stream.failed = false;
-        stream.trace_reads_remaining = 0;
+        stream.patch_toml_trace_next = 0;
+        stream.patch_toml_trace_full = false;
         self.resetStringBuffer(stream);
         self.constructors +|= 1;
         return true;
@@ -482,7 +693,7 @@ pub const Bridge = struct {
         var length: usize = 0;
         while (length < line.len) {
             var byte: [1]u8 = undefined;
-            const result = std.c.read(stream.fd, &byte, 1);
+            const result = std.c.pread(stream.fd, &byte, 1, @intCast(stream.tracked_pos));
             if (result < 0) {
                 stream.failed = true;
                 self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
@@ -500,6 +711,7 @@ pub const Bridge = struct {
             if (byte[0] == delimiter) break;
             line[length] = byte[0];
             length += 1;
+            stream.tracked_pos += 1;
         }
         if (length == line.len) {
             stream.failed = true;
@@ -536,9 +748,29 @@ pub const Bridge = struct {
 
     fn destroy(self: *Bridge, state: anytype, object: u64) void {
         _ = state;
-        const stream = self.find(object) orelse return;
+        const stream = self.findAny(object) orelse return;
         closeStream(stream);
-        stream.* = .{};
+        stream.active = false;
+        stream.fd = -1;
+        stream.ios_object = 0;
+        stream.buffer = 0;
+        stream.buffer_size = 0;
+        stream.last_read_count = 0;
+        stream.eof = false;
+        stream.failed = false;
+        stream.last_read_offset = -1;
+        stream.last_read_size = 0;
+        stream.tracked_pos = 0;
+        stream.patch_toml = false;
+        stream.patch_toml_trace_next = 0;
+        stream.patch_toml_trace_full = false;
+        stream.path_length = 0;
+        stream.string_length = 0;
+        stream.string_truncated = false;
+        @memset(&stream.path, 0);
+        @memset(&stream.string_storage, 0);
+        // note: stream.object is deliberately preserved so that ensure()
+        // can reactivate this slot when the same guest address is reused.
     }
 
     fn openCString(self: *Bridge, state: anytype, fs: anytype, object: u64, path_address: u64, mode: u64) u64 {
@@ -580,7 +812,10 @@ pub const Bridge = struct {
         if (fd < 0) {
             self.open_failures +|= 1;
             if (self.find(object)) |stream| stream.failed = true;
-            std.debug.print("macho-processor: libc++ filebuf open failed: {s} mode=0x{x}\n", .{ translated, mode });
+            std.debug.print(
+                "macho-processor: libc++ filebuf open failed: guest_path={s} host_path={s} mode=0x{x} errno={s}\n",
+                .{ path, translated, mode, @tagName(std.c.errno(fd)) },
+            );
             return 0;
         }
 
@@ -590,15 +825,41 @@ pub const Bridge = struct {
             return 0;
         };
         closeStream(stream);
+        // fd aliasing guard: if a stale stream entry still holds the same fd
+        // number (recycled by the OS after a lifecycle bug left a ghost entry),
+        // deactivate it without closing the fd (which would close OUR just-
+        // opened file).  The stale entry was either already closed or never
+        // should have held that fd in the first place.
+        // (no &other ≠ stream guard needed: closeStream cleared our fd to -1,
+        //  so an other.fd == fd match cannot be our own entry)
+        for (&self.streams) |*other| {
+            if (other.active and other.fd == fd) {
+                other.active = false;
+                other.fd = -1;
+                std.debug.print("macho-processor: libc++ fd aliasing cleanup: deactivated stale ghost entry object=0x{x}\n", .{other.object});
+            }
+        }
         stream.fd = fd;
+        stream.generation = self.next_generation;
+        self.next_generation +|= 1;
         stream.eof = false;
         stream.failed = false;
+        stream.last_read_offset = -1;
+        stream.last_read_size = 0;
         stream.patch_toml = std.mem.endsWith(u8, translated, ".patch.toml");
-        stream.trace_reads_remaining = if (stream.patch_toml) 4 else 0;
+        stream.patch_toml_eof_logged = false;
+        stream.patch_toml_trace_next = 0;
+        stream.patch_toml_trace_full = false;
+        stream.path_length = @intCast(@min(translated.len, stream.path.len));
+        @memcpy(stream.path[0..stream.path_length], translated[0..stream.path_length]);
         if (stream.ios_object != 0) _ = self.object_model.clear(state, stream.ios_object, 0);
         if (mode & OPENMODE_ATE != 0) _ = std.c.lseek(fd, 0, std.c.SEEK.END);
-        std.debug.print("macho-processor: libc++ filebuf open: {s} mode=0x{x} fd={d}\n", .{ translated, mode, fd });
-        if (stream.patch_toml) self.tracePatchTomlOpen(fd, translated);
+        std.debug.print(
+            "macho-processor: libc++ filebuf open: {s} mode=0x{x} fd={d} object=0x{x} generation={d}\n",
+            .{ translated, mode, fd, object, stream.generation },
+        );
+        if (stream.patch_toml) self.tracePatchTomlOpen(stream, translated);
+        stream.tracked_pos = 0;
         return object;
     }
 
@@ -617,7 +878,7 @@ pub const Bridge = struct {
         return stream.fd >= 0;
     }
 
-    fn readInto(self: *Bridge, state: anytype, object: u64, destination: u64, count: u64) i64 {
+    fn readInto(self: *Bridge, state: anytype, object: u64, destination: u64, count: u64, set_istream_state: bool) i64 {
         self.reads += 1;
         const stream = self.findFlexible(object) orelse return -1;
         stream.last_read_count = 0;
@@ -626,26 +887,86 @@ pub const Bridge = struct {
             self.noteState(state, stream, cxx_object_model.FAILBIT);
             return -1;
         }
+        // Reject wildly oversized reads – they would either OOM the host or
+        // corrupt guest heap metadata (toml++'s small buffer_.resize(n) does
+        // not guard against a huge n when the string's size field has been
+        // corrupted by an adjacent buffer overrun).
+        if (count > MAX_REASONABLE_READ_SIZE) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.FAILBIT | cxx_object_model.BADBIT);
+            std.debug.print("macho-processor: libc++ bridge rejecting unreasonable read: count={d}\n", .{count});
+            return -1;
+        }
+        // Also reject reads that would wrap past the end of guest address space
+        if (destination +% count < destination) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.FAILBIT | cxx_object_model.BADBIT);
+            return -1;
+        }
         const bytes = state.guestMemory(destination, count) orelse {
             stream.failed = true;
             self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
             return -1;
         };
-        const result = std.c.read(stream.fd, bytes.ptr, bytes.len);
+        const offset_before = stream.tracked_pos;
+        const result = std.c.pread(stream.fd, bytes.ptr, bytes.len, @intCast(offset_before));
         if (result < 0) {
             stream.failed = true;
             self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
             return -1;
         }
         stream.last_read_count = @intCast(result);
-        self.tracePatchRead(stream, "read", bytes[0..@intCast(result)]);
-        if (result < bytes.len) {
-            @memset(bytes[@intCast(result)..], 0);
+        stream.last_read_offset = @intCast(offset_before);
+        stream.last_read_size = @intCast(result);
+        stream.tracked_pos = offset_before + @as(u64, @intCast(result));
+        self.io_sequence +|= 1;
+        stream.last_io_sequence = self.io_sequence;
+        // Detect suspicious writes where destination (in_ = buffer_.data()) lands
+        // within 1KB of the filebuf/istream object — this indicates buffer_.data()
+        // returned a pointer into the ifstream's own memory instead of a heap
+        // allocation, which would overwrite string metadata on the next write.
+        if (result > 0 and stream.path_length > 0) {
+            const prefix = stream.path[0..@min(stream.path_length, @as(usize, 20))];
+            if (prefix.len >= 4 and (std.mem.endsWith(u8, prefix, ".patch.toml") or std.mem.endsWith(u8, prefix, ".toml"))) {
+                const delta = if (destination > object) destination - object else object - destination;
+                if (delta < 1024) {
+                    std.debug.print(
+                        "macho-processor: *** SUSPICIOUS write at destination=0x{x} (only {d} bytes from object=0x{x}) " ++ "for stream fd={d} count={d} — buffer_.data() likely corrupted!\n",
+                        .{ destination, delta, object, stream.fd, count },
+                    );
+                }
+            }
+        }
+        self.tracePatchRead(stream, "read", @intCast(offset_before), bytes[0..@intCast(result)]);
+        if (stream.patch_toml) {
+            std.debug.print(
+                "macho-processor: libc++ patch read ABI: sequence={d} generation={d} request_object=0x{x} filebuf_object=0x{x} destination=0x{x} requested={d} returned={d} tracked_before={d} tracked_after={d}\n",
+                .{ self.io_sequence, stream.generation, object, stream.object, destination, count, result, offset_before, stream.tracked_pos },
+            );
         }
         if (@as(u64, @intCast(result)) < count) {
             stream.eof = true;
-            stream.failed = true;
-            self.noteState(state, stream, cxx_object_model.EOFBIT | cxx_object_model.FAILBIT);
+            // toml++ reads fixed-size blocks and uses gcount() to delimit the
+            // final block.  Its reader must be allowed to observe a clean EOF
+            // and complete the final token; failbit here makes the modeled
+            // istream evaluate false before that parser-side EOF handling can
+            // run.  Keep standard read() semantics for every other stream.
+            const clean_patch_toml_eof = stream.patch_toml and result >= 0;
+            if (clean_patch_toml_eof and !stream.patch_toml_eof_logged) {
+                stream.patch_toml_eof_logged = true;
+                std.debug.print(
+                    "macho-processor: libc++ patch EOF classification: path={s} requested={d} returned={d} offset_before={d} final_offset={d} exact_block_boundary={} eofbit=true failbit=false verdict=normal_parser_termination\n",
+                    .{ stream.path[0..stream.path_length], count, result, offset_before, stream.tracked_pos, result == 0 },
+                );
+            }
+            if (set_istream_state and !clean_patch_toml_eof) {
+                stream.failed = true;
+            }
+            self.noteState(
+                state,
+                stream,
+                cxx_object_model.EOFBIT | if (set_istream_state and !clean_patch_toml_eof) cxx_object_model.FAILBIT else 0,
+            );
         }
         return @intCast(result);
     }
@@ -653,6 +974,31 @@ pub const Bridge = struct {
     fn gcount(self: *Bridge, object: u64) i64 {
         const stream = self.findFlexible(object) orelse return 0;
         return stream.last_read_count;
+    }
+
+    fn mirrorGuestGcount(self: *Bridge, state: anytype, istream: u64, result: i64) void {
+        const stream = self.findFlexible(istream) orelse return;
+        const address = istream + BASIC_ISTREAM_GCOUNT_OFFSET;
+        if (state.guestMemory(address, 8) == null) {
+            stream.failed = true;
+            self.rejected +|= 1;
+            if (stream.patch_toml) {
+                std.debug.print(
+                    "macho-processor: libc++ patch gcount mirror FAILED: istream=0x{x} field=0x{x} generation={d} result={d}\n",
+                    .{ istream, address, stream.generation, result },
+                );
+            }
+            return;
+        }
+        const previous = state.read64(address);
+        const mirrored: u64 = if (result > 0) @intCast(result) else 0;
+        state.write64(address, mirrored);
+        if (stream.patch_toml) {
+            std.debug.print(
+                "macho-processor: libc++ patch gcount mirror: istream=0x{x} field=0x{x} generation={d} previous=0x{x} mirrored={d} host_count={d}\n",
+                .{ istream, address, stream.generation, previous, mirrored, result },
+            );
+        }
     }
 
     fn noteState(self: *Bridge, state: anytype, stream: *const Stream, bits: u32) void {
@@ -663,17 +1009,34 @@ pub const Bridge = struct {
         self.seeks += 1;
         const stream = self.findFlexible(object) orelse return -1;
         if (stream.fd < 0) return -1;
-        const result = std.c.lseek(stream.fd, offset, direction);
-        return if (result < 0) -1 else @intCast(result);
+        const new_pos: i64 = switch (direction) {
+            std.c.SEEK.SET => offset,
+            std.c.SEEK.CUR => @as(i64, @intCast(stream.tracked_pos)) + offset,
+            std.c.SEEK.END => blk: {
+                const fsize = std.c.lseek(stream.fd, 0, std.c.SEEK.END);
+                if (fsize < 0) break :blk -1;
+                break :blk fsize + offset;
+            },
+            else => -1,
+        };
+        if (new_pos < 0) return -1;
+        stream.tracked_pos = @intCast(new_pos);
+        const ret: i64 = new_pos;
+        self.tracePatchSeek(stream, "seek", offset, direction, ret);
+        return ret;
     }
 
     fn readByte(self: *Bridge, object: u64) i32 {
         const stream = self.findFlexible(object) orelse return -1;
         if (stream.fd < 0) return -1;
         var byte: [1]u8 = undefined;
-        const result = std.c.read(stream.fd, &byte, 1);
+        const offset_before = stream.tracked_pos;
+        const result = std.c.pread(stream.fd, &byte, 1, @intCast(offset_before));
         if (result != 1) return -1;
-        self.tracePatchRead(stream, "read-byte", byte[0..1]);
+        stream.last_read_offset = @intCast(offset_before);
+        stream.last_read_size = 1;
+        stream.tracked_pos = offset_before + 1;
+        self.tracePatchRead(stream, "read-byte", @intCast(offset_before), byte[0..1]);
         return byte[0];
     }
 
@@ -682,23 +1045,62 @@ pub const Bridge = struct {
         const stream = self.findFlexible(object) orelse return -1;
         if (stream.fd < 0) return -1;
         var byte: [1]u8 = undefined;
-        const result = std.c.read(stream.fd, &byte, 1);
+        const offset_before = stream.tracked_pos;
+        const result = std.c.pread(stream.fd, &byte, 1, @intCast(offset_before));
         if (result != 1) return -1;
-        if (std.c.lseek(stream.fd, -1, std.c.SEEK.CUR) < 0) return -1;
-        self.tracePatchRead(stream, "peek", byte[0..1]);
+        stream.last_read_offset = @intCast(offset_before);
+        stream.last_read_size = 1;
+        // peek does NOT advance tracked_pos
+        self.tracePatchRead(stream, "peek", @intCast(offset_before), byte[0..1]);
         return byte[0];
     }
 
-    fn tracePatchRead(self: *Bridge, stream: *Stream, operation: []const u8, bytes: []const u8) void {
-        _ = self;
-        if (stream.patch_toml and bytes.len != 0 and !std.unicode.utf8ValidateSlice(bytes)) {
+    fn recordPatchTomlOp(self: *Bridge, stream: *Stream, operation: []const u8, offset: i64, bytes: []const u8) void {
+        self.io_sequence +|= 1;
+        stream.last_io_sequence = self.io_sequence;
+        const op_idx = stream.patch_toml_trace_next;
+        const op = &stream.patch_toml_trace[op_idx];
+        const op_len = @min(operation.len, op.operation.len);
+        @memset(&op.operation, 0);
+        @memcpy(op.operation[0..op_len], operation[0..op_len]);
+        op.op_len = @intCast(op_len);
+        op.offset = offset;
+        op.size = bytes.len;
+        op.sequence = self.io_sequence;
+        if (bytes.len > 0) {
+            const copy_len = @min(bytes.len, 4);
+            @memcpy(op.content_first[0..copy_len], bytes[0..copy_len]);
+            var hash: u64 = 0;
+            for (bytes[0..@min(bytes.len, 64)]) |b| hash = hash ^ @as(u64, b);
+            op.content_hash = hash;
+        }
+        stream.patch_toml_trace_next = (stream.patch_toml_trace_next + 1) % PATCH_TOML_TRACE_CAPACITY;
+        if (stream.patch_toml_trace_next == 0) stream.patch_toml_trace_full = true;
+    }
+
+    fn tracePatchRead(self: *Bridge, stream: *Stream, operation: []const u8, offset: i64, bytes: []const u8) void {
+        if (!stream.patch_toml or bytes.len == 0) return;
+
+        self.recordPatchTomlOp(stream, operation, offset, bytes);
+
+        var scanner = Utf8Scanner{};
+        for (bytes, 0..) |byte, index| {
+            if (scanner.feed(byte, @as(u64, @intCast(@max(offset, 0))) + index)) |issue| {
+                std.debug.print(
+                    "macho-processor: libc++ patch stream invalid UTF-8 chunk: path={s} operation={s} byte_offset={d} reason={s} byte=0x{x:0>2}\n",
+                    .{ stream.path[0..stream.path_length], operation, issue.offset, issue.reason, issue.byte },
+                );
+                self.tracePatchContext(stream.fd, stream.path[0..stream.path_length], issue.offset, "chunk-invalid");
+                break;
+            }
+        }
+        if (scanner.finish()) |issue| {
             std.debug.print(
-                "macho-processor: libc++ patch stream invalid UTF-8 chunk: fd={d} operation={s} bytes={d}\n",
-                .{ stream.fd, operation, bytes.len },
+                "macho-processor: libc++ patch stream truncated UTF-8 chunk: path={s} operation={s} byte_offset={d} reason={s}\n",
+                .{ stream.path[0..stream.path_length], operation, issue.offset, issue.reason },
             );
         }
-        if (stream.trace_reads_remaining == 0 or bytes.len == 0) return;
-        stream.trace_reads_remaining -= 1;
+
         const shown = @min(bytes.len, 32);
         var hex: [64]u8 = undefined;
         const alphabet = "0123456789abcdef";
@@ -707,45 +1109,378 @@ pub const Bridge = struct {
             hex[index * 2 + 1] = alphabet[byte & 0x0f];
         }
         std.debug.print(
-            "macho-processor: libc++ patch stream {s}: fd={d} bytes={d} first={s}\n",
-            .{ operation, stream.fd, bytes.len, hex[0 .. shown * 2] },
+            "macho-processor: libc++ patch stream {s}: path={s} fd={d} offset={d} bytes={d} first={s}\n",
+            .{ operation, stream.path[0..stream.path_length], stream.fd, offset, bytes.len, hex[0 .. shown * 2] },
         );
     }
 
-    fn tracePatchTomlOpen(_: *Bridge, fd: std.c.fd_t, path: []const u8) void {
+    fn tracePatchSeek(self: *Bridge, stream: *Stream, operation: []const u8, offset: i64, direction: std.c.whence_t, result: i64) void {
+        if (!stream.patch_toml) return;
+        const dir_label = switch (direction) {
+            std.c.SEEK.SET => "SET",
+            std.c.SEEK.CUR => "CUR",
+            std.c.SEEK.END => "END",
+            else => "?",
+        };
+        const empty: [0]u8 = undefined;
+        self.recordPatchTomlOp(stream, operation, offset, &empty);
+        std.debug.print(
+            "macho-processor: libc++ patch stream {s}: path={s} fd={d} offset={d} dir={s} result={d}\n",
+            .{ operation, stream.path[0..stream.path_length], stream.fd, offset, dir_label, result },
+        );
+    }
+
+    fn tracePatchTell(self: *Bridge, stream: *Stream, result: i64) void {
+        if (!stream.patch_toml) return;
+        const empty: [0]u8 = undefined;
+        self.recordPatchTomlOp(stream, "tellg", 0, &empty);
+        std.debug.print(
+            "macho-processor: libc++ patch stream tellg: path={s} fd={d} result={d}\n",
+            .{ stream.path[0..stream.path_length], stream.fd, result },
+        );
+    }
+
+    /// Returns the most recent block size read by an active patch stream.
+    /// tracked_pos is cumulative and must never be used as a block length.
+    pub fn findPatchTomlByteCount(self: *Bridge) ?u64 {
+        var newest_sequence: u64 = 0;
+        var count: ?u64 = null;
+        for (&self.streams) |*stream| {
+            if (!stream.active) continue;
+            if (stream.fd < 0) continue;
+            const path = stream.path[0..stream.path_length];
+            if (std.mem.endsWith(u8, path, ".patch.toml")) {
+                if (stream.last_io_sequence >= newest_sequence and stream.last_read_count >= 0) {
+                    newest_sequence = stream.last_io_sequence;
+                    count = @intCast(stream.last_read_count);
+                }
+            }
+        }
+        return count;
+    }
+
+    pub fn isActivePatchTomlIstream(self: *Bridge, object: u64) bool {
+        const stream = self.findFlexible(object) orelse return false;
+        return stream.active and stream.fd >= 0 and stream.patch_toml;
+    }
+
+    pub fn dumpPatchTomlDiagnostics(self: *Bridge, reason: []const u8) void {
+        var found = false;
+        for (&self.streams) |*stream| {
+            if (!stream.active or !stream.patch_toml) continue;
+            found = true;
+            const path = stream.path[0..stream.path_length];
+            const current: i64 = @intCast(stream.tracked_pos);
+            std.debug.print(
+                "macho-processor: TOML diagnostics ({s}): path={s} object=0x{x} fd={d} generation={d} io_sequence={d} current_offset={d} last_read_offset={d} last_read_size={d} last_gcount={d} eof={} failed={}\n",
+                .{ reason, path, stream.object, stream.fd, stream.generation, stream.last_io_sequence, current, stream.last_read_offset, stream.last_read_size, stream.last_read_count, stream.eof, stream.failed },
+            );
+            self.logPatchSchema(stream, "active-stream");
+
+            const trace_count = if (stream.patch_toml_trace_full) PATCH_TOML_TRACE_CAPACITY else stream.patch_toml_trace_next;
+            if (trace_count > 0) {
+                std.debug.print("macho-processor: libc++ patch I/O trace (last {d} operations):\n", .{trace_count});
+                if (stream.patch_toml_trace_full) {
+                    const start = stream.patch_toml_trace_next;
+                    for (0..PATCH_TOML_TRACE_CAPACITY) |i| {
+                        const idx = (start + i) % PATCH_TOML_TRACE_CAPACITY;
+                        const op = &stream.patch_toml_trace[idx];
+                        if (op.op_len == 0) continue;
+                        const op_str = op.operation[0..op.op_len];
+                        if (std.mem.eql(u8, op_str, "tellg")) continue;
+                        const hex_byte = &[_]u8{
+                            "0123456789abcdef"[op.content_first[0] >> 4],
+                            "0123456789abcdef"[op.content_first[0] & 0x0f],
+                            "0123456789abcdef"[op.content_first[1] >> 4],
+                            "0123456789abcdef"[op.content_first[1] & 0x0f],
+                            "0123456789abcdef"[op.content_first[2] >> 4],
+                            "0123456789abcdef"[op.content_first[2] & 0x0f],
+                            "0123456789abcdef"[op.content_first[3] >> 4],
+                            "0123456789abcdef"[op.content_first[3] & 0x0f],
+                        };
+                        std.debug.print("  seq={d} {s} offset={d} size={d} first={s} hash=0x{x}\n", .{ op.sequence, op_str, op.offset, op.size, hex_byte[0..8], op.content_hash });
+                    }
+                } else {
+                    for (0..stream.patch_toml_trace_next) |i| {
+                        const op = &stream.patch_toml_trace[i];
+                        if (op.op_len == 0) continue;
+                        const op_str = op.operation[0..op.op_len];
+                        if (std.mem.eql(u8, op_str, "tellg")) continue;
+                        const hex_byte = &[_]u8{
+                            "0123456789abcdef"[op.content_first[0] >> 4],
+                            "0123456789abcdef"[op.content_first[0] & 0x0f],
+                            "0123456789abcdef"[op.content_first[1] >> 4],
+                            "0123456789abcdef"[op.content_first[1] & 0x0f],
+                            "0123456789abcdef"[op.content_first[2] >> 4],
+                            "0123456789abcdef"[op.content_first[2] & 0x0f],
+                            "0123456789abcdef"[op.content_first[3] >> 4],
+                            "0123456789abcdef"[op.content_first[3] & 0x0f],
+                        };
+                        std.debug.print("  seq={d} {s} offset={d} size={d} first={s} hash=0x{x}\n", .{ op.sequence, op_str, op.offset, op.size, hex_byte[0..8], op.content_hash });
+                    }
+                }
+            }
+
+            // Detect offset regression: check if offset went backwards
+            // (peek operations do NOT advance the position and are excluded)
+            var last_offset: i64 = -1;
+            var regression_found = false;
+            const iteration_count = if (stream.patch_toml_trace_full) PATCH_TOML_TRACE_CAPACITY else stream.patch_toml_trace_next;
+            const trace_start = if (stream.patch_toml_trace_full) stream.patch_toml_trace_next else @as(u16, 0);
+            for (0..iteration_count) |i| {
+                const idx = (trace_start +% @as(u16, @intCast(i))) % PATCH_TOML_TRACE_CAPACITY;
+                const op = &stream.patch_toml_trace[idx];
+                const op_str = op.operation[0..op.op_len];
+                if (op.op_len == 0) continue;
+                if (std.mem.eql(u8, op_str, "tellg")) continue;
+                // seek sets an absolute offset; track it without regression check
+                if (std.mem.eql(u8, op_str, "seek")) {
+                    last_offset = op.offset;
+                    // peek does NOT advance the file position – skip it
+                } else if (std.mem.eql(u8, op_str, "peek")) {
+                    continue;
+                } else if (op.size > 0) {
+                    if (last_offset >= 0 and op.offset < last_offset) {
+                        std.debug.print("macho-processor: *** OFFSET REGRESSION DETECTED: was offset={d}, now offset={d} (went backwards! fd may have been reopened/reset!)\n", .{ last_offset, op.offset });
+                        regression_found = true;
+                    }
+                    if (op.offset >= 0) last_offset = op.offset + @as(i64, @intCast(op.size));
+                }
+            }
+            if (!regression_found and last_offset >= 0) {
+                std.debug.print("macho-processor: I/O trace monotonic: no offset regression detected (last tracked end offset = {d})\n", .{last_offset});
+            }
+
+            if (stream.fd >= 0) {
+                self.tracePatchTomlOpen(stream, path);
+                const center: u64 = if (stream.last_read_offset >= 0)
+                    @intCast(stream.last_read_offset)
+                else if (current >= 0)
+                    @intCast(current)
+                else
+                    0;
+                self.tracePatchContext(stream.fd, path, center, "active-stream");
+
+                // Expected vs actual content check at current offset
+                if (current >= 0) {
+                    var expected: [64]u8 = undefined;
+                    const eread = std.c.pread(stream.fd, &expected, expected.len, @intCast(current));
+                    if (eread > 0) {
+                        const ebytes = expected[0..@intCast(eread)];
+                        var ehex: [128]u8 = undefined;
+                        for (ebytes, 0..) |b, j| {
+                            ehex[j * 2] = "0123456789abcdef"[b >> 4];
+                            ehex[j * 2 + 1] = "0123456789abcdef"[b & 0x0f];
+                        }
+                        std.debug.print(
+                            "macho-processor: pread at current_offset={d} ({d} bytes): first={s}\n",
+                            .{ current, ebytes.len, ehex[0..@min(ebytes.len * 2, 64)] },
+                        );
+                    }
+                }
+
+                // fd integrity check: verify file size via lseek to end
+                if (stream.fd >= 0) {
+                    const saved = std.c.lseek(stream.fd, 0, std.c.SEEK.CUR);
+                    const fsize = std.c.lseek(stream.fd, 0, std.c.SEEK.END);
+                    if (saved >= 0 and fsize >= 0) {
+                        _ = std.c.lseek(stream.fd, saved, std.c.SEEK.SET);
+                        std.debug.print(
+                            "macho-processor: fd integrity: fd={d} file_size={d}\n",
+                            .{ stream.fd, fsize },
+                        );
+                    }
+                }
+
+                // Check for other streams sharing the same fd
+                var shared_fd_count: u32 = 0;
+                for (&self.streams) |other| {
+                    if (other.active and other.fd == stream.fd and other.object != stream.object) shared_fd_count += 1;
+                }
+                if (shared_fd_count > 0) {
+                    std.debug.print("macho-processor: *** WARNING: {d} other stream(s) share fd={d}! Possible fd aliasing\n", .{ shared_fd_count, stream.fd });
+                    std.debug.print("macho-processor: fd aliasing detail: primary object=0x{x} tracked_pos={d} path={s}\n", .{ stream.object, stream.tracked_pos, path });
+                    for (&self.streams) |other| {
+                        if (other.active and other.fd == stream.fd and other.object != stream.object) {
+                            const other_path = other.path[0..other.path_length];
+                            std.debug.print("macho-processor: fd aliasing detail: aliased object=0x{x} tracked_pos={d} path={s}\n", .{ other.object, other.tracked_pos, other_path });
+                        }
+                    }
+                }
+            }
+        }
+        if (!found) {
+            std.debug.print("macho-processor: TOML diagnostics ({s}): no active .patch.toml stream tracked by libc++ bridge\n", .{reason});
+            if (self.last_patch_schema_valid) {
+                self.logPatchSchemaValues(
+                    self.last_patch_path[0..self.last_patch_path_length],
+                    self.last_patch_schema,
+                    "archived-after-stream-destruction",
+                );
+            }
+        }
+    }
+
+    pub fn dumpPatchPostParseDiagnosis(self: *Bridge, reason: []const u8) void {
+        var newest: ?*Stream = null;
+        for (&self.streams) |*stream| {
+            if (!stream.active or !stream.patch_toml) continue;
+            if (newest == null or stream.generation > newest.?.generation) newest = stream;
+        }
+        var schema: PatchTomlSchema = undefined;
+        var path: []const u8 = undefined;
+        if (newest) |stream| {
+            schema = stream.patch_toml_schema;
+            path = stream.path[0..stream.path_length];
+        } else if (self.last_patch_schema_valid) {
+            schema = self.last_patch_schema;
+            path = self.last_patch_path[0..self.last_patch_path_length];
+        } else {
+            std.debug.print("macho-processor: PatchDB post-parse diagnosis ({s}): no active or archived patch TOML schema is available\n", .{reason});
+            return;
+        }
+        self.logPatchSchemaValues(path, schema, reason);
+        if (schema.patch_array_headers == 0) {
+            std.debug.print(
+                "macho-processor: PatchDB null-dereference correlation: the parsed file contains zero [[patch]] arrays; Xenia PatchDB::ReadPatchFile obtains patch_toml_fields.get(\"patch\") and calls patch_array->is_array() without first checking patch_array for null\n",
+                .{},
+            );
+            std.debug.print(
+                "macho-processor: PatchDB null-dereference verdict: normal EOF and successful TOML parsing are compatible with this crash; the missing optional patch node is the immediate null source, not fd reuse or stream corruption\n",
+                .{},
+            );
+        }
+    }
+
+    fn logPatchSchema(_: *Bridge, stream: *const Stream, label: []const u8) void {
+        logPatchSchemaValuesStatic(stream.path[0..stream.path_length], stream.patch_toml_schema, label);
+    }
+
+    fn logPatchSchemaValues(_: *Bridge, path: []const u8, schema: PatchTomlSchema, label: []const u8) void {
+        logPatchSchemaValuesStatic(path, schema, label);
+    }
+
+    fn rememberPatchSchema(self: *Bridge, stream: *const Stream) void {
+        self.last_patch_schema_valid = stream.patch_toml_schema.complete;
+        self.last_patch_schema_generation = stream.generation;
+        self.last_patch_schema = stream.patch_toml_schema;
+        self.last_patch_path_length = stream.path_length;
+        @memcpy(self.last_patch_path[0..self.last_patch_path_length], stream.path[0..stream.path_length]);
+    }
+
+    pub fn latestPatchSchemaHasEmptyPatchSet(self: *const Bridge) bool {
+        if (!self.last_patch_schema_valid) return false;
+        const schema = self.last_patch_schema;
+        return schema.complete and
+            schema.title_name_assignments != 0 and
+            schema.title_id_assignments != 0 and
+            schema.hash_assignments != 0 and
+            schema.patch_array_headers == 0;
+    }
+
+    pub fn logEmptyPatchCompatibility(self: *const Bridge, action: []const u8) void {
+        if (!self.last_patch_schema_valid) return;
+        logPatchSchemaValuesStatic(
+            self.last_patch_path[0..self.last_patch_path_length],
+            self.last_patch_schema,
+            action,
+        );
+    }
+
+    fn logPatchSchemaValuesStatic(path: []const u8, schema: PatchTomlSchema, label: []const u8) void {
+        std.debug.print(
+            "macho-processor: patch TOML schema[{s}]: path={s} bytes={d} lines={d} assignments(title_name/title_id/hash)={d}/{d}/{d} patch_array_headers={d} truncated_lines={d} complete={}\n",
+            .{ label, path, schema.bytes, schema.lines, schema.title_name_assignments, schema.title_id_assignments, schema.hash_assignments, schema.patch_array_headers, schema.truncated_lines, schema.complete },
+        );
+    }
+
+    fn tracePatchTomlOpen(self: *Bridge, stream: *Stream, path: []const u8) void {
+        const fd = stream.fd;
         const original = std.c.lseek(fd, 0, std.c.SEEK.CUR);
         if (original < 0) return;
         _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
-        var buffer: [8192]u8 = undefined;
-        const result = std.c.read(fd, &buffer, buffer.len);
-        _ = std.c.lseek(fd, original, std.c.SEEK.SET);
-        if (result < 0) {
-            std.debug.print("macho-processor: libc++ patch TOML preflight failed: {s} read_errno\n", .{path});
-            return;
-        }
-        const bytes = buffer[0..@intCast(result)];
+        var buffer: [4096]u8 = undefined;
+        var scanner = Utf8Scanner{};
+        var schema_scanner = PatchTomlSchemaScanner{};
+        var total: u64 = 0;
         var ascii = true;
-        for (bytes) |byte| {
-            if (byte >= 0x80) {
-                ascii = false;
-                break;
+        var invalid: ?Utf8Invalid = null;
+        while (true) {
+            const result = std.c.read(fd, &buffer, buffer.len);
+            if (result < 0) {
+                std.debug.print("macho-processor: libc++ patch TOML preflight failed: {s} errno={s}\n", .{ path, @tagName(std.c.errno(result)) });
+                _ = std.c.lseek(fd, original, std.c.SEEK.SET);
+                return;
             }
+            if (result == 0) break;
+            const bytes = buffer[0..@intCast(result)];
+            schema_scanner.feed(bytes);
+            for (bytes, 0..) |byte, index| {
+                if (byte >= 0x80) ascii = false;
+                if (invalid == null) invalid = scanner.feed(byte, total + index);
+            }
+            total += bytes.len;
         }
-        const utf8 = std.unicode.utf8ValidateSlice(bytes);
+        _ = std.c.lseek(fd, original, std.c.SEEK.SET);
+        stream.patch_toml_schema = schema_scanner.finish();
+        self.rememberPatchSchema(stream);
+        if (invalid == null) invalid = scanner.finish();
         std.debug.print(
-            "macho-processor: libc++ patch TOML preflight: {s} bytes={d} ascii={} utf8={} sampled={}\n",
-            .{ path, bytes.len, ascii, utf8, result == buffer.len },
+            "macho-processor: libc++ patch TOML preflight: path={s} bytes={d} ascii={} utf8={} full_scan=true\n",
+            .{ path, total, ascii, invalid == null },
+        );
+        self.logPatchSchema(stream, "preflight");
+        if (invalid) |issue| {
+            const context_start: u64 = issue.offset -| 8;
+            var context: [24]u8 = undefined;
+            const context_read = std.c.pread(fd, &context, context.len, @intCast(context_start));
+            const context_len: usize = if (context_read > 0) @intCast(context_read) else 0;
+            var hex: [48]u8 = undefined;
+            const alphabet = "0123456789abcdef";
+            for (context[0..context_len], 0..) |byte, index| {
+                hex[index * 2] = alphabet[byte >> 4];
+                hex[index * 2 + 1] = alphabet[byte & 0x0f];
+            }
+            std.debug.print(
+                "macho-processor: libc++ patch TOML invalid UTF-8: path={s} byte_offset={d} reason={s} byte=0x{x:0>2} context_start={d} context_hex={s}\n",
+                .{ path, issue.offset, issue.reason, issue.byte, context_start, hex[0 .. context_len * 2] },
+            );
+        } else {
+            std.debug.print(
+                "macho-processor: libc++ patch TOML host bytes validated; parser invalid-UTF8 reports likely indicate modeled stream/cursor corruption if exception still follows this file: path={s}\n",
+                .{path},
+            );
+        }
+    }
+
+    fn tracePatchContext(_: *Bridge, fd: std.c.fd_t, path: []const u8, center: u64, label: []const u8) void {
+        if (fd < 0) return;
+        const start = center -| 32;
+        var context: [96]u8 = undefined;
+        const context_read = std.c.pread(fd, &context, context.len, @intCast(start));
+        if (context_read <= 0) return;
+        const context_len: usize = @intCast(context_read);
+        var hex: [192]u8 = undefined;
+        var ascii: [96]u8 = undefined;
+        const alphabet = "0123456789abcdef";
+        for (context[0..context_len], 0..) |byte, index| {
+            hex[index * 2] = alphabet[byte >> 4];
+            hex[index * 2 + 1] = alphabet[byte & 0x0f];
+            ascii[index] = if (byte >= 0x20 and byte < 0x7f) byte else '.';
+        }
+        std.debug.print(
+            "macho-processor: libc++ patch TOML context[{s}]: path={s} center={d} start={d} bytes={d} hex={s} ascii='{s}'\n",
+            .{ label, path, center, start, context_len, hex[0 .. context_len * 2], ascii[0..context_len] },
         );
     }
 
     fn available(self: *Bridge, object: u64) i64 {
         const stream = self.findFlexible(object) orelse return -1;
         if (stream.fd < 0) return -1;
-        const current = std.c.lseek(stream.fd, 0, std.c.SEEK.CUR);
-        if (current < 0) return -1;
         const end = std.c.lseek(stream.fd, 0, std.c.SEEK.END);
-        _ = std.c.lseek(stream.fd, current, std.c.SEEK.SET);
-        return if (end < current) 0 else @intCast(end - current);
+        if (end < 0) return -1;
+        const current = stream.tracked_pos;
+        return if (@as(u64, @intCast(end)) < current) 0 else @intCast(@as(u64, @intCast(end)) - current);
     }
 
     fn setBuffer(self: *Bridge, object: u64, buffer: u64, size: u64) u64 {
@@ -761,6 +1496,24 @@ pub const Bridge = struct {
 
     fn ensure(self: *Bridge, object: u64) ?*Stream {
         if (self.find(object)) |stream| return stream;
+        // before activating a slot, deactivate any OTHER entry with the same object
+        // (catches stale duplicates left by lifecycle edge cases)
+        for (&self.streams) |*stream| {
+            if (!stream.active) continue;
+            if (stream.object == object) return stream;
+        }
+        var stale_object: ?*Stream = null;
+        for (&self.streams) |*stream| {
+            if (stream.active) continue;
+            if (stream.object == object) {
+                stale_object = stream;
+                break;
+            }
+        }
+        if (stale_object) |s| {
+            s.* = .{ .active = true, .object = object };
+            return s;
+        }
         for (&self.streams) |*stream| {
             if (stream.active) continue;
             stream.* = .{ .active = true, .object = object };
@@ -783,6 +1536,13 @@ pub const Bridge = struct {
             if (!stream.active or stream.object < FILEBUF_OFFSET_IN_IFSTREAM) continue;
             const ifstream = stream.object - FILEBUF_OFFSET_IN_IFSTREAM;
             if (object == ifstream or object == ifstream + 424) return stream;
+        }
+        return null;
+    }
+
+    fn findAny(self: *Bridge, object: u64) ?*Stream {
+        for (&self.streams) |*stream| {
+            if (stream.object == object) return stream;
         }
         return null;
     }
@@ -1005,6 +1765,64 @@ test "stream bridge resolves ifstream base objects to their filebuf" {
     try std.testing.expect(bridge.findFlexible(ifstream) != null);
 }
 
+test "modeled istream read mirrors libc++ gcount ABI field" {
+    const TestState = struct {
+        mem: [128]u8 = [_]u8{0} ** 128,
+
+        fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+            if (address + length > self.mem.len) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        fn read64(self: *const @This(), address: u64) u64 {
+            return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
+        }
+
+        fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+        }
+    };
+
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    var state = TestState{};
+    const istream: u64 = 32;
+    const stream = bridge.ensure(istream + FILEBUF_OFFSET_IN_IFSTREAM).?;
+    stream.ios_object = istream;
+    state.write64(istream + BASIC_ISTREAM_GCOUNT_OFFSET, 0x4d7ab70);
+
+    bridge.mirrorGuestGcount(&state, istream, 32);
+    try std.testing.expectEqual(@as(u64, 32), state.read64(istream + BASIC_ISTREAM_GCOUNT_OFFSET));
+    try std.testing.expectEqual(@as(i64, 0), stream.last_read_count);
+}
+
+test "patch byte count reports latest block not cumulative cursor" {
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    const older = bridge.ensure(0x1000).?;
+    older.fd = 3;
+    older.patch_toml = true;
+    older.path_length = "older.patch.toml".len;
+    @memcpy(older.path[0..older.path_length], "older.patch.toml");
+    older.tracked_pos = 4096;
+    older.last_read_count = 32;
+    older.last_io_sequence = 4;
+
+    const newer = bridge.ensure(0x2000).?;
+    newer.fd = 4;
+    newer.patch_toml = true;
+    newer.path_length = "newer.patch.toml".len;
+    @memcpy(newer.path[0..newer.path_length], "newer.patch.toml");
+    newer.tracked_pos = 8192;
+    newer.last_read_count = 17;
+    newer.last_io_sequence = 5;
+
+    try std.testing.expectEqual(@as(?u64, 17), bridge.findPatchTomlByteCount());
+    // Prevent the unit test from closing arbitrary process fds.
+    older.fd = -1;
+    newer.fd = -1;
+}
+
 test "stream bridge handles libc++ base destructor chain" {
     try std.testing.expect(isBaseDestructor(normalizeSymbol("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEED2Ev")));
     try std.testing.expect(isBaseDestructor(normalizeSymbol("__ZNSt3__19basic_iosIcNS_11char_traitsIcEEED2Ev")));
@@ -1110,8 +1928,17 @@ test "stream bridge forwards guest file operations through typed host calls" {
     try std.testing.expectEqualSlices(u8, &guest_layout_before, state.mem[object .. object + 160]);
     state.regs = .{ .rdi = object };
     try std.testing.expectEqual(@as(u64, 1), bridge.dispatch(&state, &fs, "__ZNKSt3__113basic_filebufIcNS_11char_traitsIcEEE7is_openEv").?.handled);
-    try std.testing.expectEqual(@as(i64, 0), bridge.readInto(&state, object, 400, 16));
+    try std.testing.expectEqual(@as(i64, 0), bridge.readInto(&state, object, 400, 16, false));
+    try std.testing.expect(bridge.eof(object));
+    try std.testing.expect(!bridge.failed(object));
     try std.testing.expectEqual(@as(i64, 0), bridge.seek(object, 0, std.c.SEEK.SET));
+    const patch_stream = bridge.find(object).?;
+    patch_stream.patch_toml = true;
+    patch_stream.eof = false;
+    patch_stream.failed = false;
+    try std.testing.expectEqual(@as(i64, 0), bridge.readInto(&state, object, 400, 16, true));
+    try std.testing.expect(bridge.eof(object));
+    try std.testing.expect(!bridge.failed(object));
     try std.testing.expectEqual(object, bridge.close(&state, object));
     try std.testing.expectEqualSlices(u8, &guest_layout_before, state.mem[object .. object + 160]);
     try std.testing.expect(!bridge.isOpen(object));
@@ -1128,7 +1955,7 @@ test "stream bridge forwards guest file operations through typed host calls" {
     try std.testing.expectEqual(ifstream_bridge.filebuf_vtable, state.read64(ifstream + FILEBUF_OFFSET_IN_IFSTREAM));
     try std.testing.expectEqual(ifstream_bridge.basic_ios_vtable, state.read64(ifstream + BASIC_IOS_OFFSET_IN_IFSTREAM));
     try std.testing.expectEqual(BASIC_IOS_OFFSET_IN_IFSTREAM, state.read64(ifstream_bridge.ifstream_vtable - 24));
-    try std.testing.expectEqual(@as(u8, 0x5a), state.mem[ifstream + 8]);
+    try std.testing.expectEqual(@as(u64, 0), state.read64(ifstream + BASIC_ISTREAM_GCOUNT_OFFSET));
     try std.testing.expectEqual(@as(u8, 0x5a), state.mem[ifstream + 24]);
     @memcpy(state.mem[ifstream_path_address .. ifstream_path_address + "/dev/null".len], "/dev/null");
     state.regs = .{ .rdi = ifstream, .rsi = ifstream_path_address, .rdx = OPENMODE_IN };

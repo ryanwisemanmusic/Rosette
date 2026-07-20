@@ -4,6 +4,7 @@ pub const FaultClass = enum {
     opaque_identity_dereference,
     cxx_invalid_vtt,
     cxx_object_model_null_vtable,
+    cxx_shared_control_block_null_vtable,
     bad_this_pointer,
     bad_vtable_header,
     bad_streambuf_pointer,
@@ -88,6 +89,16 @@ pub fn classify(context: Context) Classification {
     if (std.mem.eql(u8, context.instruction, "ret") and near_null) {
         return .{ .class = .bad_return_address, .reason = "RET selected an unmapped return address", .next_subsystem = "call stack / unwind runtime" };
     }
+    if (near_null and
+        std.mem.indexOf(u8, context.instruction, "call") != null and
+        std.mem.indexOf(u8, context.symbol, "__shared_count16__release_shared") != null)
+    {
+        return .{
+            .class = .cxx_shared_control_block_null_vtable,
+            .reason = "libc++ reached the final-owner virtual release with a null control-block vptr; this is object initialization/lifetime state, not an import thunk",
+            .next_subsystem = "libcpp_shared_control_block / guest heap provenance",
+        };
+    }
     if ((std.mem.indexOf(u8, context.instruction, "jmp") != null or std.mem.indexOf(u8, context.instruction, "call") != null) and near_null) {
         return .{ .class = .bad_import_thunk, .reason = "indirect import control transfer resolved to zero or a low address", .next_subsystem = "import resolver / dyld bindings" };
     }
@@ -168,4 +179,20 @@ test "opaque identities are never classified as generic memory" {
         .pointer_owner = "Objective-C selector identity",
     });
     try std.testing.expectEqual(FaultClass.opaque_identity_dereference, result.class);
+}
+
+test "shared count null virtual dispatch is not classified as an import" {
+    const result = classify(.{
+        .instruction = "call_mem64_null",
+        .symbol = "__ZNSt3__114__shared_count16__release_sharedB7v160006Ev",
+        .address = 0,
+        .rdi = 0x474bb20,
+        .rsi = 0,
+        .rsp = 0x4d79910,
+        .rbp = 0x4d79930,
+        .rdi_mapped = true,
+        .rsi_mapped = false,
+        .stack_mapped = true,
+    });
+    try std.testing.expectEqual(FaultClass.cxx_shared_control_block_null_vtable, result.class);
 }

@@ -148,8 +148,11 @@ pub const Bridge = struct {
                 self.writeErrorCode(state, state.regs.rdx, error_value, false);
             }
         }
-        if (shouldTrace(self.status_calls)) {
-            std.debug.print("macho-processor: libc++ filesystem status #{d}: {s} -> type={d}\n", .{ self.status_calls, translated, @as(i8, @bitCast(state.read8(output))) });
+        if (shouldTrace(self.status_calls) or isDiagnosticPath(path) or isDiagnosticPath(translated)) {
+            std.debug.print(
+                "macho-processor: libc++ filesystem status #{d}: guest_path={s} host_path={s} follow_symlinks={} -> type={d}\n",
+                .{ self.status_calls, path, translated, follow_symlinks, @as(i8, @bitCast(state.read8(output))) },
+            );
         }
         return output;
     }
@@ -649,6 +652,13 @@ fn saturatingMultiply(left: anytype, right: anytype) u64 {
 
 fn shouldTrace(count: u64) bool {
     return count <= 8 or count % 1000 == 0;
+}
+
+fn isDiagnosticPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".patch.toml") or
+        std.mem.indexOf(u8, path, "User_") != null or
+        std.mem.indexOf(u8, path, "Account") != null or
+        std.mem.indexOf(u8, path, "/content/") != null;
 }
 
 test "file status layout matches libc++ ABI v160006" {

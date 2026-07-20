@@ -1,10 +1,39 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 extern "c" fn mprotect(addr: [*]align(std.heap.page_size_min) u8, len: usize, prot: c_int) c_int;
 
 pub const PAGE_64K: u64 = 64 * 1024;
 pub const PAGE_4K: u64 = 4 * 1024;
 pub const LARGE_PAGE: u64 = 2 * 1024 * 1024;
+
+const PROT_READ: u32 = 0x1;
+const PROT_WRITE: u32 = 0x2;
+const PROT_EXEC: u32 = 0x4;
+const DARWIN_MAP_JIT: u32 = 0x800;
+
+/// Sparse guest mappings are interpreter backing, not host-native code. Keep
+/// guest execute permission in Mapping metadata while making the host pages
+/// readable for instruction decoding. Granting host PROT_EXEC would opt the
+/// processor into macOS JIT write-protection rules and can raise SIGBUS when
+/// the interpreted guest writes generated x86 code.
+fn hostBackingProtection(guest_prot: u32) u32 {
+    var host_prot = guest_prot & (PROT_READ | PROT_WRITE);
+    if (guest_prot & PROT_EXEC != 0) host_prot |= PROT_READ;
+    return host_prot;
+}
+
+fn hostBackingFlags(guest_flags: u32) u32 {
+    if (comptime builtin.os.tag == .macos) return guest_flags & ~DARWIN_MAP_JIT;
+    return guest_flags;
+}
+
+pub fn pageRoundedLength(length: u64) ?u64 {
+    if (length == 0) return null;
+    const page_size: u64 = std.heap.page_size_min;
+    const with_padding = std.math.add(u64, length, page_size - 1) catch return null;
+    return with_padding & ~(page_size - 1);
+}
 
 const Mapping = struct {
     guest_base: u64,
@@ -43,7 +72,7 @@ pub const Manager = struct {
     }
 
     pub fn mapFile(self: *Manager, guest_base: u64, length: u64, prot_raw: u32, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) bool {
-        if (length == 0 or guest_base % PAGE_64K != 0 or offset % std.heap.page_size_min != 0) return false;
+        if (length == 0 or (guest_base % PAGE_4K != 0) or offset % std.heap.page_size_min != 0) return false;
         const end = std.math.add(u64, guest_base, length) catch return false;
         for (self.mappings.items) |mapping| {
             const mapping_end = mapping.guest_base + mapping.memory.len;
@@ -67,6 +96,91 @@ pub const Manager = struct {
             return false;
         };
         return true;
+    }
+
+    /// Creates a true mmap-style mapping whose host-selected address is also
+    /// its guest address. This is required for large native-backend regions
+    /// requested with a null address hint (for example Xenia's indirection
+    /// table and MAP_JIT code cache). Serving those requests from the bounded
+    /// C++ guest heap both exhausts the heap and loses mmap permissions.
+    pub fn mapAnywhereWithBacking(self: *Manager, length: u64, prot_raw: u32, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) ?u64 {
+        return self.mapAnywhereWithHintAndBacking(length, prot_raw, flags_raw, host_fd, offset, null, null);
+    }
+
+    /// Maps backend VM while retaining mmap's non-fixed hint semantics. If a
+    /// maximum address is supplied, a host placement outside the required
+    /// guest pointer window is rejected instead of allowing later truncation.
+    pub fn mapAnywhereWithHintAndBacking(
+        self: *Manager,
+        length: u64,
+        prot_raw: u32,
+        flags_raw: u32,
+        host_fd: std.posix.fd_t,
+        offset: u64,
+        preferred_base: ?u64,
+        maximum_end_exclusive: ?u64,
+    ) ?u64 {
+        if (length == 0) return null;
+        if (host_fd >= 0 and offset % std.heap.page_size_min != 0) return null;
+        const effective_length = pageRoundedLength(length) orelse return null;
+        const length_usize = std.math.cast(usize, effective_length) orelse return null;
+        const host_prot_raw = hostBackingProtection(prot_raw);
+        const host_flags_raw = hostBackingFlags(flags_raw);
+        var flags: std.posix.MAP = @bitCast(host_flags_raw);
+        flags.FIXED = false;
+        const prot: std.posix.PROT = @bitCast(host_prot_raw);
+        // The interpreter does not dereference guest pointers directly. For a
+        // backend low-window contract, map backing wherever the host permits
+        // and expose the preferred address only in the guest virtual model.
+        // This avoids both destructive MAP_FIXED and macOS arm64's rejection
+        // of low host VM allocations.
+        const memory = std.posix.mmap(null, length_usize, prot, flags, host_fd, offset) catch |err| {
+            std.debug.print(
+                "macho-processor: sparse anywhere mmap FAILED: reason={s} requested_length={d} effective_length={d} page_tail={d} preferred_base=0x{x} maximum_end=0x{x} guest_prot=0x{x} host_prot=0x{x} guest_flags=0x{x} host_flags=0x{x} map_jit_emulated={} anonymous={} host_fd={d} offset=0x{x}\n",
+                .{ @errorName(err), length, effective_length, effective_length - length, preferred_base orelse 0, maximum_end_exclusive orelse 0, prot_raw, host_prot_raw, flags_raw, host_flags_raw, flags_raw & DARWIN_MAP_JIT != 0, flags.ANONYMOUS, host_fd, offset },
+            );
+            return null;
+        };
+        const host_base = @intFromPtr(memory.ptr);
+        const guest_base = preferred_base orelse host_base;
+        const guest_end = std.math.add(u64, guest_base, effective_length) catch {
+            std.posix.munmap(memory);
+            return null;
+        };
+        if (maximum_end_exclusive) |maximum_end| {
+            if (guest_end > maximum_end) {
+                std.debug.print(
+                    "macho-processor: sparse anywhere mmap rejected placement: guest_base=0x{x} guest_end=0x{x} requested_length={d} effective_length={d} preferred_base=0x{x} maximum_end=0x{x} reason=backend_pointer_window\n",
+                    .{ guest_base, guest_end, length, effective_length, preferred_base orelse 0, maximum_end },
+                );
+                std.posix.munmap(memory);
+                return null;
+            }
+        }
+        for (self.mappings.items) |mapping| {
+            const mapping_end = mapping.guest_base +| mapping.memory.len;
+            if (guest_base < mapping_end and guest_end > mapping.guest_base) {
+                std.posix.munmap(memory);
+                return null;
+            }
+        }
+        self.mappings.append(self.allocator, .{
+            .guest_base = guest_base,
+            .memory = memory,
+            .readable = prot_raw & 1 != 0,
+            .writable = prot_raw & 2 != 0,
+            .executable = prot_raw & 4 != 0,
+            .is_fixed = false,
+            .is_reservation = false,
+        }) catch {
+            std.posix.munmap(memory);
+            return null;
+        };
+        std.debug.print(
+            "macho-processor: sparse anywhere mmap succeeded: guest_base=0x{x} guest_end=0x{x} host_base=0x{x} requested_length={d} effective_length={d} page_tail={d} preferred_base=0x{x} guest_address_contract_honored={} guest_host_alias={} low_window_required={} allocation_route=modeled_guest_alias guest_prot=0x{x} host_prot=0x{x} guest_flags=0x{x} host_flags=0x{x} map_jit_emulated={} host_execute=false anonymous={} host_fd={d}\n",
+            .{ guest_base, guest_end, host_base, length, effective_length, effective_length - length, preferred_base orelse 0, preferred_base == null or preferred_base.? == guest_base, guest_base != host_base, maximum_end_exclusive != null, prot_raw, host_prot_raw, flags_raw, host_flags_raw, flags_raw & DARWIN_MAP_JIT != 0, flags.ANONYMOUS, host_fd },
+        );
+        return guest_base;
     }
 
     pub fn mapFixed(self: *Manager, guest_base: u64, length: u64, prot_raw: u32, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) bool {
@@ -188,7 +302,7 @@ pub const Manager = struct {
     }
 
     pub fn reserveLarge(self: *Manager, guest_base: u64, length: u64) bool {
-        if (length == 0 or guest_base % PAGE_64K != 0) return false;
+        if (length == 0 or (guest_base % PAGE_4K != 0)) return false;
         const end = std.math.add(u64, guest_base, length) catch return false;
         for (self.mappings.items) |mapping| {
             const mapping_end = mapping.guest_base + mapping.memory.len;
@@ -322,7 +436,8 @@ pub const Manager = struct {
             if (guest_base >= mapping.guest_base and end <= mapping_end) {
                 const offset = @as(usize, @intCast(guest_base - mapping.guest_base));
                 const page_aligned = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(&mapping.memory[offset])));
-                if (mprotect(page_aligned, @intCast(length), @as(c_int, @intCast(prot_raw))) != 0) return false;
+                const host_prot_raw = hostBackingProtection(prot_raw);
+                if (mprotect(page_aligned, @intCast(length), @as(c_int, @intCast(host_prot_raw))) != 0) return false;
                 if (mapping.is_reservation) {
                     const active_memory = @as([]align(std.heap.page_size_min) u8, @alignCast(mapping.memory[offset..][0..@intCast(length)]));
                     self.appendActivation(guest_base, active_memory, prot_raw) catch return false;
@@ -330,6 +445,12 @@ pub const Manager = struct {
                     mapping.readable = prot_raw & 1 != 0;
                     mapping.writable = prot_raw & 2 != 0;
                     mapping.executable = prot_raw & 4 != 0;
+                }
+                if (prot_raw & PROT_EXEC != 0) {
+                    std.debug.print(
+                        "macho-processor: sparse guest execute protection emulated: guest_base=0x{x} length={d} guest_prot=0x{x} host_prot=0x{x} host_execute=false\n",
+                        .{ guest_base, length, prot_raw, host_prot_raw },
+                    );
                 }
                 return true;
             }
@@ -380,6 +501,36 @@ pub const Manager = struct {
 
     pub fn contains(self: *const Manager, address: u64, length: u64) bool {
         return self.activeBytesConst(address, length) != null or self.findConst(address, length) != null;
+    }
+
+    pub fn isExecutable(self: *const Manager, address: u64, length: u64) bool {
+        const end = std.math.add(u64, address, length) catch return false;
+        var activation_index = self.activations.items.len;
+        while (activation_index != 0) {
+            activation_index -= 1;
+            const active = &self.activations.items[activation_index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (address >= active_end or end <= active.guest_base) continue;
+            return address >= active.guest_base and end <= active_end and active.executable;
+        }
+        const found = self.findConst(address, length) orelse return false;
+        return found.mapping.executable;
+    }
+
+    pub fn executableBytesConst(self: *const Manager, address: u64, length: u64) ?[]const u8 {
+        if (!self.isExecutable(address, length)) return null;
+        const end = std.math.add(u64, address, length) catch return null;
+        var activation_index = self.activations.items.len;
+        while (activation_index != 0) {
+            activation_index -= 1;
+            const active = &self.activations.items[activation_index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (address < active.guest_base or end > active_end or !active.executable) continue;
+            const offset: usize = @intCast(address - active.guest_base);
+            return active.memory[offset..][0..@intCast(length)];
+        }
+        const found = self.findConst(address, length) orelse return null;
+        return found.mapping.memory[found.offset..][0..@intCast(length)];
     }
 
     pub fn unmap(self: *Manager, guest_base: u64, length: u64) bool {
@@ -554,6 +705,57 @@ test "fixed anonymous guest range uses independent host backing" {
     const bytes = manager.bytes(0x8000_0000, 16, true) orelse return error.TestUnexpectedResult;
     bytes[0] = 0xA5;
     try std.testing.expectEqual(@as(u8, 0xA5), manager.bytesConst(0x8000_0000, 1).?[0]);
+}
+
+test "OS-selected sparse mapping preserves permissions outside the guest heap" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const anonymous_private: u32 = 0x1000 | 0x2;
+    const base = manager.mapAnywhereWithBacking(PAGE_64K, 3, anonymous_private, -1, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(base != 0);
+    try std.testing.expect(manager.contains(base, PAGE_64K));
+    try std.testing.expect(!manager.isExecutable(base, 1));
+    const bytes = manager.bytes(base, 1, true) orelse return error.TestUnexpectedResult;
+    bytes[0] = 0xC3;
+    try std.testing.expectEqual(@as(u8, 0xC3), manager.bytesConst(base, 1).?[0]);
+    try std.testing.expect(manager.protect(base, PAGE_64K, 5));
+    try std.testing.expect(manager.isExecutable(base, 1));
+    try std.testing.expectEqual(@as(u8, 0xC3), manager.executableBytesConst(base, 1).?[0]);
+}
+
+test "guest MAP_JIT execute permission uses non-executable host backing" {
+    try std.testing.expectEqual(@as(u32, PROT_READ | PROT_WRITE), hostBackingProtection(PROT_READ | PROT_WRITE | PROT_EXEC));
+    try std.testing.expectEqual(@as(u32, PROT_READ), hostBackingProtection(PROT_READ | PROT_EXEC));
+    if (comptime builtin.os.tag == .macos) {
+        try std.testing.expectEqual(@as(u32, 0x1002), hostBackingFlags(0x1802));
+    }
+}
+
+test "mmap length is rounded to the Darwin host page" {
+    try std.testing.expectEqual(@as(?u64, std.heap.page_size_min), pageRoundedLength(std.heap.page_size_min - 1));
+    try std.testing.expectEqual(@as(?u64, 0x2000_0000), pageRoundedLength(0x1FFF_FFFF));
+    try std.testing.expectEqual(@as(?u64, 0x1000_0000), pageRoundedLength(0x0FFF_FFFF));
+}
+
+test "backend hint mapping enforces a low 32-bit result window" {
+    if (comptime builtin.os.tag != .macos) return;
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const anonymous_private: u32 = 0x1000 | 0x2;
+    const base = manager.mapAnywhereWithHintAndBacking(
+        PAGE_64K,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        anonymous_private | DARWIN_MAP_JIT,
+        -1,
+        0,
+        0xA000_0000,
+        0x1_0000_0000,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(base + PAGE_64K <= 0x1_0000_0000);
+    try std.testing.expect(manager.isExecutable(base, 1));
+    try std.testing.expect(manager.bytes(base, 1, true) != null);
 }
 
 test "reserve large address space region" {

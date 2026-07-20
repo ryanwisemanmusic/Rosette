@@ -402,6 +402,76 @@ pub fn initLibcppStringFill(state: anytype, object: u64, length: u64, value: u8)
     return true;
 }
 
+pub fn resizeLibcppString(state: anytype, object: u64, new_size: u64, fill_char: u8) bool {
+    if (new_size > std.math.maxInt(usize)) return false;
+    const object_bytes = state.guestMemory(object, 24) orelse return false;
+
+    const is_long = object_bytes[0] & 1 != 0;
+    const ns: usize = @intCast(new_size);
+
+    if (is_long) {
+        const capacity = state.read64(object) & ~@as(u64, 1);
+        const old_len = state.read64(object + 8);
+        const data_ptr = state.read64(object + 16);
+        if (old_len > new_size) {
+            state.write64(object + 8, new_size);
+            if (new_size != 0) {
+                const data_bytes = state.guestMemory(data_ptr, new_size + 1) orelse return false;
+                data_bytes[ns] = 0;
+            }
+            return true;
+        }
+        if (new_size <= capacity) {
+            const data_bytes = state.guestMemory(data_ptr, new_size + 1) orelse return false;
+            const ol: usize = @intCast(old_len);
+            if (ns > ol) {
+                @memset(data_bytes[ol..ns], fill_char);
+            }
+            data_bytes[ns] = 0;
+            state.write64(object + 8, new_size);
+            return true;
+        }
+        // need to grow
+        const old_bytes = state.guestMemoryConst(data_ptr, old_len) orelse return false;
+        const new_capacity = (std.math.add(u64, new_size, 16) catch return false) & ~@as(u64, 15);
+        const new_data = state.guestAlloc(new_capacity, 16) orelse return false;
+        const new_bytes = state.guestMemory(new_data, new_capacity) orelse return false;
+        const ol_us: usize = @intCast(old_len);
+        @memcpy(new_bytes[0..ol_us], old_bytes);
+        @memset(new_bytes[ol_us..ns], fill_char);
+        new_bytes[ns] = 0;
+        state.write64(object, new_capacity | 1);
+        state.write64(object + 8, new_size);
+        state.write64(object + 16, new_data);
+        return true;
+    }
+
+    // short string
+    const old_len = object_bytes[0] >> 1;
+    if (new_size < 23) {
+        if (old_len <= new_size) {
+            const ol_us: usize = @intCast(old_len);
+            @memset(object_bytes[1 + ol_us .. 1 + ns], fill_char);
+        }
+        object_bytes[0] = @intCast(new_size << 1);
+        object_bytes[1 + ns] = 0;
+        return true;
+    }
+
+    // short -> long transition
+    const capacity = (std.math.add(u64, new_size, 16) catch return false) & ~@as(u64, 15);
+    const data = state.guestAlloc(capacity, 16) orelse return false;
+    const data_bytes = state.guestMemory(data, capacity) orelse return false;
+    const ol_us: usize = @intCast(old_len);
+    @memcpy(data_bytes[0..ol_us], object_bytes[1..(1 + ol_us)]);
+    @memset(data_bytes[ol_us..ns], fill_char);
+    data_bytes[ns] = 0;
+    state.write64(object, capacity | 1);
+    state.write64(object + 8, new_size);
+    state.write64(object + 16, data);
+    return true;
+}
+
 pub const LibcppStringView = struct {
     address: u64,
     length: u64,
@@ -422,6 +492,18 @@ pub fn libcppStringView(state: anytype, object: u64) ?LibcppStringView {
 pub fn copyLibcppString(state: anytype, destination: u64, source: u64) bool {
     const view = libcppStringView(state, source) orelse return false;
     return initLibcppString(state, destination, view.address, view.length);
+}
+
+/// Implements the value-producing libc++ `basic_string::substr(pos, count)`
+/// operation without entering another libc++ constructor. Returns null when
+/// `pos` is out of range so the caller may retain libc++'s exception behavior.
+pub fn substringLibcppString(state: anytype, destination: u64, source: u64, position: u64, count: u64) ?u64 {
+    const view = libcppStringView(state, source) orelse return null;
+    if (position > view.length) return null;
+    const available = view.length - position;
+    const result_length = @min(count, available);
+    if (!initLibcppString(state, destination, view.address + position, result_length)) return null;
+    return result_length;
 }
 
 pub fn compareLibcppStringWithBytes(state: anytype, object: u64, rhs_address: u64, rhs_length: u64) ?i32 {
@@ -771,6 +853,22 @@ test "libc++ string copy append and concatenation preserve contents" {
     try std.testing.expect(concatCStringAndLibcppString(&state, 136, 112, 7, 80));
     const concatenated = libcppStringView(&state, 136).?;
     try std.testing.expectEqualStrings("prefix hello world", state.guestMemoryConst(concatenated.address, concatenated.length).?);
+}
+
+test "libc++ string substring preserves bounds and empty suffix" {
+    var state = TestState{};
+    @memcpy(state.mem[32..48], "User_0123456789:");
+    try std.testing.expect(initLibcppString(&state, 0, 32, 16));
+
+    try std.testing.expectEqual(@as(?u64, 10), substringLibcppString(&state, 64, 0, 5, 10));
+    var view = libcppStringView(&state, 64).?;
+    try std.testing.expectEqualStrings("0123456789", state.guestMemoryConst(view.address, view.length).?);
+
+    try std.testing.expectEqual(@as(?u64, 0), substringLibcppString(&state, 96, 0, 16, std.math.maxInt(u64)));
+    view = libcppStringView(&state, 96).?;
+    try std.testing.expectEqual(@as(u64, 0), view.length);
+    try std.testing.expect(state.mem[96] & 1 == 0);
+    try std.testing.expectEqual(@as(?u64, null), substringLibcppString(&state, 128, 0, 17, 1));
 }
 
 test "libc++ string push_back preserves short and long representations" {

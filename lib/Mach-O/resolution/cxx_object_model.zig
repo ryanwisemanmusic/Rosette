@@ -38,6 +38,9 @@ pub const stream_layout = StreamLayout{
 
 pub const FILEBUF_OFFSET_IN_IFSTREAM: u64 = 16;
 pub const BASIC_IOS_OFFSET_IN_IFSTREAM: u64 = 424;
+// libc++ stores basic_istream::__gc_ immediately after the vptr.  It must be
+// initialized before a parser inspects gcount() for the first time.
+pub const BASIC_ISTREAM_GCOUNT_OFFSET: u64 = 8;
 pub const IFSTREAM_SIZE: u64 = BASIC_IOS_OFFSET_IN_IFSTREAM + stream_layout.size;
 pub const BADBIT: u32 = 1;
 pub const EOFBIT: u32 = 2;
@@ -124,10 +127,12 @@ pub const Model = struct {
 
     pub fn initializeStreamBase(self: *Model, state: anytype, kind: Kind, object: u64) bool {
         if (kind != .basic_istream and kind != .basic_ostream and kind != .basic_iostream) return false;
-        if (state.guestMemory(object, @sizeOf(u64)) == null) return false;
+        const size = if (kind == .basic_istream) BASIC_ISTREAM_GCOUNT_OFFSET + @sizeOf(u64) else @sizeOf(u64);
+        if (state.guestMemory(object, size) == null) return false;
         const record = self.ensureType(state, kind, 0) orelse return false;
         state.write64(object, record.vtable);
-        self.markObject(state, object, @sizeOf(u64), kind);
+        if (kind == .basic_istream) state.write64(object + BASIC_ISTREAM_GCOUNT_OFFSET, 0);
+        self.markObject(state, object, size, kind);
         self.objects_initialized +|= 1;
         return true;
     }
@@ -146,6 +151,7 @@ pub const Model = struct {
         const ifstream = self.ensureType(state, .basic_ifstream, @intCast(BASIC_IOS_OFFSET_IN_IFSTREAM)) orelse return false;
         const filebuf = self.ensureType(state, .basic_filebuf, null) orelse return false;
         state.write64(object, ifstream.vtable);
+        state.write64(object + BASIC_ISTREAM_GCOUNT_OFFSET, 0);
         state.write64(object + FILEBUF_OFFSET_IN_IFSTREAM, filebuf.vtable);
         if (!self.initializeBasicIos(state, object + BASIC_IOS_OFFSET_IN_IFSTREAM, object + FILEBUF_OFFSET_IN_IFSTREAM)) return false;
         self.markObject(state, object, IFSTREAM_SIZE, .basic_ifstream);

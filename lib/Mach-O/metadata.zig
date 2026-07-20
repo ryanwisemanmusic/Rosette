@@ -55,6 +55,12 @@ pub const SymbolMatch = struct {
     offset: u64,
 };
 
+const AddressedSymbol = struct {
+    name: []const u8,
+    address: u64,
+    original_index: u32,
+};
+
 const Symtab = struct {
     symbol_offset: u32,
     symbol_count: u32,
@@ -86,6 +92,7 @@ pub const Metadata = struct {
     bindings: []DataBinding,
     initializer_count: usize,
     initializer_addresses: []u64,
+    addressed_symbols: []AddressedSymbol,
     symtab: ?Symtab,
     dysymtab: ?Dysymtab,
     dyld_info: ?DyldInfo,
@@ -201,6 +208,7 @@ pub const Metadata = struct {
             .bindings = &.{},
             .initializer_count = initializer_count,
             .initializer_addresses = &.{},
+            .addressed_symbols = &.{},
             .symtab = symtab,
             .dysymtab = dysymtab,
             .dyld_info = dyld_info,
@@ -221,13 +229,24 @@ pub const Metadata = struct {
         if (self.imports.len != 0) self.allocator.free(self.imports);
         if (self.bindings.len != 0) self.allocator.free(self.bindings);
         if (self.initializer_addresses.len != 0) self.allocator.free(self.initializer_addresses);
+        if (self.addressed_symbols.len != 0) self.allocator.free(self.addressed_symbols);
         self.defined_symbols.deinit();
         self.* = undefined;
     }
 
     pub fn importAtStub(self: *const Metadata, address: u64) ?ImportedSymbol {
-        for (self.imports) |imported| {
-            if (imported.stub_address == address) return imported;
+        var low: usize = 0;
+        var high: usize = self.imports.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const imported = self.imports[middle];
+            if (address < imported.stub_address) {
+                high = middle;
+            } else if (address > imported.stub_address) {
+                low = middle + 1;
+            } else {
+                return imported;
+            }
         }
         return null;
     }
@@ -242,28 +261,29 @@ pub const Metadata = struct {
     }
 
     pub fn nearestSymbol(self: *const Metadata, address: u64) ?SymbolMatch {
-        const table = self.symtab orelse return null;
-        var best_name: []const u8 = "";
-        var best_address: u64 = 0;
-        var index: u32 = 0;
-        while (index < table.symbol_count) : (index += 1) {
-            const entry_offset = @as(usize, table.symbol_offset) + @as(usize, index) * NLIST_64_SIZE;
-            if (entry_offset + NLIST_64_SIZE > self.data.len) break;
-            const symbol_type = self.data[entry_offset + 4];
-            if ((symbol_type & N_STAB) != 0 or (symbol_type & N_TYPE) != N_SECT) continue;
-            const value = readU64(self.data, entry_offset + 8);
-            if (value == 0 or value > address or value < best_address) continue;
-            const name = self.symbolName(table, readU32(self.data, entry_offset)) orelse continue;
-            if (name.len == 0) continue;
-            best_name = name;
-            best_address = value;
-            if (value == address) break;
+        var low: usize = 0;
+        var high: usize = self.addressed_symbols.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.addressed_symbols[middle].address <= address) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
         }
-        if (best_name.len == 0) return null;
+        if (low == 0) return null;
+        var best_index = low - 1;
+        const best_address = self.addressed_symbols[best_index].address;
+        // Preserve the old symbol-table behavior for aliases at the same
+        // address by selecting the first original symbol-table entry.
+        while (best_index != 0 and self.addressed_symbols[best_index - 1].address == best_address) {
+            best_index -= 1;
+        }
+        const best = self.addressed_symbols[best_index];
         return .{
-            .name = best_name,
-            .address = best_address,
-            .offset = address - best_address,
+            .name = best.name,
+            .address = best.address,
+            .offset = address - best.address,
         };
     }
 
@@ -293,6 +313,8 @@ pub const Metadata = struct {
 
     fn indexDefinedSymbols(self: *Metadata) !void {
         const table = self.symtab orelse return;
+        var addressed: std.ArrayList(AddressedSymbol) = .empty;
+        errdefer addressed.deinit(self.allocator);
         var index: u32 = 0;
         while (index < table.symbol_count) : (index += 1) {
             const entry_offset = @as(usize, table.symbol_offset) + @as(usize, index) * NLIST_64_SIZE;
@@ -301,8 +323,22 @@ pub const Metadata = struct {
             if ((symbol_type & N_STAB) != 0 or (symbol_type & N_TYPE) != N_SECT) continue;
             const name = self.symbolName(table, readU32(self.data, entry_offset)) orelse continue;
             const address = readU64(self.data, entry_offset + 8);
-            if (address != 0) try self.defined_symbols.put(name, address);
+            if (address != 0) {
+                try self.defined_symbols.put(name, address);
+                try addressed.append(self.allocator, .{
+                    .name = name,
+                    .address = address,
+                    .original_index = index,
+                });
+            }
         }
+        self.addressed_symbols = try addressed.toOwnedSlice(self.allocator);
+        std.mem.sort(AddressedSymbol, self.addressed_symbols, {}, struct {
+            fn lessThan(_: void, lhs: AddressedSymbol, rhs: AddressedSymbol) bool {
+                if (lhs.address != rhs.address) return lhs.address < rhs.address;
+                return lhs.original_index < rhs.original_index;
+            }
+        }.lessThan);
     }
 
     pub fn symbolAddressesMatching(
@@ -356,6 +392,11 @@ pub const Metadata = struct {
         var imports: std.ArrayList(ImportedSymbol) = .empty;
         errdefer imports.deinit(self.allocator);
 
+        // Find __la_symbol_ptr section for lazy pointer address resolution
+        const la_sym_ptr = for (self.sections) |s| {
+            if (std.mem.eql(u8, s.name, "__la_symbol_ptr")) break &s;
+        } else null;
+
         for (self.sections) |section| {
             if (!std.mem.eql(u8, section.name, "__stubs") or section.stub_size == 0) continue;
             const stub_count = section.size / section.stub_size;
@@ -373,17 +414,31 @@ pub const Metadata = struct {
                 const name = self.symbolName(table, readU32(self.data, symbol_offset)) orelse continue;
                 const description = readU16(self.data, symbol_offset + 6);
                 const ordinal: u8 = @intCast(description >> 8);
+
+                // Resolve lazy pointer address from __la_symbol_ptr section if available
+                const lazy_ptr_addr = if (la_sym_ptr) |lap| blk: {
+                    const ptr_index = indirect_index -| lap.indirect_symbol_start;
+                    if (ptr_index < lap.size / 8) break :blk lap.address + ptr_index * 8;
+                    break :blk 0;
+                } else 0;
+
                 try imports.append(self.allocator, .{
                     .name = name,
                     .dylib = self.dylibForOrdinal(ordinal),
                     .stub_address = section.address + stub_index * section.stub_size,
-                    .lazy_pointer_address = 0,
+                    .lazy_pointer_address = lazy_ptr_addr,
                     .symbol_index = symbol_index,
                     .weak = isWeakReference(description),
                 });
             }
         }
-        return imports.toOwnedSlice(self.allocator);
+        const result = try imports.toOwnedSlice(self.allocator);
+        std.mem.sort(ImportedSymbol, result, {}, struct {
+            fn lessThan(_: void, lhs: ImportedSymbol, rhs: ImportedSymbol) bool {
+                return lhs.stub_address < rhs.stub_address;
+            }
+        }.lessThan);
+        return result;
     }
 
     fn collectBindings(self: *const Metadata) ![]DataBinding {

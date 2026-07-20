@@ -23,6 +23,7 @@ pub const Summary = struct {
     matched_throws: u64,
     catches_begun: u64,
     catches_ended: u64,
+    caught_throws: u64,
     frees: u64,
     rethrows: u64,
     active_catches: usize,
@@ -40,9 +41,11 @@ pub const Tracker = struct {
     active_catch_count: usize = 0,
     begin_catch_count: u64 = 0,
     end_catch_count: u64 = 0,
+    caught_throw_count: u64 = 0,
     free_count: u64 = 0,
     rethrow_count: u64 = 0,
     last_throw: ?ThrowRecord = null,
+    last_throw_caught: bool = false,
 
     pub fn recordAllocation(self: *Tracker, storage_address: u64, object_address: u64, object_size: u64, caller_address: u64) void {
         self.allocations[self.allocation_index] = .{
@@ -74,6 +77,7 @@ pub const Tracker = struct {
         self.throw_count +|= 1;
         if (allocation != null) self.matched_throw_count +|= 1;
         self.last_throw = record;
+        self.last_throw_caught = false;
         return record;
     }
 
@@ -93,6 +97,12 @@ pub const Tracker = struct {
         const object_address = self.active_catches[self.active_catch_count];
         self.active_catches[self.active_catch_count] = 0;
         self.end_catch_count +|= 1;
+        if (self.last_throw) |thrown| {
+            if (thrown.object_address == object_address and !self.last_throw_caught) {
+                self.last_throw_caught = true;
+                self.caught_throw_count +|= 1;
+            }
+        }
         return object_address;
     }
 
@@ -123,8 +133,17 @@ pub const Tracker = struct {
 
     pub fn recordRethrow(self: *Tracker) ?u64 {
         self.rethrow_count +|= 1;
+        self.last_throw_caught = false;
         if (self.active_catch_count == 0) return null;
         return self.active_catches[self.active_catch_count - 1];
+    }
+
+    /// Returns only an exception that is still eligible to drive unwinding.
+    /// `last_throw` intentionally remains available as diagnostic history
+    /// after a catch, but must never resurrect a completed phase-two walk.
+    pub fn activeThrow(self: *const Tracker) ?ThrowRecord {
+        if (self.last_throw_caught) return null;
+        return self.last_throw;
     }
 
     pub fn summary(self: *const Tracker) Summary {
@@ -134,6 +153,7 @@ pub const Tracker = struct {
             .matched_throws = self.matched_throw_count,
             .catches_begun = self.begin_catch_count,
             .catches_ended = self.end_catch_count,
+            .caught_throws = self.caught_throw_count,
             .frees = self.free_count,
             .rethrows = self.rethrow_count,
             .active_catches = self.active_catch_count,
@@ -144,8 +164,8 @@ pub const Tracker = struct {
         const totals = self.summary();
         if (totals.allocations == 0 and totals.throws == 0) return;
         std.debug.print(
-            "macho-processor: C++ exception runtime: allocations={d} throws={d} matched={d} begin_catch={d} end_catch={d} frees={d} rethrows={d} active={d}\n",
-            .{ totals.allocations, totals.throws, totals.matched_throws, totals.catches_begun, totals.catches_ended, totals.frees, totals.rethrows, totals.active_catches },
+            "macho-processor: C++ exception runtime: allocations={d} throws={d} matched={d} begin_catch={d} end_catch={d} caught_throws={d} frees={d} rethrows={d} active={d}\n",
+            .{ totals.allocations, totals.throws, totals.matched_throws, totals.catches_begun, totals.catches_ended, totals.caught_throws, totals.frees, totals.rethrows, totals.active_catches },
         );
     }
 
@@ -188,9 +208,11 @@ test "allocation history retains the newest matching object" {
 test "catch lifecycle normalizes ABI header pointers and frees storage" {
     var tracker = Tracker{};
     tracker.recordAllocation(0x3fc0, 0x4000, 32, 0x1000);
+    _ = tracker.recordThrow(0x4000, 0x5000, 0x6000, 0x2000);
     try std.testing.expectEqual(@as(u64, 0x4000), tracker.beginCatch(0x3fe0));
     try std.testing.expectEqual(@as(u64, 0x4000), tracker.recordRethrow().?);
     try std.testing.expectEqual(@as(u64, 0x4000), tracker.endCatch().?);
+    try std.testing.expect(tracker.last_throw_caught);
     const allocation = tracker.freeException(0x3ff0).?;
     try std.testing.expectEqual(@as(u64, 0x3fc0), allocation.storage_address);
     try std.testing.expectEqual(@as(usize, 0), tracker.summary().active_catches);
@@ -202,4 +224,15 @@ test "unmatched throw remains explicit" {
 
     try std.testing.expect(thrown.allocation == null);
     try std.testing.expectEqual(@as(u64, 0), tracker.summary().matched_throws);
+}
+
+test "completed catch remains history but is not an active unwind source" {
+    var tracker = Tracker{};
+    tracker.recordAllocation(0x3fc0, 0x4000, 16, 0x1000);
+    _ = tracker.recordThrow(0x4000, 0x5000, 0, 0x2000);
+    try std.testing.expect(tracker.activeThrow() != null);
+    _ = tracker.beginCatch(0x3fc0);
+    _ = tracker.endCatch();
+    try std.testing.expect(tracker.last_throw != null);
+    try std.testing.expect(tracker.activeThrow() == null);
 }

@@ -3,13 +3,22 @@ const std = @import("std");
 pub const DeferredBinding = struct {
     address: u64,
     symbol: []const u8,
-    resolved: bool,
+    addend: i64 = 0,
+    resolution: Resolution = .pending,
+};
+
+pub const Resolution = enum {
+    pending,
+    host_symbol,
+    synthetic_abi,
+    self_sentinel,
 };
 
 pub const VttBindingResolver = struct {
     allocator: std.mem.Allocator,
     deferred: std.ArrayList(DeferredBinding) = .empty,
     resolved_count: usize = 0,
+    synthetic_count: usize = 0,
     failed_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) VttBindingResolver {
@@ -24,12 +33,12 @@ pub const VttBindingResolver = struct {
         self.* = undefined;
     }
 
-    pub fn record(self: *VttBindingResolver, address: u64, symbol: []const u8) !void {
+    pub fn record(self: *VttBindingResolver, address: u64, symbol: []const u8, addend: i64) !void {
         const owned = try self.allocator.dupe(u8, symbol);
         try self.deferred.append(self.allocator, .{
             .address = address,
             .symbol = owned,
-            .resolved = false,
+            .addend = addend,
         });
     }
 
@@ -50,17 +59,22 @@ pub const VttBindingResolver = struct {
 
     pub fn logSummary(self: *const VttBindingResolver) void {
         std.debug.print(
-            "macho-processor: VTT resolver: recorded={d} resolved={d} failed={d}\n",
-            .{ self.deferred.items.len, self.resolved_count, self.failed_count },
+            "macho-processor: ABI data resolver: recorded={d} guest_materialized={d} host_resolved={d} compatibility_fallback={d}\n",
+            .{ self.deferred.items.len, self.synthetic_count, self.resolved_count, self.failed_count },
         );
         if (self.failed_count > 0) {
+            var emitted: usize = 0;
             for (self.deferred.items) |item| {
-                if (!item.resolved) {
+                if (item.resolution == .self_sentinel and emitted < 8) {
                     std.debug.print(
-                        "  unresolved VTT binding: address=0x{x} symbol={s}\n",
-                        .{ item.address, item.symbol },
+                        "  unresolved ABI data sample: address=0x{x} symbol={s} fallback={s}\n",
+                        .{ item.address, item.symbol, @tagName(item.resolution) },
                     );
+                    emitted += 1;
                 }
+            }
+            if (self.failed_count > emitted) {
+                std.debug.print("  ... {d} additional unresolved ABI data binding(s) suppressed\n", .{self.failed_count - emitted});
             }
         }
     }
@@ -71,7 +85,7 @@ extern fn dlsym(handle: *anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 test "VTT resolver records deferred bindings" {
     var resolver = VttBindingResolver.init(std.testing.allocator);
     defer resolver.deinit();
-    try resolver.record(0x1000, "__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE");
+    try resolver.record(0x1000, "__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE", 16);
     try std.testing.expectEqual(@as(usize, 1), resolver.totalDeferred());
 }
 
@@ -85,19 +99,19 @@ test "VTT resolver lookup finds symbols or returns null" {
 test "VTT resolver inlines resolution correctly" {
     var resolver = VttBindingResolver.init(std.testing.allocator);
     defer resolver.deinit();
-    try resolver.record(0x8000, "malloc");
-    try resolver.record(0x9000, "__nonexistent_vtt_xyz");
+    try resolver.record(0x8000, "malloc", 0);
+    try resolver.record(0x9000, "__nonexistent_vtt_xyz", 0);
 
     var resolved_count: usize = 0;
     for (resolver.deferred.items) |*item| {
-        if (item.resolved) continue;
+        if (item.resolution != .pending) continue;
         if (VttBindingResolver.lookupSymbol(item.symbol)) |_| {
-            item.resolved = true;
+            item.resolution = .host_symbol;
             resolved_count += 1;
         }
     }
     resolver.resolved_count = resolved_count;
     try std.testing.expectEqual(@as(usize, 1), resolved_count);
-    try std.testing.expect(resolver.deferred.items[0].resolved);
-    try std.testing.expect(!resolver.deferred.items[1].resolved);
+    try std.testing.expectEqual(Resolution.host_symbol, resolver.deferred.items[0].resolution);
+    try std.testing.expectEqual(Resolution.pending, resolver.deferred.items[1].resolution);
 }

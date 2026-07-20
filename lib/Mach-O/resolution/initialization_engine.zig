@@ -12,6 +12,13 @@ pub const Status = enum {
     terminated,
 };
 
+pub const DeferralReason = enum {
+    none,
+    assertion,
+    runtime_dependency,
+    step_limit,
+};
+
 pub const AbiSnapshot = struct {
     rsp: u64,
     rbx: u64,
@@ -46,6 +53,7 @@ pub const Record = struct {
     unresolved_observed: u64 = 0,
     assertions_observed: u64 = 0,
     attempts: u8 = 1,
+    last_deferral_reason: DeferralReason = .none,
 };
 
 pub const Engine = struct {
@@ -134,6 +142,7 @@ pub const Engine = struct {
         final_abi: AbiSnapshot,
         unresolved_imports: u64,
         assertions: u64,
+        reason: DeferralReason,
     ) void {
         const record_index = self.current_record orelse return;
         const record = &self.records.items[record_index];
@@ -145,6 +154,7 @@ pub const Engine = struct {
         record.assertions_after = assertions;
         record.unresolved_observed += unresolved_imports -| record.unresolved_before;
         record.assertions_observed += assertions -| record.assertions_before;
+        record.last_deferral_reason = reason;
         self.deferred += 1;
         self.total_steps += steps;
         self.current_record = null;
@@ -215,7 +225,7 @@ pub const Engine = struct {
         for (self.records.items) |record| {
             if (record.status == .completed) continue;
             std.debug.print(
-                "  initializer [{d}/{d}] {s} status={s} attempts={d} steps={d} rsp=0x{x}/0x{x} unresolved_observed={d} assertions_observed={d} abi_mismatch=0x{x}\n",
+                "  initializer [{d}/{d}] {s} status={s} attempts={d} steps={d} rsp=0x{x}/0x{x} unresolved_observed={d} assertions_observed={d} abi_mismatch=0x{x} last_deferral={s}\n",
                 .{
                     record.index + 1,
                     self.expected_count,
@@ -228,6 +238,7 @@ pub const Engine = struct {
                     record.unresolved_observed,
                     record.assertions_observed,
                     record.abi_mismatch,
+                    @tagName(record.last_deferral_reason),
                 },
             );
         }
@@ -276,7 +287,7 @@ test "initializer engine records a clean deferred retry as recovered" {
     defer engine.deinit();
     const initial = AbiSnapshot{ .rsp = 0x2000, .rbx = 1, .rbp = 2, .r12 = 3, .r13 = 4, .r14 = 5, .r15 = 6 };
     try std.testing.expect(engine.begin(0, 0x1000, "deferred", initial, 0, 0));
-    engine.deferCurrent(7, initial, 0, 1);
+    engine.deferCurrent(7, initial, 0, 1, .assertion);
     try std.testing.expectEqual(@as(usize, 1), engine.deferred);
     try std.testing.expect(engine.retry(0, initial, 0, 1));
     engine.finish(5, initial, 0, 1);
@@ -284,4 +295,5 @@ test "initializer engine records a clean deferred retry as recovered" {
     try std.testing.expectEqual(@as(usize, 1), engine.recovered);
     try std.testing.expectEqual(Status.recovered, engine.records.items[0].status);
     try std.testing.expectEqual(@as(u64, 1), engine.records.items[0].assertions_observed);
+    try std.testing.expectEqual(DeferralReason.assertion, engine.records.items[0].last_deferral_reason);
 }

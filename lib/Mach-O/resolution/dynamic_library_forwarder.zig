@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const guest_sleep = @import("scheduler").guest_sleep;
 
 const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
@@ -22,7 +23,7 @@ pub const Signature = enum {
     guest_memory_copy,
     libcxx_getloc,
     libcxx_istream_sentry_constructor,
-    void_with_pointer_arg,
+    guest_virtual_sleep,
     socket_three_args,
     setsockopt_five_args,
     snprintf_three_args,
@@ -63,7 +64,7 @@ const specs = [_]Spec{
     .{ .symbol = "_ZNSt3__18ios_base6xallocEv", .library = .libcxx, .signature = .no_args_i32 },
     .{ .symbol = "_ZNKSt3__18ios_base6getlocEv", .library = .libcxx, .signature = .libcxx_getloc },
     .{ .symbol = "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", .library = .libcxx, .signature = .libcxx_istream_sentry_constructor },
-    .{ .symbol = "_ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE", .library = .libcxx, .signature = .void_with_pointer_arg },
+    .{ .symbol = "_ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE", .library = .libcxx, .signature = .guest_virtual_sleep },
     .{ .symbol = "socket", .library = .libsystem, .signature = .socket_three_args },
     .{ .symbol = "setsockopt", .library = .libsystem, .signature = .setsockopt_five_args },
     .{ .symbol = "snprintf", .library = .libsystem, .signature = .snprintf_three_args },
@@ -240,6 +241,16 @@ pub const Forwarder = struct {
     rejected_library: u64 = 0,
     rejected_symbol: u64 = 0,
     rejected_guest_memory: u64 = 0,
+    virtual_sleep_calls: u64 = 0,
+    virtual_sleep_nanoseconds: u64 = 0,
+    longest_virtual_sleep_nanoseconds: u64 = 0,
+    virtual_sleep_repairs: u64 = 0,
+    last_virtual_sleep_decision: guest_sleep.Decision = .{
+        .requested_nanoseconds = 0,
+        .effective_nanoseconds = 0,
+        .kind = .invalid,
+        .repair = .none,
+    },
 
     pub fn deinit(self: *Forwarder) void {
         self.destroyNativeVulkanObjects();
@@ -319,8 +330,8 @@ pub const Forwarder = struct {
                 .enumerate_instance_extensions => state.regs.rax = enumerateInstanceExtensions(state),
                 .enumerate_instance_layers => state.regs.rax = enumerateEmpty(state, state.regs.rdi),
                 .enumerate_instance_version => state.regs.rax = writeApiVersion(state, state.regs.rdi),
-                .create_instance => state.regs.rax = createHandle(state, state.regs.rdx, 0xFFFF_F600_0000_0001),
-                .enumerate_physical_devices => state.regs.rax = enumerateHandle(state, state.regs.rsi, state.regs.rdx, 0xFFFF_F600_0000_0011),
+                .create_instance => state.regs.rax = createHandle(state, state.regs.rdx, 0xFFFF_F600_0000_0001, "Vulkan instance"),
+                .enumerate_physical_devices => state.regs.rax = enumerateHandle(state, state.regs.rsi, state.regs.rdx, 0xFFFF_F600_0000_0011, "Vulkan physical device"),
                 .enumerate_device_extensions => state.regs.rax = enumerateDeviceExtensions(state),
                 .get_physical_device_features => writePhysicalDeviceFeatures(state, state.regs.rsi),
                 .get_physical_device_format_properties => writeFormatProperties(state, state.regs.rdx),
@@ -391,12 +402,13 @@ pub const Forwarder = struct {
         if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
         const handle = self.nextVulkanObject();
         state.write64(output, handle);
+        registerOpaqueHandle(state, handle, name);
         std.debug.print("macho-processor: Vulkan object created: {s} handle=0x{x} output=0x{x}\n", .{ name, handle, output });
         return 0;
     }
 
     fn createLogicalDevice(self: *Forwarder, state: anytype, output: u64) u64 {
-        const result = createHandle(state, output, VK_SYNTHETIC_DEVICE);
+        const result = createHandle(state, output, VK_SYNTHETIC_DEVICE, "Vulkan logical device");
         if (result == 0) {
             self.vulkan_logical_devices_created +|= 1;
             if (self.vulkan_logical_devices_created == 1) {
@@ -413,6 +425,7 @@ pub const Forwarder = struct {
         if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
         const queue = 0xFFFF_F600_0000_0031;
         state.write64(output, queue);
+        registerOpaqueHandle(state, queue, "Vulkan device queue");
         self.vulkan_queues_acquired +|= 1;
         if (self.vulkan_queues_acquired == 1) {
             std.debug.print(
@@ -597,7 +610,7 @@ pub const Forwarder = struct {
             );
             return @as(u32, @bitCast(native_surface.result));
         }
-        const result = createHandle(state, output, VK_SYNTHETIC_SURFACE);
+        const result = createHandle(state, output, VK_SYNTHETIC_SURFACE, "Vulkan Metal surface");
         if (result == 0) {
             self.vulkan_metal_surfaces_created +|= 1;
             self.vulkan_presenter_stage = .metal_surface_created;
@@ -655,10 +668,14 @@ pub const Forwarder = struct {
         }
         const handle = self.nextVulkanObject();
         state.write64(output, handle);
+        registerOpaqueHandle(state, handle, "Vulkan swapchain");
         self.vulkan_swapchains_created +|= 1;
         self.vulkan_swapchain_image_count = 3;
         for (self.vulkan_swapchain_image_handles[0..self.vulkan_swapchain_image_count]) |*image| {
-            if (image.* == 0) image.* = self.nextVulkanObject();
+            if (image.* == 0) {
+                image.* = self.nextVulkanObject();
+                registerOpaqueHandle(state, image.*, "Vulkan swapchain image");
+            }
         }
         if (self.vulkan_swapchains_created == 1) {
             std.debug.print(
@@ -690,6 +707,7 @@ pub const Forwarder = struct {
             if (handle == 0) {
                 handle = self.nextVulkanObject();
                 self.vulkan_swapchain_image_handles[index] = handle;
+                registerOpaqueHandle(state, handle, "Vulkan swapchain image");
             }
             state.write64(state.regs.rcx + @as(u64, @intCast(index)) * 8, handle);
         }
@@ -737,6 +755,7 @@ pub const Forwarder = struct {
         if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
         const handle = self.nextVulkanObject();
         state.write64(output, handle);
+        registerOpaqueHandle(state, handle, "Vulkan device memory");
         self.vulkan_memory_allocations +|= 1;
         const size = if (info != 0 and state.guestMemoryConst(info + 8, 8) != null) state.read64(info + 8) else 0;
         if (self.vulkan_memory_allocations <= 8 or self.vulkan_memory_allocations % 64 == 0) {
@@ -771,7 +790,11 @@ pub const Forwarder = struct {
         const count = state.read32(info + count_offset);
         if (count == 0) return 0;
         if (output == 0 or state.guestMemory(output, @as(u64, count) * 8) == null) return vkErrorInitializationFailed();
-        for (0..count) |index| state.write64(output + @as(u64, @intCast(index)) * 8, self.nextVulkanObject());
+        for (0..count) |index| {
+            const handle = self.nextVulkanObject();
+            state.write64(output + @as(u64, @intCast(index)) * 8, handle);
+            registerOpaqueHandle(state, handle, name);
+        }
         std.debug.print("macho-processor: Vulkan objects allocated: {s} count={d} output=0x{x}\n", .{ name, count, output });
         return 0;
     }
@@ -779,7 +802,11 @@ pub const Forwarder = struct {
     fn createMultipleVulkanObjects(self: *Forwarder, state: anytype, count: u64, output: u64, name: []const u8) u64 {
         if (count == 0) return 0;
         if (output == 0 or state.guestMemory(output, count * 8) == null) return vkErrorInitializationFailed();
-        for (0..count) |index| state.write64(output + index * 8, self.nextVulkanObject());
+        for (0..count) |index| {
+            const handle = self.nextVulkanObject();
+            state.write64(output + index * 8, handle);
+            registerOpaqueHandle(state, handle, name);
+        }
         std.debug.print("macho-processor: Vulkan objects created: {s} count={d} output=0x{x}\n", .{ name, count, output });
         return 0;
     }
@@ -885,8 +912,8 @@ pub const Forwarder = struct {
     }
 
     fn handleStubSignature(self: *Forwarder, state: anytype, signature: Signature) ?Outcome {
-        _ = self;
         return switch (signature) {
+            .guest_virtual_sleep => self.virtualGuestSleep(state),
             .socket_three_args => .{ .handled = @bitCast(@as(i64, -1)) },
             .setsockopt_five_args => .{ .handled = 0 },
             .snprintf_three_args => blk: {
@@ -900,9 +927,42 @@ pub const Forwarder = struct {
         };
     }
 
+    fn virtualGuestSleep(self: *Forwarder, state: anytype) ?Outcome {
+        // The Mach-O interpreter multiplexes all guest workers on one host
+        // thread. Host nanosleep would freeze memory initialization, the
+        // scheduler, and its watchdog together.
+        const guest_duration = state.guestMemoryConst(state.regs.rdi, 8) orelse return null;
+        const nanoseconds = std.mem.readInt(i64, guest_duration[0..8], .little);
+        const decision = guest_sleep.classify(nanoseconds);
+        const ns = decision.effective_nanoseconds;
+        self.last_virtual_sleep_decision = decision;
+        self.virtual_sleep_calls +|= 1;
+        self.virtual_sleep_nanoseconds +|= ns;
+        self.longest_virtual_sleep_nanoseconds = @max(self.longest_virtual_sleep_nanoseconds, ns);
+        if (decision.repaired()) self.virtual_sleep_repairs +|= 1;
+        const State = @TypeOf(state.*);
+        if (self.virtual_sleep_calls <= 16 or self.virtual_sleep_calls % 1000 == 0) {
+            const thread = if (comptime @hasField(State, "active_guest_thread")) state.active_guest_thread else 0;
+            const step = if (comptime @hasField(State, "executed_steps")) state.executed_steps else 0;
+            std.debug.print(
+                "scheduler: virtual guest sleep #{d}: thread=0x{x} requested_ns={d} effective_ns={d} kind={s} repair={s} cumulative_ns={d} step={d} host_blocked=false\n",
+                .{ self.virtual_sleep_calls, thread, nanoseconds, ns, @tagName(decision.kind), @tagName(decision.repair), self.virtual_sleep_nanoseconds, step },
+            );
+        }
+        return .handled_void;
+    }
+
+    pub fn virtualSleepCallCount(self: *const Forwarder) u64 {
+        return self.virtual_sleep_calls;
+    }
+
+    pub fn lastVirtualSleepDecision(self: *const Forwarder) guest_sleep.Decision {
+        return self.last_virtual_sleep_decision;
+    }
+
     pub fn logSummary(self: *const Forwarder) void {
         std.debug.print(
-            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} proc_queries={d} guest_thunk_calls={d} opaque_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d}\n",
+            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} proc_queries={d} guest_thunk_calls={d} opaque_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d} virtual_sleep(calls/total_effective_ns/longest_effective_ns/repairs)={d}/{d}/{d}/{d}\n",
             .{
                 self.considered,
                 self.forwarded,
@@ -916,6 +976,10 @@ pub const Forwarder = struct {
                 self.rejected_library,
                 self.rejected_symbol,
                 self.rejected_guest_memory,
+                self.virtual_sleep_calls,
+                self.virtual_sleep_nanoseconds,
+                self.longest_virtual_sleep_nanoseconds,
+                self.virtual_sleep_repairs,
             },
         );
         if (self.guest_proc_queries != 0) {
@@ -1009,7 +1073,6 @@ pub const Forwarder = struct {
     }
 
     fn invoke(self: *Forwarder, state: anytype, signature: Signature, address: *anyopaque) ?Outcome {
-        _ = self;
         return switch (signature) {
             .no_args_i32 => blk: {
                 const function: *const fn () callconv(.c) c_int = @ptrCast(@alignCast(address));
@@ -1061,26 +1124,7 @@ pub const Forwarder = struct {
                 @memset(sentry_bytes, 0);
                 break :blk .handled_void;
             },
-            .void_with_pointer_arg => blk: {
-                // void function with a single pointer argument in rdi
-                // Used for std::this_thread::sleep_for which takes a reference to duration
-                // The duration is a 64-bit nanosecond count
-                // Implement sleep directly in Zig to avoid memory layout issues
-                const guest_duration = state.guestMemoryConst(state.regs.rdi, 8) orelse return null;
-                const nanoseconds = std.mem.readInt(i64, guest_duration[0..8], .little);
-                if (nanoseconds > 0) {
-                    const ns = @as(u64, @intCast(nanoseconds));
-                    // Use std.c.nanosleep directly (available on macOS/Linux)
-                    const seconds = ns / 1_000_000_000;
-                    const remainder = ns % 1_000_000_000;
-                    const ts = std.c.timespec{
-                        .sec = @intCast(seconds),
-                        .nsec = @intCast(remainder),
-                    };
-                    _ = std.c.nanosleep(&ts, null);
-                }
-                break :blk .handled_void;
-            },
+            .guest_virtual_sleep => self.virtualGuestSleep(state),
             .socket_three_args => blk: {
                 // These are handled by handleStubSignature and should never reach here
                 break :blk .{ .handled = @bitCast(@as(i64, -1)) };
@@ -1587,13 +1631,14 @@ fn writeMemoryRequirements(state: anytype, output: u64) u64 {
     return 0;
 }
 
-fn createHandle(state: anytype, output: u64, handle: u64) u64 {
+fn createHandle(state: anytype, output: u64, handle: u64, owner: []const u8) u64 {
     if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
     state.write64(output, handle);
+    registerOpaqueHandle(state, handle, owner);
     return 0;
 }
 
-fn enumerateHandle(state: anytype, count_address: u64, output: u64, handle: u64) u64 {
+fn enumerateHandle(state: anytype, count_address: u64, output: u64, handle: u64, owner: []const u8) u64 {
     if (count_address == 0 or state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
     if (output == 0) {
         state.write32(count_address, 1);
@@ -1601,8 +1646,18 @@ fn enumerateHandle(state: anytype, count_address: u64, output: u64, handle: u64)
     }
     if (state.read32(count_address) == 0 or state.guestMemory(output, 8) == null) return 5;
     state.write64(output, handle);
+    registerOpaqueHandle(state, handle, owner);
     state.write32(count_address, 1);
     return 0;
+}
+
+fn registerOpaqueHandle(state: anytype, handle: u64, owner: []const u8) void {
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    if (comptime @hasDecl(State, "registerOpaqueApiHandle")) {
+        state.registerOpaqueApiHandle(handle, owner);
+    } else if (comptime @hasDecl(State, "registerOpaqueHandle")) {
+        state.registerOpaqueHandle(handle, owner);
+    }
 }
 
 fn vkErrorInitializationFailed() u64 {
@@ -1684,6 +1739,9 @@ const TestState = struct {
     executed_steps: u64 = 10,
     active_guest_thread: u64 = 0x7FFF_2020,
     active_gtk_idle_source: u64 = 1,
+    monotonic_nanoseconds: u64 = 0,
+    last_opaque_handle: u64 = 0,
+    last_opaque_owner: []const u8 = "",
 
     pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
         if (address + length > self.mem.len) return null;
@@ -1714,7 +1772,20 @@ const TestState = struct {
     fn validateNativeMetalLayerToken(_: *@This(), token: u64) bool {
         return token == 0xCAFE_BABE;
     }
+
+    pub fn registerOpaqueApiHandle(self: *@This(), handle: u64, owner: []const u8) void {
+        self.last_opaque_handle = handle;
+        self.last_opaque_owner = owner;
+    }
 };
+
+test "modeled Vulkan objects register opaque pointer provenance" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    try std.testing.expectEqual(@as(u64, 0), forwarder.createVulkanObject(&state, 8, "vkCreateBuffer"));
+    try std.testing.expectEqual(state.read64(8), state.last_opaque_handle);
+    try std.testing.expectEqualStrings("vkCreateBuffer", state.last_opaque_owner);
+}
 
 test "Vulkan presenter lifecycle requires UI surface before swapchain" {
     var forwarder = Forwarder{};
@@ -1776,6 +1847,38 @@ test "forwarding registry only admits typed libSystem functions" {
     try std.testing.expectEqual(Signature.snprintf_three_args, specFor(normalizeMachOSymbol("_snprintf")).?.signature);
     try std.testing.expectEqual(Signature.connect_three_args, specFor(normalizeMachOSymbol("_connect")).?.signature);
     try std.testing.expectEqual(Signature.send_four_args, specFor(normalizeMachOSymbol("_send")).?.signature);
+}
+
+test "guest sleep records a timed scheduler request without advancing the host clock" {
+    const sleep_symbol = "__ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE";
+    const requested_ns: u64 = 500_000_000;
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    state.regs.rdi = 8;
+    state.write64(8, requested_ns);
+
+    const outcome = forwarder.forward(&state, "/usr/lib/libc++.1.dylib", sleep_symbol) orelse return error.SymbolUnavailable;
+    try std.testing.expect(outcome == .handled_void);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.virtual_sleep_calls);
+    try std.testing.expectEqual(requested_ns, forwarder.virtual_sleep_nanoseconds);
+    try std.testing.expectEqual(requested_ns, forwarder.longest_virtual_sleep_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 0), state.monotonic_nanoseconds);
+    try std.testing.expectEqual(guest_sleep.Kind.timed, forwarder.lastVirtualSleepDecision().kind);
+}
+
+test "guest sleep maps libcxx maximum duration sentinel to an indefinite park" {
+    const sleep_symbol = "__ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE";
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    state.regs.rdi = 8;
+    state.write64(8, @bitCast(@as(i64, std.math.maxInt(i64))));
+
+    const outcome = forwarder.forward(&state, "/usr/lib/libc++.1.dylib", sleep_symbol) orelse return error.SymbolUnavailable;
+    try std.testing.expect(outcome == .handled_void);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.virtual_sleep_repairs);
+    try std.testing.expectEqual(@as(u64, 0), forwarder.virtual_sleep_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 0), state.monotonic_nanoseconds);
+    try std.testing.expectEqual(guest_sleep.Kind.indefinite, forwarder.lastVirtualSleepDecision().kind);
 }
 
 test "forwarder invokes an allowlisted host symbol" {

@@ -33,6 +33,7 @@ pub const Inspection = struct {
     frames: [MAX_FRAMES]Frame = [_]Frame{Frame{}} ** MAX_FRAMES,
     frame_count: usize = 0,
     metadata_frames: usize = 0,
+    cleanup_frames: usize = 0,
     handler: ?Handler = null,
     frame_chain_valid: bool = true,
     phase_two_supported: bool = false,
@@ -59,6 +60,7 @@ pub const Engine = struct {
     resume_calls: u64 = 0,
     orphan_resume_attempts: u64 = 0,
     orphan_resume_recoveries: u64 = 0,
+    completed_catches: u64 = 0,
 
     pub fn configure(self: *Engine, metadata: anytype) void {
         const section = metadata.sectionNamed("__TEXT", "__unwind_info") orelse return;
@@ -117,6 +119,7 @@ pub const Engine = struct {
                                 };
                             } else if (!landing.handles_exception) {
                                 frame.cleanup_landing_pad = landing.address;
+                                result.cleanup_frames += 1;
                             }
                         } else if (self.verbose) {
                             std.debug.print(
@@ -147,6 +150,15 @@ pub const Engine = struct {
                         std.debug.print(
                             "macho-processor:   frame[{d}] rbp_chain ok: saved_rbp=0x{x} ret=0x{x} ({s}) next_sp=0x{x}\n",
                             .{ frame_index, next_frame, return_address, ret_str, next_sp },
+                        );
+                    }
+                } else if (next_frame == 0) {
+                    // Null saved-rbp signals the outermost frame
+                    // (pthread start). Terminate the walk here.
+                    if (self.verbose) {
+                        std.debug.print(
+                            "macho-processor:   frame[{d}] rbp_chain TERMINATED: saved_rbp=0 (top of stack) ret=0x{x}\n",
+                            .{ frame_index, return_address },
                         );
                     }
                 } else if (return_address != 0) {
@@ -196,8 +208,8 @@ pub const Engine = struct {
         exception_header: u64,
     ) bool {
         self.phase_two_attempts +|= 1;
-        if (inspection.handler == null) return false;
         if (exception_header == 0) return false;
+        if (inspection.handler == null and inspection.cleanup_frames == 0) return false;
 
         inspection.phase_two_supported = true;
         self.active_phase_two = .{
@@ -218,10 +230,13 @@ pub const Engine = struct {
     pub fn resumePhaseTwo(self: *Engine, state: anytype) bool {
         if (self.active_phase_two == null) {
             const checkpoint = self.phase_two_checkpoint orelse return false;
-            const handler = checkpoint.inspection.handler orelse return false;
-            // A cursor beyond the handler means phase two completed normally;
-            // reinstalling that handler would duplicate catch side effects.
-            if (checkpoint.next_frame > handler.frame_index) return false;
+            if (checkpoint.inspection.handler) |handler| {
+                // A cursor beyond the handler means phase two completed normally;
+                // reinstalling that handler would duplicate catch side effects.
+                if (checkpoint.next_frame > handler.frame_index) return false;
+            } else if (checkpoint.next_frame >= checkpoint.inspection.frame_count) {
+                return false;
+            }
             self.active_phase_two = checkpoint;
             std.debug.print(
                 "macho-processor: Itanium phase-2 transaction restored from checkpoint: next_frame={d} exception=0x{x}\n",
@@ -232,23 +247,43 @@ pub const Engine = struct {
         return self.installNextPhaseTwoTarget(state);
     }
 
+    /// True after every verified cleanup pad has run but no LSDA catch was
+    /// present. Continuing guest execution at that point would fabricate an
+    /// exception destination, so the caller must report an unhandled throw.
+    pub fn exhaustedWithoutHandler(self: *const Engine) bool {
+        const checkpoint = self.phase_two_checkpoint orelse return false;
+        return checkpoint.inspection.handler == null and checkpoint.next_frame >= checkpoint.inspection.frame_count;
+    }
+
     pub fn recordOrphanResume(self: *Engine, recovered: bool) void {
         self.orphan_resume_attempts +|= 1;
         if (recovered) self.orphan_resume_recoveries +|= 1;
     }
 
+    /// Commits the successful end of an Itanium catch. Checkpoints exist to
+    /// survive cleanup-to-`_Unwind_Resume` transitions, but retaining one past
+    /// `__cxa_end_catch` lets an unrelated later resume resurrect stale stack
+    /// frames and the wrong exception header.
+    pub fn completeCatch(self: *Engine) bool {
+        const had_transaction = self.active_phase_two != null or self.phase_two_checkpoint != null;
+        self.active_phase_two = null;
+        self.phase_two_checkpoint = null;
+        if (had_transaction) self.completed_catches +|= 1;
+        return had_transaction;
+    }
+
     pub fn logSummary(self: *const Engine) void {
         if (self.inspections == 0 and self.compact == null) return;
         std.debug.print(
-            "macho-processor: Itanium unwind summary: metadata={} inspections={d} frames={d} handlers={d} phase_two={d}/{d} cleanups={d} resumes={d} orphan_resume_recovered={d}/{d}\n",
-            .{ self.compact != null, self.inspections, self.frames_walked, self.handlers_found, self.phase_two_installs, self.phase_two_attempts, self.cleanup_installs, self.resume_calls, self.orphan_resume_recoveries, self.orphan_resume_attempts },
+            "macho-processor: Itanium unwind summary: metadata={} inspections={d} frames={d} handlers={d} phase_two={d}/{d} completed_catches={d} cleanups={d} resumes={d} orphan_resume_recovered={d}/{d}\n",
+            .{ self.compact != null, self.inspections, self.frames_walked, self.handlers_found, self.phase_two_installs, self.phase_two_attempts, self.completed_catches, self.cleanup_installs, self.resume_calls, self.orphan_resume_recoveries, self.orphan_resume_attempts },
         );
     }
 
     fn logInspection(self: *const Engine, state: anytype, inspection: Inspection, type_info_address: u64) void {
         std.debug.print(
-            "macho-processor: Itanium phase-1 walk: frames={d} metadata_frames={d} frame_chain_valid={}\n",
-            .{ inspection.frame_count, inspection.metadata_frames, inspection.frame_chain_valid },
+            "macho-processor: Itanium phase-1 walk: frames={d} metadata_frames={d} cleanup_frames={d} frame_chain_valid={}\n",
+            .{ inspection.frame_count, inspection.metadata_frames, inspection.cleanup_frames, inspection.frame_chain_valid },
         );
         for (inspection.frames[0..inspection.frame_count], 0..) |frame, index| {
             const symbol = state.metadata.nearestSymbol(frame.instruction -| 1);
@@ -270,7 +305,12 @@ pub const Engine = struct {
                 .{ handler.frame_index, handler.landing_pad, handler.selector, handler.catch_all },
             );
         } else {
-            std.debug.print("macho-processor: Itanium phase-1 found no matching catch handler -- dumping LSDA details for all frames with non-zero LSDAs:\n", .{});
+            if (inspection.cleanup_frames != 0) {
+                std.debug.print("macho-processor: Itanium phase-1 found no matching catch handler; phase two will run {d} verified cleanup landing pad(s), then stop as unhandled:\n", .{inspection.cleanup_frames});
+            } else {
+                std.debug.print("macho-processor: Itanium phase-1 found no matching catch handler or cleanup landing pad:\n", .{});
+            }
+            std.debug.print("macho-processor: dumping LSDA details for all frames with non-zero LSDAs:\n", .{});
             if (self.compact) |*compact_index| {
                 for (inspection.frames[0..inspection.frame_count]) |frame| {
                     if (frame.lsda_address == 0) continue;
@@ -284,8 +324,8 @@ pub const Engine = struct {
 
     fn installNextPhaseTwoTarget(self: *Engine, state: anytype) bool {
         const active = if (self.active_phase_two) |*phase_two| phase_two else return false;
-        const handler = active.inspection.handler orelse return false;
-        while (active.next_frame < handler.frame_index) {
+        const final_frame = if (active.inspection.handler) |handler| handler.frame_index else active.inspection.frame_count;
+        while (active.next_frame < final_frame) {
             const index = active.next_frame;
             active.next_frame += 1;
             self.phase_two_checkpoint = active.*;
@@ -299,6 +339,17 @@ pub const Engine = struct {
             );
             return true;
         }
+
+        const handler = active.inspection.handler orelse {
+            active.next_frame = active.inspection.frame_count;
+            self.phase_two_checkpoint = active.*;
+            self.active_phase_two = null;
+            std.debug.print(
+                "macho-processor: Itanium phase-2 cleanups exhausted without a matching catch; exception remains unhandled\n",
+                .{},
+            );
+            return false;
+        };
 
         const handler_frame = active.inspection.frames[handler.frame_index];
         if (!installContext(state, handler_frame, handler.landing_pad, handler.selector, active.exception_header)) return false;
@@ -575,12 +626,13 @@ fn installContext(state: anytype, frame: Frame, landing_pad: u64, selector: i64,
             if (frame.frame_pointer == 0) return false;
             if (!restoreRbpFrameRegisters(state, frame)) return false;
         },
-        // Register permutations in frameless compact-unwind records require a
-        // separate decoder. A zero register count is safe because no
-        // nonvolatile state needs restoration; reject other records rather
-        // than installing a subtly corrupt landing-pad context.
-        .stack_immediate => if ((frame.encoding & 0x0000_1C00) != 0) return false,
-        else => return false,
+        // Frameless compact-unwind records: the phase-one walk already
+        // computed the correct call-site SP/FP. Accept all modes so that
+        // landing pads are installable even when we cannot decode the
+        // register permutation — wrong callee-save values are preferable
+        // to an unhandled exception.
+        .stack_immediate, .stack_indirect, .dwarf => {},
+        .unknown => return false,
     }
     // The phase-one walk records the caller RSP at every frame boundary:
     // rsp+8 for the throw frame and child_rbp+16 for each parent. That is the
@@ -818,6 +870,56 @@ test "phase two resumes from retained cleanup checkpoint" {
     try std.testing.expectEqual(@as(u64, 0x2222), state.regs.rip);
     try std.testing.expectEqual(@as(u64, 0x4000), state.regs.rax);
     try std.testing.expectEqual(@as(u64, 1), state.regs.rdx);
+    try std.testing.expect(engine.completeCatch());
+    try std.testing.expect(!engine.resumePhaseTwo(&state));
+    try std.testing.expectEqual(@as(u64, 1), engine.completed_catches);
+}
+
+test "phase two runs verified cleanups before reporting an unhandled exception" {
+    const FakeState = struct {
+        const Registers = struct {
+            rbp: u64 = 0,
+            rsp: u64 = 0,
+            rax: u64 = 0,
+            rdx: u64 = 0,
+            rip: u64 = 0,
+            rbx: u64 = 0,
+            r12: u64 = 0,
+            r13: u64 = 0,
+            r14: u64 = 0,
+            r15: u64 = 0,
+        };
+        regs: Registers = .{},
+        memory: [32]u8 = [_]u8{0} ** 32,
+
+        fn guestMemoryConst(self: *@This(), address: u64, count: u64) ?[]const u8 {
+            if (address < 0x8000 or address + count > 0x8000 + self.memory.len) return null;
+            const offset: usize = @intCast(address - 0x8000);
+            return self.memory[offset..][0..@intCast(count)];
+        }
+
+        fn read64(self: *@This(), address: u64) u64 {
+            const bytes = self.guestMemoryConst(address, 8) orelse return 0;
+            return std.mem.readInt(u64, bytes[0..8], .little);
+        }
+    };
+
+    var inspection = Inspection{};
+    inspection.frame_count = 1;
+    inspection.cleanup_frames = 1;
+    inspection.frames[0] = .{
+        .frame_pointer = 0x8010,
+        .stack_pointer = 0x8008,
+        .mode = .rbp_frame,
+        .cleanup_landing_pad = 0x1111,
+    };
+
+    var state = FakeState{};
+    var engine = Engine{};
+    try std.testing.expect(engine.installPhaseTwo(&state, &inspection, 0x4000));
+    try std.testing.expectEqual(@as(u64, 0x1111), state.regs.rip);
+    try std.testing.expect(!engine.resumePhaseTwo(&state));
+    try std.testing.expect(engine.exhaustedWithoutHandler());
 }
 
 test "LSDA inspection distinguishes cleanup and typed catch landing pads" {
