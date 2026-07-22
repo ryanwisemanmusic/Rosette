@@ -64,6 +64,7 @@ pub const TerminalRegs = struct {
 };
 
 pub const TraceEntry = struct {
+    thread_handle: u64 = 0,
     rip: u64 = 0,
     op: []const u8 = "",
     len: u64 = 0,
@@ -208,6 +209,9 @@ pub const CxxExceptionReport = struct {
     phase_two_supported: bool = false,
     phase_two_installed: bool = false,
     cleanups_exhausted_without_handler: bool = false,
+    catch_completed: bool = false,
+    active_catches: usize = 0,
+    classification: []const u8 = "",
 };
 
 pub const ExitReport = struct {
@@ -329,7 +333,18 @@ pub fn logExitReport(report: ExitReport) void {
     }
 
     if (report.cxx_exception) |exception| {
-        std.debug.print("  \x1b[33mC++ exception:\x1b[0m\n", .{});
+        std.debug.print(
+            "  \x1b[33mC++ exception{s}:\x1b[0m\n",
+            .{if (exception.catch_completed) " history (caught/resolved)" else ""},
+        );
+        std.debug.print(
+            "    status={s} active_catches={d} classification={s}\n",
+            .{
+                if (exception.catch_completed) "caught" else "unresolved",
+                exception.active_catches,
+                if (exception.classification.len != 0) exception.classification else "general_cxx_exception",
+            },
+        );
         std.debug.print("    object=0x{x} allocation_matched={} allocation_size={d}\n", .{
             exception.object_address,
             exception.allocation_matched,
@@ -439,8 +454,9 @@ pub fn logExitReport(report: ExitReport) void {
     if (trace.len > 0) {
         std.debug.print("  \x1b[33mlast {d} instructions (oldest first):\x1b[0m\n", .{trace.len});
         for (trace, 0..) |entry, i| {
-            std.debug.print("    [{d:>3}] rip=0x{x:<16} op={s:<20} rsp=0x{x} rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} rbp=0x{x}\n", .{
+            std.debug.print("    [{d:>3}] thread=0x{x} rip=0x{x:<16} op={s:<20} rsp=0x{x} rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} rbp=0x{x}\n", .{
                 i,
+                entry.thread_handle,
                 entry.rip,
                 entry.op,
                 entry.rsp,
