@@ -1,6 +1,7 @@
 const std = @import("std");
 const cpu_state = @import("cpu_state.zig");
 const flags = @import("flags.zig");
+const bit_test = @import("bit_test.zig");
 const isa_registry = @import("isa_registry");
 const runtime_abi = @import("runtime_abi_handshake");
 pub const highway = @import("isa_highway");
@@ -28,9 +29,13 @@ pub const MemoryReferenceKind = enum {
 };
 
 pub const RFL_CF = flags.RFL_CF;
+pub const RFL_PF = flags.RFL_PF;
+pub const RFL_AF = flags.RFL_AF;
 pub const RFL_ZF = flags.RFL_ZF;
 pub const RFL_SF = flags.RFL_SF;
 pub const RFL_OF = flags.RFL_OF;
+pub const bitTestAndResetRegister = bit_test.resetRegister;
+pub const bitTestMemoryOperand = bit_test.memoryOperand;
 
 /// Prefix state shared by every legacy x86-64 instruction family. Keeping
 /// this in the decoder prevents each opcode handler from growing its own
@@ -273,6 +278,27 @@ pub const BitScanResult = struct {
     zero_flag: bool,
     carry_flag: ?bool,
 };
+
+pub const PopulationCountResult = struct {
+    value: u64,
+    rflags: u32,
+};
+
+/// Implements scalar POPCNT independently of a particular loader. Intel
+/// defines OF, SF, AF, CF and PF as cleared, with ZF set only for a zero source.
+pub fn populationCount(size: OperandSize, raw_source: u64, initial_rflags: u32) PopulationCountResult {
+    const mask: u64 = switch (size) {
+        .bits8 => 0xFF,
+        .bits16 => 0xFFFF,
+        .bits32 => 0xFFFF_FFFF,
+        .bits64 => 0xFFFF_FFFF_FFFF_FFFF,
+    };
+    const source = raw_source & mask;
+    const status_mask = flags.RFL_CF | flags.RFL_PF | flags.RFL_AF | flags.RFL_ZF | flags.RFL_SF | flags.RFL_OF;
+    var rflags = initial_rflags & ~status_mask;
+    if (source == 0) rflags |= flags.RFL_ZF;
+    return .{ .value = @popCount(source), .rflags = rflags };
+}
 
 pub fn bitScan(size: OperandSize, kind: BitScanKind, raw_source: u64) BitScanResult {
     const width: u7 = switch (size) {
@@ -548,6 +574,8 @@ pub const Op = enum(u16) {
     tzcnt_reg_mem,
     lzcnt_reg_reg,
     lzcnt_reg_mem,
+    popcnt_reg_reg,
+    popcnt_reg_mem,
     bswap_reg,
     crc32_reg_reg,
     crc32_reg_mem,
@@ -696,10 +724,16 @@ pub const Op = enum(u16) {
     cmovcc_reg_mem,
     setcc_reg8,
     setcc_mem8,
+    cmpxchg_mem8_reg8,
+    cmpxchg_mem16_reg16,
     cmpxchg_mem32_reg32,
     cmpxchg_mem64_reg64,
+    cmpxchg_reg8_reg8,
+    cmpxchg_reg16_reg16,
     cmpxchg_reg32_reg32,
     cmpxchg_reg64_reg64,
+    cmpxchg8b_mem,
+    cmpxchg16b_mem,
     xchg_mem32_reg32,
     xchg_mem64_reg64,
     xchg_reg32_reg32,
@@ -831,6 +865,9 @@ pub const Op = enum(u16) {
     vpxor,
     vpunpckldq,
     vpermilpd,
+    // bit test and reset
+    btr_reg_reg,
+    btr_mem_reg,
     // conditional / unconditional jumps
     jmp_rel8,
     jcc_rel8,
@@ -940,6 +977,7 @@ pub const DecodedInsn = struct {
     xmm_src: u8 = 0,
     xmm_src2: u8 = 0,
     vector_256: bool = false,
+    lock: bool = false,
 };
 
 pub fn registerOperandValue(regs: *const Regs, operand: RegisterOperand, size: OperandSize) u64 {
@@ -1039,6 +1077,7 @@ pub fn decodeLegacyMov(bytes: []const u8, pos: *usize, prefixes: LegacyPrefixes,
                 .size = size,
                 .len = @intCast(pos.*),
                 .has_0x67 = prefixes.address_size_override,
+                .lock = prefixes.lock,
             };
             switch (operands.rm) {
                 .register => |rm_reg| {
@@ -1078,6 +1117,7 @@ pub fn decodeLegacyMov(bytes: []const u8, pos: *usize, prefixes: LegacyPrefixes,
                 .addr = address,
                 .len = @intCast(pos.*),
                 .has_0x67 = prefixes.address_size_override,
+                .lock = prefixes.lock,
             };
         },
         0xB0...0xB7 => {
@@ -1091,6 +1131,7 @@ pub fn decodeLegacyMov(bytes: []const u8, pos: *usize, prefixes: LegacyPrefixes,
                 .imm = immediate,
                 .len = @intCast(pos.*),
                 .has_0x67 = prefixes.address_size_override,
+                .lock = prefixes.lock,
             };
         },
         0xB8...0xBF => {
@@ -1110,6 +1151,7 @@ pub fn decodeLegacyMov(bytes: []const u8, pos: *usize, prefixes: LegacyPrefixes,
                 .imm = immediate,
                 .len = @intCast(pos.*),
                 .has_0x67 = prefixes.address_size_override,
+                .lock = prefixes.lock,
             };
         },
         0xC6, 0xC7 => {
@@ -1128,6 +1170,7 @@ pub fn decodeLegacyMov(bytes: []const u8, pos: *usize, prefixes: LegacyPrefixes,
                 .imm = immediate,
                 .len = @intCast(pos.*),
                 .has_0x67 = prefixes.address_size_override,
+                .lock = prefixes.lock,
             };
             switch (operands.rm) {
                 .register => |register| {
@@ -1171,6 +1214,9 @@ test "shared legacy prefix decoder normalizes prefix classes" {
     try std.testing.expect(prefixes.rexW());
     try std.testing.expect(prefixes.rexR());
     try std.testing.expect(prefixes.rexB());
+    // Verify LOCK prefix propagates to DecodedInsn
+    const mov = decodeMovForTest(&[_]u8{ 0xF0, 0x89, 0xC8 }).?;
+    try std.testing.expect(mov.lock);
 }
 
 test "shared MOV decoder covers width direction and extended registers" {

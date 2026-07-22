@@ -60,8 +60,8 @@ pub fn applySub(rflags: *u32, a: u64, b: u64, result: u64, size: OperandSize) vo
 
     setOrClear(rflags, RFL_CF, a_masked < b_masked);
     setOrClear(rflags, RFL_OF, ((a_masked ^ b_masked) & (a_masked ^ r) & sign) != 0);
-    setOrClear(rflags, RFL_SF, (r & sign) != 0);
-    setOrClear(rflags, RFL_ZF, r == 0);
+    setSizeParityFlags(rflags, r, sign);
+    setOrClear(rflags, RFL_AF, ((a_masked ^ b_masked ^ r) & 0x10) != 0);
 }
 
 pub fn applySbb(rflags: *u32, a: u64, b: u64, carry: bool, result: u64, size: OperandSize) void {
@@ -74,8 +74,9 @@ pub fn applySbb(rflags: *u32, a: u64, b: u64, carry: bool, result: u64, size: Op
 
     setOrClear(rflags, RFL_CF, @as(u128, a_masked) < subtrahend);
     setOrClear(rflags, RFL_OF, ((a_masked ^ b_masked) & (a_masked ^ r) & sign) != 0);
-    setOrClear(rflags, RFL_SF, (r & sign) != 0);
-    setOrClear(rflags, RFL_ZF, r == 0);
+    setSizeParityFlags(rflags, r, sign);
+    const effective_b: u64 = @truncate(subtrahend & mask);
+    setOrClear(rflags, RFL_AF, ((a_masked ^ effective_b ^ r) & 0x10) != 0);
 }
 
 pub fn applyAdd(rflags: *u32, a: u64, b: u64, result: u64, size: OperandSize) void {
@@ -87,8 +88,8 @@ pub fn applyAdd(rflags: *u32, a: u64, b: u64, result: u64, size: OperandSize) vo
 
     setOrClear(rflags, RFL_CF, @as(u128, a_masked) + @as(u128, b_masked) > @as(u128, mask));
     setOrClear(rflags, RFL_OF, ((~(a_masked ^ b_masked)) & (a_masked ^ r) & sign) != 0);
-    setOrClear(rflags, RFL_SF, (r & sign) != 0);
-    setOrClear(rflags, RFL_ZF, r == 0);
+    setSizeParityFlags(rflags, r, sign);
+    setOrClear(rflags, RFL_AF, ((a_masked ^ b_masked ^ r) & 0x10) != 0);
 }
 
 pub fn applyIncDec(rflags: *u32, input: u64, result: u64, size: OperandSize, is_inc: bool) void {
@@ -102,8 +103,8 @@ pub fn applyIncDec(rflags: *u32, input: u64, result: u64, size: OperandSize, is_
         input_masked == sign;
 
     setOrClear(rflags, RFL_OF, overflow);
-    setOrClear(rflags, RFL_SF, (r & sign) != 0);
-    setOrClear(rflags, RFL_ZF, r == 0);
+    setSizeParityFlags(rflags, r, sign);
+    setOrClear(rflags, RFL_AF, if (is_inc) (input_masked & 0xF) == 0xF else (input_masked & 0xF) == 0);
 }
 
 pub fn applyLogic(rflags: *u32, result: u64, size: OperandSize) void {
@@ -113,8 +114,7 @@ pub fn applyLogic(rflags: *u32, result: u64, size: OperandSize) void {
 
     setOrClear(rflags, RFL_CF, false);
     setOrClear(rflags, RFL_OF, false);
-    setOrClear(rflags, RFL_SF, (r & sign) != 0);
-    setOrClear(rflags, RFL_ZF, r == 0);
+    setSizeParityFlags(rflags, r, sign);
 }
 
 pub fn evalCond(rflags: u32, cond: Condition) bool {
@@ -122,6 +122,7 @@ pub fn evalCond(rflags: u32, cond: Condition) bool {
     const zf = (rflags & RFL_ZF) != 0;
     const of = (rflags & RFL_OF) != 0;
     const cf = (rflags & RFL_CF) != 0;
+    const pf = (rflags & RFL_PF) != 0;
     return switch (cond) {
         .o => of,
         .no => !of,
@@ -133,13 +134,19 @@ pub fn evalCond(rflags: u32, cond: Condition) bool {
         .a => !cf and !zf,
         .s => sf,
         .ns => !sf,
-        .p => false,
-        .np => true,
+        .p => pf,
+        .np => !pf,
         .l => sf != of,
         .ge => sf == of,
         .le => zf or (sf != of),
         .g => !zf and (sf == of),
     };
+}
+
+fn setSizeParityFlags(rflags: *u32, result: u64, sign: u64) void {
+    setOrClear(rflags, RFL_SF, (result & sign) != 0);
+    setOrClear(rflags, RFL_ZF, result == 0);
+    setOrClear(rflags, RFL_PF, @popCount(@as(u8, @truncate(result))) % 2 == 0);
 }
 
 fn setOrClear(rflags: *u32, bit: u32, enabled: bool) void {
@@ -167,4 +174,15 @@ test "SBB preserves a borrow when source plus carry crosses the operand width" {
     try std.testing.expectEqual(@as(u8, 0), result);
     try std.testing.expect((rflags & RFL_CF) != 0);
     try std.testing.expect((rflags & RFL_ZF) != 0);
+}
+
+test "parity conditions follow the low result byte" {
+    var rflags: u32 = 0x0002;
+    applyLogic(&rflags, 0b11, .bits8);
+    try std.testing.expect(evalCond(rflags, .p));
+    try std.testing.expect(!evalCond(rflags, .np));
+
+    applyLogic(&rflags, 0b1, .bits8);
+    try std.testing.expect(!evalCond(rflags, .p));
+    try std.testing.expect(evalCond(rflags, .np));
 }

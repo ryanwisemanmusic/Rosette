@@ -1,0 +1,82 @@
+const std = @import("std");
+const flags = @import("flags.zig");
+
+pub const OperandSize = flags.OperandSize;
+
+pub const RegisterResult = struct {
+    value: u64,
+    carry: bool,
+    bit_index: u6,
+};
+
+pub const MemoryOperand = struct {
+    address: u64,
+    bit_index: u6,
+};
+
+pub fn operandBitWidth(size: OperandSize) u7 {
+    return switch (size) {
+        .bits8 => 8,
+        .bits16 => 16,
+        .bits32 => 32,
+        .bits64 => 64,
+    };
+}
+
+/// Implements the architectural register form of BTR. The source index is
+/// reduced modulo the *bit width* of the destination, not the ordinal of the
+/// OperandSize enum.
+pub fn resetRegister(size: OperandSize, value: u64, raw_index: u64) RegisterResult {
+    const width = operandBitWidth(size);
+    const bit_index: u6 = @intCast(raw_index & (width - 1));
+    const mask = @as(u64, 1) << bit_index;
+    return .{
+        .value = value & ~mask,
+        .carry = value & mask != 0,
+        .bit_index = bit_index,
+    };
+}
+
+/// Resolves the architectural memory form of BTR. Unlike the register form,
+/// high source-index bits select a preceding or following storage element.
+pub fn memoryOperand(size: OperandSize, base_address: u64, raw_index: u64) ?MemoryOperand {
+    if (size == .bits8) return null;
+    const width: i64 = operandBitWidth(size);
+    const byte_width = @divExact(width, 8);
+    const signed_index: i64 = switch (size) {
+        .bits16 => @as(i16, @bitCast(@as(u16, @truncate(raw_index)))),
+        .bits32 => @as(i32, @bitCast(@as(u32, @truncate(raw_index)))),
+        .bits64 => @bitCast(raw_index),
+        .bits8 => unreachable,
+    };
+    const element_offset = @divFloor(signed_index, width);
+    return .{
+        .address = base_address +% @as(u64, @bitCast(element_offset * byte_width)),
+        .bit_index = @intCast(@mod(signed_index, width)),
+    };
+}
+
+test "BTR register form clears every bit in the architectural width" {
+    const bit_two = resetRegister(.bits32, 0b100, 2);
+    try std.testing.expectEqual(@as(u64, 0), bit_two.value);
+    try std.testing.expect(bit_two.carry);
+    try std.testing.expectEqual(@as(u6, 2), bit_two.bit_index);
+
+    const bit_thirty_one = resetRegister(.bits32, 0x8000_0000, 31);
+    try std.testing.expectEqual(@as(u64, 0), bit_thirty_one.value);
+    try std.testing.expect(bit_thirty_one.carry);
+
+    const wrapped = resetRegister(.bits32, 0b10, 33);
+    try std.testing.expectEqual(@as(u6, 1), wrapped.bit_index);
+    try std.testing.expectEqual(@as(u64, 0), wrapped.value);
+}
+
+test "BTR memory form carries source-index high bits into the address" {
+    const following = memoryOperand(.bits32, 0x1000, 35).?;
+    try std.testing.expectEqual(@as(u64, 0x1004), following.address);
+    try std.testing.expectEqual(@as(u6, 3), following.bit_index);
+
+    const preceding = memoryOperand(.bits32, 0x1000, @bitCast(@as(i64, -1))).?;
+    try std.testing.expectEqual(@as(u64, 0x0ffc), preceding.address);
+    try std.testing.expectEqual(@as(u6, 31), preceding.bit_index);
+}
