@@ -1,4 +1,20 @@
 ROOT_DIR := $(CURDIR)
+
+# Detect invocation directory to support both
+#   cd build && make  (from build/ dir) and
+#   make              (from repo root)
+# NB: $(abspath) splits on spaces, so we use suffix substitution instead.
+ifneq ($(wildcard build.zig),)
+# CWD is the build/ directory: strip final /build, no BP prefix needed
+ROOT_DIR := $(ROOT_DIR:/build=)
+BP :=
+APP_BP := ../
+else
+# CWD is the repo root: BP prefix needed for build/ paths
+BP := build/
+APP_BP :=
+endif
+
 INCLUDE_DIR := $(ROOT_DIR)/include
 SHIM_DIR := $(INCLUDE_DIR)/shims/win32
 MACOS_SHIM_DIR := $(INCLUDE_DIR)/shims/macos
@@ -12,28 +28,31 @@ CC ?= clang
 CXX ?= clang++
 CFLAGS ?= -Wall -Wextra -Wno-ignored-attributes
 ZIG_VERSION ?= 0.16.0
-ZIG_CACHE_DIR ?= build/.zig-cache
-ZIG_GLOBAL_CACHE_DIR ?= build/.zig-cache/global
+ZIG_CACHE_DIR := $(ROOT_DIR)/build/.zig-cache
+ZIG_GLOBAL_CACHE_DIR := $(ZIG_CACHE_DIR)/global
+ZIG_OUT_DIR := $(ROOT_DIR)/zig-out
 ZIG_BUILD_ENV := ZIG_LOCAL_CACHE_DIR=$(ZIG_CACHE_DIR) ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR)
 # Always use release fast since running with safety on means ~180k instructions per second
 # Safety on is only useful if you want run time to take 5x times longer
 ROSETTE_RUNTIME_OPTIMIZE ?= ReleaseFast
-ZIG_LIB := zig-out/lib/librosette_zig.a
-EXE_RUNNER_BIN := zig-out/bin/rosette_exe_runner
-ASSEMBLER_RUNNER_BIN := zig-out/bin/rosette_assembler_runner
-APP_EXE_BUILDER_SRC := src/tooling/exe_parser/rosette_app_exe.zig
-APP_EXE_BUILDER_BIN := zig-out/bin/rosette_app_exe
-ELF_PROCESSOR_BIN := zig-out/bin/elf_processor
-ELF_PROCESSOR_SRC := lib/processor/ELF_processor/main.zig
-MACHO_PROCESSOR_BIN := zig-out/bin/macho_processor
-MACHO_PROCESSOR_SRC := lib/Mach-O/main.zig
-MACHO_NATIVE_WINDOW_OBJ := build/macho_native_window_bridge.o
-DYLD_DYLIB := zig-out/lib/rosette-exec.dylib
-SHELL_HELPER_SRC := src/shell/global_config/rosette_shell.zig
-SHELL_HELPER_BIN := zig-out/bin/rosette-shell
-COMPAT_ROUTER_SRC := src/compat/rosetta2/main.zig
-COMPAT_ROUTER_BIN := zig-out/bin/rosette-router
-C_FIX_BIN := zig-out/bin/rosette-c-fix
+ZIG_LIB := $(ZIG_OUT_DIR)/lib/librosette_zig.a
+EXE_RUNNER_BIN := $(ZIG_OUT_DIR)/bin/rosette_exe_runner
+ASSEMBLER_RUNNER_BIN := $(ZIG_OUT_DIR)/bin/rosette_assembler_runner
+APP_EXE_BUILDER_SRC := $(ROOT_DIR)/src/tooling/exe_parser/rosette_app_exe.zig
+APP_EXE_BUILDER_BIN := $(ZIG_OUT_DIR)/bin/rosette_app_exe
+ELF_PROCESSOR_BIN := $(ZIG_OUT_DIR)/bin/elf_processor
+ELF_PROCESSOR_SRC := $(ROOT_DIR)/lib/processor/ELF_processor/main.zig
+MACHO_PROCESSOR_BIN := $(ZIG_OUT_DIR)/bin/macho_processor
+MACHO_PROCESSOR_SRC := $(ROOT_DIR)/lib/Mach-O/main.zig
+MACHO_NATIVE_WINDOW_OBJ := $(ROOT_DIR)/$(BP)macho_native_window_bridge.o
+DYLD_DYLIB := $(ZIG_OUT_DIR)/lib/rosette-exec.dylib
+SHELL_HELPER_SRC := $(ROOT_DIR)/src/shell/global_config/rosette_shell.zig
+SHELL_HELPER_BIN := $(ZIG_OUT_DIR)/bin/rosette-shell
+COMPAT_ROUTER_SRC := $(ROOT_DIR)/src/compat/rosetta2/main.zig
+COMPAT_ROUTER_BIN := $(ZIG_OUT_DIR)/bin/rosette-router
+C_FIX_BIN := $(ZIG_OUT_DIR)/bin/rosette-c-fix
+
+AVX_SHIM_DYLIB := $(ZIG_OUT_DIR)/lib/avx-shim.dylib
 ASSETS_DIR ?= $(if $(wildcard assets/dll/mscoree),assets,include/assets)
 DLL_ASSETS_DIR := $(ASSETS_DIR)/dll
 EXE_EXAMPLES_DIR := $(ASSETS_DIR)/exe_examples
@@ -205,8 +224,8 @@ check:
 C_SOURCES := $(shell find $(ROOT_DIR)/src -name "*.c" -type f 2>/dev/null)
 
 c-fix-build:
-	@mkdir -p zig-out/bin build/.zig-cache/global
-	@$(ZIG_BUILD_ENV) zig build --build-file build/build.zig --prefix zig-out 2>&1
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build c-fix --build-file $(BP)build.zig --prefix "$(ZIG_OUT_DIR)" 2>&1
 	@echo "Built $(C_FIX_BIN)"
 
 c-fix: c-fix-build
@@ -230,26 +249,25 @@ clean: exe-runner-cleanup
 	rm -f snake_game app_testing/basic_snake/snake_game
 
 elf-processor-build:
-	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep x64_linux_runtime --dep x64_syscalls --dep x64_guest_abi --dep exit_diagnostics -Mroot="$(ELF_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig --dep x64_syscalls -Mx64_linux_runtime=src/x64-ASM/linux_runtime.zig -Mx64_syscalls=src/x64-ASM/syscalls.zig -Mx64_guest_abi=src/x64-ASM/guest_abi.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -femit-bin="$(ELF_PROCESSOR_BIN)"
 
 macho-processor-build:
-	@mkdir -p zig-out/bin build/.zig-cache/global
-	@"$(CC)" -fobjc-arc -fno-modules -Wall -Wextra -c lib/Mach-O/native_window_bridge.m -o "$(MACHO_NATIVE_WINDOW_OBJ)"
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime --dep scheduler -lc -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -Mscheduler=lib/scheduler/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -femit-bin="$(MACHO_PROCESSOR_BIN)"
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@"$(CC)" -fobjc-arc -fno-modules -Wall -Wextra -c "$(ROOT_DIR)/lib/Mach-O/native_window_bridge.m" -o "$(MACHO_NATIVE_WINDOW_OBJ)"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime --dep scheduler -lc -Mroot="$(MACHO_PROCESSOR_SRC)" --dep isa_highway --dep isa_registry --dep runtime_abi_handshake -Mx64_decoder=src/x64-ASM/decoder.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -Mscheduler=lib/scheduler/root.zig -Misa_highway=ISA/highway.zig -Misa_registry=ISA/root.zig -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -femit-bin="$(MACHO_PROCESSOR_BIN)"
 
 elf-processor-dylib:
-	@mkdir -p zig-out/lib
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig cc -dynamiclib -arch arm64 \
+	@mkdir -p "$(ZIG_OUT_DIR)/lib"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig cc -dynamiclib -arch arm64 \
 		-o "$(DYLD_DYLIB)" \
 		"$(ROOT_DIR)/src/shell/dyld/rosette-exec.c" \
 		-install_name @rpath/rosette-exec.dylib
 	@echo "Built $(DYLD_DYLIB)"
 
-AVX_SHIM_DYLIB := zig-out/lib/avx-shim.dylib
 avx-shim-build:
-	@mkdir -p zig-out/lib
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig cc -target x86_64-macos -dynamiclib \
+	@mkdir -p "$(ZIG_OUT_DIR)/lib"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig cc -target x86_64-macos -dynamiclib \
 		-o "$(AVX_SHIM_DYLIB)" \
 		"$(ROOT_DIR)/src/compat/rosetta2/avx-shim.c" \
 		-install_name @rpath/avx-shim.dylib \
@@ -257,16 +275,18 @@ avx-shim-build:
 	@echo "Built $(AVX_SHIM_DYLIB)"
 
 assembler-runner-build:
-	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep runtime_abi_handshake -Mroot=src/Assemblers/runner.zig --dep abort_trap_taxonomy --dep entrypoint_code_text_segment -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mabort_trap_taxonomy=src/tooling/abort_trap_taxonomy/root.zig -Mentrypoint_code_text_segment=src/entrypoint/code-text-segment/root.zig -femit-bin="$(ASSEMBLER_RUNNER_BIN)"
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep runtime_abi_handshake -Mroot=src/Assemblers/runner.zig --dep abort_trap_taxonomy --dep entrypoint_code_text_segment -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Mabort_trap_taxonomy=src/tooling/abort_trap_taxonomy/root.zig -Mentrypoint_code_text_segment=src/entrypoint/code-text-segment/root.zig -femit-bin="$(ASSEMBLER_RUNNER_BIN)"
 
 compat-router-build:
-	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_kernel_process_guard --dep exit_diagnostics -Mroot="$(COMPAT_ROUTER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(COMPAT_ROUTER_BIN)"
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_kernel_process_guard --dep exit_diagnostics -Mroot="$(COMPAT_ROUTER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(COMPAT_ROUTER_BIN)"
 
 shell-helper-build: c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
-	@mkdir -p zig-out/bin build/.zig-cache/global
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
+
+shell shell-update: override ROSETTE_RUNTIME_OPTIMIZE := ReleaseFast
 
 shell: shell-helper-build
 	@"$(SHELL_HELPER_BIN)" install "$(ROOT_DIR)"
@@ -294,7 +314,7 @@ app-wrapper: mscoree-native shell-helper-build
 	@mkdir -p program/app
 	@echo "Building Rosette.app bundle..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
-	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/bundling/build.zig 2>&1
+	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/bundling/build.zig 2>&1
 	@rm -rf \
 		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/app_testing" \
 		"app/bundling/zig-out/Rosette.app/Contents/Resources/rosette-runtime/assets/exe_examples" \
@@ -346,7 +366,7 @@ installer: app-wrapper
 	@echo "Building Rosette Installer.app..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
 	@rm -rf "app/dmg/installer/zig-out/Rosette Installer.app"
-	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/dmg/installer/build.zig -Dpayload-app=program/app/Rosette.app 2>&1
+	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/dmg/installer/build.zig -Dpayload-app=program/app/Rosette.app 2>&1
 	@if find "app/dmg/installer/zig-out/Rosette Installer.app" \( -type d -name app_testing -o -type d -path '*/assets/exe_examples' \) -print -quit | grep -q .; then \
 		echo "error: app_testing or bundled example payload entered Rosette Installer.app"; \
 		exit 1; \
@@ -395,7 +415,7 @@ uninstaller:
 	@mkdir -p program/uninstaller
 	@echo "Building Rosette Uninstaller.app..."
 	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
-	@$(ZIG_BUILD_ENV) zig build bundle --build-file app/dmg/uninstaller/build.zig 2>&1
+	@$(ZIG_BUILD_ENV) zig build bundle --build-file $(APP_BP)app/dmg/uninstaller/build.zig 2>&1
 	@echo "Signing Rosette Uninstaller.app..."
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app/Contents/MacOS/rosette-uninstall-helper"
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(CODESIGN_EXTRA_FLAGS) "app/dmg/uninstaller/zig-out/Rosette Uninstaller.app/Contents/MacOS/rosette-uninstaller"
@@ -641,10 +661,9 @@ $(MSCOREE_NATIVE_HELPER_APP): $(MSCOREE_NATIVE_WINDOW_SRC) $(MSCOREE_NATIVE_HELP
 	@echo "Built $(MSCOREE_NATIVE_HELPER_APP)"
 
 exe-runner-build: mscoree-native
-	@mkdir -p zig-out/bin
-	@mkdir -p "$(ZIG_GLOBAL_CACHE_DIR)"
-	@$(ZIG_BUILD_ENV) zig build exe-runner --build-file app/bundling/build.zig 2>&1
-	@cp app/bundling/zig-out/bin/rosette_exe_runner "$(EXE_RUNNER_BIN)"
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build exe-runner --build-file $(APP_BP)app/bundling/build.zig 2>&1
+	@cp "$(ROOT_DIR)/app/bundling/zig-out/bin/rosette_exe_runner" "$(EXE_RUNNER_BIN)"
 
 gate-runner-build: exe-runner-build
 
@@ -656,8 +675,8 @@ exe-runner-cleanup:
 	@-pkill -KILL -f '$(ROSETTE_HOST_KILL_PATTERN)' 2>/dev/null || true
 
 app-exe-builder-build:
-	@mkdir -p zig-out/bin
-	@ZIG_LOCAL_CACHE_DIR=build/.zig-cache ZIG_GLOBAL_CACHE_DIR=build/.zig-cache/global zig build-exe "$(APP_EXE_BUILDER_SRC)" -femit-bin="$(APP_EXE_BUILDER_BIN)"
+	@mkdir -p "$(ZIG_CACHE_DIR)/global"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe "$(APP_EXE_BUILDER_SRC)" -femit-bin="$(APP_EXE_BUILDER_BIN)"
 
 exe-run: exe-runner-build
 	@if [ ! -f "$(EXE)" ]; then \
