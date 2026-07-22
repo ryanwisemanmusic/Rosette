@@ -10,8 +10,15 @@ echo "Current memory status:"
 memory_pressure
 echo ""
 echo "Current swap status:"
-sysctl vm.swapusage 2>/dev/null || echo "Swap status unavailable in this sandbox"
-echo ""
+
+if sysctl vm.swapusage 2>/dev/null; then
+    :
+else
+    echo "Swap status unavailable in this sandbox"
+    echo ""
+    echo "using vm_stat instead:"
+    vm_stat
+fi
 
 echo "Note: macOS uses automatic swap management via dynamic pager"
 echo "Current swap files in /private/var/vm:"
@@ -43,7 +50,16 @@ echo "Final memory status:"
 memory_pressure
 echo ""
 echo "Final swap status:"
-sysctl vm.swapusage 2>/dev/null || echo "Swap status unavailable in this sandbox"
+
+if sysctl vm.swapusage 2>/dev/null; then
+    :
+else
+    echo "Swap status unavailable in this sandbox"
+    echo ""
+    echo "using vm_stat instead:"
+    vm_stat
+fi
+
 echo ""
 echo "=== Preflight Complete ==="
 echo "No kernel changes are required. Rosette must route Xenia's anonymous"
