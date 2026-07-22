@@ -1,11 +1,12 @@
 const std = @import("std");
 
-const EI_MAG0: u8 = 0;
-const EI_MAG1: u8 = 1;
-const EI_MAG2: u8 = 2;
-const EI_MAG3: u8 = 3;
-const EI_CLASS: u8 = 4;
-const EI_DATA: u8 = 5;
+// Header Offsets
+const EI_MAG0: u8 = 0; // Offset 0
+const EI_MAG1: u8 = 1; // Offset 1
+const EI_MAG2: u8 = 2; // Offset 2
+const EI_MAG3: u8 = 3; // Offset 3
+const EI_CLASS: u8 = 4; // Offset 4
+const EI_DATA: u8 = 5; // Offset 5
 
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;

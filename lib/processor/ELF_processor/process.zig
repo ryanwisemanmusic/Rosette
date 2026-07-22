@@ -392,6 +392,8 @@ const SYS_removexattrat = x64_syscalls.SYS_removexattrat; // 466
 
 // ─── RFLAGS bit positions ───
 const RFL_CF = x64_decoder.RFL_CF;
+const RFL_PF = x64_decoder.RFL_PF;
+const RFL_AF = x64_decoder.RFL_AF;
 const RFL_ZF = x64_decoder.RFL_ZF;
 const RFL_SF = x64_decoder.RFL_SF;
 const RFL_OF = x64_decoder.RFL_OF;
@@ -1578,6 +1580,15 @@ pub const ElfState = struct {
             .lzcnt_reg_reg,
             .lzcnt_reg_mem,
             => self.executeBitScan(d),
+            .popcnt_reg_reg, .popcnt_reg_mem => {
+                const source = if (d.op == .popcnt_reg_mem)
+                    self.readMemVal(d.addr, d.size)
+                else
+                    self.regVal(d.src_reg, d.size);
+                const result = x64_decoder.populationCount(d.size, source, self.regs.rflags);
+                self.setReg(d.dst_reg, d.size, result.value);
+                self.regs.rflags = result.rflags;
+            },
             .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
             .crc32_reg_reg, .crc32_reg_mem => {
                 const source = if (d.op == .crc32_reg_mem)
@@ -4253,6 +4264,31 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
                         else => DecodedInsn{ .op = .invalid, .len = @intCast(pos) },
                     };
                 },
+                0xB8 => {
+                    // POPCNT r16/32/64, r/m16/32/64. F3 is a mandatory
+                    // instruction prefix rather than a repeat modifier.
+                    if (!has_f3 or pos >= bytes.len) return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    const modrm = bytes[pos];
+                    pos += 1;
+                    const mod_v = modrm >> 6;
+                    const reg = (modrm >> 3) & 7;
+                    const rm = modrm & 7;
+                    const size: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+                    const dst_reg = modRmReg(reg, rex);
+
+                    if (mod_v == 3) {
+                        return DecodedInsn{
+                            .op = .popcnt_reg_reg,
+                            .size = size,
+                            .dst_reg = dst_reg,
+                            .src_reg = modRmRm(rm, rex),
+                            .len = @intCast(pos),
+                        };
+                    }
+
+                    const mem = parseModRmMemory(bytes, &pos, @as(u3, @truncate(mod_v)), rm, rex) orelse return DecodedInsn{ .op = .invalid, .len = @intCast(pos) };
+                    return DecodedInsn{ .op = .popcnt_reg_mem, .size = size, .dst_reg = dst_reg, .addr = mem.addr, .sib_has_index = mem.sib_has_index, .sib_index_reg = mem.sib_index_reg, .sib_scale = mem.sib_scale, .sib_has_base = mem.sib_has_base, .sib_base_reg = mem.sib_base_reg, .rip_relative = mem.rip_relative, .len = @intCast(pos) };
+                },
                 0xBC, 0xBD => {
                     // BSF/BSR and their F3-prefixed TZCNT/LZCNT forms.
                     if (pos >= bytes.len) return .{};
@@ -5069,6 +5105,31 @@ test "decode and execute shared bit scan instructions" {
     state.execute(bsr);
     try testing.expectEqual(@as(u64, 63), state.regs.rax);
     try testing.expect((state.regs.rflags & RFL_ZF) == 0);
+}
+
+test "decode and execute shared population count" {
+    const exact_fbo_failure = decodeInsn(&[_]u8{ 0xF3, 0x0F, 0xB8, 0xC0, 0x5D, 0xC3 });
+    try testing.expectEqual(Op.popcnt_reg_reg, exact_fbo_failure.op);
+    try testing.expectEqual(Size.bits32, exact_fbo_failure.size);
+    try testing.expectEqual(RegId.al_ax_eax_rax, exact_fbo_failure.dst_reg);
+    try testing.expectEqual(RegId.al_ax_eax_rax, exact_fbo_failure.src_reg);
+    try testing.expectEqual(@as(u8, 4), exact_fbo_failure.len);
+
+    const memory_16 = decodeInsn(&[_]u8{ 0x66, 0xF3, 0x0F, 0xB8, 0x48, 0x08 });
+    try testing.expectEqual(Op.popcnt_reg_mem, memory_16.op);
+    try testing.expectEqual(Size.bits16, memory_16.size);
+    try testing.expectEqual(RegId.cl_cx_ecx_rcx, memory_16.dst_reg);
+    try testing.expectEqual(@as(u64, 8), memory_16.addr);
+
+    try testing.expectEqual(Op.invalid, decodeInsn(&[_]u8{ 0x0F, 0xB8, 0xC0 }).op);
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.regs.rax = 0xFFFF_FFFF_0000_000B;
+    state.regs.rflags = RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF | (1 << 10);
+    state.execute(exact_fbo_failure);
+    try testing.expectEqual(@as(u64, 3), state.regs.rax);
+    try testing.expectEqual(@as(u32, 1 << 10), state.regs.rflags & (RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF | RFL_OF | (1 << 10)));
 }
 
 test "decode and execute shared byte swap" {
