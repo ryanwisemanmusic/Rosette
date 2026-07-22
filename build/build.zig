@@ -1067,6 +1067,29 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&x64_guest_abi_test.step);
     }
 
+    // TOML processor (patch file format parser)
+    {
+        const toml_processor_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/processor/TOML_processor/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const toml_processor_test = b.addTest(.{ .root_module = toml_processor_mod });
+        check_step.dependOn(&toml_processor_test.step);
+
+        const toml_exe_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/processor/TOML_processor/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        toml_exe_mod.addImport("root.zig", toml_processor_mod);
+        const toml_exe = b.addExecutable(.{
+            .name = "toml_processor",
+            .root_module = toml_exe_mod,
+        });
+        b.installArtifact(toml_exe);
+    }
+
     // Mach-O processor (x86_64 macOS binary loader/diagnostic backend)
     {
         const macho_compat_runtime_mod = b.createModule(.{
@@ -1209,7 +1232,10 @@ pub fn build(b: *std.Build) void {
             .name = "rosette-c-fix",
             .root_module = transpiler_cli_mod,
         });
-        b.installArtifact(transpiler_cli);
+        const install_transpiler_cli = b.addInstallArtifact(transpiler_cli, .{});
+        b.getInstallStep().dependOn(&install_transpiler_cli.step);
+        const c_fix_step = b.step("c-fix", "Build and install only the C source transpiler");
+        c_fix_step.dependOn(&install_transpiler_cli.step);
     }
 
     const lib = b.addLibrary(.{
