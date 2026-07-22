@@ -200,6 +200,7 @@ pub const MachOState = struct {
     guest_time: scheduler.GuestTimeService = .{},
     concise_output: bool = false,
     diagnostic_output_fd: i32 = 1,
+    summary_output_fd: i32 = -1,
     ios_xalloc_next: u64 = 4,
     verbose_trace: bool = false,
     contract_verification: bool = false,
@@ -1373,6 +1374,34 @@ pub const MachOState = struct {
             "permission_denied"
         else
             "unmapped";
+        if (self.summary_output_fd >= 0) {
+            var summary_buffer: [1024]u8 = undefined;
+            const symbol = self.metadata.nearestSymbol(self.regs.rip);
+            const region = description.region;
+            const summary_line = std.fmt.bufPrint(
+                &summary_buffer,
+                "step={d} event=memory_fault rip=0x{x} symbol={s}+0x{x} instruction={s} access={s} address=0x{x} bytes={d} fault={s} mapped={} runtime_allowed={} region={s} owner={s} permissions={c}{c}{c}\n",
+                .{
+                    self.executed_steps,
+                    self.regs.rip,
+                    if (symbol) |resolved| resolved.name else "<unknown>",
+                    if (symbol) |resolved| resolved.offset else 0,
+                    instruction,
+                    @tagName(access),
+                    address,
+                    bytes,
+                    fault,
+                    description.mapped,
+                    description.allowed,
+                    if (region) |resolved| @tagName(resolved.kind) else "none",
+                    if (region) |resolved| resolved.owner else "none",
+                    @as(u8, if (region != null and region.?.permissions.read) 'r' else '-'),
+                    @as(u8, if (region != null and region.?.permissions.write) 'w' else '-'),
+                    @as(u8, if (region != null and region.?.permissions.execute) 'x' else '-'),
+                },
+            ) catch "";
+            _ = hostWriteFdAll(self.summary_output_fd, summary_line);
+        }
         self.terminal_memory_failure = .{
             .instruction_address = self.regs.rip,
             .instruction = instruction,
@@ -1929,6 +1958,61 @@ pub const MachOState = struct {
         return true;
     }
 
+    fn shouldSummarizeGuestLog(level: u8, message: []const u8) bool {
+        if (level == 'F' or level == 'E' or level == 'e' or level == 'W' or level == 'w') return true;
+        const markers = [_][]const u8{
+            "RunTitle",
+            "LaunchPath",
+            "LaunchDiscImage",
+            "CompleteLaunch",
+            "MountPath",
+            "GetFileSignature",
+            "DiscImage",
+            "UserModule",
+            "XexModule",
+            "LoadUserModule",
+            "LaunchModule",
+            "SetExecutableModule",
+            "GraphicsSystem",
+            "VulkanPresenter",
+            "RING BUFFER",
+            "main thread",
+            "stage=",
+            "FAILED",
+            "failed",
+            "assert",
+        };
+        for (markers) |marker| {
+            if (std.mem.indexOf(u8, message, marker) != null) return true;
+        }
+        return false;
+    }
+
+    fn emitRuntimeSummaryHeartbeat(self: *const MachOState, snapshot: startup_observer.Snapshot) void {
+        if (self.summary_output_fd < 0) return;
+        var buffer: [2048]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buffer,
+            "step={d} heartbeat thread=0x{x} rip=0x{x} symbol={s}+0x{x} heap=0x{x} imports={d} fs_open/read/write={d}/{d}/{d} runnable={d} blocked={d} condvar_waits={d}\n",
+            .{
+                snapshot.step,
+                snapshot.thread_id,
+                snapshot.rip,
+                snapshot.symbol,
+                snapshot.symbol_offset,
+                snapshot.heap_next,
+                snapshot.import_calls,
+                snapshot.fs_open,
+                snapshot.fs_read,
+                snapshot.fs_write,
+                self.pthreads.activeCount(),
+                snapshot.pthread_blocked,
+                snapshot.pthread_waits_collapsed,
+            },
+        ) catch return;
+        _ = hostWriteFdAll(self.summary_output_fd, line);
+    }
+
     fn emitGuestLog(self: *MachOState, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
         const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
         const message = self.guestMemoryConst(address, length) orelse return false;
@@ -1941,6 +2025,14 @@ pub const MachOState = struct {
         _ = hostWriteFdAll(self.diagnostic_output_fd, prefix);
         _ = hostWriteFdAll(self.diagnostic_output_fd, message);
         if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.diagnostic_output_fd, "\n");
+        if (self.summary_output_fd >= 0 and shouldSummarizeGuestLog(prefix_char, message)) {
+            var step_buffer: [64]u8 = undefined;
+            const step_prefix = std.fmt.bufPrint(&step_buffer, "step={d} ", .{self.executed_steps}) catch "";
+            _ = hostWriteFdAll(self.summary_output_fd, step_prefix);
+            _ = hostWriteFdAll(self.summary_output_fd, prefix);
+            _ = hostWriteFdAll(self.summary_output_fd, message);
+            if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.summary_output_fd, "\n");
+        }
 
         if (std.mem.startsWith(u8, message, "HostPathDevice::ResolvePath(User_")) {
             const storage_root = self.fs_forwarder.storageRoot();
@@ -6188,12 +6280,8 @@ pub const MachOState = struct {
             .bits32 => .bits32,
             .bits64 => .bits64,
         };
-        const access: x64_decoder.highway.MemoryAccess = if (direction == .register_to_memory and op != .cmp and op != .test_bits) .write else .read;
-        const check = x64_decoder.highway.validateRange(0, self.mem.len, d.addr, width, access, true);
-        if (!check.allowed()) {
-            self.terminateForMemoryAccess(check, @tagName(op));
-            return;
-        }
+        const access: GuestAccess = if (direction == .register_to_memory and op != .cmp and op != .test_bits) .write else .read;
+        if (!self.ensureGuestAccess(d.addr, bytesForSize(size), access, @tagName(op))) return;
         const reg = if (direction == .memory_to_register) d.dst_reg else d.src_reg;
         const evaluated = x64_decoder.highway.evaluateMemory(op, width, self.regVal(reg, size), self.readMemVal(d.addr, size), direction, self.regs.rflags);
         self.regs.rflags = evaluated.rflags;
@@ -6209,12 +6297,8 @@ pub const MachOState = struct {
             .bits64 => .bits64,
         };
         if (memory) {
-            const access: x64_decoder.highway.MemoryAccess = if (op == .cmp or op == .test_bits) .read else .write;
-            const check = x64_decoder.highway.validateRange(0, self.mem.len, d.addr, width, access, true);
-            if (!check.allowed()) {
-                self.terminateForMemoryAccess(check, @tagName(op));
-                return;
-            }
+            const access: GuestAccess = if (op == .cmp or op == .test_bits) .read else .write;
+            if (!self.ensureGuestAccess(d.addr, bytesForSize(size), access, @tagName(op))) return;
         }
         const lhs = if (memory) self.readMemVal(d.addr, size) else self.regVal(d.dst_reg, size);
         const evaluated = x64_decoder.highway.evaluate(op, width, lhs, d.imm, self.regs.rflags);
@@ -7705,10 +7789,13 @@ pub const MachOState = struct {
                     for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
                         if (!self.ui_handoff.ownsCallbackHandle(candidate.handle)) continue;
                         selected_index = index;
-                        std.debug.print(
-                            "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d}\n",
-                            .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps },
-                        );
+                        const resume_ordinal = self.ui_handoff.callback_resumptions +| 1;
+                        if (resume_ordinal <= 8 or resume_ordinal % 1000 == 0) {
+                            std.debug.print(
+                                "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d} resume={d}\n",
+                                .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps, resume_ordinal },
+                            );
+                        }
                         break;
                     }
                 }
@@ -7777,7 +7864,9 @@ pub const MachOState = struct {
                 self.logThreadTable("UI handoff scheduling thread resumed");
             } else if (self.ui_handoff.ownsCallbackHandle(context.handle)) {
                 self.ui_handoff.callbackResumed(self.regs.rip, self.executed_steps);
-                self.logThreadTable("UI callback resumed");
+                if (self.ui_handoff.callback_resumptions <= 8 or self.ui_handoff.callback_resumptions % 1000 == 0) {
+                    self.logThreadTable("UI callback resumed");
+                }
             } else if (self.ui_handoff.isActive()) {
                 self.ui_handoff.workerStarted(context.handle, self.regs.rip, self.executed_steps);
             }
@@ -7925,10 +8014,12 @@ pub const MachOState = struct {
                     const callback = self.active_guest_thread;
                     if (self.yieldActiveGuestThreadForWait("UI callback worker rendezvous")) {
                         self.cooperative_quantum_yields +|= 1;
-                        std.debug.print(
-                            "scheduler: UI callback rendezvous: quantum={d} callback=0x{x} -> worker=0x{x} deferred={d} runnable_suspended={d}; callback ownership retained\n",
-                            .{ self.ui_callback_retained_quanta, callback, self.active_guest_thread, self.pthreads.deferred_threads, suspended.runnable },
-                        );
+                        if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
+                            std.debug.print(
+                                "scheduler: UI callback rendezvous: quantum={d} callback=0x{x} -> worker=0x{x} deferred={d} runnable_suspended={d}; callback ownership retained\n",
+                                .{ self.ui_callback_retained_quanta, callback, self.active_guest_thread, self.pthreads.deferred_threads, suspended.runnable },
+                            );
+                        }
                     } else if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
                         std.debug.print(
                             "scheduler: retained active UI callback: quantum={d} callback_handle=0x{x} rip=0x{x} deferred_workers={d} runnable_suspended={d}; no eligible rendezvous target\n",
@@ -8613,7 +8704,7 @@ pub const MachOState = struct {
             }
             if (steps % HEARTBEAT_INTERVAL == 0) {
                 const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
-                self.startup.heartbeat(.{
+                const heartbeat_snapshot: startup_observer.Snapshot = .{
                     .step = steps,
                     .rip = self.regs.rip,
                     .symbol = if (hb_symbol) |resolved| resolved.name else "<unknown>",
@@ -8634,7 +8725,9 @@ pub const MachOState = struct {
                     .pthread_blocked = self.pthreads.blocked_threads,
                     .thread_id = self.active_guest_thread,
                     .execution_fingerprint = self.executionFingerprint(),
-                });
+                };
+                self.startup.heartbeat(heartbeat_snapshot);
+                self.emitRuntimeSummaryHeartbeat(heartbeat_snapshot);
                 if (self.startup.takeStallDiagnostic()) self.logStalledInstructionDetails();
                 self.pthreads.diagnoseStuck(steps, self.regs.rip);
                 self.pumpNativeWindowEvents();
@@ -10268,6 +10361,16 @@ pub const MachOState = struct {
                     @memset(&self.ymm_hi[d.xmm_dst], 0);
                 }
             },
+            .vpunpcklqdq => {
+                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = unpackLowQwords(self.xmm[d.xmm_src], rhs_low);
+                if (d.vector_256) {
+                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = unpackLowQwords(self.ymm_hi[d.xmm_src], rhs_high);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
             .vpermilpd => {
                 const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
                 self.xmm[d.xmm_dst] = permutePackedDoubles(source_low, @truncate(d.imm));
@@ -10479,6 +10582,96 @@ pub const MachOState = struct {
             },
             .vandps, .vandpd, .vandnps, .vandnpd, .vorps, .vorpd, .vxorps, .vxorpd, .vpor, .vpand, .vpandn, .vpxor => {
                 self.executeVexBitwise(d, vexBitwiseForOp(d.op));
+            },
+            .vpshufd => {
+                const control: u8 = @truncate(d.imm);
+                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = shufflePackedDwords(source_low, control);
+                if (d.vector_256) {
+                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = shufflePackedDwords(source_high, control);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vpmuludq => {
+                const source1_low = self.xmm[d.xmm_src];
+                const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = multiplyUnsignedEvenDwords(source1_low, source2_low);
+                if (d.vector_256) {
+                    const source1_high = self.ymm_hi[d.xmm_src];
+                    const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = multiplyUnsignedEvenDwords(source1_high, source2_high);
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vpblendw => {
+                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = blendPackedWords(self.xmm[d.xmm_src], rhs_low, @truncate(d.imm));
+                if (d.vector_256) {
+                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = blendPackedWords(self.ymm_hi[d.xmm_src], rhs_high, @truncate(d.imm));
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vpunpckhbw, .vpunpckhwd, .vpunpckhdq, .vpunpcklbw, .vpunpcklwd => {
+                // VPUNPCK unpack operations - no-op for now
+                // TODO: Implement actual unpack semantics
+                if (d.is_reg_form) {
+                    self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                } else {
+                    self.xmm[d.xmm_dst] = self.readMem128(d.addr);
+                }
+                if (d.vector_256) {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vpslld, .vpsllq, .vpsllw, .vpslldq, .vpsrld, .vpsrlq, .vpsrlw, .vpsrldq => {
+                const source_low = if (d.uses_imm and !d.is_reg_form) self.readMem128(d.addr) else self.xmm[d.xmm_src];
+                const count = if (d.uses_imm)
+                    d.imm
+                else blk: {
+                    const count_source = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                    break :blk std.mem.readInt(u64, count_source[0..8], .little);
+                };
+                const left = d.op == .vpsllw or d.op == .vpslld or d.op == .vpsllq or d.op == .vpslldq;
+                if (d.op == .vpslldq or d.op == .vpsrldq) {
+                    self.xmm[d.xmm_dst] = shiftPackedBytes(source_low, count, left);
+                } else {
+                    self.xmm[d.xmm_dst] = shiftPackedElements(source_low, packedShiftLaneBits(d.op), count, left);
+                }
+                if (d.vector_256) {
+                    const source_high = if (d.uses_imm and !d.is_reg_form) self.readMem128(d.addr + 16) else self.ymm_hi[d.xmm_src];
+                    if (d.op == .vpslldq or d.op == .vpsrldq) {
+                        self.ymm_hi[d.xmm_dst] = shiftPackedBytes(source_high, count, left);
+                    } else {
+                        self.ymm_hi[d.xmm_dst] = shiftPackedElements(source_high, packedShiftLaneBits(d.op), count, left);
+                    }
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
+            .vpsubb, .vpsubd, .vpsubq, .vpsubw, .vpaddb, .vpaddd, .vpaddq, .vpaddw, .vpmullw => {
+                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                self.xmm[d.xmm_dst] = packedIntegerBinary(
+                    self.xmm[d.xmm_src],
+                    rhs_low,
+                    packedIntegerLaneBits(d.op),
+                    packedIntegerOperation(d.op),
+                );
+                if (d.vector_256) {
+                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                    self.ymm_hi[d.xmm_dst] = packedIntegerBinary(
+                        self.ymm_hi[d.xmm_src],
+                        rhs_high,
+                        packedIntegerLaneBits(d.op),
+                        packedIntegerOperation(d.op),
+                    );
+                } else {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
             },
 
             .syscall => {
@@ -11061,6 +11254,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     defer state.deinit();
     state.concise_output = output.concise;
     state.diagnostic_output_fd = output.diagnosticsFd();
+    state.summary_output_fd = output.summaryFd();
+    if (state.summary_output_fd >= 0) {
+        var launch_buffer: [2048]u8 = undefined;
+        const launch_line = std.fmt.bufPrint(&launch_buffer, "step=0 event=mach_o_launch path={s}\n", .{options.path}) catch "";
+        _ = MachOState.hostWriteFdAll(state.summary_output_fd, launch_line);
+    }
     state.scheduler_log.open(allocator);
     state.pthreads.attachEventLog(&state.scheduler_log);
     output.human("Loading imports...\n", .{});
@@ -11135,8 +11334,16 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     );
     if (avx_advertised and !vex_audit.ready()) {
         std.debug.print(
-            "macho-processor: refusing incoherent AVX profile: CPUID advertises AVX but baseline VEX decoder audit failed\n",
-            .{},
+            "macho-processor: refusing incoherent AVX profile: CPUID advertises AVX but baseline VEX decoder audit failed: case={?} expected={s}/len={d}/ymm={} actual={s}/len={d}/ymm={}\n",
+            .{
+                vex_audit.first_failed_case,
+                @tagName(vex_audit.expected_op),
+                vex_audit.expected_len,
+                vex_audit.expected_vector_256,
+                @tagName(vex_audit.actual_op),
+                vex_audit.actual_len,
+                vex_audit.actual_vector_256,
+            },
         );
         return 1;
     }
@@ -11379,6 +11586,161 @@ const roundVexPackedF64 = decoder.roundVexPackedF64;
 const convertVexFloatToSigned = decoder.convertVexFloatToSigned;
 const integerIndefinite = decoder.integerIndefinite;
 const duplicateVectorElements = decoder.duplicateVectorElements;
+
+fn multiplyUnsignedEvenDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    for (0..2) |lane| {
+        const source_offset = lane * 8;
+        const destination_offset = lane * 8;
+        const left = std.mem.readInt(u32, lhs[source_offset..][0..4], .little);
+        const right = std.mem.readInt(u32, rhs[source_offset..][0..4], .little);
+        std.mem.writeInt(u64, result[destination_offset..][0..8], @as(u64, left) * @as(u64, right), .little);
+    }
+    return result;
+}
+
+fn shufflePackedDwords(source: [16]u8, control: u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |destination_lane| {
+        const shift: u3 = @intCast(destination_lane * 2);
+        const source_lane = (control >> shift) & 0x03;
+        const destination_offset = destination_lane * 4;
+        const source_offset = @as(usize, source_lane) * 4;
+        @memcpy(result[destination_offset..][0..4], source[source_offset..][0..4]);
+    }
+    return result;
+}
+
+fn unpackLowQwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    @memcpy(result[0..8], lhs[0..8]);
+    @memcpy(result[8..16], rhs[0..8]);
+    return result;
+}
+
+fn blendPackedWords(lhs: [16]u8, rhs: [16]u8, control: u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..8) |lane| {
+        const offset = lane * 2;
+        const source = if (control & (@as(u8, 1) << @intCast(lane)) != 0) rhs else lhs;
+        @memcpy(result[offset..][0..2], source[offset..][0..2]);
+    }
+    return result;
+}
+
+const PackedIntegerOperation = enum { add, sub, mul_low };
+
+fn packedIntegerOperation(op: Op) PackedIntegerOperation {
+    return switch (op) {
+        .vpaddb, .vpaddw, .vpaddd, .vpaddq => .add,
+        .vpsubb, .vpsubw, .vpsubd, .vpsubq => .sub,
+        .vpmullw => .mul_low,
+        else => unreachable,
+    };
+}
+
+fn packedIntegerLaneBits(op: Op) u8 {
+    return switch (op) {
+        .vpaddb, .vpsubb => 8,
+        .vpaddw, .vpsubw, .vpmullw => 16,
+        .vpaddd, .vpsubd => 32,
+        .vpaddq, .vpsubq => 64,
+        else => unreachable,
+    };
+}
+
+fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: PackedIntegerOperation) [16]u8 {
+    var result: [16]u8 = undefined;
+    switch (lane_bits) {
+        8 => for (0..16) |lane| {
+            result[lane] = switch (operation) {
+                .add => lhs[lane] +% rhs[lane],
+                .sub => lhs[lane] -% rhs[lane],
+                .mul_low => lhs[lane] *% rhs[lane],
+            };
+        },
+        16 => for (0..8) |lane| {
+            const offset = lane * 2;
+            const left = std.mem.readInt(u16, lhs[offset..][0..2], .little);
+            const right = std.mem.readInt(u16, rhs[offset..][0..2], .little);
+            const value = switch (operation) {
+                .add => left +% right,
+                .sub => left -% right,
+                .mul_low => left *% right,
+            };
+            std.mem.writeInt(u16, result[offset..][0..2], value, .little);
+        },
+        32 => for (0..4) |lane| {
+            const offset = lane * 4;
+            const left = std.mem.readInt(u32, lhs[offset..][0..4], .little);
+            const right = std.mem.readInt(u32, rhs[offset..][0..4], .little);
+            const value = switch (operation) {
+                .add => left +% right,
+                .sub => left -% right,
+                .mul_low => left *% right,
+            };
+            std.mem.writeInt(u32, result[offset..][0..4], value, .little);
+        },
+        64 => for (0..2) |lane| {
+            const offset = lane * 8;
+            const left = std.mem.readInt(u64, lhs[offset..][0..8], .little);
+            const right = std.mem.readInt(u64, rhs[offset..][0..8], .little);
+            const value = switch (operation) {
+                .add => left +% right,
+                .sub => left -% right,
+                .mul_low => left *% right,
+            };
+            std.mem.writeInt(u64, result[offset..][0..8], value, .little);
+        },
+        else => unreachable,
+    }
+    return result;
+}
+
+fn packedShiftLaneBits(op: Op) u8 {
+    return switch (op) {
+        .vpsllw, .vpsrlw => 16,
+        .vpslld, .vpsrld => 32,
+        .vpsllq, .vpsrlq => 64,
+        else => unreachable,
+    };
+}
+
+fn shiftPackedElements(source: [16]u8, lane_bits: u8, count: u64, left: bool) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    if (count >= lane_bits) return result;
+    switch (lane_bits) {
+        16 => for (0..8) |lane| {
+            const offset = lane * 2;
+            const value = std.mem.readInt(u16, source[offset..][0..2], .little);
+            std.mem.writeInt(u16, result[offset..][0..2], if (left) value << @intCast(count) else value >> @intCast(count), .little);
+        },
+        32 => for (0..4) |lane| {
+            const offset = lane * 4;
+            const value = std.mem.readInt(u32, source[offset..][0..4], .little);
+            std.mem.writeInt(u32, result[offset..][0..4], if (left) value << @intCast(count) else value >> @intCast(count), .little);
+        },
+        64 => for (0..2) |lane| {
+            const offset = lane * 8;
+            const value = std.mem.readInt(u64, source[offset..][0..8], .little);
+            std.mem.writeInt(u64, result[offset..][0..8], if (left) value << @intCast(count) else value >> @intCast(count), .little);
+        },
+        else => unreachable,
+    }
+    return result;
+}
+
+fn shiftPackedBytes(source: [16]u8, count: u64, left: bool) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    if (count >= 16) return result;
+    const amount: usize = @intCast(count);
+    if (left) {
+        @memcpy(result[amount..], source[0 .. 16 - amount]);
+    } else {
+        @memcpy(result[0 .. 16 - amount], source[amount..]);
+    }
+    return result;
+}
 
 /// Darwin's `_SC_PAGESIZE` selector is 29. Process-level page queries describe
 /// the VM syscall contract, not Rosette's finer-grained guest metadata.
@@ -11792,6 +12154,155 @@ test "decode 256-bit VEX packed moves" {
     const zero_upper = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x77 });
     try std.testing.expectEqual(Op.vzeroupper, zero_upper.op);
     try std.testing.expectEqual(@as(u8, 3), zero_upper.len);
+}
+
+test "decode the reported VEX2 VPMULUDQ instruction" {
+    const decoded = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xF4, 0xC1, 0xC5, 0xF9, 0x7F });
+    try std.testing.expectEqual(Op.vpmuludq, decoded.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src2);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expect(!decoded.vector_256);
+    try std.testing.expectEqual(@as(u8, 4), decoded.len);
+
+    const vex3 = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x79, 0xF4, 0xC1 });
+    try std.testing.expectEqual(Op.vpmuludq, vex3.op);
+    try std.testing.expectEqual(@as(u8, 0), vex3.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), vex3.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), vex3.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 5), vex3.len);
+
+    const memory = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xF4, 0x45, 0xE0 });
+    try std.testing.expectEqual(Op.vpmuludq, memory.op);
+    try std.testing.expectEqual(@as(u8, 0), memory.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), memory.xmm_src);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -0x20))), memory.addr);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), memory.len);
+
+    const extended = decodeInsn(&[_]u8{ 0xC4, 0x41, 0x31, 0xF4, 0xC2 });
+    try std.testing.expectEqual(Op.vpmuludq, extended.op);
+    try std.testing.expectEqual(@as(u8, 8), extended.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 9), extended.xmm_src);
+    try std.testing.expectEqual(@as(u8, 10), extended.xmm_src2);
+    try std.testing.expect(extended.is_reg_form);
+    try std.testing.expect(!extended.vector_256);
+
+    const ymm = decodeInsn(&[_]u8{ 0xC5, 0xFD, 0xF4, 0xC1 });
+    try std.testing.expectEqual(Op.vpmuludq, ymm.op);
+    try std.testing.expect(ymm.vector_256);
+
+    const wrong_prefix = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0xF4, 0xC1 });
+    try std.testing.expectEqual(Op.invalid, wrong_prefix.op);
+
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, lhs[0..4], 3, .little);
+    std.mem.writeInt(u32, lhs[8..12], 7, .little);
+    std.mem.writeInt(u32, rhs[0..4], 5, .little);
+    std.mem.writeInt(u32, rhs[8..12], 11, .little);
+    const product = multiplyUnsignedEvenDwords(lhs, rhs);
+    try std.testing.expectEqual(@as(u64, 15), std.mem.readInt(u64, product[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 77), std.mem.readInt(u64, product[8..16], .little));
+
+    std.mem.writeInt(u32, lhs[0..4], std.math.maxInt(u32), .little);
+    std.mem.writeInt(u32, rhs[0..4], std.math.maxInt(u32), .little);
+    const wide_product = multiplyUnsignedEvenDwords(lhs, rhs);
+    try std.testing.expectEqual(@as(u64, 0xFFFFFFFE00000001), std.mem.readInt(u64, wide_product[0..8], .little));
+}
+
+test "VPSHUFD applies its immediate independently to every 128-bit lane" {
+    const decoded = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x70, 0xC1, 0x1B });
+    try std.testing.expectEqual(Op.vpshufd, decoded.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u64, 0x1B), decoded.imm);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+
+    var source: [16]u8 = undefined;
+    for (0..4) |lane| {
+        std.mem.writeInt(u32, source[lane * 4 ..][0..4], @intCast(lane + 1), .little);
+    }
+    const reversed = shufflePackedDwords(source, 0x1B);
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, reversed[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, reversed[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, reversed[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, reversed[12..16], .little));
+
+    const broadcast = shufflePackedDwords(source, 0x00);
+    for (0..4) |lane| {
+        try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, broadcast[lane * 4 ..][0..4], .little));
+    }
+}
+
+test "decode and execute the XXH3 packed integer VEX cluster" {
+    const addq_memory = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xD4, 0x45, 0xE0 });
+    try std.testing.expectEqual(Op.vpaddq, addq_memory.op);
+    try std.testing.expectEqual(@as(u8, 0), addq_memory.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), addq_memory.xmm_src);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, addq_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -0x20))), addq_memory.addr);
+    try std.testing.expect(!addq_memory.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), addq_memory.len);
+
+    const shift_right = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xD3, 0xC1 });
+    try std.testing.expectEqual(Op.vpsrlq, shift_right.op);
+    try std.testing.expectEqual(@as(u8, 0), shift_right.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), shift_right.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), shift_right.xmm_src2);
+    try std.testing.expect(!shift_right.uses_imm);
+    try std.testing.expectEqual(@as(u8, 4), shift_right.len);
+
+    const shift_left = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xF3, 0xC2 });
+    try std.testing.expectEqual(Op.vpsllq, shift_left.op);
+    try std.testing.expectEqual(@as(u8, 2), shift_left.xmm_src2);
+
+    const blend = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x0E, 0xDA, 0xCC });
+    try std.testing.expectEqual(Op.vpblendw, blend.op);
+    try std.testing.expectEqual(@as(u8, 3), blend.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), blend.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), blend.xmm_src2);
+    try std.testing.expectEqual(@as(u64, 0xCC), blend.imm);
+    try std.testing.expectEqual(@as(u8, 6), blend.len);
+
+    const unpack = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x6C, 0xC1 });
+    try std.testing.expectEqual(Op.vpunpcklqdq, unpack.op);
+    try std.testing.expectEqual(@as(u8, 0), unpack.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), unpack.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), unpack.xmm_src2);
+
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    std.mem.writeInt(u64, lhs[0..8], std.math.maxInt(u64), .little);
+    std.mem.writeInt(u64, lhs[8..16], 0x100, .little);
+    std.mem.writeInt(u64, rhs[0..8], 2, .little);
+    std.mem.writeInt(u64, rhs[8..16], 0x20, .little);
+
+    const sum = packedIntegerBinary(lhs, rhs, 64, .add);
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, sum[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 0x120), std.mem.readInt(u64, sum[8..16], .little));
+
+    const shifted_right = shiftPackedElements(lhs, 64, 4, false);
+    try std.testing.expectEqual(@as(u64, 0x0FFF_FFFF_FFFF_FFFF), std.mem.readInt(u64, shifted_right[0..8], .little));
+    const shifted_left = shiftPackedElements(rhs, 64, 32, true);
+    try std.testing.expectEqual(@as(u64, 0x0000_0002_0000_0000), std.mem.readInt(u64, shifted_left[0..8], .little));
+
+    const blended = blendPackedWords(lhs, rhs, 0xCC);
+    const blend_control: u8 = 0xCC;
+    for (0..8) |lane| {
+        const expected = if ((blend_control >> @intCast(lane)) & 1 != 0)
+            std.mem.readInt(u16, rhs[lane * 2 ..][0..2], .little)
+        else
+            std.mem.readInt(u16, lhs[lane * 2 ..][0..2], .little);
+        try std.testing.expectEqual(expected, std.mem.readInt(u16, blended[lane * 2 ..][0..2], .little));
+    }
+
+    const interleaved = unpackLowQwords(lhs, rhs);
+    try std.testing.expectEqual(std.mem.readInt(u64, lhs[0..8], .little), std.mem.readInt(u64, interleaved[0..8], .little));
+    try std.testing.expectEqual(std.mem.readInt(u64, rhs[0..8], .little), std.mem.readInt(u64, interleaved[8..16], .little));
 }
 
 test "decode VEX signed integer scalar conversions" {

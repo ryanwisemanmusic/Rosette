@@ -67,6 +67,21 @@ pub const LegacyPrefixes = struct {
     }
 };
 
+pub const VexPrefix = struct {
+    len: usize = 0,
+    is_2byte: bool = false,
+    has_66_prefix: bool = false,
+    has_f2_prefix: bool = false,
+    has_f3_prefix: bool = false,
+    w: bool = false,
+    r: bool = true,
+    x: bool = true,
+    b: bool = true,
+    l: bool = false,
+    vvvv: u4 = 0,
+    m: u5 = 1,
+};
+
 pub fn decodeLegacyPrefixes(bytes: []const u8) LegacyPrefixes {
     var result = LegacyPrefixes{};
     while (result.len < bytes.len and result.len < 15) {
@@ -92,6 +107,51 @@ pub fn decodeLegacyPrefixes(bytes: []const u8) LegacyPrefixes {
         result.len += 1;
     }
     return result;
+}
+
+pub fn decodeVexPrefix(bytes: []const u8) ?VexPrefix {
+    if (bytes.len == 0) return null;
+    var result = VexPrefix{};
+    var pos: usize = 0;
+
+    // Check for 2-byte VEX (C5)
+    if (bytes[pos] == 0xC5) {
+        result.is_2byte = true;
+        pos += 1;
+        if (pos >= bytes.len) return null;
+        const byte = bytes[pos];
+        result.r = (byte & 0x80) == 0;
+        result.l = (byte & 0x04) != 0;
+        result.vvvv = ~@as(u4, @truncate((byte >> 3) & 0xF));
+        result.m = 1; // 2-byte VEX implies m-mmmm = 1
+        result.has_66_prefix = (byte & 0x03) == 1;
+        result.has_f3_prefix = (byte & 0x03) == 2;
+        result.has_f2_prefix = (byte & 0x03) == 3;
+        result.len = 2;
+        return result;
+    }
+
+    // Check for 3-byte VEX (C4)
+    if (bytes[pos] == 0xC4) {
+        pos += 1;
+        if (pos + 1 >= bytes.len) return null;
+        const byte1 = bytes[pos];
+        const byte2 = bytes[pos + 1];
+        result.r = (byte1 & 0x80) == 0;
+        result.x = (byte1 & 0x40) == 0;
+        result.b = (byte1 & 0x20) == 0;
+        result.m = @as(u5, @truncate(byte1 & 0x1F));
+        result.w = (byte2 & 0x80) != 0;
+        result.vvvv = ~@as(u4, @truncate((byte2 >> 3) & 0xF));
+        result.l = (byte2 & 0x04) != 0;
+        result.has_66_prefix = (byte2 & 0x03) == 1;
+        result.has_f3_prefix = (byte2 & 0x03) == 2;
+        result.has_f2_prefix = (byte2 & 0x03) == 3;
+        result.len = 3;
+        return result;
+    }
+
+    return null;
 }
 
 pub const RegisterOperand = struct {
@@ -756,6 +816,32 @@ pub const Op = enum(u16) {
     vpinsrb_xmm_xmm_reg32,
     vpinsrb_xmm_xmm_mem8,
     vpshufb,
+    vpshufd,
+    vpmuludq,
+    vpblendw,
+    vpunpckhbw,
+    vpunpckhwd,
+    vpunpckhdq,
+    vpunpcklbw,
+    vpunpcklwd,
+    vpunpcklqdq,
+    vpslld,
+    vpsllq,
+    vpsllw,
+    vpslldq,
+    vpsrld,
+    vpsrlq,
+    vpsrlw,
+    vpsrldq,
+    vpsubb,
+    vpsubd,
+    vpsubq,
+    vpsubw,
+    vpaddb,
+    vpaddd,
+    vpaddq,
+    vpaddw,
+    vpmullw,
     vpcmpeqb,
     vpcmpeqw,
     vpcmpeqd,
@@ -977,6 +1063,7 @@ pub const DecodedInsn = struct {
     xmm_src: u8 = 0,
     xmm_src2: u8 = 0,
     vector_256: bool = false,
+    uses_imm: bool = false,
     lock: bool = false,
 };
 
@@ -1061,6 +1148,150 @@ fn readUnsignedImmediate(bytes: []const u8, pos: *usize, byte_count: usize) ?u64
     };
     pos.* += byte_count;
     return value;
+}
+
+pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
+    const vex = decodeVexPrefix(bytes) orelse return null;
+    var pos = vex.len;
+    if (pos >= bytes.len) return null;
+
+    const opcode = bytes[pos];
+    pos += 1;
+
+    // Handle VPSHUFD (opcode 0x70 with VEX prefix)
+    if (opcode == 0x70) {
+        if (pos >= bytes.len) return null;
+        const modrm = bytes[pos];
+        pos += 1;
+
+        const mod: u2 = @truncate(modrm >> 6);
+        const reg_code: u3 = @truncate(modrm >> 3);
+        const rm_code: u3 = @truncate(modrm);
+
+        // VPSHUFD: VEX.NDS.LIG.66.0F.WIG 70 /r ib
+        // Destination is XMM register (reg field)
+        // Source is XMM register (rm field for mod=11) or memory (mod!=11)
+        // Immediate byte is the shuffle control
+
+        const dst_xmm: u8 = (if (vex.r) @as(u8, 8) else @as(u8, 0)) | reg_code;
+        const src_xmm: u8 = (if (vex.r) @as(u8, 8) else @as(u8, 0)) | rm_code;
+
+        // Parse SIB and displacement for memory form
+        var addr: u64 = undefined;
+        const is_reg_form = (mod == 3);
+
+        if (!is_reg_form) {
+            // Memory form - need to parse address
+            const has_sib = (rm_code == 4) or (mod == 0 and rm_code == 5);
+            if (has_sib) {
+                if (pos >= bytes.len) return null;
+                _ = bytes[pos]; // Consume SIB byte
+                pos += 1;
+            }
+
+            const disp_size: u4 = switch (mod) {
+                0 => if (rm_code == 5 or has_sib) @as(u4, 4) else 0,
+                1 => 1,
+                2 => 4,
+                else => unreachable,
+            };
+            if (pos + disp_size > bytes.len) return null;
+            if (disp_size == 1) {
+                const disp: i8 = @bitCast(bytes[pos]);
+                addr = @as(u64, @bitCast(@as(i64, disp)));
+                pos += 1;
+            } else if (disp_size == 4) {
+                const disp: i32 = std.mem.readInt(i32, bytes[pos..][0..4], .little);
+                addr = @as(u64, @bitCast(@as(i64, disp)));
+                pos += 4;
+            } else {
+                addr = 0;
+            }
+        }
+
+        // Immediate byte is always required for VPSHUFD
+        if (pos >= bytes.len) return null;
+        const imm = bytes[pos];
+        pos += 1;
+
+        return .{
+            .op = .vpshufd,
+            .size = .bits64,
+            .len = @intCast(pos),
+            .xmm_dst = dst_xmm,
+            .xmm_src = src_xmm,
+            .imm = imm,
+            .is_reg_form = is_reg_form,
+            .addr = addr,
+            .vector_256 = vex.l,
+        };
+    }
+
+    // Handle VMOVDQA (opcode 0x6F and 0x7F with VEX prefix)
+    if (opcode == 0x6F or opcode == 0x7F) {
+        if (pos >= bytes.len) return null;
+        const modrm = bytes[pos];
+        pos += 1;
+
+        const mod: u2 = @truncate(modrm >> 6);
+        const reg_code: u3 = @truncate(modrm >> 3);
+        const rm_code: u3 = @truncate(modrm);
+
+        const dst_xmm: u8 = (if (vex.r) @as(u8, 8) else @as(u8, 0)) | reg_code;
+        const src_xmm: u8 = (if (vex.r) @as(u8, 8) else @as(u8, 0)) | rm_code;
+
+        // Parse SIB and displacement if needed
+        var addr: u64 = undefined;
+        const is_reg_form = (mod == 3);
+
+        if (!is_reg_form) {
+            // Memory form - need to parse address
+            // Check for SIB byte (rm=100 with mod!=3, or rm=101 with mod=0)
+            const has_sib = (rm_code == 4) or (mod == 0 and rm_code == 5);
+            if (has_sib) {
+                if (pos >= bytes.len) return null;
+                _ = bytes[pos]; // Consume SIB byte
+                pos += 1;
+                // SIB byte: scale (bits 7-6), index (bits 5-3), base (bits 2-0)
+                // For simplicity, we'll skip full SIB decoding for now
+                // and just consume the byte
+            }
+
+            const disp_size: u4 = switch (mod) {
+                0 => if (rm_code == 5 or has_sib) @as(u4, 4) else 0,
+                1 => 1,
+                2 => 4,
+                else => unreachable,
+            };
+            if (pos + disp_size > bytes.len) return null;
+            if (disp_size == 1) {
+                const disp: i8 = @bitCast(bytes[pos]);
+                addr = @as(u64, @bitCast(@as(i64, disp)));
+                pos += 1;
+            } else if (disp_size == 4) {
+                const disp: i32 = std.mem.readInt(i32, bytes[pos..][0..4], .little);
+                addr = @as(u64, @bitCast(@as(i64, disp)));
+                pos += 4;
+            } else {
+                addr = 0;
+            }
+        }
+
+        const op_enum: Op = if (opcode == 0x6F) .vmovdqa_mem_xmm else .vmovdqa_xmm_mem;
+
+        return .{
+            .op = op_enum,
+            .size = .bits64,
+            .len = @intCast(pos),
+            .xmm_dst = dst_xmm,
+            .xmm_src = src_xmm,
+            .is_reg_form = is_reg_form,
+            .addr = addr,
+            .vector_256 = vex.l,
+        };
+    }
+
+    return null;
 }
 
 /// Decodes every legacy general-purpose MOV encoding that is valid in long

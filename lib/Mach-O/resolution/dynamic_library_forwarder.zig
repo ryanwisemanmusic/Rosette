@@ -31,6 +31,7 @@ pub const Signature = enum {
     snprintf_three_args,
     connect_three_args,
     send_four_args,
+    cccrypt,
 };
 
 pub const LibraryClass = enum {
@@ -72,6 +73,7 @@ const specs = [_]Spec{
     .{ .symbol = "snprintf", .library = .libsystem, .signature = .snprintf_three_args },
     .{ .symbol = "connect", .library = .libsystem, .signature = .connect_three_args },
     .{ .symbol = "send", .library = .libsystem, .signature = .send_four_args },
+    .{ .symbol = "CCCrypt", .library = .libsystem, .signature = .cccrypt },
 };
 
 const Library = struct {
@@ -1159,6 +1161,35 @@ pub const Forwarder = struct {
             .send_four_args => blk: {
                 // These are handled by handleStubSignature and should never reach here
                 break :blk .{ .handled = 0 };
+            },
+            .cccrypt => blk: {
+                const key = state.guestMemoryConst(state.regs.rcx, 16) orelse return null;
+                const iv = state.guestMemoryConst(state.regs.r9, 16) orelse return null;
+                const data_in_addr = state.read64(state.regs.rsp + 8);
+                const data_in_length = state.read64(state.regs.rsp + 16);
+                const data_out_addr = state.read64(state.regs.rsp + 24);
+                const data_out_avail = state.read64(state.regs.rsp + 32);
+                const data_out_moved_addr = state.read64(state.regs.rsp + 40);
+                const data_in = state.guestMemoryConst(data_in_addr, data_in_length) orelse return null;
+                const data_out = state.guestMemory(data_out_addr, data_out_avail) orelse return null;
+                const CCCryptFn = *const fn (c_uint, c_uint, c_uint, *const anyopaque, usize, *const anyopaque, *const anyopaque, usize, *anyopaque, usize, *usize) callconv(.c) c_int;
+                const function: CCCryptFn = @ptrCast(@alignCast(address));
+                var moved: usize = 0;
+                const result = function(
+                    @as(c_uint, @truncate(state.regs.rdi)),
+                    @as(c_uint, @truncate(state.regs.rsi)),
+                    @as(c_uint, @truncate(state.regs.rdx)),
+                    @ptrCast(key.ptr),
+                    @as(usize, @intCast(state.regs.r8)),
+                    @ptrCast(iv.ptr),
+                    @ptrCast(data_in.ptr),
+                    data_in_length,
+                    @ptrCast(data_out.ptr),
+                    data_out_avail,
+                    &moved,
+                );
+                state.write64(data_out_moved_addr, moved);
+                break :blk .{ .handled = @bitCast(@as(i64, result)) };
             },
         };
     }

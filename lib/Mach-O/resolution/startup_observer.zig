@@ -76,6 +76,14 @@ pub const Observer = struct {
     stuck_state_start_wall: u64 = 0,
     last_stall_diagnostic_wall: u64 = 0,
     stall_diagnostic_due: bool = false,
+    hot_symbol: []const u8 = "",
+    hot_symbol_count: u64 = 0,
+    hot_symbol_start_step: u64 = 0,
+    hot_symbol_start_wall: u64 = 0,
+    hot_symbol_start_heap: u64 = 0,
+    hot_symbol_start_imports: u64 = 0,
+    hot_symbol_start_fs_read: u64 = 0,
+    last_hot_symbol_diagnostic_wall: u64 = 0,
     stall_policy: StallPolicy = .{},
     timing_stack: [16]PhaseTiming = undefined,
     timing_depth: usize = 0,
@@ -137,6 +145,26 @@ pub const Observer = struct {
             same_state_ns >= self.stall_policy.min_same_state_ns and
             cooldown_elapsed;
 
+        if (std.mem.eql(u8, self.hot_symbol, snapshot.symbol)) {
+            self.hot_symbol_count +|= 1;
+        } else {
+            self.hot_symbol = snapshot.symbol;
+            self.hot_symbol_count = 1;
+            self.hot_symbol_start_step = snapshot.step;
+            self.hot_symbol_start_wall = now;
+            self.hot_symbol_start_heap = snapshot.heap_next;
+            self.hot_symbol_start_imports = snapshot.import_calls;
+            self.hot_symbol_start_fs_read = snapshot.fs_read;
+        }
+        const hot_symbol_steps = snapshot.step -| self.hot_symbol_start_step;
+        const hot_symbol_ns = now -| self.hot_symbol_start_wall;
+        const hot_symbol_cooldown_elapsed = self.last_hot_symbol_diagnostic_wall == 0 or
+            now -| self.last_hot_symbol_diagnostic_wall >= self.stall_policy.diagnostic_cooldown_ns;
+        const hot_symbol_due = self.hot_symbol_count >= self.stall_policy.min_repeated_samples and
+            hot_symbol_steps >= self.stall_policy.min_same_state_steps and
+            hot_symbol_ns >= self.stall_policy.min_same_state_ns and
+            hot_symbol_cooldown_elapsed;
+
         const phase_str = @tagName(self.phase);
         std.debug.print(
             "info(macho): heartbeat phase={s} step={d} delta={d} {d}steps/s rip=0x{x} {s}+0x{x} thread=0x{x} heap=0x{x} imports={d} fs(r/w)={d}/{d} pthread(created/blocked/waits)={d}/{d}/{d}\n",
@@ -163,6 +191,25 @@ pub const Observer = struct {
             std.debug.print(
                 "info(macho): unchanged execution-state warning: thread=0x{x} rip=0x{x} {s}+0x{x} samples={d} same_state_steps={d} same_state_ms={d} at {d}steps/s\n",
                 .{ snapshot.thread_id, snapshot.rip, snapshot.symbol, snapshot.symbol_offset, self.stuck_pc_count, same_state_steps, same_state_ns / std.time.ns_per_ms, steps_per_sec },
+            );
+        }
+        if (hot_symbol_due) {
+            self.last_hot_symbol_diagnostic_wall = now;
+            std.debug.print(
+                "info(macho): hot-symbol progress: phase={s} thread=0x{x} symbol={s} samples={d} duration_ms={d} translated_steps={d} rate={d}steps/s heap_delta={d} imports_delta={d} fs_read_delta={d} execution_state={s}; this is translated host-code activity, not proof of emulated-title progress\n",
+                .{
+                    phase_str,
+                    snapshot.thread_id,
+                    snapshot.symbol,
+                    self.hot_symbol_count,
+                    hot_symbol_ns / std.time.ns_per_ms,
+                    hot_symbol_steps,
+                    steps_per_sec,
+                    snapshot.heap_next -| self.hot_symbol_start_heap,
+                    snapshot.import_calls -| self.hot_symbol_start_imports,
+                    snapshot.fs_read -| self.hot_symbol_start_fs_read,
+                    if (self.stuck_pc_count > 1) "unchanged" else "changing",
+                },
             );
         }
     }

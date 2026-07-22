@@ -664,6 +664,43 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode == 0x6C and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpunpcklqdq, .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPSHUFD: VEX.NDS.LIG.66.0F.WIG 70 /r ib
+    if (opcode == 0x70 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpshufd, .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @intCast(rm.addr);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        }
+        // Immediate byte for shuffle control
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if ((opcode == 0x12 or opcode == 0x13 or opcode == 0x16 or opcode == 0x17) and
         !vector_256 and (prefix == 0 or prefix == 1))
     {
@@ -853,9 +890,235 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VPMULUDQ: VEX.NDS.128.66.0F.WIG F4 /r
+    if (opcode == 0xF4 and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = .vpmuludq;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // Variable-count packed logical shifts. The count is the low 64 bits of
+    // the third XMM/m128 operand and applies to every element.
+    if ((opcode == 0xD1 or opcode == 0xD2 or opcode == 0xD3 or
+        opcode == 0xF1 or opcode == 0xF2 or opcode == 0xF3) and prefix == 1)
+    {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0xD1 => .vpsrlw,
+            0xD2 => .vpsrld,
+            0xD3 => .vpsrlq,
+            0xF1 => .vpsllw,
+            0xF2 => .vpslld,
+            0xF3 => .vpsllq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPUNPCKHBW/HDQ/HWD: VEX.NDS.128.66.0F.WIG 68/69/6A /r
+    if ((opcode == 0x68 or opcode == 0x69 or opcode == 0x6A) and prefix == 1 and (vex & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x68 => .vpunpckhbw,
+            0x69 => .vpunpckhwd,
+            0x6A => .vpunpckhdq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPUNPCKLBW/LWD/LQD: VEX.NDS.128.66.0F.WIG 60/61/62 /r
+    if ((opcode == 0x60 or opcode == 0x61) and prefix == 1 and (vex & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x60 => .vpunpcklbw,
+            0x61 => .vpunpcklwd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPSHUFB: VEX.NDS.128.66.0F.WIG 00 /r ib
+    if (opcode == 0x00 and prefix == 1 and (vex & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        // Immediate byte for shuffle control
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.op = .vpshufb;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPSHUFD: VEX.NDS.LIG.66.0F.WIG 70 /r ib (already handled above, keeping for reference)
+
+    // Immediate-count packed shifts: /2 and /3 shift right, /6 and /7
+    // shift left. VEX.vvvv is the destination and ModRM.r/m is the source.
+    if ((opcode == 0x71 or opcode == 0x72 or opcode == 0x73) and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        const group = (@intFromEnum(rm.reg) & 0x07);
+        if (group != 2 and group != 3 and group != 6 and group != 7) return .{};
+        decoded.xmm_dst = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        pos += 1;
+        decoded.op = switch (opcode) {
+            0x71 => if (group == 2) .vpsrlw else .vpsllw,
+            0x72 => if (group == 2) .vpsrld else .vpslld,
+            0x73 => switch (group) {
+                2 => .vpsrlq,
+                3 => .vpsrldq,
+                6 => .vpsllq,
+                7 => .vpslldq,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPSUBB/PSUBD/PSUBQ/PSUBW: VEX.NDS.128.66.0F.WIG F8/FA/FB/F9 /r
+    if ((opcode == 0xF8 or opcode == 0xFA or opcode == 0xFB or opcode == 0xF9) and prefix == 1 and (vex & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0xF8 => .vpsubb,
+            0xFA => .vpsubd,
+            0xFB => .vpsubq,
+            0xF9 => .vpsubw,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPADDB/PADDW/PADDD/PADDQ: VEX.NDS.128/256.66.0F.WIG FC/FD/FE/D4 /r
+    if ((opcode == 0xFC or opcode == 0xFD or opcode == 0xFE or opcode == 0xD4) and prefix == 1) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0xFC => .vpaddb,
+            0xFD => .vpaddw,
+            0xFE => .vpaddd,
+            0xD4 => .vpaddq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPMULLW: VEX.NDS.128.66.0F.WIG D5 /r
+    if (opcode == 0xD5 and prefix == 1 and (vex & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = .vpmullw;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if ((vex & 0x78) != 0x78) return .{};
 
-    var d = DecodedInsn{};
+    var d = DecodedInsn{ .vector_256 = vector_256 };
     var pos = start_pos + 3;
     const modrm = bytes[pos];
     const is_mem = modrm < 0xC0;
@@ -1286,6 +1549,123 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         } else {
             decoded.xmm_src2 = @intCast(rm.addr);
         }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and opcode == 0x6C and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpunpcklqdq, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPMULUDQ: VEX.NDS.128/256.66.0F.WIG F4 /r
+    if (opcode_map == 1 and opcode == 0xF4 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpmuludq, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and
+        (opcode == 0xD1 or opcode == 0xD2 or opcode == 0xD3 or
+            opcode == 0xF1 or opcode == 0xF2 or opcode == 0xF3) and prefix == 1)
+    {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0xD1 => .vpsrlw,
+            0xD2 => .vpsrld,
+            0xD3 => .vpsrlq,
+            0xF1 => .vpsllw,
+            0xF2 => .vpslld,
+            0xF3 => .vpsllq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and
+        (opcode == 0xF8 or opcode == 0xF9 or opcode == 0xFA or opcode == 0xFB or
+            opcode == 0xFC or opcode == 0xFD or opcode == 0xFE or opcode == 0xD4 or opcode == 0xD5) and prefix == 1)
+    {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0xF8 => .vpsubb,
+            0xF9 => .vpsubw,
+            0xFA => .vpsubd,
+            0xFB => .vpsubq,
+            0xFC => .vpaddb,
+            0xFD => .vpaddw,
+            0xFE => .vpaddd,
+            0xD4 => .vpaddq,
+            0xD5 => .vpmullw,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 3 and opcode == 0x0E and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpblendw, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        if (pos >= bytes.len) return .{};
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        pos += 1;
         decoded.len = @intCast(pos);
         return decoded;
     }

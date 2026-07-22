@@ -14,6 +14,7 @@ pub const Controller = struct {
     concise: bool = false,
     saved_stderr: i32 = -1,
     detail_fd: i32 = -1,
+    summary_fd: i32 = -1,
 
     pub fn init(allocator: std.mem.Allocator) Controller {
         if (environmentFlag("ROSETTE_MACHO_VERBOSE_STDOUT")) return .{};
@@ -26,13 +27,27 @@ pub const Controller = struct {
         defer allocator.free(path_z);
         const detail_fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c_uint, 0o644));
         if (detail_fd < 0) return .{};
+        var summary_fd: i32 = -1;
+        if (std.fs.path.join(allocator, &.{ root, ".rosette", "rosette-runtime-summary.log" })) |summary_path| {
+            defer allocator.free(summary_path);
+            if (allocator.dupeZ(u8, summary_path)) |summary_path_z| {
+                defer allocator.free(summary_path_z);
+                summary_fd = c.open(summary_path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c_uint, 0o644));
+            } else |_| {}
+        } else |_| {}
         const saved_stderr = c.dup(c.STDERR_FILENO);
         if (saved_stderr < 0 or c.dup2(detail_fd, c.STDERR_FILENO) < 0) {
             if (saved_stderr >= 0) _ = c.close(saved_stderr);
             _ = c.close(detail_fd);
+            if (summary_fd >= 0) _ = c.close(summary_fd);
             return .{};
         }
-        return .{ .concise = true, .saved_stderr = saved_stderr, .detail_fd = detail_fd };
+        if (summary_fd >= 0) {
+            writeAll(summary_fd, "# Rosette Runtime Summary\n");
+            writeAll(summary_fd, "# Selected Xenia lifecycle/errors and periodic translated-execution heartbeats.\n");
+            writeAll(summary_fd, "# Full diagnostics remain in rosette-runtime.log.\n");
+        }
+        return .{ .concise = true, .saved_stderr = saved_stderr, .detail_fd = detail_fd, .summary_fd = summary_fd };
     }
 
     pub fn deinit(self: *Controller) void {
@@ -41,6 +56,7 @@ pub const Controller = struct {
             _ = c.close(self.saved_stderr);
         }
         if (self.detail_fd >= 0) _ = c.close(self.detail_fd);
+        if (self.summary_fd >= 0) _ = c.close(self.summary_fd);
         self.* = .{};
     }
 
@@ -53,6 +69,10 @@ pub const Controller = struct {
 
     pub fn diagnosticsFd(self: *const Controller) i32 {
         return if (self.concise) c.STDERR_FILENO else c.STDOUT_FILENO;
+    }
+
+    pub fn summaryFd(self: *const Controller) i32 {
+        return self.summary_fd;
     }
 };
 

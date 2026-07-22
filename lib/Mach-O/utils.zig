@@ -433,6 +433,13 @@ pub fn stepBudgetAllows(max_steps: u64, completed_steps: u64) bool {
 pub const VexDecoderAudit = struct {
     passed: usize,
     total: usize,
+    first_failed_case: ?usize = null,
+    expected_op: Op = .invalid,
+    actual_op: Op = .invalid,
+    expected_len: usize = 0,
+    actual_len: usize = 0,
+    expected_vector_256: bool = false,
+    actual_vector_256: bool = false,
 
     pub fn ready(self: VexDecoderAudit) bool {
         return self.passed == self.total;
@@ -443,22 +450,47 @@ pub const VexDecoderAudit = struct {
 /// by compilers and JITs are executable. Audit both VEX2/VEX3, 128/256-bit,
 /// extended-base, scalar-move, arithmetic and zero-upper forms before launch.
 pub fn auditVexDecoder() VexDecoderAudit {
-    const cases = [_][]const u8{
-        &.{ 0xC5, 0xFA, 0x7E, 0x40, 0x48 }, // vmovq xmm0, [rax+0x48]
-        &.{ 0xC5, 0xFA, 0x6F, 0x00 }, // vmovdqu xmm0, [rax]
-        &.{ 0xC4, 0xC1, 0x7A, 0x7F, 0x01 }, // vmovdqu [r9], xmm0
-        &.{ 0xC5, 0xFC, 0x10, 0x00 }, // vmovups ymm0, [rax]
-        &.{ 0xC5, 0xFC, 0x11, 0x00 }, // vmovups [rax], ymm0
-        &.{ 0xC5, 0xF8, 0x58, 0xC1 }, // vaddps xmm0, xmm0, xmm1
-        &.{ 0xC5, 0xF8, 0x57, 0xC0 }, // vxorps xmm0, xmm0, xmm0
-        &.{ 0xC5, 0xF8, 0x77 }, // vzeroupper
+    const AuditCase = struct {
+        bytes: []const u8,
+        op: Op,
+        vector_256: bool = false,
+    };
+    const cases = [_]AuditCase{
+        .{ .bytes = &.{ 0xC5, 0xFA, 0x7E, 0x40, 0x48 }, .op = .vmovq_xmm_mem64 }, // vmovq xmm0, [rax+0x48]
+        .{ .bytes = &.{ 0xC5, 0xFA, 0x6F, 0x00 }, .op = .vmovdqu_xmm_mem }, // vmovdqu xmm0, [rax]
+        .{ .bytes = &.{ 0xC4, 0xC1, 0x7A, 0x7F, 0x01 }, .op = .vmovdqu_mem_xmm }, // vmovdqu [r9], xmm0
+        .{ .bytes = &.{ 0xC5, 0xFC, 0x10, 0x00 }, .op = .vmovups_ymm_mem, .vector_256 = true }, // vmovups ymm0, [rax]
+        .{ .bytes = &.{ 0xC5, 0xFC, 0x11, 0x00 }, .op = .vmovups_mem_ymm, .vector_256 = true }, // vmovups [rax], ymm0
+        .{ .bytes = &.{ 0xC5, 0xF8, 0x58, 0xC1 }, .op = .vaddps }, // vaddps xmm0, xmm0, xmm1
+        .{ .bytes = &.{ 0xC5, 0xF8, 0x57, 0xC0 }, .op = .vxorps }, // vxorps xmm0, xmm0, xmm0
+        .{ .bytes = &.{ 0xC5, 0xF9, 0xF4, 0xC1 }, .op = .vpmuludq }, // vpmuludq xmm0, xmm0, xmm1
+        .{ .bytes = &.{ 0xC4, 0x41, 0x31, 0xF4, 0xC2 }, .op = .vpmuludq }, // vpmuludq xmm8, xmm9, xmm10
+        .{ .bytes = &.{ 0xC5, 0xFD, 0xF4, 0xC1 }, .op = .vpmuludq, .vector_256 = true }, // vpmuludq ymm0, ymm0, ymm1
+        .{ .bytes = &.{ 0xC5, 0xF9, 0xD4, 0x45, 0xE0 }, .op = .vpaddq }, // vpaddq xmm0, xmm0, [rbp-0x20]
+        .{ .bytes = &.{ 0xC5, 0xF9, 0xD3, 0xC1 }, .op = .vpsrlq }, // vpsrlq xmm0, xmm0, xmm1
+        .{ .bytes = &.{ 0xC5, 0xF9, 0xF3, 0xC2 }, .op = .vpsllq }, // vpsllq xmm0, xmm0, xmm2
+        .{ .bytes = &.{ 0xC4, 0xE3, 0x79, 0x0E, 0xDA, 0xCC }, .op = .vpblendw }, // vpblendw xmm3, xmm0, xmm2, 0xcc
+        .{ .bytes = &.{ 0xC5, 0xF9, 0x6C, 0xC1 }, .op = .vpunpcklqdq }, // vpunpcklqdq xmm0, xmm0, xmm1
+        .{ .bytes = &.{ 0xC5, 0xF8, 0x77 }, .op = .vzeroupper }, // vzeroupper
     };
     var passed: usize = 0;
-    for (cases) |bytes| {
-        const decoded = decodeInsn(bytes);
-        if (decoded.op != .invalid and decoded.len == bytes.len) passed += 1;
+    var result = VexDecoderAudit{ .passed = 0, .total = cases.len };
+    for (cases, 0..) |case, index| {
+        const decoded = decodeInsn(case.bytes);
+        if (decoded.op == case.op and decoded.len == case.bytes.len and decoded.vector_256 == case.vector_256) {
+            passed += 1;
+        } else if (result.first_failed_case == null) {
+            result.first_failed_case = index;
+            result.expected_op = case.op;
+            result.actual_op = decoded.op;
+            result.expected_len = case.bytes.len;
+            result.actual_len = decoded.len;
+            result.expected_vector_256 = case.vector_256;
+            result.actual_vector_256 = decoded.vector_256;
+        }
     }
-    return .{ .passed = passed, .total = cases.len };
+    result.passed = passed;
+    return result;
 }
 
 test "Mach-O execution is unlimited unless an explicit step budget is set" {
@@ -469,5 +501,12 @@ test "Mach-O execution is unlimited unless an explicit step budget is set" {
 }
 
 test "advertised AVX profile passes baseline VEX decoder audit" {
-    try std.testing.expect(auditVexDecoder().ready());
+    const audit = auditVexDecoder();
+    if (!audit.ready()) {
+        std.debug.print(
+            "VEX audit failure: case={?} expected={s}/len={d}/ymm={} actual={s}/len={d}/ymm={}\n",
+            .{ audit.first_failed_case, @tagName(audit.expected_op), audit.expected_len, audit.expected_vector_256, @tagName(audit.actual_op), audit.actual_len, audit.actual_vector_256 },
+        );
+    }
+    try std.testing.expect(audit.ready());
 }

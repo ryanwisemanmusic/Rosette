@@ -404,18 +404,24 @@ pub const Bridge = struct {
             return .{ .handled = @bitCast(self.seek(state.regs.rdi, 0, std.c.SEEK.CUR)) };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgENS_4fposI11__mbstate_tEE")) {
-            _ = self.seek(state.regs.rdi, @bitCast(state.regs.rsi), std.c.SEEK.SET);
+            const seek_result = self.seek(state.regs.rdi, @bitCast(state.regs.rsi), std.c.SEEK.SET);
+            self.clearEofBitAfterSeek(state, state.regs.rdi, seek_result);
             return .{ .handled = state.regs.rdi };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgExNS_8ios_base7seekdirE")) {
-            _ = self.seek(state.regs.rdi, @bitCast(state.regs.rsi), seekDirection(state.regs.rdx));
+            const seek_result = self.seek(state.regs.rdi, @bitCast(state.regs.rsi), seekDirection(state.regs.rdx));
+            self.clearEofBitAfterSeek(state, state.regs.rdi, seek_result);
             return .{ .handled = state.regs.rdi };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7seekoffExNS_8ios_base7seekdirEj")) {
-            return .{ .handled = @bitCast(self.seek(state.regs.rdi, @bitCast(state.regs.rsi), seekDirection(state.regs.rdx))) };
+            const seek_result = self.seek(state.regs.rdi, @bitCast(state.regs.rsi), seekDirection(state.regs.rdx));
+            self.clearEofBitAfterSeek(state, state.regs.rdi, seek_result);
+            return .{ .handled = @bitCast(seek_result) };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7seekposENS_4fposI11__mbstate_tEEj")) {
-            return .{ .handled = @bitCast(self.seek(state.regs.rdi, @bitCast(state.regs.rsi), std.c.SEEK.SET)) };
+            const seek_result = self.seek(state.regs.rdi, @bitCast(state.regs.rsi), std.c.SEEK.SET);
+            self.clearEofBitAfterSeek(state, state.regs.rdi, seek_result);
+            return .{ .handled = @bitCast(seek_result) };
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE4peekEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9underflowEv"))
@@ -708,7 +714,10 @@ pub const Bridge = struct {
                 }
                 break;
             }
-            if (byte[0] == delimiter) break;
+            if (byte[0] == delimiter) {
+                stream.tracked_pos += 1;
+                break;
+            }
             line[length] = byte[0];
             length += 1;
             stream.tracked_pos += 1;
@@ -1021,9 +1030,20 @@ pub const Bridge = struct {
         };
         if (new_pos < 0) return -1;
         stream.tracked_pos = @intCast(new_pos);
+        stream.eof = false;
+        stream.failed = false;
         const ret: i64 = new_pos;
         self.tracePatchSeek(stream, "seek", offset, direction, ret);
         return ret;
+    }
+
+    fn clearEofBitAfterSeek(self: *Bridge, state: anytype, object: u64, seek_result: i64) void {
+        if (seek_result < 0) return;
+        const stream = self.findFlexible(object) orelse return;
+        if (stream.ios_object != 0) {
+            const current = self.object_model.rdstate(state, stream.ios_object);
+            _ = self.object_model.clear(state, stream.ios_object, current & ~cxx_object_model.EOFBIT);
+        }
     }
 
     fn readByte(self: *Bridge, object: u64) i32 {
