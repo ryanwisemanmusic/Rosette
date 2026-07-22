@@ -81,6 +81,9 @@ pub const PolicyConfig = struct {
     /// Starvation threshold (steps)
     starvation_threshold: u64 = 100000,
 
+    /// Diagnostic-only threshold for a thread remaining in one blocked state.
+    stuck_diagnostic_threshold: u64 = 1_000_000,
+
     /// Whether to favor UI threads
     favor_ui_threads: bool = true,
 
@@ -154,7 +157,7 @@ pub const SchedulerPolicy = struct {
             }
 
             // Yield if there are suspended threads and this thread has run long enough
-            if (context.suspended_threads > 0 and e.execution_steps > self.config.max_quantum) {
+            if (context.suspended_threads > 0 and e.continuous_run_steps > self.config.max_quantum) {
                 return .yield;
             }
 
@@ -172,12 +175,13 @@ pub const SchedulerPolicy = struct {
 
     /// Preemptive scheduling policy
     fn preemptivePolicy(self: *SchedulerPolicy, registry: *thread_registry.ThreadRegistry, context: SchedulingContext, entry: ?*thread_registry.ThreadEntry) SchedulingDecision {
+        _ = self;
         _ = registry;
         _ = context;
 
         // Preempt based on time slice
         if (entry) |e| {
-            if (e.execution_steps % self.config.preemption_interval == 0) {
+            if (e.quantum_remaining == 0) {
                 return .preempt;
             }
         }
@@ -196,7 +200,7 @@ pub const SchedulerPolicy = struct {
 
         // Add preemption points
         if (entry) |e| {
-            if (e.execution_steps % (self.config.preemption_interval * 2) == 0) {
+            if (e.quantum_remaining == 0) {
                 return .preempt;
             }
         }
@@ -212,7 +216,7 @@ pub const SchedulerPolicy = struct {
 
         // Run threads to completion unless they explicitly yield
         // Check if there are suspended threads that should run first
-        if (registry.suspended_head != registry.suspended_tail) {
+        if (registry.suspended_count != 0) {
             return .yield;
         }
 
@@ -254,7 +258,7 @@ pub const SchedulerPolicy = struct {
         }
 
         // Rotate through suspended threads
-        if (registry.suspended_head != registry.suspended_tail) {
+        if (registry.suspended_count != 0) {
             return .yield;
         }
 
@@ -292,7 +296,7 @@ pub const SchedulerPolicy = struct {
         for (&registry.entries) |*e| {
             if (!e.active or e.state != .suspended) continue;
 
-            const wait_duration = context.current_step -| e.creation_step;
+            const wait_duration = context.current_step -| e.state_since_step;
             if (wait_duration > self.config.starvation_threshold) {
                 stuck_count += 1;
             }
@@ -304,7 +308,7 @@ pub const SchedulerPolicy = struct {
         }
 
         // Check if current thread has been running too long
-        if (entry.execution_steps > self.config.starvation_threshold) {
+        if (entry.continuous_run_steps > self.config.starvation_threshold) {
             return true;
         }
 
