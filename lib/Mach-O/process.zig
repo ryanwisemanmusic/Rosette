@@ -10616,6 +10616,43 @@ pub const MachOState = struct {
                     @memset(&self.ymm_hi[d.xmm_dst], 0);
                 }
             },
+            .vpinsrd, .vpinsrq, .vpinsrw => {
+                const index: u8 = @truncate(d.imm);
+                const lane_count: u8 = if (d.op == .vpinsrd) 4 else if (d.op == .vpinsrq) 2 else 8;
+                const element_size: u8 = if (d.op == .vpinsrd) 4 else if (d.op == .vpinsrq) 8 else 2;
+                const clamped_index = index % lane_count;
+                const offset = clamped_index * element_size;
+
+                // Copy source XMM to destination
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+
+                // Insert the element
+                if (d.is_reg_form) {
+                    // From XMM register (low dword/qword/word)
+                    const src_xmm = self.xmm[d.xmm_src2];
+                    @memcpy(self.xmm[d.xmm_dst][offset..][0..element_size], src_xmm[0..element_size]);
+                } else {
+                    // From memory (read 32/64/16 bits)
+                    const mem_value = if (d.op == .vpinsrd)
+                        self.readMemVal(d.addr, .bits32)
+                    else if (d.op == .vpinsrq)
+                        self.readMemVal(d.addr, .bits64)
+                    else
+                        self.readMemVal(d.addr, .bits16);
+                    
+                    if (d.op == .vpinsrd) {
+                        std.mem.writeInt(u32, self.xmm[d.xmm_dst][offset..][0..4], @intCast(mem_value), .little);
+                    } else if (d.op == .vpinsrq) {
+                        std.mem.writeInt(u64, self.xmm[d.xmm_dst][offset..][0..8], mem_value, .little);
+                    } else {
+                        std.mem.writeInt(u16, self.xmm[d.xmm_dst][offset..][0..2], @intCast(mem_value), .little);
+                    }
+                }
+
+                if (d.vector_256) {
+                    @memset(&self.ymm_hi[d.xmm_dst], 0);
+                }
+            },
             .vpunpckhbw, .vpunpckhwd, .vpunpckhdq, .vpunpcklbw, .vpunpcklwd => {
                 // VPUNPCK unpack operations - no-op for now
                 // TODO: Implement actual unpack semantics

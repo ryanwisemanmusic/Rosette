@@ -1866,6 +1866,34 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VPINSRD/VPINSRQ/VPINSRW: VEX.NDS.LIG.66.0F38.WIG 22/23/2A /r ib
+    if (opcode_map == 3 and (opcode == 0x22 or opcode == 0x23 or opcode == 0x2A) and prefix == 1 and !vector_256) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        // Immediate byte for index
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.op = switch (opcode) {
+            0x22 => .vpinsrd,
+            0x23 => .vpinsrq,
+            0x2A => .vpinsrw,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode_map == 3 and opcode == 0x20 and prefix == 1 and !vector_256) {
         var decoded = DecodedInsn{ .size = .bits8 };
         var pos = start_pos + 4;
