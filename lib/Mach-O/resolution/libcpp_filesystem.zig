@@ -104,6 +104,9 @@ pub const Bridge = struct {
         if (std.mem.eql(u8, name, "__ZNSt3__14__fs10filesystem4path17replace_extensionERKS2_")) {
             return .{ .handled = self.replaceExtension(state) };
         }
+        if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path11__extensionEv")) {
+            return .{ .handled = self.extension(state) };
+        }
         if (std.mem.eql(u8, name, "__ZNSt3__115system_categoryEv")) {
             return .{ .handled = self.category(state, false) };
         }
@@ -350,6 +353,28 @@ pub const Bridge = struct {
         @memcpy(result_buffer[prefix_length + dot_length .. result_length], replacement);
         _ = compat_runtime.initLibcppStringFromSlice(state, object, result_buffer[0..result_length]);
         return object;
+    }
+
+    /// libc++'s private path::__extension() returns a string_view in RAX:RDX,
+    /// not a path object through a hidden result pointer. Keep the view backed
+    /// by the source path's basic_string storage so the public path::extension
+    /// wrapper can immediately copy it into its result object.
+    fn extension(self: *Bridge, state: anytype) u64 {
+        self.path_calls +|= 1;
+        const view = compat_runtime.libcppStringView(state, state.regs.rdi) orelse {
+            state.regs.rdx = 0;
+            return 0;
+        };
+        const path = state.guestMemoryConst(view.address, view.length) orelse {
+            state.regs.rdx = 0;
+            return 0;
+        };
+        const start = extensionStart(path) orelse {
+            state.regs.rdx = 0;
+            return 0;
+        };
+        state.regs.rdx = path.len - start;
+        return view.address + start;
     }
 
     fn errorMessage(self: *Bridge, state: anytype) u64 {
@@ -722,4 +747,51 @@ test "extension replacement preserves path and hidden-file rules" {
     try std.testing.expectEqual(@as(?usize, 8), extensionStart("dir/name.txt"));
     try std.testing.expectEqual(@as(?usize, null), extensionStart("dir/.config"));
     try std.testing.expectEqual(@as(?usize, null), extensionStart("dir/.."));
+}
+
+test "path extension bridge returns the libc++ string_view register pair" {
+    const TestState = struct {
+        const Registers = struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0 };
+
+        mem: [256]u8 = [_]u8{0} ** 256,
+        heap_next: u64 = 192,
+        regs: Registers = .{},
+
+        pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+            if (address > self.mem.len or length > self.mem.len - address) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        pub fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            if (address > self.mem.len or length > self.mem.len - address) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        pub fn guestAlloc(self: *@This(), length: u64, alignment: u64) ?u64 {
+            const start = (self.heap_next + alignment - 1) & ~(alignment - 1);
+            if (start > self.mem.len or length > self.mem.len - start) return null;
+            self.heap_next = start + length;
+            return start;
+        }
+
+        pub fn read64(self: *const @This(), address: u64) u64 {
+            return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
+        }
+
+        pub fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+        }
+    };
+
+    var state = TestState{};
+    const path = "/games/title.iso";
+    @memcpy(state.mem[128 .. 128 + path.len], path);
+    try std.testing.expect(compat_runtime.initLibcppString(&state, 32, 128, path.len));
+    state.regs.rdi = 32;
+
+    var bridge = Bridge{};
+    const address = bridge.extension(&state);
+
+    try std.testing.expectEqual(@as(u64, 4), state.regs.rdx);
+    try std.testing.expectEqualStrings(".iso", state.guestMemoryConst(address, state.regs.rdx).?);
 }

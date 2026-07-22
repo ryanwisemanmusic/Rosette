@@ -7,6 +7,29 @@ pub const Class = enum {
     export_ordinal_bounds,
 };
 
+pub const Severity = enum {
+    fatal,
+    recoverable_state_reset,
+    recoverable_skip,
+    expected,
+};
+
+pub const Recovery = struct {
+    action: RecoveryAction,
+    severity: Severity,
+    message: []const u8 = "",
+};
+
+pub const RecoveryAction = enum {
+    none,
+    /// Skip the assertion and continue execution past the abort
+    skip_assertion,
+    /// Reset thread/initializer state and retry
+    reset_and_retry,
+    /// Log and continue (expected behavior)
+    log_and_continue,
+};
+
 pub const TimerQueueSnapshot = struct {
     frame_state_address: u64,
     frame_state: u8,
@@ -169,6 +192,15 @@ pub fn quarantineRepeatedIdleGeneration(state: anytype, snapshot: TimerQueueSnap
     if (live_state[0] != 0) return false;
     live_state[0] = 3; // kDisarmed
     return true;
+}
+
+pub fn recoveryFor(assertion_class: Class, _: u64, _: u64) Recovery {
+    return switch (assertion_class) {
+        .none => .{ .action = .none, .severity = .fatal },
+        .timer_queue_wait_item_state => .{ .action = .reset_and_retry, .severity = .recoverable_state_reset, .message = "timer queue state recovery available via CAS replay" },
+        .breakpoint_untracked_thread => .{ .action = .skip_assertion, .severity = .recoverable_skip, .message = "breakpoint on untracked thread is secondary signal-handler fallout; skip and resume" },
+        .export_ordinal_bounds => .{ .action = .skip_assertion, .severity = .recoverable_skip, .message = "export ordinal bounds assertion; table resize may be needed" },
+    };
 }
 
 pub fn classify(file_name: []const u8, function_name: []const u8, expression: []const u8) Class {

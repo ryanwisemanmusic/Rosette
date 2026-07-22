@@ -26,6 +26,10 @@ pub const Forwarder = struct {
     directory_read_count: u64 = 0,
     errno_updates: u64 = 0,
     last_errno: c_int = 0,
+    fallback_roots: std.ArrayList([]const u8) = .{
+        .items = &.{},
+        .capacity = 0,
+    },
 
     pub fn init(allocator: std.mem.Allocator) Forwarder {
         return .{
@@ -37,7 +41,45 @@ pub const Forwarder = struct {
     pub fn deinit(self: *Forwarder) void {
         self.fd_manager.deinit();
         self.translator.deinit();
+        for (self.fallback_roots.items) |root| self.translator.allocator.free(root);
+        self.fallback_roots.deinit(self.translator.allocator);
         self.* = undefined;
+    }
+
+    pub fn addFallbackRoot(self: *Forwarder, root: []const u8) void {
+        const duped = self.translator.allocator.dupe(u8, root) catch return;
+        self.fallback_roots.append(self.translator.allocator, duped) catch {
+            self.translator.allocator.free(duped);
+        };
+    }
+
+    pub fn tryOpenFallback(self: *Forwarder, path: []const u8, oflags: std.c.O, mode: u32, err: std.c.E) ?c_int {
+        if (err != .NOENT) return null;
+        if (self.fallback_roots.items.len == 0) return null;
+        const basename = std.fs.path.basename(path);
+        if (basename.len == 0) return null;
+        var candidate_buf: [4096]u8 = undefined;
+        for (self.fallback_roots.items) |root| {
+            const total = root.len + 1 + basename.len;
+            if (total + 1 > candidate_buf.len) continue;
+            @memcpy(candidate_buf[0..root.len], root);
+            candidate_buf[root.len] = '/';
+            @memcpy(candidate_buf[root.len + 1 ..][0..basename.len], basename);
+            candidate_buf[total] = 0;
+            const host_fd = std.c.open(
+                @as([*:0]const u8, @ptrCast(&candidate_buf)),
+                oflags,
+                @as(c_int, @intCast(mode & 0xFFFF)),
+            );
+            if (host_fd >= 0) {
+                std.debug.print(
+                    "macho-processor: fs fallback open: original={s} fallback_root={s} basename={s} -> host_fd={d}\n",
+                    .{ path, root, basename, host_fd },
+                );
+                return host_fd;
+            }
+        }
+        return null;
     }
 
     pub fn configurePaths(self: *Forwarder, storage_root: []const u8) void {
@@ -68,19 +110,26 @@ pub const Forwarder = struct {
         path_buffer.appendSlice(self.translator.allocator, translated_path) catch return self.fail(state, .NOMEM);
         path_buffer.append(self.translator.allocator, 0) catch return self.fail(state, .NOMEM);
 
-        const host_fd = std.c.open(
+        const oflags: std.c.O = @bitCast(@as(u32, @truncate(state.regs.rsi)));
+        const mode: u32 = @truncate(state.regs.rdx);
+        var host_fd = std.c.open(
             @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
-            @bitCast(@as(u32, @truncate(state.regs.rsi))),
-            @as(c_int, @intCast(state.regs.rdx & 0xFFFF)),
+            oflags,
+            @as(c_int, @intCast(mode & 0xFFFF)),
         );
         if (host_fd < 0) {
+            const err = std.c.errno(host_fd);
             if (isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
                 std.debug.print(
                     "macho-processor: fs open FAILED: guest_path={s} host_path={s} flags=0x{x} mode=0{o} errno={s}\n",
-                    .{ path, translated_path, state.regs.rsi, state.regs.rdx & 0xFFFF, @tagName(std.c.errno(host_fd)) },
+                    .{ path, translated_path, @as(u32, @bitCast(oflags)), mode & 0xFFFF, @tagName(err) },
                 );
             }
-            return self.failHost(state, host_fd);
+            if (self.tryOpenFallback(translated_path, oflags, mode, err)) |fallback_fd| {
+                host_fd = fallback_fd;
+            } else {
+                return self.failHost(state, host_fd);
+            }
         }
         const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
         if (shouldTrace(self.open_count) or isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
@@ -103,20 +152,27 @@ pub const Forwarder = struct {
         path_buffer.appendSlice(self.translator.allocator, translated_path) catch return self.fail(state, .NOMEM);
         path_buffer.append(self.translator.allocator, 0) catch return self.fail(state, .NOMEM);
 
-        const host_fd = std.c.openat(
+        const oflags: std.c.O = @bitCast(@as(u32, @truncate(state.regs.rdx)));
+        const mode: u32 = @truncate(state.regs.rcx);
+        var host_fd = std.c.openat(
             dir_fd,
             @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
-            @bitCast(@as(u32, @truncate(state.regs.rdx))),
-            @as(c_int, @intCast(state.regs.rcx & 0xFFFF)),
+            oflags,
+            @as(c_int, @intCast(mode & 0xFFFF)),
         );
         if (host_fd < 0) {
+            const err = std.c.errno(host_fd);
             if (isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
                 std.debug.print(
                     "macho-processor: fs openat FAILED: dir_guest_fd={d} guest_path={s} host_path={s} flags=0x{x} errno={s}\n",
-                    .{ state.regs.rdi, path, translated_path, state.regs.rdx, @tagName(std.c.errno(host_fd)) },
+                    .{ state.regs.rdi, path, translated_path, @as(u32, @bitCast(oflags)), @tagName(err) },
                 );
             }
-            return self.failHost(state, host_fd);
+            if (self.tryOpenFallback(translated_path, oflags, mode, err)) |fallback_fd| {
+                host_fd = fallback_fd;
+            } else {
+                return self.failHost(state, host_fd);
+            }
         }
         const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
         if (shouldTrace(self.open_count) or isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
@@ -836,22 +892,41 @@ pub const Forwarder = struct {
                 .{ state.regs.rdi, length, state.regs.rdx, raw_flags },
             );
         }
-        // Xenia reserves its 32-bit guest address space with a non-fixed,
-        // anonymous PROT_NONE mmap.  This is virtual address space, not a 4 GiB
-        // physical allocation, and must not be served by the bounded guest heap.
-        if (state.regs.rdx == 0 and length >= 1024 * 1024 * 1024) {
+        // Large mappings are virtual address space and must never be copied
+        // into Rosette's bounded guest heap. This covers both Xenia's PROT_NONE
+        // address-space reservation and read-only mappings of multi-gigabyte
+        // disc images.
+        if (length >= 1024 * 1024 * 1024) {
             const host_fd: std.posix.fd_t = if (map_flags.ANONYMOUS)
                 -1
             else
-                self.fd_manager.hostFd(state.regs.r8) orelse return @bitCast(@as(i64, -1));
-            const reserved = state.guestReserveAddressSpaceWithBacking(length, raw_flags, host_fd, @bitCast(offset)) orelse {
-                std.debug.print("macho-processor: large mmap FAILED: route=import stage=sparse_reserve\n", .{});
-                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "sparse_reserve");
-                return @bitCast(@as(i64, -1));
-            };
-            std.debug.print("macho-processor: large mmap succeeded: route=import guest_base=0x{x} length={d}\n", .{ reserved, length });
-            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, reserved, "sparse_reserve");
-            return reserved;
+                self.fd_manager.hostFd(state.regs.r8) orelse {
+                    std.debug.print("macho-processor: large mmap FAILED: route=import stage=fd_translation guest_fd=0x{x}\n", .{state.regs.r8});
+                    return @bitCast(@as(i64, -1));
+                };
+            if (state.regs.rdx == 0) {
+                const reserved = state.guestReserveAddressSpaceWithBacking(length, raw_flags, host_fd, @bitCast(offset)) orelse {
+                    std.debug.print("macho-processor: large mmap FAILED: route=import stage=sparse_reserve\n", .{});
+                    if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "sparse_reserve");
+                    return @bitCast(@as(i64, -1));
+                };
+                std.debug.print("macho-processor: large mmap succeeded: route=import kind=reservation guest_base=0x{x} length={d}\n", .{ reserved, length });
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, reserved, "sparse_reserve");
+                return reserved;
+            }
+            if (comptime @hasDecl(@TypeOf(state.*), "guestMapAnywhereWithBacking")) {
+                const mapped = state.guestMapAnywhereWithBacking(length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset)) orelse {
+                    std.debug.print("macho-processor: large mmap FAILED: route=import stage=sparse_file_map host_fd={d}\n", .{host_fd});
+                    if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "sparse_file_map");
+                    return @bitCast(@as(i64, -1));
+                };
+                std.debug.print(
+                    "macho-processor: large mmap succeeded: route=import kind=file_backed guest_base=0x{x} length={d} prot=0x{x} host_fd={d} offset={d}\n",
+                    .{ mapped, length, state.regs.rdx, host_fd, offset },
+                );
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, mapped, "sparse_file_map");
+                return mapped;
+            }
         }
         const mapped = state.guestHeapAllocate(length, 4096) orelse {
             if (backend_trace) {

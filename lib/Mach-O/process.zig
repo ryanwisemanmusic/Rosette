@@ -14,6 +14,7 @@ const initializer_dependency = @import("resolution/initializer_dependency.zig");
 const abi_data_materializer = @import("resolution/abi_data_materializer.zig");
 const memory_transaction = @import("resolution/memory_transaction.zig");
 const dynamic_library_forwarder = @import("resolution/dynamic_library_forwarder.zig");
+const guest_memory_geometry = @import("resolution/guest_memory_geometry.zig");
 const lazy_import_stub = @import("resolution/lazy_import_stub.zig");
 const smart_stub_generator = @import("resolution/smart_stub_generator.zig");
 const cxx_exception_diagnostics = @import("resolution/cxx_exception_diagnostics.zig");
@@ -45,6 +46,10 @@ const runtime_output = @import("resolution/runtime_output.zig");
 const tlv_runtime = @import("resolution/tlv_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
 const symbol_assembly_context = @import("resolution/symbol_assembly_context.zig");
+const export_table_manager = @import("resolution/export_table_manager.zig");
+const export_table_lifecycle = @import("resolution/export_table_lifecycle.zig");
+const dynamic_export_registry = @import("resolution/dynamic_export_registry.zig");
+const thread_wait_profiler = @import("resolution/thread_wait_profiler.zig");
 const contract = @import("contract");
 const scheduler = @import("scheduler");
 
@@ -206,6 +211,10 @@ pub const MachOState = struct {
     atomic_cmpxchg8: atomic_compare_exchange.Stats = .{},
     classified_ud2_recoveries: u64 = 0,
     timer_recovery_tracker: guest_assertion_recovery.TimerRecoveryTracker = .{},
+    export_table_mgr: export_table_manager.Manager = .{},
+    export_table_lc: export_table_lifecycle.Lifecycle = .{},
+    export_registry: dynamic_export_registry.Registry = .{},
+    wait_profiler: thread_wait_profiler.WaitProfileSystem = .{},
     breakpoint_cleanup_recoveries: u64 = 0,
     diagnostic_throttler: diagnostic_throttle.Tracker = .{},
     libcpp_shared_control_blocks: libcpp_shared_control_block.Stats = .{},
@@ -269,6 +278,14 @@ pub const MachOState = struct {
     guest_log_buffer_address: u64 = 0,
     guest_log_mirror_fd: i32 = -1,
     guest_log_line_count: u64 = 0,
+    guest_stdio_write_count: u64 = 0,
+    guest_stdout_byte_count: u64 = 0,
+    guest_stderr_byte_count: u64 = 0,
+    guest_stdio_mirror_failures: u64 = 0,
+    guest_stdio_read_count: u64 = 0,
+    guest_stdio_read_bytes: u64 = 0,
+    guest_stdio_seek_count: u64 = 0,
+    guest_stdio_failures: u64 = 0,
     strict_initializers: bool = false,
     strict_imports: bool = false,
     signal_actions: [GUEST_SIGNAL_ACTION_COUNT]GuestSignalAction = [_]GuestSignalAction{.{}} ** GUEST_SIGNAL_ACTION_COUNT,
@@ -1867,10 +1884,14 @@ pub const MachOState = struct {
     }
 
     fn configureGuestLogMirror(self: *MachOState, args: []const []const u8) void {
+        std.debug.print("ROSETTE: configureGuestLogMirror called\n", .{});
         const prefix = "--log_file=";
+        var found_log_file = false;
         for (args) |arg| {
             if (!std.mem.startsWith(u8, arg, prefix) or arg.len == prefix.len) continue;
             const path = arg[prefix.len..];
+            std.debug.print("ROSETTE: Found --log_file= argument: '{s}'\n", .{path});
+            found_log_file = true;
             const path_z = self.allocator.dupeZ(u8, path) catch return;
             defer self.allocator.free(path_z);
             const flags = parseFopenFlags("a") orelse return;
@@ -1880,13 +1901,20 @@ pub const MachOState = struct {
                 @as(c_int, 0o666),
             );
             if (fd < 0) {
-                std.debug.print("macho-processor: guest log mirror could not open {s}\n", .{path});
+                std.debug.print("ROSETTE: guest log mirror could not open {s}\n", .{path});
                 return;
             }
             if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
             self.guest_log_mirror_fd = fd;
-            std.debug.print("macho-processor: guest log mirror: {s}\n", .{path});
+            std.debug.print(
+                "ROSETTE: guest log mirror configured: {s}; captures synchronous Xenia logs and modeled guest stdout/stderr\n",
+                .{path},
+            );
             return;
+        }
+        if (!found_log_file) {
+            std.debug.print("ROSETTE: No --log_file= argument found - Xenia logs will not be mirrored to file\n", .{});
+            std.debug.print("ROSETTE: Add --log_file=/path/to/log.txt to capture Xenia output\n", .{});
         }
     }
 
@@ -2485,11 +2513,13 @@ pub const MachOState = struct {
             if (self.terminated) return .control_transferred;
             return .{ .terminated = exit_code };
         }
-        if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove")) {
+        if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove") or
+            std.mem.eql(u8, name, "___memcpy_chk"))
+        {
             self.resolving_import_route = .guest_memory_copy;
             return self.handleGuestMemoryCopy(name);
         }
-        if (std.mem.eql(u8, name, "_memset")) {
+        if (std.mem.eql(u8, name, "_memset") or std.mem.eql(u8, name, "___memset_chk")) {
             self.resolving_import_route = .memset;
             const dst = self.regs.rdi;
             const val: u8 = @truncate(self.regs.rsi);
@@ -2499,6 +2529,16 @@ pub const MachOState = struct {
                 @memset(buf, val);
             }
             return .{ .handled = dst };
+        }
+        if (std.mem.eql(u8, name, "_pthread_once")) {
+            self.resolving_import_route = .pthread;
+            const once_control = self.regs.rdi;
+            const init_routine = self.regs.rsi;
+            const once_value = self.readMemVal(once_control, .bits32);
+            if (once_value != 0) return .{ .handled = 0 };
+            self.writeMemVal(once_control, .bits32, 1);
+            self.regs.rip = init_routine;
+            return .control_transferred;
         }
         if (std.mem.eql(u8, name, "_bzero") or std.mem.eql(u8, name, "__bzero")) {
             self.resolving_import_route = .bzero;
@@ -2857,15 +2897,54 @@ pub const MachOState = struct {
                         if (a > 65535) continue;
                         for (saved) |b| {
                             if (b > 65535 or b < a) continue;
-                            const ordinal = a;
-                            const size = b;
+                            const ordinal = @as(u32, @intCast(a));
+                            const size = @as(u32, @intCast(b));
                             if (ordinal < size) continue;
                             found_pair = true;
+                            const recovery = self.export_table_mgr.diagnoseExportOrdinalBounds(ordinal, size, 0);
+                            _ = self.export_table_lc.recordOrdinalBounds("xbdm", ordinal, size);
+                            self.export_registry.register(ordinal, function_name, 0, true);
                             if (ordinal < 256 or (size < 256 and ordinal - size <= 16)) {
                                 std.debug.print(
                                     "  export ordinal bounds ROOT CAUSE: ordinal={d} >= table_size={d}; values are small and consistent — this is a guest-side export table sizing issue (the export table needs more entries or the ordinal needs updating)\n",
                                     .{ ordinal, size },
                                 );
+                                if (recovery == .table_was_resized) {
+                                    std.debug.print(
+                                        "  export table sizing recovery: export table manager recorded ordinal={d} size={d}; future assertions for this table will be tracked\n",
+                                        .{ ordinal, size },
+                                    );
+                                }
+                                if (self.export_table_lc.module_count > 0 and
+                                    self.export_table_lc.modules[0].class == .deferred_exports)
+                                {
+                                    const var_name = export_table_lifecycle.Lifecycle.extractVectorName(expression);
+                                    if (var_name) |vname| {
+                                        const sym_addr = self.metadata.definedSymbolAddress(vname);
+                                        if (sym_addr) |addr| {
+                                            std.debug.print(
+                                                "  export table pre-population: found vector={s} at 0x{x}; scheduling growth to size {d}\n",
+                                                .{ vname, addr, ordinal + 1 },
+                                            );
+                                            _ = self.export_table_lc.requestVectorGrowth(addr, ordinal + 1, 8, vname);
+                                        } else {
+                                            var sym_buf: [1]u64 = undefined;
+                                            const found = self.metadata.symbolAddressesMatching("", vname, &sym_buf);
+                                            if (found > 0 and sym_buf[0] != 0) {
+                                                _ = self.export_table_lc.requestVectorGrowth(sym_buf[0], ordinal + 1, 8, vname);
+                                                std.debug.print(
+                                                    "  export table pre-population: found vector={s} at 0x{x} via substring match; scheduling growth to size {d}\n",
+                                                    .{ vname, sym_buf[0], ordinal + 1 },
+                                                );
+                                            } else {
+                                                std.debug.print(
+                                                    "  export table pre-population: vector={s} not found in symbol table; will fall back to defer+retry\n",
+                                                    .{vname},
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 std.debug.print(
                                     "  export ordinal bounds ROOT CAUSE: ordinal={d} >= table_size={d}; values are large or unexpected — this is likely emulator-level memory corruption or a data-structure initialization failure\n",
@@ -2875,6 +2954,7 @@ pub const MachOState = struct {
                         }
                     }
                     if (!found_pair) {
+                        _ = self.export_table_mgr.recordTable(0, 0, 0);
                         std.debug.print(
                             "  export ordinal bounds: no plausible ordinal/size pair found in callee-saved registers (rbx/r12-r15); the values were either computed per-call and not preserved, or the register state was already clobbered\n",
                             .{},
@@ -3799,6 +3879,9 @@ pub const MachOState = struct {
         if (std.mem.endsWith(u8, name, "_fwrite")) {
             return .{ .handled = self.handleFwrite() };
         }
+        if (std.mem.eql(u8, name, "_fread")) {
+            return .{ .handled = self.handleFread() };
+        }
         if (std.mem.endsWith(u8, name, "_fflush")) {
             return .{ .handled = self.handleFflush() };
         }
@@ -3822,10 +3905,10 @@ pub const MachOState = struct {
             self.exit_code = 0;
             return .control_transferred;
         }
-        if (std.mem.endsWith(u8, name, "_ftell")) {
+        if (std.mem.eql(u8, name, "_ftell") or std.mem.eql(u8, name, "_ftello")) {
             return .{ .handled = self.handleFtell() };
         }
-        if (std.mem.endsWith(u8, name, "_fseek")) {
+        if (std.mem.eql(u8, name, "_fseek") or std.mem.eql(u8, name, "_fseeko")) {
             return .{ .handled = self.handleFseek() };
         }
         if (std.mem.endsWith(u8, name, "_ferror")) {
@@ -4213,6 +4296,13 @@ pub const MachOState = struct {
         const destination_address = self.regs.rdi;
         const source_address = self.regs.rsi;
         const count = self.regs.rdx;
+        if (std.mem.eql(u8, name, "___memcpy_chk") and count > self.regs.rcx) {
+            std.debug.print(
+                "macho-processor: fortified memcpy rejected: destination=0x{x} source=0x{x} bytes={d} destination_size={d}\n",
+                .{ destination_address, source_address, count, self.regs.rcx },
+            );
+            return .{ .terminated = 134 };
+        }
         if (count == 0) return .{ .handled = destination_address };
 
         const source = self.guestMemoryConst(source_address, count);
@@ -5571,20 +5661,54 @@ pub const MachOState = struct {
             written += @intCast(rc);
         }
         if (file.kind == .regular) file.position += @intCast(written);
-        return written == bytes.len;
+        const completed = written == bytes.len;
+        if (completed and file.kind != .regular) {
+            self.guest_stdio_write_count +|= 1;
+            switch (file.kind) {
+                .stdout => self.guest_stdout_byte_count +|= written,
+                .stderr => self.guest_stderr_byte_count +|= written,
+                .regular => unreachable,
+            }
+            if (self.guest_log_mirror_fd >= 0 and
+                self.guest_log_mirror_fd != file.fd and
+                !hostWriteFdAll(self.guest_log_mirror_fd, bytes))
+            {
+                self.guest_stdio_mirror_failures +|= 1;
+            }
+            if (self.guest_stdio_write_count == 1) {
+                std.debug.print(
+                    "macho-processor: guest stdio capture active: first_stream={s} log_mirror_active={}\n",
+                    .{ @tagName(file.kind), self.guest_log_mirror_fd >= 0 },
+                );
+            }
+        }
+        return completed;
     }
 
     fn handleFopen(self: *MachOState) ?u64 {
         const path = self.guestCString(self.regs.rdi, 4096) orelse return null;
         const mode = self.guestCString(self.regs.rsi, 32) orelse return null;
         const flags = parseFopenFlags(mode) orelse return null;
+        var temp_buf: [4096]u8 = undefined;
+        var translated_path: []const u8 = path;
+        if (self.fs_forwarder.resolveHostPath(path, &temp_buf)) |t| {
+            translated_path = t;
+        }
         var path_buf = std.ArrayList(u8).empty;
         defer path_buf.deinit(self.allocator);
-        path_buf.appendSlice(self.allocator, path) catch return null;
+        path_buf.appendSlice(self.allocator, translated_path) catch return null;
         path_buf.append(self.allocator, 0) catch return null;
         const zpath: [*:0]const u8 = @ptrCast(path_buf.items.ptr);
-        const fd = std.c.open(zpath, @bitCast(@as(u32, @intCast(flags))), @as(c_int, 0o666));
-        if (fd < 0) return null;
+        const oflags: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+        var fd = std.c.open(zpath, oflags, @as(c_int, 0o666));
+        if (fd < 0) {
+            const err = std.c.errno(fd);
+            if (self.fs_forwarder.tryOpenFallback(translated_path, oflags, 0o666, err)) |fallback_fd| {
+                fd = fallback_fd;
+            } else {
+                return null;
+            }
+        }
         return self.allocGuestFile(fd, .regular);
     }
 
@@ -5675,6 +5799,60 @@ pub const MachOState = struct {
         return element_count;
     }
 
+    fn handleFread(self: *MachOState) u64 {
+        const element_size = self.regs.rsi;
+        const element_count = self.regs.rdx;
+        if (element_size == 0 or element_count == 0) return 0;
+        const byte_count = std.math.mul(u64, element_size, element_count) catch {
+            self.setGuestErrno(@intFromEnum(std.c.E.OVERFLOW));
+            self.guest_stdio_failures +|= 1;
+            return 0;
+        };
+        const destination = self.guestMemory(self.regs.rdi, byte_count) orelse {
+            self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
+            self.guest_stdio_failures +|= 1;
+            std.debug.print("macho-processor: fread rejected: destination=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
+            return 0;
+        };
+        const file = self.guestFileFromHandle(self.regs.rcx) orelse {
+            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
+            self.guest_stdio_failures +|= 1;
+            std.debug.print("macho-processor: fread rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
+            return 0;
+        };
+        if (file.fd < 0) {
+            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
+            file.error_flag = true;
+            self.guest_stdio_failures +|= 1;
+            return 0;
+        }
+
+        const initial_position = file.position;
+        var bytes_read: usize = 0;
+        while (bytes_read < destination.len) {
+            const result = std.c.read(file.fd, destination.ptr + bytes_read, destination.len - bytes_read);
+            if (result < 0) {
+                self.setGuestErrno(@intCast(@intFromEnum(std.c.errno(result))));
+                file.error_flag = true;
+                self.guest_stdio_failures +|= 1;
+                break;
+            }
+            if (result == 0) break;
+            bytes_read += @intCast(result);
+        }
+        file.position += @intCast(bytes_read);
+        self.guest_stdio_read_count +|= 1;
+        self.guest_stdio_read_bytes +|= bytes_read;
+        const complete_elements = bytes_read / @as(usize, @intCast(element_size));
+        if (self.guest_stdio_read_count <= 8 or self.guest_stdio_read_count % 1000 == 0) {
+            std.debug.print(
+                "macho-processor: fread #{d}: FILE=0x{x} host_fd={d} position={d}->{d} requested={d} read={d} elements={d}/{d}\n",
+                .{ self.guest_stdio_read_count, self.regs.rcx, file.fd, initial_position, file.position, byte_count, bytes_read, complete_elements, element_count },
+            );
+        }
+        return complete_elements;
+    }
+
     fn handleFflush(self: *MachOState) u64 {
         if (self.regs.rdi == 0) return 0;
         const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
@@ -5694,13 +5872,27 @@ pub const MachOState = struct {
         const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
         const offset: i64 = @bitCast(self.regs.rsi);
         const whence: i32 = @intCast(self.regs.rdx);
-        if (file.fd < 0) return @bitCast(@as(i64, -1));
+        self.guest_stdio_seek_count +|= 1;
+        if (file.fd < 0) {
+            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
+            self.guest_stdio_failures +|= 1;
+            return @bitCast(@as(i64, -1));
+        }
+        const initial_position = file.position;
         const pos = std.c.lseek(file.fd, offset, whence);
         if (pos < 0) {
+            self.setGuestErrno(@intCast(@intFromEnum(std.c.errno(pos))));
             file.error_flag = true;
+            self.guest_stdio_failures +|= 1;
             return @bitCast(@as(i64, -1));
         }
         file.position = pos;
+        if (self.guest_stdio_seek_count <= 8 or self.guest_stdio_seek_count % 1000 == 0) {
+            std.debug.print(
+                "macho-processor: fseek #{d}: FILE=0x{x} host_fd={d} position={d}->{d} offset={d} whence={d}\n",
+                .{ self.guest_stdio_seek_count, self.regs.rdi, file.fd, initial_position, pos, offset, whence },
+            );
+        }
         return 0;
     }
 
@@ -6150,6 +6342,12 @@ pub const MachOState = struct {
     }
 
     fn setupMachOState(self: *MachOState, path: []const u8, args: []const []const u8) void {
+        std.debug.print("ROSETTE: setupMachOState called with path: '{s}'\n", .{path});
+        std.debug.print("ROSETTE: Argument count: {d}\n", .{args.len});
+        for (args, 0..) |arg, i| {
+            std.debug.print("ROSETTE:   argv[{d}] = '{s}'\n", .{ i, arg });
+        }
+
         self.configureGuestLogMirror(args);
         self.launch_options.configure(args);
         var argument_index: usize = 0;
@@ -6164,16 +6362,28 @@ pub const MachOState = struct {
                 self.fs_forwarder.configurePaths(argument[prefix.len..]);
                 break;
             }
+            if (std.mem.eql(u8, argument, "--fs-fallback") and argument_index + 1 < args.len) {
+                self.fs_forwarder.addFallbackRoot(args[argument_index + 1]);
+            }
+            const fb_prefix = "--fs-fallback=";
+            if (std.mem.startsWith(u8, argument, fb_prefix)) {
+                self.fs_forwarder.addFallbackRoot(argument[fb_prefix.len..]);
+            }
         }
         var full_args = std.ArrayList([]const u8).empty;
         defer full_args.deinit(self.allocator);
         full_args.append(self.allocator, path) catch {};
         for (args) |a| full_args.append(self.allocator, a) catch {};
 
+        std.debug.print("ROSETTE: Full argv count (including path): {d}\n", .{full_args.items.len});
+        std.debug.print("ROSETTE: Entry point vaddr: 0x{x}\n", .{self.entry_point_vaddr});
+
         self.trace_range_start = 0x1332000;
         self.trace_range_end = 0x1333000;
         self.setupInitialStack(full_args.items);
         self.regs.rip = self.entry_point_vaddr;
+
+        std.debug.print("ROSETTE: setupMachOState complete - RIP set to 0x{x}\n", .{self.regs.rip});
     }
 
     fn initializerAbi(self: *const MachOState) initialization_resolution.AbiSnapshot {
@@ -6401,6 +6611,8 @@ pub const MachOState = struct {
         if (self.metadata.initializer_addresses.len == 0) return true;
 
         const launch_regs = self.regs;
+        self.export_table_lc.enterPhase(.initializers_in_progress);
+
         var pending: std.ArrayList(usize) = .empty;
         defer pending.deinit(self.allocator);
         var next_pending: std.ArrayList(usize) = .empty;
@@ -6420,8 +6632,79 @@ pub const MachOState = struct {
             }
         }
 
+        self.export_table_lc.enterPhase(.exports_resolved);
+
+        if (pending.items.len != 0) {
+            var growth_buf: [4]export_table_lifecycle.VectorGrowthRequest = undefined;
+            const growth_count = self.export_table_lc.popGrowthRequests(&growth_buf);
+            if (growth_count > 0) {
+                std.debug.print(
+                    "macho-processor: pre-populating {d} export vector(s) before retry pass\n",
+                    .{growth_count},
+                );
+            }
+            for (growth_buf[0..growth_count]) |req| {
+                const var_name = std.mem.sliceTo(&req.variable_name, 0);
+                const current_size = if (self.guestMemoryConst(req.vector_address, 16) != null)
+                    self.read32(req.vector_address)
+                else
+                    0;
+                std.debug.print(
+                    "macho-processor:   pre-populating vector={s} at 0x{x} current_size={d} needed_size={d} element_size={d}\n",
+                    .{ var_name, req.vector_address, current_size, req.needed_size, req.element_size },
+                );
+                if (current_size >= req.needed_size) {
+                    std.debug.print(
+                        "macho-processor:   vector already has enough entries ({d} >= {d}); skipping growth\n",
+                        .{ current_size, req.needed_size },
+                    );
+                    continue;
+                }
+                if (current_size > 0) {
+                    std.debug.print(
+                        "macho-processor:   vector has {d} entries but needs {d}; growing\n",
+                        .{ current_size, req.needed_size },
+                    );
+                }
+                const dummy_item = self.memory_forwarder.allocate(self, req.element_size, 16) orelse {
+                    std.debug.print(
+                        "macho-processor:   failed to allocate dummy item for vector pre-population\n",
+                        .{},
+                    );
+                    continue;
+                };
+                {
+                    const slice = self.guestMemory(dummy_item, req.element_size) orelse {
+                        std.debug.print(
+                            "macho-processor:   dummy item memory not writable after allocation\n",
+                            .{},
+                        );
+                        continue;
+                    };
+                    @memset(slice, 0);
+                }
+                const item_addr = dummy_item;
+                var append_count: u32 = 0;
+                while (self.read32(req.vector_address) < req.needed_size) {
+                    if (!self.appendTrivialVector(req.vector_address, item_addr, req.element_size, req.needed_size)) {
+                        std.debug.print(
+                            "macho-processor:   appendTrivialVector failed after {d} appends\n",
+                            .{append_count},
+                        );
+                        break;
+                    }
+                    append_count += 1;
+                }
+                std.debug.print(
+                    "macho-processor:   vector pre-population: appended {d} entries, new size={d}\n",
+                    .{ append_count, self.read32(req.vector_address) },
+                );
+            }
+        }
+
         var retry_round: u8 = 0;
         while (pending.items.len != 0 and retry_round < 3) : (retry_round += 1) {
+            self.export_table_lc.retry_pass = retry_round + 1;
             std.debug.print(
                 "macho-processor: retrying {d} deferred initializer(s), pass {d}\n",
                 .{ pending.items.len, retry_round + 1 },
@@ -6433,6 +6716,7 @@ pub const MachOState = struct {
                     .failed => return false,
                 }
             }
+            self.export_table_lc.onRetryPass(retry_round + 1);
             pending.clearRetainingCapacity();
             std.mem.swap(std.ArrayList(usize), &pending, &next_pending);
         }
@@ -8255,6 +8539,36 @@ pub const MachOState = struct {
         while (!self.terminated and stepBudgetAllows(self.max_steps, steps)) : (steps +|= 1) {
             self.executed_steps = steps;
 
+            // Never interpret the register file after the cooperative
+            // scheduler has parked its owner. A zero active handle means the
+            // registers are merely the last saved context, not executable
+            // work. Try real queued work once, then stop with a precise
+            // invariant failure instead of manufacturing millions of steps.
+            if (self.cooperative_ui_context != null and self.active_guest_thread == 0) {
+                const started_idle = self.pendingGtkIdleCallbackCount() != 0 and
+                    self.startNextGtkIdleCallback("zero-active run guard", true);
+                const resumed_worker = !started_idle and self.resumeSuspendedGuestThread();
+                if (!started_idle and !resumed_worker) {
+                    self.scheduler_log.emit(.{
+                        .kind = .deadlock,
+                        .step = steps,
+                        .thread = 0,
+                        .runnable = self.pthreads.activeCount(),
+                        .blocked = self.pthreads.blocked_threads,
+                        .reason = "zero_active_guest_thread",
+                    });
+                    std.debug.print(
+                        "macho-processor: runtime invariant failure: no active or runnable guest thread; refusing stale-register execution rip=0x{x} suspended={d} blocked={d} pending_gtk={d}\n",
+                        .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pendingGtkIdleCallbackCount() },
+                    );
+                    self.faulted = true;
+                    self.exit_code = 125;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+                    self.terminated = true;
+                    break;
+                }
+            }
+
             // Update scheduler step
             // self.thread_scheduler.updateStep(steps);
 
@@ -8325,10 +8639,21 @@ pub const MachOState = struct {
                 self.pthreads.diagnoseStuck(steps, self.regs.rip);
                 self.pumpNativeWindowEvents();
                 self.logCooperativeHeartbeat();
+                self.pthreads.profileThreadStates(&self.wait_profiler, steps, self.active_guest_thread);
             }
             if (self.concise_output and steps != 0 and steps % 100_000_000 == 0) {
-                var progress_buffer: [96]u8 = undefined;
-                const progress = std.fmt.bufPrint(&progress_buffer, "Instruction count: {d}\n", .{steps}) catch "";
+                var progress_buffer: [256]u8 = undefined;
+                const progress = std.fmt.bufPrint(
+                    &progress_buffer,
+                    "Translated instructions: {d} (activity only, not application progress; runnable={d} blocked={d} condvar_waits={d} quiescence_recoveries={d})\n",
+                    .{
+                        steps,
+                        self.pthreads.activeCount(),
+                        self.pthreads.blocked_threads,
+                        self.pthreads.collapsed_waits,
+                        self.cooperative_quiescence_recoveries,
+                    },
+                ) catch "";
                 _ = hostWriteFdAll(1, progress);
                 self.scheduler_log.emit(.{
                     .kind = .runnable_count,
@@ -10410,6 +10735,15 @@ pub const MachOState = struct {
         self.executeHighwayImmediate(d, .bit_and, d.size, false);
     }
 
+    fn resolveSyscallFd(self: *MachOState, guest_fd: u64) i32 {
+        if (guest_fd < self.guest_fds.len) {
+            const host = self.guest_fds[@as(usize, @intCast(guest_fd))];
+            if (host >= 0) return host;
+        }
+        if (self.fs_forwarder.fd_manager.hostFd(guest_fd)) |host| return host;
+        return -1;
+    }
+
     fn dispatchMacOSSyscall(self: *MachOState, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) void {
         const number = self.regs.rax;
         log.info("syscall: number=0x{x} ({s}) args=({d}, {d}, {d}, {d}, {d}, {d})", .{
@@ -10427,6 +10761,53 @@ pub const MachOState = struct {
                 self.terminated = true;
                 self.exit_code = exit_code;
             },
+            @intFromEnum(macho_runtime.Syscall.open) => {
+                const path = self.guestCString(arg1, 4096) orelse {
+                    self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
+                    return;
+                };
+                var temp_buf: [4096]u8 = undefined;
+                var translated_path = path;
+                if (self.fs_forwarder.resolveHostPath(path, &temp_buf)) |t| {
+                    translated_path = t;
+                }
+                var path_buf: [4096]u8 = undefined;
+                const plen = @min(translated_path.len, path_buf.len - 1);
+                @memcpy(path_buf[0..plen], translated_path[0..plen]);
+                path_buf[plen] = 0;
+                const oflags: std.c.O = @bitCast(@as(u32, @truncate(arg2)));
+                const mode: std.c.mode_t = @intCast(arg3 & 0xFFFF);
+                var host_fd = std.c.open(@as([*:0]const u8, @ptrCast(&path_buf)), oflags, mode);
+                if (host_fd < 0) {
+                    const err = std.c.errno(host_fd);
+                    if (err == .NOENT) {
+                        if (self.fs_forwarder.tryOpenFallback(translated_path, oflags, @as(u32, @intCast(arg3)), err)) |fallback_fd| {
+                            host_fd = fallback_fd;
+                        }
+                    }
+                    if (host_fd < 0) {
+                        self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
+                        return;
+                    }
+                }
+                const guest_fd = self.fs_forwarder.fd_manager.register(host_fd, .file) orelse {
+                    _ = std.c.close(host_fd);
+                    self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
+                    return;
+                };
+                if (guest_fd < self.guest_fds.len) {
+                    self.guest_fds[@as(usize, @intCast(guest_fd))] = host_fd;
+                }
+                self.regs.rax = guest_fd;
+            },
+            @intFromEnum(macho_runtime.Syscall.close) => {
+                const close_guest_fd = arg1;
+                if (close_guest_fd < self.guest_fds.len) {
+                    self.guest_fds[@as(usize, @intCast(close_guest_fd))] = -1;
+                }
+                const rc = self.fs_forwarder.fd_manager.close(close_guest_fd);
+                self.regs.rax = if (rc < 0) std.math.maxInt(u64) else 0;
+            },
             @intFromEnum(macho_runtime.Syscall.write) => {
                 const fd = arg1;
                 const buf = arg2;
@@ -10435,7 +10816,7 @@ pub const MachOState = struct {
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFE;
                     return;
                 };
-                const host_fd: i32 = if (fd < self.guest_fds.len) self.guest_fds[@as(usize, @intCast(fd))] else -1;
+                const host_fd = self.resolveSyscallFd(fd);
                 var written: usize = 0;
                 if (host_fd >= 0) {
                     while (written < data.len) {
@@ -10457,7 +10838,7 @@ pub const MachOState = struct {
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFE;
                     return;
                 };
-                const host_fd: i32 = if (fd < self.guest_fds.len) self.guest_fds[@as(usize, @intCast(fd))] else -1;
+                const host_fd = self.resolveSyscallFd(fd);
                 if (host_fd >= 0) {
                     const n = std.c.read(host_fd, data.ptr, data.len);
                     if (n < 0) {
@@ -10696,6 +11077,25 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     defer temp_state.deinit();
 
     std.debug.print("macho-processor: {s}\n", .{options.path});
+    std.debug.print("ROSETTE: Loading MachO binary: '{s}'\n", .{options.path});
+    if (std.mem.endsWith(u8, options.path, ".iso")) {
+        std.debug.print("ROSETTE: WARNING: .iso file detected - this may indicate incorrect routing\n", .{});
+    }
+    const image_fingerprint = std.hash.Wyhash.hash(0, slice);
+    const has_xbdm_diagnostics = std.mem.indexOf(
+        u8,
+        slice,
+        "[XBDM export diagnostics] table initialized:",
+    ) != null;
+    std.debug.print(
+        "macho-processor: image identity: bytes={d} wyhash64={x:0>16} xbdm_diagnostics={} bundle_executable={}\n",
+        .{
+            slice.len,
+            image_fingerprint,
+            has_xbdm_diagnostics,
+            std.mem.indexOf(u8, options.path, ".app/Contents/MacOS/") != null,
+        },
+    );
     std.debug.print("  filetype: 0x{x}", .{temp_state.header.filetype});
     switch (temp_state.header.filetype) {
         2 => std.debug.print(" (MH_EXECUTE)\n", .{}),
@@ -10766,9 +11166,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.guest_fds[1] = 1;
     state.guest_fds[2] = 2;
 
+    std.debug.print("ROSETTE: About to setup MachO state for path: '{s}'\n", .{options.path});
+    std.debug.print("ROSETTE: This confirms Rosetta is routing Xenia through compatibility layer\n", .{});
     output.human("Initializing pthread runtime...\n", .{});
     state.setupMachOState(options.path, options.args);
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
+    std.debug.print("ROSETTE: MachO state setup completed successfully\n", .{});
 
     state.startup.enter(.static_init, state.executed_steps);
     output.human("Initializing guest runtime...\n", .{});
@@ -10785,6 +11188,9 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.libcxx_streams.logSummary();
         state.logging.logSummary();
         state.backend_diagnostics.logSummary();
+        state.export_table_mgr.logSummary();
+        state.export_table_lc.logSummary();
+        state.export_registry.logSummary();
         state.pthreads.logSummary();
         state.logCooperativeSchedulerSummary();
         state.memory_forwarder.logSummary();
@@ -10852,6 +11258,24 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         std.debug.print(
             "macho-processor: synchronous guest log bridge: mirrored_lines={d}\n",
             .{state.guest_log_line_count},
+        );
+    }
+    if (state.guest_stdio_write_count != 0) {
+        std.debug.print(
+            "macho-processor: guest stdio capture: writes={d} stdout_bytes={d} stderr_bytes={d} log_mirror_active={} mirror_failures={d}\n",
+            .{
+                state.guest_stdio_write_count,
+                state.guest_stdout_byte_count,
+                state.guest_stderr_byte_count,
+                state.guest_log_mirror_fd >= 0,
+                state.guest_stdio_mirror_failures,
+            },
+        );
+    }
+    if (state.guest_stdio_read_count != 0 or state.guest_stdio_seek_count != 0 or state.guest_stdio_failures != 0) {
+        std.debug.print(
+            "macho-processor: guest stdio input: reads={d} bytes={d} seeks={d} failures={d}\n",
+            .{ state.guest_stdio_read_count, state.guest_stdio_read_bytes, state.guest_stdio_seek_count, state.guest_stdio_failures },
         );
     }
 
@@ -10956,22 +11380,18 @@ const convertVexFloatToSigned = decoder.convertVexFloatToSigned;
 const integerIndefinite = decoder.integerIndefinite;
 const duplicateVectorElements = decoder.duplicateVectorElements;
 
-/// Darwin's `_SC_PAGESIZE` selector is 29. Keep this guest-facing instead of
-/// forwarding to the ARM64 host so generated x86 code observes the page
-/// geometry used by Rosette's Mach-O address space.
+/// Darwin's `_SC_PAGESIZE` selector is 29. Process-level page queries describe
+/// the VM syscall contract, not Rosette's finer-grained guest metadata.
 fn guestSysconf(selector: i32) u64 {
-    return switch (selector) {
-        29 => 4096,
-        else => @bitCast(@as(i64, -1)),
-    };
+    return guest_memory_geometry.darwinSysconf(selector) orelse @bitCast(@as(i64, -1));
 }
 
 fn sdlCompatibilityVersion() [3]u8 {
     return .{ 2, 0, 0 };
 }
 
-test "Darwin sysconf reports Rosette guest page size" {
-    try std.testing.expectEqual(@as(u64, 4096), guestSysconf(29));
+test "Darwin sysconf reports the host VM page contract" {
+    try std.testing.expectEqual(guest_memory_geometry.host_vm_page_size, guestSysconf(29));
     try std.testing.expectEqual(std.math.maxInt(u64), guestSysconf(-1));
     try std.testing.expectEqual(std.math.maxInt(u64), guestSysconf(9999));
 }

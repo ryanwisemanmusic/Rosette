@@ -118,6 +118,8 @@ const Thread = struct {
     wait_address: u64 = 0,
     wait_result: WaitResult = .pending,
     spurious_wake_pending: bool = false,
+    last_spurious_condvar: u64 = 0,
+    last_spurious_generation: u64 = 0,
     priority: i32 = 0,
     numeric_id: u64 = 0,
 };
@@ -241,6 +243,10 @@ pub const Runtime = struct {
             self.condition_notifications +|= 1;
             self.condition_broadcasts +|= 1;
             self.condvarBroadcast(state.regs.rdi);
+            return .handled_void;
+        }
+        if (std.mem.eql(u8, name, "__ZNSt3__119__shared_mutex_baseC1Ev")) {
+            // __shared_mutex_base constructor is a no-op in single-threaded execution
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "__ZNSt3__15mutex4lockEv")) {
@@ -675,11 +681,15 @@ pub const Runtime = struct {
 
     /// POSIX condition waits may return spuriously. Use that latitude only
     /// when no modeled thread is runnable and no finite deadline can make
-    /// progress. Each wait instance is eligible at most once.
+    /// progress. A condition generation is eligible at most once per thread;
+    /// repeatedly leaving and re-entering the same predicate loop without a
+    /// real notification must not become a synthetic busy loop.
     pub fn wakeOldestCondvarForQuiescence(self: *Runtime, preferred_handle: u64, current_step: u64) ?u64 {
         var selected: ?*Thread = null;
         for (&self.threads) |*thread| {
             if (!thread.active or thread.state != .waiting_condvar or thread.spurious_wake_pending) continue;
+            if (thread.waiting_condvar == thread.last_spurious_condvar and
+                thread.wait_generation == thread.last_spurious_generation) continue;
             if (thread.waiting_mutex != 0 and self.mutexWouldBlock(thread.waiting_mutex, thread.handle)) continue;
             if (thread.handle == preferred_handle) {
                 selected = thread;
@@ -689,6 +699,8 @@ pub const Runtime = struct {
         }
         const thread = selected orelse return null;
         thread.spurious_wake_pending = true;
+        thread.last_spurious_condvar = thread.waiting_condvar;
+        thread.last_spurious_generation = thread.wait_generation;
         self.quiescence_spurious_wakes +|= 1;
         self.emit(.{
             .kind = .quiescence_recovery,
@@ -894,6 +906,14 @@ pub const Runtime = struct {
         const cv = self.condvarForAddress(address) orelse return 0;
         if (cv.waiters != 0) return 16;
         cv.* = .{};
+        // Reusing a destroyed condition object's address starts a new
+        // synchronization lifetime, so old spurious-wake history must not
+        // suppress the new object.
+        for (&self.threads) |*thread| {
+            if (thread.last_spurious_condvar != address) continue;
+            thread.last_spurious_condvar = 0;
+            thread.last_spurious_generation = 0;
+        }
         return 0;
     }
 
@@ -1043,6 +1063,41 @@ pub const Runtime = struct {
             if (cv.active and cv.address == address) return cv;
         }
         return null;
+    }
+
+    pub fn profileThreadStates(
+        self: *const Runtime,
+        profiler: anytype,
+        current_step: u64,
+        _: u64,
+    ) void {
+        var active_buf: [64]u8 = [_]u8{0} ** 64;
+        var handle_buf: [64]u64 = [_]u64{0} ** 64;
+        var state_buf: [64]u8 = [_]u8{0} ** 64;
+        var blocked_buf: [64]u64 = [_]u64{0} ** 64;
+        var cv_buf: [64]u64 = [_]u64{0} ** 64;
+        var mutex_buf: [64]u64 = [_]u64{0} ** 64;
+        var deadline_buf: [64]u64 = [_]u64{0} ** 64;
+        for (&self.threads, 0..) |*t, i| {
+            active_buf[i] = @intFromBool(t.active);
+            handle_buf[i] = t.handle;
+            state_buf[i] = @intFromEnum(t.state);
+            blocked_buf[i] = t.blocked_since_step;
+            cv_buf[i] = t.waiting_condvar;
+            mutex_buf[i] = t.waiting_mutex;
+            deadline_buf[i] = t.wait_deadline_nanoseconds;
+        }
+        profiler.checkAndNudge(
+            &active_buf,
+            &handle_buf,
+            &state_buf,
+            &blocked_buf,
+            &cv_buf,
+            &mutex_buf,
+            &deadline_buf,
+            current_step,
+            0,
+        );
     }
 };
 
@@ -1450,6 +1505,16 @@ test "global quiescence grants one POSIX spurious wake to oldest condvar waiter"
     try std.testing.expectEqual(second, runtime.wakeOldestCondvarForQuiescence(second, 101).?);
     try std.testing.expect(runtime.threads[1].spurious_wake_pending);
     try std.testing.expect(runtime.wakeOldestCondvarForQuiescence(0, 102) == null);
+
+    // Returning to the same predicate wait without a signal does not mint an
+    // unlimited stream of artificial work.
+    runtime.threads[0].spurious_wake_pending = false;
+    runtime.threads[1].spurious_wake_pending = false;
+    try std.testing.expect(runtime.wakeOldestCondvarForQuiescence(0, 103) == null);
+
+    // A genuine condition generation change makes a later wait eligible.
+    runtime.threads[0].wait_generation = 1;
+    try std.testing.expectEqual(first, runtime.wakeOldestCondvarForQuiescence(0, 104).?);
 }
 
 test "thread state transitions" {

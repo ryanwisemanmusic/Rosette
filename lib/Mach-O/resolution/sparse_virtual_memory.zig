@@ -1,10 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const guest_memory_geometry = @import("guest_memory_geometry.zig");
 
 extern "c" fn mprotect(addr: [*]align(std.heap.page_size_min) u8, len: usize, prot: c_int) c_int;
 
 pub const PAGE_64K: u64 = 64 * 1024;
-pub const PAGE_4K: u64 = 4 * 1024;
+pub const PAGE_4K: u64 = guest_memory_geometry.guest_page_size;
 pub const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 
 const PROT_READ: u32 = 0x1;
@@ -28,11 +29,34 @@ fn hostBackingFlags(guest_flags: u32) u32 {
     return guest_flags;
 }
 
+fn fileOffsetIsHostAligned(offset: u64) bool {
+    return offset % guest_memory_geometry.host_vm_page_size == 0;
+}
+
 pub fn pageRoundedLength(length: u64) ?u64 {
     if (length == 0) return null;
     const page_size: u64 = std.heap.page_size_min;
     const with_padding = std.math.add(u64, length, page_size - 1) catch return null;
     return with_padding & ~(page_size - 1);
+}
+
+const HostPageSpan = struct {
+    offset: usize,
+    length: usize,
+};
+
+/// Converts an exact guest protection range into the containing host-page
+/// span. On Apple Silicon a valid 4 KiB x86 guest page often begins inside a
+/// 16 KiB host page; only the host syscall span is widened.
+fn hostPageSpan(offset: usize, length: usize, capacity: usize) ?HostPageSpan {
+    if (length == 0) return null;
+    const page_size = std.heap.page_size_min;
+    const end = std.math.add(usize, offset, length) catch return null;
+    const rounded_end_input = std.math.add(usize, end, page_size - 1) catch return null;
+    const aligned_offset = offset & ~(page_size - 1);
+    const aligned_end = rounded_end_input & ~(page_size - 1);
+    if (aligned_end > capacity or aligned_end <= aligned_offset) return null;
+    return .{ .offset = aligned_offset, .length = aligned_end - aligned_offset };
 }
 
 const Mapping = struct {
@@ -47,7 +71,7 @@ const Mapping = struct {
 
 const Activation = struct {
     guest_base: u64,
-    memory: []align(std.heap.page_size_min) u8,
+    memory: []u8,
     readable: bool,
     writable: bool,
     executable: bool,
@@ -72,7 +96,7 @@ pub const Manager = struct {
     }
 
     pub fn mapFile(self: *Manager, guest_base: u64, length: u64, prot_raw: u32, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) bool {
-        if (length == 0 or (guest_base % PAGE_4K != 0) or offset % std.heap.page_size_min != 0) return false;
+        if (length == 0 or (guest_base % PAGE_4K != 0) or !fileOffsetIsHostAligned(offset)) return false;
         const end = std.math.add(u64, guest_base, length) catch return false;
         for (self.mappings.items) |mapping| {
             const mapping_end = mapping.guest_base + mapping.memory.len;
@@ -121,7 +145,7 @@ pub const Manager = struct {
         maximum_end_exclusive: ?u64,
     ) ?u64 {
         if (length == 0) return null;
-        if (host_fd >= 0 and offset % std.heap.page_size_min != 0) return null;
+        if (host_fd >= 0 and !fileOffsetIsHostAligned(offset)) return null;
         const effective_length = pageRoundedLength(length) orelse return null;
         const length_usize = std.math.cast(usize, effective_length) orelse return null;
         const host_prot_raw = hostBackingProtection(prot_raw);
@@ -186,6 +210,13 @@ pub const Manager = struct {
     pub fn mapFixed(self: *Manager, guest_base: u64, length: u64, prot_raw: u32, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) bool {
         if (length == 0 or guest_base % std.heap.page_size_min != 0) {
             std.debug.print("macho-processor: sparse fixed mmap rejected: reason=invalid_length_or_alignment guest_base=0x{x} length={d} required_alignment={d}\n", .{ guest_base, length, std.heap.page_size_min });
+            return false;
+        }
+        if (host_fd >= 0 and !fileOffsetIsHostAligned(offset)) {
+            std.debug.print(
+                "macho-processor: sparse fixed mmap rejected: reason=file_offset_not_host_page_aligned offset=0x{x} host_page_size={d} guest_tracking_page={d}; verify getpagesize/sysconf use the Darwin VM contract\n",
+                .{ offset, guest_memory_geometry.host_vm_page_size, guest_memory_geometry.guest_page_size },
+            );
             return false;
         }
         const end = std.math.add(u64, guest_base, length) catch {
@@ -435,11 +466,31 @@ pub const Manager = struct {
             const mapping_end = mapping.guest_base + mapping.memory.len;
             if (guest_base >= mapping.guest_base and end <= mapping_end) {
                 const offset = @as(usize, @intCast(guest_base - mapping.guest_base));
-                const page_aligned = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(&mapping.memory[offset])));
-                const host_prot_raw = hostBackingProtection(prot_raw);
-                if (mprotect(page_aligned, @intCast(length), @as(c_int, @intCast(host_prot_raw))) != 0) return false;
+                const requested_length = std.math.cast(usize, length) orelse return false;
+                const host_span = hostPageSpan(offset, requested_length, mapping.memory.len) orelse return false;
+                const page_aligned = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(mapping.memory.ptr + host_span.offset)));
+                var effective_guest_prot = prot_raw;
                 if (mapping.is_reservation) {
-                    const active_memory = @as([]align(std.heap.page_size_min) u8, @alignCast(mapping.memory[offset..][0..@intCast(length)]));
+                    const host_guest_start = mapping.guest_base + host_span.offset;
+                    const host_guest_end = host_guest_start + host_span.length;
+                    for (self.activations.items) |active| {
+                        const active_end = active.guest_base +| active.memory.len;
+                        if (active.guest_base >= host_guest_end or active_end <= host_guest_start) continue;
+                        if (active.readable) effective_guest_prot |= PROT_READ;
+                        if (active.writable) effective_guest_prot |= PROT_WRITE;
+                        if (active.executable) effective_guest_prot |= PROT_EXEC;
+                    }
+                }
+                const host_prot_raw = hostBackingProtection(effective_guest_prot);
+                if (mprotect(page_aligned, host_span.length, @as(c_int, @intCast(host_prot_raw))) != 0) return false;
+                if (host_span.offset != offset or host_span.length != requested_length) {
+                    std.debug.print(
+                        "macho-processor: sparse guest protection normalized: guest_base=0x{x} guest_length={d} guest_page={d} host_offset=0x{x} host_length={d} host_page={d} prot=0x{x}; exact guest permissions retained in metadata\n",
+                        .{ guest_base, length, PAGE_4K, host_span.offset, host_span.length, std.heap.page_size_min, prot_raw },
+                    );
+                }
+                if (mapping.is_reservation) {
+                    const active_memory = mapping.memory[offset..][0..requested_length];
                     self.appendActivation(guest_base, active_memory, prot_raw) catch return false;
                 } else {
                     mapping.readable = prot_raw & 1 != 0;
@@ -556,8 +607,21 @@ pub const Manager = struct {
             }
             if (!found_exact) return false;
             const offset: usize = @intCast(guest_base - mapping.guest_base);
-            const memory = @as([]align(std.heap.page_size_min) u8, @alignCast(mapping.memory[offset..][0..@intCast(length)]));
-            if (mprotect(memory.ptr, memory.len, 0) != 0) return false;
+            const requested_length = std.math.cast(usize, length) orelse return false;
+            const host_span = hostPageSpan(offset, requested_length, mapping.memory.len) orelse return false;
+            const host_guest_start = mapping.guest_base + host_span.offset;
+            const host_guest_end = host_guest_start + host_span.length;
+            var remaining_guest_prot: u32 = 0;
+            for (self.activations.items) |active| {
+                const active_end = active.guest_base +| active.memory.len;
+                if (active.guest_base >= guest_base and active_end <= end) continue;
+                if (active.guest_base >= host_guest_end or active_end <= host_guest_start) continue;
+                if (active.readable) remaining_guest_prot |= PROT_READ;
+                if (active.writable) remaining_guest_prot |= PROT_WRITE;
+                if (active.executable) remaining_guest_prot |= PROT_EXEC;
+            }
+            const host_memory = @as([]align(std.heap.page_size_min) u8, @alignCast(mapping.memory[host_span.offset..][0..host_span.length]));
+            if (mprotect(host_memory.ptr, host_memory.len, @intCast(hostBackingProtection(remaining_guest_prot))) != 0) return false;
             self.removeActivationsWithin(guest_base, length);
             return true;
         }
@@ -603,7 +667,7 @@ pub const Manager = struct {
         return null;
     }
 
-    fn appendActivation(self: *Manager, guest_base: u64, memory: []align(std.heap.page_size_min) u8, prot_raw: u32) !void {
+    fn appendActivation(self: *Manager, guest_base: u64, memory: []u8, prot_raw: u32) !void {
         // Newer mprotect calls supersede older permission records for the same
         // exact span. Reverse lookup below also handles contained updates.
         try self.activations.append(self.allocator, .{
@@ -665,8 +729,11 @@ pub const Manager = struct {
             const mapping_end = mapping.guest_base + mapping.memory.len;
             if (guest_base < mapping.guest_base or end > mapping_end) continue;
             const offset: usize = @intCast(guest_base - mapping.guest_base);
-            const memory = @as([]align(std.heap.page_size_min) u8, @alignCast(mapping.memory[offset..][0..@intCast(length)]));
-            if (mprotect(memory.ptr, memory.len, @as(c_int, @intCast(prot_raw))) != 0) return false;
+            const requested_length = std.math.cast(usize, length) orelse return false;
+            const host_span = hostPageSpan(offset, requested_length, mapping.memory.len) orelse return false;
+            const host_memory = @as([]align(std.heap.page_size_min) u8, @alignCast(mapping.memory[host_span.offset..][0..host_span.length]));
+            if (mprotect(host_memory.ptr, host_memory.len, @as(c_int, @intCast(hostBackingProtection(prot_raw)))) != 0) return false;
+            const memory = mapping.memory[offset..][0..requested_length];
             self.appendActivation(guest_base, memory, prot_raw) catch return false;
             return true;
         }
@@ -694,6 +761,13 @@ fn isRecoverableFixedMmapFailure(err: anyerror) bool {
 
 test "64K guest mapping alignment is explicit" {
     try std.testing.expectEqual(@as(u64, 65536), PAGE_64K);
+}
+
+test "file-backed offsets use Darwin VM alignment rather than guest tracking alignment" {
+    try std.testing.expect(fileOffsetIsHostAligned(guest_memory_geometry.host_vm_page_size));
+    if (guest_memory_geometry.host_vm_page_size > PAGE_4K) {
+        try std.testing.expect(!fileOffsetIsHostAligned(PAGE_4K));
+    }
 }
 
 test "fixed anonymous guest range uses independent host backing" {
@@ -736,6 +810,15 @@ test "mmap length is rounded to the Darwin host page" {
     try std.testing.expectEqual(@as(?u64, std.heap.page_size_min), pageRoundedLength(std.heap.page_size_min - 1));
     try std.testing.expectEqual(@as(?u64, 0x2000_0000), pageRoundedLength(0x1FFF_FFFF));
     try std.testing.expectEqual(@as(?u64, 0x1000_0000), pageRoundedLength(0x0FFF_FFFF));
+}
+
+test "guest protection range is widened only at the host syscall boundary" {
+    const host_page = std.heap.page_size_min;
+    const guest_page: usize = @intCast(PAGE_4K);
+    const guest_offset: usize = if (host_page > guest_page) guest_page else 0;
+    const span = hostPageSpan(guest_offset, guest_page, host_page * 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), span.offset);
+    try std.testing.expectEqual(host_page, span.length);
 }
 
 test "backend hint mapping enforces a low 32-bit result window" {
@@ -794,6 +877,21 @@ test "partial activation and fixed mapping preserve surrounding reservation" {
     try std.testing.expect(manager.unmap(base + PAGE_64K, PAGE_64K));
     try std.testing.expect(manager.bytes(base, 1, true) != null);
     try std.testing.expect(manager.bytes(base + PAGE_64K, 1, false) == null);
+}
+
+test "4K guest protection succeeds inside a larger host page" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    const host_page = std.heap.page_size_min;
+    const base = manager.reserveAnywhere(host_page * 2) orelse return error.TestUnexpectedResult;
+    const guest_offset: u64 = if (host_page > @as(usize, @intCast(PAGE_4K))) PAGE_4K else 0;
+    const guest_base = base + guest_offset;
+
+    try std.testing.expect(manager.protect(guest_base, PAGE_4K, PROT_READ | PROT_WRITE));
+    const bytes = manager.bytes(guest_base, PAGE_4K, true) orelse return error.TestUnexpectedResult;
+    bytes[0] = 0xA5;
+    try std.testing.expectEqual(@as(u8, 0xA5), manager.bytesConst(guest_base, 1).?[0]);
+    if (guest_offset != 0) try std.testing.expect(manager.bytes(base, 1, false) == null);
 }
 
 test "high fixed anonymous mapping falls back to guest modeled backing" {

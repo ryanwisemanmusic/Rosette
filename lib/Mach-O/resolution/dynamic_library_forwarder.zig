@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const guest_sleep = @import("scheduler").guest_sleep;
+const guest_memory_geometry = @import("guest_memory_geometry.zig");
 
 const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
@@ -17,6 +18,7 @@ extern fn dlclose(handle: *anyopaque) c_int;
 pub const Signature = enum {
     no_args_i32,
     no_args_u32,
+    darwin_vm_page_size,
     buffer_length_usize,
     two_buffers_length_i32,
     buffer_byte_length_pointer,
@@ -54,7 +56,7 @@ const specs = [_]Spec{
     .{ .symbol = "geteuid", .library = .libsystem, .signature = .no_args_u32 },
     .{ .symbol = "getgid", .library = .libsystem, .signature = .no_args_u32 },
     .{ .symbol = "getegid", .library = .libsystem, .signature = .no_args_u32 },
-    .{ .symbol = "getpagesize", .library = .libsystem, .signature = .no_args_i32 },
+    .{ .symbol = "getpagesize", .library = .libsystem, .signature = .darwin_vm_page_size },
     .{ .symbol = "arc4random", .library = .libsystem, .signature = .no_args_u32 },
     .{ .symbol = "strnlen", .library = .libsystem, .signature = .buffer_length_usize },
     .{ .symbol = "strncmp", .library = .libsystem, .signature = .two_buffers_length_i32 },
@@ -245,6 +247,7 @@ pub const Forwarder = struct {
     virtual_sleep_nanoseconds: u64 = 0,
     longest_virtual_sleep_nanoseconds: u64 = 0,
     virtual_sleep_repairs: u64 = 0,
+    page_size_queries: u64 = 0,
     last_virtual_sleep_decision: guest_sleep.Decision = .{
         .requested_nanoseconds = 0,
         .effective_nanoseconds = 0,
@@ -913,6 +916,16 @@ pub const Forwarder = struct {
 
     fn handleStubSignature(self: *Forwarder, state: anytype, signature: Signature) ?Outcome {
         return switch (signature) {
+            .darwin_vm_page_size => blk: {
+                self.page_size_queries +|= 1;
+                if (self.page_size_queries <= 4) {
+                    std.debug.print(
+                        "macho-processor: Darwin VM page geometry query #{d}: getpagesize={d} guest_tracking_page={d} contract=host_mmap_compatible\n",
+                        .{ self.page_size_queries, guest_memory_geometry.host_vm_page_size, guest_memory_geometry.guest_page_size },
+                    );
+                }
+                break :blk .{ .handled = guest_memory_geometry.host_vm_page_size };
+            },
             .guest_virtual_sleep => self.virtualGuestSleep(state),
             .socket_three_args => .{ .handled = @bitCast(@as(i64, -1)) },
             .setsockopt_five_args => .{ .handled = 0 },
@@ -962,7 +975,7 @@ pub const Forwarder = struct {
 
     pub fn logSummary(self: *const Forwarder) void {
         std.debug.print(
-            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} proc_queries={d} guest_thunk_calls={d} opaque_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d} virtual_sleep(calls/total_effective_ns/longest_effective_ns/repairs)={d}/{d}/{d}/{d}\n",
+            "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} proc_queries={d} guest_thunk_calls={d} opaque_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d} page_geometry_queries={d} virtual_sleep(calls/total_effective_ns/longest_effective_ns/repairs)={d}/{d}/{d}/{d}\n",
             .{
                 self.considered,
                 self.forwarded,
@@ -976,6 +989,7 @@ pub const Forwarder = struct {
                 self.rejected_library,
                 self.rejected_symbol,
                 self.rejected_guest_memory,
+                self.page_size_queries,
                 self.virtual_sleep_calls,
                 self.virtual_sleep_nanoseconds,
                 self.longest_virtual_sleep_nanoseconds,
@@ -1082,6 +1096,7 @@ pub const Forwarder = struct {
                 const function: *const fn () callconv(.c) c_uint = @ptrCast(@alignCast(address));
                 break :blk .{ .handled = function() };
             },
+            .darwin_vm_page_size => .{ .handled = guest_memory_geometry.host_vm_page_size },
             .buffer_length_usize => blk: {
                 const bytes = state.guestMemoryConst(state.regs.rdi, state.regs.rsi) orelse return null;
                 const function: *const fn ([*]const u8, usize) callconv(.c) usize = @ptrCast(@alignCast(address));
@@ -1836,6 +1851,7 @@ test "Vulkan presenter lifecycle reports a swapchain surface mismatch" {
 
 test "forwarding registry only admits typed libSystem functions" {
     try std.testing.expectEqual(Signature.no_args_i32, specFor("getpid").?.signature);
+    try std.testing.expectEqual(Signature.darwin_vm_page_size, specFor("getpagesize").?.signature);
     try std.testing.expect(specFor("objc_msgSend") == null);
     try std.testing.expect(specFor("_ZNSt3__16localeD1Ev") == null);
     try std.testing.expectEqual(LibraryClass.libcxx, specFor("_ZNSt3__18ios_base6xallocEv").?.library);
@@ -1847,6 +1863,14 @@ test "forwarding registry only admits typed libSystem functions" {
     try std.testing.expectEqual(Signature.snprintf_three_args, specFor(normalizeMachOSymbol("_snprintf")).?.signature);
     try std.testing.expectEqual(Signature.connect_three_args, specFor(normalizeMachOSymbol("_connect")).?.signature);
     try std.testing.expectEqual(Signature.send_four_args, specFor(normalizeMachOSymbol("_send")).?.signature);
+}
+
+test "getpagesize observes the Darwin VM geometry required by host mmap" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    const result = forwarder.forward(&state, "/usr/lib/libSystem.B.dylib", "_getpagesize") orelse return error.SymbolUnavailable;
+    try std.testing.expectEqual(@as(u64, guest_memory_geometry.host_vm_page_size), result.handled);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.page_size_queries);
 }
 
 test "guest sleep records a timed scheduler request without advancing the host clock" {

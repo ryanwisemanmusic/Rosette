@@ -10,6 +10,7 @@ pub const Strategy = enum {
     same_type,
     exact_dynamic_type,
     hierarchy,
+    name_based,
 };
 
 pub const Resolution = struct {
@@ -108,7 +109,33 @@ pub const Engine = struct {
             self.trace(state, source_object, matches.destination, source_type, destination_type, hint, .hierarchy);
             return .{ .address = matches.destination, .strategy = .hierarchy };
         }
-        if (matches.destination_count > 1) self.ambiguous +|= 1;
+        if (matches.destination_count > 1) {
+            self.ambiguous +|= 1;
+            return self.failMetadata();
+        }
+
+        {
+            const dest_name = typeName(state, destination_type) orelse return self.failMetadata();
+            var name_matches = Matches{};
+            visitHierarchyByName(
+                state,
+                dynamic_type,
+                complete_object,
+                source_type,
+                source_object,
+                dest_name,
+                true,
+                0,
+                &name_matches,
+            );
+            if (name_matches.source_found and name_matches.destination_count == 1) {
+                self.resolved +|= 1;
+                self.hierarchy_resolved +|= 1;
+                self.trace(state, source_object, name_matches.destination, source_type, destination_type, hint, .name_based);
+                return .{ .address = name_matches.destination, .strategy = .name_based };
+            }
+            if (name_matches.destination_count > 1) self.ambiguous +|= 1;
+        }
         return self.failMetadata();
     }
 
@@ -198,6 +225,66 @@ fn visitHierarchy(
                     source_type,
                     source_object,
                     destination_type,
+                    public_path and (flags & BASE_PUBLIC) != 0,
+                    depth + 1,
+                    matches,
+                );
+            }
+        },
+    }
+}
+
+fn visitHierarchyByName(
+    state: anytype,
+    type_info: u64,
+    object: u64,
+    source_type: u64,
+    source_object: u64,
+    dest_name: []const u8,
+    public_path: bool,
+    depth: usize,
+    matches: *Matches,
+) void {
+    if (depth > MAX_HIERARCHY_DEPTH or type_info == 0 or object == 0) return;
+    if (public_path and type_info == source_type and object == source_object) matches.source_found = true;
+    if (public_path) {
+        if (typeName(state, type_info)) |name| {
+            if (std.mem.eql(u8, name, dest_name)) {
+                matches.recordDestination(object);
+                if (!matches.source_found) return;
+            }
+        }
+    }
+
+    switch (typeKind(state, type_info)) {
+        .class, .unknown => {},
+        .single_inheritance => {
+            const base_type = readPointer(state, type_info +| 16) orelse return;
+            visitHierarchyByName(state, base_type, object, source_type, source_object, dest_name, public_path, depth + 1, matches);
+        },
+        .multiple_inheritance => {
+            const header = state.guestMemoryConst(type_info +| 16, 8) orelse return;
+            const base_count = std.mem.readInt(u32, header[4..8], .little);
+            if (base_count > MAX_BASES_PER_TYPE) return;
+            var index: u32 = 0;
+            while (index < base_count) : (index += 1) {
+                const entry = type_info +| 24 +| @as(u64, index) * 16;
+                const base_type = readPointer(state, entry) orelse continue;
+                const offset_flags = readPointer(state, entry +| 8) orelse continue;
+                const flags: u8 = @truncate(offset_flags);
+                const encoded_offset: i64 = @as(i64, @bitCast(offset_flags)) >> 8;
+                const base_object = if ((flags & BASE_VIRTUAL) != 0) blk: {
+                    const vtable = readPointer(state, object) orelse continue;
+                    const dynamic_offset = readSigned(state, addSigned(vtable, encoded_offset)) orelse continue;
+                    break :blk addSigned(object, dynamic_offset);
+                } else addSigned(object, encoded_offset);
+                visitHierarchyByName(
+                    state,
+                    base_type,
+                    base_object,
+                    source_type,
+                    source_object,
+                    dest_name,
                     public_path and (flags & BASE_PUBLIC) != 0,
                     depth + 1,
                     matches,

@@ -306,6 +306,15 @@ fn appleCtypeMask(character: u8) u32 {
 /// Initializes the libc++ ABI v1 `basic_string<char>` representation used by
 /// Apple libc++ ABI tag v160006.
 pub fn initLibcppString(state: anytype, object: u64, source: u64, length: u64) bool {
+    // A null pointer is valid for an empty string. Avoid asking the guest
+    // address translator to map it, since real Mach-O mappings intentionally
+    // leave address zero unmapped.
+    if (length == 0) {
+        const object_bytes = state.guestMemory(object, 24) orelse return false;
+        @memset(object_bytes, 0);
+        return true;
+    }
+
     var source_address = source;
     if (rangesOverlap(object, 24, source, length)) {
         const snapshot_size = @max(length, 1);
@@ -750,6 +759,12 @@ test "libc++ short and long string layouts" {
     try std.testing.expectEqual(@as(u64, 32), std.mem.readInt(u64, state.mem[88..96], .little));
     const data = std.mem.readInt(u64, state.mem[96..104], .little);
     try std.testing.expectEqualSlices(u8, state.mem[48..80], state.mem[@intCast(data)..@intCast(data + 32)]);
+}
+
+test "libc++ empty string initialization does not dereference its source" {
+    var state = TestState{};
+    try std.testing.expect(initLibcppString(&state, 160, std.math.maxInt(u64), 0));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), state.mem[160..184]);
 }
 
 test "libc++ string assignment tolerates an overlapping source" {
