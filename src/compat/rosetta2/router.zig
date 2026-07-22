@@ -228,10 +228,17 @@ fn fallbackAfterRosetteMachOFailure(
     if (exit_code == 0) return null;
     if (decision.backend != .rosette_macho) return null;
     if (!isMachOProcessorFailureStatus(exit_code)) {
-        std.debug.print(
-            "rosette-router: authoritative guest exit from Rosette Mach-O backend: status={d}; Apple fallback suppressed\n",
-            .{exit_code},
-        );
+        if (signalNameFromExitCode(exit_code)) |signal_name| {
+            std.debug.print(
+                "rosette-router: Rosette Mach-O backend ended with signal-style status={d} ({s}); this may be a host backing/runtime fault, not an authoritative guest exit; Apple fallback suppressed by policy\n",
+                .{ exit_code, signal_name },
+            );
+        } else {
+            std.debug.print(
+                "rosette-router: authoritative guest exit from Rosette Mach-O backend: status={d}; Apple fallback suppressed\n",
+                .{exit_code},
+            );
+        }
         return null;
     }
     if (!allowsFallbackAfterRosetteFailure(policy)) return null;
@@ -252,6 +259,27 @@ fn fallbackAfterRosetteMachOFailure(
 
 fn isMachOProcessorFailureStatus(exit_code: u8) bool {
     return exit_code == 124 or exit_code == 125 or exit_code == 127;
+}
+
+fn signalNameFromExitCode(exit_code: u8) ?[]const u8 {
+    if (exit_code < 128) return null;
+    return switch (exit_code - 128) {
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGEMT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGBUS",
+        11 => "SIGSEGV",
+        15 => "SIGTERM",
+        else => "unknown signal",
+    };
+}
+
+test "signal-style Mach-O backend exits identify SIGBUS" {
+    try std.testing.expectEqualStrings("SIGBUS", signalNameFromExitCode(138).?);
+    try std.testing.expectEqualStrings("SIGILL", signalNameFromExitCode(132).?);
+    try std.testing.expect(signalNameFromExitCode(127) == null);
 }
 
 fn allowsFallbackAfterRosetteFailure(policy: Policy) bool {
