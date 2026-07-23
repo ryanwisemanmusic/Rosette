@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const ExportTableState = enum(u8) {
     uninitialized,
@@ -122,14 +123,14 @@ pub const Lifecycle = struct {
             if (mod.state == .uninitialized) {
                 mod.state = .deferred;
                 self.deferred_initializers_skipped += 1;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: deferred export table classified module={s} as deferred_exports; will defer initializer and pre-populate vector before retry\n",
                     .{name_hint},
                 );
                 return true;
             }
             if (mod.state == .deferred) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: deferred export table module={s} still empty on retry pass {d}; will attempt vector growth\n",
                     .{ name_hint, self.retry_pass },
                 );
@@ -139,7 +140,7 @@ pub const Lifecycle = struct {
 
         if (mod.state == .uninitialized) {
             mod.state = .resolving;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: export table first bound for module={s} ordinal={d} size={d}; marking for resolution\n",
                 .{ name_hint, ordinal, table_size },
             );
@@ -194,7 +195,7 @@ pub const Lifecycle = struct {
             if (mod.state == .deferred) {
                 mod.resolved_on_pass = pass;
                 mod.state = .ready;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: export table resolved on retry pass {d} for module={s} last_ordinal={d} needed_size={d}\n",
                     .{ pass, mod.name_hint, mod.last_ordinal, mod.needed_size },
                 );
@@ -220,13 +221,13 @@ pub const Lifecycle = struct {
 
     pub fn logSummary(self: *const Lifecycle) void {
         if (self.deferred_resolutions == 0 and self.deferred_initializers_skipped == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: export table lifecycle summary: modules={d} deferred={d} skips={d} phase_transitions={d}\n",
             .{ self.module_count, self.deferred_resolutions, self.deferred_initializers_skipped, self.phase_transitions },
         );
         for (0..self.module_count) |i| {
             const mod = self.modules[i];
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor:   module[{d}] name={s} class={s} state={s} last_ordinal={d} size={d} pass={d}\n",
                 .{ i, mod.name_hint, @tagName(mod.class), @tagName(mod.state), mod.last_ordinal, mod.needed_size, mod.resolved_on_pass },
             );

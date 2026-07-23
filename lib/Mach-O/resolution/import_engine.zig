@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
 const pointer_firewall = @import("pointer_firewall.zig");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Outcome = enum {
     resolved,
@@ -584,7 +585,7 @@ pub const Engine = struct {
     }
 
     pub fn logSummary(self: *const Engine) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: import resolution summary: calls={d} resolved={d} unresolved={d} terminated={d} symbols={d} contract={d} local={d} dynamic={d} libcxx_fs={d} libcxx_stream={d} pthread={d} smart_stub={d} shim={d} verified={d} modeled={d}",
             .{
                 self.total_calls,
@@ -604,12 +605,12 @@ pub const Engine = struct {
                 self.modeled_calls,
             },
         );
-        if (self.dropped_records != 0) std.debug.print(" dropped={d}", .{self.dropped_records});
-        std.debug.print("\n", .{});
+        if (self.dropped_records != 0) machoCapturePrint(" dropped={d}", .{self.dropped_records});
+        machoCapturePrint("\n", .{});
 
         for (self.entries.items) |entry| {
             if (entry.unresolved != 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "  unresolved: {s} domain={s} calls={d} phase={s} owner={s} first_caller={s}\n",
                     .{
                         entry.symbol,
@@ -621,17 +622,17 @@ pub const Engine = struct {
                     },
                 );
             } else if (entry.provider == .contract and entry.confidence == .verified) {
-                std.debug.print(
+                machoCapturePrint(
                     "  verified contract: {s} domain={s} calls={d}\n",
                     .{ entry.symbol, @tagName(entry.domain), entry.calls },
                 );
             }
         }
 
-        std.debug.print("macho-processor: import contract coverage matrix:\n", .{});
+        machoCapturePrint("macho-processor: import contract coverage matrix:\n", .{});
         for (self.entries.items) |entry| {
             const pointer_kind = if (entry.pointer_kind) |kind| @tagName(kind) else "none";
-            std.debug.print(
+            machoCapturePrint(
                 "  {s} | domain={s} provider={s} confidence={s} calls={d} writes_guest_memory={} pointer={s} object_model_safe={} crash_nearby={}\n",
                 .{
                     entry.symbol,

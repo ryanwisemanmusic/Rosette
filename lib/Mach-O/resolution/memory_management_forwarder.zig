@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const Allocation = struct {
     size: u64,
@@ -106,7 +107,7 @@ pub const Manager = struct {
 
     pub fn logSummary(self: *const Manager) void {
         const totals = self.summary();
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: memory forwarding: alloc={d} realloc={d} free={d} reused={d} live={d}\n",
             .{ totals.allocations, totals.reallocations, totals.frees, totals.reused_blocks, totals.live_allocations },
         );

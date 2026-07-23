@@ -4,6 +4,7 @@ const x64_decoder = @import("x64_decoder");
 const types = @import("types.zig");
 const constants = @import("constants.zig");
 const decoder = @import("decoder.zig");
+const machoCapturePrint = @import("event_log.zig").machoCapturePrint;
 
 const Regs = x64_decoder.Regs;
 const DecodedInsn = x64_decoder.DecodedInsn;
@@ -289,12 +290,12 @@ pub fn writeDarwinSigaction(bytes: []u8, action: GuestSignalAction) void {
     std.mem.writeInt(u32, bytes[12..16], action.flags, .little);
 }
 
-pub fn writeDarwinSiginfo(bytes: []u8, signal: u8, fault_rip: u64) void {
+pub fn writeDarwinSiginfo(bytes: []u8, signal: u8, signal_code: i32, fault_address: u64) void {
     if (bytes.len < DARWIN_SIGINFO_SIZE) return;
     @memset(bytes[0..DARWIN_SIGINFO_SIZE], 0);
     std.mem.writeInt(i32, bytes[0..4], signal, .little);
-    std.mem.writeInt(i32, bytes[8..12], 1, .little); // ILL_ILLOPC
-    std.mem.writeInt(u64, bytes[24..32], fault_rip, .little); // si_addr
+    std.mem.writeInt(i32, bytes[8..12], signal_code, .little);
+    std.mem.writeInt(u64, bytes[24..32], fault_address, .little); // si_addr
 }
 
 pub fn writeDarwinUcontext(bytes: []u8, mcontext: u64) void {
@@ -304,11 +305,12 @@ pub fn writeDarwinUcontext(bytes: []u8, mcontext: u64) void {
     std.mem.writeInt(u64, bytes[48..56], mcontext, .little); // uc_mcontext
 }
 
-pub fn writeDarwinMcontext(bytes: []u8, regs: Regs) void {
+pub fn writeDarwinMcontext(bytes: []u8, regs: Regs, trap_number: u16, error_code: u32, fault_address: u64) void {
     if (bytes.len < DARWIN_MCONTEXT_SIZE) return;
     @memset(bytes[0..DARWIN_MCONTEXT_SIZE], 0);
-    std.mem.writeInt(u16, bytes[0..2], 6, .little); // #UD / invalid-opcode trap number
-    std.mem.writeInt(u64, bytes[8..16], regs.rip, .little); // exception state faultvaddr
+    std.mem.writeInt(u16, bytes[0..2], trap_number, .little);
+    std.mem.writeInt(u32, bytes[4..8], error_code, .little);
+    std.mem.writeInt(u64, bytes[8..16], fault_address, .little); // exception state faultvaddr
     const values = [_]u64{
         regs.rax, regs.rbx, regs.rcx, regs.rdx,    regs.rdi,                  regs.rsi,                  regs.rbp,
         regs.rsp, regs.r8,  regs.r9,  regs.r10,    regs.r11,                  regs.r12,                  regs.r13,
@@ -361,7 +363,7 @@ test "Darwin sigaction and x86_64 mcontext preserve guest signal state" {
     original.segments.fs.selector = 0x53;
     original.segments.gs.selector = 0x5B;
     var mcontext = [_]u8{0} ** DARWIN_MCONTEXT_SIZE;
-    writeDarwinMcontext(&mcontext, original);
+    writeDarwinMcontext(&mcontext, original, 6, 0, original.rip);
     var restored = Regs{};
     try std.testing.expect(readDarwinMcontext(&mcontext, &restored));
     try std.testing.expectEqual(original.rax, restored.rax);
@@ -369,6 +371,21 @@ test "Darwin sigaction and x86_64 mcontext preserve guest signal state" {
     try std.testing.expectEqual(original.rip, restored.rip);
     try std.testing.expectEqual(original.rflags, restored.rflags);
     try std.testing.expectEqual(original.segments.gs.selector, restored.segments.gs.selector);
+}
+
+test "Darwin SIGSEGV state exposes access violation address and write bit" {
+    var siginfo = [_]u8{0} ** DARWIN_SIGINFO_SIZE;
+    writeDarwinSiginfo(&siginfo, 11, 2, 0x7FC8_0700);
+    try std.testing.expectEqual(@as(i32, 11), std.mem.readInt(i32, siginfo[0..4], .little));
+    try std.testing.expectEqual(@as(i32, 2), std.mem.readInt(i32, siginfo[8..12], .little));
+    try std.testing.expectEqual(@as(u64, 0x7FC8_0700), std.mem.readInt(u64, siginfo[24..32], .little));
+
+    var mcontext = [_]u8{0} ** DARWIN_MCONTEXT_SIZE;
+    const regs = Regs{ .rip = 0x1234 };
+    writeDarwinMcontext(&mcontext, regs, 14, 3, 0x7FC8_0700);
+    try std.testing.expectEqual(@as(u16, 14), std.mem.readInt(u16, mcontext[0..2], .little));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, mcontext[4..8], .little));
+    try std.testing.expectEqual(@as(u64, 0x7FC8_0700), std.mem.readInt(u64, mcontext[8..16], .little));
 }
 
 test "guest SIGILL return requires a changed RIP or patched UD2 bytes" {
@@ -406,7 +423,7 @@ pub fn selectedCpuProfile() x64_decoder.capabilities.Profile {
     const raw = std.c.getenv("ROSETTE_X64_CPU_PROFILE") orelse return .xenia;
     const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), " \t\r\n");
     return x64_decoder.capabilities.parseProfile(value) orelse {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: unknown ROSETTE_X64_CPU_PROFILE={s}; using xenia\n",
             .{value},
         );
@@ -503,7 +520,7 @@ test "Mach-O execution is unlimited unless an explicit step budget is set" {
 test "advertised AVX profile passes baseline VEX decoder audit" {
     const audit = auditVexDecoder();
     if (!audit.ready()) {
-        std.debug.print(
+        machoCapturePrint(
             "VEX audit failure: case={?} expected={s}/len={d}/ymm={} actual={s}/len={d}/ymm={}\n",
             .{ audit.first_failed_case, @tagName(audit.expected_op), audit.expected_len, audit.expected_vector_256, @tagName(audit.actual_op), audit.actual_len, audit.actual_vector_256 },
         );

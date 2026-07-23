@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const ALLOCATION_HISTORY_LEN: usize = 32;
 
@@ -163,7 +164,7 @@ pub const Tracker = struct {
     pub fn logSummary(self: *const Tracker) void {
         const totals = self.summary();
         if (totals.allocations == 0 and totals.throws == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: C++ exception runtime: allocations={d} throws={d} matched={d} begin_catch={d} end_catch={d} caught_throws={d} frees={d} rethrows={d} active={d}\n",
             .{ totals.allocations, totals.throws, totals.matched_throws, totals.catches_begun, totals.catches_ended, totals.caught_throws, totals.frees, totals.rethrows, totals.active_catches },
         );

@@ -1379,7 +1379,7 @@ pub const ElfState = struct {
             .clc => self.regs.rflags &= ~RFL_CF,
             .stc => self.regs.rflags |= RFL_CF,
 
-            .fild_mem16, .fld_mem32, .fld_mem64, .fstp_mem32, .fstp_mem64, .fld_st, .fstp_st, .fxch_st, .ffree_st, .fninit, .fnstsw_ax, .fnstcw_mem16, .fldcw_mem16, .x87_binary, .fucomip_st => {},
+            .fild_mem16, .fld_mem32, .fld_mem64, .fld_mem80, .fstp_mem32, .fstp_mem64, .fld_st, .fstp_st, .fxch_st, .ffree_st, .fninit, .fnstsw_ax, .fnstcw_mem16, .fldcw_mem16, .x87_binary, .fucomip_st => {},
 
             .fild_mem32 => {
                 self.x87_integer_top = @bitCast(@as(i64, @bitCast(@as(u64, self.readMemVal(d.addr, .bits32)))));

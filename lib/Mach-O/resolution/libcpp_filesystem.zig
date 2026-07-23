@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 extern "c" fn strerror(error_value: c_int) ?[*:0]const u8;
 extern "c" fn statvfs(path: [*:0]const u8, result: *StatVfs) c_int;
@@ -121,7 +122,7 @@ pub const Bridge = struct {
 
     pub fn logSummary(self: *const Bridge) void {
         if (self.status_calls == 0 and self.path_calls == 0 and self.mutation_calls == 0 and self.capacity_calls == 0 and self.copy_calls == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ filesystem: status={d} paths={d} capacity={d} mutations={d} copies={d} errors={d}\n",
             .{ self.status_calls, self.path_calls, self.capacity_calls, self.mutation_calls, self.copy_calls, self.errors_written },
         );
@@ -152,7 +153,7 @@ pub const Bridge = struct {
             }
         }
         if (shouldTrace(self.status_calls) or isDiagnosticPath(path) or isDiagnosticPath(translated)) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ filesystem status #{d}: guest_path={s} host_path={s} follow_symlinks={} -> type={d}\n",
                 .{ self.status_calls, path, translated, follow_symlinks, @as(i8, @bitCast(state.read8(output))) },
             );

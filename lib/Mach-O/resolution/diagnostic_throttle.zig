@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Kind = enum(u8) {
     guest_assertion,
@@ -114,7 +115,7 @@ pub const Tracker = struct {
     pub fn logSummary(self: *const Tracker) void {
         const totals = self.summary();
         if (totals.observed == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: repetitive diagnostic throttle: observed={d} unique_symbol_cases={d} detailed={d} checkpoints={d} suppressed={d} capacity_overflows={d}\n",
             .{ totals.observed, totals.unique, totals.detailed, totals.checkpoints, totals.suppressed, totals.capacity_overflows },
         );

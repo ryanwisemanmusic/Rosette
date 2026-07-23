@@ -1,6 +1,7 @@
 const std = @import("std");
 const x64_decoder = @import("x64_decoder");
 const macho_metadata = @import("../metadata.zig");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const DecodedInsn = x64_decoder.DecodedInsn;
 
@@ -151,7 +152,7 @@ pub const Tracker = struct {
     }
 
     pub fn logSummary(self: *const Tracker) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: unknown-symbol assembly analysis: symbols={d} use_sites={d} observations={d} repeated={d}\n",
             .{ self.unique_symbols, self.use_sites.items.len, self.observations, self.repeated_observations },
         );
@@ -265,18 +266,18 @@ pub const Catalog = struct {
         for (self.sites) |site| {
             if (std.mem.eql(u8, site.symbol, imported.name)) site_count += 1;
         }
-        std.debug.print(
+        machoCapturePrint(
             "  [unknown-symbol assembly] symbol={s} image={s} stub=0x{x} static_use_sites={d} indexed_sites={d} decoded={d} decode_gaps={d}\n",
             .{ imported.name, imported.dylib, imported.stub_address, site_count, self.sites.len, self.decoded_instructions, self.decode_gaps },
         );
         if (self.decode_gaps != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "    coverage: exact for indexed control transfers; {d} function region(s) stopped at an undecoded instruction and were not inferred past that boundary\n",
                 .{self.decode_gaps},
             );
         }
         if (site_count == 0) {
-            std.debug.print("    no statically resolvable use site; runtime context below is authoritative for register-indirect dispatch\n", .{});
+            machoCapturePrint("    no statically resolvable use site; runtime context below is authoritative for register-indirect dispatch\n", .{});
             return;
         }
 
@@ -284,7 +285,7 @@ pub const Catalog = struct {
         for (self.sites) |indexed| {
             if (!std.mem.eql(u8, indexed.symbol, imported.name)) continue;
             const site = collectContextAt(metadata, indexed, decode) orelse {
-                std.debug.print(
+                machoCapturePrint(
                     "    use-site[{d}] kind={s} address=0x{x} context=<unavailable before exact decode boundary>\n",
                     .{ ordinal, @tagName(indexed.kind), indexed.address },
                 );
@@ -292,12 +293,12 @@ pub const Catalog = struct {
                 continue;
             };
             if (metadata.nearestSymbol(site.address)) |caller| {
-                std.debug.print(
+                machoCapturePrint(
                     "    use-site[{d}] kind={s} address=0x{x} caller={s}+0x{x}\n",
                     .{ ordinal, @tagName(site.kind), site.address, caller.name, caller.offset },
                 );
             } else {
-                std.debug.print(
+                machoCapturePrint(
                     "    use-site[{d}] kind={s} address=0x{x} caller=<unknown>\n",
                     .{ ordinal, @tagName(site.kind), site.address },
                 );
@@ -528,28 +529,28 @@ fn logInstruction(
     selected: bool,
     register_state: ?RuntimeRegisterState,
 ) void {
-    std.debug.print("      {s} 0x{x}: ", .{ if (selected) ">" else " ", instruction.address });
-    for (instruction.bytes[0..instruction.byte_count]) |byte| std.debug.print("{x:0>2} ", .{byte});
-    std.debug.print(" {s} size={s}", .{ @tagName(instruction.decoded.op), @tagName(instruction.decoded.size) });
-    if (instruction.decoded.imm != 0) std.debug.print(" imm=0x{x}", .{instruction.decoded.imm});
+    machoCapturePrint("      {s} 0x{x}: ", .{ if (selected) ">" else " ", instruction.address });
+    for (instruction.bytes[0..instruction.byte_count]) |byte| machoCapturePrint("{x:0>2} ", .{byte});
+    machoCapturePrint(" {s} size={s}", .{ @tagName(instruction.decoded.op), @tagName(instruction.decoded.size) });
+    if (instruction.decoded.imm != 0) machoCapturePrint(" imm=0x{x}", .{instruction.decoded.imm});
     if (instruction.direct_target) |target| {
         logAddressRelationship(metadata, "target", target);
     } else if (instruction.operand_address) |operand| {
         logAddressRelationship(metadata, "operand", operand);
     }
     if (register_state) |regs| {
-        std.debug.print(" rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{ regs.rsp, regs.rax, regs.rcx, regs.rdx });
+        machoCapturePrint(" rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{ regs.rsp, regs.rax, regs.rcx, regs.rdx });
     }
-    std.debug.print("\n", .{});
+    machoCapturePrint("\n", .{});
 }
 
 fn logAddressRelationship(metadata: *const macho_metadata.Metadata, label: []const u8, address: u64) void {
     if (metadata.importAtStub(address)) |imported| {
-        std.debug.print(" {s}=0x{x}<{s}@{s}>", .{ label, address, imported.name, imported.dylib });
+        machoCapturePrint(" {s}=0x{x}<{s}@{s}>", .{ label, address, imported.name, imported.dylib });
     } else if (metadata.nearestSymbol(address)) |symbol| {
-        std.debug.print(" {s}=0x{x}<{s}+0x{x}>", .{ label, address, symbol.name, symbol.offset });
+        machoCapturePrint(" {s}=0x{x}<{s}+0x{x}>", .{ label, address, symbol.name, symbol.offset });
     } else {
-        std.debug.print(" {s}=0x{x}", .{ label, address });
+        machoCapturePrint(" {s}=0x{x}", .{ label, address });
     }
 }
 

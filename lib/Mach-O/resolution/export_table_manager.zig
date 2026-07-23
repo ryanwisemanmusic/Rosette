@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const TableEntry = struct {
     address: u64,
@@ -96,7 +97,7 @@ pub const Manager = struct {
 
     pub fn logSummary(self: *const Manager) void {
         if (self.resizes == 0 and self.skips == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: export table manager summary: resizes={d} skips={d} tracked_tables={d}\n",
             .{ self.resizes, self.skips, self.trackedTableCount() },
         );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const DeferredBinding = struct {
     address: u64,
@@ -58,7 +59,7 @@ pub const VttBindingResolver = struct {
     }
 
     pub fn logSummary(self: *const VttBindingResolver) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: ABI data resolver: recorded={d} guest_materialized={d} host_resolved={d} compatibility_fallback={d}\n",
             .{ self.deferred.items.len, self.synthetic_count, self.resolved_count, self.failed_count },
         );
@@ -66,7 +67,7 @@ pub const VttBindingResolver = struct {
             var emitted: usize = 0;
             for (self.deferred.items) |item| {
                 if (item.resolution == .self_sentinel and emitted < 8) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  unresolved ABI data sample: address=0x{x} symbol={s} fallback={s}\n",
                         .{ item.address, item.symbol, @tagName(item.resolution) },
                     );
@@ -74,7 +75,7 @@ pub const VttBindingResolver = struct {
                 }
             }
             if (self.failed_count > emitted) {
-                std.debug.print("  ... {d} additional unresolved ABI data binding(s) suppressed\n", .{self.failed_count - emitted});
+                machoCapturePrint("  ... {d} additional unresolved ABI data binding(s) suppressed\n", .{self.failed_count - emitted});
             }
         }
     }

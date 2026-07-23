@@ -1,6 +1,7 @@
 const std = @import("std");
 const path_translation = @import("path_translation.zig");
 const fd_management = @import("fd_management.zig");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
 extern "c" fn shm_unlink(name: [*:0]const u8) c_int;
@@ -72,7 +73,7 @@ pub const Forwarder = struct {
                 @as(c_int, @intCast(mode & 0xFFFF)),
             );
             if (host_fd >= 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: fs fallback open: original={s} fallback_root={s} basename={s} -> host_fd={d}\n",
                     .{ path, root, basename, host_fd },
                 );
@@ -84,7 +85,7 @@ pub const Forwarder = struct {
 
     pub fn configurePaths(self: *Forwarder, storage_root: []const u8) void {
         self.translator.configure(storage_root);
-        std.debug.print("macho-processor: fs forwarding storage root: {s}\n", .{storage_root});
+        machoCapturePrint("macho-processor: fs forwarding storage root: {s}\n", .{storage_root});
     }
 
     pub fn storageRoot(self: *const Forwarder) []const u8 {
@@ -120,7 +121,7 @@ pub const Forwarder = struct {
         if (host_fd < 0) {
             const err = std.c.errno(host_fd);
             if (isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: fs open FAILED: guest_path={s} host_path={s} flags=0x{x} mode=0{o} errno={s}\n",
                     .{ path, translated_path, @as(u32, @bitCast(oflags)), mode & 0xFFFF, @tagName(err) },
                 );
@@ -133,7 +134,7 @@ pub const Forwarder = struct {
         }
         const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
         if (shouldTrace(self.open_count) or isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
-            std.debug.print("macho-processor: fs open #{d}: guest_path={s} host_path={s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, path, translated_path, guest_fd, host_fd });
+            machoCapturePrint("macho-processor: fs open #{d}: guest_path={s} host_path={s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, path, translated_path, guest_fd, host_fd });
         }
         return guest_fd;
     }
@@ -163,7 +164,7 @@ pub const Forwarder = struct {
         if (host_fd < 0) {
             const err = std.c.errno(host_fd);
             if (isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: fs openat FAILED: dir_guest_fd={d} guest_path={s} host_path={s} flags=0x{x} errno={s}\n",
                     .{ state.regs.rdi, path, translated_path, @as(u32, @bitCast(oflags)), @tagName(err) },
                 );
@@ -176,7 +177,7 @@ pub const Forwarder = struct {
         }
         const guest_fd = self.fd_manager.register(host_fd, .file) orelse return self.fail(state, .NOMEM);
         if (shouldTrace(self.open_count) or isDiagnosticPath(path) or isDiagnosticPath(translated_path)) {
-            std.debug.print("macho-processor: fs openat #{d}: dir_guest_fd={d} guest_path={s} host_path={s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, state.regs.rdi, path, translated_path, guest_fd, host_fd });
+            machoCapturePrint("macho-processor: fs openat #{d}: dir_guest_fd={d} guest_path={s} host_path={s} -> guest_fd={d} host_fd={d}\n", .{ self.open_count, state.regs.rdi, path, translated_path, guest_fd, host_fd });
         }
         return guest_fd;
     }
@@ -189,14 +190,14 @@ pub const Forwarder = struct {
             const rc = std.c.read(host_fd, bytes.ptr, bytes.len);
             if (rc >= 0) {
                 if (shouldTrace(self.read_count)) {
-                    std.debug.print("macho-processor: fs read #{d}: guest_fd={d} requested={d} result={d}\n", .{ self.read_count, state.regs.rdi, bytes.len, rc });
+                    machoCapturePrint("macho-processor: fs read #{d}: guest_fd={d} requested={d} result={d}\n", .{ self.read_count, state.regs.rdi, bytes.len, rc });
                 }
                 return @intCast(rc);
             }
             const err = std.c.errno(rc);
             if (err != .INTR and err != .AGAIN) {
                 if (shouldTrace(self.read_count)) {
-                    std.debug.print("macho-processor: fs read #{d} FAILED: guest_fd={d} errno={s}\n", .{ self.read_count, state.regs.rdi, @tagName(err) });
+                    machoCapturePrint("macho-processor: fs read #{d} FAILED: guest_fd={d} errno={s}\n", .{ self.read_count, state.regs.rdi, @tagName(err) });
                 }
                 return @bitCast(self.fail(state, err));
             }
@@ -262,7 +263,7 @@ pub const Forwarder = struct {
         const bytes = state.guestMemoryConst(state.regs.rsi, state.regs.rdx) orelse return -1;
         const rc = std.c.write(host_fd, bytes.ptr, bytes.len);
         if (shouldTrace(self.write_count)) {
-            std.debug.print("macho-processor: fs write #{d}: guest_fd={d} requested={d} result={d}\n", .{ self.write_count, state.regs.rdi, bytes.len, rc });
+            machoCapturePrint("macho-processor: fs write #{d}: guest_fd={d} requested={d} result={d}\n", .{ self.write_count, state.regs.rdi, bytes.len, rc });
         }
         return if (rc < 0) -1 else @intCast(rc);
     }
@@ -307,7 +308,7 @@ pub const Forwarder = struct {
         const destination = state.guestMemory(state.regs.rsi, @sizeOf(std.c.Stat)) orelse return self.fail(state, .FAULT);
         @memcpy(destination, std.mem.asBytes(&host_stat));
         if (shouldTrace(self.stat_count)) {
-            std.debug.print("macho-processor: fs fstat #{d}: guest_fd={d} host_fd={d} mode=0{o}\n", .{ self.stat_count, state.regs.rdi, host_fd, host_stat.mode });
+            machoCapturePrint("macho-processor: fs fstat #{d}: guest_fd={d} host_fd={d} mode=0{o}\n", .{ self.stat_count, state.regs.rdi, host_fd, host_stat.mode });
         }
         return 0;
     }
@@ -588,7 +589,7 @@ pub const Forwarder = struct {
         const entry = self.fd_manager.lookup(state.regs.rdi) orelse return self.fail(state, .BADF);
         const host_fd = entry.host_fd;
         const requested_size: i64 = std.math.cast(i64, state.regs.rsi) orelse {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: fs ftruncate rejected: guest_fd={d} host_fd={d} length=0x{x} reason=size_exceeds_signed_off_t\n",
                 .{ state.regs.rdi, host_fd, state.regs.rsi },
             );
@@ -606,7 +607,7 @@ pub const Forwarder = struct {
                     if (std.c.ftruncate(fallback_fd, requested_size) == 0) {
                         entry.host_fd = fallback_fd;
                         _ = std.c.close(host_fd);
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: fs ftruncate fallback: guest_fd={d} old_host_fd={d} replacement_host_fd={d} length={d} primary_errno={s}\n",
                             .{ state.regs.rdi, host_fd, fallback_fd, state.regs.rsi, @tagName(err) },
                         );
@@ -614,19 +615,19 @@ pub const Forwarder = struct {
                     }
                     const fallback_err = std.c.errno(-1);
                     _ = std.c.close(fallback_fd);
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: fs ftruncate fallback FAILED: guest_fd={d} length={d} primary_errno={s} fallback_errno={s}\n",
                         .{ state.regs.rdi, state.regs.rsi, @tagName(err), @tagName(fallback_err) },
                     );
                 }
             }
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: fs ftruncate FAILED: guest_fd={d} host_fd={d} length={d} errno={s}\n",
                 .{ state.regs.rdi, host_fd, state.regs.rsi, @tagName(err) },
             );
             return self.fail(state, err);
         }
-        std.debug.print("macho-processor: fs ftruncate #{d}: guest_fd={d} host_fd={d} length={d}\n", .{ self.ftruncate_count, state.regs.rdi, host_fd, state.regs.rsi });
+        machoCapturePrint("macho-processor: fs ftruncate #{d}: guest_fd={d} host_fd={d} length={d}\n", .{ self.ftruncate_count, state.regs.rdi, host_fd, state.regs.rsi });
         return 0;
     }
 
@@ -645,7 +646,7 @@ pub const Forwarder = struct {
         var host_fd = shm_open(c_path, oflag, mode);
         if (host_fd < 0) {
             const err = std.c.errno(host_fd);
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: shm_open FAILED #{d}: name={s} oflag=0x{x} mode=0{o} errno={s}\n",
                 .{ self.shm_open_count, path, @as(u32, @bitCast(oflag)), mode, @tagName(err) },
             );
@@ -653,13 +654,13 @@ pub const Forwarder = struct {
                 _ = shm_unlink(c_path);
                 host_fd = shm_open(c_path, oflag, mode);
                 if (host_fd >= 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: shm_open recovered after unlink: name={s} -> host_fd={d}\n",
                         .{ path, host_fd },
                     );
                 } else {
                     const retry_err = std.c.errno(host_fd);
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: shm_open retry FAILED: name={s} errno={s}; trying temp-backed shared memory\n",
                         .{ path, @tagName(retry_err) },
                     );
@@ -673,7 +674,7 @@ pub const Forwarder = struct {
             _ = std.c.close(host_fd);
             return self.fail(state, .NOMEM);
         };
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: shm_open #{d}: name={s} oflag=0x{x} mode=0{o} -> guest_fd={d} host_fd={d}\n",
             .{ self.shm_open_count, path, @as(u32, @bitCast(oflag)), mode, guest_fd, host_fd },
         );
@@ -696,14 +697,14 @@ pub const Forwarder = struct {
         };
         const host_fd = std.c.open(temp_path, flags, @as(std.c.mode_t, 0o600));
         if (host_fd < 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: temp-backed shm FAILED: guest_name={s} path={s} errno={s}\n",
                 .{ guest_name, temp_path, @tagName(std.c.errno(host_fd)) },
             );
             return null;
         }
         _ = std.c.unlink(temp_path);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: temp-backed shm #{d}: guest_name={s} path={s} host_fd={d} unlinked=true\n",
             .{ self.shm_fallback_count, guest_name, temp_path, host_fd },
         );
@@ -719,10 +720,10 @@ pub const Forwarder = struct {
         const rc = shm_unlink(@as([*:0]const u8, @ptrCast(path_buffer.items.ptr)));
         if (rc != 0) {
             const err = std.c.errno(rc);
-            std.debug.print("macho-processor: shm_unlink FAILED: name={s} errno={s}\n", .{ path, @tagName(err) });
+            machoCapturePrint("macho-processor: shm_unlink FAILED: name={s} errno={s}\n", .{ path, @tagName(err) });
             return self.fail(state, err);
         }
-        std.debug.print("macho-processor: shm_unlink: name={s}\n", .{path});
+        machoCapturePrint("macho-processor: shm_unlink: name={s}\n", .{path});
         return 0;
     }
 
@@ -816,7 +817,7 @@ pub const Forwarder = struct {
         const x64_code_cache_hint = state.regs.rdi >= 0x8000_0000 and state.regs.rdi < 0xA000_0000;
         const trace_mapping = backend_trace or x64_code_cache_hint or length >= 1024 * 1024 * 1024 or (map_flags.FIXED and length >= 64 * 1024 * 1024);
         if (trace_mapping) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: large/fixed mmap entry: route=import addr=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} guest_fd=0x{x} offset={d}\n",
                 .{ state.regs.rdi, length, state.regs.rdx, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS, state.regs.r8, offset },
             );
@@ -825,14 +826,14 @@ pub const Forwarder = struct {
             const backend_sparse_threshold = 64 * 1024 * 1024;
             if (backend_trace and state.regs.rdi == 0 and map_flags.ANONYMOUS and length >= backend_sparse_threshold) {
                 const mapped = state.guestMapBackendWithBacking(length, @truncate(state.regs.rdx), raw_flags, -1, @bitCast(offset)) orelse {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: x64 backend sparse mmap FAILED: route=import address=0x0 length={d} prot=0x{x} flags=0x{x}; bounded guest heap fallback is intentionally disabled for large backend VM regions\n",
                         .{ length, state.regs.rdx, raw_flags },
                     );
                     if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "backend_sparse_anywhere");
                     return @bitCast(@as(i64, -1));
                 };
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: x64 backend sparse mmap succeeded: route=import guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} heap_bypassed=true\n",
                     .{ mapped, length, state.regs.rdx, raw_flags },
                 );
@@ -859,7 +860,7 @@ pub const Forwarder = struct {
             const mapped = state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset));
             if (trace_mapping) {
                 const outcome: []const u8 = if (mapped) "succeeded" else "FAILED";
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: large/fixed mmap {s}: route=import addr=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset={d}\n",
                     .{ outcome, state.regs.rdi, length, state.regs.rdx, raw_flags, host_fd, offset },
                 );
@@ -872,14 +873,14 @@ pub const Forwarder = struct {
                 -1
             else
                 self.fd_manager.hostFd(state.regs.r8) orelse {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: x64 code-cache hint rejected: reason=guest_fd_translation address=0x{x} length={d} guest_fd=0x{x}\n",
                         .{ state.regs.rdi, length, state.regs.r8 },
                     );
                     return @bitCast(@as(i64, -1));
                 };
             if (state.guestMapFile(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset))) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: x64 code-cache hint mapped: guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d}\n",
                     .{ state.regs.rdi, length, state.regs.rdx, raw_flags, host_fd },
                 );
@@ -887,7 +888,7 @@ pub const Forwarder = struct {
                 return state.regs.rdi;
             }
             if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "code_cache_hint_sparse_map");
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: x64 code-cache hint unavailable: guest_base=0x{x} length={d} prot=0x{x} flags=0x{x}; falling back to ordinary mmap placement\n",
                 .{ state.regs.rdi, length, state.regs.rdx, raw_flags },
             );
@@ -901,26 +902,26 @@ pub const Forwarder = struct {
                 -1
             else
                 self.fd_manager.hostFd(state.regs.r8) orelse {
-                    std.debug.print("macho-processor: large mmap FAILED: route=import stage=fd_translation guest_fd=0x{x}\n", .{state.regs.r8});
+                    machoCapturePrint("macho-processor: large mmap FAILED: route=import stage=fd_translation guest_fd=0x{x}\n", .{state.regs.r8});
                     return @bitCast(@as(i64, -1));
                 };
             if (state.regs.rdx == 0) {
                 const reserved = state.guestReserveAddressSpaceWithBacking(length, raw_flags, host_fd, @bitCast(offset)) orelse {
-                    std.debug.print("macho-processor: large mmap FAILED: route=import stage=sparse_reserve\n", .{});
+                    machoCapturePrint("macho-processor: large mmap FAILED: route=import stage=sparse_reserve\n", .{});
                     if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "sparse_reserve");
                     return @bitCast(@as(i64, -1));
                 };
-                std.debug.print("macho-processor: large mmap succeeded: route=import kind=reservation guest_base=0x{x} length={d}\n", .{ reserved, length });
+                machoCapturePrint("macho-processor: large mmap succeeded: route=import kind=reservation guest_base=0x{x} length={d}\n", .{ reserved, length });
                 if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, reserved, "sparse_reserve");
                 return reserved;
             }
             if (comptime @hasDecl(@TypeOf(state.*), "guestMapAnywhereWithBacking")) {
                 const mapped = state.guestMapAnywhereWithBacking(length, @truncate(state.regs.rdx), raw_flags, host_fd, @bitCast(offset)) orelse {
-                    std.debug.print("macho-processor: large mmap FAILED: route=import stage=sparse_file_map host_fd={d}\n", .{host_fd});
+                    machoCapturePrint("macho-processor: large mmap FAILED: route=import stage=sparse_file_map host_fd={d}\n", .{host_fd});
                     if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "sparse_file_map");
                     return @bitCast(@as(i64, -1));
                 };
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: large mmap succeeded: route=import kind=file_backed guest_base=0x{x} length={d} prot=0x{x} host_fd={d} offset={d}\n",
                     .{ mapped, length, state.regs.rdx, host_fd, offset },
                 );
@@ -930,7 +931,7 @@ pub const Forwarder = struct {
         }
         const mapped = state.guestHeapAllocate(length, 4096) orelse {
             if (backend_trace) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: x64 backend mmap FAILED: route=import stage=guest_heap_allocate address=0x{x} length={d} heap allocation could not satisfy backend request\n",
                     .{ state.regs.rdi, length },
                 );
@@ -985,7 +986,7 @@ pub const Forwarder = struct {
     }
 
     pub fn logSummary(self: *const Forwarder) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} shm_open={d} shm_fallback={d} ftruncate={d} access={d} errno_updates={d} last_errno={d}\n",
             .{
                 self.open_count,

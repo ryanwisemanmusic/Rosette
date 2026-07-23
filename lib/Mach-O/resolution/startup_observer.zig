@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Phase = enum {
     dyld_bind,
@@ -105,7 +106,7 @@ pub const Observer = struct {
         self.phase_start_step = step;
         self.last_symbol = "<unknown>";
         self.same_symbol_checkpoints = 0;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: startup phase transition: {s} -> {s} at step {d} (+{d} steps)\n",
             .{ @tagName(prev), @tagName(phase), step, elapsed },
         );
@@ -166,7 +167,7 @@ pub const Observer = struct {
             hot_symbol_cooldown_elapsed;
 
         const phase_str = @tagName(self.phase);
-        std.debug.print(
+        machoCapturePrint(
             "info(macho): heartbeat phase={s} step={d} delta={d} {d}steps/s rip=0x{x} {s}+0x{x} thread=0x{x} heap=0x{x} imports={d} fs(r/w)={d}/{d} pthread(created/blocked/waits)={d}/{d}/{d}\n",
             .{
                 phase_str,
@@ -188,14 +189,14 @@ pub const Observer = struct {
         );
         if (self.stall_diagnostic_due) {
             self.last_stall_diagnostic_wall = now;
-            std.debug.print(
+            machoCapturePrint(
                 "info(macho): unchanged execution-state warning: thread=0x{x} rip=0x{x} {s}+0x{x} samples={d} same_state_steps={d} same_state_ms={d} at {d}steps/s\n",
                 .{ snapshot.thread_id, snapshot.rip, snapshot.symbol, snapshot.symbol_offset, self.stuck_pc_count, same_state_steps, same_state_ns / std.time.ns_per_ms, steps_per_sec },
             );
         }
         if (hot_symbol_due) {
             self.last_hot_symbol_diagnostic_wall = now;
-            std.debug.print(
+            machoCapturePrint(
                 "info(macho): hot-symbol progress: phase={s} thread=0x{x} symbol={s} samples={d} duration_ms={d} translated_steps={d} rate={d}steps/s heap_delta={d} imports_delta={d} fs_read_delta={d} execution_state={s}; this is translated host-code activity, not proof of emulated-title progress\n",
                 .{
                     phase_str,
@@ -231,7 +232,7 @@ pub const Observer = struct {
             self.last_symbol = snapshot.symbol;
             self.same_symbol_checkpoints = 1;
         }
-        std.debug.print(
+        machoCapturePrint(
             "info(macho): startup phase={s} step={d} at {s}+0x{x} rip=0x{x} heap=0x{x} imports={d} fs(open/read/write)={d}/{d}/{d} guest-heap(alloc/live)={d}/{d} options(seen/kept/skipped)={d}/{d}/{d} logging(lines)={d} pthread(created/waits-collapsed/blocked)={d}/{d}/{d} text-dump(runs/lines)={d}/{d} same-symbol={d}\n",
             .{
                 @tagName(self.phase),         snapshot.step,                 snapshot.symbol,
@@ -247,7 +248,7 @@ pub const Observer = struct {
     }
 
     pub fn logSummary(self: *const Observer) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: startup observer: final_phase={s} checkpoints={d} phase_steps={d} depth={d}\n",
             .{ @tagName(self.phase), self.checkpoints, self.phase_start_step, self.timing_depth },
         );
@@ -255,19 +256,19 @@ pub const Observer = struct {
 
     pub fn timingSummary(self: *const Observer) void {
         if (self.timing_depth == 0) return;
-        std.debug.print("macho-processor: startup phase timing report (steps):\n", .{});
+        machoCapturePrint("macho-processor: startup phase timing report (steps):\n", .{});
         for (0..self.timing_depth) |i| {
             const t = &self.timing_stack[i];
             const elapsed_steps = if (i + 1 < self.timing_depth)
                 self.timing_stack[i + 1].start_step -| t.start_step
             else
                 self.phase_start_step -| t.start_step;
-            std.debug.print(
+            machoCapturePrint(
                 "  phase={s} start_step={d} duration_steps={d}\n",
                 .{ @tagName(t.phase), t.start_step, elapsed_steps },
             );
         }
-        std.debug.print(
+        machoCapturePrint(
             "  phase={s} current at step={d} (active)\n",
             .{ @tagName(self.phase), self.phase_start_step },
         );

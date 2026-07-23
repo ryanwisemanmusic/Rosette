@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const MAX_REQUESTED_OPTIONS: usize = 64;
 
@@ -38,19 +39,19 @@ pub const Filter = struct {
     }
 
     pub fn logSummary(self: *const Filter) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: launch option acceleration: requested={d} seen={d} kept={d} skipped={d}\n",
             .{ self.requested_count, self.registrations_seen, self.registrations_kept, self.registrations_skipped },
         );
     }
 
     pub fn logConfiguration(self: *const Filter, target_count: usize) void {
-        std.debug.print("macho-processor: launch option acceleration armed: targets={d} requested=", .{target_count});
+        machoCapturePrint("macho-processor: launch option acceleration armed: targets={d} requested=", .{target_count});
         for (self.requested[0..self.requested_count], 0..) |name, index| {
-            if (index != 0) std.debug.print(",", .{});
-            std.debug.print("{s}", .{name});
+            if (index != 0) machoCapturePrint(",", .{});
+            machoCapturePrint("{s}", .{name});
         }
-        std.debug.print("\n", .{});
+        machoCapturePrint("\n", .{});
     }
 
     fn appendUnique(self: *Filter, name: []const u8) void {

@@ -37,6 +37,7 @@ pub const PAGE_READ: u8 = 1 << 0;
 pub const PAGE_WRITE: u8 = 1 << 1;
 pub const PAGE_EXECUTE: u8 = 1 << 2;
 pub const GUEST_SIGILL: u8 = 4;
+pub const GUEST_SIGSEGV: u8 = 11;
 pub const SA_RESETHAND: u32 = 0x0004;
 pub const SA_NODEFER: u32 = 0x0010;
 pub const SA_SIGINFO: u32 = 0x0040;

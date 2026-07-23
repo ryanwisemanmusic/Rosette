@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const ExportRecord = struct {
     name: [64]u8 = [_]u8{0} ** 64,
@@ -140,14 +141,14 @@ pub const Registry = struct {
 
     pub fn logSummary(self: *const Registry) void {
         if (self.count == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: dynamic export registry: entries={d} fallback_attempts={d} fallback_hits={d}\n",
             .{ self.count, self.fallback_attempts, self.fallback_hits },
         );
         for (0..@min(self.count, 8)) |i| {
             const e = self.entries[i];
             const ename = std.mem.sliceTo(&e.name, 0);
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor:   entry[{d}] ordinal={d} name={s} addr=0x{x} from_assert={}\n",
                 .{ i, e.ordinal, ename, e.function_address, e.from_assertion },
             );

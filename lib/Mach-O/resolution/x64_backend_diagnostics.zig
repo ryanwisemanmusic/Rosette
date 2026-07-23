@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Phase = enum {
     not_seen,
@@ -219,7 +220,7 @@ pub const Engine = struct {
 
     pub fn logSummary(self: *const Engine) void {
         if (self.phase == .not_seen and self.assertions == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: x64 backend diagnostics summary: phase={s} events={d} assertions(total/backend/capstone/low32_thunk)={d}/{d}/{d}/{d} signal(delivered/returned)={d}/{d} code_cache(indirection_failures/successes)={d}/{d} backend_successes={d} processor_successes={d} memory_ops(mmap/mprotect)={d}/{d} verdict={s}\n",
             .{
                 @tagName(self.phase),
@@ -240,7 +241,7 @@ pub const Engine = struct {
             },
         );
         if (self.last_mapping.valid) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: x64 backend last mmap: route={s} step={d} address=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} result_known={} succeeded={} result=0x{x} stage={s}\n",
                 .{
                     self.last_mapping.route,

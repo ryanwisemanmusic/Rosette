@@ -445,6 +445,7 @@ pub const Op = enum(u16) {
     fild_mem64,
     fld_mem32,
     fld_mem64,
+    fld_mem80,
     fstp_mem80,
     fstp_mem32,
     fstp_mem64,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Confidence = enum {
     verified,
@@ -61,7 +62,7 @@ pub const Generator = struct {
     }
 
     pub fn logSummary(self: *const Generator) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: smart stub generation: considered={d} generated={d} weak={d} verified={d} rejected_cpp={d} rejected_unknown={d}\n",
             .{
                 self.considered,

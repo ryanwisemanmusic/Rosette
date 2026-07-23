@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const guest_sleep = @import("scheduler").guest_sleep;
 const guest_memory_geometry = @import("guest_memory_geometry.zig");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
@@ -32,6 +33,7 @@ pub const Signature = enum {
     connect_three_args,
     send_four_args,
     cccrypt,
+    pointer_in_pointer_out,
 };
 
 pub const LibraryClass = enum {
@@ -74,6 +76,7 @@ const specs = [_]Spec{
     .{ .symbol = "connect", .library = .libsystem, .signature = .connect_three_args },
     .{ .symbol = "send", .library = .libsystem, .signature = .send_four_args },
     .{ .symbol = "CCCrypt", .library = .libsystem, .signature = .cccrypt },
+    .{ .symbol = "asctime", .library = .libsystem, .signature = .pointer_in_pointer_out },
 };
 
 const Library = struct {
@@ -273,7 +276,7 @@ pub const Forwarder = struct {
         const entry = self.guestLibraryEntry(library_token) orelse return 0;
         if (entry.virtual_vulkan) {
             const token = self.allocateGuestSymbol(library_token, symbol);
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan guest loader lookup: {s} -> 0x{x} ({s})\n",
                 .{ symbol, token, @tagName(guestSymbolKind(symbol)) },
             );
@@ -290,7 +293,7 @@ pub const Forwarder = struct {
         if (self.guestLibraryEntry(library_token) == null) return 0;
         self.guest_proc_queries +|= 1;
         const token = self.allocateGuestSymbol(library_token, symbol);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Vulkan proc query #{d}: {s} -> 0x{x} ({s})\n",
             .{ self.guest_proc_queries, symbol, token, @tagName(guestSymbolKind(symbol)) },
         );
@@ -385,7 +388,7 @@ pub const Forwarder = struct {
                 // has an explicit bridge.
                 .@"opaque" => {
                     self.guest_opaque_calls +|= 1;
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: Vulkan ABI gap: called unmodeled proc {s} (token=0x{x}, call={d}); returning zero\n",
                         .{ entry.name[0..entry.name_length], entry.token, entry.calls },
                     );
@@ -408,7 +411,7 @@ pub const Forwarder = struct {
         const handle = self.nextVulkanObject();
         state.write64(output, handle);
         registerOpaqueHandle(state, handle, name);
-        std.debug.print("macho-processor: Vulkan object created: {s} handle=0x{x} output=0x{x}\n", .{ name, handle, output });
+        machoCapturePrint("macho-processor: Vulkan object created: {s} handle=0x{x} output=0x{x}\n", .{ name, handle, output });
         return 0;
     }
 
@@ -417,7 +420,7 @@ pub const Forwarder = struct {
         if (result == 0) {
             self.vulkan_logical_devices_created +|= 1;
             if (self.vulkan_logical_devices_created == 1) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: Vulkan milestone: logical_device_created handle=0x{x} output=0x{x}\n",
                     .{ VK_SYNTHETIC_DEVICE, output },
                 );
@@ -433,7 +436,7 @@ pub const Forwarder = struct {
         registerOpaqueHandle(state, queue, "Vulkan device queue");
         self.vulkan_queues_acquired +|= 1;
         if (self.vulkan_queues_acquired == 1) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan milestone: queue_acquired queue=0x{x} output=0x{x} via={s}\n",
                 .{ queue, output, name },
             );
@@ -484,7 +487,7 @@ pub const Forwarder = struct {
         }
         if (result != 0 or instance == null) {
             self.native_vulkan_failures +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native Vulkan instance creation failed: attempt={d} VkResult={d} library_token=0x{x}\n",
                 .{ self.native_vulkan_instance_attempts, result, library_token },
             );
@@ -492,7 +495,7 @@ pub const Forwarder = struct {
         }
         self.native_vulkan_instance = instance;
         self.native_vulkan_library_token = library_token;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: native Vulkan shadow instance ready: instance=0x{x} library_token=0x{x} attempt={d}\n",
             .{ @intFromPtr(instance.?), library_token, self.native_vulkan_instance_attempts },
         );
@@ -540,14 +543,14 @@ pub const Forwarder = struct {
         const result = create_surface(self.native_vulkan_instance, &create_info, null, &surface);
         if (result != 0 or surface == 0) {
             self.native_vulkan_failures +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native vkCreateMetalSurfaceEXT failed: attempt={d} VkResult={d} CAMetalLayer=0x{x} surface=0x{x}\n",
                 .{ self.native_vulkan_surface_attempts, result, host_layer, surface },
             );
             return .{ .enforced = true, .result = if (result != 0) result else vkErrorInitializationFailedSigned(), .surface = 0 };
         }
         self.native_vulkan_surface = surface;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: native vkCreateMetalSurfaceEXT succeeded: attempt={d} instance=0x{x} CAMetalLayer=0x{x} VkSurfaceKHR=0x{x}\n",
             .{ self.native_vulkan_surface_attempts, @intFromPtr(self.native_vulkan_instance.?), host_layer, surface },
         );
@@ -585,7 +588,7 @@ pub const Forwarder = struct {
         const s_type = if (info != null) state.read32(create_info) else 0;
         const layer = if (info != null) state.read64(create_info + 24) else 0;
         if (state.active_gtk_idle_source == 0) self.vulkan_presenter_off_ui_calls +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Vulkan presenter bind: stage=metal_surface_requested step={d} thread=0x{x} gtk_idle_source={d} instance=0x{x} create_info=0x{x} s_type={d} layer=0x{x} output=0x{x}\n",
             .{ state.executed_steps, state.active_guest_thread, state.active_gtk_idle_source, instance, create_info, s_type, layer, output },
         );
@@ -599,7 +602,7 @@ pub const Forwarder = struct {
         if (info == null or s_type != VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT or !layer_valid) {
             self.vulkan_presenter_stage = .failed;
             self.vulkan_presenter_bind_failures +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan presenter bind failed: stage=metal_surface reason={s} create_info=0x{x} s_type={d} expected={d}\n",
                 .{ if (info == null) "unmapped_create_info" else if (s_type != VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT) "unexpected_s_type" else if (layer == 0) "null_metal_layer" else "unbound_native_metal_layer", create_info, s_type, VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT },
             );
@@ -609,7 +612,7 @@ pub const Forwarder = struct {
         if (native_surface.enforced and native_surface.result != 0) {
             self.vulkan_presenter_stage = .failed;
             self.vulkan_presenter_bind_failures +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan presenter bind failed: stage=metal_surface reason=host_vkCreateMetalSurfaceEXT_failed VkResult={d} layer=0x{x}\n",
                 .{ native_surface.result, layer },
             );
@@ -623,7 +626,7 @@ pub const Forwarder = struct {
                 state.noteNativeVulkanSurfaceBound(layer, VK_SYNTHETIC_SURFACE, native_surface.surface);
             }
             if (self.vulkan_metal_surfaces_created == 1) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: Vulkan milestone: metal_surface_created surface=0x{x} layer=0x{x} output=0x{x} gtk_idle_source={d}\n",
                     .{ VK_SYNTHETIC_SURFACE, layer, output, state.active_gtk_idle_source },
                 );
@@ -642,7 +645,7 @@ pub const Forwarder = struct {
         const s_type = if (info != null) state.read32(create_info) else 0;
         const surface = if (info != null) state.read64(create_info + 24) else 0;
         if (state.active_gtk_idle_source == 0) self.vulkan_presenter_off_ui_calls +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Vulkan presenter bind: stage=swapchain_requested attempt={d} step={d} thread=0x{x} gtk_idle_source={d} device=0x{x} create_info=0x{x} s_type={d} surface=0x{x} output=0x{x}\n",
             .{ self.vulkan_presenter_bind_attempts, state.executed_steps, state.active_guest_thread, state.active_gtk_idle_source, device, create_info, s_type, surface, output },
         );
@@ -665,7 +668,7 @@ pub const Forwarder = struct {
         if (failure_reason) |reason| {
             self.vulkan_presenter_stage = .failed;
             self.vulkan_presenter_bind_failures +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan presenter bind failed: stage=swapchain attempt={d} reason={s} device=0x{x} surface=0x{x} s_type={d} output=0x{x}\n",
                 .{ self.vulkan_presenter_bind_attempts, reason, device, surface, s_type, output },
             );
@@ -683,13 +686,13 @@ pub const Forwarder = struct {
             }
         }
         if (self.vulkan_swapchains_created == 1) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan milestone: swapchain_created handle=0x{x} output=0x{x} images={d}\n",
                 .{ handle, output, self.vulkan_swapchain_image_count },
             );
         }
         self.vulkan_presenter_stage = .ready;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Vulkan presenter bind complete: stage=ready attempt={d} surface=0x{x} swapchain=0x{x} gtk_idle_source={d}\n",
             .{ self.vulkan_presenter_bind_attempts, surface, handle, state.active_gtk_idle_source },
         );
@@ -719,7 +722,7 @@ pub const Forwarder = struct {
         state.write32(count_address, written);
         self.vulkan_swapchain_images_enumerated +|= written;
         if (self.vulkan_swapchain_images_enumerated == written) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan milestone: swapchain_images count={d} output=0x{x}\n",
                 .{ written, state.regs.rcx },
             );
@@ -732,7 +735,7 @@ pub const Forwarder = struct {
         state.write32(output, 0);
         self.vulkan_images_acquired +|= 1;
         if (self.vulkan_images_acquired == 1) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan milestone: first_image_acquired index=0 output=0x{x}\n",
                 .{output},
             );
@@ -743,7 +746,7 @@ pub const Forwarder = struct {
     fn queueSubmit(self: *Forwarder) u64 {
         self.vulkan_queue_submits +|= 1;
         if (self.vulkan_queue_submits == 1) {
-            std.debug.print("macho-processor: Vulkan milestone: first_queue_submit\n", .{});
+            machoCapturePrint("macho-processor: Vulkan milestone: first_queue_submit\n", .{});
         }
         return 0;
     }
@@ -751,7 +754,7 @@ pub const Forwarder = struct {
     fn queuePresent(self: *Forwarder) u64 {
         self.vulkan_presents +|= 1;
         if (self.vulkan_presents == 1) {
-            std.debug.print("macho-processor: Vulkan milestone: first_present_reached\n", .{});
+            machoCapturePrint("macho-processor: Vulkan milestone: first_present_reached\n", .{});
         }
         return 0;
     }
@@ -764,7 +767,7 @@ pub const Forwarder = struct {
         self.vulkan_memory_allocations +|= 1;
         const size = if (info != 0 and state.guestMemoryConst(info + 8, 8) != null) state.read64(info + 8) else 0;
         if (self.vulkan_memory_allocations <= 8 or self.vulkan_memory_allocations % 64 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan memory allocated: handle=0x{x} requested_size={d} output=0x{x}\n",
                 .{ handle, size, output },
             );
@@ -783,7 +786,7 @@ pub const Forwarder = struct {
         const mapped = state.guestAlloc(allocation_size, 16) orelse return vkErrorOutOfHostMemory();
         state.write64(output, mapped);
         self.vulkan_memory_maps +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Vulkan memory mapped: ptr=0x{x} modeled_size={d} requested_size={d} output=0x{x}\n",
             .{ mapped, allocation_size, requested_size, output },
         );
@@ -800,7 +803,7 @@ pub const Forwarder = struct {
             state.write64(output + @as(u64, @intCast(index)) * 8, handle);
             registerOpaqueHandle(state, handle, name);
         }
-        std.debug.print("macho-processor: Vulkan objects allocated: {s} count={d} output=0x{x}\n", .{ name, count, output });
+        machoCapturePrint("macho-processor: Vulkan objects allocated: {s} count={d} output=0x{x}\n", .{ name, count, output });
         return 0;
     }
 
@@ -812,7 +815,7 @@ pub const Forwarder = struct {
             state.write64(output + index * 8, handle);
             registerOpaqueHandle(state, handle, name);
         }
-        std.debug.print("macho-processor: Vulkan objects created: {s} count={d} output=0x{x}\n", .{ name, count, output });
+        machoCapturePrint("macho-processor: Vulkan objects created: {s} count={d} output=0x{x}\n", .{ name, count, output });
         return 0;
     }
 
@@ -825,7 +828,7 @@ pub const Forwarder = struct {
                 entry.* = .{ .token = token, .virtual_vulkan = true, .path_length = path_length };
                 @memcpy(entry.path[0..path_length], path[0..path_length]);
                 self.guest_open_count +|= 1;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: Vulkan guest loader virtualized: path={s} mode=0x{x} token=0x{x}; native dyld load deferred until Metal surface bind\n",
                     .{ path, mode, token },
                 );
@@ -921,7 +924,7 @@ pub const Forwarder = struct {
             .darwin_vm_page_size => blk: {
                 self.page_size_queries +|= 1;
                 if (self.page_size_queries <= 4) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: Darwin VM page geometry query #{d}: getpagesize={d} guest_tracking_page={d} contract=host_mmap_compatible\n",
                         .{ self.page_size_queries, guest_memory_geometry.host_vm_page_size, guest_memory_geometry.guest_page_size },
                     );
@@ -959,7 +962,7 @@ pub const Forwarder = struct {
         if (self.virtual_sleep_calls <= 16 or self.virtual_sleep_calls % 1000 == 0) {
             const thread = if (comptime @hasField(State, "active_guest_thread")) state.active_guest_thread else 0;
             const step = if (comptime @hasField(State, "executed_steps")) state.executed_steps else 0;
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: virtual guest sleep #{d}: thread=0x{x} requested_ns={d} effective_ns={d} kind={s} repair={s} cumulative_ns={d} step={d} host_blocked=false\n",
                 .{ self.virtual_sleep_calls, thread, nanoseconds, ns, @tagName(decision.kind), @tagName(decision.repair), self.virtual_sleep_nanoseconds, step },
             );
@@ -976,7 +979,7 @@ pub const Forwarder = struct {
     }
 
     pub fn logSummary(self: *const Forwarder) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: dynamic library forwarding: considered={d} forwarded={d} guest_open={d} guest_close={d} guest_lookup={d} proc_queries={d} guest_thunk_calls={d} opaque_calls={d} not_allowlisted={d} library_rejected={d} symbol_missing={d} guest_memory_rejected={d} page_geometry_queries={d} virtual_sleep(calls/total_effective_ns/longest_effective_ns/repairs)={d}/{d}/{d}/{d}\n",
             .{
                 self.considered,
@@ -999,7 +1002,7 @@ pub const Forwarder = struct {
             },
         );
         if (self.guest_proc_queries != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Vulkan lifecycle: device={d} queue={d} metal_surface={d} swapchain={d} swapchain_images={d} acquired={d} submits={d} presents={d} memory(alloc/maps)={d}/{d} opaque={d} presenter(stage/attempts/failures/off_ui_calls)={s}/{d}/{d}/{d}\n",
                 .{
                     self.vulkan_logical_devices_created,
@@ -1019,14 +1022,14 @@ pub const Forwarder = struct {
                     self.vulkan_presenter_off_ui_calls,
                 },
             );
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native Vulkan presenter backing: loader(attempts/failures)={d}/{d} instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
                 .{ self.native_vulkan_loader_attempts, self.native_vulkan_loader_failures, self.native_vulkan_instance_attempts, self.native_vulkan_surface_attempts, self.native_vulkan_failures, if (self.native_vulkan_instance) |instance| @intFromPtr(instance) else 0, self.native_vulkan_surface, self.native_vulkan_library_token },
             );
-            std.debug.print("macho-processor: Vulkan proc inventory:\n", .{});
+            machoCapturePrint("macho-processor: Vulkan proc inventory:\n", .{});
             for (&self.guest_symbols) |*entry| {
                 if (entry.token == 0) continue;
-                std.debug.print(
+                machoCapturePrint(
                     "  token=0x{x} kind={s} calls={d} name={s}\n",
                     .{ entry.token, @tagName(entry.kind), entry.calls, entry.name[0..entry.name_length] },
                 );
@@ -1068,20 +1071,20 @@ pub const Forwarder = struct {
         var path_buffer: [1024]u8 = undefined;
         const path_z = nulTerminate(&path_buffer, path) orelse return null;
         self.native_vulkan_loader_attempts +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: native Vulkan loader begin: attempt={d} path={s}; entering host dlopen/dyld initializers\n",
             .{ self.native_vulkan_loader_attempts, path },
         );
         const handle = dlopen(path_z, RTLD_LAZY | RTLD_LOCAL) orelse {
             self.native_vulkan_loader_failures +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native Vulkan loader failed: attempt={d} path={s}\n",
                 .{ self.native_vulkan_loader_attempts, path },
             );
             return null;
         };
         entry.handle = handle;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: native Vulkan loader ready: attempt={d} path={s} host_handle=0x{x}\n",
             .{ self.native_vulkan_loader_attempts, path, @intFromPtr(handle) },
         );
@@ -1190,6 +1193,21 @@ pub const Forwarder = struct {
                 );
                 state.write64(data_out_moved_addr, moved);
                 break :blk .{ .handled = @bitCast(@as(i64, result)) };
+            },
+            .pointer_in_pointer_out => blk: {
+                const tm = state.guestMemoryConst(state.regs.rdi, 64) orelse {
+                    const fallback = state.guestMemory(state.regs.rsp - 64, 4) orelse break :blk .{ .handled = 0 };
+                    @memcpy(fallback, "???\x00");
+                    break :blk .{ .handled = state.regs.rsp - 64 };
+                };
+                const function: *const fn ([*]const u8) callconv(.c) [*:0]const u8 = @ptrCast(@alignCast(address));
+                const result = function(tm.ptr);
+                const result_bytes = std.mem.sliceTo(result, 0);
+                const buf_len = @min(result_bytes.len + 1, 256);
+                const guest_buf = state.guestMemory(state.regs.rsp - 64, buf_len) orelse break :blk .{ .handled = 0 };
+                @memcpy(guest_buf[0..result_bytes.len], result_bytes);
+                if (result_bytes.len < buf_len) guest_buf[result_bytes.len] = 0;
+                break :blk .{ .handled = state.regs.rsp - 64 };
             },
         };
     }

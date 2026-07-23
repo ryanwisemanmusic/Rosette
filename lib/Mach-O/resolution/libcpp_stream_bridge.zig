@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
 const cxx_object_model = @import("cxx_object_model.zig");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const MAX_STREAMS = 256; // was 64 — raised for IO-5
 const PATCH_TOML_TRACE_CAPACITY = 128;
@@ -12,6 +13,7 @@ const STRINGSTREAM_BUFFER_OFFSET: u64 = 24;
 const STRINGSTREAM_IOS_OFFSET: u64 = 128;
 const STRINGSTREAM_MIN_SIZE: u64 = STRINGSTREAM_IOS_OFFSET + cxx_object_model.stream_layout.size;
 const STRINGSTREAM_TEXT_CAPACITY: usize = 512;
+const PROC_SELF_MAPS_CAPACITY: usize = 256 * 1024;
 
 /// libc++ stream layout version — offsets are validated against libc++ 16 (v160006).
 /// Update these when targeting a different libc++ version.
@@ -62,6 +64,7 @@ const Stream = struct {
     string_length: usize = 0,
     string_truncated: bool = false,
     string_storage: [STRINGSTREAM_TEXT_CAPACITY]u8 = [_]u8{0} ** STRINGSTREAM_TEXT_CAPACITY,
+    synthetic_proc_maps: bool = false,
 };
 
 const PatchTomlOp = struct {
@@ -255,6 +258,8 @@ pub const Bridge = struct {
     last_patch_schema: PatchTomlSchema = .{},
     last_patch_path_length: u16 = 0,
     last_patch_path: [512]u8 = [_]u8{0} ** 512,
+    proc_maps_length: usize = 0,
+    proc_maps_storage: [PROC_SELF_MAPS_CAPACITY]u8 = [_]u8{0} ** PROC_SELF_MAPS_CAPACITY,
 
     pub fn deinit(self: *Bridge) void {
         for (&self.streams) |*stream| closeStream(stream);
@@ -386,7 +391,7 @@ pub const Bridge = struct {
             const result = self.gcount(state.regs.rdi);
             if (self.findFlexible(state.regs.rdi)) |stream| {
                 if (stream.patch_toml) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: libc++ patch gcount import: object=0x{x} generation={d} host_count={d} guest_field=0x{x}\n",
                         .{ state.regs.rdi, stream.generation, result, state.read64(state.regs.rdi + BASIC_ISTREAM_GCOUNT_OFFSET) },
                     );
@@ -445,6 +450,9 @@ pub const Bridge = struct {
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6setbufEPcl")) {
             return .{ .handled = self.setBuffer(state.regs.rdi, state.regs.rsi, state.regs.rdx) };
         }
+        if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERm")) {
+            return .{ .handled = self.extractUnsignedLong(state) };
+        }
         return null;
     }
 
@@ -497,7 +505,8 @@ pub const Bridge = struct {
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7snextcEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9showmanycEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE4syncEv") or
-            std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6setbufEPcl");
+            std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6setbufEPcl") or
+            std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERm");
     }
 
     pub fn handlePubsetbuf(self: *Bridge, object: u64, buffer: u64, size: u64) u64 {
@@ -574,7 +583,7 @@ pub const Bridge = struct {
         const appended = self.appendToOstream(state, ostream, rendered);
         self.thread_id_insertions +|= 1;
         if (self.thread_id_insertions <= 16 or !appended) {
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: libc++ thread id insertion #{d}: raw=0x{x} displayed={d} ostream=0x{x} appended={}\n",
                 .{ self.thread_id_insertions, raw_id, displayed_id, ostream, appended },
             );
@@ -603,6 +612,54 @@ pub const Bridge = struct {
         const text = state.guestCString(address, 4096) orelse return ostream;
         _ = self.appendToOstream(state, ostream, text);
         return ostream;
+    }
+
+    fn extractUnsignedLong(self: *Bridge, state: anytype) u64 {
+        const istream = state.regs.rdi;
+        const dest_ptr = state.regs.rsi;
+        const stream = self.findFlexible(istream) orelse return istream;
+
+        // Read a line from the stream to parse the number
+        var buffer: [64]u8 = undefined;
+        var length: usize = 0;
+
+        if (self.syntheticContent(stream)) |content| {
+            while (length < buffer.len and stream.tracked_pos < content.len) {
+                const byte = content[@intCast(stream.tracked_pos)];
+                stream.tracked_pos += 1;
+                if (byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r') break;
+                buffer[length] = byte;
+                length += 1;
+            }
+            if (stream.tracked_pos >= content.len) {
+                stream.eof = true;
+                self.noteState(state, stream, cxx_object_model.EOFBIT);
+            }
+        } else if (stream.fd >= 0) {
+            while (length < buffer.len) {
+                var byte: [1]u8 = undefined;
+                const result = std.c.pread(stream.fd, &byte, 1, @intCast(stream.tracked_pos));
+                if (result <= 0) break;
+                if (byte[0] == ' ' or byte[0] == '\n' or byte[0] == '\t' or byte[0] == '\r') {
+                    stream.tracked_pos += 1;
+                    break;
+                }
+                buffer[length] = byte[0];
+                length += 1;
+                stream.tracked_pos += 1;
+            }
+        }
+
+        // Parse the number
+        const text = buffer[0..length];
+        const value = std.fmt.parseUnsigned(u64, text, 10) catch 0;
+
+        // Write to destination
+        if (state.guestMemory(dest_ptr, 8) != null) {
+            state.write64(dest_ptr, value);
+        }
+
+        return istream;
     }
 
     fn appendToOstream(self: *Bridge, state: anytype, ostream: u64, text: []const u8) bool {
@@ -672,7 +729,7 @@ pub const Bridge = struct {
         };
         self.resetStringBuffer(stream);
         self.constructors +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: modeled libc++ stringstream object=0x{x} ostream=0x{x} streambuf=0x{x} ios=0x{x}\n",
             .{ object, object + STRINGSTREAM_OSTREAM_OFFSET, streambuf, object + STRINGSTREAM_IOS_OFFSET },
         );
@@ -689,7 +746,7 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         };
-        if (stream.fd < 0) {
+        if (stream.fd < 0 and !stream.synthetic_proc_maps) {
             stream.failed = true;
             self.noteState(state, stream, cxx_object_model.FAILBIT);
             return false;
@@ -697,6 +754,24 @@ pub const Bridge = struct {
 
         var line: [64 * 1024]u8 = undefined;
         var length: usize = 0;
+        if (self.syntheticContent(stream)) |content| {
+            while (length < line.len and stream.tracked_pos < content.len) {
+                const byte = content[@intCast(stream.tracked_pos)];
+                stream.tracked_pos += 1;
+                if (byte == delimiter) break;
+                line[length] = byte;
+                length += 1;
+            }
+            if (stream.tracked_pos >= content.len) {
+                stream.eof = true;
+                self.noteState(state, stream, cxx_object_model.EOFBIT);
+                if (length == 0) {
+                    stream.failed = true;
+                    self.noteState(state, stream, cxx_object_model.FAILBIT);
+                }
+            }
+            return compat_runtime.initLibcppStringFromSlice(state, string_object, line[0..length]);
+        }
         while (length < line.len) {
             var byte: [1]u8 = undefined;
             const result = std.c.pread(stream.fd, &byte, 1, @intCast(stream.tracked_pos));
@@ -747,9 +822,9 @@ pub const Bridge = struct {
     pub fn logSummary(self: *const Bridge) void {
         var live: usize = 0;
         for (self.streams) |stream| {
-            if (stream.active and stream.fd >= 0) live += 1;
+            if (stream.active and (stream.fd >= 0 or stream.synthetic_proc_maps)) live += 1;
         }
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ stream bridge: constructors={d} open={d} open_failed={d} close={d} read={d} seek={d} peek={d} buffers={d} base_dtors={d} live={d} rejected={d}\n",
             .{ self.constructors, self.opens, self.open_failures, self.closes, self.reads, self.seeks, self.peeks, self.buffer_changes, self.base_destructors, live, self.rejected },
         );
@@ -800,6 +875,9 @@ pub const Bridge = struct {
 
     fn openBytes(self: *Bridge, state: anytype, fs: anytype, object: u64, path: []const u8, mode: u64) u64 {
         self.opens += 1;
+        if (std.mem.eql(u8, path, "/proc/self/maps")) {
+            return self.openProcSelfMaps(state, object, mode);
+        }
         var translated_buffer: [4096]u8 = undefined;
         const translated = fs.resolveHostPath(path, &translated_buffer) orelse path;
         if (translated.len >= translated_buffer.len) {
@@ -821,7 +899,7 @@ pub const Bridge = struct {
         if (fd < 0) {
             self.open_failures +|= 1;
             if (self.find(object)) |stream| stream.failed = true;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ filebuf open failed: guest_path={s} host_path={s} mode=0x{x} errno={s}\n",
                 .{ path, translated, mode, @tagName(std.c.errno(fd)) },
             );
@@ -845,10 +923,11 @@ pub const Bridge = struct {
             if (other.active and other.fd == fd) {
                 other.active = false;
                 other.fd = -1;
-                std.debug.print("macho-processor: libc++ fd aliasing cleanup: deactivated stale ghost entry object=0x{x}\n", .{other.object});
+                machoCapturePrint("macho-processor: libc++ fd aliasing cleanup: deactivated stale ghost entry object=0x{x}\n", .{other.object});
             }
         }
         stream.fd = fd;
+        stream.synthetic_proc_maps = false;
         stream.generation = self.next_generation;
         self.next_generation +|= 1;
         stream.eof = false;
@@ -863,7 +942,7 @@ pub const Bridge = struct {
         @memcpy(stream.path[0..stream.path_length], translated[0..stream.path_length]);
         if (stream.ios_object != 0) _ = self.object_model.clear(state, stream.ios_object, 0);
         if (mode & OPENMODE_ATE != 0) _ = std.c.lseek(fd, 0, std.c.SEEK.END);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ filebuf open: {s} mode=0x{x} fd={d} object=0x{x} generation={d}\n",
             .{ translated, mode, fd, object, stream.generation },
         );
@@ -872,10 +951,52 @@ pub const Bridge = struct {
         return object;
     }
 
+    fn openProcSelfMaps(self: *Bridge, state: anytype, object: u64, mode: u64) u64 {
+        if (mode & OPENMODE_IN == 0 or mode & OPENMODE_OUT != 0) {
+            self.open_failures +|= 1;
+            return 0;
+        }
+        const State = @TypeOf(state.*);
+        if (comptime !@hasDecl(State, "renderProcSelfMaps")) {
+            self.open_failures +|= 1;
+            return 0;
+        }
+        const stream = self.ensure(object) orelse {
+            self.rejected +|= 1;
+            return 0;
+        };
+        closeStream(stream);
+        const snapshot = state.renderProcSelfMaps(self.proc_maps_storage[0..]);
+        self.proc_maps_length = snapshot.len;
+        stream.synthetic_proc_maps = true;
+        stream.generation = self.next_generation;
+        self.next_generation +|= 1;
+        stream.eof = false;
+        stream.failed = false;
+        stream.last_read_count = 0;
+        stream.last_read_offset = -1;
+        stream.last_read_size = 0;
+        stream.tracked_pos = if (mode & OPENMODE_ATE != 0) snapshot.len else 0;
+        stream.patch_toml = false;
+        const path = "/proc/self/maps";
+        stream.path_length = path.len;
+        @memcpy(stream.path[0..path.len], path);
+        if (stream.ios_object != 0) _ = self.object_model.clear(state, stream.ios_object, 0);
+        machoCapturePrint(
+            "macho-processor: libc++ virtual file open: path=/proc/self/maps bytes={d} object=0x{x} generation={d} source=rosette_guest_mappings\n",
+            .{ snapshot.len, object, stream.generation },
+        );
+        return object;
+    }
+
     fn close(self: *Bridge, state: anytype, object: u64) u64 {
         _ = state;
         self.closes += 1;
         const stream = self.findFlexible(object) orelse return 0;
+        if (stream.synthetic_proc_maps) {
+            stream.synthetic_proc_maps = false;
+            return object;
+        }
         if (stream.fd < 0) return 0;
         const result = std.c.close(stream.fd);
         stream.fd = -1;
@@ -884,14 +1005,14 @@ pub const Bridge = struct {
 
     fn isOpen(self: *Bridge, object: u64) bool {
         const stream = self.findFlexible(object) orelse return false;
-        return stream.fd >= 0;
+        return stream.fd >= 0 or stream.synthetic_proc_maps;
     }
 
     fn readInto(self: *Bridge, state: anytype, object: u64, destination: u64, count: u64, set_istream_state: bool) i64 {
         self.reads += 1;
         const stream = self.findFlexible(object) orelse return -1;
         stream.last_read_count = 0;
-        if (stream.fd < 0) {
+        if (stream.fd < 0 and !stream.synthetic_proc_maps) {
             stream.failed = true;
             self.noteState(state, stream, cxx_object_model.FAILBIT);
             return -1;
@@ -903,7 +1024,7 @@ pub const Bridge = struct {
         if (count > MAX_REASONABLE_READ_SIZE) {
             stream.failed = true;
             self.noteState(state, stream, cxx_object_model.FAILBIT | cxx_object_model.BADBIT);
-            std.debug.print("macho-processor: libc++ bridge rejecting unreasonable read: count={d}\n", .{count});
+            machoCapturePrint("macho-processor: libc++ bridge rejecting unreasonable read: count={d}\n", .{count});
             return -1;
         }
         // Also reject reads that would wrap past the end of guest address space
@@ -918,6 +1039,26 @@ pub const Bridge = struct {
             return -1;
         };
         const offset_before = stream.tracked_pos;
+        if (self.syntheticContent(stream)) |content| {
+            const offset: usize = @min(@as(usize, @intCast(offset_before)), content.len);
+            const remaining = content.len - offset;
+            const copied = @min(bytes.len, remaining);
+            @memcpy(bytes[0..copied], content[offset..][0..copied]);
+            stream.last_read_count = @intCast(copied);
+            stream.last_read_offset = @intCast(offset_before);
+            stream.last_read_size = copied;
+            stream.tracked_pos = offset_before +| copied;
+            if (copied < count) {
+                stream.eof = true;
+                if (set_istream_state) stream.failed = true;
+                self.noteState(
+                    state,
+                    stream,
+                    cxx_object_model.EOFBIT | if (set_istream_state) cxx_object_model.FAILBIT else 0,
+                );
+            }
+            return @intCast(copied);
+        }
         const result = std.c.pread(stream.fd, bytes.ptr, bytes.len, @intCast(offset_before));
         if (result < 0) {
             stream.failed = true;
@@ -939,7 +1080,7 @@ pub const Bridge = struct {
             if (prefix.len >= 4 and (std.mem.endsWith(u8, prefix, ".patch.toml") or std.mem.endsWith(u8, prefix, ".toml"))) {
                 const delta = if (destination > object) destination - object else object - destination;
                 if (delta < 1024) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: *** SUSPICIOUS write at destination=0x{x} (only {d} bytes from object=0x{x}) " ++ "for stream fd={d} count={d} — buffer_.data() likely corrupted!\n",
                         .{ destination, delta, object, stream.fd, count },
                     );
@@ -948,7 +1089,7 @@ pub const Bridge = struct {
         }
         self.tracePatchRead(stream, "read", @intCast(offset_before), bytes[0..@intCast(result)]);
         if (stream.patch_toml) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ patch read ABI: sequence={d} generation={d} request_object=0x{x} filebuf_object=0x{x} destination=0x{x} requested={d} returned={d} tracked_before={d} tracked_after={d}\n",
                 .{ self.io_sequence, stream.generation, object, stream.object, destination, count, result, offset_before, stream.tracked_pos },
             );
@@ -963,7 +1104,7 @@ pub const Bridge = struct {
             const clean_patch_toml_eof = stream.patch_toml and result >= 0;
             if (clean_patch_toml_eof and !stream.patch_toml_eof_logged) {
                 stream.patch_toml_eof_logged = true;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: libc++ patch EOF classification: path={s} requested={d} returned={d} offset_before={d} final_offset={d} exact_block_boundary={} eofbit=true failbit=false verdict=normal_parser_termination\n",
                     .{ stream.path[0..stream.path_length], count, result, offset_before, stream.tracked_pos, result == 0 },
                 );
@@ -992,7 +1133,7 @@ pub const Bridge = struct {
             stream.failed = true;
             self.rejected +|= 1;
             if (stream.patch_toml) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: libc++ patch gcount mirror FAILED: istream=0x{x} field=0x{x} generation={d} result={d}\n",
                     .{ istream, address, stream.generation, result },
                 );
@@ -1003,7 +1144,7 @@ pub const Bridge = struct {
         const mirrored: u64 = if (result > 0) @intCast(result) else 0;
         state.write64(address, mirrored);
         if (stream.patch_toml) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ patch gcount mirror: istream=0x{x} field=0x{x} generation={d} previous=0x{x} mirrored={d} host_count={d}\n",
                 .{ istream, address, stream.generation, previous, mirrored, result },
             );
@@ -1017,11 +1158,12 @@ pub const Bridge = struct {
     fn seek(self: *Bridge, object: u64, offset: i64, direction: std.c.whence_t) i64 {
         self.seeks += 1;
         const stream = self.findFlexible(object) orelse return -1;
-        if (stream.fd < 0) return -1;
+        if (stream.fd < 0 and !stream.synthetic_proc_maps) return -1;
         const new_pos: i64 = switch (direction) {
             std.c.SEEK.SET => offset,
             std.c.SEEK.CUR => @as(i64, @intCast(stream.tracked_pos)) + offset,
             std.c.SEEK.END => blk: {
+                if (stream.synthetic_proc_maps) break :blk @as(i64, @intCast(self.proc_maps_length)) + offset;
                 const fsize = std.c.lseek(stream.fd, 0, std.c.SEEK.END);
                 if (fsize < 0) break :blk -1;
                 break :blk fsize + offset;
@@ -1048,6 +1190,14 @@ pub const Bridge = struct {
 
     fn readByte(self: *Bridge, object: u64) i32 {
         const stream = self.findFlexible(object) orelse return -1;
+        if (self.syntheticContent(stream)) |content| {
+            if (stream.tracked_pos >= content.len) return -1;
+            const byte = content[@intCast(stream.tracked_pos)];
+            stream.last_read_offset = @intCast(stream.tracked_pos);
+            stream.last_read_size = 1;
+            stream.tracked_pos += 1;
+            return byte;
+        }
         if (stream.fd < 0) return -1;
         var byte: [1]u8 = undefined;
         const offset_before = stream.tracked_pos;
@@ -1063,6 +1213,12 @@ pub const Bridge = struct {
     fn peek(self: *Bridge, object: u64) i32 {
         self.peeks += 1;
         const stream = self.findFlexible(object) orelse return -1;
+        if (self.syntheticContent(stream)) |content| {
+            if (stream.tracked_pos >= content.len) return -1;
+            stream.last_read_offset = @intCast(stream.tracked_pos);
+            stream.last_read_size = 1;
+            return content[@intCast(stream.tracked_pos)];
+        }
         if (stream.fd < 0) return -1;
         var byte: [1]u8 = undefined;
         const offset_before = stream.tracked_pos;
@@ -1106,7 +1262,7 @@ pub const Bridge = struct {
         var scanner = Utf8Scanner{};
         for (bytes, 0..) |byte, index| {
             if (scanner.feed(byte, @as(u64, @intCast(@max(offset, 0))) + index)) |issue| {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: libc++ patch stream invalid UTF-8 chunk: path={s} operation={s} byte_offset={d} reason={s} byte=0x{x:0>2}\n",
                     .{ stream.path[0..stream.path_length], operation, issue.offset, issue.reason, issue.byte },
                 );
@@ -1115,7 +1271,7 @@ pub const Bridge = struct {
             }
         }
         if (scanner.finish()) |issue| {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ patch stream truncated UTF-8 chunk: path={s} operation={s} byte_offset={d} reason={s}\n",
                 .{ stream.path[0..stream.path_length], operation, issue.offset, issue.reason },
             );
@@ -1128,7 +1284,7 @@ pub const Bridge = struct {
             hex[index * 2] = alphabet[byte >> 4];
             hex[index * 2 + 1] = alphabet[byte & 0x0f];
         }
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ patch stream {s}: path={s} fd={d} offset={d} bytes={d} first={s}\n",
             .{ operation, stream.path[0..stream.path_length], stream.fd, offset, bytes.len, hex[0 .. shown * 2] },
         );
@@ -1144,7 +1300,7 @@ pub const Bridge = struct {
         };
         const empty: [0]u8 = undefined;
         self.recordPatchTomlOp(stream, operation, offset, &empty);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ patch stream {s}: path={s} fd={d} offset={d} dir={s} result={d}\n",
             .{ operation, stream.path[0..stream.path_length], stream.fd, offset, dir_label, result },
         );
@@ -1154,7 +1310,7 @@ pub const Bridge = struct {
         if (!stream.patch_toml) return;
         const empty: [0]u8 = undefined;
         self.recordPatchTomlOp(stream, "tellg", 0, &empty);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ patch stream tellg: path={s} fd={d} result={d}\n",
             .{ stream.path[0..stream.path_length], stream.fd, result },
         );
@@ -1191,7 +1347,7 @@ pub const Bridge = struct {
             found = true;
             const path = stream.path[0..stream.path_length];
             const current: i64 = @intCast(stream.tracked_pos);
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: TOML diagnostics ({s}): path={s} object=0x{x} fd={d} generation={d} io_sequence={d} current_offset={d} last_read_offset={d} last_read_size={d} last_gcount={d} eof={} failed={}\n",
                 .{ reason, path, stream.object, stream.fd, stream.generation, stream.last_io_sequence, current, stream.last_read_offset, stream.last_read_size, stream.last_read_count, stream.eof, stream.failed },
             );
@@ -1199,7 +1355,7 @@ pub const Bridge = struct {
 
             const trace_count = if (stream.patch_toml_trace_full) PATCH_TOML_TRACE_CAPACITY else stream.patch_toml_trace_next;
             if (trace_count > 0) {
-                std.debug.print("macho-processor: libc++ patch I/O trace (last {d} operations):\n", .{trace_count});
+                machoCapturePrint("macho-processor: libc++ patch I/O trace (last {d} operations):\n", .{trace_count});
                 if (stream.patch_toml_trace_full) {
                     const start = stream.patch_toml_trace_next;
                     for (0..PATCH_TOML_TRACE_CAPACITY) |i| {
@@ -1218,7 +1374,7 @@ pub const Bridge = struct {
                             "0123456789abcdef"[op.content_first[3] >> 4],
                             "0123456789abcdef"[op.content_first[3] & 0x0f],
                         };
-                        std.debug.print("  seq={d} {s} offset={d} size={d} first={s} hash=0x{x}\n", .{ op.sequence, op_str, op.offset, op.size, hex_byte[0..8], op.content_hash });
+                        machoCapturePrint("  seq={d} {s} offset={d} size={d} first={s} hash=0x{x}\n", .{ op.sequence, op_str, op.offset, op.size, hex_byte[0..8], op.content_hash });
                     }
                 } else {
                     for (0..stream.patch_toml_trace_next) |i| {
@@ -1236,7 +1392,7 @@ pub const Bridge = struct {
                             "0123456789abcdef"[op.content_first[3] >> 4],
                             "0123456789abcdef"[op.content_first[3] & 0x0f],
                         };
-                        std.debug.print("  seq={d} {s} offset={d} size={d} first={s} hash=0x{x}\n", .{ op.sequence, op_str, op.offset, op.size, hex_byte[0..8], op.content_hash });
+                        machoCapturePrint("  seq={d} {s} offset={d} size={d} first={s} hash=0x{x}\n", .{ op.sequence, op_str, op.offset, op.size, hex_byte[0..8], op.content_hash });
                     }
                 }
             }
@@ -1261,14 +1417,14 @@ pub const Bridge = struct {
                     continue;
                 } else if (op.size > 0) {
                     if (last_offset >= 0 and op.offset < last_offset) {
-                        std.debug.print("macho-processor: *** OFFSET REGRESSION DETECTED: was offset={d}, now offset={d} (went backwards! fd may have been reopened/reset!)\n", .{ last_offset, op.offset });
+                        machoCapturePrint("macho-processor: *** OFFSET REGRESSION DETECTED: was offset={d}, now offset={d} (went backwards! fd may have been reopened/reset!)\n", .{ last_offset, op.offset });
                         regression_found = true;
                     }
                     if (op.offset >= 0) last_offset = op.offset + @as(i64, @intCast(op.size));
                 }
             }
             if (!regression_found and last_offset >= 0) {
-                std.debug.print("macho-processor: I/O trace monotonic: no offset regression detected (last tracked end offset = {d})\n", .{last_offset});
+                machoCapturePrint("macho-processor: I/O trace monotonic: no offset regression detected (last tracked end offset = {d})\n", .{last_offset});
             }
 
             if (stream.fd >= 0) {
@@ -1292,7 +1448,7 @@ pub const Bridge = struct {
                             ehex[j * 2] = "0123456789abcdef"[b >> 4];
                             ehex[j * 2 + 1] = "0123456789abcdef"[b & 0x0f];
                         }
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: pread at current_offset={d} ({d} bytes): first={s}\n",
                             .{ current, ebytes.len, ehex[0..@min(ebytes.len * 2, 64)] },
                         );
@@ -1305,7 +1461,7 @@ pub const Bridge = struct {
                     const fsize = std.c.lseek(stream.fd, 0, std.c.SEEK.END);
                     if (saved >= 0 and fsize >= 0) {
                         _ = std.c.lseek(stream.fd, saved, std.c.SEEK.SET);
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: fd integrity: fd={d} file_size={d}\n",
                             .{ stream.fd, fsize },
                         );
@@ -1318,19 +1474,19 @@ pub const Bridge = struct {
                     if (other.active and other.fd == stream.fd and other.object != stream.object) shared_fd_count += 1;
                 }
                 if (shared_fd_count > 0) {
-                    std.debug.print("macho-processor: *** WARNING: {d} other stream(s) share fd={d}! Possible fd aliasing\n", .{ shared_fd_count, stream.fd });
-                    std.debug.print("macho-processor: fd aliasing detail: primary object=0x{x} tracked_pos={d} path={s}\n", .{ stream.object, stream.tracked_pos, path });
+                    machoCapturePrint("macho-processor: *** WARNING: {d} other stream(s) share fd={d}! Possible fd aliasing\n", .{ shared_fd_count, stream.fd });
+                    machoCapturePrint("macho-processor: fd aliasing detail: primary object=0x{x} tracked_pos={d} path={s}\n", .{ stream.object, stream.tracked_pos, path });
                     for (&self.streams) |other| {
                         if (other.active and other.fd == stream.fd and other.object != stream.object) {
                             const other_path = other.path[0..other.path_length];
-                            std.debug.print("macho-processor: fd aliasing detail: aliased object=0x{x} tracked_pos={d} path={s}\n", .{ other.object, other.tracked_pos, other_path });
+                            machoCapturePrint("macho-processor: fd aliasing detail: aliased object=0x{x} tracked_pos={d} path={s}\n", .{ other.object, other.tracked_pos, other_path });
                         }
                     }
                 }
             }
         }
         if (!found) {
-            std.debug.print("macho-processor: TOML diagnostics ({s}): no active .patch.toml stream tracked by libc++ bridge\n", .{reason});
+            machoCapturePrint("macho-processor: TOML diagnostics ({s}): no active .patch.toml stream tracked by libc++ bridge\n", .{reason});
             if (self.last_patch_schema_valid) {
                 self.logPatchSchemaValues(
                     self.last_patch_path[0..self.last_patch_path_length],
@@ -1356,16 +1512,16 @@ pub const Bridge = struct {
             schema = self.last_patch_schema;
             path = self.last_patch_path[0..self.last_patch_path_length];
         } else {
-            std.debug.print("macho-processor: PatchDB post-parse diagnosis ({s}): no active or archived patch TOML schema is available\n", .{reason});
+            machoCapturePrint("macho-processor: PatchDB post-parse diagnosis ({s}): no active or archived patch TOML schema is available\n", .{reason});
             return;
         }
         self.logPatchSchemaValues(path, schema, reason);
         if (schema.patch_array_headers == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: PatchDB null-dereference correlation: the parsed file contains zero [[patch]] arrays; Xenia PatchDB::ReadPatchFile obtains patch_toml_fields.get(\"patch\") and calls patch_array->is_array() without first checking patch_array for null\n",
                 .{},
             );
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: PatchDB null-dereference verdict: normal EOF and successful TOML parsing are compatible with this crash; the missing optional patch node is the immediate null source, not fd reuse or stream corruption\n",
                 .{},
             );
@@ -1408,7 +1564,7 @@ pub const Bridge = struct {
     }
 
     fn logPatchSchemaValuesStatic(path: []const u8, schema: PatchTomlSchema, label: []const u8) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: patch TOML schema[{s}]: path={s} bytes={d} lines={d} assignments(title_name/title_id/hash)={d}/{d}/{d} patch_array_headers={d} truncated_lines={d} complete={}\n",
             .{ label, path, schema.bytes, schema.lines, schema.title_name_assignments, schema.title_id_assignments, schema.hash_assignments, schema.patch_array_headers, schema.truncated_lines, schema.complete },
         );
@@ -1428,7 +1584,7 @@ pub const Bridge = struct {
         while (true) {
             const result = std.c.read(fd, &buffer, buffer.len);
             if (result < 0) {
-                std.debug.print("macho-processor: libc++ patch TOML preflight failed: {s} errno={s}\n", .{ path, @tagName(std.c.errno(result)) });
+                machoCapturePrint("macho-processor: libc++ patch TOML preflight failed: {s} errno={s}\n", .{ path, @tagName(std.c.errno(result)) });
                 _ = std.c.lseek(fd, original, std.c.SEEK.SET);
                 return;
             }
@@ -1445,7 +1601,7 @@ pub const Bridge = struct {
         stream.patch_toml_schema = schema_scanner.finish();
         self.rememberPatchSchema(stream);
         if (invalid == null) invalid = scanner.finish();
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ patch TOML preflight: path={s} bytes={d} ascii={} utf8={} full_scan=true\n",
             .{ path, total, ascii, invalid == null },
         );
@@ -1461,12 +1617,12 @@ pub const Bridge = struct {
                 hex[index * 2] = alphabet[byte >> 4];
                 hex[index * 2 + 1] = alphabet[byte & 0x0f];
             }
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ patch TOML invalid UTF-8: path={s} byte_offset={d} reason={s} byte=0x{x:0>2} context_start={d} context_hex={s}\n",
                 .{ path, issue.offset, issue.reason, issue.byte, context_start, hex[0 .. context_len * 2] },
             );
         } else {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ patch TOML host bytes validated; parser invalid-UTF8 reports likely indicate modeled stream/cursor corruption if exception still follows this file: path={s}\n",
                 .{path},
             );
@@ -1488,7 +1644,7 @@ pub const Bridge = struct {
             hex[index * 2 + 1] = alphabet[byte & 0x0f];
             ascii[index] = if (byte >= 0x20 and byte < 0x7f) byte else '.';
         }
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ patch TOML context[{s}]: path={s} center={d} start={d} bytes={d} hex={s} ascii='{s}'\n",
             .{ label, path, center, start, context_len, hex[0 .. context_len * 2], ascii[0..context_len] },
         );
@@ -1496,6 +1652,9 @@ pub const Bridge = struct {
 
     fn available(self: *Bridge, object: u64) i64 {
         const stream = self.findFlexible(object) orelse return -1;
+        if (self.syntheticContent(stream)) |content| {
+            return if (stream.tracked_pos >= content.len) 0 else @intCast(content.len - @as(usize, @intCast(stream.tracked_pos)));
+        }
         if (stream.fd < 0) return -1;
         const end = std.c.lseek(stream.fd, 0, std.c.SEEK.END);
         if (end < 0) return -1;
@@ -1512,6 +1671,11 @@ pub const Bridge = struct {
         stream.buffer_size = size;
         self.buffer_changes += 1;
         return object;
+    }
+
+    fn syntheticContent(self: *const Bridge, stream: *const Stream) ?[]const u8 {
+        if (!stream.synthetic_proc_maps) return null;
+        return self.proc_maps_storage[0..self.proc_maps_length];
     }
 
     fn ensure(self: *Bridge, object: u64) ?*Stream {
@@ -1571,6 +1735,7 @@ pub const Bridge = struct {
 fn closeStream(stream: *Stream) void {
     if (stream.fd >= 0) _ = std.c.close(stream.fd);
     stream.fd = -1;
+    stream.synthetic_proc_maps = false;
 }
 
 fn normalizeSymbol(symbol: []const u8) []const u8 {
@@ -1814,6 +1979,53 @@ test "modeled istream read mirrors libc++ gcount ABI field" {
     bridge.mirrorGuestGcount(&state, istream, 32);
     try std.testing.expectEqual(@as(u64, 32), state.read64(istream + BASIC_ISTREAM_GCOUNT_OFFSET));
     try std.testing.expectEqual(@as(i64, 0), stream.last_read_count);
+}
+
+test "virtual proc maps file supports libc++ reads and seeks without a host fd" {
+    const TestState = struct {
+        mem: [256]u8 = [_]u8{0} ** 256,
+
+        pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+            if (address + length > self.mem.len) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        pub fn read32(self: *const @This(), address: u64) u32 {
+            return std.mem.readInt(u32, self.mem[@intCast(address)..][0..4], .little);
+        }
+
+        pub fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.mem[@intCast(address)..][0..4], value, .little);
+        }
+
+        pub fn read64(self: *const @This(), address: u64) u64 {
+            return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
+        }
+
+        pub fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+        }
+
+        pub fn renderProcSelfMaps(_: *const @This(), output: []u8) []const u8 {
+            const content = "1000-2000 rw-p 00000000 00:00 0 [rosette-mapping]\n";
+            @memcpy(output[0..content.len], content);
+            return output[0..content.len];
+        }
+    };
+
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    var state = TestState{};
+    const object: u64 = 32;
+    try std.testing.expectEqual(object, bridge.openProcSelfMaps(&state, object, OPENMODE_IN));
+    try std.testing.expect(bridge.isOpen(object));
+    try std.testing.expectEqual(@as(i64, 8), bridge.readInto(&state, object, 128, 8, false));
+    try std.testing.expectEqualStrings("1000-200", state.mem[128..136]);
+    try std.testing.expectEqual(@as(i64, 0), bridge.seek(object, 0, std.c.SEEK.SET));
+    try std.testing.expectEqual(@as(i32, '1'), bridge.peek(object));
+    try std.testing.expectEqual(@as(i32, '1'), bridge.readByte(object));
+    try std.testing.expectEqual(object, bridge.close(&state, object));
+    try std.testing.expect(!bridge.isOpen(object));
 }
 
 test "patch byte count reports latest block not cumulative cursor" {

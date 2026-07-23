@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const bootstrap_thunk: u64 = 0xFFFF_F700_0000_0000;
 const descriptor_size: u64 = 3 * @sizeOf(u64);
@@ -26,7 +27,7 @@ pub const Runtime = struct {
             self.descriptor_count +|= 1;
         }
         if (self.descriptor_count != 0) {
-            std.debug.print("macho-processor: installed Darwin TLV bootstrap for {d} descriptor(s)\n", .{self.descriptor_count});
+            machoCapturePrint("macho-processor: installed Darwin TLV bootstrap for {d} descriptor(s)\n", .{self.descriptor_count});
         }
     }
 

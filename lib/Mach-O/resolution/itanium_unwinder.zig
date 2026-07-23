@@ -1,6 +1,7 @@
 const std = @import("std");
 const compact_unwind = @import("compact_unwind.zig");
 const itanium_dynamic_cast = @import("itanium_dynamic_cast.zig");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const MAX_FRAMES: usize = 48;
 const DW_EH_PE_OMIT: u8 = 0xFF;
@@ -68,7 +69,7 @@ pub const Engine = struct {
         const image_base = unwindImageBase(metadata);
         self.compact = compact_unwind.Index.init(bytes, section.address, image_base);
         if (self.compact != null) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Itanium unwind engine indexed __unwind_info: address=0x{x} size={d} image_base=0x{x}\n",
                 .{ section.address, section.size, image_base },
             );
@@ -99,7 +100,7 @@ pub const Engine = struct {
                     if (self.verbose) {
                         const fsym = state.metadata.nearestSymbol(info.function_start);
                         const fsym_str = if (fsym) |s| s.name else "???";
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   frame[{d}] compact_unwind hit: func={s}+0x{x} mode={s} lsda=0x{x}\n",
                             .{ frame_index, fsym_str, info.function_start, @tagName(info.mode), info.lsda_address },
                         );
@@ -122,7 +123,7 @@ pub const Engine = struct {
                                 result.cleanup_frames += 1;
                             }
                         } else if (self.verbose) {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "macho-processor:   frame[{d}] compact_unwind MISS for ip=0x{x}\n",
                                 .{ frame_index, instruction -| 1 },
                             );
@@ -147,7 +148,7 @@ pub const Engine = struct {
                     if (self.verbose) {
                         const ret_sym = state.metadata.nearestSymbol(return_address);
                         const ret_str = if (ret_sym) |s| s.name else "???";
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   frame[{d}] rbp_chain ok: saved_rbp=0x{x} ret=0x{x} ({s}) next_sp=0x{x}\n",
                             .{ frame_index, next_frame, return_address, ret_str, next_sp },
                         );
@@ -156,7 +157,7 @@ pub const Engine = struct {
                     // Null saved-rbp signals the outermost frame
                     // (pthread start). Terminate the walk here.
                     if (self.verbose) {
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   frame[{d}] rbp_chain TERMINATED: saved_rbp=0 (top of stack) ret=0x{x}\n",
                             .{ frame_index, return_address },
                         );
@@ -167,7 +168,7 @@ pub const Engine = struct {
                     next_fp = next_frame;
                     next_sp = frame_pointer + 16;
                     if (self.verbose) {
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   frame[{d}] rbp_chain BROKEN: saved_rbp=0x{x} (valid={}) ret=0x{x} continuing via return address\n",
                             .{ frame_index, next_frame, next_frame > frame_pointer and state.guestMemoryConst(next_frame, 16) != null, return_address },
                         );
@@ -176,14 +177,14 @@ pub const Engine = struct {
             } else if (frame_pointer != 0) {
                 result.frame_chain_valid = false;
                 if (self.verbose) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   frame[{d}] rbp=0x{x} memory UNREADABLE, frame chain terminated\n",
                         .{ frame_index, frame_pointer },
                     );
                 }
             } else {
                 if (self.verbose) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   frame[{d}] rbp=0x0, frame chain terminated\n",
                         .{frame_index},
                     );
@@ -238,7 +239,7 @@ pub const Engine = struct {
                 return false;
             }
             self.active_phase_two = checkpoint;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Itanium phase-2 transaction restored from checkpoint: next_frame={d} exception=0x{x}\n",
                 .{ checkpoint.next_frame, checkpoint.exception_header },
             );
@@ -274,43 +275,43 @@ pub const Engine = struct {
 
     pub fn logSummary(self: *const Engine) void {
         if (self.inspections == 0 and self.compact == null) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Itanium unwind summary: metadata={} inspections={d} frames={d} handlers={d} phase_two={d}/{d} completed_catches={d} cleanups={d} resumes={d} orphan_resume_recovered={d}/{d}\n",
             .{ self.compact != null, self.inspections, self.frames_walked, self.handlers_found, self.phase_two_installs, self.phase_two_attempts, self.completed_catches, self.cleanup_installs, self.resume_calls, self.orphan_resume_recoveries, self.orphan_resume_attempts },
         );
     }
 
     fn logInspection(self: *const Engine, state: anytype, inspection: Inspection, type_info_address: u64) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Itanium phase-1 walk: frames={d} metadata_frames={d} cleanup_frames={d} frame_chain_valid={}\n",
             .{ inspection.frame_count, inspection.metadata_frames, inspection.cleanup_frames, inspection.frame_chain_valid },
         );
         for (inspection.frames[0..inspection.frame_count], 0..) |frame, index| {
             const symbol = state.metadata.nearestSymbol(frame.instruction -| 1);
             if (symbol) |resolved| {
-                std.debug.print(
+                machoCapturePrint(
                     "  unwind[{d}] {s}+0x{x} rbp=0x{x} sp=0x{x} mode={s} lsda=0x{x} cleanup=0x{x}\n",
                     .{ index, resolved.name, resolved.offset, frame.frame_pointer, frame.stack_pointer, @tagName(frame.mode), frame.lsda_address, frame.cleanup_landing_pad },
                 );
             } else {
-                std.debug.print(
+                machoCapturePrint(
                     "  unwind[{d}] ip=0x{x} rbp=0x{x} sp=0x{x} mode={s} lsda=0x{x} cleanup=0x{x}\n",
                     .{ index, frame.instruction, frame.frame_pointer, frame.stack_pointer, @tagName(frame.mode), frame.lsda_address, frame.cleanup_landing_pad },
                 );
             }
         }
         if (inspection.handler) |handler| {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Itanium phase-1 handler candidate: frame={d} landing_pad=0x{x} selector={d} catch_all={}\n",
                 .{ handler.frame_index, handler.landing_pad, handler.selector, handler.catch_all },
             );
         } else {
             if (inspection.cleanup_frames != 0) {
-                std.debug.print("macho-processor: Itanium phase-1 found no matching catch handler; phase two will run {d} verified cleanup landing pad(s), then stop as unhandled:\n", .{inspection.cleanup_frames});
+                machoCapturePrint("macho-processor: Itanium phase-1 found no matching catch handler; phase two will run {d} verified cleanup landing pad(s), then stop as unhandled:\n", .{inspection.cleanup_frames});
             } else {
-                std.debug.print("macho-processor: Itanium phase-1 found no matching catch handler or cleanup landing pad:\n", .{});
+                machoCapturePrint("macho-processor: Itanium phase-1 found no matching catch handler or cleanup landing pad:\n", .{});
             }
-            std.debug.print("macho-processor: dumping LSDA details for all frames with non-zero LSDAs:\n", .{});
+            machoCapturePrint("macho-processor: dumping LSDA details for all frames with non-zero LSDAs:\n", .{});
             if (self.compact) |*compact_index| {
                 for (inspection.frames[0..inspection.frame_count]) |frame| {
                     if (frame.lsda_address == 0) continue;
@@ -333,7 +334,7 @@ pub const Engine = struct {
             if (frame.cleanup_landing_pad == 0) continue;
             if (!installContext(state, frame, frame.cleanup_landing_pad, 0, active.exception_header)) return false;
             self.cleanup_installs +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Itanium phase-2 cleanup installed: frame={d} landing_pad=0x{x} exception=0x{x}\n",
                 .{ index, frame.cleanup_landing_pad, active.exception_header },
             );
@@ -344,7 +345,7 @@ pub const Engine = struct {
             active.next_frame = active.inspection.frame_count;
             self.phase_two_checkpoint = active.*;
             self.active_phase_two = null;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Itanium phase-2 cleanups exhausted without a matching catch; exception remains unhandled\n",
                 .{},
             );
@@ -356,7 +357,7 @@ pub const Engine = struct {
         active.next_frame = handler.frame_index + 1;
         self.phase_two_checkpoint = active.*;
         self.phase_two_installs +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Itanium phase-2 handler installed: frame={d} landing_pad=0x{x} selector={d} rbp=0x{x} rsp=0x{x} exception=0x{x}\n",
             .{ handler.frame_index, handler.landing_pad, handler.selector, state.regs.rbp, state.regs.rsp, active.exception_header },
         );
@@ -476,7 +477,7 @@ fn logLsdaCallSitesForFrame(
     thrown_type: u64,
 ) void {
     const data = state.guestMemoryConst(frame.lsda_address, 4096) orelse {
-        std.debug.print("macho-processor:   [LSDA] lsda=0x{x} UNREADABLE\n", .{frame.lsda_address});
+        machoCapturePrint("macho-processor:   [LSDA] lsda=0x{x} UNREADABLE\n", .{frame.lsda_address});
         return;
     };
     var position: usize = 0;
@@ -500,7 +501,7 @@ fn logLsdaCallSitesForFrame(
 
     const symbol = state.metadata.nearestSymbol(frame.function_start);
     const func_name = if (symbol) |s| s.name else "<unknown>";
-    std.debug.print(
+    machoCapturePrint(
         "macho-processor:   [LSDA] func={s} lsda=0x{x} lp_start=0x{x} ip_offset=0x{x} type_enc=0x{x} cs_enc=0x{x}\n",
         .{ func_name, frame.lsda_address, lp_start, instruction_offset, type_encoding, call_site_encoding },
     );
@@ -513,7 +514,7 @@ fn logLsdaCallSitesForFrame(
         const cs_landing = readEncoded(state, data, frame.lsda_address, &pos, call_site_encoding) orelse return;
         const cs_action = readUleb(data, &pos) orelse return;
         const matches = instruction_offset >= cs_start and instruction_offset < cs_start +| cs_length;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor:   [LSDA] call-site[{d}] range=[0x{x},0x{x}) landing=0x{x} action={d} ip_in_range={}\n",
             .{ cs_index, cs_start, cs_start +| cs_length, cs_landing, cs_action, matches },
         );
@@ -533,13 +534,13 @@ fn logLsdaCallSitesForFrame(
                         const catch_name = if (ct != 0) (state.guestCString(state.read64(ct +| 8), 256) orelse "<unreadable>") else "<catch_all>";
                         const thrown_name = if (thrown_type != 0) (state.guestCString(state.read64(thrown_type +| 8), 256) orelse "<unreadable>") else "<none>";
                         const compatible = ct == 0 or itanium_dynamic_cast.isCatchCompatible(state, thrown_type, ct);
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   [LSDA]   catch type_filter={d} catch_type=0x{x} ({s}) thrown=0x{x} ({s}) compatible={}\n",
                             .{ tf, ct, catch_name, thrown_type, thrown_name, compatible },
                         );
                     }
                 } else if (tf == 0) {
-                    std.debug.print("macho-processor:   [LSDA]   cleanup type_filter=0\n", .{});
+                    machoCapturePrint("macho-processor:   [LSDA]   cleanup type_filter=0\n", .{});
                 }
                 if (nxt == 0) break;
                 const next_position = @as(i64, @intCast(cursor)) + nxt;
@@ -567,7 +568,7 @@ fn logLsdaCallSites(
 ) void {
     const symbol = state.metadata.nearestSymbol(frame.function_start);
     const func_name = if (symbol) |s| s.name else "<unknown>";
-    std.debug.print(
+    machoCapturePrint(
         "macho-processor:   [LSDA] func={s} lp_start=0x{x} lp_enc=0x{x} type_enc=0x{x} type_table=0x{x} cs_enc=0x{x} cs_end=0x{x} ip_offset=0x{x}\n",
         .{ func_name, lp_start, lp_encoding, type_encoding, type_table, call_site_encoding, call_site_end, instruction_offset },
     );
@@ -580,7 +581,7 @@ fn logLsdaCallSites(
         const cs_landing = readEncoded(state, data, frame.lsda_address, &pos, call_site_encoding) orelse return;
         const cs_action = readUleb(data, &pos) orelse return;
         const matches = instruction_offset >= cs_start and instruction_offset < cs_start +| cs_length;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor:   [LSDA] call-site[{d}] range=[0x{x},0x{x}) landing=0x{x} action={d} match={}\n",
             .{ cs_index, cs_start, cs_start +| cs_length, cs_landing, cs_action, matches },
         );
@@ -599,13 +600,13 @@ fn logLsdaCallSites(
                         if ((type_encoding & DW_EH_PE_INDIRECT) != 0 and ct != 0) ct = state.read64(ct);
                         const catch_name = if (ct != 0) (state.guestCString(state.read64(ct +| 8), 256) orelse "<unknown>") else "<catch_all>";
                         const thrown_name = state.guestCString(state.read64(thrown_type +| 8), 256) orelse "<unknown>";
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   [LSDA]   type-filter={d} catch_type=0x{x} ({s}) thrown_type=0x{x} ({s})\n",
                             .{ type_filter, ct, catch_name, thrown_type, thrown_name },
                         );
                     }
                 } else if (type_filter == 0) {
-                    std.debug.print("macho-processor:   [LSDA]   type-filter=0 (cleanup)\n", .{});
+                    machoCapturePrint("macho-processor:   [LSDA]   type-filter=0 (cleanup)\n", .{});
                 }
                 if (next == 0) break;
                 const next_position = @as(i64, @intCast(cursor)) + next;

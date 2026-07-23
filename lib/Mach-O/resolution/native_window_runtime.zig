@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const APPLICATION_TOKEN: u64 = 0xFFFF_F400_0000_0011;
 pub const WINDOW_TOKEN: u64 = 0xFFFF_F400_0000_0021;
@@ -64,7 +65,7 @@ pub const Runtime = struct {
         self.application_ensure_attempts +|= 1;
         const ok = rosette_macho_native_application_ensure() != 0;
         if (!ok) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native AppKit application creation failed: attempt={d}\n",
                 .{self.application_ensure_attempts},
             );
@@ -85,7 +86,7 @@ pub const Runtime = struct {
         ) != 0;
         if (!ok) {
             self.window_ensure_failures +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native AppKit window creation failed: attempt={d} failures={d} requested={d}x{d}\n",
                 .{ self.window_ensure_attempts, self.window_ensure_failures, self.requested_width, self.requested_height },
             );
@@ -94,7 +95,7 @@ pub const Runtime = struct {
         const status = rosette_macho_native_window_status();
         if (!self.window_ready_logged) {
             self.window_ready_logged = true;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native AppKit window ready: NSApplication=0x{x} NSWindow=0x{x} NSView=0x{x} CAMetalLayer=0x{x} MTLDevice=0x{x} drawable={d}x{d} main_thread={} attached={}\n",
                 .{ status.application, status.window, status.view, status.metal_layer, status.metal_device, status.width, status.height, status.on_main_thread != 0, status.layer_attached != 0 },
             );
@@ -142,7 +143,7 @@ pub const Runtime = struct {
         if (!self.ensureWindow()) return 0;
         if (self.view_requests == 1) {
             const status = rosette_macho_native_window_status();
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: Quartz NSView exported to guest: token=0x{x} host_NSView=0x{x} NSWindow=0x{x} drawable={d}x{d}\n",
                 .{ VIEW_TOKEN, status.view, status.window, status.width, status.height },
             );
@@ -155,7 +156,7 @@ pub const Runtime = struct {
         if (!self.ensureWindow()) return 0;
         if (self.layer_requests == 1) {
             const status = rosette_macho_native_window_status();
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: CAMetalLayer exported to guest: token=0x{x} host_CAMetalLayer=0x{x} MTLDevice=0x{x} attached={}\n",
                 .{ METAL_LAYER_TOKEN, status.metal_layer, status.metal_device, status.layer_attached != 0 },
             );
@@ -172,7 +173,7 @@ pub const Runtime = struct {
         if (attached) {
             self.layer_attachments +|= 1;
             const status = rosette_macho_native_window_status();
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: native Metal layer attached: token=0x{x} NSView=0x{x} CAMetalLayer=0x{x} MTLDevice=0x{x} drawable={d}x{d}\n",
                 .{ token, status.view, status.metal_layer, status.metal_device, status.width, status.height },
             );
@@ -197,7 +198,7 @@ pub const Runtime = struct {
     pub fn noteSurfaceBound(self: *Runtime, layer_token: u64, guest_surface: u64, host_surface: u64) void {
         self.surface_bindings +|= 1;
         const status = rosette_macho_native_window_status();
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: native presenter surface bound: binding={d} layer_token=0x{x} CAMetalLayer=0x{x} host_VkSurfaceKHR=0x{x} guest_VkSurfaceKHR=0x{x} drawable={d}x{d}\n",
             .{ self.surface_bindings, layer_token, status.metal_layer, host_surface, guest_surface, status.width, status.height },
         );
@@ -285,7 +286,7 @@ pub const Runtime = struct {
     pub fn logSummary(self: *const Runtime) void {
         if (self.application_ensure_attempts == 0 and self.window_ensure_attempts == 0) return;
         const status = rosette_macho_native_window_status();
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: native window bridge: app_attempts={d} window_attempts={d} failures={d} objc={d} view_requests={d} layer(requests/attached/failures)={d}/{d}/{d} surface_bindings={d} event_pumps={d} host(app/window/view/layer/device)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x} drawable={d}x{d} ready(app/window/layer/visible/main)={}/{}/{}/{}/{} events={d}\n",
             .{ self.application_ensure_attempts, self.window_ensure_attempts, self.window_ensure_failures, self.objc_messages, self.view_requests, self.layer_requests, self.layer_attachments, self.layer_attachment_failures, self.surface_bindings, self.event_pump_calls, status.application, status.window, status.view, status.metal_layer, status.metal_device, status.width, status.height, status.application_ready != 0, status.window_ready != 0, status.layer_attached != 0, status.visible != 0, status.on_main_thread != 0, status.events_pumped },
         );

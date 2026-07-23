@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Mode = enum {
     unavailable,
@@ -24,7 +25,7 @@ pub const Engine = struct {
         if (self.mode != .synchronous) return false;
         self.initialization_substitutions +|= 1;
         self.initialized = true;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: logging runtime: synchronous transport initialized app={s}; asynchronous guest writer bypassed\n",
             .{if (app_name.len == 0) "<unnamed>" else app_name},
         );
@@ -49,7 +50,7 @@ pub const Engine = struct {
 
     pub fn logSummary(self: *const Engine) void {
         if (self.initialization_attempts == 0 and self.emitted_lines == 0 and self.rejected_lines == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: logging runtime: mode={s} init_attempts={d} init_substitutions={d} shutdown_substitutions={d} lines={d} bytes={d} rejected={d}\n",
             .{
                 @tagName(self.mode),

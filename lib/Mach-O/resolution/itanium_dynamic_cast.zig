@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const MAX_HIERARCHY_DEPTH: usize = 32;
 const MAX_BASES_PER_TYPE: u32 = 256;
@@ -141,7 +142,7 @@ pub const Engine = struct {
 
     pub fn logSummary(self: *const Engine) void {
         if (self.attempts == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Itanium dynamic cast: attempts={d} resolved={d} null={d} exact={d} hierarchy={d} negative_hints={d} metadata_failures={d} ambiguous={d}\n",
             .{
                 self.attempts,
@@ -174,7 +175,7 @@ pub const Engine = struct {
         _ = self;
         const source_name = typeName(state, source_type) orelse "<unknown>";
         const destination_name = typeName(state, destination_type) orelse "<unknown>";
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: __dynamic_cast resolved: strategy={s} source=0x{x} result=0x{x} hint={d} {s} -> {s}\n",
             .{ @tagName(strategy), source, result, hint, source_name, destination_name },
         );

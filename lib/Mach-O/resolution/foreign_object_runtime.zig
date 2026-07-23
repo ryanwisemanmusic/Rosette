@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const MAX_TYPES = 128;
 const MAX_OBJECTS = 512;
@@ -133,7 +134,7 @@ pub const Runtime = struct {
             self.main_loop_entries +|= 1;
             self.main_loop_depth +|= 1;
             self.main_loop_bypasses +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: GTK main loop bypass #{d}: no cooperative guest-thread/event dispatcher is active; returning from gtk_main will initiate guest shutdown\n",
                 .{self.main_loop_bypasses},
             );
@@ -149,7 +150,7 @@ pub const Runtime = struct {
     }
 
     pub fn logSummary(self: *const Runtime) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: foreign object runtime: calls={d} types={d} objects={d} allocations={d} refs={d} mutations={d} rejected={d} main_loop(entries/bypasses/quits/depth)={d}/{d}/{d}/{d}\n",
             .{ self.calls, self.type_count, self.object_count, self.allocations, self.references, self.mutations, self.rejected, self.main_loop_entries, self.main_loop_bypasses, self.main_loop_quits, self.main_loop_depth },
         );

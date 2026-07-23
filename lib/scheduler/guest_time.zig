@@ -17,6 +17,9 @@ pub const Service = struct {
     next_sequence: u64 = 1,
     quiescence_advances: u64 = 0,
     quiescence_advanced_ns: u64 = 0,
+    execution_step_watermark: ?u64 = null,
+    execution_advances: u64 = 0,
+    execution_advanced_ns: u64 = 0,
     deadlines: std.ArrayList(TimerEntry) = .empty,
 
     pub fn deinit(self: *Service, allocator: std.mem.Allocator) void {
@@ -51,6 +54,28 @@ pub const Service = struct {
         self.quiescence_advances +|= 1;
         self.quiescence_advanced_ns +|= scheduler_tick_ns;
         return self.advanceBy(scheduler_tick_ns);
+    }
+
+    /// Keep finite guest waits moving while other guest contexts remain
+    /// runnable. One translated instruction represents one nanosecond of
+    /// deterministic virtual execution time (a nominal 1 GHz guest clock).
+    ///
+    /// Previously the clock advanced only during global quiescence. A busy
+    /// producer could therefore prevent every timer and sleep deadline from
+    /// expiring forever, even while the cooperative scheduler kept rotating
+    /// contexts. The watermark makes repeated scheduler scans idempotent.
+    pub fn advanceForExecution(self: *Service, current_step: u64) u64 {
+        const previous_step = self.execution_step_watermark orelse {
+            self.execution_step_watermark = current_step;
+            return self.monotonic_ns;
+        };
+        if (current_step <= previous_step) return self.monotonic_ns;
+
+        const delta_ns = current_step - previous_step;
+        self.execution_step_watermark = current_step;
+        self.execution_advances +|= 1;
+        self.execution_advanced_ns +|= delta_ns;
+        return self.advanceBy(delta_ns);
     }
 
     pub fn schedule(
@@ -165,6 +190,16 @@ test "quiescence advances time by bounded scheduler ticks" {
     try std.testing.expectEqual(@as(u64, 2_000_010), service.advanceForQuiescence());
     try std.testing.expectEqual(@as(u64, 2), service.quiescence_advances);
     try std.testing.expectEqual(@as(u64, 2_000_000), service.quiescence_advanced_ns);
+}
+
+test "execution advances finite deadlines while runnable work continues" {
+    var service = Service{ .monotonic_ns = 10 };
+    try std.testing.expectEqual(@as(u64, 10), service.advanceForExecution(1_000));
+    try std.testing.expectEqual(@as(u64, 1_000_010), service.advanceForExecution(1_001_000));
+    try std.testing.expectEqual(@as(u64, 1_000_010), service.advanceForExecution(1_001_000));
+    try std.testing.expectEqual(@as(u64, 1_000_010), service.advanceForExecution(900_000));
+    try std.testing.expectEqual(@as(u64, 1), service.execution_advances);
+    try std.testing.expectEqual(@as(u64, 1_000_000), service.execution_advanced_ns);
 }
 
 test "cancel removes a signaled wait deadline without disturbing heap order" {

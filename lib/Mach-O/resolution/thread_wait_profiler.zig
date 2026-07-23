@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const WaitCategory = enum {
     /// Thread is intentionally idle (condvar wait with no deadline, or
@@ -7,8 +8,8 @@ pub const WaitCategory = enum {
     /// Thread is parked in a spin/poll loop (no syscall). The scheduler
     /// handles this via spin-parking; no recovery needed.
     parked,
-    /// Thread has been waiting condvar/mutex beyond a healthy threshold
-    /// with no signal. Possible deadlock candidate.
+    /// A dependency cycle has been proven by a wait-for graph. Age alone is
+    /// never sufficient evidence for this category.
     deadlock,
     /// Thread is waiting but has been starved of CPU time (cooperative
     /// scheduler not yielding to it).
@@ -53,18 +54,24 @@ pub const WaitProfileSystem = struct {
         thread_state: u8,
         wait_steps: u64,
         deadline_nanoseconds: u64,
-        current_step: u64,
+        current_nanoseconds: u64,
     ) WaitCategory {
         switch (thread_state) {
-            0, 1, 10, 11 => return .expected, // created, runnable, terminated, cancelled
-            3, 4 => { // sleeping_until_deadline, sleeping_indefinitely
-                if (wait_steps > self.idle_park_expected_threshold) return .idle;
+            0, 1, 2, 11, 12 => return .expected, // created, runnable, running, terminated, cancelled
+            3 => { // sleeping_until_deadline
+                if (deadline_nanoseconds != 0 and deadline_nanoseconds <= current_nanoseconds) return .starvation;
                 return .expected;
             },
-            5, 6, 7, 8, 9 => { // waiting_mutex, condvar, semaphore, event, futex, join
-                if (wait_steps > self.deadlock_warning_threshold) return .deadlock;
+            4 => return .idle, // sleeping_indefinitely
+            5 => { // waiting_mutex
+                // Without an ownership cycle this is contention/starvation,
+                // not proof of deadlock.
                 if (wait_steps > self.starvation_warning_threshold) return .starvation;
-                if (deadline_nanoseconds != 0 and deadline_nanoseconds <= current_step) return .starvation;
+                return .expected;
+            },
+            6, 7, 8, 9, 10 => { // condvar, semaphore, event, futex, join
+                if (deadline_nanoseconds == 0) return .idle;
+                if (deadline_nanoseconds <= current_nanoseconds) return .starvation;
                 return .expected;
             },
             else => return .expected,
@@ -81,7 +88,7 @@ pub const WaitProfileSystem = struct {
         threads_waiting_mutex: []const u64,
         threads_deadlines: []const u64,
         current_step: u64,
-        _: u64,
+        current_nanoseconds: u64,
     ) void {
         if (current_step -| self.last_profile_step < self.profile_interval) return;
         self.last_profile_step = current_step;
@@ -94,8 +101,8 @@ pub const WaitProfileSystem = struct {
             if (profile.count >= profile.entries.len) break;
 
             const wait_steps = current_step -| threads_blocked_since[i];
-            const deadline_passed = threads_deadlines[i] != 0 and threads_deadlines[i] <= current_step;
-            const category = self.classifyWait(threads_states[i], wait_steps, threads_deadlines[i], current_step);
+            const deadline_passed = threads_deadlines[i] != 0 and threads_deadlines[i] <= current_nanoseconds;
+            const category = self.classifyWait(threads_states[i], wait_steps, threads_deadlines[i], current_nanoseconds);
 
             profile.entries[profile.count] = .{
                 .handle = threads_handles[i],
@@ -121,13 +128,13 @@ pub const WaitProfileSystem = struct {
         {
             self.deadlock_warnings += 1;
             self.last_deadlock_warning_step = current_step;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: THREAD WAIT PROFILE: {d} thread(s) in deadlock-wait category at step={d}; possible deadlock or missing condvar signal\n",
                 .{ profile.deadlock_count, current_step },
             );
             for (profile.entries[0..profile.count]) |entry| {
                 if (entry.category != .deadlock) continue;
-                std.debug.print(
+                machoCapturePrint(
                     "  deadlock-thread handle=0x{x} state={d} wait_steps={d} condvar=0x{x} mutex=0x{x} deadline_passed={}\n",
                     .{ entry.handle, entry.state, entry.wait_steps, entry.waiting_condvar, entry.waiting_mutex, entry.deadline_passed },
                 );
@@ -140,7 +147,7 @@ pub const WaitProfileSystem = struct {
             self.starvation_warnings += 1;
             self.last_starvation_warning_step = current_step;
             self.nudge_actions += 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: THREAD WAIT PROFILE: {d} thread(s) in starvation-wait category at step={d}; scheduler nudge may be needed\n",
                 .{ profile.starvation_count, current_step },
             );
@@ -153,9 +160,9 @@ test "wait profile classifies created state as expected" {
     try std.testing.expectEqual(WaitCategory.expected, profile_system.classifyWait(0, 0, 0, 0));
 }
 
-test "wait profile classifies long condvar wait as deadlock" {
+test "wait profile treats an indefinite condvar worker as idle rather than deadlocked" {
     const profile_system = WaitProfileSystem{};
-    try std.testing.expectEqual(WaitCategory.deadlock, profile_system.classifyWait(6, 15_000_000, 0, 20_000_000));
+    try std.testing.expectEqual(WaitCategory.idle, profile_system.classifyWait(6, 15_000_000, 0, 20_000_000));
 }
 
 test "wait profile classifies medium mutex wait as starvation" {
@@ -165,5 +172,11 @@ test "wait profile classifies medium mutex wait as starvation" {
 
 test "wait profile classifies short wait as expected" {
     const profile_system = WaitProfileSystem{};
-    try std.testing.expectEqual(WaitCategory.expected, profile_system.classifyWait(6, 100, 0, 1000));
+    try std.testing.expectEqual(WaitCategory.expected, profile_system.classifyWait(6, 100, 2_000, 1000));
+}
+
+test "wait profile compares deadlines with virtual nanoseconds not instruction steps" {
+    const profile_system = WaitProfileSystem{};
+    try std.testing.expectEqual(WaitCategory.expected, profile_system.classifyWait(3, 500_000_000, 2_000_000_000, 1_500_000_000));
+    try std.testing.expectEqual(WaitCategory.starvation, profile_system.classifyWait(3, 10, 2_000_000_000, 2_000_000_000));
 }

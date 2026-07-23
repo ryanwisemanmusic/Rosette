@@ -290,7 +290,8 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
                     else => return .{},
                 },
                 0xDB => switch (group) {
-                    5 => x87.op = .fild_mem32,
+                    0 => x87.op = .fild_mem32,
+                    5 => x87.op = .fld_mem80,
                     7 => x87.op = .fstp_mem80,
                     else => return .{},
                 },

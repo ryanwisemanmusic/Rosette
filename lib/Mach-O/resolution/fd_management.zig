@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 extern "c" fn dirfd(directory: *std.c.DIR) c_int;
 
@@ -230,7 +231,7 @@ pub const Manager = struct {
         for (self.entries) |entry| {
             if (entry.host_fd >= 0) live += 1;
         }
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: fd management: table_size={d} live={d} translated={d} closed={d} rejected_full={d}\n",
             .{ self.capacity, live, self.translated, self.closed, self.rejected_full },
         );

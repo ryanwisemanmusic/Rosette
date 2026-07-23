@@ -1,5 +1,6 @@
 const std = @import("std");
 const scheduler = @import("scheduler");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const CURRENT_THREAD_HANDLE: u64 = 0x7FFF_1000;
 const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
@@ -263,7 +264,7 @@ pub const Runtime = struct {
 
     pub fn logSummary(self: *const Runtime) void {
         if (self.created_threads == 0 and self.mutex_locks == 0 and self.collapsed_waits == 0 and self.tls_sets == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits/quiescence_wakes)={d}/{d}/{d}/{d} timed_waits(started/signaled/expired)={d}/{d}/{d} indefinite_wait_sentinels={d} sleeps(timed_started/timed_completed/indefinite)={d}/{d}/{d} yield_hints={d} tls_sets={d} thread_id_queries={d}\n",
             .{
                 self.created_threads,
@@ -294,38 +295,59 @@ pub const Runtime = struct {
         );
     }
 
-    pub fn diagnoseStuck(self: *Runtime, current_step: u64, current_rip: u64) void {
+    pub fn diagnoseStuck(self: *Runtime, current_step: u64, current_rip: u64, current_nanoseconds: u64) void {
         _ = current_rip;
         if (current_step -| self.last_diagnostic_step < 5_000_000) return;
-        var blocked_count: u32 = 0;
+        var actionable_blocked_count: u32 = 0;
         var expected_parked_count: u32 = 0;
         var oldest_expected_park_steps: u64 = 0;
         for (&self.threads) |*thread| {
-            if (!thread.active or thread.state == .runnable or thread.state == .running or thread.state == .terminated) continue;
-            if (thread.state == .sleeping_indefinitely) {
+            if (!thread.active or thread.state == .runnable or thread.state == .running or
+                thread.state == .terminated or thread.state == .cancelled)
+            {
+                continue;
+            }
+            const finite_deadline_pending = thread.wait_deadline_nanoseconds != 0 and
+                thread.wait_deadline_nanoseconds > current_nanoseconds;
+            const expected_dependency_wait = switch (thread.state) {
+                .sleeping_indefinitely,
+                .waiting_condvar,
+                .waiting_semaphore,
+                .waiting_event,
+                .waiting_futex_address,
+                .waiting_join,
+                => thread.wait_deadline_nanoseconds == 0,
+                .sleeping_until_deadline => finite_deadline_pending,
+                else => false,
+            };
+            if (expected_dependency_wait) {
                 expected_parked_count += 1;
                 oldest_expected_park_steps = @max(oldest_expected_park_steps, current_step -| thread.blocked_since_step);
                 continue;
             }
-            blocked_count += 1;
+            actionable_blocked_count += 1;
             const blocked_steps = current_step -| thread.blocked_since_step;
             if (blocked_steps > 2_000_000) {
-                std.debug.print(
-                    "macho-processor: thread stuck: handle=0x{x} state={s} blocked_for={d} steps reason={s}\n",
-                    .{ thread.handle, @tagName(thread.state), blocked_steps, thread.blocked_reason },
+                const deadline_overdue_ns = if (thread.wait_deadline_nanoseconds != 0)
+                    current_nanoseconds -| thread.wait_deadline_nanoseconds
+                else
+                    0;
+                machoCapturePrint(
+                    "macho-processor: actionable thread wait: handle=0x{x} state={s} blocked_for={d} steps deadline_overdue_ns={d} reason={s}\n",
+                    .{ thread.handle, @tagName(thread.state), blocked_steps, deadline_overdue_ns, thread.blocked_reason },
                 );
             }
         }
-        if (blocked_count > 0) {
+        if (actionable_blocked_count > 0) {
             const active = self.activeCount();
-            std.debug.print(
-                "macho-processor: scheduler: {d} threads active, {d} blocked/deferred, total={d}\n",
-                .{ active, blocked_count, self.created_threads },
+            machoCapturePrint(
+                "macho-processor: scheduler health: modeled_pthreads_runnable={d} actionable_waits={d} expected_parked={d} total_created={d}\n",
+                .{ active, actionable_blocked_count, expected_parked_count, self.created_threads },
             );
         }
         if (expected_parked_count != self.last_reported_expected_parks) {
-            std.debug.print(
-                "macho-processor: scheduler: expected indefinite parks={d} oldest_age={d} steps; these threads are dormant until an explicit runtime wake/cancel\n",
+            machoCapturePrint(
+                "macho-processor: scheduler: expected parks={d} oldest_age={d} steps; these are pending finite deadlines or dormant dependency waits, not deadlock evidence\n",
                 .{ expected_parked_count, oldest_expected_park_steps },
             );
             self.last_reported_expected_parks = expected_parked_count;
@@ -460,7 +482,7 @@ pub const Runtime = struct {
         if (timed_wait and state.regs.rdx == cpp_infinite_time_point) {
             self.cpp_indefinite_waits_started +|= 1;
             if (self.cpp_indefinite_waits_started <= 8) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: libc++ condition wait classified indefinite: thread=0x{x} cond=0x{x} raw_time_point=INT64_MAX; no finite guest timer scheduled\n",
                     .{ handle, cond_addr },
                 );
@@ -527,7 +549,7 @@ pub const Runtime = struct {
             .reason = "pthread_cond_wait",
         });
         if (self.collapsed_waits <= 8 or self.collapsed_waits % 1000 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: cooperative condvar wait #{d} cond=0x{x} released_mutex=0x{x} thread=0x{x} waiters={d} timed={} now_ns={d} deadline_ns={d}\n",
                 .{ self.collapsed_waits, cond_addr, mutex_addr, handle, cv.waiters, deadline_nanoseconds != 0, monotonicNow(state), deadline_nanoseconds },
             );
@@ -777,7 +799,7 @@ pub const Runtime = struct {
             self.created_threads +|= 1;
             self.deferred_threads +|= 1;
             self.emit(.{ .kind = .thread_created, .step = schedulerStep(state), .thread = handle, .reason = "pthread_create" });
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: pthread runtime: deferred guest thread #{d} handle=0x{x} numeric_id={d} start=0x{x} arg=0x{x} stack={d}\n",
                 .{ self.created_threads, handle, thread.numeric_id, thread.start_routine, thread.argument, thread.stack_size },
             );
@@ -829,7 +851,7 @@ pub const Runtime = struct {
             mutex.contention_count +|= 1;
             self.mutex_contentions +|= 1;
             if (mutex.contention_count <= 8 or mutex.contention_count % 100 == 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: pthread mutex contention #{d} mutex=0x{x} depth={d} owner=0x{x}\n",
                     .{ mutex.contention_count, address, mutex.depth, mutex.owner_thread },
                 );
@@ -931,7 +953,7 @@ pub const Runtime = struct {
                 thread.notified_generation = cv.generation;
                 self.emit(.{ .kind = .condvar_signal, .thread = thread.handle, .object = address, .generation = cv.generation, .reason = "notify_one" });
                 if (cv.notifications <= 8 or cv.notifications % 1000 == 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: condvar signal: cond=0x{x} waiter=0x{x} waiters={d} generation={d} total_notifications={d}\n",
                         .{ address, thread.handle, cv.waiters, cv.generation, cv.notifications },
                     );
@@ -953,7 +975,7 @@ pub const Runtime = struct {
             cv.notifications +|= woke;
             self.emit(.{ .kind = .condvar_broadcast, .object = address, .generation = cv.generation, .runnable = woke, .reason = "notify_all" });
             if (woke > 0 and (cv.notifications <= 8 or cv.notifications % 1000 == 0)) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: condvar broadcast: cond=0x{x} targeted_waiters={d} generation={d} total_notifications={d}\n",
                     .{ address, woke, cv.generation, cv.notifications },
                 );
@@ -984,7 +1006,7 @@ pub const Runtime = struct {
         state.write64(state.regs.rsi, numeric_id);
         self.thread_id_queries +|= 1;
         if (self.thread_id_queries <= 16 or self.thread_id_queries % 256 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: pthread thread id query #{d}: handle=0x{x} -> numeric_id={d}\n",
                 .{ self.thread_id_queries, handle, numeric_id },
             );
@@ -1069,7 +1091,7 @@ pub const Runtime = struct {
         self: *const Runtime,
         profiler: anytype,
         current_step: u64,
-        _: u64,
+        current_nanoseconds: u64,
     ) void {
         var active_buf: [64]u8 = [_]u8{0} ** 64;
         var handle_buf: [64]u64 = [_]u64{0} ** 64;
@@ -1096,7 +1118,7 @@ pub const Runtime = struct {
             &mutex_buf,
             &deadline_buf,
             current_step,
-            0,
+            current_nanoseconds,
         );
     }
 };

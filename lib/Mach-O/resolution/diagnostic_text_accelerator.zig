@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const MAX_INPUT_SIZE: usize = 4 * 1024 * 1024;
 const PREFIX = "----------- CONFIG DUMP -----------\n";
@@ -74,7 +75,7 @@ pub const Engine = struct {
         self.output_bytes +|= filtered.length;
         self.lines_seen +|= filtered.lines_seen;
         self.lines_retained +|= filtered.lines_retained;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: diagnostic text acceleration: {s} input={d} output={d} lines={d}/{d}\n",
             .{ path, input_length, filtered.length, filtered.lines_retained, filtered.lines_seen },
         );
@@ -89,7 +90,7 @@ pub const Engine = struct {
 
     pub fn logSummary(self: *const Engine) void {
         if (self.accelerations == 0 and self.failures == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: diagnostic text accelerator: runs={d} input={d} output={d} lines={d}/{d} failures={d} last_failure={s}\n",
             .{ self.accelerations, self.input_bytes, self.output_bytes, self.lines_retained, self.lines_seen, self.failures, @tagName(self.last_failure) },
         );
@@ -98,7 +99,7 @@ pub const Engine = struct {
     fn fail(self: *Engine, reason: Failure) ?Output {
         self.failures +|= 1;
         self.last_failure = reason;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: diagnostic text acceleration unavailable: {s}; continuing with guest implementation\n",
             .{@tagName(reason)},
         );

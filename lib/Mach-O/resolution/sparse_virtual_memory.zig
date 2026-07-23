@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const guest_memory_geometry = @import("guest_memory_geometry.zig");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 extern "c" fn mprotect(addr: [*]align(std.heap.page_size_min) u8, len: usize, prot: c_int) c_int;
 
@@ -159,7 +160,7 @@ pub const Manager = struct {
         // This avoids both destructive MAP_FIXED and macOS arm64's rejection
         // of low host VM allocations.
         const memory = std.posix.mmap(null, length_usize, prot, flags, host_fd, offset) catch |err| {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: sparse anywhere mmap FAILED: reason={s} requested_length={d} effective_length={d} page_tail={d} preferred_base=0x{x} maximum_end=0x{x} guest_prot=0x{x} host_prot=0x{x} guest_flags=0x{x} host_flags=0x{x} map_jit_emulated={} anonymous={} host_fd={d} offset=0x{x}\n",
                 .{ @errorName(err), length, effective_length, effective_length - length, preferred_base orelse 0, maximum_end_exclusive orelse 0, prot_raw, host_prot_raw, flags_raw, host_flags_raw, flags_raw & DARWIN_MAP_JIT != 0, flags.ANONYMOUS, host_fd, offset },
             );
@@ -173,7 +174,7 @@ pub const Manager = struct {
         };
         if (maximum_end_exclusive) |maximum_end| {
             if (guest_end > maximum_end) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: sparse anywhere mmap rejected placement: guest_base=0x{x} guest_end=0x{x} requested_length={d} effective_length={d} preferred_base=0x{x} maximum_end=0x{x} reason=backend_pointer_window\n",
                     .{ guest_base, guest_end, length, effective_length, preferred_base orelse 0, maximum_end },
                 );
@@ -200,7 +201,7 @@ pub const Manager = struct {
             std.posix.munmap(memory);
             return null;
         };
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: sparse anywhere mmap succeeded: guest_base=0x{x} guest_end=0x{x} host_base=0x{x} requested_length={d} effective_length={d} page_tail={d} preferred_base=0x{x} guest_address_contract_honored={} guest_host_alias={} low_window_required={} allocation_route=modeled_guest_alias guest_prot=0x{x} host_prot=0x{x} guest_flags=0x{x} host_flags=0x{x} map_jit_emulated={} host_execute=false anonymous={} host_fd={d}\n",
             .{ guest_base, guest_end, host_base, length, effective_length, effective_length - length, preferred_base orelse 0, preferred_base == null or preferred_base.? == guest_base, guest_base != host_base, maximum_end_exclusive != null, prot_raw, host_prot_raw, flags_raw, host_flags_raw, flags_raw & DARWIN_MAP_JIT != 0, flags.ANONYMOUS, host_fd },
         );
@@ -209,18 +210,18 @@ pub const Manager = struct {
 
     pub fn mapFixed(self: *Manager, guest_base: u64, length: u64, prot_raw: u32, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) bool {
         if (length == 0 or guest_base % std.heap.page_size_min != 0) {
-            std.debug.print("macho-processor: sparse fixed mmap rejected: reason=invalid_length_or_alignment guest_base=0x{x} length={d} required_alignment={d}\n", .{ guest_base, length, std.heap.page_size_min });
+            machoCapturePrint("macho-processor: sparse fixed mmap rejected: reason=invalid_length_or_alignment guest_base=0x{x} length={d} required_alignment={d}\n", .{ guest_base, length, std.heap.page_size_min });
             return false;
         }
         if (host_fd >= 0 and !fileOffsetIsHostAligned(offset)) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: sparse fixed mmap rejected: reason=file_offset_not_host_page_aligned offset=0x{x} host_page_size={d} guest_tracking_page={d}; verify getpagesize/sysconf use the Darwin VM contract\n",
                 .{ offset, guest_memory_geometry.host_vm_page_size, guest_memory_geometry.guest_page_size },
             );
             return false;
         }
         const end = std.math.add(u64, guest_base, length) catch {
-            std.debug.print("macho-processor: sparse fixed mmap rejected: reason=address_overflow guest_base=0x{x} length={d}\n", .{ guest_base, length });
+            machoCapturePrint("macho-processor: sparse fixed mmap rejected: reason=address_overflow guest_base=0x{x} length={d}\n", .{ guest_base, length });
             return false;
         };
         var inside_reservation = false;
@@ -228,7 +229,7 @@ pub const Manager = struct {
             const mapping_end = mapping.guest_base + mapping.memory.len;
             if (guest_base < mapping_end and end > mapping.guest_base) {
                 if (!mapping.is_reservation or guest_base < mapping.guest_base or end > mapping_end) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: sparse fixed mmap rejected: reason=overlap guest=[0x{x},0x{x}) existing=[0x{x},0x{x}) existing_is_reservation={}\n",
                         .{ guest_base, end, mapping.guest_base, mapping_end, mapping.is_reservation },
                     );
@@ -246,13 +247,13 @@ pub const Manager = struct {
             const anonymous_private = flags.ANONYMOUS and host_fd < 0;
             if (anonymous_private and inside_reservation) {
                 if (self.activateReservationRange(guest_base, length, prot_raw)) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: sparse fixed mmap activated reservation: primary={s} guest_base=0x{x} length={d} prot=0x{x} flags=0x{x}\n",
                         .{ @errorName(err), guest_base, length, prot_raw, flags_raw },
                     );
                     return true;
                 }
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: sparse fixed mmap FAILED: reason={s} fallback_disallowed=reservation_activation_failed guest_base=0x{x} length={d}\n",
                     .{ @errorName(err), guest_base, length },
                 );
@@ -261,7 +262,7 @@ pub const Manager = struct {
             if (anonymous_private and isRecoverableFixedMmapFailure(err)) {
                 flags.FIXED = false;
                 const alt = std.posix.mmap(null, length_usize, prot, flags, -1, 0) catch |fallback_err| {
-                    std.debug.print("macho-processor: sparse fixed mmap FAILED: primary={s} fallback={s} guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ @errorName(err), @errorName(fallback_err), guest_base, length, prot_raw, flags_raw, host_fd, offset });
+                    machoCapturePrint("macho-processor: sparse fixed mmap FAILED: primary={s} fallback={s} guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ @errorName(err), @errorName(fallback_err), guest_base, length, prot_raw, flags_raw, host_fd, offset });
                     return false;
                 };
                 self.mappings.append(self.allocator, .{
@@ -276,20 +277,20 @@ pub const Manager = struct {
                     std.posix.munmap(alt);
                     return false;
                 };
-                std.debug.print(
-                    "macho-processor: sparse fixed mmap fallback: primary={s} guest_base=0x{x} length={d} model=anonymous_guest_backing host_base=0x{x}\n",
+                machoCapturePrint(
+                    "macho-processor: sparse fixed mmap guest-alias recovery: host_fixed_result={s} guest_base=0x{x} length={d} model=anonymous_guest_backing host_base=0x{x} recovered=true system_memory_exhausted=false\n",
                     .{ @errorName(err), guest_base, length, @intFromPtr(alt.ptr) },
                 );
                 return true;
             }
             if (err == error.MemoryMappingNotSupported or err == error.PermissionDenied) {
                 if (inside_reservation) {
-                    std.debug.print("macho-processor: sparse fixed mmap FAILED: reason={s} fallback_disallowed=would_break_reserved_guest_address guest_base=0x{x} length={d}\n", .{ @errorName(err), guest_base, length });
+                    machoCapturePrint("macho-processor: sparse fixed mmap FAILED: reason={s} fallback_disallowed=would_break_reserved_guest_address guest_base=0x{x} length={d}\n", .{ @errorName(err), guest_base, length });
                     return false;
                 }
                 flags.FIXED = false;
                 const alt = std.posix.mmap(null, length_usize, prot, flags, host_fd, offset) catch |fallback_err| {
-                    std.debug.print("macho-processor: sparse fixed mmap FAILED: primary={s} fallback={s} guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ @errorName(err), @errorName(fallback_err), guest_base, length, prot_raw, flags_raw, host_fd, offset });
+                    machoCapturePrint("macho-processor: sparse fixed mmap FAILED: primary={s} fallback={s} guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ @errorName(err), @errorName(fallback_err), guest_base, length, prot_raw, flags_raw, host_fd, offset });
                     return false;
                 };
                 self.mappings.append(self.allocator, .{
@@ -306,12 +307,12 @@ pub const Manager = struct {
                 };
                 return true;
             }
-            std.debug.print("macho-processor: sparse fixed mmap FAILED: reason={s} guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ @errorName(err), guest_base, length, prot_raw, flags_raw, host_fd, offset });
+            machoCapturePrint("macho-processor: sparse fixed mmap FAILED: reason={s} guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ @errorName(err), guest_base, length, prot_raw, flags_raw, host_fd, offset });
             return false;
         };
         if (inside_reservation) {
             self.appendActivation(guest_base, memory, prot_raw) catch return false;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: sparse fixed mmap attached backing: guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} host_fd={d} offset=0x{x} activations={d}\n",
                 .{ guest_base, length, prot_raw, flags_raw, host_fd, offset, self.activations.items.len },
             );
@@ -388,22 +389,22 @@ pub const Manager = struct {
 
     pub fn reserveAnywhereWithBacking(self: *Manager, length: u64, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) ?u64 {
         if (length == 0) {
-            std.debug.print("macho-processor: sparse reserve rejected: reason=zero_length flags=0x{x} host_fd={d} offset=0x{x}\n", .{ flags_raw, host_fd, offset });
+            machoCapturePrint("macho-processor: sparse reserve rejected: reason=zero_length flags=0x{x} host_fd={d} offset=0x{x}\n", .{ flags_raw, host_fd, offset });
             return null;
         }
         const length_usize = std.math.cast(usize, length) orelse {
-            std.debug.print("macho-processor: sparse reserve rejected: reason=length_exceeds_host_usize length={d} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ length, flags_raw, host_fd, offset });
+            machoCapturePrint("macho-processor: sparse reserve rejected: reason=length_exceeds_host_usize length={d} flags=0x{x} host_fd={d} offset=0x{x}\n", .{ length, flags_raw, host_fd, offset });
             return null;
         };
         const none_prot: std.posix.PROT = @bitCast(@as(u32, 0));
         var flags: std.posix.MAP = @bitCast(flags_raw);
         flags.FIXED = false;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: sparse reserve request: length={d} (0x{x}) prot=NONE flags=0x{x} fixed={} anonymous={} host_fd={d} offset=0x{x} existing_mappings={d}\n",
             .{ length, length, flags_raw, flags.FIXED, flags.ANONYMOUS, host_fd, offset, self.mappings.items.len },
         );
         const memory = if (!flags.ANONYMOUS and host_fd < 0) invalid_fd_fallback: {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: sparse reserve request has non-anonymous fd=-1; reserving anonymous PROT_NONE space instead length={d} flags=0x{x} offset=0x{x}\n",
                 .{ length, flags_raw, offset },
             );
@@ -411,14 +412,14 @@ pub const Manager = struct {
             var anon_private: std.posix.MAP = @bitCast(anon_private_raw);
             anon_private.FIXED = false;
             break :invalid_fd_fallback std.posix.mmap(null, length_usize, none_prot, anon_private, -1, 0) catch |fallback_err| {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: sparse reserve fallback FAILED: primary=invalid_fd fallback={s} length={d} requested_flags=0x{x} fallback_flags=0x{x}\n",
                     .{ @errorName(fallback_err), length, flags_raw, anon_private_raw },
                 );
                 return null;
             };
         } else std.posix.mmap(null, length_usize, none_prot, flags, host_fd, offset) catch |err| fallback: {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: sparse reserve FAILED: syscall=mmap reason={s} length={d} flags=0x{x} anonymous={} host_fd={d} offset=0x{x}\n",
                 .{ @errorName(err), length, flags_raw, flags.ANONYMOUS, host_fd, offset },
             );
@@ -427,13 +428,13 @@ pub const Manager = struct {
             var anon_private: std.posix.MAP = @bitCast(anon_private_raw);
             anon_private.FIXED = false;
             const fallback = std.posix.mmap(null, length_usize, none_prot, anon_private, -1, 0) catch |fallback_err| {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: sparse reserve fallback FAILED: primary={s} fallback={s} length={d} requested_flags=0x{x} fallback_flags=0x{x}\n",
                     .{ @errorName(err), @errorName(fallback_err), length, flags_raw, anon_private_raw },
                 );
                 return null;
             };
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: sparse reserve fallback: primary={s} requested_flags=0x{x} requested_fd={d}; reserved anonymous PROT_NONE space instead\n",
                 .{ @errorName(err), flags_raw, host_fd },
             );
@@ -453,7 +454,7 @@ pub const Manager = struct {
             return null;
         };
         self.total_reserved +|= length;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: sparse reserve succeeded: guest_base=0x{x} host_base=0x{x} length={d} host_page_size={d} total_reserved={d}\n",
             .{ guest_base, @intFromPtr(memory.ptr), length, std.heap.page_size_min, self.total_reserved },
         );
@@ -484,7 +485,7 @@ pub const Manager = struct {
                 const host_prot_raw = hostBackingProtection(effective_guest_prot);
                 if (mprotect(page_aligned, host_span.length, @as(c_int, @intCast(host_prot_raw))) != 0) return false;
                 if (host_span.offset != offset or host_span.length != requested_length) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: sparse guest protection normalized: guest_base=0x{x} guest_length={d} guest_page={d} host_offset=0x{x} host_length={d} host_page={d} prot=0x{x}; exact guest permissions retained in metadata\n",
                         .{ guest_base, length, PAGE_4K, host_span.offset, host_span.length, std.heap.page_size_min, prot_raw },
                     );
@@ -498,7 +499,7 @@ pub const Manager = struct {
                     mapping.executable = prot_raw & 4 != 0;
                 }
                 if (prot_raw & PROT_EXEC != 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: sparse guest execute protection emulated: guest_base=0x{x} length={d} guest_prot=0x{x} host_prot=0x{x} host_execute=false\n",
                         .{ guest_base, length, prot_raw, host_prot_raw },
                     );
@@ -552,6 +553,22 @@ pub const Manager = struct {
 
     pub fn contains(self: *const Manager, address: u64, length: u64) bool {
         return self.activeBytesConst(address, length) != null or self.findConst(address, length) != null;
+    }
+
+    pub fn containsMapped(self: *const Manager, address: u64, length: u64) bool {
+        const end = std.math.add(u64, address, length) catch return false;
+        var activation_index = self.activations.items.len;
+        while (activation_index != 0) {
+            activation_index -= 1;
+            const active = &self.activations.items[activation_index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (address >= active.guest_base and end <= active_end) return true;
+        }
+        for (self.mappings.items) |mapping| {
+            const mapping_end = mapping.guest_base +| mapping.memory.len;
+            if (address >= mapping.guest_base and end <= mapping_end) return true;
+        }
+        return false;
     }
 
     pub fn isExecutable(self: *const Manager, address: u64, length: u64) bool {
@@ -637,10 +654,49 @@ pub const Manager = struct {
             if (m.is_fixed) fixed_count += 1;
             map_count += 1;
         }
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: sparse memory: mappings={d} fixed={d} reservations={d} activations={d} reserved_bytes={d}\n",
             .{ map_count, fixed_count, reserved_count, self.activations.items.len, self.total_reserved },
         );
+    }
+
+    /// Render the Linux-compatible process map view used by Xenia's generic
+    /// POSIX protection query. Addresses are Rosette guest addresses because
+    /// those are the pointer values observed by the interpreted x86 process.
+    ///
+    /// Activations are emitted newest-first so a narrow mprotect update takes
+    /// precedence over its containing PROT_NONE reservation when Xenia scans
+    /// for the first range containing an address.
+    pub fn renderProcSelfMaps(self: *const Manager, output: []u8) []const u8 {
+        var used: usize = 0;
+        var activation_index = self.activations.items.len;
+        while (activation_index != 0) {
+            activation_index -= 1;
+            const activation = self.activations.items[activation_index];
+            if (!appendProcMapLine(
+                output,
+                &used,
+                activation.guest_base,
+                activation.guest_base +| activation.memory.len,
+                activation.readable,
+                activation.writable,
+                activation.executable,
+                "[rosette-activation]",
+            )) break;
+        }
+        for (self.mappings.items) |mapping| {
+            if (!appendProcMapLine(
+                output,
+                &used,
+                mapping.guest_base,
+                mapping.guest_base +| mapping.memory.len,
+                mapping.readable,
+                mapping.writable,
+                mapping.executable,
+                if (mapping.is_reservation) "[rosette-reservation]" else "[rosette-mapping]",
+            )) break;
+        }
+        return output[0..used];
     }
 
     test "file-backed PROT_NONE reservation falls back to anonymous address space" {
@@ -752,6 +808,32 @@ pub const Manager = struct {
     }
 };
 
+fn appendProcMapLine(
+    output: []u8,
+    used: *usize,
+    begin: u64,
+    end: u64,
+    readable: bool,
+    writable: bool,
+    executable: bool,
+    label: []const u8,
+) bool {
+    if (begin >= end or used.* >= output.len) return false;
+    const protection = [4]u8{
+        if (readable) 'r' else '-',
+        if (writable) 'w' else '-',
+        if (executable) 'x' else '-',
+        'p',
+    };
+    const line = std.fmt.bufPrint(
+        output[used.*..],
+        "{x}-{x} {s} 00000000 00:00 0 {s}\n",
+        .{ begin, end, protection[0..], label },
+    ) catch return false;
+    used.* += line.len;
+    return true;
+}
+
 fn isRecoverableFixedMmapFailure(err: anyerror) bool {
     return err == error.MemoryMappingNotSupported or
         err == error.PermissionDenied or
@@ -796,6 +878,26 @@ test "OS-selected sparse mapping preserves permissions outside the guest heap" {
     try std.testing.expect(manager.protect(base, PAGE_64K, 5));
     try std.testing.expect(manager.isExecutable(base, 1));
     try std.testing.expectEqual(@as(u8, 0xC3), manager.executableBytesConst(base, 1).?[0]);
+}
+
+test "proc maps view reports newest guest protection before its reservation" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const base = manager.reserveAnywhere(PAGE_64K) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(manager.protect(base, PAGE_4K, 0));
+    try std.testing.expect(manager.protect(base, PAGE_4K, PROT_READ | PROT_WRITE));
+
+    var output: [4096]u8 = undefined;
+    const maps = manager.renderProcSelfMaps(&output);
+    var expected_buffer: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buffer,
+        "{x}-{x} rw-p",
+        .{ base, base + PAGE_4K },
+    );
+    try std.testing.expect(std.mem.startsWith(u8, maps, expected));
+    try std.testing.expect(std.mem.indexOf(u8, maps, "[rosette-reservation]") != null);
 }
 
 test "guest MAP_JIT execute permission uses non-executable host backing" {

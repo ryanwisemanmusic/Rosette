@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Status = enum {
     running,
@@ -218,13 +219,13 @@ pub const Engine = struct {
     }
 
     pub fn logSummary(self: *const Engine) void {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: initialization resolution summary: expected={d} healthy={d} recovered={d} degraded={d} deferred={d} failed={d} steps={d}\n",
             .{ self.expected_count, self.healthy, self.recovered, self.degraded, self.deferred, self.failed, self.total_steps },
         );
         for (self.records.items) |record| {
             if (record.status == .completed) continue;
-            std.debug.print(
+            machoCapturePrint(
                 "  initializer [{d}/{d}] {s} status={s} attempts={d} steps={d} rsp=0x{x}/0x{x} unresolved_observed={d} assertions_observed={d} abi_mismatch=0x{x} last_deferral={s}\n",
                 .{
                     record.index + 1,

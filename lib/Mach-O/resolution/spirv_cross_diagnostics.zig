@@ -1,4 +1,5 @@
 const std = @import("std");
+const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 pub const Classification = enum {
     unrelated,
@@ -25,7 +26,7 @@ pub fn classify(input: Input) Classification {
     const missing_entry_point = std.mem.indexOf(u8, input.message, "no entry point") != null or
         std.mem.indexOf(u8, input.message, "No entry point") != null;
     const expected_probe = input.verification_frame_seen and missing_entry_point;
-    
+
     // For expected dummy probes, prioritize probe context over catch completion
     // Frame chain validity may fail due to stack bottom (rbp=0x0), but that doesn't
     // prevent the catch from completing successfully
@@ -97,7 +98,7 @@ pub const Tracker = struct {
 
     pub fn logSummary(self: *const Tracker) void {
         if (self.compiler_error_throws == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: SPIRV-Cross exception diagnostics: compiler_errors={d} expected_dummy_probe(throws/caught)={d}/{d} other_caught={d} unresolved={d} last={s}\n",
             .{
                 self.compiler_error_throws,

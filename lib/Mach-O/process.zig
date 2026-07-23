@@ -52,6 +52,9 @@ const dynamic_export_registry = @import("resolution/dynamic_export_registry.zig"
 const thread_wait_profiler = @import("resolution/thread_wait_profiler.zig");
 const contract = @import("contract");
 const scheduler = @import("scheduler");
+const jit = @import("jit");
+const macho_log = @import("event_log.zig");
+const machoCapturePrint = macho_log.machoCapturePrint;
 
 test {
     std.testing.refAllDecls(symbol_assembly_context);
@@ -109,6 +112,7 @@ const PAGE_READ = constants.PAGE_READ;
 const PAGE_WRITE = constants.PAGE_WRITE;
 const PAGE_EXECUTE = constants.PAGE_EXECUTE;
 const GUEST_SIGILL = constants.GUEST_SIGILL;
+const GUEST_SIGSEGV = constants.GUEST_SIGSEGV;
 const SA_RESETHAND = constants.SA_RESETHAND;
 const SA_NODEFER = constants.SA_NODEFER;
 const SA_SIGINFO = constants.SA_SIGINFO;
@@ -198,6 +202,7 @@ pub const MachOState = struct {
     guest_fds: [16]i32 = .{-1} ** 16,
     next_guest_fd: u64 = 3,
     guest_time: scheduler.GuestTimeService = .{},
+    pending_direct_sleep: ?scheduler.GuestSleepDecision = null,
     concise_output: bool = false,
     diagnostic_output_fd: i32 = 1,
     summary_output_fd: i32 = -1,
@@ -251,6 +256,8 @@ pub const MachOState = struct {
     cooperative_wait_result_resumes: u64 = 0,
     cooperative_self_resumes: u64 = 0,
     cooperative_quiescence_recoveries: u64 = 0,
+    jit_commit_count: u64 = 0,
+    jit_export_count: u64 = 0,
     opaque_destructor_quarantines: u64 = 0,
     cooperative_starvation_warnings: u64 = 0,
     last_cooperative_starvation_step: u64 = 0,
@@ -311,6 +318,8 @@ pub const MachOState = struct {
     backend_diagnostics: x64_backend_diagnostics.Engine = .{},
     pthreads: pthread_runtime.Runtime = .{},
     scheduler_log: scheduler.SchedulerEventLog = .{},
+    jit_log: jit.JitEventLog = .{},
+    macho_log: macho_log.Logger = .{},
     tlv: tlv_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
     memory_forwarder: memory_management_forwarder.Manager,
@@ -624,6 +633,8 @@ pub const MachOState = struct {
 
     pub fn deinit(self: *MachOState) void {
         self.scheduler_log.close();
+        self.jit_log.close();
+        self.macho_log.close();
         self.guest_time.deinit(self.allocator);
         self.closeGuestFiles();
         self.libcxx_streams.deinit();
@@ -720,7 +731,7 @@ pub const MachOState = struct {
             if (isLocalBindingScope(binding.dylib)) {
                 if (self.metadata.definedSymbolAddress(binding.name)) |defined_address| {
                     const target = applyBindingAddend(defined_address, binding.addend) orelse {
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: rejected overflowing local-image binding addend: slot=0x{x} symbol={s} target=0x{x} addend={d}\n",
                             .{ binding.address, binding.name, defined_address, binding.addend },
                         );
@@ -774,7 +785,7 @@ pub const MachOState = struct {
             };
             if (target < BOUND_IMPORT_THUNK_BASE) {
                 target = applyBindingAddend(target, binding.addend) orelse {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: rejected overflowing dyld binding addend: slot=0x{x} symbol={s} target=0x{x} addend={d}\n",
                         .{ binding.address, binding.name, target, binding.addend },
                     );
@@ -788,7 +799,7 @@ pub const MachOState = struct {
             if (isWritableDataSection(section)) writable_callable_bindings += 1;
             if (self.capstoneCallbackSlotName(binding.address)) |slot_name| {
                 capstone_callback_bindings += 1;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: Capstone runtime callback binding: slot={s} address=0x{x} import={s} target=0x{x} section={s} repaired_null={}\n",
                     .{ slot_name, binding.address, binding.name, target, section.name, existing == 0 },
                 );
@@ -837,7 +848,7 @@ pub const MachOState = struct {
                         item.resolution = .self_sentinel;
                         sentinel_count += 1;
                         if (sentinel_samples < 8) {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "macho-processor: unresolved ABI data fallback sample: address=0x{x} symbol={s} action=self_sentinel host_lookup=missing\n",
                                 .{ item.address, item.symbol },
                             );
@@ -846,13 +857,13 @@ pub const MachOState = struct {
                     }
                 }
                 if (synthetic_count > 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: guest ABI data materialized: bindings={d} unique(typeinfo/type_name/vtable/construction_vtable/vtt/guard/reference_temporary)={d}/{d}/{d}/{d}/{d}/{d}/{d}; relocation addends preserved\n",
                         .{ synthetic_count, category_counts[@intFromEnum(abi_data_materializer.Category.typeinfo)], category_counts[@intFromEnum(abi_data_materializer.Category.type_name)], category_counts[@intFromEnum(abi_data_materializer.Category.vtable)], category_counts[@intFromEnum(abi_data_materializer.Category.construction_vtable)], category_counts[@intFromEnum(abi_data_materializer.Category.vtt)], category_counts[@intFromEnum(abi_data_materializer.Category.guard)], category_counts[@intFromEnum(abi_data_materializer.Category.reference_temporary)] },
                     );
                 }
                 if (sentinel_count > 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: unresolved ABI data fallback summary: total={d} samples={d} suppressed={d} action=self_sentinel compatibility_only=true\n",
                         .{ sentinel_count, sentinel_samples, sentinel_count - sentinel_samples },
                     );
@@ -867,14 +878,14 @@ pub const MachOState = struct {
             }
             if (resolved > 0) {
                 applied +|= resolved;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: resolved {d} deferred ABI data binding(s) via host symbol lookup\n",
                     .{resolved},
                 );
             }
         }
 
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: applied {d} dyld data binding(s), including {d} local-image pointer(s), {d} validated prebound weak pointer(s), {d} callable GOT pointer(s), {d} writable function pointer(s), and {d}/5 Capstone runtime callback(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d} guest_materialized={d} host_resolved={d}\n",
             .{ applied, local_image_data_bindings, preserved_weak_data_bindings, callable_got_bindings, writable_callable_bindings, capstone_callback_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings, self.vtt_resolver.synthetic_count, self.vtt_resolver.resolved_count },
         );
@@ -934,24 +945,24 @@ pub const MachOState = struct {
         };
         var present: usize = 0;
         var nonzero: usize = 0;
-        std.debug.print("  Capstone runtime callback state ({s}):\n", .{reason});
+        machoCapturePrint("  Capstone runtime callback state ({s}):\n", .{reason});
         for (slots) |slot| {
             const address = self.metadata.definedSymbolAddress(slot) orelse {
-                std.debug.print("    {s}: symbol_missing\n", .{slot});
+                machoCapturePrint("    {s}: symbol_missing\n", .{slot});
                 continue;
             };
             present += 1;
             const target = self.read64(address);
             if (target != 0) nonzero += 1;
             if (self.metadata.importAtStub(target)) |imported| {
-                std.debug.print("    {s}: address=0x{x} target=0x{x} import={s}@{s}\n", .{ slot, address, target, imported.name, imported.dylib });
+                machoCapturePrint("    {s}: address=0x{x} target=0x{x} import={s}@{s}\n", .{ slot, address, target, imported.name, imported.dylib });
             } else if (self.metadata.nearestSymbol(target)) |symbol| {
-                std.debug.print("    {s}: address=0x{x} target=0x{x} symbol={s}+0x{x}\n", .{ slot, address, target, symbol.name, symbol.offset });
+                machoCapturePrint("    {s}: address=0x{x} target=0x{x} symbol={s}+0x{x}\n", .{ slot, address, target, symbol.name, symbol.offset });
             } else {
-                std.debug.print("    {s}: address=0x{x} target=0x{x} unresolved={}\n", .{ slot, address, target, target != 0 });
+                machoCapturePrint("    {s}: address=0x{x} target=0x{x} unresolved={}\n", .{ slot, address, target, target != 0 });
             }
         }
-        std.debug.print("    summary: symbols={d}/5 nonzero={d}/5 cs_open_requires_all_nonzero=true\n", .{ present, nonzero });
+        machoCapturePrint("    summary: symbols={d}/5 nonzero={d}/5 cs_open_requires_all_nonzero=true\n", .{ present, nonzero });
     }
 
     fn isAbiDataSymbol(symbol_name: []const u8) bool {
@@ -1011,7 +1022,7 @@ pub const MachOState = struct {
     }
 
     fn describeGuestAccess(self: *const MachOState, address: u64, size: u64, access: GuestAccess) GuestAccessDescription {
-        const sparse_mapped = self.sparse_memory.contains(address, size);
+        const sparse_mapped = self.sparse_memory.containsMapped(address, size);
         const sparse_allowed = switch (access) {
             .read => self.sparse_memory.bytesConst(address, size) != null,
             .write => false,
@@ -1259,7 +1270,7 @@ pub const MachOState = struct {
             else
                 "<unknown>";
             if (initializer == null or initializer.?.attempts == 1) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: initializer dependency deferred: initializer={d}/{d} attempt={d} fault_rip=0x{x} null_store=0x{x} base={s} producer_rip=0x{x} source_slot=0x{x} source_symbol={s} source_region={s}/{s} source_value=0x{x} distance={d}; transaction will roll back before retry\n",
                     .{
                         if (initializer) |record| record.index + 1 else 0,
@@ -1335,6 +1346,39 @@ pub const MachOState = struct {
         std.mem.writeInt(u16, destination[8..10], sign | @as(u16, @intCast(unbiased + 16383)), .little);
     }
 
+    fn readExtendedFloat80(source: []const u8) f64 {
+        std.debug.assert(source.len >= 10);
+        const significand = std.mem.readInt(u64, source[0..8], .little);
+        const sign_exponent = std.mem.readInt(u16, source[8..10], .little);
+        const negative = (sign_exponent & 0x8000) != 0;
+        const exponent = sign_exponent & 0x7FFF;
+        const sign_bit: u64 = if (negative) @as(u64, 1) << 63 else 0;
+
+        if (exponent == 0x7FFF) {
+            const special_bits = if ((significand & 0x7FFF_FFFF_FFFF_FFFF) == 0)
+                sign_bit | 0x7FF0_0000_0000_0000
+            else
+                sign_bit | 0x7FF8_0000_0000_0000;
+            return @bitCast(special_bits);
+        }
+        if (significand == 0) return @bitCast(sign_bit);
+
+        // Convert the explicit x87 integer bit and biased exponent to binary64.
+        // Values written by writeExtendedFloat80 round-trip exactly because the
+        // eleven discarded low significand bits are zero.
+        const unbiased: i32 = if (exponent == 0) -16382 else @as(i32, exponent) - 16383;
+        if (unbiased > 1023) return @bitCast(sign_bit | 0x7FF0_0000_0000_0000);
+        if (unbiased >= -1022) {
+            const binary64_exponent: u64 = @intCast(unbiased + 1023);
+            const fraction = (significand >> 11) & 0x000F_FFFF_FFFF_FFFF;
+            return @bitCast(sign_bit | (binary64_exponent << 52) | fraction);
+        }
+        if (unbiased < -1074) return @bitCast(sign_bit);
+        const subnormal_shift: u6 = @intCast(-1011 - unbiased);
+        const fraction = significand >> subnormal_shift;
+        return @bitCast(sign_bit | (fraction & 0x000F_FFFF_FFFF_FFFF));
+    }
+
     fn ensureGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) bool {
         if (access == .read and self.sparse_memory.bytesConst(address, bytes) != null) return true;
         if (access == .write and self.sparse_memory.bytes(address, bytes, true) != null) return true;
@@ -1347,6 +1391,17 @@ pub const MachOState = struct {
     fn terminateForGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) void {
         if (self.terminal_memory_failure != null) return;
         if (self.tryQuarantineOpaqueDestructor(address)) return;
+        const description = self.describeGuestAccess(address, bytes, access);
+        if (access != .execute and description.mapped and !description.allowed) {
+            const instruction_len = self.currentGuestInstructionLength();
+            if (self.deliverGuestSignal(GUEST_SIGSEGV, self.regs.rip, instruction_len, address, access)) {
+                machoCapturePrint(
+                    "macho-processor: mapped guest protection fault routed to SIGSEGV handler: rip=0x{x} address=0x{x} bytes={d} access={s} instruction={s}\n",
+                    .{ self.regs.rip, address, bytes, @tagName(access), instruction },
+                );
+                return;
+            }
+        }
         if (!self.toml_fault_diagnostics_dumped) {
             if (self.metadata.nearestSymbol(self.regs.rip)) |symbol| {
                 const toml_symbol = std.mem.indexOf(u8, symbol.name, "toml") != null;
@@ -1354,7 +1409,7 @@ pub const MachOState = struct {
                     std.mem.indexOf(u8, symbol.name, "patcher") != null;
                 if (toml_symbol or patch_db_symbol) {
                     self.toml_fault_diagnostics_dumped = true;
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: TOML/PatchDB guest access fault: rip=0x{x} symbol={s}+0x{x} address=0x{x} bytes={d} access={s}; dumping stream and schema state before termination\n",
                         .{ self.regs.rip, symbol.name, symbol.offset, address, bytes, @tagName(access) },
                     );
@@ -1366,7 +1421,6 @@ pub const MachOState = struct {
             }
         }
         if (address < 0x1000) self.dumpTerminalAddressProvenance(address);
-        const description = self.describeGuestAccess(address, bytes, access);
         const policy = description.pointer_policy;
         const fault: []const u8 = if (policy != null and !policy.?.may_dereference)
             "opaque_identity_dereference"
@@ -1417,6 +1471,20 @@ pub const MachOState = struct {
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.memory_access_violation);
     }
 
+    fn currentGuestInstructionLength(self: *const MachOState) u8 {
+        const latest_index = if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1;
+        const latest = self.trace_entries[latest_index];
+        if (latest.rip == self.regs.rip and latest.len != 0) return latest.len;
+        const instruction_bytes: []const u8 = if (self.sparse_memory.executableBytesConst(self.regs.rip, 16)) |sparse_code|
+            sparse_code
+        else blk: {
+            const offset = self.translateGuest(self.regs.rip, 1, .execute) orelse return 1;
+            break :blk self.mem[offset..];
+        };
+        const decoded = decodeInsn(instruction_bytes);
+        return if (decoded.len != 0) decoded.len else 1;
+    }
+
     fn tryQuarantineOpaqueDestructor(self: *MachOState, address: u64) bool {
         const policy = self.pointer_firewall.policyAt(address) orelse return false;
         if (policy.kind != .opaque_identity or policy.may_dereference) return false;
@@ -1448,7 +1516,7 @@ pub const MachOState = struct {
 
         self.regs.rip = return_address;
         self.opaque_destructor_quarantines +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: opaque lifetime quarantine #{d}: destructor={s} this=0x{x} owner={s} restored_caller=0x{x} via={s}; skipped invalid guest cleanup without dereferencing API identity\n",
             .{ self.opaque_destructor_quarantines, symbol.name, address, policy.owner, return_address, restored_via },
         );
@@ -1459,7 +1527,7 @@ pub const MachOState = struct {
         const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse return;
         const decoded = decodeInsn(bytes);
         if (!decoded.sib_has_base and !decoded.sib_has_index and !decoded.rip_relative) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: near-null address provenance: rip=0x{x} op={s} effective=0x{x}; decoder exposed no base/index expression\n",
                 .{ self.regs.rip, @tagName(decoded.op), effective_address },
             );
@@ -1471,7 +1539,7 @@ pub const MachOState = struct {
         const index_value = if (decoded.sib_has_index) x64_decoder.regVal(&self.regs, decoded.sib_index_reg, address_size) else 0;
         const scaled_index = index_value << @as(u6, decoded.sib_scale);
         const rip_component = if (decoded.rip_relative) self.regs.rip + decoded.len else 0;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: near-null address provenance: rip=0x{x} op={s} effective=0x{x} displacement=0x{x} base({s})=0x{x} index({s},scale={d})=0x{x} rip_component=0x{x}\n",
             .{
                 self.regs.rip,
@@ -1513,7 +1581,7 @@ pub const MachOState = struct {
             const before = traceRegisterValue(entry, register);
             if (before != after) {
                 const symbol = self.metadata.nearestSymbol(entry.rip);
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: near-null {s} register transition: thread=0x{x} register={s} before=0x{x} after=0x{x} caused_by=0x{x} {s}+0x{x} op={s} same_thread_distance={d} cross_thread_entries_excluded={d}\n",
                     .{ role, fault_thread, @tagName(register), before, after, entry.rip, if (symbol) |resolved| resolved.name else "<unknown>", if (symbol) |resolved| resolved.offset else 0, @tagName(entry.op), same_thread_entries, excluded_entries },
                 );
@@ -1521,7 +1589,7 @@ pub const MachOState = struct {
             }
             after = before;
         }
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: near-null {s} register transition: thread=0x{x} register={s} remained 0x{x} throughout {d} retained same-thread instructions; excluded {d} cross-thread entries\n",
             .{ role, fault_thread, @tagName(register), terminal_value, same_thread_entries, excluded_entries },
         );
@@ -1824,7 +1892,7 @@ pub const MachOState = struct {
             .may_execute = prot & 4 != 0,
             .owner = "low-window backend sparse mmap",
         });
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: x64 backend placement contract: requested_length={d} effective_length={d} preferred_base=0x{x} result=0x{x} result_end=0x{x} executable={} below_4g={} pointer_truncation_safe={}\n",
             .{ length, effective_length, preferred_base orelse 0, address, address +| effective_length, executable, address +| effective_length <= 0x1_0000_0000, !executable or address < 0x1_0000_0000 },
         );
@@ -1856,6 +1924,10 @@ pub const MachOState = struct {
             .execute = prot & 4 != 0,
         }, .guest_mmap, "sparse guest mprotect", self.regs.rip);
         return true;
+    }
+
+    pub fn renderProcSelfMaps(self: *const MachOState, output: []u8) []const u8 {
+        return self.sparse_memory.renderProcSelfMaps(output);
     }
 
     pub fn guestCString(self: *const MachOState, addr: u64, max_len: usize) ?[]const u8 {
@@ -1913,13 +1985,13 @@ pub const MachOState = struct {
     }
 
     fn configureGuestLogMirror(self: *MachOState, args: []const []const u8) void {
-        std.debug.print("ROSETTE: configureGuestLogMirror called\n", .{});
+        machoCapturePrint("ROSETTE: configureGuestLogMirror called\n", .{});
         const prefix = "--log_file=";
         var found_log_file = false;
         for (args) |arg| {
             if (!std.mem.startsWith(u8, arg, prefix) or arg.len == prefix.len) continue;
             const path = arg[prefix.len..];
-            std.debug.print("ROSETTE: Found --log_file= argument: '{s}'\n", .{path});
+            machoCapturePrint("ROSETTE: Found --log_file= argument: '{s}'\n", .{path});
             found_log_file = true;
             const path_z = self.allocator.dupeZ(u8, path) catch return;
             defer self.allocator.free(path_z);
@@ -1930,20 +2002,20 @@ pub const MachOState = struct {
                 @as(c_int, 0o666),
             );
             if (fd < 0) {
-                std.debug.print("ROSETTE: guest log mirror could not open {s}\n", .{path});
+                machoCapturePrint("ROSETTE: guest log mirror could not open {s}\n", .{path});
                 return;
             }
             if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
             self.guest_log_mirror_fd = fd;
-            std.debug.print(
+            machoCapturePrint(
                 "ROSETTE: guest log mirror configured: {s}; captures synchronous Xenia logs and modeled guest stdout/stderr\n",
                 .{path},
             );
             return;
         }
         if (!found_log_file) {
-            std.debug.print("ROSETTE: No --log_file= argument found - Xenia logs will not be mirrored to file\n", .{});
-            std.debug.print("ROSETTE: Add --log_file=/path/to/log.txt to capture Xenia output\n", .{});
+            machoCapturePrint("ROSETTE: No --log_file= argument found - Xenia logs will not be mirrored to file\n", .{});
+            machoCapturePrint("ROSETTE: Add --log_file=/path/to/log.txt to capture Xenia output\n", .{});
         }
     }
 
@@ -1988,6 +2060,10 @@ pub const MachOState = struct {
         return false;
     }
 
+    fn shouldSuppressRuntimeGuestLog(message: []const u8) bool {
+        return std.mem.startsWith(u8, message, "FRAME LIMITER heartbeat:");
+    }
+
     fn emitRuntimeSummaryHeartbeat(self: *const MachOState, snapshot: startup_observer.Snapshot) void {
         if (self.summary_output_fd < 0) return;
         var buffer: [2048]u8 = undefined;
@@ -2022,9 +2098,18 @@ pub const MachOState = struct {
         var prefix_buffer: [32]u8 = undefined;
         const prefix = std.fmt.bufPrint(&prefix_buffer, "[xenia] {c}> ", .{prefix_char}) catch return false;
 
-        _ = hostWriteFdAll(self.diagnostic_output_fd, prefix);
-        _ = hostWriteFdAll(self.diagnostic_output_fd, message);
-        if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.diagnostic_output_fd, "\n");
+        // Keep high-frequency frame-limiter telemetry in Xenia's own log and
+        // the Mach-O event log without duplicating it in rosette-runtime.log.
+        if (!shouldSuppressRuntimeGuestLog(message)) {
+            _ = hostWriteFdAll(self.diagnostic_output_fd, prefix);
+            _ = hostWriteFdAll(self.diagnostic_output_fd, message);
+            if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.diagnostic_output_fd, "\n");
+        }
+        if (self.macho_log.isOpen()) {
+            var xenia_buffer: [4096]u8 = undefined;
+            const xenia_line = std.fmt.bufPrint(&xenia_buffer, "{s}{s}", .{ prefix, message }) catch "";
+            self.macho_log.captureLine(xenia_line);
+        }
         if (self.summary_output_fd >= 0 and shouldSummarizeGuestLog(prefix_char, message)) {
             var step_buffer: [64]u8 = undefined;
             const step_prefix = std.fmt.bufPrint(&step_buffer, "step={d} ", .{self.executed_steps}) catch "";
@@ -2036,7 +2121,7 @@ pub const MachOState = struct {
 
         if (std.mem.startsWith(u8, message, "HostPathDevice::ResolvePath(User_")) {
             const storage_root = self.fs_forwarder.storageRoot();
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile resolution trace: Xenia is resolving an internal User_<profile-id>: device; storage_root={s}; this is before any host open syscall\n",
                 .{if (storage_root.len != 0) storage_root else "<not configured>"},
             );
@@ -2046,21 +2131,21 @@ pub const MachOState = struct {
         }
         if (std.mem.indexOf(u8, message, "Failed to open Account file: C000000F") != null) {
             if (self.profile_account_flow.active) self.profile_account_flow.stage = .open_failed;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile resolution failure: X_STATUS_NO_SUCH_FILE (0xC000000F); the Xenia User_<profile-id>: device has no Account-file backing path. Check the following fs open/status diagnostics for a host-path attempt; if none follows, the missing mapping is inside Xenia's virtual device layer.\n",
                 .{},
             );
         }
         if (std.mem.indexOf(u8, message, "Failed to decrypt account data file for XUID") != null) {
             if (self.profile_account_flow.active) self.profile_account_flow.stage = .decrypt_failed;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile crypto diagnosis: both retail and devkit Account HMAC/RC4 verification paths rejected the 404-byte payload; this is a real Account failure, unlike a success-path device dismount\n",
                 .{},
             );
         }
         if (std.mem.startsWith(u8, message, "Unregistered device: User_")) {
             const stage = self.profile_account_flow.stage;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile device lifecycle: temporary User_<profile-id>: mount was unregistered at stage={s}; interpretation={s}\n",
                 .{ @tagName(stage), if (stage == .decrypted or stage == .inserting or stage == .completed) "expected LoadAccount cleanup after successful Account decryption; the decoded account remains eligible for accounts_ insertion" else "early cleanup associated with an incomplete Account load" },
             );
@@ -2081,7 +2166,7 @@ pub const MachOState = struct {
         self.profile_host_preflight_checks +|= 1;
         const storage_root = self.fs_forwarder.storageRoot();
         if (storage_root.len == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile host preflight #{d}: profile={s} unavailable because no storage root is configured\n",
                 .{ self.profile_host_preflight_checks, profile_id },
             );
@@ -2094,20 +2179,20 @@ pub const MachOState = struct {
             "{s}/content/{s}/FFFE07D1/00010000/{s}/Account",
             .{ storage_root, profile_id, profile_id },
         ) catch {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile host preflight #{d}: profile={s} expected Account path exceeds diagnostic buffer\n",
                 .{ self.profile_host_preflight_checks, profile_id },
             );
             return;
         };
         const file_stat = std.Io.Dir.cwd().statFile(self.io, account_path, .{}) catch |err| {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile host preflight #{d}: profile={s} account={s} host_status={s}; VFS failure may be genuine\n",
                 .{ self.profile_host_preflight_checks, profile_id, account_path, @errorName(err) },
             );
             return;
         };
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: profile host preflight #{d}: profile={s} account={s} host_status=present kind={s} bytes={d}; a later C000000F without an Account open is a guest VFS path-resolution failure\n",
             .{ self.profile_host_preflight_checks, profile_id, account_path, @tagName(file_stat.kind), file_stat.size },
         );
@@ -2128,7 +2213,7 @@ pub const MachOState = struct {
             self.profile_account_flow.bytes_read = 0;
             self.profile_account_flow.attempts +|= 1;
             const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile Account flow #{d} started: manager=0x{x} xuid={x:0>16} return=0x{x} {s}+0x{x} step={d}\n",
                 .{ self.profile_account_flow.attempts, self.regs.rdi, self.regs.rsi, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.executed_steps },
             );
@@ -2144,7 +2229,7 @@ pub const MachOState = struct {
             if (caller) |symbol| {
                 if (classifyProfileDismountCaller(symbol.name, symbol.offset)) |stage| self.profile_account_flow.stage = stage;
             }
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile temporary dismount: xuid={x:0>16} stage={s} caller=0x{x} {s}+0x{x} bytes_read={d} minimum_account_bytes={d} interpretation={s}\n",
                 .{ self.profile_account_flow.xuid, @tagName(self.profile_account_flow.stage), return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, if (self.profile_account_flow.stage == .decrypted) "expected success-path cleanup before accounts_ insertion" else "early LoadAccount cleanup" },
             );
@@ -2155,7 +2240,7 @@ pub const MachOState = struct {
         if (insert_entry != 0 and self.regs.rip == insert_entry) {
             self.profile_account_flow.stage = .inserting;
             const key = if (self.guestMemoryConst(self.regs.rsi, 8) != null) self.read64(self.regs.rsi) else 0;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile accounts_ insertion checkpoint: map=0x{x} key_ptr=0x{x} key={x:0>16} account=0x{x} expected_xuid={x:0>16} key_matches={}\n",
                 .{ self.regs.rdi, self.regs.rsi, key, self.regs.rdx, self.profile_account_flow.xuid, key == self.profile_account_flow.xuid },
             );
@@ -2172,7 +2257,7 @@ pub const MachOState = struct {
             } else {
                 self.profile_account_flow.failures +|= 1;
             }
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile Account flow completed: xuid={x:0>16} success={} final_stage={s} bytes_read={d}/{d} elapsed_steps={d}; device dismount before this return is {s}\n",
                 .{ self.profile_account_flow.xuid, succeeded, @tagName(self.profile_account_flow.stage), self.profile_account_flow.bytes_read, self.profile_account_flow.requested_bytes, self.executed_steps -| self.profile_account_flow.started_step, if (succeeded) "normal and the decoded account is now in accounts_" else "associated with an earlier load failure" },
             );
@@ -2192,7 +2277,7 @@ pub const MachOState = struct {
         }
         self.profile_account_flow.stage = .host_opened;
         self.profile_account_flow.account_guest_fd = guest_fd;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: profile Account host descriptor bound: xuid={x:0>16} guest_fd={d} stage=host_opened\n",
             .{ self.profile_account_flow.xuid, guest_fd },
         );
@@ -2203,7 +2288,7 @@ pub const MachOState = struct {
         self.profile_account_flow.requested_bytes +|= requested;
         if (result > 0) self.profile_account_flow.bytes_read +|= @intCast(result);
         self.profile_account_flow.stage = .reading;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: profile Account read checkpoint: xuid={x:0>16} guest_fd={d} offset={d} requested={d} returned={d} cumulative={d} minimum={d} complete_encrypted_file={}\n",
             .{ self.profile_account_flow.xuid, guest_fd, offset, requested, result, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, self.profile_account_flow.bytes_read >= PROFILE_ENCRYPTED_ACCOUNT_BYTES },
         );
@@ -2213,7 +2298,7 @@ pub const MachOState = struct {
         const observation = self.backend_diagnostics.observeLine(message, self.executed_steps) orelse return;
         const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
         const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: x64 backend event #{d}: event={s} phase={s}->{s} step={d} delta={d} active=0x{x} caller=0x{x} {s}+0x{x}\n",
             .{
                 observation.sequence,
@@ -2232,17 +2317,17 @@ pub const MachOState = struct {
         if (observation.event == .indirection_table_failed) {
             const mapping = self.backend_diagnostics.last_mapping;
             if (!mapping.valid) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: x64 code-cache warning correlation: no mmap call was observed after backend initialization began; allocation may have used an unmodeled route\n",
                     .{},
                 );
             } else {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: x64 code-cache warning correlation: latest mmap route={s} address=0x{x} length={d} prot=0x{x} flags=0x{x} result_known={} succeeded={} result=0x{x} stage={s}\n",
                     .{ mapping.route, mapping.address, mapping.length, mapping.prot, mapping.flags, mapping.result_known, mapping.succeeded, mapping.result, if (mapping.stage.len != 0) mapping.stage else "<pending>" },
                 );
                 if (mapping.address == 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: x64 code-cache warning interpretation: the macOS guest requested OS-selected placement (address=0), so the guest's 0x80000000-0x9fffffff warning text does not describe the actual mmap hint used on this path\n",
                         .{},
                     );
@@ -2250,7 +2335,7 @@ pub const MachOState = struct {
             }
         }
         if (observation.event == .backend_initialize_succeeded and self.backend_diagnostics.capstone_assertions != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: x64 backend recovery evidence: initialization reached completed-successfully after {d} Capstone constructor assertion(s); backend object existence is proven, while Capstone-dependent diagnostics remain degraded\n",
                 .{self.backend_diagnostics.capstone_assertions},
             );
@@ -2265,7 +2350,7 @@ pub const MachOState = struct {
         if (!self.backend_diagnostics.noteMmapAttempt(route, address, length, prot, flags, fixed, anonymous, self.executed_steps)) return;
         const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
         const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: x64 backend mmap attempt #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} caller=0x{x} {s}+0x{x}\n",
             .{ self.backend_diagnostics.mmap_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, flags, fixed, anonymous, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0 },
         );
@@ -2274,7 +2359,7 @@ pub const MachOState = struct {
     pub fn noteBackendMmapResult(self: *MachOState, succeeded: bool, result: u64, stage: []const u8) void {
         if (!self.backend_diagnostics.last_mapping.valid or self.backend_diagnostics.last_mapping.step != self.executed_steps) return;
         self.backend_diagnostics.noteMmapResult(succeeded, result, stage);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: x64 backend mmap result: attempt={d} succeeded={} result=0x{x} stage={s}\n",
             .{ self.backend_diagnostics.mmap_attempts_during_backend, succeeded, result, stage },
         );
@@ -2282,7 +2367,7 @@ pub const MachOState = struct {
 
     pub fn noteBackendMprotect(self: *MachOState, route: []const u8, address: u64, length: u64, prot: u64, succeeded: bool) void {
         if (!self.backend_diagnostics.noteMprotectAttempt()) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: x64 backend mprotect #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} succeeded={}\n",
             .{ self.backend_diagnostics.mprotect_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, succeeded },
         );
@@ -2391,16 +2476,16 @@ pub const MachOState = struct {
 
     fn dumpGuestStack(self: *const MachOState) void {
         const count: usize = 12;
-        std.debug.print("    [stack backtrace (rsp=0x{x}):\n", .{self.regs.rsp});
+        machoCapturePrint("    [stack backtrace (rsp=0x{x}):\n", .{self.regs.rsp});
         var addr = self.regs.rsp;
         for (0..count) |i| {
             const val = self.read64(addr);
             if (val == 0) {
-                std.debug.print("      [{d}] 0x{x}: 0x0\n", .{ i, addr });
+                machoCapturePrint("      [{d}] 0x{x}: 0x0\n", .{ i, addr });
             } else if (self.metadata.nearestSymbol(val)) |sym| {
-                std.debug.print("      [{d}] 0x{x}: 0x{x} → {s}+0x{x}\n", .{ i, addr, val, sym.name, sym.offset });
+                machoCapturePrint("      [{d}] 0x{x}: 0x{x} → {s}+0x{x}\n", .{ i, addr, val, sym.name, sym.offset });
             } else {
-                std.debug.print("      [{d}] 0x{x}: 0x{x}\n", .{ i, addr, val });
+                machoCapturePrint("      [{d}] 0x{x}: 0x{x}\n", .{ i, addr, val });
             }
             addr +%= 8;
         }
@@ -2441,7 +2526,7 @@ pub const MachOState = struct {
                         .handled => |result| {
                             self.regs.rax = result;
                             if (self.verbose_trace) {
-                                std.debug.print("  [handled import] {s} from {s}; stub=0x{x} return=0x{x} → rax=0x{x}\n", .{
+                                machoCapturePrint("  [handled import] {s} from {s}; stub=0x{x} return=0x{x} → rax=0x{x}\n", .{
                                     imported.name,
                                     imported.dylib,
                                     imported.stub_address,
@@ -2452,7 +2537,7 @@ pub const MachOState = struct {
                         },
                         .handled_void => {
                             if (self.verbose_trace) {
-                                std.debug.print(
+                                machoCapturePrint(
                                     "  [handled void import] {s} from {s}; stub=0x{x} return=0x{x}\n",
                                     .{ imported.name, imported.dylib, imported.stub_address, synthetic_return },
                                 );
@@ -2461,7 +2546,7 @@ pub const MachOState = struct {
                         .control_transferred => {
                             self.pending_import_stub_rip = null;
                             if (self.verbose_trace) {
-                                std.debug.print(
+                                machoCapturePrint(
                                     "  [handled control transfer] {s} from {s}; landing_pad=0x{x}\n",
                                     .{ imported.name, imported.dylib, self.regs.rip },
                                 );
@@ -2472,12 +2557,12 @@ pub const MachOState = struct {
                             self.regs.rax = result;
                             self.recordUnresolvedImport(imported, synthetic_return, self.regs.rax);
                             if (self.metadata.nearestSymbol(synthetic_return)) |caller_sym| {
-                                std.debug.print(
+                                machoCapturePrint(
                                     "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller={s}+0x{x} return=0x{x} → rax=0x{x}\n",
                                     .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, caller_sym.name, caller_sym.offset, synthetic_return, self.regs.rax },
                                 );
                             } else {
-                                std.debug.print(
+                                machoCapturePrint(
                                     "  [unresolved import #{d}] {s} from {s}; stub=0x{x} caller=0x{x} → rax=0x{x}\n",
                                     .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, synthetic_return, self.regs.rax },
                                 );
@@ -2491,7 +2576,7 @@ pub const MachOState = struct {
                                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
                             }
                             self.terminated = true;
-                            std.debug.print("  [terminal import] {s} exit_code={d}\n", .{ imported.name, exit_code });
+                            machoCapturePrint("  [terminal import] {s} exit_code={d}\n", .{ imported.name, exit_code });
                         },
                     }
                 }
@@ -2594,7 +2679,7 @@ pub const MachOState = struct {
         if ((std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) and
             self.foreign_objects.main_loop_bypasses != 0)
         {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest exit attribution: follows {d} bypassed GTK main loop(s); this is UI event-loop shutdown, not a filesystem or config-write failure\n",
                 .{self.foreign_objects.main_loop_bypasses},
             );
@@ -2647,7 +2732,7 @@ pub const MachOState = struct {
             const selector: i32 = @bitCast(@as(u32, @truncate(self.regs.rdi)));
             const value = guestSysconf(selector);
             if (self.verbose_trace) {
-                std.debug.print("    [posix] sysconf({d}) -> {d}\n", .{ selector, @as(i64, @bitCast(value)) });
+                machoCapturePrint("    [posix] sysconf({d}) -> {d}\n", .{ selector, @as(i64, @bitCast(value)) });
             }
             return .{ .handled = value };
         }
@@ -2655,7 +2740,7 @@ pub const MachOState = struct {
             const path = self.guestCString(self.regs.rdi, 1024) orelse return .{ .handled = 0 };
             const handle = self.dynamic_forwarder.openGuest(path, self.regs.rsi);
             if (self.verbose_trace or handle == 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "    [dynamic loader] dlopen({s}, 0x{x}) -> 0x{x}\n",
                     .{ path, self.regs.rsi, handle },
                 );
@@ -2671,7 +2756,7 @@ pub const MachOState = struct {
             const address = self.dynamic_forwarder.lookupGuest(self.regs.rdi, symbol);
             if (address != 0) self.registerSyntheticThunk(address, 1, symbol);
             if (self.verbose_trace or address == 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "    [dynamic loader] dlsym(0x{x}, {s}) -> 0x{x}\n",
                     .{ self.regs.rdi, symbol, address },
                 );
@@ -2682,7 +2767,7 @@ pub const MachOState = struct {
             const output = self.guestMemory(self.regs.rdi, 3) orelse return .{ .unsupported = 0 };
             output[0..3].* = sdlCompatibilityVersion();
             if (self.verbose_trace) {
-                std.debug.print(
+                machoCapturePrint(
                     "    [SDL2] SDL_GetVersion(output=0x{x}) -> {d}.{d}.{d}\n",
                     .{ self.regs.rdi, output[0], output[1], output[2] },
                 );
@@ -2725,7 +2810,7 @@ pub const MachOState = struct {
                 self.import_provider_override = .local_definition;
                 self.import_confidence_override = .verified;
                 if (self.verbose_trace) {
-                    std.debug.print("    [local definition] {s}: stub=0x{x} -> target=0x{x}\n", .{ name, imported.stub_address, target });
+                    machoCapturePrint("    [local definition] {s}: stub=0x{x} -> target=0x{x}\n", .{ name, imported.stub_address, target });
                 }
                 return .control_transferred;
             }
@@ -2801,10 +2886,10 @@ pub const MachOState = struct {
             if (self.verbose_trace) {
                 const c = contract.resolveFromAllFamilies(name);
                 const tag = @tagName(outcome);
-                std.debug.print("    [contract] {s} → {s}", .{ name, if (c) |cc| cc.name else "?" });
+                machoCapturePrint("    [contract] {s} → {s}", .{ name, if (c) |cc| cc.name else "?" });
                 switch (outcome) {
-                    .handled => |val| std.debug.print(" ({s}) handled=0x{x}\n", .{ tag, val }),
-                    .terminated => |code| std.debug.print(" ({s}) terminated={d}\n", .{ tag, code }),
+                    .handled => |val| machoCapturePrint(" ({s}) handled=0x{x}\n", .{ tag, val }),
+                    .terminated => |code| machoCapturePrint(" ({s}) terminated={d}\n", .{ tag, code }),
                 }
             }
             if (self.contract_verification) {
@@ -2815,13 +2900,13 @@ pub const MachOState = struct {
                     };
                 }
                 if (contract.verify.resolveExpected(name, self.regs.rdi)) |expected| {
-                    std.debug.print("    [contract] WARNING: {s} verification mismatch, using expected\n", .{name});
+                    machoCapturePrint("    [contract] WARNING: {s} verification mismatch, using expected\n", .{name});
                     return switch (expected) {
                         .handled => |val| ImportHandlerResult{ .handled = val },
                         .terminated => |code| ImportHandlerResult{ .terminated = code },
                     };
                 }
-                std.debug.print("    [contract] WARNING: {s} verification mismatch, no expected fallback\n", .{name});
+                machoCapturePrint("    [contract] WARNING: {s} verification mismatch, no expected fallback\n", .{name});
             }
             return switch (outcome) {
                 .handled => |val| ImportHandlerResult{ .handled = val },
@@ -2833,14 +2918,14 @@ pub const MachOState = struct {
             const class_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
             const handle = self.compat.classNamed(class_name);
             self.registerOpaqueHandle(handle, "objc class identity");
-            std.debug.print("    [objc] class {s} -> 0x{x}\n", .{ class_name, handle });
+            machoCapturePrint("    [objc] class {s} -> 0x{x}\n", .{ class_name, handle });
             return .{ .handled = handle };
         }
         if (std.mem.eql(u8, name, "_sel_registerName")) {
             const selector_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
             const handle = self.compat.selectorNamed(selector_name);
             self.registerOpaqueHandle(handle, "Objective-C selector identity");
-            std.debug.print("    [objc] selector {s} -> 0x{x}\n", .{ selector_name, handle });
+            machoCapturePrint("    [objc] selector {s} -> 0x{x}\n", .{ selector_name, handle });
             return .{ .handled = handle };
         }
         if (std.mem.eql(u8, name, "_objc_msgSend")) {
@@ -2855,7 +2940,7 @@ pub const MachOState = struct {
                 if (native_result.value >= 0xFFFF_0000_0000_0000) {
                     self.registerNativeWindowHandles();
                 }
-                std.debug.print(
+                machoCapturePrint(
                     "    [objc/native] msgSend receiver=0x{x} class={s} selector={s} argument=0x{x} -> 0x{x} action={s}\n",
                     .{ self.regs.rdi, class_name, selector_name, self.regs.rdx, native_result.value, native_result.action },
                 );
@@ -2863,7 +2948,7 @@ pub const MachOState = struct {
             }
             const result = self.compat.sendMessage(self.regs.rdi, self.regs.rsi);
             if (result.value >= 0xFFFF_0000_0000_0000) self.registerOpaqueHandle(result.value, "Objective-C object identity");
-            std.debug.print(
+            machoCapturePrint(
                 "    [objc] msgSend receiver=0x{x} selector={s} -> 0x{x} modeled={}\n",
                 .{ self.regs.rdi, result.selector_name, result.value, result.modeled },
             );
@@ -2896,45 +2981,45 @@ pub const MachOState = struct {
                 assertion_variant,
             );
             if (assertion_observation.disposition == .checkpoint) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: repeated guest assertion checkpoint: symbol={s} occurrence={d} suppressed_since_previous={d} total_assertions={d}\n",
                     .{ if (caller) |symbol| symbol.name else function_name, assertion_observation.occurrence, assertion_observation.suppressed_since_emit, self.guest_assertion_count },
                 );
             } else if (assertion_observation.disposition == .detail) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: guest assertion #{d}: {s}:{d} {s}: {s}\n",
                     .{ self.guest_assertion_count, file_name, self.regs.rdx, function_name, expression },
                 );
-                std.debug.print(
+                machoCapturePrint(
                     "  assertion context: step={d} phase={s} active=0x{x} return=0x{x} caller={s}+0x{x} rsp=0x{x} rbp=0x{x}\n",
                     .{ self.executed_steps, @tagName(self.startup.phase), self.active_guest_thread, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.regs.rsp, self.regs.rbp },
                 );
                 if (backend_binding != .none) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  x64 backend assertion binding: kind={s} backend_phase={s}\n",
                         .{ @tagName(backend_binding), @tagName(self.backend_diagnostics.phase) },
                     );
                     if (backend_binding == .x64_backend_capstone) {
-                        std.debug.print(
+                        machoCapturePrint(
                             "  x64 backend assertion cause: source line 139 is the failure branch of cs_open(CS_ARCH_X86, CS_MODE_64, &capstone_handle_); this indicates Capstone initialization failure inside an existing X64Backend constructor, not absence of the backend object\n",
                             .{},
                         );
-                        std.debug.print(
+                        machoCapturePrint(
                             "  x64 backend assertion impact: Capstone-backed disassembly/introspection is unreliable until proven otherwise; subsequent backend/code-cache/processor success events will be logged as independent readiness evidence\n",
                             .{},
                         );
                         self.dumpCapstoneCallbackState("cs_open assertion");
                     } else if (backend_binding == .x64_backend_low32_thunk) {
                         const mapping = self.backend_diagnostics.last_mapping;
-                        std.debug.print(
+                        machoCapturePrint(
                             "  x64 backend assertion cause: source line 438 requires resolve_function_thunk_ to fit in uint32_t because every indirection-table entry stores a 32-bit host-code pointer; the generated code cache was placed above the low 4 GiB window\n",
                             .{},
                         );
-                        std.debug.print(
+                        machoCapturePrint(
                             "  x64 backend assertion impact: continuing would truncate the thunk address and seed every default indirection with an invalid target; backend executable mappings must be rejected unless their end is at or below 0x100000000\n",
                             .{},
                         );
-                        std.debug.print(
+                        machoCapturePrint(
                             "  x64 backend low-address correlation: latest_mmap(valid/succeeded)={}/{} requested_address=0x{x} length={d} result=0x{x} result_high32=0x{x} stage={s}\n",
                             .{ mapping.valid, mapping.succeeded, mapping.address, mapping.length, mapping.result, mapping.result >> 32, if (mapping.stage.len != 0) mapping.stage else "<pending>" },
                         );
@@ -2942,44 +3027,44 @@ pub const MachOState = struct {
                     self.dumpGuestStack();
                 }
                 if (assertion_class == .timer_queue_wait_item_state) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  timer queue assertion cause: TimerThreadMain expected WaitItem::State::kDisarmed before its compiler-emitted UD2; this is the primary invariant failure, and a following Processor::OnThreadBreakpointHit assertion is secondary signal-handler fallout\n",
                         .{},
                     );
-                    std.debug.print(
+                    machoCapturePrint(
                         "  timer queue assertion context: cooperative active_thread=0x{x} deferred_threads={d} suspended_threads={d} pending_idle={d}; inspect wait-item arm/disarm transitions before treating the breakpoint handler as the root cause\n",
                         .{ self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, gtkIdleQueueSnapshotFor(&self.gtk_idle_callbacks).pending },
                     );
                     if (guest_assertion_recovery.timerQueueSnapshot(self, self.regs.rbp)) |snapshot| {
-                        std.debug.print(
+                        machoCapturePrint(
                             "  timer queue state snapshot: frame_state[{s}]={d} at 0x{x} shared_ptr_slot=0x{x} wait_item=0x{x} object_state={s} due_ns={?d} interval_ns={?d}\n",
                             .{ timerQueueStateName(snapshot.frame_state), snapshot.frame_state, snapshot.frame_state_address, snapshot.shared_ptr_address, snapshot.wait_item, if (snapshot.object_state) |state| timerQueueStateName(state) else "<unmapped>", snapshot.due_nanoseconds, snapshot.interval_nanoseconds },
                         );
                         if (snapshot.object_state) |object_state| {
                             if (object_state != snapshot.frame_state) {
-                                std.debug.print(
+                                machoCapturePrint(
                                     "  timer queue state divergence: compare_exchange expected-output={s}({d}) but live wait_item state={s}({d}); this distinguishes decoder/CAS corruption from a genuinely concurrent state transition\n",
                                     .{ timerQueueStateName(snapshot.frame_state), snapshot.frame_state, timerQueueStateName(object_state), object_state },
                                 );
                             }
                         }
                     } else {
-                        std.debug.print(
+                        machoCapturePrint(
                             "  timer queue state snapshot unavailable: rbp=0x{x}; retaining the assertion as non-recoverable because the modeled CAS state cannot be proven\n",
                             .{self.regs.rbp},
                         );
                     }
                 } else if (assertion_class == .breakpoint_untracked_thread) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  breakpoint assertion cause: Processor::OnThreadBreakpointHit could not find the current modeled thread in Xenia's thread_debug_infos_ map; the backend exists, but this SIGILL arrived on a Rosette-cooperatively scheduled thread that Xenia's debugger registry does not track\n",
                         .{},
                     );
-                    std.debug.print(
+                    machoCapturePrint(
                         "  breakpoint assertion impact: this is a secondary failure while handling an earlier UD2. Any subsequent __Unwind_Resume(nullptr) belongs to the failed breakpoint-handler cleanup path and must not be mistaken for the original application fault\n",
                         .{},
                     );
                 } else if (assertion_class == .export_ordinal_bounds) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  export ordinal bounds assertion: an export_entry->ordinal >= export_table.size(); the ordinal value exceeds the registered export count\n",
                         .{},
                     );
@@ -2997,12 +3082,12 @@ pub const MachOState = struct {
                             _ = self.export_table_lc.recordOrdinalBounds("xbdm", ordinal, size);
                             self.export_registry.register(ordinal, function_name, 0, true);
                             if (ordinal < 256 or (size < 256 and ordinal - size <= 16)) {
-                                std.debug.print(
+                                machoCapturePrint(
                                     "  export ordinal bounds ROOT CAUSE: ordinal={d} >= table_size={d}; values are small and consistent — this is a guest-side export table sizing issue (the export table needs more entries or the ordinal needs updating)\n",
                                     .{ ordinal, size },
                                 );
                                 if (recovery == .table_was_resized) {
-                                    std.debug.print(
+                                    machoCapturePrint(
                                         "  export table sizing recovery: export table manager recorded ordinal={d} size={d}; future assertions for this table will be tracked\n",
                                         .{ ordinal, size },
                                     );
@@ -3014,7 +3099,7 @@ pub const MachOState = struct {
                                     if (var_name) |vname| {
                                         const sym_addr = self.metadata.definedSymbolAddress(vname);
                                         if (sym_addr) |addr| {
-                                            std.debug.print(
+                                            machoCapturePrint(
                                                 "  export table pre-population: found vector={s} at 0x{x}; scheduling growth to size {d}\n",
                                                 .{ vname, addr, ordinal + 1 },
                                             );
@@ -3024,12 +3109,12 @@ pub const MachOState = struct {
                                             const found = self.metadata.symbolAddressesMatching("", vname, &sym_buf);
                                             if (found > 0 and sym_buf[0] != 0) {
                                                 _ = self.export_table_lc.requestVectorGrowth(sym_buf[0], ordinal + 1, 8, vname);
-                                                std.debug.print(
+                                                machoCapturePrint(
                                                     "  export table pre-population: found vector={s} at 0x{x} via substring match; scheduling growth to size {d}\n",
                                                     .{ vname, sym_buf[0], ordinal + 1 },
                                                 );
                                             } else {
-                                                std.debug.print(
+                                                machoCapturePrint(
                                                     "  export table pre-population: vector={s} not found in symbol table; will fall back to defer+retry\n",
                                                     .{vname},
                                                 );
@@ -3038,7 +3123,7 @@ pub const MachOState = struct {
                                     }
                                 }
                             } else {
-                                std.debug.print(
+                                machoCapturePrint(
                                     "  export ordinal bounds ROOT CAUSE: ordinal={d} >= table_size={d}; values are large or unexpected — this is likely emulator-level memory corruption or a data-structure initialization failure\n",
                                     .{ ordinal, size },
                                 );
@@ -3047,11 +3132,11 @@ pub const MachOState = struct {
                     }
                     if (!found_pair) {
                         _ = self.export_table_mgr.recordTable(0, 0, 0);
-                        std.debug.print(
+                        machoCapturePrint(
                             "  export ordinal bounds: no plausible ordinal/size pair found in callee-saved registers (rbx/r12-r15); the values were either computed per-call and not preserved, or the register state was already clobbered\n",
                             .{},
                         );
-                        std.debug.print(
+                        machoCapturePrint(
                             "  export ordinal bounds raw register state: rbx=0x{x} r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n",
                             .{ self.regs.rbx, self.regs.r12, self.regs.r13, self.regs.r14, self.regs.r15 },
                         );
@@ -3059,7 +3144,7 @@ pub const MachOState = struct {
                 }
             }
             if (self.initializer_resolver.current()) |initializer| {
-                std.debug.print(
+                machoCapturePrint(
                     "  assertion owner: initializer [{d}/{d}] {s}\n",
                     .{ initializer.index + 1, self.metadata.initializer_addresses.len, initializer.symbol },
                 );
@@ -3195,7 +3280,7 @@ pub const MachOState = struct {
 
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm") != null) {
             const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, self.regs.rdx);
-            if (self.verbose_trace) std.debug.print(
+            if (self.verbose_trace) machoCapturePrint(
                 "    [libc++] basic_string::__init(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, ok },
             );
@@ -3204,7 +3289,7 @@ pub const MachOState = struct {
         if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc") != null) {
             const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
             const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
-            if (self.verbose_trace) std.debug.print(
+            if (self.verbose_trace) machoCapturePrint(
                 "    [libc++] basic_string::assign(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
                 .{ self.regs.rdi, self.regs.rsi, source.len, ok },
             );
@@ -3252,7 +3337,7 @@ pub const MachOState = struct {
         {
             const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
             if (!ok) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: libc++ string copy rejected: destination=0x{x} source=0x{x} destination_mapped={} source_mapped={}\n",
                     .{ self.regs.rdi, self.regs.rsi, self.guestMemoryConst(self.regs.rdi, 24) != null, self.guestMemoryConst(self.regs.rsi, 24) != null },
                 );
@@ -3287,7 +3372,7 @@ pub const MachOState = struct {
             const result = compat_runtime.compareLibcppStringWithBytes(self, self.regs.rdi, self.regs.rsi, rhs.len) orelse
                 return .{ .unsupported = 0 };
             if (self.verbose_trace) {
-                std.debug.print(
+                machoCapturePrint(
                     "    [libc++] basic_string::compare(this=0x{x}, rhs=0x{x}, rhs_length={d}) -> {d}\n",
                     .{ self.regs.rdi, self.regs.rsi, rhs.len, result },
                 );
@@ -3307,7 +3392,7 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "___cxa_atexit")) {
             const registered = self.compat.registerAtexit(self.regs.rdi, self.regs.rsi, self.regs.rdx);
-            if (self.verbose_trace) std.debug.print(
+            if (self.verbose_trace) machoCapturePrint(
                 "    [c++] __cxa_atexit(function=0x{x}, argument=0x{x}, dso=0x{x}) -> {}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, registered },
             );
@@ -3316,7 +3401,7 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "_atexit")) {
             const registered = self.compat.registerPlainAtexit(self.regs.rdi);
             if (self.verbose_trace) {
-                std.debug.print(
+                machoCapturePrint(
                     "    [posix] atexit(function=0x{x}) -> {}\n",
                     .{ self.regs.rdi, registered },
                 );
@@ -3390,7 +3475,7 @@ pub const MachOState = struct {
                     return .{ .handled = self.regs.rdi };
                 }
             }
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: __dynamic_cast metadata unresolved: source=0x{x} source_type=0x{x} destination_type=0x{x} hint={d}; returning null\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, @as(i64, @bitCast(self.regs.rcx)) },
             );
@@ -3439,22 +3524,22 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "___cxa_begin_catch")) {
             const object_address = self.cxx_exceptions.beginCatch(self.regs.rdi);
-            std.debug.print("macho-processor: __cxa_begin_catch object=0x{x}\n", .{object_address});
+            machoCapturePrint("macho-processor: __cxa_begin_catch object=0x{x}\n", .{object_address});
             return .{ .handled = object_address };
         }
         if (std.mem.eql(u8, name, "___cxa_end_catch")) {
             const object_address = self.cxx_exceptions.endCatch();
             if (object_address) |object| {
-                std.debug.print("macho-processor: __cxa_end_catch object=0x{x}\n", .{object});
+                machoCapturePrint("macho-processor: __cxa_end_catch object=0x{x}\n", .{object});
                 if (self.unwinder.completeCatch()) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: Itanium catch transaction completed: object=0x{x}; phase-two checkpoint retired\n",
                         .{object},
                     );
                 }
                 const spirv_resolution = self.spirv_cross.noteCatch(object);
                 if (spirv_resolution == .expected_dummy_probe_caught) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: SPIRV-Cross dummy-module probe resolved: object=0x{x} entry_point_expected=false handler_completed=true; this exception is verified startup history, not a hang cause\n",
                         .{object},
                     );
@@ -3481,7 +3566,7 @@ pub const MachOState = struct {
                 self.regs.rdx,
                 self.read64(self.regs.rsp),
             );
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest raised C++ exception object=0x{x} type_info=0x{x} destructor=0x{x}\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx },
             );
@@ -3490,7 +3575,7 @@ pub const MachOState = struct {
             var exception_message: []const u8 = "";
             if (self.cxxExceptionTypeName(thrown.type_info_address)) |type_name| {
                 exception_type_name = type_name;
-                std.debug.print("macho-processor: C++ exception ABI type name: {s}\n", .{type_name});
+                machoCapturePrint("macho-processor: C++ exception ABI type name: {s}\n", .{type_name});
                 if (std.mem.indexOf(u8, type_name, "toml") != null and
                     std.mem.indexOf(u8, type_name, "parse_error") != null)
                 {
@@ -3498,13 +3583,13 @@ pub const MachOState = struct {
                 }
             }
             if (self.metadata.nearestSymbol(thrown.type_info_address)) |symbol| {
-                std.debug.print("macho-processor: C++ exception type: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
+                machoCapturePrint("macho-processor: C++ exception type: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
             }
             if (self.metadata.nearestSymbol(thrown.destructor_address)) |symbol| {
-                std.debug.print("macho-processor: C++ exception destructor: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
+                machoCapturePrint("macho-processor: C++ exception destructor: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
             }
             if (self.diagnosticSymbol(thrown.caller_address)) |throw_site| {
-                std.debug.print("macho-processor: C++ exception throw site: {s}+0x{x} (0x{x})\n", .{
+                machoCapturePrint("macho-processor: C++ exception throw site: {s}+0x{x} (0x{x})\n", .{
                     throw_site.symbol,
                     throw_site.symbol_offset,
                     throw_site.address,
@@ -3512,7 +3597,7 @@ pub const MachOState = struct {
             }
             if (thrown.allocation) |allocation| {
                 if (self.diagnosticSymbol(allocation.caller_address)) |allocation_site| {
-                    std.debug.print("macho-processor: C++ exception allocation site: {s}+0x{x} (size={d})\n", .{
+                    machoCapturePrint("macho-processor: C++ exception allocation site: {s}+0x{x} (size={d})\n", .{
                         allocation_site.symbol,
                         allocation_site.symbol_offset,
                         allocation.object_size,
@@ -3521,7 +3606,7 @@ pub const MachOState = struct {
             }
             if (self.cxxExceptionMessage(thrown.object_address)) |message| {
                 exception_message = message;
-                std.debug.print("macho-processor: C++ exception message: {s}\n", .{message});
+                machoCapturePrint("macho-processor: C++ exception message: {s}\n", .{message});
                 if (std.mem.indexOf(u8, message, "invalid utf-8") != null or
                     std.mem.indexOf(u8, message, "invalid UTF-8") != null or
                     std.mem.indexOf(u8, message, "utf-8") != null)
@@ -3547,7 +3632,7 @@ pub const MachOState = struct {
                 .catch_completed = false,
             });
             if (spirv_classification == .expected_dummy_probe_unwinding) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: SPIRV-Cross dummy-module probe recognized: object=0x{x} missing_entry_point=true verification_frame=true handler=0x{x} phase_two_installed=true; awaiting expected catch completion\n",
                     .{ thrown.object_address, if (inspection.handler) |handler| handler.landing_pad else 0 },
                 );
@@ -3558,9 +3643,9 @@ pub const MachOState = struct {
             }
             self.last_unwind_inspection = inspection;
             if (inspection.handler != null) {
-                std.debug.print("macho-processor: stopping after verified phase-1 catch discovery because this frame layout is not phase-2 safe\n", .{});
+                machoCapturePrint("macho-processor: stopping after verified phase-1 catch discovery because this frame layout is not phase-2 safe\n", .{});
             } else {
-                std.debug.print("macho-processor: stopping after Itanium phase-1 found no matching catch handler\n", .{});
+                machoCapturePrint("macho-processor: stopping after Itanium phase-1 found no matching catch handler\n", .{});
             }
             self.dumpGuestStack();
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
@@ -3577,7 +3662,7 @@ pub const MachOState = struct {
                 outer_assertion,
                 self.signal_frame_count,
             )) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: suppressing null __Unwind_Resume from nested breakpoint-handler fallout: outer_assertion={s} inner_assertion={s} signal_depth={d}; restoring outer signal context\n",
                     .{ @tagName(outer_assertion), @tagName(self.last_guest_assertion_class), self.signal_frame_count },
                 );
@@ -3589,7 +3674,7 @@ pub const MachOState = struct {
             }
             if (self.unwinder.resumePhaseTwo(self)) return .control_transferred;
             if (self.unwinder.exhaustedWithoutHandler()) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: Itanium phase-2 stopped after all verified cleanup pads; no matching LSDA catch exists for the guest exception\n",
                     .{},
                 );
@@ -3599,22 +3684,22 @@ pub const MachOState = struct {
             if (self.recoverOrphanedPhaseTwoResume(name)) return .control_transferred;
             if (self.regs.rdi != 0 or self.cxx_exceptions.activeThrow() != null) {
                 const exception_header = if (self.regs.rdi != 0) self.regs.rdi else if (self.cxx_exceptions.activeThrow()) |thrown| if (thrown.allocation) |allocation| allocation.storage_address else thrown.object_address else 0;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: Itanium host _Unwind_Resume fallback rejected: header=0x{x}; host addresses cannot be installed as guest RIP\n",
                     .{exception_header},
                 );
             }
             if (self.regs.rdi == 0 and self.last_guest_assertion_class == .breakpoint_untracked_thread) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: breakpoint cleanup chain diagnosis: __Unwind_Resume received a null exception argument after Processor::OnThreadBreakpointHit asserted on an untracked modeled thread; no C++ throw object exists to resume, so exit 125 is secondary handler-cleanup termination\n",
                     .{},
                 );
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: breakpoint cleanup chain origin: assertion_step={d} assertion_return=0x{x} active_thread=0x{x} signal_depth={d} deferred_threads={d} suspended_threads={d}\n",
                     .{ self.last_guest_assertion_step, self.last_guest_assertion_return, self.active_guest_thread, self.signal_frame_count, self.pthreads.deferred_threads, self.suspended_guest_thread_count },
                 );
             }
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest requested exception resume without a recoverable phase-2 cleanup chain: symbol={s} exception_arg=0x{x} rip=0x{x} rsp=0x{x} rbp=0x{x}\n",
                 .{ name, self.regs.rdi, self.regs.rip, self.regs.rsp, self.regs.rbp },
             );
@@ -3623,7 +3708,7 @@ pub const MachOState = struct {
         }
         if (std.mem.eql(u8, name, "___cxa_rethrow")) {
             const object_address = self.cxx_exceptions.recordRethrow() orelse self.regs.rdi;
-            std.debug.print("macho-processor: guest rethrew exception object=0x{x}\n", .{object_address});
+            machoCapturePrint("macho-processor: guest rethrew exception object=0x{x}\n", .{object_address});
             const thrown = self.cxx_exceptions.last_throw orelse {
                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
                 return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
@@ -3703,7 +3788,7 @@ pub const MachOState = struct {
                 return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
             };
             @memset(buf, value);
-            if (self.verbose_trace) std.debug.print("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
+            if (self.verbose_trace) machoCapturePrint("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
             return .{ .handled = dst };
         }
         if (std.mem.eql(u8, name, "___bzero")) {
@@ -3715,7 +3800,7 @@ pub const MachOState = struct {
                 return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
             };
             @memset(buf, 0);
-            if (self.verbose_trace) std.debug.print("    [import] _bzero(dst=0x{x}, count={d})\n", .{ dst, count });
+            if (self.verbose_trace) machoCapturePrint("    [import] _bzero(dst=0x{x}, count={d})\n", .{ dst, count });
             return .handled_void;
         }
 
@@ -3798,9 +3883,10 @@ pub const MachOState = struct {
             const req = self.guestMemory(req_ptr, 16) orelse return .{ .handled = @bitCast(@as(i64, -1)) };
             const tv_sec = std.mem.readInt(i64, req[0..8], .little);
             const tv_nsec = std.mem.readInt(i64, req[8..16], .little);
-            if (tv_sec < 0 or tv_nsec < 0) return .{ .handled = @bitCast(@as(i64, -1)) };
+            if (tv_sec < 0 or tv_nsec < 0 or tv_nsec >= 1_000_000_000) return .{ .handled = @bitCast(@as(i64, -1)) };
             const total_ns: u64 = (@as(u64, @intCast(tv_sec)) * 1_000_000_000) +| @as(u64, @intCast(tv_nsec));
-            _ = self.guest_time.advanceBy(total_ns);
+            const requested_ns: i64 = @intCast(@min(total_ns, @as(u64, std.math.maxInt(i64))));
+            self.pending_direct_sleep = scheduler.classifyGuestSleep(requested_ns);
             if (rem_ptr != 0) {
                 if (self.guestMemory(rem_ptr, 16)) |rem| {
                     @memset(rem, 0);
@@ -3980,7 +4066,7 @@ pub const MachOState = struct {
         if (std.mem.endsWith(u8, name, "_abort")) {
             self.terminated = true;
             self.exit_code = 1;
-            std.debug.print("macho-processor: guest called abort()\n", .{});
+            machoCapturePrint("macho-processor: guest called abort()\n", .{});
             return .control_transferred;
         }
         if (std.mem.eql(u8, name, "__tlv_atexit")) {
@@ -4043,22 +4129,22 @@ pub const MachOState = struct {
         }
 
         if (std.mem.eql(u8, name, "__ZNSt3__16thread4joinEv")) {
-            if (self.verbose_trace) std.debug.print("    [import] std::thread::join(object=0x{x})\n", .{self.regs.rdi});
+            if (self.verbose_trace) machoCapturePrint("    [import] std::thread::join(object=0x{x})\n", .{self.regs.rdi});
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "__ZNSt3__16thread20hardware_concurrencyEv")) {
             const count = std.Thread.getCpuCount() catch 1;
-            if (self.verbose_trace) std.debug.print("    [import] std::thread::hardware_concurrency() -> {d}\n", .{count});
+            if (self.verbose_trace) machoCapturePrint("    [import] std::thread::hardware_concurrency() -> {d}\n", .{count});
             return .{ .handled = count };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__111this_thread6get_idEv")) {
             const handle = self.pthreads.currentThreadHandle(self);
-            if (self.verbose_trace) std.debug.print("    [import] std::this_thread::get_id() -> 0x{x}\n", .{handle});
+            if (self.verbose_trace) machoCapturePrint("    [import] std::this_thread::get_id() -> 0x{x}\n", .{handle});
             return .{ .handled = handle };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__119__thread_local_dataEv")) {
             const allocation = self.guestAlloc(64, 16) orelse return .{ .unsupported = 0 };
-            if (self.verbose_trace) std.debug.print("    [import] __thread_local_data() -> 0x{x}\n", .{allocation});
+            if (self.verbose_trace) machoCapturePrint("    [import] __thread_local_data() -> 0x{x}\n", .{allocation});
             return .{ .handled = allocation };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev")) {
@@ -4068,12 +4154,12 @@ pub const MachOState = struct {
                 if (self.libcxx_streams.object_model.ensureType(self, .basic_streambuf, null)) |record| {
                     self.write64(object, record.vtable);
                 }
-                if (self.verbose_trace) std.debug.print("    [import] basic_streambuf::C2(object=0x{x})\n", .{object});
+                if (self.verbose_trace) machoCapturePrint("    [import] basic_streambuf::C2(object=0x{x})\n", .{object});
             }
             return .{ .handled = object };
         }
         if (std.mem.eql(u8, name, "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv")) {
-            if (self.verbose_trace) std.debug.print("    [import] operator<<(void* ptr=0x{x}) -> *this\n", .{self.regs.rsi});
+            if (self.verbose_trace) machoCapturePrint("    [import] operator<<(void* ptr=0x{x}) -> *this\n", .{self.regs.rsi});
             return .{ .handled = self.regs.rdi };
         }
         if (std.mem.eql(u8, name, "__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv")) {
@@ -4082,12 +4168,12 @@ pub const MachOState = struct {
             if (!self.libcxx_streams.stringbufToString(self, stringbuf_ptr, output_ptr)) {
                 _ = compat_runtime.initLibcppStringLiteral(self, output_ptr, "");
             }
-            if (self.verbose_trace) std.debug.print("    [import] basic_stringbuf::str() -> modeled string at 0x{x}\n", .{output_ptr});
+            if (self.verbose_trace) machoCapturePrint("    [import] basic_stringbuf::str() -> modeled string at 0x{x}\n", .{output_ptr});
             return .{ .handled = output_ptr };
         }
 
         if (std.mem.endsWith(u8, name, "_g_type_check_instance_cast")) {
-            std.debug.print("    [import] _g_type_check_instance_cast compatibility shim → passthrough\n", .{});
+            machoCapturePrint("    [import] _g_type_check_instance_cast compatibility shim → passthrough\n", .{});
             return .{ .handled = self.regs.rdi };
         }
 
@@ -4098,7 +4184,7 @@ pub const MachOState = struct {
                 .modeled => .modeled,
             };
             if (self.verbose_trace) {
-                std.debug.print(
+                machoCapturePrint(
                     "    [smart stub] {s} reason={s} confidence={s}\n",
                     .{ name, @tagName(generated.reason), @tagName(generated.confidence) },
                 );
@@ -4116,7 +4202,7 @@ pub const MachOState = struct {
             if (self.guestMemory(self.regs.rdi, 8)) |buf| {
                 std.mem.writeInt(u32, buf[0..4], @bitCast(sin_val), .little);
                 std.mem.writeInt(u32, buf[4..8], @bitCast(cos_val), .little);
-                if (self.verbose_trace) std.debug.print("    [import] ___sincosf_stret(angle={d}) -> sin={d} cos={d} ptr=0x{x}\n", .{ angle, sin_val, cos_val, self.regs.rdi });
+                if (self.verbose_trace) machoCapturePrint("    [import] ___sincosf_stret(angle={d}) -> sin={d} cos={d} ptr=0x{x}\n", .{ angle, sin_val, cos_val, self.regs.rdi });
             }
             return .{ .handled = self.regs.rdi };
         }
@@ -4124,11 +4210,11 @@ pub const MachOState = struct {
             const angle: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
             const result: f32 = @cos(angle);
             std.mem.writeInt(u32, self.xmm[0][0..4], @bitCast(result), .little);
-            if (self.verbose_trace) std.debug.print("    [import] _cosf(angle={d}) -> {d}\n", .{ angle, result });
+            if (self.verbose_trace) machoCapturePrint("    [import] _cosf(angle={d}) -> {d}\n", .{ angle, result });
             return .{ .handled = 0 };
         }
 
-        if (self.verbose_trace) std.debug.print("    [import] (unhandled) {s}\n", .{name});
+        if (self.verbose_trace) machoCapturePrint("    [import] (unhandled) {s}\n", .{name});
         return .{ .unsupported = 0 };
     }
 
@@ -4147,7 +4233,7 @@ pub const MachOState = struct {
         const supplied_is_tracked = supplied_header == tracked_header or supplied_header == thrown.object_address;
         const use_tracked_header = supplied_header == 0 or !supplied_is_tracked;
         const exception_header = if (use_tracked_header) tracked_header else supplied_header;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: Itanium orphan-resume reconstruction: symbol={s} supplied_header=0x{x} tracked_header=0x{x} using_tracked={} rip=0x{x} rsp=0x{x} frames={d} handler_found={}\n",
             .{ symbol, supplied_header, tracked_header, use_tracked_header, self.regs.rip, self.regs.rsp, inspection.frame_count, inspection.handler != null },
         );
@@ -4389,7 +4475,7 @@ pub const MachOState = struct {
         const source_address = self.regs.rsi;
         const count = self.regs.rdx;
         if (std.mem.eql(u8, name, "___memcpy_chk") and count > self.regs.rcx) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: fortified memcpy rejected: destination=0x{x} source=0x{x} bytes={d} destination_size={d}\n",
                 .{ destination_address, source_address, count, self.regs.rcx },
             );
@@ -4406,7 +4492,7 @@ pub const MachOState = struct {
                 std.mem.copyForwards(u8, destination.?, source.?);
             }
         } else if (self.verbose_trace) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: {s} skipped: source=0x{x} destination=0x{x} bytes={d} source_backed={} destination_backed={}\n",
                 .{ name, source_address, destination_address, count, source != null, destination != null },
             );
@@ -4446,7 +4532,7 @@ pub const MachOState = struct {
         self.resolving_import_route = .pthread;
         self.import_provider_override = .pthread_runtime;
         if (self.pthreads.scheduler_yields <= 8 or self.pthreads.scheduler_yields % 1000 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: explicit guest yield #{d}: import={s} from=0x{x} to=0x{x} switched={} suspended={d} deferred={d}\n",
                 .{ self.pthreads.scheduler_yields, imported.name, previous_thread, self.active_guest_thread, switched, self.suspended_guest_thread_count, self.pthreads.deferred_threads },
             );
@@ -4511,8 +4597,7 @@ pub const MachOState = struct {
         return self.yieldActiveGuestThreadForWait("pthread mutex contention");
     }
 
-    fn handleVirtualSleepSchedulingBoundary(self: *MachOState, reason: []const u8) bool {
-        const decision = self.dynamic_forwarder.lastVirtualSleepDecision();
+    fn handleSleepSchedulingBoundary(self: *MachOState, decision: scheduler.GuestSleepDecision, reason: []const u8) bool {
         const sleeping_thread = self.active_guest_thread;
         var parked = false;
         switch (decision.kind) {
@@ -4544,12 +4629,16 @@ pub const MachOState = struct {
         const switched = self.yieldActiveGuestThreadForWait(reason);
         if (switched) self.cooperative_sleep_yields +|= 1;
         if (self.cooperative_sleep_yields <= 16 or self.cooperative_sleep_yields % 100 == 0 or decision.kind == .indefinite) {
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: virtual sleep boundary: sleeper=0x{x} resumed=0x{x} kind={s} parked={} switched={} deadline_ns={d} suspended={d} deferred={d}\n",
                 .{ sleeping_thread, self.active_guest_thread, @tagName(decision.kind), parked, switched, if (decision.kind == .timed) self.guest_time.now() +| decision.effective_nanoseconds else 0, self.suspended_guest_thread_count, self.pthreads.deferred_threads },
             );
         }
         return switched;
+    }
+
+    fn handleVirtualSleepSchedulingBoundary(self: *MachOState, reason: []const u8) bool {
+        return self.handleSleepSchedulingBoundary(self.dynamic_forwarder.lastVirtualSleepDecision(), reason);
     }
 
     fn handleDirectImportCall(self: *MachOState, imported: macho_metadata.ImportedSymbol) void {
@@ -4566,13 +4655,14 @@ pub const MachOState = struct {
         if (self.handleCooperativeMutexContention(imported)) return;
         if (self.handleCooperativeWaitImport(imported, return_address)) return;
         const virtual_sleep_calls_before = self.dynamic_forwarder.virtualSleepCallCount();
+        self.pending_direct_sleep = null;
         var import_completed = false;
         switch (self.handleImport(imported)) {
             .handled => |result| {
                 import_completed = true;
                 self.regs.rax = result;
                 if (self.verbose_trace) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  [handled direct import] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
                         .{ imported.name, imported.dylib, imported.stub_address, return_address, result },
                     );
@@ -4581,7 +4671,7 @@ pub const MachOState = struct {
             .handled_void => {
                 import_completed = true;
                 if (self.verbose_trace) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  [handled void direct import] {s} from {s}; stub=0x{x} return=0x{x}\n",
                         .{ imported.name, imported.dylib, imported.stub_address, return_address },
                     );
@@ -4589,7 +4679,7 @@ pub const MachOState = struct {
             },
             .control_transferred => {
                 if (self.verbose_trace) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  [handled direct control transfer] {s} from {s}; landing_pad=0x{x}\n",
                         .{ imported.name, imported.dylib, self.regs.rip },
                     );
@@ -4599,7 +4689,7 @@ pub const MachOState = struct {
             .unsupported => |result| {
                 self.regs.rax = result;
                 self.recordUnresolvedImport(imported, return_address, result);
-                std.debug.print(
+                machoCapturePrint(
                     "  [unresolved direct import #{d}] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
                     .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, return_address, result },
                 );
@@ -4614,7 +4704,7 @@ pub const MachOState = struct {
                     self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
                 }
                 self.terminated = true;
-                std.debug.print("  [handled terminal direct import] {s}({d})\n", .{ imported.name, exit_code });
+                machoCapturePrint("  [handled terminal direct import] {s}({d})\n", .{ imported.name, exit_code });
                 return;
             },
         }
@@ -4622,8 +4712,13 @@ pub const MachOState = struct {
         if (return_address != 0 and self.isExecutableAddress(return_address)) {
             _ = self.pop();
             self.regs.rip = return_address;
-            if (import_completed and self.dynamic_forwarder.virtualSleepCallCount() != virtual_sleep_calls_before) {
-                _ = self.handleVirtualSleepSchedulingBoundary("libc++ virtual sleep");
+            if (import_completed) {
+                if (self.pending_direct_sleep) |decision| {
+                    self.pending_direct_sleep = null;
+                    _ = self.handleSleepSchedulingBoundary(decision, "POSIX nanosleep");
+                } else if (self.dynamic_forwarder.virtualSleepCallCount() != virtual_sleep_calls_before) {
+                    _ = self.handleVirtualSleepSchedulingBoundary("libc++ virtual sleep");
+                }
             }
         } else {
             self.faulted = true;
@@ -4664,7 +4759,7 @@ pub const MachOState = struct {
     ) void {
         const use_site = self.traceCallSite(return_address) orelse return_address;
         const observation = self.symbol_assembly.observe(imported.name, use_site) catch |err| {
-            std.debug.print(
+            machoCapturePrint(
                 "  [unknown-symbol assembly] tracking failed for {s}: {s}\n",
                 .{ imported.name, @errorName(err) },
             );
@@ -4678,7 +4773,7 @@ pub const MachOState = struct {
                     &self.metadata,
                     decodeInsn,
                 ) catch |err| {
-                    std.debug.print(
+                    machoCapturePrint(
                         "  [unknown-symbol assembly] static index failed for {s}: {s}\n",
                         .{ imported.name, @errorName(err) },
                     );
@@ -4691,7 +4786,7 @@ pub const MachOState = struct {
         if (observation.first_use_site) {
             self.logDynamicUnknownSymbolContext(imported, use_site, observation.symbol_hits);
         } else if (observation.site_hits == 2) {
-            std.debug.print(
+            machoCapturePrint(
                 "  [unknown-symbol assembly] repeated symbol={s} use_site=0x{x}; identical context is deduplicated\n",
                 .{ imported.name, use_site },
             );
@@ -4737,22 +4832,22 @@ pub const MachOState = struct {
         const start = selected -| symbol_assembly_context.CONTEXT_BEFORE;
         const end = @min(count, selected + 1 + symbol_assembly_context.CONTEXT_AFTER);
         if (self.metadata.nearestSymbol(use_site)) |caller| {
-            std.debug.print(
+            machoCapturePrint(
                 "  [unknown-symbol runtime block] symbol={s} occurrence={d} use_site=0x{x} caller={s}+0x{x}\n",
                 .{ imported.name, symbol_hits, use_site, caller.name, caller.offset },
             );
         } else {
-            std.debug.print(
+            machoCapturePrint(
                 "  [unknown-symbol runtime block] symbol={s} occurrence={d} use_site=0x{x} caller=<unknown>\n",
                 .{ imported.name, symbol_hits, use_site },
             );
         }
-        std.debug.print(
+        machoCapturePrint(
             "    entry-registers: rdi=0x{x} rsi=0x{x} rdx=0x{x} rcx=0x{x} r8=0x{x} r9=0x{x} rsp=0x{x}\n",
             .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9, self.regs.rsp },
         );
         for (self.xmm[0..4], 0..) |value, index| {
-            std.debug.print(
+            machoCapturePrint(
                 "    entry-xmm{d}: low=0x{x} high=0x{x}\n",
                 .{
                     index,
@@ -4802,7 +4897,7 @@ pub const MachOState = struct {
     fn dispatchNextAtexit(self: *MachOState) void {
         while (self.compat.takeLastAtexit()) |entry| {
             if (entry.function == 0 or !self.isExecutableAddress(entry.function)) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: skipping invalid atexit callback 0x{x} argument=0x{x} dso=0x{x}\n",
                     .{ entry.function, entry.argument, entry.dso },
                 );
@@ -4814,7 +4909,7 @@ pub const MachOState = struct {
             self.regs.rip = entry.function;
             self.atexit_callbacks_invoked +|= 1;
             if (self.verbose_trace) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: invoking atexit callback #{d}: function=0x{x} argument=0x{x} dso=0x{x} takes_argument={}\n",
                     .{ self.atexit_callbacks_invoked, entry.function, entry.argument, entry.dso, entry.takes_argument },
                 );
@@ -4825,7 +4920,7 @@ pub const MachOState = struct {
         self.exit_code = self.pending_exit_code;
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
         self.terminated = true;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: guest exit callbacks complete: invoked={d} exit_code={d}\n",
             .{ self.atexit_callbacks_invoked, self.exit_code },
         );
@@ -4857,7 +4952,7 @@ pub const MachOState = struct {
         }
         if (self.verbose_trace) {
             const action = self.signal_actions[signal_index];
-            std.debug.print(
+            machoCapturePrint(
                 "    [signal] sigaction signal={d} handler=0x{x} flags=0x{x} mask=0x{x}\n",
                 .{ self.regs.rdi, action.handler, action.flags, action.mask },
             );
@@ -4887,7 +4982,7 @@ pub const MachOState = struct {
                     if (!guest_assertion_recovery.quarantineRepeatedIdleGeneration(self, snapshot)) return false;
                     self.classified_ud2_recoveries +|= 1;
                     const owner = self.metadata.nearestSymbol(self.last_guest_assertion_return);
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: timer recovery circuit breaker: wait_item=0x{x} due_ns={?d} interval_ns={?d} owner={s} repeated_generation_quarantined=true state=kIdle->kDisarmed resume=0x{x}; callback replay for this generation was already attempted\n",
                         .{ snapshot.wait_item, snapshot.due_nanoseconds, snapshot.interval_nanoseconds, if (owner) |symbol| symbol.name else "<unknown>", self.regs.rip +% instruction_len },
                     );
@@ -4917,12 +5012,12 @@ pub const MachOState = struct {
                     @intFromEnum(action),
                 );
                 if (observation.disposition == .detail) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: classified UD2 recovery #{d}: timer queue strong CAS false-negative frame/live=kIdle; owner={s} wait_item=0x{x} state kIdle->kInCallback replay=0x{x} callback_pending=true step_delta={d} address_delta={d}\n",
                         .{ self.classified_ud2_recoveries, if (owner) |symbol| symbol.name else "<unknown>", snapshot.wait_item, replay_rip, step_delta, address_delta },
                     );
                 } else if (observation.disposition == .checkpoint) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: repeated classified UD2 recovery checkpoint: owner={s} case=idle_cas_false_negative occurrence={d} suppressed_since_previous={d} total_recoveries={d}\n",
                         .{ if (owner) |symbol| symbol.name else "<unknown>", observation.occurrence, observation.suppressed_since_emit, self.classified_ud2_recoveries },
                     );
@@ -4941,12 +5036,12 @@ pub const MachOState = struct {
                     (@as(u64, @intFromEnum(action)) << 8) | snapshot.frame_state,
                 );
                 if (observation.disposition == .detail) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: classified UD2 recovery #{d}: duplicate timer queue reference owner={s} frame/live={s}; wait_item=0x{x} action=quarantine_duplicate resume=0x{x} step_delta={d} address_delta={d}\n",
                         .{ self.classified_ud2_recoveries, if (owner) |symbol| symbol.name else "<unknown>", timerQueueStateName(snapshot.frame_state), snapshot.wait_item, self.regs.rip +% instruction_len, step_delta, address_delta },
                     );
                 } else if (observation.disposition == .checkpoint) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: repeated classified UD2 recovery checkpoint: owner={s} case=callback_owned_duplicate state={s} occurrence={d} suppressed_since_previous={d} total_recoveries={d}\n",
                         .{ if (owner) |symbol| symbol.name else "<unknown>", timerQueueStateName(snapshot.frame_state), observation.occurrence, observation.suppressed_since_emit, self.classified_ud2_recoveries },
                     );
@@ -4958,27 +5053,35 @@ pub const MachOState = struct {
         }
     }
 
-    fn deliverGuestSignal(self: *MachOState, signal: u8, fault_rip: u64, instruction_len: u8) bool {
+    fn deliverGuestSignal(
+        self: *MachOState,
+        signal: u8,
+        fault_rip: u64,
+        instruction_len: u8,
+        fault_address: u64,
+        fault_access: ?GuestAccess,
+    ) bool {
         const signal_index = guestSignalIndex(signal) orelse return false;
         const action = self.signal_actions[signal_index];
         if (action.handler == 0) return false; // SIG_DFL: retain Rosette's diagnostic termination.
         if (action.handler == 1) { // SIG_IGN: make forward progress without synthesizing a callback.
             self.regs.rip +%= instruction_len;
-            std.debug.print("macho-processor: guest ignored signal {d} at rip=0x{x}\n", .{ signal, fault_rip });
+            machoCapturePrint("macho-processor: guest ignored signal {d} at rip=0x{x}\n", .{ signal, fault_rip });
             return true;
         }
         if (action.flags & SA_NODEFER == 0 and self.signalIsActive(signal)) {
+            if (signal != GUEST_SIGILL) return false;
             // POSIX blocks the signal currently being handled unless
             // SA_NODEFER is requested. Queueing is unnecessary for UD2: the
             // outer handler already owns the exception and the nested trap is
             // an assertion in that handler's diagnostic path.
             self.regs.rip = fault_rip +% instruction_len;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: deferred recursive guest signal {d} at rip=0x{x}; outer handler remains active\n",
                 .{ signal, fault_rip },
             );
             if (self.last_guest_assertion_class == .breakpoint_untracked_thread) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: recursive signal provenance: Processor::OnThreadBreakpointHit asserted because the active modeled thread was absent from Xenia's debugger registry; this nested UD2 is handler fallout, not a second independent backend failure\n",
                     .{},
                 );
@@ -4993,8 +5096,15 @@ pub const MachOState = struct {
         const mcontext_bytes = self.guestMemory(frame.mcontext, DARWIN_MCONTEXT_SIZE) orelse return false;
         const ucontext_bytes = self.guestMemory(frame.ucontext, DARWIN_UCONTEXT_SIZE) orelse return false;
 
-        writeDarwinSiginfo(siginfo_bytes, signal, fault_rip);
-        writeDarwinMcontext(mcontext_bytes, self.regs);
+        const protection_fault = signal == GUEST_SIGSEGV;
+        const signal_code: i32 = if (protection_fault) 2 else 1; // SEGV_ACCERR / ILL_ILLOPC
+        const trap_number: u16 = if (protection_fault) 14 else 6; // #PF / #UD
+        const error_code: u32 = if (protection_fault)
+            1 | (if (fault_access == .write) @as(u32, 2) else 0)
+        else
+            0;
+        writeDarwinSiginfo(siginfo_bytes, signal, signal_code, fault_address);
+        writeDarwinMcontext(mcontext_bytes, self.regs, trap_number, error_code, fault_address);
         writeDarwinUcontext(ucontext_bytes, frame.mcontext);
 
         if (action.flags & SA_RESETHAND != 0) self.signal_actions[signal_index] = .{};
@@ -5020,12 +5130,12 @@ pub const MachOState = struct {
         self.guest_signal_deliveries +|= 1;
         const backend_correlated = self.backend_diagnostics.signalCorrelates(self.executed_steps, fault_rip);
         if (backend_correlated) self.backend_diagnostics.noteSignalDelivery();
-        std.debug.print(
-            "macho-processor: delivered guest signal {d} to 0x{x}; fault_rip=0x{x} siginfo=0x{x} ucontext=0x{x}\n",
-            .{ signal, action.handler, fault_rip, frame.siginfo, frame.ucontext },
+        machoCapturePrint(
+            "macho-processor: delivered guest signal {d} to 0x{x}; fault_rip=0x{x} fault_address=0x{x} access={s} siginfo=0x{x} ucontext=0x{x}\n",
+            .{ signal, action.handler, fault_rip, fault_address, if (fault_access) |access| @tagName(access) else "instruction", frame.siginfo, frame.ucontext },
         );
         if (backend_correlated) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest signal correlation: signal={d} fault_rip=0x{x} is linked to backend assertion kind={s} assertion_return=0x{x} step_delta={d}\n",
                 .{ signal, fault_rip, @tagName(self.backend_diagnostics.last_backend_assertion_binding), self.backend_diagnostics.last_backend_assertion_rip, self.executed_steps -| self.backend_diagnostics.last_backend_assertion_step },
             );
@@ -5038,7 +5148,7 @@ pub const MachOState = struct {
             self.executed_steps -| self.last_guest_assertion_step <= 4096 and
             assertion_distance <= 16)
         {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest signal assertion provenance: signal={d} fault_rip=0x{x} assertion={s} assertion_return=0x{x} address_delta={d} step_delta={d}\n",
                 .{ signal, fault_rip, @tagName(self.last_guest_assertion_class), self.last_guest_assertion_return, assertion_distance, self.executed_steps -| self.last_guest_assertion_step },
             );
@@ -5086,7 +5196,7 @@ pub const MachOState = struct {
         }
         const fault_bytes = self.guestMemoryConst(frame.fault_rip, frame.instruction_len) orelse &.{};
         const resume_rip = resolveGuestSignalReturn(frame, self.regs.rip, fault_bytes) orelse {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest signal {d} handler returned without resolving fault at rip=0x{x}\n",
                 .{ frame.signal, frame.fault_rip },
             );
@@ -5097,7 +5207,7 @@ pub const MachOState = struct {
             return false;
         };
         if (resume_rip != self.regs.rip) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest signal {d} handler returned with unchanged UD2 at rip=0x{x}; resuming at 0x{x}\n",
                 .{ frame.signal, frame.fault_rip, resume_rip },
             );
@@ -5105,13 +5215,13 @@ pub const MachOState = struct {
         }
         if (self.backend_diagnostics.signalReturnCorrelates(frame.fault_rip)) {
             self.backend_diagnostics.noteSignalReturn();
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest signal correlation resolved: signal={d} backend_assertion={s} fault_rip=0x{x} resume_rip=0x{x}; execution continued\n",
                 .{ frame.signal, @tagName(self.backend_diagnostics.last_backend_assertion_binding), frame.fault_rip, self.regs.rip },
             );
         }
         if (self.verbose_trace) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: guest signal {d} returned; fault_rip=0x{x} resume_rip=0x{x}\n",
                 .{ frame.signal, frame.fault_rip, self.regs.rip },
             );
@@ -5164,7 +5274,7 @@ pub const MachOState = struct {
         switch (decision) {
             .not_applicable => return null,
             .rejected => |reason| {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: libc++ shared control-block recovery rejected: object=0x{x} operand=0x{x} vptr=0x{x} strong=0x{x} weak=0x{x} reason={s}\n",
                     .{
                         object,
@@ -5179,7 +5289,7 @@ pub const MachOState = struct {
             },
             .recover => |recovery| {
                 self.write64(object, recovery.address_point);
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: libc++ shared control-block vptr restored: object=0x{x} vtable_symbol=0x{x} address_point=0x{x} slot=0x{x} target=0x{x} strong=0x{x} weak=0x{x} caller={s}+0x{x}; continuing verified __on_zero_shared dispatch\n",
                     .{
                         object,
@@ -5241,7 +5351,7 @@ pub const MachOState = struct {
         }
         self.pending_control_transfer = null;
         self.terminal_control_transfer = failure;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: invalid control transfer: kind={s} instruction=0x{x} operand=0x{x} target=0x{x} return=0x{x} candidate_import={s}\n",
             .{
                 failure.kind,
@@ -5253,7 +5363,7 @@ pub const MachOState = struct {
             },
         );
         if (failure.instruction_byte_count != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: transfer decode: op={s} len={d} bytes={any} indirect=[0x{x}]=0x{x} mapped={} executable={} import_image={s}\n",
                 .{
                     failure.decoded_operation,
@@ -5277,19 +5387,19 @@ pub const MachOState = struct {
     /// Log extensive crash diagnostics around an invalid control transfer.
     /// Called before the process is marked as faulted.
     fn logCrashDiagnostics(self: *MachOState, context: ControlTransferContext) void {
-        std.debug.print("macho-processor: CRASH DIAGNOSTICS BEGIN\n", .{});
+        machoCapturePrint("macho-processor: CRASH DIAGNOSTICS BEGIN\n", .{});
 
         // 1. Thread info
         const thread_handle = self.active_guest_thread;
         const thread_id = self.threadNumericId(thread_handle);
         const thread_role = self.threadRole(thread_handle, self.regs.rip);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor:   thread: handle=0x{x} numeric_id={d} role={s} rip=0x{x} rsp=0x{x} rbp=0x{x}\n",
             .{ thread_handle, thread_id, thread_role, self.regs.rip, self.regs.rsp, self.regs.rbp },
         );
 
         // 2. Full register dump
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor:   regs: rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n" ++ "macho-processor:         rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n" ++ "macho-processor:         r8=0x{x}  r9=0x{x}  r10=0x{x} r11=0x{x}\n" ++ "macho-processor:         r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n" ++ "macho-processor:         rip=0x{x} rflags=0x{x}\n",
             .{
                 self.regs.rax, self.regs.rbx,    self.regs.rcx, self.regs.rdx,
@@ -5312,14 +5422,14 @@ pub const MachOState = struct {
                 else
                     "direct";
                 const dst_reg = @tagName(dec.dst_reg);
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor:   instr decode: op={s} addr_mode={s} addr=0x{x} dst_reg={s}\n",
                     .{ @tagName(dec.op), addrmode, dec.addr, dst_reg },
                 );
                 if (dec.sib_has_index) {
                     const idx_reg = @tagName(dec.sib_index_reg);
                     const base_reg = if (dec.sib_has_base) @tagName(dec.sib_base_reg) else "none";
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:     sib: index={s} scale={d} base={s}\n",
                         .{ idx_reg, dec.sib_scale, base_reg },
                     );
@@ -5334,20 +5444,20 @@ pub const MachOState = struct {
             if (op_mapped) {
                 const op_sym = self.metadata.nearestSymbol(context.operand_address);
                 const op_value = self.read64(context.operand_address);
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor:   operand 0x{x}: mapped=yes offset=0x{x} value=0x{x}\n",
                     .{ context.operand_address, op_offset.?, op_value },
                 );
                 // Show nearest symbol with stale-match warning
                 if (op_sym) |s| {
                     const stale = if (s.offset > 1024) " (STALE MATCH: offset > 1024)" else "";
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   nearest symbol: {s}+0x{x}{s}\n",
                         .{ s.name, s.offset, stale },
                     );
                 }
             } else {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor:   operand 0x{x}: mapped=no offset=<none>\n",
                     .{context.operand_address},
                 );
@@ -5359,26 +5469,26 @@ pub const MachOState = struct {
                 for (self.segments) |seg| {
                     if (context.operand_address >= seg.vmaddr and context.operand_address < seg.vmaddr + seg.vmsize) {
                         const rel_off = context.operand_address - seg.vmaddr;
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   address region: Mach-O segment {s} [0x{x}-0x{x}] offset_in_segment=0x{x} prot=",
                             .{ seg.name, seg.vmaddr, seg.vmaddr + seg.vmsize - 1, rel_off },
                         );
                         if (seg.initprot & 1 != 0) {
-                            std.debug.print("r", .{});
+                            machoCapturePrint("r", .{});
                         } else {
-                            std.debug.print("-", .{});
+                            machoCapturePrint("-", .{});
                         }
                         if (seg.initprot & 2 != 0) {
-                            std.debug.print("w", .{});
+                            machoCapturePrint("w", .{});
                         } else {
-                            std.debug.print("-", .{});
+                            machoCapturePrint("-", .{});
                         }
                         if (seg.initprot & 4 != 0) {
-                            std.debug.print("x", .{});
+                            machoCapturePrint("x", .{});
                         } else {
-                            std.debug.print("-", .{});
+                            machoCapturePrint("-", .{});
                         }
-                        std.debug.print("\n", .{});
+                        machoCapturePrint("\n", .{});
                         found_seg = true;
                         break;
                     }
@@ -5386,7 +5496,7 @@ pub const MachOState = struct {
                 if (!found_seg) {
                     // Not in a Mach-O segment; check if it's a sparse mapping
                     const in_sparse = self.sparse_memory.contains(context.operand_address, 8);
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   address region: outside Mach-O segments sparse_mapped={}\n",
                         .{in_sparse},
                     );
@@ -5394,7 +5504,7 @@ pub const MachOState = struct {
             }
 
             // Dump nearby entries (16 qwords: 8 before, the operand, 8 after)
-            std.debug.print("macho-processor:   jump table dump [0x{x} +/- 64 bytes]:\n", .{context.operand_address});
+            machoCapturePrint("macho-processor:   jump table dump [0x{x} +/- 64 bytes]:\n", .{context.operand_address});
             const dump_start = context.operand_address -| 64;
             const dump_end = context.operand_address + 72;
             var dump_addr = dump_start;
@@ -5403,16 +5513,16 @@ pub const MachOState = struct {
                 if (self.addrToOffset(dump_addr)) |_| {
                     const val = self.read64(dump_addr);
                     const val_sym = self.metadata.nearestSymbol(val);
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:     [0x{x}]=0x{x}{s}",
                         .{ dump_addr, val, marker },
                     );
                     if (val_sym) |s| {
-                        std.debug.print(" {s}+0x{x}", .{ s.name, s.offset });
+                        machoCapturePrint(" {s}+0x{x}", .{ s.name, s.offset });
                     }
-                    std.debug.print("\n", .{});
+                    machoCapturePrint("\n", .{});
                 } else {
-                    std.debug.print("macho-processor:     [0x{x}]=<unmapped>{s}\n", .{ dump_addr, marker });
+                    machoCapturePrint("macho-processor:     [0x{x}]=<unmapped>{s}\n", .{ dump_addr, marker });
                 }
             }
 
@@ -5459,24 +5569,24 @@ pub const MachOState = struct {
                 // Print hi32 analysis
                 if (lo32_counts > 1 and hi32_const != null and hi32_all_same) {
                     const hi = hi32_const.?;
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   corruption pattern: all entries have constant high 32 bits = 0x{x}",
                         .{hi},
                     );
                     if (hi == 0xfffffc00) {
-                        std.debug.print(" (kernel-space range, possible sign-extended 32-bit address)\n", .{});
+                        machoCapturePrint(" (kernel-space range, possible sign-extended 32-bit address)\n", .{});
                     } else if (hi == 0x00000000) {
-                        std.debug.print(" (entries are valid 32-bit addresses in low 4GB)\n", .{});
+                        machoCapturePrint(" (entries are valid 32-bit addresses in low 4GB)\n", .{});
                     } else if (hi == 0xffffffff) {
-                        std.debug.print(" (possible -1 / invalid pattern)\n", .{});
+                        machoCapturePrint(" (possible -1 / invalid pattern)\n", .{});
                     } else if (hi == 0x00007fff) {
-                        std.debug.print(" (possible userspace address on macOS)\n", .{});
+                        machoCapturePrint(" (possible userspace address on macOS)\n", .{});
                     } else {
-                        std.debug.print("\n", .{});
+                        machoCapturePrint("\n", .{});
                     }
 
                     // Interpret the entries as 32-bit pointers
-                    std.debug.print("macho-processor:   interpreting as 32-bit pointer table:\n", .{});
+                    machoCapturePrint("macho-processor:   interpreting as 32-bit pointer table:\n", .{});
                     scan_addr = context.operand_address -| 64;
                     while (scan_addr < scan_end) : (scan_addr += 8) {
                         if (self.addrToOffset(scan_addr) == null) continue;
@@ -5486,12 +5596,12 @@ pub const MachOState = struct {
                         const lo_sym = self.metadata.nearestSymbol(lo32);
                         const lo_small = if (lo32 < 0x1000) " (looks like a small offset, not a pointer)" else "";
                         if (lo_sym) |s| {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "macho-processor:     0x{x} -> 0x{x} (lo32) {s}+0x{x}{s}\n",
                                 .{ scan_addr, lo32, s.name, s.offset, lo_small },
                             );
                         } else {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "macho-processor:     0x{x} -> 0x{x} (lo32){s}\n",
                                 .{ scan_addr, lo32, lo_small },
                             );
@@ -5502,7 +5612,7 @@ pub const MachOState = struct {
                 // Print lo32 arithmetic progression analysis
                 if (lo32_counts > 1 and lo32_arith_prog and lo32_step != null) {
                     const step_val = lo32_step.?;
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   corruption pattern: lo32 entries form arithmetic progression (step={d}, decreasing={}). Table was shifted by one entry (read as wrong-type entries).\n",
                         .{ @abs(step_val), step_val < 0 },
                     );
@@ -5510,7 +5620,7 @@ pub const MachOState = struct {
 
                 // Print lo32 small offset warning
                 if (lo32_counts > 1 and lo32_all_small) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   corruption pattern: all lo32 values are small (< 4GB). Entries may be 32-bit offsets, not addresses.\n",
                         .{},
                     );
@@ -5520,35 +5630,35 @@ pub const MachOState = struct {
 
         // 5. Suspended thread table snapshot
         if (self.suspended_guest_thread_count > 0) {
-            std.debug.print("macho-processor:   suspended threads ({d}):\n", .{self.suspended_guest_thread_count});
+            machoCapturePrint("macho-processor:   suspended threads ({d}):\n", .{self.suspended_guest_thread_count});
             for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |st, i| {
                 const st_sym = self.metadata.nearestSymbol(st.regs.rip);
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor:     [{d}] handle=0x{x} rip=0x{x} rsp=0x{x} reason={s} suspended_step={d}",
                     .{ i, st.handle, st.regs.rip, st.regs.rsp, st.reason, st.suspended_step },
                 );
                 if (st_sym) |s| {
-                    std.debug.print(" {s}+0x{x}", .{ s.name, s.offset });
+                    machoCapturePrint(" {s}+0x{x}", .{ s.name, s.offset });
                 }
-                std.debug.print("\n", .{});
+                machoCapturePrint("\n", .{});
             }
         }
 
         // 6. Guest backtrace (walk stack via rbp chain)
-        std.debug.print("macho-processor:   guest backtrace (rbp chain):\n", .{});
+        machoCapturePrint("macho-processor:   guest backtrace (rbp chain):\n", .{});
         var frame_rbp = self.regs.rbp;
         var frame_rip = self.regs.rip;
         var frame_depth: usize = 0;
         while (frame_depth < 16) : (frame_depth += 1) {
             const frame_sym = self.metadata.nearestSymbol(frame_rip);
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor:     #{d} rip=0x{x} rbp=0x{x}",
                 .{ frame_depth, frame_rip, frame_rbp },
             );
             if (frame_sym) |s| {
-                std.debug.print(" {s}+0x{x}", .{ s.name, s.offset });
+                machoCapturePrint(" {s}+0x{x}", .{ s.name, s.offset });
             }
-            std.debug.print("\n", .{});
+            machoCapturePrint("\n", .{});
             // Walk to next frame: saved rbp is at [rbp], saved return address is at [rbp+8]
             if (frame_rbp == 0 or self.addrToOffset(frame_rbp) == null) break;
             const next_rbp = self.read64(frame_rbp);
@@ -5567,7 +5677,7 @@ pub const MachOState = struct {
         }
 
         // 7. Scheduler counters
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor:   scheduler: active=0x{x} suspended={d} switches={d} returns={d}" ++ " wait_yields={d} quantum_yields={d} rotation_yields={d}" ++ " preserved_resumes={d} wait_resumes={d} self_resumes={d}" ++ " quiescence_recoveries={d} starvation_warnings={d}\n",
             .{
                 self.active_guest_thread,
@@ -5584,7 +5694,7 @@ pub const MachOState = struct {
                 self.cooperative_starvation_warnings,
             },
         );
-        std.debug.print("macho-processor: CRASH DIAGNOSTICS END\n", .{});
+        machoCapturePrint("macho-processor: CRASH DIAGNOSTICS END\n", .{});
     }
 
     fn handleOpen(self: *MachOState) u64 {
@@ -5768,7 +5878,7 @@ pub const MachOState = struct {
                 self.guest_stdio_mirror_failures +|= 1;
             }
             if (self.guest_stdio_write_count == 1) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: guest stdio capture active: first_stream={s} log_mirror_active={}\n",
                     .{ @tagName(file.kind), self.guest_log_mirror_fd >= 0 },
                 );
@@ -5807,13 +5917,13 @@ pub const MachOState = struct {
     fn handleFdopen(self: *MachOState) ?u64 {
         const mode = self.guestCString(self.regs.rsi, 32) orelse {
             self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
-            std.debug.print("macho-processor: fdopen rejected: unreadable mode pointer=0x{x}\n", .{self.regs.rsi});
+            machoCapturePrint("macho-processor: fdopen rejected: unreadable mode pointer=0x{x}\n", .{self.regs.rsi});
             return null;
         };
         const guest_fd = self.regs.rdi;
         const host_fd = self.fs_forwarder.fd_manager.take(guest_fd) orelse {
             self.setGuestErrno(@intFromEnum(std.c.E.BADF));
-            std.debug.print("macho-processor: fdopen rejected: invalid guest_fd={d} mode={s}\n", .{ guest_fd, mode });
+            machoCapturePrint("macho-processor: fdopen rejected: invalid guest_fd={d} mode={s}\n", .{ guest_fd, mode });
             return null;
         };
         const handle = self.allocGuestFile(host_fd, .regular) orelse {
@@ -5821,7 +5931,7 @@ pub const MachOState = struct {
             self.setGuestErrno(@intFromEnum(std.c.E.NOMEM));
             return null;
         };
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: fdopen: guest_fd={d} host_fd={d} mode={s} -> FILE=0x{x}\n",
             .{ guest_fd, host_fd, mode, handle },
         );
@@ -5875,19 +5985,19 @@ pub const MachOState = struct {
         };
         const bytes = self.guestMemoryConst(self.regs.rdi, byte_count) orelse {
             self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
-            std.debug.print("macho-processor: fwrite rejected: source=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
+            machoCapturePrint("macho-processor: fwrite rejected: source=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
             return 0;
         };
         const file = self.guestFileFromHandle(self.regs.rcx) orelse {
             self.setGuestErrno(@intFromEnum(std.c.E.BADF));
-            std.debug.print("macho-processor: fwrite rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
+            machoCapturePrint("macho-processor: fwrite rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
             return 0;
         };
         if (!self.hostWriteAll(file, bytes)) {
-            std.debug.print("macho-processor: fwrite failed: FILE=0x{x} host_fd={d} requested={d}\n", .{ self.regs.rcx, file.fd, byte_count });
+            machoCapturePrint("macho-processor: fwrite failed: FILE=0x{x} host_fd={d} requested={d}\n", .{ self.regs.rcx, file.fd, byte_count });
             return 0;
         }
-        std.debug.print("macho-processor: fwrite: FILE=0x{x} host_fd={d} bytes={d} elements={d}\n", .{ self.regs.rcx, file.fd, byte_count, element_count });
+        machoCapturePrint("macho-processor: fwrite: FILE=0x{x} host_fd={d} bytes={d} elements={d}\n", .{ self.regs.rcx, file.fd, byte_count, element_count });
         return element_count;
     }
 
@@ -5903,13 +6013,13 @@ pub const MachOState = struct {
         const destination = self.guestMemory(self.regs.rdi, byte_count) orelse {
             self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
             self.guest_stdio_failures +|= 1;
-            std.debug.print("macho-processor: fread rejected: destination=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
+            machoCapturePrint("macho-processor: fread rejected: destination=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
             return 0;
         };
         const file = self.guestFileFromHandle(self.regs.rcx) orelse {
             self.setGuestErrno(@intFromEnum(std.c.E.BADF));
             self.guest_stdio_failures +|= 1;
-            std.debug.print("macho-processor: fread rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
+            machoCapturePrint("macho-processor: fread rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
             return 0;
         };
         if (file.fd < 0) {
@@ -5937,7 +6047,7 @@ pub const MachOState = struct {
         self.guest_stdio_read_bytes +|= bytes_read;
         const complete_elements = bytes_read / @as(usize, @intCast(element_size));
         if (self.guest_stdio_read_count <= 8 or self.guest_stdio_read_count % 1000 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: fread #{d}: FILE=0x{x} host_fd={d} position={d}->{d} requested={d} read={d} elements={d}/{d}\n",
                 .{ self.guest_stdio_read_count, self.regs.rcx, file.fd, initial_position, file.position, byte_count, bytes_read, complete_elements, element_count },
             );
@@ -5980,7 +6090,7 @@ pub const MachOState = struct {
         }
         file.position = pos;
         if (self.guest_stdio_seek_count <= 8 or self.guest_stdio_seek_count % 1000 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: fseek #{d}: FILE=0x{x} host_fd={d} position={d}->{d} offset={d} whence={d}\n",
                 .{ self.guest_stdio_seek_count, self.regs.rdi, file.fd, initial_position, pos, offset, whence },
             );
@@ -6157,7 +6267,7 @@ pub const MachOState = struct {
         const argv_ptr = self.regs.rsi;
         _ = argc_ptr;
         _ = argv_ptr;
-        std.debug.print("    [import] _gtk_init_check compatibility shim → success\n", .{});
+        machoCapturePrint("    [import] _gtk_init_check compatibility shim → success\n", .{});
         return 1;
     }
 
@@ -6426,10 +6536,10 @@ pub const MachOState = struct {
     }
 
     fn setupMachOState(self: *MachOState, path: []const u8, args: []const []const u8) void {
-        std.debug.print("ROSETTE: setupMachOState called with path: '{s}'\n", .{path});
-        std.debug.print("ROSETTE: Argument count: {d}\n", .{args.len});
+        machoCapturePrint("ROSETTE: setupMachOState called with path: '{s}'\n", .{path});
+        machoCapturePrint("ROSETTE: Argument count: {d}\n", .{args.len});
         for (args, 0..) |arg, i| {
-            std.debug.print("ROSETTE:   argv[{d}] = '{s}'\n", .{ i, arg });
+            machoCapturePrint("ROSETTE:   argv[{d}] = '{s}'\n", .{ i, arg });
         }
 
         self.configureGuestLogMirror(args);
@@ -6459,15 +6569,15 @@ pub const MachOState = struct {
         full_args.append(self.allocator, path) catch {};
         for (args) |a| full_args.append(self.allocator, a) catch {};
 
-        std.debug.print("ROSETTE: Full argv count (including path): {d}\n", .{full_args.items.len});
-        std.debug.print("ROSETTE: Entry point vaddr: 0x{x}\n", .{self.entry_point_vaddr});
+        machoCapturePrint("ROSETTE: Full argv count (including path): {d}\n", .{full_args.items.len});
+        machoCapturePrint("ROSETTE: Entry point vaddr: 0x{x}\n", .{self.entry_point_vaddr});
 
         self.trace_range_start = 0x1332000;
         self.trace_range_end = 0x1333000;
         self.setupInitialStack(full_args.items);
         self.regs.rip = self.entry_point_vaddr;
 
-        std.debug.print("ROSETTE: setupMachOState complete - RIP set to 0x{x}\n", .{self.regs.rip});
+        machoCapturePrint("ROSETTE: setupMachOState complete - RIP set to 0x{x}\n", .{self.regs.rip});
     }
 
     fn initializerAbi(self: *const MachOState) initialization_resolution.AbiSnapshot {
@@ -6548,7 +6658,7 @@ pub const MachOState = struct {
         self.beginInitializerTransaction();
 
         if (!self.isExecutableAddress(address)) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: initializer [{d}/{d}] has invalid target 0x{x}\n",
                 .{ index + 1, self.metadata.initializer_addresses.len, address },
             );
@@ -6604,7 +6714,7 @@ pub const MachOState = struct {
             self.initializer_abort_requested = false;
             self.initializer_abort_reason = .none;
             if (deferral_reason != .runtime_dependency or deferral_attempt <= 1) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: deferred initializer [{d}/{d}] {s} reason={s}\n",
                     .{ index + 1, self.metadata.initializer_addresses.len, symbol_name, @tagName(deferral_reason) },
                 );
@@ -6613,7 +6723,7 @@ pub const MachOState = struct {
         }
         if (self.terminated) {
             const final_abi = self.initializerAbi();
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: initializer [{d}/{d}] terminated at rip=0x{x} reason={s} exit_code=0x{x}\n",
                 .{ index + 1, self.metadata.initializer_addresses.len, self.regs.rip, @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)), self.exit_code },
             );
@@ -6626,7 +6736,7 @@ pub const MachOState = struct {
                 self.unresolved_import_count,
                 self.guest_assertion_count,
             );
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: initializer [{d}/{d}] failed at {s}+0x{x}\n",
                 .{ index + 1, self.metadata.initializer_addresses.len, symbol_name, if (nearest_symbol) |item| item.offset else address },
             );
@@ -6634,7 +6744,7 @@ pub const MachOState = struct {
         }
         if (self.regs.rip != INITIALIZER_RETURN_SENTINEL) {
             const final_abi = self.initializerAbi();
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: initializer [{d}/{d}] exceeded {d} steps at {s}+0x{x}; terminal_rip=0x{x}\n",
                 .{ index + 1, self.metadata.initializer_addresses.len, INITIALIZER_STEP_LIMIT, symbol_name, if (nearest_symbol) |item| item.offset else address, self.regs.rip },
             );
@@ -6647,7 +6757,7 @@ pub const MachOState = struct {
                 self.guest_assertion_count,
                 .step_limit,
             );
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: deferred initializer [{d}/{d}] {s} after step limit\n",
                 .{ index + 1, self.metadata.initializer_addresses.len, symbol_name },
             );
@@ -6678,7 +6788,7 @@ pub const MachOState = struct {
             self.guest_assertion_count,
         );
         if (self.strict_initializers and self.initializer_resolver.degraded != degraded_before) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: strict initializer mode rejected [{d}/{d}] {s}\n",
                 .{ index + 1, self.metadata.initializer_addresses.len, symbol_name },
             );
@@ -6709,7 +6819,7 @@ pub const MachOState = struct {
                 .failed => return false,
             }
             if ((index + 1) % 50 == 0 or index + 1 == self.metadata.initializer_addresses.len) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: processed initializer {d}/{d}\n",
                     .{ index + 1, self.metadata.initializer_addresses.len },
                 );
@@ -6722,7 +6832,7 @@ pub const MachOState = struct {
             var growth_buf: [4]export_table_lifecycle.VectorGrowthRequest = undefined;
             const growth_count = self.export_table_lc.popGrowthRequests(&growth_buf);
             if (growth_count > 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: pre-populating {d} export vector(s) before retry pass\n",
                     .{growth_count},
                 );
@@ -6733,25 +6843,25 @@ pub const MachOState = struct {
                     self.read32(req.vector_address)
                 else
                     0;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor:   pre-populating vector={s} at 0x{x} current_size={d} needed_size={d} element_size={d}\n",
                     .{ var_name, req.vector_address, current_size, req.needed_size, req.element_size },
                 );
                 if (current_size >= req.needed_size) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   vector already has enough entries ({d} >= {d}); skipping growth\n",
                         .{ current_size, req.needed_size },
                     );
                     continue;
                 }
                 if (current_size > 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   vector has {d} entries but needs {d}; growing\n",
                         .{ current_size, req.needed_size },
                     );
                 }
                 const dummy_item = self.memory_forwarder.allocate(self, req.element_size, 16) orelse {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor:   failed to allocate dummy item for vector pre-population\n",
                         .{},
                     );
@@ -6759,7 +6869,7 @@ pub const MachOState = struct {
                 };
                 {
                     const slice = self.guestMemory(dummy_item, req.element_size) orelse {
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   dummy item memory not writable after allocation\n",
                             .{},
                         );
@@ -6771,7 +6881,7 @@ pub const MachOState = struct {
                 var append_count: u32 = 0;
                 while (self.read32(req.vector_address) < req.needed_size) {
                     if (!self.appendTrivialVector(req.vector_address, item_addr, req.element_size, req.needed_size)) {
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor:   appendTrivialVector failed after {d} appends\n",
                             .{append_count},
                         );
@@ -6779,7 +6889,7 @@ pub const MachOState = struct {
                     }
                     append_count += 1;
                 }
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor:   vector pre-population: appended {d} entries, new size={d}\n",
                     .{ append_count, self.read32(req.vector_address) },
                 );
@@ -6789,7 +6899,7 @@ pub const MachOState = struct {
         var retry_round: u8 = 0;
         while (pending.items.len != 0 and retry_round < 3) : (retry_round += 1) {
             self.export_table_lc.retry_pass = retry_round + 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: retrying {d} deferred initializer(s), pass {d}\n",
                 .{ pending.items.len, retry_round + 1 },
             );
@@ -6806,7 +6916,7 @@ pub const MachOState = struct {
         }
 
         if (pending.items.len != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: {d} initializer(s) remained deferred after 3 retry passes\n",
                 .{pending.items.len},
             );
@@ -6889,7 +6999,7 @@ pub const MachOState = struct {
         const position = self.regs.rdx;
         const count = self.regs.rcx;
         const source_view = compat_runtime.libcppStringView(self, source_object) orelse {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ basic_string::substr rejected unreadable source object=0x{x} destination=0x{x}\n",
                 .{ source_object, destination },
             );
@@ -6898,7 +7008,7 @@ pub const MachOState = struct {
         if (source_view.length > 1 << 20 or
             self.guestMemoryConst(source_view.address, source_view.length) == null)
         {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ basic_string::substr rejected corrupt source: object=0x{x} data=0x{x} length={d} pos={d} count={d}\n",
                 .{ source_object, source_view.address, source_view.length, position, count },
             );
@@ -6907,7 +7017,7 @@ pub const MachOState = struct {
         if (position > source_view.length) {
             // Preserve libc++'s std::out_of_range path instead of converting a
             // programming error into a different string.
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ basic_string::substr out-of-range delegated to guest: source_length={d} pos={d} count={d}\n",
                 .{ source_view.length, position, count },
             );
@@ -6936,19 +7046,19 @@ pub const MachOState = struct {
             false;
         self.libcxx_string_substr_fast_paths +|= 1;
         if (self.libcxx_string_substr_fast_paths <= 16 or vfs_resolution or profile_device) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ basic_string::substr fast path #{d}: source_object=0x{x} destination=0x{x} source_length={d} pos={d} count={d} result_length={d} caller=0x{x} {s}+0x{x} source='{s}'\n",
                 .{ self.libcxx_string_substr_fast_paths, source_object, destination, source_view.length, position, count, result_length, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, preview },
             );
         }
         if (vfs_resolution) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: VFS relative-path checkpoint: mount_length={d} normalized_length={d} relative_length={d} root_resolution={}; HostPathDevice must receive only this suffix, never the User_<profile-id>: prefix\n",
                 .{ position, source_view.length, result_length, result_length == 0 },
             );
         }
         if (profile_device and position == source_view.length and result_length == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile device root normalized successfully: source='{s}' pos==size and substr result is empty; ResolvePath should now return the mounted HostPathDevice root before Account child lookup\n",
                 .{preview},
             );
@@ -6972,7 +7082,7 @@ pub const MachOState = struct {
         if (self.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info != 0 and
             self.regs.rip == self.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info)
         {
-            std.debug.print("macho-processor: modeled x64 CPU feature detection\n", .{});
+            machoCapturePrint("macho-processor: modeled x64 CPU feature detection\n", .{});
             self.regs.rip = self.pop();
             return true;
         }
@@ -6983,7 +7093,7 @@ pub const MachOState = struct {
             self.regs.rip == self.internal_targets.xenia_vulkan_provider_vulkan_device and
             self.regs.rdi == 0)
         {
-            std.debug.print("macho-processor: Vulkan provider unavailable; returning null Vulkan device\n", .{});
+            machoCapturePrint("macho-processor: Vulkan provider unavailable; returning null Vulkan device\n", .{});
             self.regs.rax = 0;
             self.regs.rip = self.pop();
             return true;
@@ -7068,7 +7178,7 @@ pub const MachOState = struct {
             if (self.launch_options.registrations_skipped == 1 or
                 self.launch_options.registrations_skipped % 100 == 0)
             {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: launch option fast path skipped {d} unused registration(s); latest={s}\n",
                     .{ self.launch_options.registrations_skipped, name },
                 );
@@ -7148,7 +7258,7 @@ pub const MachOState = struct {
         self.page_entry_bulk_bytes +|= range.byte_count;
         const return_address = self.read64(self.regs.rsp);
         const caller = self.metadata.nearestSymbol(return_address);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: bulk default construction: PageEntry count={d} bytes={d} range=0x{x}-0x{x} return={s}+0x{x}\n",
             .{ count, range.byte_count, end, range.new_end, if (caller) |resolved| resolved.name else "<unknown>", if (caller) |resolved| resolved.offset else 0 },
         );
@@ -7175,7 +7285,7 @@ pub const MachOState = struct {
         const begin = self.read64(vector);
         const end = self.read64(vector + 8);
         if (begin == 0 or end < begin or (end - begin) % 24 != 0) {
-            std.debug.print("macho-processor: launch option acceleration could not decode positional option vector at 0x{x}\n", .{vector});
+            machoCapturePrint("macho-processor: launch option acceleration could not decode positional option vector at 0x{x}\n", .{vector});
             return;
         }
         const count = @min((end - begin) / 24, launch_argument_accelerator.MAX_REQUESTED_OPTIONS);
@@ -7184,7 +7294,7 @@ pub const MachOState = struct {
             const view = compat_runtime.libcppStringView(self, object) orelse continue;
             const name = self.guestMemoryConst(view.address, view.length) orelse continue;
             self.launch_options.request(name);
-            std.debug.print("macho-processor: launch option acceleration retained positional option: {s}\n", .{name});
+            machoCapturePrint("macho-processor: launch option acceleration retained positional option: {s}\n", .{name});
         }
     }
 
@@ -7194,7 +7304,7 @@ pub const MachOState = struct {
         {
             if (self.guest_log_buffer_address == 0) {
                 self.guest_log_buffer_address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return false;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: synchronous Xenia log bridge enabled at buffer=0x{x}\n",
                     .{self.guest_log_buffer_address},
                 );
@@ -7273,7 +7383,7 @@ pub const MachOState = struct {
         self.write64(output + 16, storage + storage_size);
         self.cxxopts_split_accelerations += 1;
         if (self.cxxopts_split_accelerations == 1 or self.cxxopts_split_accelerations % 250 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: cxxopts option-name fast path handled {d} call(s)\n",
                 .{self.cxxopts_split_accelerations},
             );
@@ -7360,17 +7470,17 @@ pub const MachOState = struct {
             self.guestMemoryConst(data_ptr, safe_length);
         const ascii = if (have_bytes) |bytes| isAsciiBytes(bytes) else false;
         if (have_bytes == null and raw_length > 1024 * 1024) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: toml++ is_ascii fast path UNCERTAIN: pointer=0x{x} raw_bytes={d} forced_ascii=false; parser will use slow path\n",
                 .{ data_ptr, raw_length },
             );
         } else if (have_bytes == null) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: toml++ is_ascii fast path rejected unreadable input: pointer=0x{x} raw_bytes={d} capped={d}\n",
                 .{ data_ptr, raw_length, safe_length },
             );
         } else if (length_mismatch) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: toml++ is_ascii ABI LENGTH MISMATCH: pointer=0x{x} raw={d} expected={?d} bounded={d} ascii={}; no guest parser fields were modified\n",
                 .{ data_ptr, raw_length, expected_length, safe_length, ascii },
             );
@@ -7392,7 +7502,7 @@ pub const MachOState = struct {
                         var block = TomlAsciiBlock{ .reader = reader, .length = @intCast(safe_length) };
                         @memcpy(block.bytes[0..block.length], have_bytes.?[0..block.length]);
                         self.toml_ascii_block = block;
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: toml++ ASCII codepoint checkpoint armed: reader=0x{x} istream=0x{x} bytes={d} caller_rbp=0x{x}\n",
                             .{ reader, istream, safe_length, self.regs.rbp },
                         );
@@ -7405,7 +7515,7 @@ pub const MachOState = struct {
         self.regs.rip = self.pop();
         self.toml_ascii_fast_paths +|= 1;
         if (self.toml_ascii_fast_paths <= 8 or self.toml_ascii_fast_paths % 256 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: toml++ is_ascii fast path #{d}: pointer=0x{x} bytes={d} ascii={} return=0x{x}\n",
                 .{ self.toml_ascii_fast_paths, data_ptr, safe_length, ascii, self.regs.rip },
             );
@@ -7423,7 +7533,7 @@ pub const MachOState = struct {
         const expected = pending.bytes[0..pending.length];
         const storage_length: u64 = @as(u64, pending.length) * @as(u64, TOML_CODEPOINT_STRIDE);
         const storage = self.guestMemory(reader + TOML_CODEPOINTS_OFFSET, storage_length) orelse {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: toml++ ASCII codepoint checkpoint FAILED: reader=0x{x} storage is not writable bytes={d}\n",
                 .{ reader, storage_length },
             );
@@ -7439,12 +7549,12 @@ pub const MachOState = struct {
             self.write64(reader + TOML_CODEPOINT_COUNT_OFFSET, pending.length);
         }
 
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: toml++ ASCII codepoint checkpoint: reader=0x{x} current={d} guest_count={d} expected_count={d} scalar_repairs={d} raw_repairs={d} first_bad_index={?d} first_bad_scalar=U+{x:0>4} first_bad_raw=0x{x:0>2} expected=0x{x:0>2}\n",
             .{ reader, guest_current, guest_count, pending.length, report.scalar_repairs, report.raw_repairs, report.first_bad_index, report.first_bad_scalar, report.first_bad_raw, report.first_expected },
         );
         if (guest_current > pending.length or guest_count != pending.length or report.scalar_repairs != 0 or report.raw_repairs != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: toml++ codepoint integrity mismatch repaired from host-validated ASCII bytes; current index was left unchanged\n",
                 .{},
             );
@@ -7462,11 +7572,11 @@ pub const MachOState = struct {
 
         self.patch_db_empty_array_recoveries +|= 1;
         self.libcxx_streams.logEmptyPatchCompatibility("empty-patch compatibility");
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: PatchDB empty-patch compatibility #{d}: rip=0x{x} {s}+0x{x} patch_node=0x0; skipping null virtual is_array() call and selecting Xenia's existing non-array return path at 0x{x}\n",
             .{ self.patch_db_empty_array_recoveries, self.regs.rip, symbol.name, symbol.offset, self.regs.rip + 14 },
         );
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: PatchDB compatibility semantics: equivalent source guard is if (!patch_array || !patch_array->is_array()) return patch_file; parser output and decoded instruction semantics were not modified\n",
             .{},
         );
@@ -7478,13 +7588,13 @@ pub const MachOState = struct {
 
     fn logStalledInstructionDetails(self: *MachOState) void {
         const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse {
-            std.debug.print("macho-processor: stuck-pc decode unavailable: rip=0x{x} instruction bytes are unreadable\n", .{self.regs.rip});
+            machoCapturePrint("macho-processor: stuck-pc decode unavailable: rip=0x{x} instruction bytes are unreadable\n", .{self.regs.rip});
             return;
         };
         const decoded = decodeInsn(bytes);
         const symbol = self.metadata.nearestSymbol(self.regs.rip);
         self.stalled_instruction_reports +|= 1;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: stuck-pc decode #{d}: rip=0x{x} {s}+0x{x} op={s} len={d} bytes={any} regs(rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp/rflags)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}\n",
             .{
                 self.stalled_instruction_reports,
@@ -7506,7 +7616,7 @@ pub const MachOState = struct {
             },
         );
         self.dumpRecentTrace();
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: unchanged execution-state capture complete; execution remains active and scheduler recovery is still permitted\n",
             .{},
         );
@@ -7556,7 +7666,7 @@ pub const MachOState = struct {
                 self.dumpRecentTrace();
                 return false;
             }
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: invalid control-flow target rip=0x{x}; address is outside executable Mach-O segments\n",
                 .{self.regs.rip},
             );
@@ -7571,13 +7681,13 @@ pub const MachOState = struct {
         const decoded = self.decodeAt() orelse {
             if (self.terminated) return false;
             const rip = self.regs.rip;
-            std.debug.print("macho-processor: decode failed at rip=0x{x}\n", .{rip});
+            machoCapturePrint("macho-processor: decode failed at rip=0x{x}\n", .{rip});
             if (self.fileOffsetForVaddr(rip)) |file_off| {
                 const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
                 const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
-                std.debug.print("macho-processor: decode failed file_offset=0x{x} bytes={any}\n", .{ file_off, file_bytes });
+                machoCapturePrint("macho-processor: decode failed file_offset=0x{x} bytes={any}\n", .{ file_off, file_bytes });
             } else {
-                std.debug.print("macho-processor: decode failed at unmapped address\n", .{});
+                machoCapturePrint("macho-processor: decode failed at unmapped address\n", .{});
             }
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.decode_failed);
             self.terminated = true;
@@ -7587,9 +7697,9 @@ pub const MachOState = struct {
             const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
             const mem_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
             const rip = self.regs.rip;
-            std.debug.print("macho-processor: invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}\n", .{ rip, mem_off, mem_bytes });
+            machoCapturePrint("macho-processor: invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}\n", .{ rip, mem_off, mem_bytes });
             if (x64_decoder.capabilities.classifyRequirement(mem_bytes)) |requirement| {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: ISA requirement: {s} encoding requires {s}; virtual profile={s}, advertised={}\n",
                     .{
                         @tagName(requirement.encoding),
@@ -7602,9 +7712,9 @@ pub const MachOState = struct {
             if (self.fileOffsetForVaddr(rip)) |file_off| {
                 const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
                 const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
-                std.debug.print("macho-processor: invalid instruction source-map: rip=0x{x} file_off=0x{x} file_bytes={any}\n", .{ rip, file_off, file_bytes });
+                machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=0x{x} file_bytes={any}\n", .{ rip, file_off, file_bytes });
             } else {
-                std.debug.print("macho-processor: invalid instruction source-map: rip=0x{x} file_off=<unmapped>\n", .{rip});
+                machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=<unmapped>\n", .{rip});
             }
             self.dumpRecentTrace();
             self.faulted = true;
@@ -7616,7 +7726,7 @@ pub const MachOState = struct {
         self.recordTrace(decoded);
         if (self.cooperative_bootstrap_trace_remaining != 0) {
             const symbol = self.metadata.nearestSymbol(self.regs.rip);
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: GTK worker bootstrap: active=0x{x} rip=0x{x} {s}+0x{x} op={s} len={d}\n",
                 .{
                     self.active_guest_thread,
@@ -7670,7 +7780,7 @@ pub const MachOState = struct {
         }
         self.startup.enter(.gtk_init, self.executed_steps);
         self.startup.enter(.main_loop, self.executed_steps);
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: GTK cooperative main loop entered: guest_thread=0x{x} start=0x{x} deferred_remaining={d}\n",
             .{ deferred.handle, deferred.start_routine, self.pthreads.deferred_threads },
         );
@@ -7680,7 +7790,7 @@ pub const MachOState = struct {
 
     fn startDeferredGuestThread(self: *MachOState, deferred: pthread_runtime.DeferredThread) bool {
         if (!self.isExecutableAddress(deferred.start_routine)) {
-            std.debug.print("macho-processor: deferred guest thread rejected: start=0x{x} is not executable\n", .{deferred.start_routine});
+            machoCapturePrint("macho-processor: deferred guest thread rejected: start=0x{x} is not executable\n", .{deferred.start_routine});
             return false;
         }
         const requested_stack = if (deferred.stack_size == 0) DEFAULT_GUEST_THREAD_STACK_SIZE else deferred.stack_size;
@@ -7702,7 +7812,7 @@ pub const MachOState = struct {
 
         // Handle thread creation through scheduler
         // const scheduler_handle = self.thread_scheduler.handleThreadCreation(creation_context, stack_base, stack_size) catch |err| {
-        //     std.debug.print("macho-processor: scheduler rejected thread creation: {s}\n", .{@errorName(err)});
+        //     machoCapturePrint("macho-processor: scheduler rejected thread creation: {s}\n", .{@errorName(err)});
         //     return false;
         // };
 
@@ -7769,6 +7879,11 @@ pub const MachOState = struct {
     // Suspended workers are a FIFO queue.  A LIFO pop would immediately resume
     // the same worker that just yielded once all deferred threads had started.
     fn resumeSuspendedGuestThread(self: *MachOState) bool {
+        // Finite waits must progress even when another guest context remains
+        // continuously runnable. The virtual clock is derived from translated
+        // instruction steps, keeping scheduling deterministic and independent
+        // of host execution speed.
+        _ = self.guest_time.advanceForExecution(self.executed_steps);
         if (self.suspended_guest_thread_count == 0) return false;
         const completed_handoff_thread = self.ui_handoff.completionResumeHandle();
         var attempts = self.suspended_guest_thread_count;
@@ -7779,7 +7894,7 @@ pub const MachOState = struct {
                     for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
                         if (candidate.handle != completed_handoff_thread) continue;
                         selected_index = index;
-                        std.debug.print(
+                        machoCapturePrint(
                             "scheduler: UI handoff completion-affinity resume: generation={d} scheduling_thread=0x{x} skipped_fifo_entries={d} callback_completed_step={d} step={d}\n",
                             .{ self.ui_handoff.generation, candidate.handle, index, self.ui_handoff.completed_step, self.executed_steps },
                         );
@@ -7791,7 +7906,7 @@ pub const MachOState = struct {
                         selected_index = index;
                         const resume_ordinal = self.ui_handoff.callback_resumptions +| 1;
                         if (resume_ordinal <= 8 or resume_ordinal % 1000 == 0) {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d} resume={d}\n",
                                 .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps, resume_ordinal },
                             );
@@ -7851,13 +7966,13 @@ pub const MachOState = struct {
             });
             const resume_count = self.cooperative_preserved_register_resumes + self.cooperative_wait_result_resumes;
             if (resume_count <= 16 or resume_count % 1000 == 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "scheduler: guest context resume #{d}: thread=0x{x} reason={s} suspended_step={d} rip=0x{x} rsp=0x{x} rax(saved/restored)=0x{x}/0x{x} policy={s}\n",
                     .{ resume_count, context.handle, context.reason, context.suspended_step, self.regs.rip, self.regs.rsp, saved_rax, self.regs.rax, if (resume_decision.?.rax_override != null) "wait_result_override" else "preserve_all_registers" },
                 );
             }
             if (context.handle == completed_handoff_thread and self.ui_handoff.completionResumed(context.handle, self.executed_steps)) {
-                std.debug.print(
+                machoCapturePrint(
                     "scheduler: UI handoff dependency resolved: resumed scheduling_thread=0x{x} after callback cleanup; FIFO fallback remains available for unrelated workers\n",
                     .{context.handle},
                 );
@@ -7902,7 +8017,7 @@ pub const MachOState = struct {
                         self.cooperative_quiescence_recoveries +|= 1;
                         const advanced_now = self.guest_time.advanceForQuiescence();
                         if (self.cooperative_quiescence_recoveries <= 8 or self.cooperative_quiescence_recoveries % 100 == 0) {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "scheduler: global quiescence recovery #{d}: POSIX spurious wake thread=0x{x} preferred=0x{x} blocked={d} virtual_now_ns={d} reason={s}; advanced one bounded idle tick because no runnable producer or finite deadline remained\n",
                                 .{ self.cooperative_quiescence_recoveries, woken, preferred, self.pthreads.blocked_threads, advanced_now, reason },
                             );
@@ -7956,7 +8071,7 @@ pub const MachOState = struct {
         if (worker == waiter) {
             self.cooperative_self_resumes +|= 1;
             if (self.cooperative_self_resumes <= 8 or self.cooperative_self_resumes % 1000 == 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "scheduler: cooperative yield found no alternate runnable context: thread=0x{x} reason={s} suspended={d} deferred={d} self_resumes={d}\n",
                     .{ waiter, reason, self.suspended_guest_thread_count, self.pthreads.deferred_threads, self.cooperative_self_resumes },
                 );
@@ -7974,7 +8089,7 @@ pub const MachOState = struct {
             .reason = reason,
         });
         if (self.cooperative_wait_yields <= 16 or self.cooperative_wait_yields % 100 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: cooperative wait yield #{d}: waiter=0x{x} -> worker=0x{x} reason={s} deferred_remaining={d} suspended={d} gtk_idle_pending={d}\n",
                 .{ self.cooperative_wait_yields, waiter, worker, reason, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.pendingGtkIdleCallbackCount() },
             );
@@ -8015,13 +8130,13 @@ pub const MachOState = struct {
                     if (self.yieldActiveGuestThreadForWait("UI callback worker rendezvous")) {
                         self.cooperative_quantum_yields +|= 1;
                         if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "scheduler: UI callback rendezvous: quantum={d} callback=0x{x} -> worker=0x{x} deferred={d} runnable_suspended={d}; callback ownership retained\n",
                                 .{ self.ui_callback_retained_quanta, callback, self.active_guest_thread, self.pthreads.deferred_threads, suspended.runnable },
                             );
                         }
                     } else if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
-                        std.debug.print(
+                        machoCapturePrint(
                             "scheduler: retained active UI callback: quantum={d} callback_handle=0x{x} rip=0x{x} deferred_workers={d} runnable_suspended={d}; no eligible rendezvous target\n",
                             .{ self.ui_callback_retained_quanta, self.active_guest_thread, self.regs.rip, self.pthreads.deferred_threads, suspended.runnable },
                         );
@@ -8050,7 +8165,7 @@ pub const MachOState = struct {
                 self.gtk_idle_dispatch_failures +|= 1;
                 const block = self.gtkIdleDispatchBlock();
                 if (self.gtk_idle_dispatch_failures <= 8 or self.gtk_idle_dispatch_failures % 100 == 0) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: GTK idle wake blocked: failure={d} reason={s} active=0x{x} pending={d} suspended={d}/{d}\n",
                         .{ self.gtk_idle_dispatch_failures, @tagName(block), scheduling_thread, pending_idle, self.suspended_guest_thread_count, self.suspended_guest_threads.len },
                     );
@@ -8058,7 +8173,7 @@ pub const MachOState = struct {
                 return;
             }
             self.gtk_idle_wakeups +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: GTK idle wake dispatched: wake={d} from_thread=0x{x} source={d} pending={d}\n",
                 .{ self.gtk_idle_wakeups, scheduling_thread, self.active_gtk_idle_source, self.pendingGtkIdleCallbackCount() },
             );
@@ -8082,7 +8197,7 @@ pub const MachOState = struct {
         self.cooperative_quantum_yields +|= 1;
         if (work == .suspended_thread) self.cooperative_rotation_yields +|= 1;
         if (self.cooperative_quantum_yields <= 8 or self.cooperative_quantum_yields % 100 == 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: cooperative quantum yield #{d}: work={s} from=0x{x} to=0x{x} deferred={d} suspended={d} runnable_rotations={d}\n",
                 .{ self.cooperative_quantum_yields, @tagName(work), previous_thread, self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.cooperative_rotation_yields },
             );
@@ -8097,7 +8212,7 @@ pub const MachOState = struct {
                 const duration = self.executed_steps -| self.active_gtk_idle_started_step;
                 self.gtk_idle_completed +|= 1;
                 self.ui_handoff.completed(self.executed_steps);
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: GTK idle callback completed: source={d} callback=0x{x} duration_steps={d} completed={d} pending={d}\n",
                     .{ source, callback, duration, self.gtk_idle_completed, self.pendingGtkIdleCallbackCount() },
                 );
@@ -8109,7 +8224,7 @@ pub const MachOState = struct {
             } else {
                 self.pthreads.markCompleted(self.active_guest_thread);
                 self.cooperative_thread_returns +|= 1;
-                std.debug.print("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
+                machoCapturePrint("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
                 self.active_guest_thread = 0;
             }
         }
@@ -8123,7 +8238,7 @@ pub const MachOState = struct {
 
     fn scheduleGtkIdleCallback(self: *MachOState, function: u64, data: u64, tag: []const u8) u64 {
         if (function == 0 or !self.isExecutableAddress(function)) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: GTK idle rejected: callback=0x{x} executable={} tag={s}\n",
                 .{ function, self.isExecutableAddress(function), tag },
             );
@@ -8145,14 +8260,14 @@ pub const MachOState = struct {
             };
             self.gtk_idle_scheduled +|= 1;
             self.ui_handoff.queued(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
                 .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingGtkIdleCallbackCount() },
             );
             self.logThreadTable("GTK idle scheduled");
             return source;
         }
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: GTK idle rejected: queue full callback=0x{x} data=0x{x} tag={s}\n",
             .{ function, data, tag },
         );
@@ -8184,7 +8299,7 @@ pub const MachOState = struct {
             if (!entry.active or entry.source_id != source) continue;
             entry.* = .{};
             self.gtk_idle_removed +|= 1;
-            std.debug.print("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.pendingGtkIdleCallbackCount() });
+            machoCapturePrint("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.pendingGtkIdleCallbackCount() });
             return true;
         }
         return false;
@@ -8196,7 +8311,7 @@ pub const MachOState = struct {
         for (&self.gtk_idle_callbacks) |*entry| {
             if (!entry.active) continue;
             if (!self.isExecutableAddress(entry.function)) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: GTK idle dropped non-executable callback: source={d} callback=0x{x} tag={s}\n",
                     .{ entry.source_id, entry.function, entry.tag },
                 );
@@ -8227,7 +8342,7 @@ pub const MachOState = struct {
             self.gtk_idle_started +|= 1;
             self.ui_handoff.callbackStarted(self.active_guest_thread, self.regs.rip, self.executed_steps);
             self.cooperative_thread_switches +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
                 .{ source, function, data, tag, reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingGtkIdleCallbackCount() },
             );
@@ -8307,30 +8422,30 @@ pub const MachOState = struct {
     }
 
     fn logThreadTable(self: *const MachOState, reason: []const u8) void {
-        std.debug.print(
+        machoCapturePrint(
             "scheduler: THREAD TABLE BEGIN reason={s} step={d} active=0x{x} contexts(active/suspended)={d}/{d} pthread_entries={d} deferred={d} ui_phase={s}\n",
             .{ reason, self.executed_steps, self.active_guest_thread, @intFromBool(self.active_guest_thread != 0), self.suspended_guest_thread_count, self.pthreads.created_threads, self.pthreads.deferred_threads, @tagName(self.ui_handoff.phase) },
         );
-        std.debug.print("scheduler: CTX  slot handle             tid role         state      age_steps rip                symbol/reason\n", .{});
+        machoCapturePrint("scheduler: CTX  slot handle             tid role         state      age_steps rip                symbol/reason\n", .{});
         if (self.active_guest_thread != 0) {
             const symbol = self.metadata.nearestSymbol(self.regs.rip);
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: CTX  run  0x{x:0>16} {d: >3} {s: <12} running    {d: >9} 0x{x:0>16} {s}\n",
                 .{ self.active_guest_thread, self.threadNumericId(self.active_guest_thread), self.threadRole(self.active_guest_thread, self.regs.rip), 0, self.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>" },
             );
         }
         for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |context, index| {
             const symbol = self.metadata.nearestSymbol(context.regs.rip);
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: CTX  q{d:0>2}  0x{x:0>16} {d: >3} {s: <12} suspended  {d: >9} 0x{x:0>16} {s} | {s}\n",
                 .{ index, context.handle, self.threadNumericId(context.handle), self.threadRole(context.handle, context.regs.rip), self.executed_steps -| context.suspended_step, context.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>", context.reason },
             );
         }
-        std.debug.print("scheduler: REG  slot handle             tid role         pthread_state context stored start              blocked_for wait\n", .{});
+        machoCapturePrint("scheduler: REG  slot handle             tid role         pthread_state context stored start              blocked_for wait\n", .{});
         for (0..self.pthreads.tableCapacity()) |slot| {
             const snapshot = self.pthreads.snapshotAt(slot) orelse continue;
             const start_symbol = self.metadata.nearestSymbol(snapshot.start_routine);
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: REG  {d:0>2}   0x{x:0>16} {d: >3} {s: <12} {s: <13} {s: <7} {s: <6} 0x{x:0>16} {d: >11} {s}\n",
                 .{
                     slot,
@@ -8346,7 +8461,7 @@ pub const MachOState = struct {
                 },
             );
         }
-        std.debug.print("scheduler: THREAD TABLE END reason={s}\n", .{reason});
+        machoCapturePrint("scheduler: THREAD TABLE END reason={s}\n", .{reason});
     }
 
     fn restoreGtkMainLoopCaller(self: *MachOState, reason: []const u8) void {
@@ -8377,14 +8492,14 @@ pub const MachOState = struct {
             return;
         }
         self.regs.rip = return_address;
-        std.debug.print("macho-processor: GTK cooperative main loop exited: {s}\n", .{reason});
+        machoCapturePrint("macho-processor: GTK cooperative main loop exited: {s}\n", .{reason});
     }
 
     fn logCooperativeSchedulerSummary(self: *const MachOState) void {
         if (self.cooperative_thread_switches == 0 and self.cooperative_wait_yields == 0) return;
-        std.debug.print(
-            "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} quiescence(recoveries/clock_ticks/advanced_ns)={d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
-            .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.gtk_idle_scheduled, self.gtk_idle_started, self.gtk_idle_completed, self.gtk_idle_removed, self.pendingGtkIdleCallbackCount(), self.gtk_idle_wakeups, self.gtk_idle_dispatch_failures, self.gtk_idle_starvation_warnings },
+        machoCapturePrint(
+            "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
+            .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.gtk_idle_scheduled, self.gtk_idle_started, self.gtk_idle_completed, self.gtk_idle_removed, self.pendingGtkIdleCallbackCount(), self.gtk_idle_wakeups, self.gtk_idle_dispatch_failures, self.gtk_idle_starvation_warnings },
         );
     }
 
@@ -8396,7 +8511,7 @@ pub const MachOState = struct {
         const suspended = self.runnableSuspendedSnapshot();
         const suspended_age = if (suspended.oldest_handle != 0) self.executed_steps -| suspended.oldest_step else 0;
         const dispatch_block = self.gtkIdleDispatchBlock();
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: GTK cooperative heartbeat: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} deferred={d} suspended(total/runnable/blocked)={d}/{d}/{d} oldest_runnable(handle/rip/age/reason)=0x{x}/0x{x}/{d}/{s} switches={d} wait_yields={d} quantum_yields={d} runnable_rotations={d} waits={d} gtk_idle(scheduled/started/completed/pending)={d}/{d}/{d}/{d} active_idle(source/callback/age)={d}/0x{x}/{d} oldest_pending(source/callback/age/thread/rip/tag)={d}/0x{x}/{d}/0x{x}/0x{x}/{s} dispatch={s}\n",
             .{
                 self.executed_steps,
@@ -8439,7 +8554,7 @@ pub const MachOState = struct {
             self.last_cooperative_starvation_step = self.executed_steps;
             self.cooperative_starvation_warnings +|= 1;
             const oldest_symbol = self.metadata.nearestSymbol(suspended.oldest_rip);
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: RUNNABLE CONTEXT STARVATION: warning={d} handle=0x{x} rip=0x{x} {s}+0x{x} age={d} reason={s} active=0x{x} runnable/blocked={d}/{d}; round-robin quantum rotation should cap this near {d} steps\n",
                 .{ self.cooperative_starvation_warnings, suspended.oldest_handle, suspended.oldest_rip, if (oldest_symbol) |resolved| resolved.name else "<unknown>", if (oldest_symbol) |resolved| resolved.offset else 0, suspended_age, suspended.oldest_reason, self.active_guest_thread, suspended.runnable, suspended.blocked, COOPERATIVE_THREAD_QUANTUM_STEPS * @as(u64, @intCast(suspended.runnable + 1)) },
             );
@@ -8447,13 +8562,13 @@ pub const MachOState = struct {
         }
         if (idle.pending != 0 and idle_age >= GTK_IDLE_STARVATION_STEPS and dispatch_block != .callback_already_running) {
             self.gtk_idle_starvation_warnings +|= 1;
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: GTK IDLE STARVATION: warning={d} source={d} callback=0x{x} tag={s} queued_for={d} steps scheduling_thread=0x{x} scheduling_rip=0x{x} active=0x{x} block={s} suspended={d}/{d}\n",
                 .{ self.gtk_idle_starvation_warnings, idle.oldest_source, idle.oldest_callback, idle.oldest_tag, idle_age, idle.oldest_scheduling_thread, idle.oldest_scheduling_rip, self.active_guest_thread, @tagName(dispatch_block), self.suspended_guest_thread_count, self.suspended_guest_threads.len },
             );
         }
         if (self.ui_handoff.isActive()) {
-            std.debug.print(
+            machoCapturePrint(
                 "scheduler: UI handoff heartbeat: generation={d} phase={s} source={d} callback_handle=0x{x} callback_rip=0x{x} worker=0x{x} worker_rip=0x{x} no_progress={d} suspend/resume/worker_slices={d}/{d}/{d}\n",
                 .{
                     self.ui_handoff.generation,
@@ -8489,7 +8604,7 @@ pub const MachOState = struct {
             0;
         const return_source = if (has_frame_return) "rbp+8" else "rsp";
         const return_symbol = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: memory initialization progress: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} return[{s}]=0x{x} {s}+0x{x} page_entry(runs/bytes)={d}/{d} sparse(reserved/mappings/activations)={d}/{d}/{d} heap=0x{x} coop(deferred/suspended/quantum_yields/wait_yields)={d}/{d}/{d}/{d}\n",
             .{
                 steps,
@@ -8553,7 +8668,7 @@ pub const MachOState = struct {
         }
 
         const return_address = self.pop();
-        if (self.verbose_trace) std.debug.print("    [synthetic runtime] {s} -> rax=0x{x} return=0x{x}\n", .{ @tagName(thunk), self.regs.rax, return_address });
+        if (self.verbose_trace) machoCapturePrint("    [synthetic runtime] {s} -> rax=0x{x} return=0x{x}\n", .{ @tagName(thunk), self.regs.rax, return_address });
         if (return_address == 0) {
             self.faulted = true;
             self.exit_code = 127;
@@ -8605,7 +8720,7 @@ pub const MachOState = struct {
         if (!self.dynamic_forwarder.dispatchGuestSymbol(self, thunk_address)) return false;
         const return_address = self.pop();
         if (self.verbose_trace) {
-            std.debug.print(
+            machoCapturePrint(
                 "    [dynamic loader thunk] address=0x{x} -> rax=0x{x} return=0x{x}\n",
                 .{ thunk_address, self.regs.rax, return_address },
             );
@@ -8648,7 +8763,7 @@ pub const MachOState = struct {
                         .blocked = self.pthreads.blocked_threads,
                         .reason = "zero_active_guest_thread",
                     });
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: runtime invariant failure: no active or runnable guest thread; refusing stale-register execution rip=0x{x} suspended={d} blocked={d} pending_gtk={d}\n",
                         .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pendingGtkIdleCallbackCount() },
                     );
@@ -8696,7 +8811,7 @@ pub const MachOState = struct {
                 if (self.startup.enabled) {
                     self.startup.checkpoint(snapshot);
                 } else {
-                    std.debug.print(
+                    machoCapturePrint(
                         "info(macho): step={d} rip=0x{x} at {s}+0x{x}\n",
                         .{ steps, self.regs.rip, snapshot.symbol, snapshot.symbol_offset },
                     );
@@ -8729,10 +8844,73 @@ pub const MachOState = struct {
                 self.startup.heartbeat(heartbeat_snapshot);
                 self.emitRuntimeSummaryHeartbeat(heartbeat_snapshot);
                 if (self.startup.takeStallDiagnostic()) self.logStalledInstructionDetails();
-                self.pthreads.diagnoseStuck(steps, self.regs.rip);
+                self.pthreads.diagnoseStuck(steps, self.regs.rip, self.guest_time.now());
                 self.pumpNativeWindowEvents();
                 self.logCooperativeHeartbeat();
-                self.pthreads.profileThreadStates(&self.wait_profiler, steps, self.active_guest_thread);
+                self.pthreads.profileThreadStates(&self.wait_profiler, steps, self.guest_time.now());
+                if (hb_symbol) |resolved| {
+                    if (std.mem.indexOf(u8, resolved.name, "CommitExecutableRange") != null) {
+                        self.jit_commit_count +|= 1;
+                        self.jit_log.emit(.{
+                            .kind = .code_cache_allocated,
+                            .step = steps,
+                            .guest_addr = @intCast(self.regs.rip & 0xFFFFFFFF),
+                            .host_addr = self.regs.rip,
+                            .size = 4096,
+                            .total_functions = @intCast(self.import_resolver.total_calls),
+                            .unique_ordinals = @intCast(self.import_resolver.total_calls),
+                            .call_count = self.jit_commit_count,
+                            .thread_id = self.active_guest_thread,
+                            .reason = "commit",
+                        });
+                    }
+                    if (std.mem.indexOf(u8, resolved.name, "GetProcAddressByOrdinal") != null) {
+                        self.jit_export_count +|= 1;
+                        if (self.jit_export_count % 100 == 0) {
+                            self.macho_log.emit(.{
+                                .kind = .import_resolution,
+                                .step = steps,
+                                .thread_id = self.active_guest_thread,
+                                .import_calls = self.import_resolver.total_calls,
+                                .reason = "GetProcAddressByOrdinal",
+                            });
+                        }
+                        if (self.jit_export_count % 10 == 0) {
+                            self.jit_log.emit(.{
+                                .kind = .host_to_guest_call,
+                                .step = steps,
+                                .guest_addr = @intCast(self.regs.rip & 0xFFFFFFFF),
+                                .call_count = self.jit_export_count,
+                                .total_functions = @intCast(self.import_resolver.total_calls),
+                                .unique_ordinals = @intCast(self.import_resolver.total_calls),
+                                .thread_id = self.active_guest_thread,
+                                .reason = "export_resolution",
+                            });
+                        }
+                    }
+                }
+                self.jit_log.emit(.{
+                    .kind = .monitor_snapshot,
+                    .step = steps,
+                    .total_functions = @intCast(self.import_resolver.total_calls),
+                    .unique_ordinals = @intCast(self.import_resolver.total_calls),
+                    .code_cache_bytes = @intCast(self.memory_forwarder.summary().allocations *| 4096),
+                    .call_count = self.jit_commit_count,
+                    .thread_id = self.active_guest_thread,
+                    .reason = "heartbeat",
+                });
+                self.macho_log.emit(.{
+                    .kind = .heartbeat,
+                    .step = steps,
+                    .thread_id = self.active_guest_thread,
+                    .guest_addr = self.regs.rip,
+                    .runnable = @intCast(self.pthreads.activeCount()),
+                    .blocked = @intCast(self.pthreads.blocked_threads),
+                    .condvar_waits = self.pthreads.collapsed_waits,
+                    .import_calls = self.import_resolver.total_calls,
+                    .reason = "heartbeat",
+                    .symbol = if (hb_symbol) |resolved| resolved.name else "",
+                });
             }
             if (self.concise_output and steps != 0 and steps % 100_000_000 == 0) {
                 var progress_buffer: [256]u8 = undefined;
@@ -8784,7 +8962,7 @@ pub const MachOState = struct {
         });
         const normalized_reason = exit_diagnostics.normalizeReason(inferred_reason, self.unresolved_import_count);
         if (normalized_reason != recorded_reason) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: diagnostics invariant repaired: reason={s} faulted={} reclassified={s}\n",
                 .{ @tagName(recorded_reason), self.faulted, @tagName(normalized_reason) },
             );
@@ -8793,12 +8971,33 @@ pub const MachOState = struct {
         if (self.terminated and (self.exit_code != 0 or self.unresolved_import_count != 0)) {
             self.logExitDiagnostics();
         }
+        self.jit_log.emit(.{
+            .kind = .process_exit,
+            .step = steps,
+            .total_functions = @intCast(self.import_resolver.total_calls),
+            .unique_ordinals = @intCast(self.import_resolver.total_calls),
+            .code_cache_bytes = @intCast(self.memory_forwarder.summary().allocations *| 4096),
+            .thread_id = self.active_guest_thread,
+            .exit_code = @as(i32, @intCast(self.exit_code & 0xFFFFFFFF)),
+            .reason = @tagName(recorded_reason),
+        });
+        self.macho_log.emit(.{
+            .kind = .process_exit,
+            .step = steps,
+            .thread_id = self.active_guest_thread,
+            .runnable = @intCast(self.pthreads.activeCount()),
+            .blocked = @intCast(self.pthreads.blocked_threads),
+            .condvar_waits = self.pthreads.collapsed_waits,
+            .import_calls = self.import_resolver.total_calls,
+            .exit_code = @as(i32, @intCast(self.exit_code & 0xFFFFFFFF)),
+            .reason = @tagName(recorded_reason),
+        });
     }
 
     fn logDecodeCacheSummary(self: *const MachOState) void {
         const total = self.decode_cache_hits + self.decode_cache_misses;
         const hit_percent = if (total == 0) 0 else self.decode_cache_hits * 100 / total;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: decode cache: entries={d} hits={d} misses={d} hit_rate={d}% code_generation={d}\n",
             .{ self.decode_cache.len, self.decode_cache_hits, self.decode_cache_misses, hit_percent, self.code_generation },
         );
@@ -8807,46 +9006,46 @@ pub const MachOState = struct {
     fn logPerformanceAccelerationSummary(self: *const MachOState) void {
         const total = self.import_route_cache_hits + self.import_route_cache_misses;
         const hit_percent = if (total == 0) 0 else self.import_route_cache_hits * 100 / total;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: import route cache: entries={d} hits={d} misses={d} hit_rate={d}% collisions={d} fallbacks={d}\n",
             .{ IMPORT_ROUTE_CACHE_SIZE, self.import_route_cache_hits, self.import_route_cache_misses, hit_percent, self.import_route_cache_collisions, self.import_route_cache_fallbacks },
         );
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: bulk construction acceleration: page_entry_runs={d} bytes={d}\n",
             .{ self.page_entry_bulk_initializations, self.page_entry_bulk_bytes },
         );
         if (self.lazy_import_direct_dispatches != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: lazy import safety: typed_direct_dispatches={d} dyld_stub_binder_entries=0\n",
                 .{self.lazy_import_direct_dispatches},
             );
         }
         if (self.patch_db_empty_array_recoveries != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: PatchDB empty-patch compatibility: recoveries={d}\n",
                 .{self.patch_db_empty_array_recoveries},
             );
         }
         if (self.libcxx_string_substr_fast_paths != 0 or self.profile_host_preflight_checks != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: libc++ path slicing: substr_fast_paths={d} profile_host_preflights={d}\n",
                 .{ self.libcxx_string_substr_fast_paths, self.profile_host_preflight_checks },
             );
         }
         if (self.opaque_destructor_quarantines != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: opaque lifetime safety: destructor_quarantines={d}; only registered opaque identities with validated caller frames were skipped\n",
                 .{self.opaque_destructor_quarantines},
             );
         }
         if (self.profile_account_flow.attempts != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: profile Account lifecycle: attempts={d} successes={d} failures={d} active={} final_stage={s} last_xuid={x:0>16} last_bytes_read={d}/{d}\n",
                 .{ self.profile_account_flow.attempts, self.profile_account_flow.successes, self.profile_account_flow.failures, self.profile_account_flow.active, @tagName(self.profile_account_flow.stage), self.profile_account_flow.xuid, self.profile_account_flow.bytes_read, self.profile_account_flow.requested_bytes },
             );
         }
         if (self.atomic_cmpxchg8.operations != 0 or self.classified_ud2_recoveries != 0 or self.breakpoint_cleanup_recoveries != 0) {
-            std.debug.print(
+            machoCapturePrint(
                 "macho-processor: atomic/UD2 robustness: cmpxchg8(operations/successes/failures)={d}/{d}/{d} classified_ud2_recoveries={d} timer_recovery(allowed/quarantined)={d}/{d} breakpoint_cleanup_recoveries={d} ownership={s}\n",
                 .{ self.atomic_cmpxchg8.operations, self.atomic_cmpxchg8.successes, self.atomic_cmpxchg8.failures, self.classified_ud2_recoveries, self.timer_recovery_tracker.allowed, self.timer_recovery_tracker.quarantined, self.breakpoint_cleanup_recoveries, if (self.atomic_cmpxchg8.indicatesDecoderGap(self.classified_ud2_recoveries)) "rosette_decoder_gap" else "no_decoder_gap_observed" },
             );
@@ -8857,7 +9056,7 @@ pub const MachOState = struct {
 
     fn logSharedControlBlockSummary(self: *const MachOState) void {
         if (self.libcpp_shared_control_blocks.candidates == 0) return;
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: libc++ shared control-block robustness: candidates={d} verified_vptr_restorations={d} rejected={d}\n",
             .{
                 self.libcpp_shared_control_blocks.candidates,
@@ -9217,12 +9416,12 @@ pub const MachOState = struct {
                 asm volatile ("mfence" ::: .{ .memory = true });
             }
             if (self.verbose_trace) {
-                std.debug.print("macho-processor: LOCK prefix consumed at rip=0x{x} op={s}\n", .{ self.regs.rip, @tagName(d.op) });
+                machoCapturePrint("macho-processor: LOCK prefix consumed at rip=0x{x} op={s}\n", .{ self.regs.rip, @tagName(d.op) });
             }
         }
         switch (d.op) {
             .invalid => {
-                std.debug.print("macho-processor: undecoded instruction at rip=0x{x} opcode_prefix=0x{x}\n", .{ self.regs.rip, self.readMemVal(self.regs.rip, .bits8) });
+                machoCapturePrint("macho-processor: undecoded instruction at rip=0x{x} opcode_prefix=0x{x}\n", .{ self.regs.rip, self.readMemVal(self.regs.rip, .bits8) });
                 self.faulted = true;
                 self.exit_code = 1;
                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
@@ -9239,6 +9438,13 @@ pub const MachOState = struct {
             .fild_mem64 => _ = self.x87.push(@floatFromInt(@as(i64, @bitCast(self.readMemVal(d.addr, .bits64))))),
             .fld_mem32 => _ = self.x87.push(@as(f64, @floatCast(@as(f32, @bitCast(@as(u32, @truncate(self.readMemVal(d.addr, .bits32)))))))),
             .fld_mem64 => _ = self.x87.push(@bitCast(self.readMemVal(d.addr, .bits64))),
+            .fld_mem80 => {
+                const input = self.guestMemoryConst(d.addr, 10) orelse {
+                    self.terminateForGuestAccess(d.addr, 10, .read, "fld_mem80");
+                    return;
+                };
+                _ = self.x87.push(readExtendedFloat80(input));
+            },
             .fstp_mem80 => {
                 const output = self.guestMemory(d.addr, 10) orelse {
                     self.terminateForGuestAccess(d.addr, 10, .write, "fstp_mem80");
@@ -9772,20 +9978,20 @@ pub const MachOState = struct {
                             target,
                         );
                         if (observation.disposition == .detail) {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "macho-processor: lazy import direct dispatch #{d}: thread=0x{x} stub=0x{x} pointer=0x{x} pointer_value=0x{x} import={s} return=0x{x} step={d}; dyld_stub_binder bypassed=true\n",
                                 .{ self.lazy_import_direct_dispatches, self.active_guest_thread, stub_rip, d.addr, target, import.name, self.read64(self.regs.rsp), self.executed_steps },
                             );
                             if (target != 0) {
                                 if (self.metadata.nearestSymbol(target)) |symbol| {
-                                    std.debug.print(
+                                    machoCapturePrint(
                                         "macho-processor: lazy import pointer classification: target=0x{x} symbol={s}+0x{x} action=typed_import\n",
                                         .{ target, symbol.name, symbol.offset },
                                     );
                                 }
                             }
                         } else if (observation.disposition == .checkpoint) {
-                            std.debug.print(
+                            machoCapturePrint(
                                 "macho-processor: repeated lazy import checkpoint: import={s} stub=0x{x} occurrence={d} suppressed_since_previous={d} total_direct_dispatches={d}\n",
                                 .{ import.name, stub_rip, observation.occurrence, observation.suppressed_since_emit, self.lazy_import_direct_dispatches },
                             );
@@ -10163,7 +10369,7 @@ pub const MachOState = struct {
                         const symbol = self.metadata.nearestSymbol(self.regs.rip);
                         const adjacent = if (!d.is_reg_form) self.guestMemoryConst(d.addr, 4) else null;
                         const adjacent_value = if (adjacent) |bytes| std.mem.readInt(u32, bytes[0..4], .little) else 0;
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: atomic cmpxchg8 #{d}: rip=0x{x} {s}+0x{x} target={s}0x{x} expected=0x{x:0>2} actual=0x{x:0>2} replacement=0x{x:0>2} matched={} adjacent32_mapped={} adjacent32=0x{x:0>8}\n",
                             .{ self.atomic_cmpxchg8.operations, self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, if (d.is_reg_form) "register:" else "memory:", if (d.is_reg_form) @intFromEnum(d.dst_reg) else d.addr, expected, actual, replacement, matched, adjacent != null, adjacent_value },
                         );
@@ -10211,7 +10417,7 @@ pub const MachOState = struct {
                     self.atomic_cmpxchg8.record(matched);
                     if (self.atomic_cmpxchg8.operations <= 16 or (!matched and self.atomic_cmpxchg8.failures <= 16)) {
                         const symbol = self.metadata.nearestSymbol(self.regs.rip);
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: atomic cmpxchg8b #{d}: rip=0x{x} {s}+0x{x} target=0x{x} expected=0x{x:0>8}:0x{x:0>8} actual=0x{x:0>8}:0x{x:0>8} replacement=0x{x:0>8}:0x{x:0>8} matched={}\n",
                             .{ self.atomic_cmpxchg8.operations, self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, d.addr, expected_hi, expected_lo, actual_hi, actual_lo, replacement_hi, replacement_lo, matched },
                         );
@@ -10639,7 +10845,7 @@ pub const MachOState = struct {
                         self.readMemVal(d.addr, .bits64)
                     else
                         self.readMemVal(d.addr, .bits16);
-                    
+
                     if (d.op == .vpinsrd) {
                         std.mem.writeInt(u32, self.xmm[d.xmm_dst][offset..][0..4], @intCast(mem_value), .little);
                     } else if (d.op == .vpinsrq) {
@@ -10734,12 +10940,12 @@ pub const MachOState = struct {
                 if (self.tryRecoverClassifiedAssertionUd2(d.len)) return;
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const assertion_age = self.executed_steps -| self.last_guest_assertion_step;
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: UD2 encounter: rip=0x{x} {s}+0x{x} active=0x{x} signal_depth={d} assertion={s} assertion_age={d} assertion_return=0x{x} bytes=0f0b\n",
                     .{ self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(self.last_guest_assertion_class), assertion_age, self.last_guest_assertion_return },
                 );
-                if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len)) return;
-                std.debug.print("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});
+                if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len, self.regs.rip, null)) return;
+                machoCapturePrint("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});
                 self.faulted = true;
                 self.terminated = true;
                 self.exit_code = 128 + GUEST_SIGILL;
@@ -11094,7 +11300,7 @@ pub const MachOState = struct {
 
                 if (self.backendMemoryDiagnosticsActive() and addr == 0 and map_flags.ANONYMOUS and length >= 64 * 1024 * 1024) {
                     const mapped = self.guestMapBackendWithBacking(length, @truncate(prot), raw_flags, -1, @bitCast(offset)) orelse {
-                        std.debug.print(
+                        machoCapturePrint(
                             "macho-processor: x64 backend sparse mmap FAILED: route=syscall address=0x0 length={d} prot=0x{x} flags=0x{x}\n",
                             .{ length, prot, raw_flags },
                         );
@@ -11102,7 +11308,7 @@ pub const MachOState = struct {
                         self.regs.rax = std.math.maxInt(u64);
                         return;
                     };
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: x64 backend sparse mmap succeeded: route=syscall guest_base=0x{x} length={d} prot=0x{x} flags=0x{x} heap_bypassed=true\n",
                         .{ mapped, length, prot, raw_flags },
                     );
@@ -11112,7 +11318,7 @@ pub const MachOState = struct {
                 }
 
                 if (length >= 1024 * 1024 * 1024) {
-                    std.debug.print(
+                    machoCapturePrint(
                         "macho-processor: large mmap entry: route=syscall addr=0x{x} length={d} aligned_length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} guest_fd=0x{x} offset={d}\n",
                         .{ addr, length, aligned_length, prot, raw_flags, map_flags.FIXED, map_flags.ANONYMOUS, arg5, offset },
                     );
@@ -11123,18 +11329,18 @@ pub const MachOState = struct {
                         -1
                     else
                         self.fs_forwarder.fd_manager.hostFd(arg5) orelse {
-                            std.debug.print("macho-processor: large mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
+                            machoCapturePrint("macho-processor: large mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
                             self.noteBackendMmapResult(false, 0, "syscall_large_fd_translation");
                             self.regs.rax = std.math.maxInt(u64);
                             return;
                         };
                     const reserved = self.guestReserveAddressSpaceWithBacking(aligned_length, raw_flags, host_fd, @bitCast(offset)) orelse {
-                        std.debug.print("macho-processor: large mmap FAILED: route=syscall stage=sparse_reserve\n", .{});
+                        machoCapturePrint("macho-processor: large mmap FAILED: route=syscall stage=sparse_reserve\n", .{});
                         self.noteBackendMmapResult(false, 0, "syscall_sparse_reserve");
                         self.regs.rax = std.math.maxInt(u64);
                         return;
                     };
-                    std.debug.print("macho-processor: large mmap succeeded: route=syscall guest_base=0x{x} length={d}\n", .{ reserved, aligned_length });
+                    machoCapturePrint("macho-processor: large mmap succeeded: route=syscall guest_base=0x{x} length={d}\n", .{ reserved, aligned_length });
                     self.noteBackendMmapResult(true, reserved, "syscall_sparse_reserve");
                     self.regs.rax = reserved;
                     return;
@@ -11145,13 +11351,13 @@ pub const MachOState = struct {
                         -1
                     else
                         self.fs_forwarder.fd_manager.hostFd(arg5) orelse {
-                            std.debug.print("macho-processor: fixed mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
+                            machoCapturePrint("macho-processor: fixed mmap FAILED: route=syscall stage=fd_translation guest_fd=0x{x}\n", .{arg5});
                             self.noteBackendMmapResult(false, 0, "syscall_fixed_fd_translation");
                             self.regs.rax = std.math.maxInt(u64);
                             return;
                         };
                     if (!self.guestMapFile(addr, aligned_length, @truncate(prot), raw_flags, host_fd, @bitCast(offset))) {
-                        std.debug.print("macho-processor: fixed mmap FAILED: route=syscall stage=sparse_map addr=0x{x} length={d}\n", .{ addr, aligned_length });
+                        machoCapturePrint("macho-processor: fixed mmap FAILED: route=syscall stage=sparse_map addr=0x{x} length={d}\n", .{ addr, aligned_length });
                         self.noteBackendMmapResult(false, 0, "syscall_fixed_sparse_map");
                         self.regs.rax = std.math.maxInt(u64);
                         return;
@@ -11162,7 +11368,7 @@ pub const MachOState = struct {
                 }
 
                 const mapped = if (addr != 0) addr else self.guestAlloc(aligned_length, alignment) orelse {
-                    std.debug.print("macho-processor: mmap FAILED: route=syscall stage=guest_heap length={d} alignment={d}\n", .{ aligned_length, alignment });
+                    machoCapturePrint("macho-processor: mmap FAILED: route=syscall stage=guest_heap length={d} alignment={d}\n", .{ aligned_length, alignment });
                     self.noteBackendMmapResult(false, 0, "syscall_guest_heap_allocate");
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
@@ -11192,13 +11398,13 @@ pub const MachOState = struct {
                 const length = ((arg2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
                 const prot = arg3;
                 if (self.guestProtectSparseMemory(address, length, @truncate(prot))) {
-                    std.debug.print("macho-processor: sparse mprotect succeeded: route=syscall address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
+                    machoCapturePrint("macho-processor: sparse mprotect succeeded: route=syscall address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
                     self.noteBackendMprotect("syscall", address, length, prot, true);
                     self.regs.rax = 0;
                     return;
                 }
                 if (mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address) == null) {
-                    std.debug.print("macho-processor: mprotect FAILED: route=syscall reason=address_not_mapped address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
+                    machoCapturePrint("macho-processor: mprotect FAILED: route=syscall reason=address_not_mapped address=0x{x} length={d} prot=0x{x}\n", .{ address, length, prot });
                     self.noteBackendMprotect("syscall", address, length, prot, false);
                     self.regs.rax = 0xFFFF_FFFF_FFFF_FFFF;
                     return;
@@ -11216,7 +11422,7 @@ pub const MachOState = struct {
                 const address = arg1;
                 const length = ((arg2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
                 if (self.guestUnmapFile(address, length)) {
-                    std.debug.print("macho-processor: sparse munmap succeeded: route=syscall address=0x{x} length={d}\n", .{ address, length });
+                    machoCapturePrint("macho-processor: sparse munmap succeeded: route=syscall address=0x{x} length={d}\n", .{ address, length });
                     self.regs.rax = 0;
                     return;
                 }
@@ -11283,7 +11489,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     defer allocator.free(file_data);
 
     const slice = extractX8664Slice(allocator, file_data) catch |err| {
-        std.debug.print("macho-processor: not a valid x86_64 Mach-O binary: {s}\n", .{@errorName(err)});
+        machoCapturePrint("macho-processor: not a valid x86_64 Mach-O binary: {s}\n", .{@errorName(err)});
         return 1;
     };
 
@@ -11299,6 +11505,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     }
     state.scheduler_log.open(allocator);
     state.pthreads.attachEventLog(&state.scheduler_log);
+    state.jit_log.open(allocator);
+    state.macho_log.open(allocator);
+    state.macho_log.emit(.{
+        .kind = .process_launch,
+        .step = 0,
+        .reason = options.path,
+    });
     output.human("Loading imports...\n", .{});
     state.cpu_profile = selectedCpuProfile();
     state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");
@@ -11312,10 +11525,10 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     var temp_state = try macho.load(allocator, slice);
     defer temp_state.deinit();
 
-    std.debug.print("macho-processor: {s}\n", .{options.path});
-    std.debug.print("ROSETTE: Loading MachO binary: '{s}'\n", .{options.path});
+    machoCapturePrint("macho-processor: {s}\n", .{options.path});
+    machoCapturePrint("ROSETTE: Loading MachO binary: '{s}'\n", .{options.path});
     if (std.mem.endsWith(u8, options.path, ".iso")) {
-        std.debug.print("ROSETTE: WARNING: .iso file detected - this may indicate incorrect routing\n", .{});
+        machoCapturePrint("ROSETTE: WARNING: .iso file detected - this may indicate incorrect routing\n", .{});
     }
     const image_fingerprint = std.hash.Wyhash.hash(0, slice);
     const has_xbdm_diagnostics = std.mem.indexOf(
@@ -11323,7 +11536,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         slice,
         "[XBDM export diagnostics] table initialized:",
     ) != null;
-    std.debug.print(
+    machoCapturePrint(
         "macho-processor: image identity: bytes={d} wyhash64={x:0>16} xbdm_diagnostics={} bundle_executable={}\n",
         .{
             slice.len,
@@ -11332,28 +11545,28 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             std.mem.indexOf(u8, options.path, ".app/Contents/MacOS/") != null,
         },
     );
-    std.debug.print("  filetype: 0x{x}", .{temp_state.header.filetype});
+    machoCapturePrint("  filetype: 0x{x}", .{temp_state.header.filetype});
     switch (temp_state.header.filetype) {
-        2 => std.debug.print(" (MH_EXECUTE)\n", .{}),
-        6 => std.debug.print(" (MH_DYLIB)\n", .{}),
-        8 => std.debug.print(" (MH_BUNDLE)\n", .{}),
-        else => std.debug.print("\n", .{}),
+        2 => machoCapturePrint(" (MH_EXECUTE)\n", .{}),
+        6 => machoCapturePrint(" (MH_DYLIB)\n", .{}),
+        8 => machoCapturePrint(" (MH_BUNDLE)\n", .{}),
+        else => machoCapturePrint("\n", .{}),
     }
-    std.debug.print("  cputype:  0x{x}", .{temp_state.header.cputype});
-    if (temp_state.header.cputype == macho.CPU_TYPE_X86_64) std.debug.print(" (x86_64)\n", .{}) else std.debug.print("\n", .{});
-    std.debug.print("  ncmds:    {d}\n", .{temp_state.header.ncmds});
-    std.debug.print("  segments: {d}\n", .{temp_state.segments.len});
-    std.debug.print("  entry:    0x{x}\n", .{temp_state.entry_point});
-    std.debug.print("  stack:    0x{x}\n", .{temp_state.stack_size});
-    std.debug.print("  mem_base: 0x{x}\n", .{state.mem_base});
-    std.debug.print("  entry_vaddr: 0x{x}\n", .{state.entry_point_vaddr});
-    std.debug.print("  dylibs:    {d}\n", .{state.metadata.dylibs.len});
-    std.debug.print("  imports:   {d}\n", .{state.metadata.imports.len});
-    std.debug.print("  initializers: {d}\n", .{state.metadata.initializer_count});
-    std.debug.print("  strict initializers: {}\n", .{state.strict_initializers});
-    std.debug.print("  strict imports: {}\n", .{state.strict_imports});
-    std.debug.print("  x64 cpu profile: {s}\n", .{state.cpu_profile.label()});
-    std.debug.print(
+    machoCapturePrint("  cputype:  0x{x}", .{temp_state.header.cputype});
+    if (temp_state.header.cputype == macho.CPU_TYPE_X86_64) machoCapturePrint(" (x86_64)\n", .{}) else machoCapturePrint("\n", .{});
+    machoCapturePrint("  ncmds:    {d}\n", .{temp_state.header.ncmds});
+    machoCapturePrint("  segments: {d}\n", .{temp_state.segments.len});
+    machoCapturePrint("  entry:    0x{x}\n", .{temp_state.entry_point});
+    machoCapturePrint("  stack:    0x{x}\n", .{temp_state.stack_size});
+    machoCapturePrint("  mem_base: 0x{x}\n", .{state.mem_base});
+    machoCapturePrint("  entry_vaddr: 0x{x}\n", .{state.entry_point_vaddr});
+    machoCapturePrint("  dylibs:    {d}\n", .{state.metadata.dylibs.len});
+    machoCapturePrint("  imports:   {d}\n", .{state.metadata.imports.len});
+    machoCapturePrint("  initializers: {d}\n", .{state.metadata.initializer_count});
+    machoCapturePrint("  strict initializers: {}\n", .{state.strict_initializers});
+    machoCapturePrint("  strict imports: {}\n", .{state.strict_imports});
+    machoCapturePrint("  x64 cpu profile: {s}\n", .{state.cpu_profile.label()});
+    machoCapturePrint(
         "  advertised ISA: SSE4.2={} AVX={} AVX2={} AVX-512F={} XCR0=0x{x}\n",
         .{
             x64_decoder.capabilities.supports(state.cpu_profile, .sse42),
@@ -11365,12 +11578,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     );
     const vex_audit = auditVexDecoder();
     const avx_advertised = x64_decoder.capabilities.supports(state.cpu_profile, .avx);
-    std.debug.print(
+    machoCapturePrint(
         "  decoder ISA verification: VEX baseline={d}/{d} ready={} AVX advertised={}\n",
         .{ vex_audit.passed, vex_audit.total, vex_audit.ready(), avx_advertised },
     );
     if (avx_advertised and !vex_audit.ready()) {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: refusing incoherent AVX profile: CPUID advertises AVX but baseline VEX decoder audit failed: case={?} expected={s}/len={d}/ymm={} actual={s}/len={d}/ymm={}\n",
             .{
                 vex_audit.first_failed_case,
@@ -11385,7 +11598,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         return 1;
     }
     if (state.metadata.nearestSymbol(state.entry_point_vaddr)) |entry_symbol| {
-        std.debug.print("  entry_symbol: {s}+0x{x}\n", .{ entry_symbol.name, entry_symbol.offset });
+        machoCapturePrint("  entry_symbol: {s}+0x{x}\n", .{ entry_symbol.name, entry_symbol.offset });
     }
 
     for (temp_state.segments, 0..) |seg, i| {
@@ -11396,13 +11609,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             1 => "r--",
             else => "???",
         };
-        std.debug.print("    [{d}] {s: <12}  vm=0x{x:0>8}  size=0x{x:0>8}  file=0x{x:0>8}  ({s})\n", .{
+        machoCapturePrint("    [{d}] {s: <12}  vm=0x{x:0>8}  size=0x{x:0>8}  file=0x{x:0>8}  ({s})\n", .{
             i, seg.name, seg.vmaddr, seg.vmsize, seg.fileoff, prot_str,
         });
     }
 
     if (temp_state.entry_point == 0) {
-        std.debug.print("macho-processor: no entry point found\n", .{});
+        machoCapturePrint("macho-processor: no entry point found\n", .{});
         return 1;
     }
 
@@ -11410,16 +11623,16 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.guest_fds[1] = 1;
     state.guest_fds[2] = 2;
 
-    std.debug.print("ROSETTE: About to setup MachO state for path: '{s}'\n", .{options.path});
-    std.debug.print("ROSETTE: This confirms Rosetta is routing Xenia through compatibility layer\n", .{});
+    machoCapturePrint("ROSETTE: About to setup MachO state for path: '{s}'\n", .{options.path});
+    machoCapturePrint("ROSETTE: This confirms Rosetta is routing Xenia through compatibility layer\n", .{});
     output.human("Initializing pthread runtime...\n", .{});
     state.setupMachOState(options.path, options.args);
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
-    std.debug.print("ROSETTE: MachO state setup completed successfully\n", .{});
+    machoCapturePrint("ROSETTE: MachO state setup completed successfully\n", .{});
 
     state.startup.enter(.static_init, state.executed_steps);
     output.human("Initializing guest runtime...\n", .{});
-    std.debug.print("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
+    machoCapturePrint("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
     const initializers_ok = state.runInitializers();
     state.initializer_resolver.logSummary();
     if (!initializers_ok) {
@@ -11449,13 +11662,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.symbol_assembly.logSummary();
         state.logDecodeCacheSummary();
         state.logPerformanceAccelerationSummary();
-        std.debug.print("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
+        machoCapturePrint("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
         return state.exit_code;
     }
 
     state.startup.enter(.main_enter, state.executed_steps);
     output.human("Loading guest program...\n", .{});
-    std.debug.print("macho-processor: starting execution at 0x{x}, rsp=0x{x}\n", .{ state.regs.rip, state.regs.rsp });
+    machoCapturePrint("macho-processor: starting execution at 0x{x}, rsp=0x{x}\n", .{ state.regs.rip, state.regs.rsp });
 
     state.run();
 
@@ -11471,7 +11684,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         output.human("✗ Waiting guest threads: {d}\n", .{state.pthreads.blocked_threads});
     }
 
-    std.debug.print("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
+    machoCapturePrint("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
     state.logDecodeCacheSummary();
     state.logPerformanceAccelerationSummary();
     state.import_resolver.logSummary();
@@ -11499,13 +11712,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.pthreads.logSummary();
     state.sparse_memory.logSummary();
     if (state.guest_log_line_count != 0) {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: synchronous guest log bridge: mirrored_lines={d}\n",
             .{state.guest_log_line_count},
         );
     }
     if (state.guest_stdio_write_count != 0) {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: guest stdio capture: writes={d} stdout_bytes={d} stderr_bytes={d} log_mirror_active={} mirror_failures={d}\n",
             .{
                 state.guest_stdio_write_count,
@@ -11517,7 +11730,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         );
     }
     if (state.guest_stdio_read_count != 0 or state.guest_stdio_seek_count != 0 or state.guest_stdio_failures != 0) {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: guest stdio input: reads={d} bytes={d} seeks={d} failures={d}\n",
             .{ state.guest_stdio_read_count, state.guest_stdio_read_bytes, state.guest_stdio_seek_count, state.guest_stdio_failures },
         );
@@ -11528,12 +11741,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         for (0..end) |i| {
             const entry = state.import_trace_entries[i];
             if (entry.caller_symbol.len != 0) {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: unresolved import #{d}: {s} from {s}; stub=0x{x} return=0x{x} caller={s}+0x{x} synthesized_rax=0x{x}\n",
                     .{ i, entry.symbol, entry.dylib, entry.stub_address, entry.return_address, entry.caller_symbol, entry.caller_offset, entry.synthetic_result },
                 );
             } else {
-                std.debug.print(
+                machoCapturePrint(
                     "macho-processor: unresolved import #{d}: {s} from {s}; stub=0x{x} return=0x{x} synthesized_rax=0x{x}\n",
                     .{ i, entry.symbol, entry.dylib, entry.stub_address, entry.return_address, entry.synthetic_result },
                 );
@@ -11542,7 +11755,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     }
 
     if (state.unresolved_import_count != 0 and !state.faulted) {
-        std.debug.print(
+        machoCapturePrint(
             "macho-processor: runtime incomplete: {d} unresolved import call(s); guest exit {d} is diagnostic only, returning processor status {d}\n",
             .{ state.unresolved_import_count, state.exit_code, UNSUPPORTED_RUNTIME_EXIT_CODE },
         );
@@ -11556,7 +11769,7 @@ fn extractX8664Slice(allocator: std.mem.Allocator, data: []const u8) ![]const u8
     return fat.extractX8664Slice(allocator, data) catch |err| {
         if (err == error.NotMachO) return error.NotMachO;
         if (err == error.NoX86_64Slice) {
-            std.debug.print("macho-processor: no x86_64 slice found in fat binary\n", .{});
+            machoCapturePrint("macho-processor: no x86_64 slice found in fat binary\n", .{});
             return error.NoX86_64Slice;
         }
         return err;
@@ -12895,7 +13108,7 @@ test "decode prefetch memory hint as no-op" {
     try std.testing.expectEqual(@as(u8, 4), prefetchw.len);
 }
 
-test "decode x87 integer load and extended store used by chrono timeout path" {
+test "decode x87 integer and extended-real forms used by chrono timeout path" {
     const load = decodeInsn(&[_]u8{ 0xDF, 0x6D, 0xC8, 0xDB, 0x7D, 0xD0 });
     try std.testing.expectEqual(Op.fild_mem64, load.op);
     try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, load.sib_base_reg);
@@ -12907,6 +13120,26 @@ test "decode x87 integer load and extended store used by chrono timeout path" {
     try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, store.sib_base_reg);
     try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -48))), store.addr);
     try std.testing.expectEqual(@as(u8, 3), store.len);
+
+    // FLD m80real in libc++'s duration comparison. This was previously
+    // misdecoded as FILD m32int, forcing every finite sleep to duration::max().
+    const load_extended = decodeInsn(&[_]u8{ 0xDB, 0x6D, 0xB4 });
+    try std.testing.expectEqual(Op.fld_mem80, load_extended.op);
+    try std.testing.expectEqual(RegId.ch_bp_ebp_rbp, load_extended.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -76))), load_extended.addr);
+    try std.testing.expectEqual(@as(u8, 3), load_extended.len);
+
+    const load_i32 = decodeInsn(&[_]u8{ 0xDB, 0x00 });
+    try std.testing.expectEqual(Op.fild_mem32, load_i32.op);
+}
+
+test "x87 extended-real conversion preserves finite chrono durations" {
+    var encoded = [_]u8{0} ** 10;
+    const durations = [_]f64{ 0.001, 0.010, 0.100, 0.500, -0.001 };
+    for (durations) |duration| {
+        MachOState.writeExtendedFloat80(&encoded, duration);
+        try std.testing.expectApproxEqAbs(duration, MachOState.readExtendedFloat80(&encoded), 1e-15);
+    }
 }
 
 test "x87 stack tracks physical tags and status TOP" {
@@ -13036,7 +13269,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (environmentFlag("ROSETTE_MACHO_VERBOSE_STDOUT")) {
         const executable_path = std.process.executablePathAlloc(init.io, allocator) catch null;
-        std.debug.print(
+        machoCapturePrint(
             "scheduler: runtime integration active version=ui-handoff-v2 optimize={s} executable={s}\n",
             .{ @tagName(builtin.mode), if (executable_path) |path| path else "<unavailable>" },
         );
@@ -13046,7 +13279,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(args);
 
     if (args.len < 2) {
-        std.debug.print("usage: macho_processor <binary> [args...]\n", .{});
+        machoCapturePrint("usage: macho_processor <binary> [args...]\n", .{});
         std.process.exit(1);
     }
 
@@ -13056,7 +13289,7 @@ pub fn main(init: std.process.Init) !void {
     });
     const process_status: u8 = if (exit_code <= std.math.maxInt(u8)) @intCast(exit_code) else UNSUPPORTED_RUNTIME_EXIT_CODE;
     if (process_status != exit_code) {
-        std.debug.print("macho-processor: normalized non-status exit value 0x{x} to {d}\n", .{ exit_code, process_status });
+        machoCapturePrint("macho-processor: normalized non-status exit value 0x{x} to {d}\n", .{ exit_code, process_status });
     }
     std.process.exit(process_status);
 }

@@ -406,6 +406,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const jit_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/compiler/JIT/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const bridge_register_trace_module = b.createModule(.{
         .root_source_file = b.path("../src/bridge/register-tracing/runtime.zig"),
         .target = target,
@@ -734,6 +739,11 @@ pub fn build(b: *std.Build) void {
     {
         const contract_test = b.addTest(.{ .root_module = contract_mod });
         check_step.dependOn(&contract_test.step);
+    }
+
+    {
+        const jit_test = b.addTest(.{ .root_module = jit_mod });
+        check_step.dependOn(&jit_test.step);
     }
 
     {
@@ -1120,6 +1130,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("contract", contract_mod);
         macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_processor_mod.addImport("scheduler", scheduler_mod);
+        macho_processor_mod.addImport("jit", jit_mod);
         if (is_macos) {
             macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
             macho_processor_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
@@ -1150,6 +1161,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("contract", contract_mod);
         macho_processor_test_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_processor_test_mod.addImport("scheduler", scheduler_mod);
+        macho_processor_test_mod.addImport("jit", jit_mod);
         if (is_macos) {
             macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
             macho_processor_test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
