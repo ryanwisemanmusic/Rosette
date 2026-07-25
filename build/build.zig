@@ -1112,6 +1112,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        const primitive_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/primitive/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         const scheduler_mod = b.createModule(.{
             .root_source_file = b.path("../lib/scheduler/root.zig"),
             .target = target,
@@ -1129,6 +1134,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_processor_mod.addImport("contract", contract_mod);
         macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        macho_processor_mod.addImport("primitive", primitive_mod);
         macho_processor_mod.addImport("scheduler", scheduler_mod);
         macho_processor_mod.addImport("jit", jit_mod);
         if (is_macos) {
@@ -1160,6 +1166,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_processor_test_mod.addImport("contract", contract_mod);
         macho_processor_test_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        macho_processor_test_mod.addImport("primitive", primitive_mod);
         macho_processor_test_mod.addImport("scheduler", scheduler_mod);
         macho_processor_test_mod.addImport("jit", jit_mod);
         if (is_macos) {
