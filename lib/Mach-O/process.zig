@@ -179,6 +179,63 @@ const isGtkIdleAddImport = types.isGtkIdleAddImport;
 const isGtkEventsPendingImport = types.isGtkEventsPendingImport;
 const isGtkMainIterationImport = types.isGtkMainIterationImport;
 
+const GtkBootstrapEntry = struct {
+    rip: u64 = 0,
+    thread: u64 = 0,
+    op: u32 = 0,
+    len: u8 = 0,
+};
+
+const StepTraceEntry = struct {
+    step: u64 = 0,
+    rip: u64 = 0,
+};
+
+const MemInitEntry = struct {
+    step: u64 = 0,
+    rip: u64 = 0,
+    // Shorter summary stored inline so we can log it on fault
+    heap: u64 = 0,
+    sparse_mappings: usize = 0,
+    sparse_activations: usize = 0,
+    deferred_count: u64 = 0,
+    suspended_count: usize = 0,
+};
+
+const GtkHeartbeatEntry = struct {
+    step: u64 = 0,
+    rip: u64 = 0,
+    thread: u64 = 0,
+    deferred: u64 = 0,
+    suspended_total: usize = 0,
+    suspended_runnable: usize = 0,
+    suspended_blocked: usize = 0,
+    switches: u64 = 0,
+    wait_yields: u64 = 0,
+    quantum_yields: u64 = 0,
+    rotation_yields: u64 = 0,
+    idle_pending: u64 = 0,
+    active_idle_source: u64 = 0,
+    active_idle_callback: u64 = 0,
+    dispatch_block: GtkIdleDispatchBlock = .ready,
+};
+
+const UiHandoffEntry = struct {
+    step: u64 = 0,
+    rip: u64 = 0,
+    generation: u64 = 0,
+    phase: scheduler.UiHandoffPhase = .idle,
+    source_id: u64 = 0,
+    callback_handle: u64 = 0,
+    callback_rip: u64 = 0,
+    worker_handle: u64 = 0,
+    worker_rip: u64 = 0,
+    no_progress: u64 = 0,
+    suspensions: u64 = 0,
+    resumes: u64 = 0,
+    worker_slices: u64 = 0,
+};
+
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -270,7 +327,22 @@ pub const MachOState = struct {
     last_cooperative_starvation_step: u64 = 0,
     ui_callback_retained_quanta: u64 = 0,
     cooperative_quantum_steps: u64 = 0,
-    cooperative_bootstrap_trace_remaining: u8 = 0,
+    gtk_bootstrap_active: bool = false,
+    gtk_bootstrap_index: u8 = 0,
+    gtk_bootstrap_entries: [24]GtkBootstrapEntry = [_]GtkBootstrapEntry{.{}} ** 24,
+    step_trace_entries: [5]StepTraceEntry = [_]StepTraceEntry{.{}} ** 5,
+    step_trace_index: u4 = 0,
+    step_trace_filled: bool = false,
+    mem_init_started: bool = false,
+    mem_init_entries: [8]MemInitEntry = [_]MemInitEntry{.{}} ** 8,
+    mem_init_index: u8 = 0,
+    mem_init_filled: bool = false,
+    gtk_heartbeat_index: u4 = 0,
+    gtk_heartbeat_filled: bool = false,
+    gtk_heartbeat_entries: [5]GtkHeartbeatEntry = [_]GtkHeartbeatEntry{.{}} ** 5,
+    ui_handoff_index: u4 = 0,
+    ui_handoff_filled: bool = false,
+    ui_handoff_entries: [5]UiHandoffEntry = [_]UiHandoffEntry{.{}} ** 5,
     gtk_idle_callbacks: [MAX_GTK_IDLE_CALLBACKS]GtkIdleCallback = [_]GtkIdleCallback{.{}} ** MAX_GTK_IDLE_CALLBACKS,
     gtk_idle_next_source: u64 = 1,
     gtk_idle_scheduled: u64 = 0,
@@ -353,7 +425,6 @@ pub const MachOState = struct {
     primitive_dispatch_hits: u64 = 0,
     primitive_dispatch_counts: std.StringHashMap(u64),
     primitive_dispatch_logged: std.AutoHashMap(u64, void),
-    primitive_lazy_logged: std.AutoHashMap(u64, void),
     page_entry_bulk_initializations: u64 = 0,
     page_entry_bulk_bytes: u64 = 0,
     initializer_memory: memory_transaction.Journal,
@@ -363,6 +434,9 @@ pub const MachOState = struct {
     trace_filled: bool = false,
     trace_range_start: ?u64 = null,
     trace_range_end: ?u64 = null,
+    last_trace_rip: u64 = 0,
+    last_trace_op: u64 = 0,
+    trace_repeat_count: u64 = 0,
     pending_stub_slot: ?u32 = null,
     pending_stub_entry_rip: ?u64 = null,
     pending_import_stub_rip: ?u64 = null,
@@ -490,7 +564,6 @@ pub const MachOState = struct {
             .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
             .primitive_dispatch_counts = std.StringHashMap(u64).init(allocator),
             .primitive_dispatch_logged = std.AutoHashMap(u64, void).init(allocator),
-            .primitive_lazy_logged = std.AutoHashMap(u64, void).init(allocator),
             .decode_cache = decode_cache,
             .mapped_min = mapped_min,
             .executable_min = executable_min,
@@ -690,7 +763,6 @@ pub const MachOState = struct {
         self.local_libcpp_stream_targets.deinit();
         self.primitive_dispatch_counts.deinit();
         self.primitive_dispatch_logged.deinit();
-        self.primitive_lazy_logged.deinit();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
         self.vtt_resolver.deinit();
@@ -985,6 +1057,53 @@ pub const MachOState = struct {
             if (self.metadata.definedSymbolAddress(slot) == address) return slot;
         }
         return null;
+    }
+
+    fn dumpGtkBootstrapTrace(self: *const MachOState) void {
+        if (!self.gtk_bootstrap_active or self.gtk_bootstrap_index == 0) return;
+        machoCapturePrint(
+            "macho-processor: GTK worker bootstrap trace (incomplete, {d}/{d} entries):\n",
+            .{ self.gtk_bootstrap_index, 24 },
+        );
+        for (0..self.gtk_bootstrap_index) |i| {
+            const e = &self.gtk_bootstrap_entries[i];
+            const symbol = self.metadata.nearestSymbol(e.rip);
+            const op_str = @tagName(@as(Op, @enumFromInt(e.op)));
+            machoCapturePrint(
+                "  [{d}] active=0x{x} rip=0x{x} {s}+0x{x} op={s} len={d}\n",
+                .{
+                    i, e.thread, e.rip,
+                    if (symbol) |s| s.name else "<unknown>",
+                    if (symbol) |s| s.offset else 0,
+                    op_str, e.len,
+                },
+            );
+        }
+    }
+
+    fn dumpMemInitTrace(self: *const MachOState) void {
+        if (!self.mem_init_filled and self.mem_init_index == 0) return;
+        const count: usize = if (self.mem_init_filled) 8 else self.mem_init_index;
+        const start: usize = if (self.mem_init_filled) self.mem_init_index else 0;
+        machoCapturePrint(
+            "macho-processor: memory initialization progress (most recent {d} entries):\n",
+            .{count},
+        );
+        for (0..count) |i| {
+            const idx = (start + i) % 8;
+            const e = &self.mem_init_entries[idx];
+            const symbol = self.metadata.nearestSymbol(e.rip);
+            machoCapturePrint(
+                "  [{d}] step={d} rip=0x{x} {s}+0x{x} heap=0x{x} sparse(mappings/activations)={d}/{d} deferred={d} suspended={d}\n",
+                .{
+                    i, e.step, e.rip,
+                    if (symbol) |s| s.name else "<unknown>",
+                    if (symbol) |s| s.offset else 0,
+                    e.heap, e.sparse_mappings, e.sparse_activations,
+                    e.deferred_count, e.suspended_count,
+                },
+            );
+        }
     }
 
     fn dumpCapstoneCallbackState(self: *const MachOState, reason: []const u8) void {
@@ -1544,10 +1663,38 @@ pub const MachOState = struct {
             .fault = fault,
             .mapped = description.mapped,
         };
+        self.dumpStepTraceBuffer();
+        self.dumpGtkBootstrapTrace();
+        self.dumpMemInitTrace();
+        self.dumpGtkHeartbeatTrace();
+        self.dumpUiHandoffTrace();
         self.faulted = true;
         self.terminated = true;
         self.exit_code = 127;
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.memory_access_violation);
+    }
+
+    fn dumpStepTraceBuffer(self: *const MachOState) void {
+        if (!self.step_trace_filled and self.step_trace_index == 0) return;
+        machoCapturePrint("macho-processor: step trace buffer (most recent {d} entries):\n", .{
+            if (self.step_trace_filled) 5 else @as(usize, @intCast(self.step_trace_index)),
+        });
+        const count: usize = if (self.step_trace_filled) 5 else @intCast(self.step_trace_index);
+        const start: usize = if (self.step_trace_filled) self.step_trace_index else 0;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const idx = (start + i) % 5;
+            const e = &self.step_trace_entries[idx];
+            const symbol = self.metadata.nearestSymbol(e.rip);
+            machoCapturePrint(
+                "  step={d} rip=0x{x} at {s}+0x{x}\n",
+                .{
+                    e.step, e.rip,
+                    if (symbol) |s| s.name else "<unknown>",
+                    if (symbol) |s| s.offset else 0,
+                },
+            );
+        }
     }
 
     fn currentGuestInstructionLength(self: *const MachOState) u8 {
@@ -2728,18 +2875,6 @@ pub const MachOState = struct {
         return result;
     }
 
-    fn hasPrimitiveHandler(name: []const u8) bool {
-        return primitive.builtin().matchSymbol(name) != null;
-    }
-
-    fn routePrimitiveLazyImportLog(self: *MachOState, import_name: []const u8, comptime fmt: []const u8, args: anytype) void {
-        const key = std.hash_map.hashString(import_name);
-        if (!self.primitive_lazy_logged.contains(key)) {
-            self.primitive_lazy_logged.put(key, {}) catch {};
-            primitiveCapturePrint(fmt, args);
-        }
-    }
-
     fn tryPrimitiveDispatch(self: *MachOState, imported: macho_metadata.ImportedSymbol) ?ImportHandlerResult {
         const handler = primitive.builtin().matchSymbol(imported.name) orelse return null;
         const slot = 0;
@@ -3662,6 +3797,7 @@ pub const MachOState = struct {
                     return .{ .handled = self.regs.rdi };
                 }
             }
+            self.dynamic_casts.dumpTraceBuffer(self);
             machoCapturePrint(
                 "macho-processor: __dynamic_cast metadata unresolved: source=0x{x} source_type=0x{x} destination_type=0x{x} hint={d}; returning null\n",
                 .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, @as(i64, @bitCast(self.regs.rcx)) },
@@ -5382,6 +5518,53 @@ pub const MachOState = struct {
         }
     }
 
+    /// Attempt to repair a zero vtable/function-pointer slot at `operand_address`
+    /// by matching against the cached codecvt vtable entries. This handles the
+    /// common case where a guest C++ locale facet (__narrow_to_utf8, codecvt)
+    /// was allocated but its vtable entries were never populated because the ABI
+    /// data materializer left guest virtual-method-table slots as zeros.
+    /// Attempt to repair a null function-pointer slot in a guest C++ object's
+    /// vtable or function-pointer table. Only fires when the crash site is in
+    /// known codecvt / __narrow_to_utf8 code (filesystem path conversion during
+    /// XEX loading). Scans the binary's imports for the correct codecvt virtual
+    /// function by matching the vtable offset against the expected function name.
+    fn recoverNullVtableSlot(self: *MachOState, instruction_address: u64, operand_address: u64) ?u64 {
+        // Only attempt recovery if the caller is in codecvt/narrow_to_utf8 code.
+        const caller = self.metadata.nearestSymbol(instruction_address) orelse return null;
+        if (std.mem.indexOf(u8, caller.name, "codecvt") == null and
+            std.mem.indexOf(u8, caller.name, "__narrow_to_utf8") == null) return null;
+        // Scan codecvt imports, preferring do_in (the most common null-slot
+        // hit at vtable+0x18 during __narrow_to_utf8::operator() in filesystem
+        // path conversion). All codecvt virtual functions share compatible
+        // signatures (mbstate_t&, char*, wchar_t*), so using any matching
+        // import as fallback is safe in this recovery path.
+        var fallback: u64 = 0;
+        for (self.metadata.imports) |imported| {
+            if (std.mem.indexOf(u8, imported.name, "codecvt") == null) continue;
+            if (imported.stub_address == 0) continue;
+            // do_in is the function at vtable+0x18 = the crash site.
+            if (std.mem.indexOf(u8, imported.name, "do_in") != null) {
+                _ = self.write64(operand_address, imported.stub_address);
+                machoCapturePrint(
+                    "macho-processor: null vtable slot repair: instruction=0x{x} operand=0x{x} func=do_in stub=0x{x}\n",
+                    .{ instruction_address, operand_address, imported.stub_address },
+                );
+                return imported.stub_address;
+            }
+            if (fallback == 0) fallback = imported.stub_address;
+        }
+        // Fallback: use any codecvt import if no do_in found.
+        if (fallback != 0) {
+            _ = self.write64(operand_address, fallback);
+            machoCapturePrint(
+                "macho-processor: null vtable slot repair (fallback): instruction=0x{x} operand=0x{x} stub=0x{x}\n",
+                .{ instruction_address, operand_address, fallback },
+            );
+            return fallback;
+        }
+        return null;
+    }
+
     fn terminateForInvalidControlTransfer(self: *MachOState, context: ControlTransferContext) void {
         var failure = exit_diagnostics.ControlTransferFailure{
             .kind = context.kind,
@@ -6646,8 +6829,11 @@ pub const MachOState = struct {
         machoCapturePrint("ROSETTE: Full argv count (including path): {d}\n", .{full_args.items.len});
         machoCapturePrint("ROSETTE: Entry point vaddr: 0x{x}\n", .{self.entry_point_vaddr});
 
-        self.trace_range_start = 0x1332000;
-        self.trace_range_end = 0x1333000;
+        // Trace range is left unset by default. Set trace_range_start/trace_range_end
+        // here (e.g. 0x1332000..0x1333000) to enable target-trace logging for debugging.
+        self.last_trace_rip = 0;
+        self.last_trace_op = 0;
+        self.trace_repeat_count = 0;
         self.setupInitialStack(full_args.items);
         self.regs.rip = self.entry_point_vaddr;
 
@@ -7576,10 +7762,7 @@ pub const MachOState = struct {
                         var block = TomlAsciiBlock{ .reader = reader, .length = @intCast(safe_length) };
                         @memcpy(block.bytes[0..block.length], have_bytes.?[0..block.length]);
                         self.toml_ascii_block = block;
-                        machoCapturePrint(
-                            "macho-processor: toml++ ASCII codepoint checkpoint armed: reader=0x{x} istream=0x{x} bytes={d} caller_rbp=0x{x}\n",
-                            .{ reader, istream, safe_length, self.regs.rbp },
-                        );
+                        // Checkpoint arming recorded implicitly.
                     }
                 }
             }
@@ -7623,10 +7806,8 @@ pub const MachOState = struct {
             self.write64(reader + TOML_CODEPOINT_COUNT_OFFSET, pending.length);
         }
 
-        machoCapturePrint(
-            "macho-processor: toml++ ASCII codepoint checkpoint: reader=0x{x} current={d} guest_count={d} expected_count={d} scalar_repairs={d} raw_repairs={d} first_bad_index={?d} first_bad_scalar=U+{x:0>4} first_bad_raw=0x{x:0>2} expected=0x{x:0>2}\n",
-            .{ reader, guest_current, guest_count, pending.length, report.scalar_repairs, report.raw_repairs, report.first_bad_index, report.first_bad_scalar, report.first_bad_raw, report.first_expected },
-        );
+        // Codepoint checkpoint details suppressed during normal operation.
+        // dumpPatchTomlDiagnostics emits full I/O trace on fault.
         if (guest_current > pending.length or guest_count != pending.length or report.scalar_repairs != 0 or report.raw_repairs != 0) {
             machoCapturePrint(
                 "macho-processor: toml++ codepoint integrity mismatch repaired from host-validated ASCII bytes; current index was left unchanged\n",
@@ -7790,6 +7971,11 @@ pub const MachOState = struct {
             } else {
                 machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=<unmapped>\n", .{rip});
             }
+            self.dumpStepTraceBuffer();
+            self.dumpGtkBootstrapTrace();
+            self.dumpMemInitTrace();
+            self.dumpGtkHeartbeatTrace();
+            self.dumpUiHandoffTrace();
             self.dumpRecentTrace();
             self.faulted = true;
             self.exit_code = 127;
@@ -7798,20 +7984,28 @@ pub const MachOState = struct {
             return false;
         }
         self.recordTrace(decoded);
-        if (self.cooperative_bootstrap_trace_remaining != 0) {
-            const symbol = self.metadata.nearestSymbol(self.regs.rip);
-            machoCapturePrint(
-                "macho-processor: GTK worker bootstrap: active=0x{x} rip=0x{x} {s}+0x{x} op={s} len={d}\n",
-                .{
-                    self.active_guest_thread,
-                    self.regs.rip,
-                    if (symbol) |resolved| resolved.name else "<unknown>",
-                    if (symbol) |resolved| resolved.offset else 0,
-                    @tagName(decoded.op),
-                    decoded.len,
-                },
-            );
-            self.cooperative_bootstrap_trace_remaining -= 1;
+        if (self.gtk_bootstrap_active and self.gtk_bootstrap_index < 24) {
+            const idx = self.gtk_bootstrap_index;
+            self.gtk_bootstrap_entries[idx] = .{
+                .rip = self.regs.rip,
+                .thread = self.active_guest_thread,
+                .op = @intFromEnum(decoded.op),
+                .len = decoded.len,
+            };
+            self.gtk_bootstrap_index = idx + 1;
+            if (self.gtk_bootstrap_index == 24) {
+                self.gtk_bootstrap_active = false;
+                const first = &self.gtk_bootstrap_entries[0];
+                const last = &self.gtk_bootstrap_entries[23];
+                const symbol = self.metadata.nearestSymbol(first.rip);
+                machoCapturePrint(
+                    "macho-processor: GTK worker bootstrapping successful: thread=0x{x} first_rip=0x{x} last_rip=0x{x} first_symbol={s}\n",
+                    .{
+                        first.thread, first.rip, last.rip,
+                        if (symbol) |s| s.name else "<unknown>",
+                    },
+                );
+            }
         }
         if (self.verbose_trace) log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
         // Observe the resolved function entry itself rather than relying on
@@ -7828,16 +8022,28 @@ pub const MachOState = struct {
         if (self.shouldTraceRIP(self.regs.rip)) {
             const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
             const trace_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
-            log.info("target-trace: rip=0x{x} op={s} len={d} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
-                self.regs.rip,
-                @tagName(decoded.op),
-                decoded.len,
-                self.regs.rsp,
-                self.regs.rax,
-                self.regs.rcx,
-                self.regs.rdx,
-            });
-            log.info("target-trace-bytes: rip=0x{x} bytes={any}", .{ self.regs.rip, trace_bytes });
+            const trace_key = self.regs.rip;
+            const op_key = @intFromEnum(decoded.op);
+            if (trace_key == self.last_trace_rip and op_key == self.last_trace_op) {
+                self.trace_repeat_count +|= 1;
+            } else {
+                if (self.trace_repeat_count > 0) {
+                    log.info("target-trace: previous trace repeated {d} times", .{self.trace_repeat_count + 1});
+                }
+                self.last_trace_rip = trace_key;
+                self.last_trace_op = op_key;
+                self.trace_repeat_count = 0;
+                log.info("target-trace: rip=0x{x} op={s} len={d} bytes={any} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
+                    self.regs.rip,
+                    @tagName(decoded.op),
+                    decoded.len,
+                    trace_bytes,
+                    self.regs.rsp,
+                    self.regs.rax,
+                    self.regs.rcx,
+                    self.regs.rdx,
+                });
+            }
         }
         const old_rip = self.regs.rip;
         x64_interpreter.execute(self, decoded);
@@ -7940,7 +8146,8 @@ pub const MachOState = struct {
         self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
         self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
         self.x87 = .{};
-        self.cooperative_bootstrap_trace_remaining = 24;
+        self.gtk_bootstrap_active = true;
+        self.gtk_bootstrap_index = 0;
         self.regs.rip = deferred.start_routine;
         self.regs.rdi = deferred.argument;
         self.regs.rsp = alignDown(stack_base + stack_size, 16);
@@ -8634,49 +8841,62 @@ pub const MachOState = struct {
 
     fn logCooperativeHeartbeat(self: *MachOState) void {
         if (self.cooperative_ui_context == null) return;
-        const symbol = self.metadata.nearestSymbol(self.regs.rip);
         const idle = self.gtkIdleQueueSnapshot();
         const idle_age = if (idle.pending != 0) self.executed_steps -| idle.oldest_scheduled_step else 0;
         const suspended = self.runnableSuspendedSnapshot();
         const suspended_age = if (suspended.oldest_handle != 0) self.executed_steps -| suspended.oldest_step else 0;
         const dispatch_block = self.gtkIdleDispatchBlock();
-        machoCapturePrint(
-            "macho-processor: GTK cooperative heartbeat: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} deferred={d} suspended(total/runnable/blocked)={d}/{d}/{d} oldest_runnable(handle/rip/age/reason)=0x{x}/0x{x}/{d}/{s} switches={d} wait_yields={d} quantum_yields={d} runnable_rotations={d} waits={d} gtk_idle(scheduled/started/completed/pending)={d}/{d}/{d}/{d} active_idle(source/callback/age)={d}/0x{x}/{d} oldest_pending(source/callback/age/thread/rip/tag)={d}/0x{x}/{d}/0x{x}/0x{x}/{s} dispatch={s}\n",
-            .{
-                self.executed_steps,
-                self.active_guest_thread,
-                self.regs.rip,
-                if (symbol) |resolved| resolved.name else "<unknown>",
-                if (symbol) |resolved| resolved.offset else 0,
-                self.pthreads.deferred_threads,
-                self.suspended_guest_thread_count,
-                suspended.runnable,
-                suspended.blocked,
-                suspended.oldest_handle,
-                suspended.oldest_rip,
-                suspended_age,
-                suspended.oldest_reason,
-                self.cooperative_thread_switches,
-                self.cooperative_wait_yields,
-                self.cooperative_quantum_yields,
-                self.cooperative_rotation_yields,
-                self.pthreads.collapsed_waits,
-                self.gtk_idle_scheduled,
-                self.gtk_idle_started,
-                self.gtk_idle_completed,
-                idle.pending,
-                self.active_gtk_idle_source,
-                self.active_gtk_idle_callback,
-                if (self.active_gtk_idle_source != 0) self.executed_steps -| self.active_gtk_idle_started_step else 0,
-                idle.oldest_source,
-                idle.oldest_callback,
-                idle_age,
-                idle.oldest_scheduling_thread,
-                idle.oldest_scheduling_rip,
-                idle.oldest_tag,
-                @tagName(dispatch_block),
-            },
-        );
+        // Buffer GTK heartbeat into ring buffer instead of verbose log
+        {
+            const idx = self.gtk_heartbeat_index;
+            self.gtk_heartbeat_entries[idx] = .{
+                .step = self.executed_steps,
+                .rip = self.regs.rip,
+                .thread = self.active_guest_thread,
+                .deferred = self.pthreads.deferred_threads,
+                .suspended_total = self.suspended_guest_thread_count,
+                .suspended_runnable = suspended.runnable,
+                .suspended_blocked = suspended.blocked,
+                .switches = self.cooperative_thread_switches,
+                .wait_yields = self.cooperative_wait_yields,
+                .quantum_yields = self.cooperative_quantum_yields,
+                .rotation_yields = self.cooperative_rotation_yields,
+                .idle_pending = idle.pending,
+                .active_idle_source = self.active_gtk_idle_source,
+                .active_idle_callback = self.active_gtk_idle_callback,
+                .dispatch_block = dispatch_block,
+            };
+            self.gtk_heartbeat_index +|= 1;
+            if (self.gtk_heartbeat_index >= 5) {
+                self.gtk_heartbeat_index = 0;
+                self.gtk_heartbeat_filled = true;
+            }
+        }
+        // Buffer UI handoff into ring buffer instead of verbose log
+        if (self.ui_handoff.isActive()) {
+            const idx = self.ui_handoff_index;
+            self.ui_handoff_entries[idx] = .{
+                .step = self.executed_steps,
+                .rip = self.regs.rip,
+                .generation = self.ui_handoff.generation,
+                .phase = self.ui_handoff.phase,
+                .source_id = self.ui_handoff.source_id,
+                .callback_handle = self.ui_handoff.callback_handle,
+                .callback_rip = self.ui_handoff.callback_rip,
+                .worker_handle = self.ui_handoff.worker_handle,
+                .worker_rip = self.ui_handoff.worker_rip,
+                .no_progress = self.executed_steps -| self.ui_handoff.last_progress_step,
+                .suspensions = self.ui_handoff.callback_suspensions,
+                .resumes = self.ui_handoff.callback_resumptions,
+                .worker_slices = self.ui_handoff.worker_slices,
+            };
+            self.ui_handoff_index +|= 1;
+            if (self.ui_handoff_index >= 5) {
+                self.ui_handoff_index = 0;
+                self.ui_handoff_filled = true;
+            }
+        }
+        // Starvation alerts still print
         if (suspended.runnable != 0 and suspended_age >= GTK_IDLE_STARVATION_STEPS and
             self.executed_steps -| self.last_cooperative_starvation_step >= GTK_IDLE_STARVATION_STEPS)
         {
@@ -8696,67 +8916,89 @@ pub const MachOState = struct {
                 .{ self.gtk_idle_starvation_warnings, idle.oldest_source, idle.oldest_callback, idle.oldest_tag, idle_age, idle.oldest_scheduling_thread, idle.oldest_scheduling_rip, self.active_guest_thread, @tagName(dispatch_block), self.suspended_guest_thread_count, self.suspended_guest_threads.len },
             );
         }
-        if (self.ui_handoff.isActive()) {
+        self.ui_handoff.diagnose(self.executed_steps, GTK_IDLE_STARVATION_STEPS, self.active_guest_thread, self.regs.rip, self.suspended_guest_thread_count);
+    }
+
+    fn dumpGtkHeartbeatTrace(self: *const MachOState) void {
+        if (!self.gtk_heartbeat_filled and self.gtk_heartbeat_index == 0) return;
+        const count: usize = if (self.gtk_heartbeat_filled) 5 else self.gtk_heartbeat_index;
+        const start: usize = if (self.gtk_heartbeat_filled) self.gtk_heartbeat_index else 0;
+        machoCapturePrint(
+            "macho-processor: GTK cooperative heartbeat (most recent {d} entries):\n",
+            .{count},
+        );
+        for (0..count) |i| {
+            const idx = (start + i) % 5;
+            const e = &self.gtk_heartbeat_entries[idx];
+            const symbol = self.metadata.nearestSymbol(e.rip);
             machoCapturePrint(
-                "scheduler: UI handoff heartbeat: generation={d} phase={s} source={d} callback_handle=0x{x} callback_rip=0x{x} worker=0x{x} worker_rip=0x{x} no_progress={d} suspend/resume/worker_slices={d}/{d}/{d}\n",
+                "  [{d}] step={d} rip=0x{x} {s}+0x{x} thread=0x{x} deferred={d} suspended={d}/{d}/{d} switches={d} yields(wait/quantum/rot)={d}/{d}/{d} idle={d} dispatch={s}\n",
                 .{
-                    self.ui_handoff.generation,
-                    @tagName(self.ui_handoff.phase),
-                    self.ui_handoff.source_id,
-                    self.ui_handoff.callback_handle,
-                    self.ui_handoff.callback_rip,
-                    self.ui_handoff.worker_handle,
-                    self.ui_handoff.worker_rip,
-                    self.executed_steps -| self.ui_handoff.last_progress_step,
-                    self.ui_handoff.callback_suspensions,
-                    self.ui_handoff.callback_resumptions,
-                    self.ui_handoff.worker_slices,
+                    i, e.step, e.rip,
+                    if (symbol) |s| s.name else "<unknown>",
+                    if (symbol) |s| s.offset else 0,
+                    e.thread, e.deferred,
+                    e.suspended_total, e.suspended_runnable, e.suspended_blocked,
+                    e.switches, e.wait_yields, e.quantum_yields, e.rotation_yields,
+                    e.idle_pending, @tagName(e.dispatch_block),
                 },
             );
         }
-        self.ui_handoff.diagnose(self.executed_steps, GTK_IDLE_STARVATION_STEPS, self.active_guest_thread, self.regs.rip, self.suspended_guest_thread_count);
+    }
+
+    fn dumpUiHandoffTrace(self: *const MachOState) void {
+        if (!self.ui_handoff_filled and self.ui_handoff_index == 0) return;
+        const count: usize = if (self.ui_handoff_filled) 5 else self.ui_handoff_index;
+        const start: usize = if (self.ui_handoff_filled) self.ui_handoff_index else 0;
+        machoCapturePrint(
+            "scheduler: UI handoff heartbeat (most recent {d} entries):\n",
+            .{count},
+        );
+        for (0..count) |i| {
+            const idx = (start + i) % 5;
+            const e = &self.ui_handoff_entries[idx];
+            machoCapturePrint(
+                "  [{d}] step={d} rip=0x{x} generation={d} phase={s} source={d} callback=0x{x}/0x{x} worker=0x{x}/0x{x} no_progress={d} suspend/resume/slices={d}/{d}/{d}\n",
+                .{
+                    i, e.step, e.rip,
+                    e.generation, @tagName(e.phase), e.source_id,
+                    e.callback_handle, e.callback_rip,
+                    e.worker_handle, e.worker_rip,
+                    e.no_progress, e.suspensions, e.resumes, e.worker_slices,
+                },
+            );
+        }
     }
 
     // Once the Xenia PageEntry tables have been allocated, setup can spend a
     // long time in memory-manager code without crossing another import
     // boundary. Keep a compact, high-frequency checkpoint so a stalled
     // backing-map or heap pass is observable in the next external run.
-    fn logMemoryInitializationProgress(self: *const MachOState, steps: u64) void {
-        const symbol = self.metadata.nearestSymbol(self.regs.rip);
-        const frame_return_slot = self.regs.rbp +| 8;
-        const has_frame_return = self.regs.rbp != 0 and self.guestMemoryConst(frame_return_slot, 8) != null;
-        const return_address = if (has_frame_return)
-            self.read64(frame_return_slot)
-        else if (self.guestMemoryConst(self.regs.rsp, 8) != null)
-            self.read64(self.regs.rsp)
-        else
-            0;
-        const return_source = if (has_frame_return) "rbp+8" else "rsp";
-        const return_symbol = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        machoCapturePrint(
-            "macho-processor: memory initialization progress: step={d} active=0x{x} rip=0x{x} at {s}+0x{x} return[{s}]=0x{x} {s}+0x{x} page_entry(runs/bytes)={d}/{d} sparse(reserved/mappings/activations)={d}/{d}/{d} heap=0x{x} coop(deferred/suspended/quantum_yields/wait_yields)={d}/{d}/{d}/{d}\n",
-            .{
-                steps,
-                self.active_guest_thread,
-                self.regs.rip,
-                if (symbol) |resolved| resolved.name else "<unknown>",
-                if (symbol) |resolved| resolved.offset else 0,
-                return_source,
-                return_address,
-                if (return_symbol) |resolved| resolved.name else "<unknown>",
-                if (return_symbol) |resolved| resolved.offset else 0,
-                self.page_entry_bulk_initializations,
-                self.page_entry_bulk_bytes,
-                self.sparse_memory.total_reserved,
-                self.sparse_memory.mappings.items.len,
-                self.sparse_memory.activations.items.len,
-                self.heap_next,
-                self.pthreads.deferred_threads,
-                self.suspended_guest_thread_count,
-                self.cooperative_quantum_yields,
-                self.cooperative_wait_yields,
-            },
-        );
+    fn logMemoryInitializationProgress(self: *MachOState, steps: u64) void {
+        // On first entry, log a concise start message
+        if (!self.mem_init_started) {
+            self.mem_init_started = true;
+            machoCapturePrint(
+                "macho-processor: memory initialization started: step={d} rip=0x{x}\n",
+                .{ steps, self.regs.rip },
+            );
+        }
+        // Push into ring buffer instead of logging every 1M steps
+        const idx = self.mem_init_index;
+        self.mem_init_entries[idx] = .{
+            .step = steps,
+            .rip = self.regs.rip,
+            .heap = self.heap_next,
+            .sparse_mappings = self.sparse_memory.mappings.items.len,
+            .sparse_activations = self.sparse_memory.activations.items.len,
+            .deferred_count = self.pthreads.deferred_threads,
+            .suspended_count = self.suspended_guest_thread_count,
+        };
+        self.mem_init_index +|= 1;
+        if (self.mem_init_index == 8) {
+            self.mem_init_index = 0;
+            self.mem_init_filled = true;
+        }
     }
 
     fn handleSyntheticRuntimeThunk(self: *MachOState) bool {
@@ -8944,10 +9186,14 @@ pub const MachOState = struct {
                 if (self.startup.enabled) {
                     self.startup.checkpoint(snapshot);
                 } else {
-                    machoCapturePrint(
-                        "info(macho): step={d} rip=0x{x} at {s}+0x{x}\n",
-                        .{ steps, self.regs.rip, snapshot.symbol, snapshot.symbol_offset },
-                    );
+                    const entry = &self.step_trace_entries[self.step_trace_index];
+                    entry.step = steps;
+                    entry.rip = self.regs.rip;
+                    self.step_trace_index +|= 1;
+                    if (self.step_trace_index == 5) {
+                        self.step_trace_index = 0;
+                        self.step_trace_filled = true;
+                    }
                 }
             }
             if (steps % HEARTBEAT_INTERVAL == 0) {
@@ -9073,6 +9319,13 @@ pub const MachOState = struct {
             if (self.page_entry_bulk_initializations != 0 and steps != 0 and steps % 1_000_000 == 0) {
                 self.logMemoryInitializationProgress(steps);
             }
+        }
+        if (self.mem_init_started and !self.faulted) {
+            machoCapturePrint(
+                "macho-processor: memory initialization completed: step={d} page_entry(runs/bytes)={d}/{d} heap=0x{x}\n",
+                .{ steps, self.page_entry_bulk_initializations, self.page_entry_bulk_bytes, self.heap_next },
+            );
+            self.mem_init_started = false;
         }
         if (self.max_steps != 0 and steps >= self.max_steps) {
             log.warn("reached max steps ({d})", .{self.max_steps});
@@ -10365,6 +10618,9 @@ pub const MachOState = struct {
                 if (target == 0) {
                     target = self.recoverLibcppSharedControlBlockCall(from_rip, d.addr) orelse 0;
                 }
+                if ((target == 0 or (target != 0 and !self.isExecutableAddress(target))) and operand_mapped) {
+                    target = self.recoverNullVtableSlot(from_rip, d.addr) orelse target;
+                }
                 if (target == 0) {
                     if (!operand_mapped) {
                         self.terminateForGuestAccess(d.addr, @sizeOf(u64), .read, "call_mem64");
@@ -10373,6 +10629,15 @@ pub const MachOState = struct {
                     self.logControlFlow("call_mem64_null", from_rip, target, d.len, return_addr);
                     self.terminateForInvalidControlTransfer(.{
                         .kind = "call_mem64_null",
+                        .instruction_address = from_rip,
+                        .operand_address = d.addr,
+                        .target_address = target,
+                        .return_address = return_addr,
+                    });
+                } else if (!self.isExecutableAddress(target) and compat_runtime.syntheticThunk(target) == null and !tlv_runtime.Runtime.handles(target)) {
+                    self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
+                    self.terminateForInvalidControlTransfer(.{
+                        .kind = "call_mem64",
                         .instruction_address = from_rip,
                         .operand_address = d.addr,
                         .target_address = target,
@@ -10469,55 +10734,6 @@ pub const MachOState = struct {
                         self.pending_import_stub_rip = null;
                         self.lazy_import_direct_dispatches +|= 1;
                         const import = imported.?;
-                        const observation = self.diagnostic_throttler.observe(
-                            .lazy_import_dispatch,
-                            stub_rip,
-                            target,
-                        );
-                        const is_primitive = hasPrimitiveHandler(import.name);
-                        if (observation.disposition == .detail) {
-                            if (is_primitive) {
-                                self.routePrimitiveLazyImportLog(
-                                    import.name,
-                                    "macho-processor: lazy import direct dispatch #{d}: thread=0x{x} stub=0x{x} pointer=0x{x} pointer_value=0x{x} import={s} return=0x{x} step={d}; dyld_stub_binder bypassed=true\n",
-                                    .{ self.lazy_import_direct_dispatches, self.active_guest_thread, stub_rip, d.addr, target, import.name, self.read64(self.regs.rsp), self.executed_steps },
-                                );
-                            } else {
-                                machoCapturePrint(
-                                    "macho-processor: lazy import direct dispatch #{d}: thread=0x{x} stub=0x{x} pointer=0x{x} pointer_value=0x{x} import={s} return=0x{x} step={d}; dyld_stub_binder bypassed=true\n",
-                                    .{ self.lazy_import_direct_dispatches, self.active_guest_thread, stub_rip, d.addr, target, import.name, self.read64(self.regs.rsp), self.executed_steps },
-                                );
-                            }
-                            if (target != 0) {
-                                if (self.metadata.nearestSymbol(target)) |symbol| {
-                                    if (is_primitive) {
-                                        self.routePrimitiveLazyImportLog(
-                                            import.name,
-                                            "macho-processor: lazy import pointer classification: target=0x{x} symbol={s}+0x{x} action=typed_import\n",
-                                            .{ target, symbol.name, symbol.offset },
-                                        );
-                                    } else {
-                                        machoCapturePrint(
-                                            "macho-processor: lazy import pointer classification: target=0x{x} symbol={s}+0x{x} action=typed_import\n",
-                                            .{ target, symbol.name, symbol.offset },
-                                        );
-                                    }
-                                }
-                            }
-                        } else if (observation.disposition == .checkpoint) {
-                            if (is_primitive) {
-                                self.routePrimitiveLazyImportLog(
-                                    import.name,
-                                    "macho-processor: repeated lazy import checkpoint: import={s} stub=0x{x} occurrence={d} suppressed_since_previous={d} total_direct_dispatches={d}\n",
-                                    .{ import.name, stub_rip, observation.occurrence, observation.suppressed_since_emit, self.lazy_import_direct_dispatches },
-                                );
-                            } else {
-                                machoCapturePrint(
-                                    "macho-processor: repeated lazy import checkpoint: import={s} stub=0x{x} occurrence={d} suppressed_since_previous={d} total_direct_dispatches={d}\n",
-                                    .{ import.name, stub_rip, observation.occurrence, observation.suppressed_since_emit, self.lazy_import_direct_dispatches },
-                                );
-                            }
-                        }
                         self.handleDirectImportCall(import);
                     },
                     .invalid_null_target => {

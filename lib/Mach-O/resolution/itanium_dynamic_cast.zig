@@ -49,6 +49,17 @@ const Matches = struct {
     }
 };
 
+const ResolvedEntry = struct {
+    source: u64,
+    result: u64,
+    source_type: u64,
+    destination_type: u64,
+    hint: i64,
+    strategy: Strategy,
+};
+
+const TRACE_BUFFER_SIZE: usize = 16;
+
 pub const Engine = struct {
     attempts: u64 = 0,
     resolved: u64 = 0,
@@ -58,6 +69,13 @@ pub const Engine = struct {
     failed_metadata: u64 = 0,
     ambiguous: u64 = 0,
     negative_hints: u64 = 0,
+    trace_buffer: [TRACE_BUFFER_SIZE]ResolvedEntry = undefined,
+    trace_index: usize = 0,
+    trace_filled: bool = false,
+    last_fail_source: u64 = 0,
+    last_fail_src_type: u64 = 0,
+    last_fail_dst_type: u64 = 0,
+    last_fail_hint: u64 = 0,
 
     pub fn resolve(
         self: *Engine,
@@ -77,6 +95,11 @@ pub const Engine = struct {
             self.resolved +|= 1;
             return .{ .address = source_object, .strategy = .same_type };
         }
+
+        self.last_fail_source = source_object;
+        self.last_fail_src_type = source_type;
+        self.last_fail_dst_type = destination_type;
+        self.last_fail_hint = offset_hint_raw;
 
         const source_vtable = readPointer(state, source_object) orelse return self.failMetadata();
         const offset_to_top = readSigned(state, source_vtable -| 16) orelse return self.failMetadata();
@@ -163,7 +186,7 @@ pub const Engine = struct {
     }
 
     fn trace(
-        self: *const Engine,
+        self: *Engine,
         state: anytype,
         source: u64,
         result: u64,
@@ -172,13 +195,43 @@ pub const Engine = struct {
         hint: i64,
         strategy: Strategy,
     ) void {
-        _ = self;
-        const source_name = typeName(state, source_type) orelse "<unknown>";
-        const destination_name = typeName(state, destination_type) orelse "<unknown>";
-        machoCapturePrint(
-            "macho-processor: __dynamic_cast resolved: strategy={s} source=0x{x} result=0x{x} hint={d} {s} -> {s}\n",
-            .{ @tagName(strategy), source, result, hint, source_name, destination_name },
-        );
+        _ = state;
+        const entry = &self.trace_buffer[self.trace_index];
+        entry.* = .{
+            .source = source,
+            .result = result,
+            .source_type = source_type,
+            .destination_type = destination_type,
+            .hint = hint,
+            .strategy = strategy,
+        };
+        self.trace_index = (self.trace_index + 1) % TRACE_BUFFER_SIZE;
+        if (self.trace_index == 0) self.trace_filled = true;
+    }
+
+    pub fn dumpTraceBuffer(self: *const Engine, state: anytype) void {
+        const count = if (self.trace_filled) TRACE_BUFFER_SIZE else self.trace_index;
+        if (count > 0) {
+            const start = if (self.trace_filled) self.trace_index else 0;
+            for (0..count) |i| {
+                const idx = (start + i) % TRACE_BUFFER_SIZE;
+                const entry = self.trace_buffer[idx];
+                const source_name = typeName(state, entry.source_type) orelse "<unknown>";
+                const dest_name = typeName(state, entry.destination_type) orelse "<unknown>";
+                machoCapturePrint(
+                    "macho-processor: __dynamic_cast resolved: strategy={s} source=0x{x} result=0x{x} hint={d} {s} -> {s}\n",
+                    .{ @tagName(entry.strategy), entry.source, entry.result, entry.hint, source_name, dest_name },
+                );
+            }
+        }
+        if (self.last_fail_source != 0) {
+            const source_name = typeName(state, self.last_fail_src_type) orelse "<unknown>";
+            const dest_name = typeName(state, self.last_fail_dst_type) orelse "<unknown>";
+            machoCapturePrint(
+                "macho-processor: __dynamic_cast FAILED: source=0x{x} source_type={s} dest_type={s} hint={d}\n",
+                .{ self.last_fail_source, source_name, dest_name, @as(i64, @bitCast(self.last_fail_hint)) },
+            );
+        }
     }
 };
 

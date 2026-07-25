@@ -228,7 +228,7 @@ pub const DecodeCacheEntry = struct {
 };
 
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
-pub const HEARTBEAT_INTERVAL: u64 = 5_000_000;
+pub const HEARTBEAT_INTERVAL: u64 = 25_000_000;
 
 pub const ImportHandlerResult = union(enum) {
     handled: u64,
