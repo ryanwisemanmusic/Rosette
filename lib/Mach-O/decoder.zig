@@ -3351,6 +3351,11 @@ pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
         .bits16
     else
         .bits32;
+    // The executor uses DecodedInsn.size for the accumulator, destination,
+    // source and flags. Merely selecting the byte/word Op below is not
+    // sufficient: DecodedInsn defaults to bits32, which made 0F B0 compare
+    // EAX and a dword even though it had decoded as cmpxchg_mem8_reg8.
+    d.size = sz;
     const modrm = bytes[pos];
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
@@ -3556,4 +3561,27 @@ pub fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
 
     d.len = @as(u8, @intCast(pos));
     return d;
+}
+
+test "CMPXCHG decoder preserves the opcode-selected operand width" {
+    // Xenia's TimerQueue compare_exchange_strong emits this exact instruction:
+    // lock cmpxchgb %dl, (%rcx)
+    const byte_memory = decodeInsn(&[_]u8{ 0xF0, 0x0F, 0xB0, 0x11 });
+    try std.testing.expectEqual(Op.cmpxchg_mem8_reg8, byte_memory.op);
+    try std.testing.expectEqual(Size.bits8, byte_memory.size);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, byte_memory.src_reg);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, byte_memory.sib_base_reg);
+    try std.testing.expect(byte_memory.lock);
+
+    const word_memory = decodeInsn(&[_]u8{ 0xF0, 0x66, 0x0F, 0xB1, 0x11 });
+    try std.testing.expectEqual(Op.cmpxchg_mem16_reg16, word_memory.op);
+    try std.testing.expectEqual(Size.bits16, word_memory.size);
+
+    const dword_memory = decodeInsn(&[_]u8{ 0xF0, 0x0F, 0xB1, 0x11 });
+    try std.testing.expectEqual(Op.cmpxchg_mem32_reg32, dword_memory.op);
+    try std.testing.expectEqual(Size.bits32, dword_memory.size);
+
+    const qword_memory = decodeInsn(&[_]u8{ 0xF0, 0x48, 0x0F, 0xB1, 0x11 });
+    try std.testing.expectEqual(Op.cmpxchg_mem64_reg64, qword_memory.op);
+    try std.testing.expectEqual(Size.bits64, qword_memory.size);
 }

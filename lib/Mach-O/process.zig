@@ -51,10 +51,12 @@ const export_table_lifecycle = @import("resolution/export_table_lifecycle.zig");
 const dynamic_export_registry = @import("resolution/dynamic_export_registry.zig");
 const thread_wait_profiler = @import("resolution/thread_wait_profiler.zig");
 const contract = @import("contract");
+const primitive = @import("primitive");
 const scheduler = @import("scheduler");
 const jit = @import("jit");
 const macho_log = @import("event_log.zig");
 const machoCapturePrint = macho_log.machoCapturePrint;
+const primitiveCapturePrint = macho_log.primitiveCapturePrint;
 
 test {
     std.testing.refAllDecls(symbol_assembly_context);
@@ -214,14 +216,19 @@ pub const MachOState = struct {
     last_guest_assertion_class: GuestAssertionClass = .none,
     last_guest_assertion_step: u64 = 0,
     last_guest_assertion_return: u64 = 0,
-    atomic_cmpxchg8: atomic_compare_exchange.Stats = .{},
-    classified_ud2_recoveries: u64 = 0,
-    timer_recovery_tracker: guest_assertion_recovery.TimerRecoveryTracker = .{},
+    atomic_cmpxchg: atomic_compare_exchange.Stats = .{},
+    timer_queue_watch: struct {
+        active: bool = false,
+        wait_item_addr: u64 = 0,
+        state_addr: u64 = 0,
+        thread: u64 = 0,
+        logged_writes: u64 = 0,
+    } = .{},
+    sha1_tracer: Sha1Tracer = .{},
     export_table_mgr: export_table_manager.Manager = .{},
     export_table_lc: export_table_lifecycle.Lifecycle = .{},
     export_registry: dynamic_export_registry.Registry = .{},
     wait_profiler: thread_wait_profiler.WaitProfileSystem = .{},
-    breakpoint_cleanup_recoveries: u64 = 0,
     diagnostic_throttler: diagnostic_throttle.Tracker = .{},
     libcpp_shared_control_blocks: libcpp_shared_control_block.Stats = .{},
     toml_ascii_fast_paths: u64 = 0,
@@ -343,6 +350,10 @@ pub const MachOState = struct {
     import_route_cache_misses: u64 = 0,
     import_route_cache_collisions: u64 = 0,
     import_route_cache_fallbacks: u64 = 0,
+    primitive_dispatch_hits: u64 = 0,
+    primitive_dispatch_counts: std.StringHashMap(u64),
+    primitive_dispatch_logged: std.AutoHashMap(u64, void),
+    primitive_lazy_logged: std.AutoHashMap(u64, void),
     page_entry_bulk_initializations: u64 = 0,
     page_entry_bulk_bytes: u64 = 0,
     initializer_memory: memory_transaction.Journal,
@@ -477,6 +488,9 @@ pub const MachOState = struct {
             .symbol_assembly = symbol_assembly_context.Tracker.init(allocator),
             .page_permissions = page_permissions,
             .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
+            .primitive_dispatch_counts = std.StringHashMap(u64).init(allocator),
+            .primitive_dispatch_logged = std.AutoHashMap(u64, void).init(allocator),
+            .primitive_lazy_logged = std.AutoHashMap(u64, void).init(allocator),
             .decode_cache = decode_cache,
             .mapped_min = mapped_min,
             .executable_min = executable_min,
@@ -593,6 +607,30 @@ pub const MachOState = struct {
         result.internal_targets.libcpp_atomic_bool_control_block_vtable = result.metadata.symbolAddressWithPrefix(
             libcpp_shared_control_block.atomic_bool_vtable_symbol_prefix,
         ) orelse 0;
+        result.internal_targets.sha1_process_bytes = result.metadata.symbolAddressWithPrefix(
+            "__ZN4sha14SHA112processBytesEPKvm",
+        ) orelse 0;
+        // Keep the entry-detection window local to processBytes. The SHA1
+        // methods are not contiguous in Xenia's Mach-O image; spanning from
+        // processBytes to processBlock includes unrelated XEX loader code and
+        // caused the tracer to auto-latch long before SHA1 was called.
+        const sha1_process_block = result.metadata.symbolAddressWithPrefix(
+            "__ZN4sha14SHA112processBlockEv",
+        ) orelse 0;
+        result.internal_targets.sha1_start =
+            result.internal_targets.sha1_process_bytes;
+        result.internal_targets.sha1_end =
+            result.internal_targets.sha1_process_bytes +| 0x40;
+        machoCapturePrint(
+            "macho-processor: SHA1 tracer init: enabled={} sha1_process_bytes=0x{x} sha1_range=0x{x}..0x{x} processBlock=0x{x}\n",
+            .{
+                result.sha1_tracer.enabled,
+                result.internal_targets.sha1_process_bytes,
+                result.internal_targets.sha1_start,
+                result.internal_targets.sha1_end,
+                sha1_process_block,
+            },
+        );
         if (result.metadata.sectionNamed("__TEXT", "__stub_helper")) |section| {
             result.stub_helper_start = section.address;
             result.stub_helper_end = section.address +| section.size;
@@ -631,6 +669,16 @@ pub const MachOState = struct {
         return result;
     }
 
+    fn dumpPrimitiveTotals(self: *MachOState) void {
+        if (self.primitive_dispatch_counts.count() == 0) return;
+        primitiveCapturePrint("primitive lib: === totals ===\n", .{});
+        var iter = self.primitive_dispatch_counts.iterator();
+        while (iter.next()) |entry| {
+            primitiveCapturePrint("primitive lib:   {s}: {d} dispatch(s)\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+        primitiveCapturePrint("primitive lib: === end totals ===\n", .{});
+    }
+
     pub fn deinit(self: *MachOState) void {
         self.scheduler_log.close();
         self.jit_log.close();
@@ -638,7 +686,11 @@ pub const MachOState = struct {
         self.guest_time.deinit(self.allocator);
         self.closeGuestFiles();
         self.libcxx_streams.deinit();
+        self.dumpPrimitiveTotals();
         self.local_libcpp_stream_targets.deinit();
+        self.primitive_dispatch_counts.deinit();
+        self.primitive_dispatch_logged.deinit();
+        self.primitive_lazy_logged.deinit();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
         self.vtt_resolver.deinit();
@@ -1165,6 +1217,31 @@ pub const MachOState = struct {
         return value;
     }
 
+    fn timerQueueWatchWrite(self: *MachOState, addr: u64, size: Size, val: u64) void {
+        if (!self.timer_queue_watch.active) return;
+        if (self.timer_queue_watch.logged_writes >= 32) {
+            self.timer_queue_watch.active = false;
+            return;
+        }
+        if (addr != self.timer_queue_watch.state_addr) return;
+        self.timer_queue_watch.logged_writes +|= 1;
+        const state_name = guest_assertion_recovery.timerQueueStateName(@as(u8, @truncate(val)));
+        const symbol = self.metadata.nearestSymbol(self.regs.rip);
+        machoCapturePrint(
+            "  timer queue state write #{d}: addr=0x{x} size={s} val={s}({d}) rip=0x{x} thread=0x{x} symbol={s}\n",
+            .{
+                self.timer_queue_watch.logged_writes,
+                addr,
+                @tagName(size),
+                state_name,
+                @as(u8, @truncate(val)),
+                self.regs.rip,
+                self.active_guest_thread,
+                if (symbol) |s| s.name else "<unknown>",
+            },
+        );
+    }
+
     pub fn writeMemVal(self: *MachOState, addr: u64, size: Size, val: u64) void {
         const bytes = bytesForSize(size);
         if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
@@ -1175,6 +1252,7 @@ pub const MachOState = struct {
                 .bits32 => std.mem.writeInt(u32, storage[0..4], @truncate(val), .little),
                 .bits64 => std.mem.writeInt(u64, storage[0..8], val, .little),
             }
+            self.timerQueueWatchWrite(addr, size, val);
             return;
         }
         const off = self.translateGuest(addr, bytes, .write) orelse {
@@ -1191,6 +1269,7 @@ pub const MachOState = struct {
             .bits32 => std.mem.writeInt(u32, self.mem[off..][0..4], @truncate(val), .little),
             .bits64 => std.mem.writeInt(u64, self.mem[off..][0..8], val, .little),
         }
+        self.timerQueueWatchWrite(addr, size, val);
     }
 
     fn bytesForSize(size: Size) u8 {
@@ -2649,7 +2728,104 @@ pub const MachOState = struct {
         return result;
     }
 
+    fn hasPrimitiveHandler(name: []const u8) bool {
+        return primitive.builtin().matchSymbol(name) != null;
+    }
+
+    fn routePrimitiveLazyImportLog(self: *MachOState, import_name: []const u8, comptime fmt: []const u8, args: anytype) void {
+        const key = std.hash_map.hashString(import_name);
+        if (!self.primitive_lazy_logged.contains(key)) {
+            self.primitive_lazy_logged.put(key, {}) catch {};
+            primitiveCapturePrint(fmt, args);
+        }
+    }
+
+    fn tryPrimitiveDispatch(self: *MachOState, imported: macho_metadata.ImportedSymbol) ?ImportHandlerResult {
+        const handler = primitive.builtin().matchSymbol(imported.name) orelse return null;
+        const slot = 0;
+        var ctx = primitive.PrimitiveContext{
+            .ptr = self,
+            .readArgFn = struct {
+                fn read(ptr: *anyopaque, index: u8) u64 {
+                    const st: *MachOState = @ptrCast(@alignCast(ptr));
+                    return switch (index) {
+                        0 => st.regs.rdi,
+                        1 => st.regs.rsi,
+                        2 => st.regs.rdx,
+                        3 => st.regs.rcx,
+                        4 => st.regs.r8,
+                        5 => st.regs.r9,
+                        else => 0,
+                    };
+                }
+            }.read,
+            .setResultFn = struct {
+                fn set(ptr: *anyopaque, value: u64) void {
+                    const st: *MachOState = @ptrCast(@alignCast(ptr));
+                    st.regs.rax = value;
+                }
+            }.set,
+            .readGuestFn = struct {
+                fn read(ptr: *const anyopaque, address: u64, size: usize) ?[]const u8 {
+                    const st: *const MachOState = @ptrCast(@alignCast(ptr));
+                    return st.guestMemoryConst(address, @intCast(size));
+                }
+            }.read,
+            .writeGuestFn = struct {
+                fn write(ptr: *anyopaque, address: u64, data: []const u8) ?void {
+                    const st: *MachOState = @ptrCast(@alignCast(ptr));
+                    const dest = st.guestMemory(address, @intCast(data.len)) orelse return null;
+                    @memcpy(dest[0..data.len], data);
+                    return {};
+                }
+            }.write,
+            .readCStringFn = struct {
+                fn read(ptr: *const anyopaque, address: u64) ?[]const u8 {
+                    const st: *const MachOState = @ptrCast(@alignCast(ptr));
+                    return st.guestCString(address, 4096);
+                }
+            }.read,
+        };
+        const result = handler(slot, &ctx);
+        const action = switch (result) {
+            .handled => "handled",
+            .handled_void => "handled_void",
+            .unsupported => "unsupported",
+            .fallback => "fallback",
+        };
+
+        const action_u8: u8 = @intFromEnum(result);
+        const name_hash = std.hash_map.hashString(imported.name);
+        const pair_key = name_hash ^ (@as(u64, action_u8) << 56);
+        if (!self.primitive_dispatch_logged.contains(pair_key)) {
+            self.primitive_dispatch_logged.put(pair_key, {}) catch {};
+            primitiveCapturePrint(
+                "primitive lib: slot={d} import={s} action={s}\n",
+                .{ slot, imported.name, action },
+            );
+        }
+
+        const gop = self.primitive_dispatch_counts.getOrPut(imported.name) catch
+            return switch (result) {
+                .handled => ImportHandlerResult{ .handled = self.regs.rax },
+                .handled_void => .handled_void,
+                .unsupported, .fallback => null,
+            };
+        if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+
+        return switch (result) {
+            .handled => ImportHandlerResult{ .handled = self.regs.rax },
+            .handled_void => .handled_void,
+            .unsupported, .fallback => null,
+        };
+    }
+
     fn handleImportImpl(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
+        if (self.tryPrimitiveDispatch(imported)) |result| {
+            self.primitive_dispatch_hits +|= 1;
+            return result;
+        }
+
         const cache_index = importRouteCacheIndex(imported.stub_address);
         const entry = &self.import_route_cache[cache_index];
         if (entry.valid and entry.stub_address == imported.stub_address) {
@@ -3047,6 +3223,17 @@ pub const MachOState = struct {
                                     .{ timerQueueStateName(snapshot.frame_state), snapshot.frame_state, timerQueueStateName(object_state), object_state },
                                 );
                             }
+                        }
+                        if (snapshot.wait_item != 0) {
+                            self.timer_queue_watch.active = true;
+                            self.timer_queue_watch.wait_item_addr = snapshot.wait_item;
+                            self.timer_queue_watch.state_addr = snapshot.wait_item + 0x50;
+                            self.timer_queue_watch.thread = self.active_guest_thread;
+                            self.timer_queue_watch.logged_writes = 0;
+                            machoCapturePrint(
+                                "  timer queue state watch activated: watching addr=0x{x} (wait_item+0x50) for next 32 writes on any thread\n",
+                                .{snapshot.wait_item + 0x50},
+                            );
                         }
                     } else {
                         machoCapturePrint(
@@ -3652,26 +3839,6 @@ pub const MachOState = struct {
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         }
         if (std.mem.eql(u8, name, "__Unwind_Resume") or std.mem.eql(u8, name, "__Unwind_Resume_or_Rethrow")) {
-            const outer_assertion = if (self.signal_frame_count != 0)
-                self.signal_frames[self.signal_frame_count - 1].assertion_class
-            else
-                GuestAssertionClass.none;
-            if (guest_assertion_recovery.shouldEscapeNullBreakpointUnwind(
-                self.regs.rdi,
-                self.last_guest_assertion_class,
-                outer_assertion,
-                self.signal_frame_count,
-            )) {
-                machoCapturePrint(
-                    "macho-processor: suppressing null __Unwind_Resume from nested breakpoint-handler fallout: outer_assertion={s} inner_assertion={s} signal_depth={d}; restoring outer signal context\n",
-                    .{ @tagName(outer_assertion), @tagName(self.last_guest_assertion_class), self.signal_frame_count },
-                );
-                if (self.finishGuestSignalReturn()) {
-                    self.breakpoint_cleanup_recoveries +|= 1;
-                    self.last_guest_assertion_class = .none;
-                    return .control_transferred;
-                }
-            }
             if (self.unwinder.resumePhaseTwo(self)) return .control_transferred;
             if (self.unwinder.exhaustedWithoutHandler()) {
                 machoCapturePrint(
@@ -4958,99 +5125,6 @@ pub const MachOState = struct {
             );
         }
         return 0;
-    }
-
-    fn tryRecoverClassifiedAssertionUd2(self: *MachOState, instruction_len: u8) bool {
-        if (self.last_guest_assertion_class != .timer_queue_wait_item_state) return false;
-        const step_delta = self.executed_steps -| self.last_guest_assertion_step;
-        const address_delta = if (self.regs.rip >= self.last_guest_assertion_return)
-            self.regs.rip - self.last_guest_assertion_return
-        else
-            self.last_guest_assertion_return - self.regs.rip;
-        const snapshot = guest_assertion_recovery.timerQueueSnapshot(self, self.regs.rbp) orelse return false;
-        const action = guest_assertion_recovery.timerQueueAction(
-            step_delta,
-            address_delta,
-            snapshot.frame_state,
-            snapshot.object_state,
-        );
-        switch (action) {
-            .none => return false,
-            .replay_false_negative_idle_cas => {
-                const disposition = self.timer_recovery_tracker.observe(snapshot, action, self.executed_steps);
-                if (disposition == .quarantine_repeated_generation) {
-                    if (!guest_assertion_recovery.quarantineRepeatedIdleGeneration(self, snapshot)) return false;
-                    self.classified_ud2_recoveries +|= 1;
-                    const owner = self.metadata.nearestSymbol(self.last_guest_assertion_return);
-                    machoCapturePrint(
-                        "macho-processor: timer recovery circuit breaker: wait_item=0x{x} due_ns={?d} interval_ns={?d} owner={s} repeated_generation_quarantined=true state=kIdle->kDisarmed resume=0x{x}; callback replay for this generation was already attempted\n",
-                        .{ snapshot.wait_item, snapshot.due_nanoseconds, snapshot.interval_nanoseconds, if (owner) |symbol| symbol.name else "<unknown>", self.regs.rip +% instruction_len },
-                    );
-                    self.scheduler_log.emit(.{
-                        .kind = .quiescence_recovery,
-                        .step = self.executed_steps,
-                        .thread = self.active_guest_thread,
-                        .object = snapshot.wait_item,
-                        .deadline_ns = snapshot.due_nanoseconds orelse 0,
-                        .reason = "stale_timer_generation_quarantined",
-                    });
-                    self.last_guest_assertion_class = .none;
-                    self.regs.rip +%= instruction_len;
-                    return true;
-                }
-                const replay_rip = guest_assertion_recovery.applyIdleCasReplay(
-                    self,
-                    snapshot,
-                    self.last_guest_assertion_return,
-                ) orelse return false;
-                self.classified_ud2_recoveries +|= 1;
-                const owner = self.metadata.nearestSymbol(self.last_guest_assertion_return);
-                const owner_address = if (owner) |symbol| self.last_guest_assertion_return -| symbol.offset else self.last_guest_assertion_return;
-                const observation = self.diagnostic_throttler.observe(
-                    .classified_ud2_recovery,
-                    owner_address,
-                    @intFromEnum(action),
-                );
-                if (observation.disposition == .detail) {
-                    machoCapturePrint(
-                        "macho-processor: classified UD2 recovery #{d}: timer queue strong CAS false-negative frame/live=kIdle; owner={s} wait_item=0x{x} state kIdle->kInCallback replay=0x{x} callback_pending=true step_delta={d} address_delta={d}\n",
-                        .{ self.classified_ud2_recoveries, if (owner) |symbol| symbol.name else "<unknown>", snapshot.wait_item, replay_rip, step_delta, address_delta },
-                    );
-                } else if (observation.disposition == .checkpoint) {
-                    machoCapturePrint(
-                        "macho-processor: repeated classified UD2 recovery checkpoint: owner={s} case=idle_cas_false_negative occurrence={d} suppressed_since_previous={d} total_recoveries={d}\n",
-                        .{ if (owner) |symbol| symbol.name else "<unknown>", observation.occurrence, observation.suppressed_since_emit, self.classified_ud2_recoveries },
-                    );
-                }
-                self.last_guest_assertion_class = .none;
-                self.regs.rip = replay_rip;
-                return true;
-            },
-            .quarantine_callback_owned_duplicate => {
-                self.classified_ud2_recoveries +|= 1;
-                const owner = self.metadata.nearestSymbol(self.last_guest_assertion_return);
-                const owner_address = if (owner) |symbol| self.last_guest_assertion_return -| symbol.offset else self.last_guest_assertion_return;
-                const observation = self.diagnostic_throttler.observe(
-                    .classified_ud2_recovery,
-                    owner_address,
-                    (@as(u64, @intFromEnum(action)) << 8) | snapshot.frame_state,
-                );
-                if (observation.disposition == .detail) {
-                    machoCapturePrint(
-                        "macho-processor: classified UD2 recovery #{d}: duplicate timer queue reference owner={s} frame/live={s}; wait_item=0x{x} action=quarantine_duplicate resume=0x{x} step_delta={d} address_delta={d}\n",
-                        .{ self.classified_ud2_recoveries, if (owner) |symbol| symbol.name else "<unknown>", timerQueueStateName(snapshot.frame_state), snapshot.wait_item, self.regs.rip +% instruction_len, step_delta, address_delta },
-                    );
-                } else if (observation.disposition == .checkpoint) {
-                    machoCapturePrint(
-                        "macho-processor: repeated classified UD2 recovery checkpoint: owner={s} case=callback_owned_duplicate state={s} occurrence={d} suppressed_since_previous={d} total_recoveries={d}\n",
-                        .{ if (owner) |symbol| symbol.name else "<unknown>", timerQueueStateName(snapshot.frame_state), observation.occurrence, observation.suppressed_since_emit, self.classified_ud2_recoveries },
-                    );
-                }
-                self.last_guest_assertion_class = .none;
-                self.regs.rip +%= instruction_len;
-                return true;
-            },
-        }
     }
 
     fn deliverGuestSignal(
@@ -7740,6 +7814,17 @@ pub const MachOState = struct {
             self.cooperative_bootstrap_trace_remaining -= 1;
         }
         if (self.verbose_trace) log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
+        // Observe the resolved function entry itself rather than relying on
+        // the preceding call target. Lazy-import stubs may transfer here via a
+        // jump after Rosette has already handled the original call.
+        if (self.sha1_tracer.enabled and
+            self.internal_targets.sha1_process_bytes != 0 and
+            self.regs.rip == self.internal_targets.sha1_process_bytes)
+        {
+            self.sha1_tracer.entry_rip = self.regs.rip;
+            self.sha1_tracer.instruction_count = 0;
+            self.sha1_tracer.onProcessBytesEntry(self);
+        }
         if (self.shouldTraceRIP(self.regs.rip)) {
             const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
             const trace_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
@@ -7758,6 +7843,41 @@ pub const MachOState = struct {
         x64_interpreter.execute(self, decoded);
         if (!self.terminated and self.regs.rip == old_rip) {
             self.regs.rip +%= decoded.len;
+        }
+        // Unconditional SHA1 range detection: if RIP is inside the known SHA1
+        // address range and the tracer hasn't latched an entry point yet,
+        // auto-latch and force-enable the tracer so progress logging fires.
+        if (!self.terminated and
+            self.internal_targets.sha1_start != 0 and
+            self.internal_targets.sha1_end != 0)
+        {
+            const rip = self.regs.rip;
+            if (rip >= self.internal_targets.sha1_start and rip < self.internal_targets.sha1_end) {
+                if (self.sha1_tracer.entry_rip == 0) {
+                    self.sha1_tracer.entry_rip = rip;
+                    machoCapturePrint(
+                        "macho-processor: SHA1 tracer auto-latched: entry_rip=0x{x} step={d}\n",
+                        .{ rip, self.executed_steps },
+                    );
+                }
+            }
+        }
+
+        if (!self.terminated and self.sha1_tracer.enabled and self.sha1_tracer.entry_rip != 0) {
+            self.sha1_tracer.instruction_count += 1;
+            if (self.sha1_tracer.instruction_count == Sha1Tracer.HOT_THRESHOLD and !self.sha1_tracer.initial_report_done) {
+                self.sha1_tracer.hot_function_rip = self.sha1_tracer.entry_rip;
+                self.sha1_tracer.detected_at_step = self.executed_steps;
+                self.sha1_tracer.initial_report_done = true;
+                self.sha1_tracer.logSha1EntryCall(self);
+            }
+            if (self.sha1_tracer.initial_report_done and self.sha1_tracer.depth == 0) {
+                self.sha1_tracer.progress_log_counter += 1;
+                if (self.sha1_tracer.progress_log_counter >= Sha1Tracer.PROGRESS_LOG_INTERVAL) {
+                    self.sha1_tracer.progress_log_counter = 0;
+                    self.sha1_tracer.logSha1Progress(self);
+                }
+            }
         }
         return !self.terminated;
     }
@@ -8121,10 +8241,19 @@ pub const MachOState = struct {
         // dependency is waiting for a slice. Preempt only at a full quantum;
         // the callback context remains stored and retains handoff ownership.
         if (idle_callback_running) {
-            if (self.ui_handoff.callbackQuantumAction(self.pthreads.deferred_threads, suspended.runnable) == .rendezvous_worker) {
-                self.cooperative_quantum_steps +|= 1;
-                if (self.cooperative_quantum_steps >= COOPERATIVE_THREAD_QUANTUM_STEPS) {
-                    self.cooperative_quantum_steps = 0;
+            // Always count quantum steps while the callback is running so
+            // that we periodically register progress.  The tracker only
+            // updates last_progress_step on explicit state transitions
+            // (callbackStarted, callbackSuspended, workerStarted, …), so
+            // a long pure-computation inside the callback (e.g. SHA-1
+            // hash for memory initialisation) would otherwise trigger a
+            // false callback_stalled health with no_progress > stall_steps.
+            self.cooperative_quantum_steps +|= 1;
+            if (self.cooperative_quantum_steps >= COOPERATIVE_THREAD_QUANTUM_STEPS) {
+                self.cooperative_quantum_steps = 0;
+                self.ui_handoff.registerProgress(self.executed_steps);
+
+                if (self.ui_handoff.callbackQuantumAction(self.pthreads.deferred_threads, suspended.runnable) == .rendezvous_worker) {
                     self.ui_callback_retained_quanta +|= 1;
                     const callback = self.active_guest_thread;
                     if (self.yieldActiveGuestThreadForWait("UI callback worker rendezvous")) {
@@ -8742,6 +8871,10 @@ pub const MachOState = struct {
 
     pub fn run(self: *MachOState) void {
         var steps: u64 = 0;
+        machoCapturePrint(
+            "macho-processor: CMPXCHG contract active — 0F B0 executes at byte width, flags use ACC-DEST, and assertion-triggered CAS repair paths are absent.\n",
+            .{},
+        );
         while (!self.terminated and stepBudgetAllows(self.max_steps, steps)) : (steps +|= 1) {
             self.executed_steps = steps;
 
@@ -9044,10 +9177,55 @@ pub const MachOState = struct {
                 .{ self.profile_account_flow.attempts, self.profile_account_flow.successes, self.profile_account_flow.failures, self.profile_account_flow.active, @tagName(self.profile_account_flow.stage), self.profile_account_flow.xuid, self.profile_account_flow.bytes_read, self.profile_account_flow.requested_bytes },
             );
         }
-        if (self.atomic_cmpxchg8.operations != 0 or self.classified_ud2_recoveries != 0 or self.breakpoint_cleanup_recoveries != 0) {
+        if (self.atomic_cmpxchg.operations != 0) {
             machoCapturePrint(
-                "macho-processor: atomic/UD2 robustness: cmpxchg8(operations/successes/failures)={d}/{d}/{d} classified_ud2_recoveries={d} timer_recovery(allowed/quarantined)={d}/{d} breakpoint_cleanup_recoveries={d} ownership={s}\n",
-                .{ self.atomic_cmpxchg8.operations, self.atomic_cmpxchg8.successes, self.atomic_cmpxchg8.failures, self.classified_ud2_recoveries, self.timer_recovery_tracker.allowed, self.timer_recovery_tracker.quarantined, self.breakpoint_cleanup_recoveries, if (self.atomic_cmpxchg8.indicatesDecoderGap(self.classified_ud2_recoveries)) "rosette_decoder_gap" else "no_decoder_gap_observed" },
+                "macho-processor: atomic outcomes: cmpxchg(operations/matches/mismatches)={d}/{d}/{d}; mismatches are architectural outcomes, not runtime failures\n",
+                .{ self.atomic_cmpxchg.operations, self.atomic_cmpxchg.matches, self.atomic_cmpxchg.mismatches },
+            );
+        }
+
+        // === SHA1 verification diagnostics ===
+        if (self.sha1_tracer.initial_report_done) {
+            machoCapturePrint(
+                "macho-processor: SHA1 hash verification: hot_function_rip=0x{x} this=0x{x} data=0x{x} length={d} last_block_index={d} last_byte_count={d} step_first_detected={d}\n",
+                .{
+                    self.sha1_tracer.hot_function_rip,
+                    self.sha1_tracer.sha1_this_ptr,
+                    self.sha1_tracer.sha1_data_ptr,
+                    self.sha1_tracer.sha1_byte_len,
+                    self.sha1_tracer.last_block_index,
+                    self.sha1_tracer.last_byte_count,
+                    self.sha1_tracer.detected_at_step,
+                },
+            );
+            machoCapturePrint(
+                "macho-processor: SHA1 processBytes summary: entry_count={d} repeat_count={d} repeat_detected={} last_data=0x{x} last_length={d}\n",
+                .{
+                    self.sha1_tracer.process_bytes_entry_count,
+                    self.sha1_tracer.pb_repeat_count,
+                    self.sha1_tracer.pb_repeat_detected,
+                    self.sha1_tracer.pb_data_ptr,
+                    self.sha1_tracer.pb_byte_len,
+                },
+            );
+            if (self.guest_assertion_count == 0) {
+                machoCapturePrint(
+                    "macho-processor: SHA1 progress: no assertion recovery or guest assertion was observed while the hash loop advanced\n",
+                    .{},
+                );
+            }
+        }
+
+        // === generic verification gate ===
+        if (self.guest_assertion_count == 0) {
+            machoCapturePrint(
+                "macho-processor: runtime invariant check: PASS — cmpxchg operations={d} matches={d} mismatches={d}; no guest assertion\n",
+                .{ self.atomic_cmpxchg.operations, self.atomic_cmpxchg.matches, self.atomic_cmpxchg.mismatches },
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: runtime invariant check: FAIL — guest_assertions={d}; cmpxchg mismatches={d} are reported only as context\n",
+                .{ self.guest_assertion_count, self.atomic_cmpxchg.mismatches },
             );
         }
         self.diagnostic_throttler.logSummary();
@@ -9396,28 +9574,311 @@ pub const MachOState = struct {
         exit_diagnostics.logExitReport(report);
     }
 
+    fn releaseBarrier() void {
+        if (comptime @import("builtin").target.cpu.arch == .aarch64) {
+            asm volatile ("dmb ish" ::: .{ .memory = true });
+        } else {
+            asm volatile ("mfence" ::: .{ .memory = true });
+        }
+    }
+
+    fn logAtomicDiagnostic(self: *MachOState, matched: bool, size: Size, addr: u64, expected: u64, actual: u64, replacement: u64, is_locked: bool, rax_before: u64, rflags_before: u32) void {
+        const op_num = self.atomic_cmpxchg.operations;
+        if (op_num <= 16 or (!matched and self.atomic_cmpxchg.mismatches <= 16)) {
+            const symbol = self.metadata.nearestSymbol(self.regs.rip);
+            const subtract_expected_vs_actual = (expected -% actual) & maskForSize(size);
+            const cf: u8 = @intFromBool((expected & maskForSize(size)) < (actual & maskForSize(size)));
+            const of: u8 = @intFromBool(((expected ^ actual) & (expected ^ subtract_expected_vs_actual) & signBitForSize(size)) != 0);
+            primitiveCapturePrint(
+                "macho-processor: CMPXCHG#{d}: rip=0x{x} size={s} lock={} matched={} addr=0x{x} " ++
+                    "expected(ACC)=0x{x} actual(DEST)=0x{x} replacement(SRC)=0x{x} " ++
+                    "RAX_before=0x{x:0>16} subtract(AL-DEST)=0x{x} " ++
+                    "rflags_before=0x{x:0>8} rflags_after=0x{x:0>8} " ++
+                    "CF_expected={d} OF_expected={d} ZF={d} step={d} thread=0x{x} owner={s}\n",
+                .{
+                    op_num,
+                    self.regs.rip,
+                    @tagName(size),
+                    is_locked,
+                    matched,
+                    addr,
+                    expected,
+                    actual,
+                    replacement,
+                    rax_before,
+                    subtract_expected_vs_actual,
+                    rflags_before,
+                    self.regs.rflags,
+                    cf,
+                    of,
+                    @as(u8, @intFromBool(matched)),
+                    self.executed_steps,
+                    self.active_guest_thread,
+                    if (symbol) |s| s.name else "<unknown>",
+                },
+            );
+        }
+    }
+
+    /// Tracks hot functions that dominate execution and dumps SHA1 diagnostics.
+    /// SHA1::processBytes is a guest function (part of Xenia) not in our codebase;
+    /// we detect it heuristically when a function exceeds 1M guest instructions,
+    /// and additionally by intercepting calls targeting the resolved symbol.
+    pub const Sha1Tracer = struct {
+        /// Master enable — always on, negligible overhead.
+        enabled: bool = true,
+        /// Current call depth (0 = top level).
+        depth: u32 = 0,
+        /// RIP of the current function's entry point.
+        entry_rip: u64 = 0,
+        /// Call-site RIP that invoked the current function.
+        call_site: u64 = 0,
+        /// Guest instruction count spent in the current function.
+        instruction_count: u64 = 0,
+        /// Small call stack (depth ≤ 4) to restore function tracking on ret.
+        saved_entry: [4]u64 = .{0} ** 4,
+        saved_count: [4]u64 = .{0} ** 4,
+        saved_call_site: [4]u64 = .{0} ** 4,
+        /// Set when a hot function is detected.
+        hot_function_rip: u64 = 0,
+        /// Step counter at which the hot function was first detected.
+        detected_at_step: u64 = 0,
+        /// Whether we have reported the initial diagnostic entry.
+        initial_report_done: bool = false,
+        /// Throttle for periodic progress reports.
+        progress_log_counter: u32 = 0,
+        /// Cached SHA1 arguments from onProcessBytesEntry or logSha1EntryCall.
+        /// System V x86_64: RDI=this, RSI=data, RDX=length.
+        sha1_this_ptr: u64 = 0,
+        sha1_data_ptr: u64 = 0,
+        sha1_byte_len: u64 = 0,
+        /// Last-sampled SHA1 object state for progress tracking.
+        last_data_ptr: u64 = 0,
+        last_block_index: u32 = 0,
+        last_byte_count: u64 = 0,
+        /// Cumulative blocks consumed between progress samples.
+        blocks_consumed: u64 = 0,
+
+        // --- Enhanced processBytes entry tracking ---
+        /// How many times sha1::SHA1::processBytes has been entered.
+        process_bytes_entry_count: u64 = 0,
+        /// Data pointer from the most recent processBytes entry.
+        pb_data_ptr: u64 = 0,
+        /// Byte length from the most recent processBytes entry.
+        pb_byte_len: u64 = 0,
+        /// Previous processBytes data ptr for repeat detection.
+        prev_pb_data_ptr: u64 = 0,
+        /// Previous processBytes byte len for repeat detection.
+        prev_pb_byte_len: u64 = 0,
+        /// How many times the same (data_ptr, length) pair has been seen.
+        pb_repeat_count: u64 = 0,
+        /// Step when the first repeat was detected.
+        pb_repeat_first_step: u64 = 0,
+        /// Whether a repeated-buffer scenario has been diagnosed.
+        pb_repeat_detected: bool = false,
+
+        const HOT_THRESHOLD: u64 = 1_000_000;
+        const PROGRESS_LOG_INTERVAL: u32 = 100;
+
+        fn reset(self: *@This()) void {
+            self.entry_rip = 0;
+            self.call_site = 0;
+            self.instruction_count = 0;
+            self.depth = 0;
+            self.hot_function_rip = 0;
+            self.detected_at_step = 0;
+            self.initial_report_done = false;
+            self.progress_log_counter = 0;
+            self.sha1_this_ptr = 0;
+            self.sha1_data_ptr = 0;
+            self.sha1_byte_len = 0;
+            self.last_data_ptr = 0;
+            self.last_block_index = 0;
+            self.last_byte_count = 0;
+            self.blocks_consumed = 0;
+            self.process_bytes_entry_count = 0;
+            self.pb_data_ptr = 0;
+            self.pb_byte_len = 0;
+            self.prev_pb_data_ptr = 0;
+            self.prev_pb_byte_len = 0;
+            self.pb_repeat_count = 0;
+            self.pb_repeat_first_step = 0;
+            self.pb_repeat_detected = false;
+        }
+
+        /// Called from call handler when target matches sha1_process_bytes.
+        /// Captures processBytes arguments (System V: RDI=this, RSI=data, RDX=len)
+        /// and logs entry with caller chain and SHA1 object state.
+        fn onProcessBytesEntry(self: *@This(), state: *MachOState) void {
+            self.process_bytes_entry_count += 1;
+            const this_ptr = state.regs.rdi;
+            const data_ptr = state.regs.rsi;
+            const byte_len = state.regs.rdx;
+            self.pb_data_ptr = data_ptr;
+            self.pb_byte_len = byte_len;
+
+            // Detect repeated call with the same (data, length) pair
+            if (data_ptr == self.prev_pb_data_ptr and byte_len == self.prev_pb_byte_len) {
+                self.pb_repeat_count += 1;
+                if (self.pb_repeat_count == 1) {
+                    self.pb_repeat_first_step = state.executed_steps;
+                }
+                if (!self.pb_repeat_detected and self.pb_repeat_count >= 3) {
+                    self.pb_repeat_detected = true;
+                    primitiveCapturePrint(
+                        "macho-processor: SHA1 WARNING: processBytes called with SAME buffer repeatedly! data=0x{x} length={d} repeat_count={d} step={d}\n",
+                        .{ data_ptr, byte_len, self.pb_repeat_count, state.executed_steps },
+                    );
+                }
+            } else {
+                self.prev_pb_data_ptr = data_ptr;
+                self.prev_pb_byte_len = byte_len;
+            }
+
+            // Update the hot-function cache so logSha1Progress uses correct args
+            self.sha1_this_ptr = this_ptr;
+            self.sha1_data_ptr = data_ptr;
+            self.sha1_byte_len = byte_len;
+            self.last_data_ptr = data_ptr;
+
+            // TinySHA1 object layout in this Xenia build:
+            // buffered-byte count at +0x60=96, total byte count at +0x68=104.
+            var block_index: u32 = 0;
+            var byte_count: u64 = 0;
+            if (state.guestMemoryConst(this_ptr + 96, 4)) |idx_bytes| {
+                block_index = std.mem.readInt(u32, idx_bytes[0..4], .little);
+            }
+            if (state.guestMemoryConst(this_ptr + 104, 8)) |cnt_bytes| {
+                byte_count = std.mem.readInt(u64, cnt_bytes[0..8], .little);
+            }
+            self.last_block_index = block_index;
+            self.last_byte_count = byte_count;
+
+            const return_address = if (state.guestMemoryConst(state.regs.rsp, 8)) |return_bytes|
+                std.mem.readInt(u64, return_bytes[0..8], .little)
+            else
+                0;
+            const caller = state.metadata.nearestSymbol(return_address);
+            primitiveCapturePrint(
+                "macho-processor: SHA1 processBytes entry #{d}: thread=0x{x} this=0x{x} data=0x{x} length={d} return=0x{x} caller={s}+0x{x} buffered_bytes={d} prior_total_bytes={d} step={d}\n",
+                .{
+                    self.process_bytes_entry_count,
+                    state.active_guest_thread,
+                    this_ptr,
+                    data_ptr,
+                    byte_len,
+                    return_address,
+                    if (caller) |symbol| symbol.name else "<unknown>",
+                    if (caller) |symbol| symbol.offset else 0,
+                    block_index,
+                    byte_count,
+                    state.executed_steps,
+                },
+            );
+        }
+
+        fn logSha1EntryCall(self: *@This(), state: *MachOState) void {
+            // Capture System V x86_64 calling convention args at function entry
+            // (RDI=this, RSI=data, RDX=length for member functions)
+            self.sha1_this_ptr = state.regs.rdi;
+            self.sha1_data_ptr = state.regs.rsi;
+            self.sha1_byte_len = state.regs.rdx;
+            self.last_data_ptr = self.sha1_data_ptr;
+            self.sha1_byte_len = state.regs.rdx;
+
+            // Read TinySHA1 buffered-byte and total-byte counters.
+            if (state.guestMemoryConst(self.sha1_this_ptr + 96, 4)) |idx_bytes| {
+                self.last_block_index = std.mem.readInt(u32, idx_bytes[0..4], .little);
+            }
+            if (state.guestMemoryConst(self.sha1_this_ptr + 104, 8)) |cnt_bytes| {
+                self.last_byte_count = std.mem.readInt(u64, cnt_bytes[0..8], .little);
+            }
+
+            const symbol = state.metadata.nearestSymbol(self.entry_rip);
+            const caller = state.metadata.nearestSymbol(self.call_site);
+            primitiveCapturePrint(
+                "macho-processor: SHA1 entry: function_rip=0x{x} ({s}) caller_rip=0x{x} ({s}) this=0x{x} data=0x{x} length={d} block_index={d} byte_count={d} thread=0x{x} step={d}\n",
+                .{
+                    self.entry_rip,
+                    if (symbol) |s| s.name else "<unknown>",
+                    self.call_site,
+                    if (caller) |s| s.name else "<unknown>",
+                    self.sha1_this_ptr,
+                    self.sha1_data_ptr,
+                    self.sha1_byte_len,
+                    self.last_block_index,
+                    self.last_byte_count,
+                    state.active_guest_thread,
+                    state.executed_steps,
+                },
+            );
+        }
+
+        fn logSha1Progress(self: *@This(), state: *MachOState) void {
+            // Read current SHA1 object state from guest memory
+            var current_block_index: u32 = self.last_block_index;
+            var current_byte_count: u64 = self.last_byte_count;
+            if (state.guestMemoryConst(self.sha1_this_ptr + 96, 4)) |idx_bytes| {
+                current_block_index = std.mem.readInt(u32, idx_bytes[0..4], .little);
+            }
+            if (state.guestMemoryConst(self.sha1_this_ptr + 104, 8)) |cnt_bytes| {
+                current_byte_count = std.mem.readInt(u64, cnt_bytes[0..8], .little);
+            }
+            const delta_bytes = current_byte_count -| self.last_byte_count;
+            const bytes_remaining = self.sha1_byte_len -| current_byte_count;
+            const blocks_delta = (current_block_index -| self.last_block_index);
+
+            primitiveCapturePrint(
+                "macho-processor: SHA1 progress: step={d} data_ptr=0x{x} delta_bytes={d} bytes_remaining={d} block_index={d} byte_count={d} new_blocks_this_sample={d} thread=0x{x}\n",
+                .{
+                    state.executed_steps,
+                    self.sha1_data_ptr + current_byte_count,
+                    delta_bytes,
+                    bytes_remaining,
+                    current_block_index,
+                    current_byte_count,
+                    blocks_delta,
+                    state.active_guest_thread,
+                },
+            );
+
+            // Check for stall: same 64-byte block being processed repeatedly?
+            if (current_block_index == self.last_block_index and delta_bytes > 0) {
+                primitiveCapturePrint(
+                    "macho-processor: SHA1 WARNING: same 64-byte block being processed repeatedly! block_index={d} step={d}\n",
+                    .{ current_block_index, state.executed_steps },
+                );
+            }
+            // Check for no-progress stall: byte_count not advancing at all
+            if (current_byte_count == self.last_byte_count and current_block_index == self.last_block_index) {
+                primitiveCapturePrint(
+                    "macho-processor: SHA1 WARNING: no byte/block progress since last sample! byte_count={d} block_index={d} step={d}\n",
+                    .{ current_byte_count, current_block_index, state.executed_steps },
+                );
+            }
+            // Check for completion: bytes_remaining == 0
+            if (bytes_remaining == 0 and current_block_index > 0) {
+                primitiveCapturePrint(
+                    "macho-processor: SHA1 NOTE: byte_count==length reached (block_index={d}) — should complete soon! step={d}\n",
+                    .{ current_block_index, state.executed_steps },
+                );
+            }
+
+            self.last_block_index = current_block_index;
+            self.last_byte_count = current_byte_count;
+        }
+    };
+
     pub fn execute(self: *MachOState, initial_d: DecodedInsn) void {
         var d = initial_d;
         // Detect LOCK prefix (0xF0) from raw instruction bytes at RIP.
-        // The LOCK prefix is consumed here rather than threaded through the
-        // decoder's 20+ sub-decode functions. This is reliable because 0xF0
-        // must be the first byte when present (Intel Vol.2 §2.1.1: LOCK
-        // precedes all other prefixes including REX and segment overrides).
         if (self.guestMemoryConst(self.regs.rip, 1)) |bytes| {
             if (bytes[0] == 0xF0) d.lock = true;
         }
         if (d.lock) {
-            // Full sequential-consistency barrier (host-native instruction):
-            // ensures all prior loads/stores complete before the LOCK-prefixed
-            // RMW executes, matching x86 LOCK# signal semantics.
-            if (comptime @import("builtin").target.cpu.arch == .aarch64) {
-                asm volatile ("dmb ish" ::: .{ .memory = true });
-            } else {
-                asm volatile ("mfence" ::: .{ .memory = true });
-            }
-            if (self.verbose_trace) {
-                machoCapturePrint("macho-processor: LOCK prefix consumed at rip=0x{x} op={s}\n", .{ self.regs.rip, @tagName(d.op) });
-            }
+            // Acquire barrier: all prior loads/stores complete before the
+            // LOCK-prefixed RMW executes (x86 LOCK# acquire semantic).
+            releaseBarrier();
         }
         switch (d.op) {
             .invalid => {
@@ -9847,6 +10308,16 @@ pub const MachOState = struct {
                 self.push(return_addr);
                 self.regs.rip = target;
                 self.logControlFlow("call_rel32", from_rip, target, d.len, return_addr);
+                if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
+                    const stk = self.sha1_tracer.depth;
+                    self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
+                    self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
+                    self.sha1_tracer.saved_call_site[stk] = self.sha1_tracer.call_site;
+                    self.sha1_tracer.depth += 1;
+                    self.sha1_tracer.entry_rip = target;
+                    self.sha1_tracer.call_site = from_rip;
+                    self.sha1_tracer.instruction_count = 0;
+                }
             },
             .call_reg64 => {
                 const from_rip = self.regs.rip;
@@ -9870,6 +10341,16 @@ pub const MachOState = struct {
                     self.push(return_addr);
                     self.regs.rip = target;
                     self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
+                    if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
+                        const stk = self.sha1_tracer.depth;
+                        self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
+                        self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
+                        self.sha1_tracer.saved_call_site[stk] = self.sha1_tracer.call_site;
+                        self.sha1_tracer.depth += 1;
+                        self.sha1_tracer.entry_rip = target;
+                        self.sha1_tracer.call_site = from_rip;
+                        self.sha1_tracer.instruction_count = 0;
+                    }
                 }
             },
             .call_mem64 => {
@@ -9908,9 +10389,18 @@ pub const MachOState = struct {
                     self.push(return_addr);
                     self.regs.rip = target;
                     self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
+                    if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
+                        const stk = self.sha1_tracer.depth;
+                        self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
+                        self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
+                        self.sha1_tracer.saved_call_site[stk] = self.sha1_tracer.call_site;
+                        self.sha1_tracer.depth += 1;
+                        self.sha1_tracer.entry_rip = target;
+                        self.sha1_tracer.call_site = from_rip;
+                        self.sha1_tracer.instruction_count = 0;
+                    }
                 }
             },
-
             .ret => {
                 if (d.imm > 0) {
                     self.regs.rsp +|= d.imm;
@@ -9924,6 +10414,13 @@ pub const MachOState = struct {
                 }
                 self.logControlFlow("ret", self.regs.rip, ret_addr, d.len, null);
                 self.regs.rip = ret_addr;
+                if (self.sha1_tracer.enabled and self.sha1_tracer.depth > 0) {
+                    self.sha1_tracer.depth -= 1;
+                    const stk = self.sha1_tracer.depth;
+                    self.sha1_tracer.entry_rip = self.sha1_tracer.saved_entry[stk];
+                    self.sha1_tracer.instruction_count = self.sha1_tracer.saved_count[stk];
+                    self.sha1_tracer.call_site = self.sha1_tracer.saved_call_site[stk];
+                }
             },
 
             .jmp_rel8 => {
@@ -9977,24 +10474,49 @@ pub const MachOState = struct {
                             stub_rip,
                             target,
                         );
+                        const is_primitive = hasPrimitiveHandler(import.name);
                         if (observation.disposition == .detail) {
-                            machoCapturePrint(
-                                "macho-processor: lazy import direct dispatch #{d}: thread=0x{x} stub=0x{x} pointer=0x{x} pointer_value=0x{x} import={s} return=0x{x} step={d}; dyld_stub_binder bypassed=true\n",
-                                .{ self.lazy_import_direct_dispatches, self.active_guest_thread, stub_rip, d.addr, target, import.name, self.read64(self.regs.rsp), self.executed_steps },
-                            );
+                            if (is_primitive) {
+                                self.routePrimitiveLazyImportLog(
+                                    import.name,
+                                    "macho-processor: lazy import direct dispatch #{d}: thread=0x{x} stub=0x{x} pointer=0x{x} pointer_value=0x{x} import={s} return=0x{x} step={d}; dyld_stub_binder bypassed=true\n",
+                                    .{ self.lazy_import_direct_dispatches, self.active_guest_thread, stub_rip, d.addr, target, import.name, self.read64(self.regs.rsp), self.executed_steps },
+                                );
+                            } else {
+                                machoCapturePrint(
+                                    "macho-processor: lazy import direct dispatch #{d}: thread=0x{x} stub=0x{x} pointer=0x{x} pointer_value=0x{x} import={s} return=0x{x} step={d}; dyld_stub_binder bypassed=true\n",
+                                    .{ self.lazy_import_direct_dispatches, self.active_guest_thread, stub_rip, d.addr, target, import.name, self.read64(self.regs.rsp), self.executed_steps },
+                                );
+                            }
                             if (target != 0) {
                                 if (self.metadata.nearestSymbol(target)) |symbol| {
-                                    machoCapturePrint(
-                                        "macho-processor: lazy import pointer classification: target=0x{x} symbol={s}+0x{x} action=typed_import\n",
-                                        .{ target, symbol.name, symbol.offset },
-                                    );
+                                    if (is_primitive) {
+                                        self.routePrimitiveLazyImportLog(
+                                            import.name,
+                                            "macho-processor: lazy import pointer classification: target=0x{x} symbol={s}+0x{x} action=typed_import\n",
+                                            .{ target, symbol.name, symbol.offset },
+                                        );
+                                    } else {
+                                        machoCapturePrint(
+                                            "macho-processor: lazy import pointer classification: target=0x{x} symbol={s}+0x{x} action=typed_import\n",
+                                            .{ target, symbol.name, symbol.offset },
+                                        );
+                                    }
                                 }
                             }
                         } else if (observation.disposition == .checkpoint) {
-                            machoCapturePrint(
-                                "macho-processor: repeated lazy import checkpoint: import={s} stub=0x{x} occurrence={d} suppressed_since_previous={d} total_direct_dispatches={d}\n",
-                                .{ import.name, stub_rip, observation.occurrence, observation.suppressed_since_emit, self.lazy_import_direct_dispatches },
-                            );
+                            if (is_primitive) {
+                                self.routePrimitiveLazyImportLog(
+                                    import.name,
+                                    "macho-processor: repeated lazy import checkpoint: import={s} stub=0x{x} occurrence={d} suppressed_since_previous={d} total_direct_dispatches={d}\n",
+                                    .{ import.name, stub_rip, observation.occurrence, observation.suppressed_since_emit, self.lazy_import_direct_dispatches },
+                                );
+                            } else {
+                                machoCapturePrint(
+                                    "macho-processor: repeated lazy import checkpoint: import={s} stub=0x{x} occurrence={d} suppressed_since_previous={d} total_direct_dispatches={d}\n",
+                                    .{ import.name, stub_rip, observation.occurrence, observation.suppressed_since_emit, self.lazy_import_direct_dispatches },
+                                );
+                            }
                         }
                         self.handleDirectImportCall(import);
                     },
@@ -10361,22 +10883,13 @@ pub const MachOState = struct {
                 else
                     self.readMemVal(d.addr, size);
                 const replacement = self.regVal(d.src_reg, size);
+                const rax_before = self.regs.rax;
+                const rflags_before = self.regs.rflags;
                 const outcome = atomic_compare_exchange.evaluate(expected, actual, replacement);
                 const matched = outcome.matched;
-                if (size == .bits8) {
-                    self.atomic_cmpxchg8.record(matched);
-                    if (self.atomic_cmpxchg8.operations <= 16 or (!matched and self.atomic_cmpxchg8.failures <= 16)) {
-                        const symbol = self.metadata.nearestSymbol(self.regs.rip);
-                        const adjacent = if (!d.is_reg_form) self.guestMemoryConst(d.addr, 4) else null;
-                        const adjacent_value = if (adjacent) |bytes| std.mem.readInt(u32, bytes[0..4], .little) else 0;
-                        machoCapturePrint(
-                            "macho-processor: atomic cmpxchg8 #{d}: rip=0x{x} {s}+0x{x} target={s}0x{x} expected=0x{x:0>2} actual=0x{x:0>2} replacement=0x{x:0>2} matched={} adjacent32_mapped={} adjacent32=0x{x:0>8}\n",
-                            .{ self.atomic_cmpxchg8.operations, self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, if (d.is_reg_form) "register:" else "memory:", if (d.is_reg_form) @intFromEnum(d.dst_reg) else d.addr, expected, actual, replacement, matched, adjacent != null, adjacent_value },
-                        );
-                    }
-                }
-                self.regs.rflags &= ~(RFL_ZF | RFL_CF);
-                self.regs.rflags |= if (matched) RFL_ZF else RFL_CF;
+                // x86 CMPXCHG: flags reflect AL − DEST (= expected − actual)
+                const subtract_result = expected -% actual;
+                self.setFlagsSub(expected, actual, subtract_result, size);
                 if (matched) {
                     if (d.is_reg_form) {
                         self.setReg(d.dst_reg, size, outcome.destination);
@@ -10386,17 +10899,28 @@ pub const MachOState = struct {
                 } else {
                     self.setReg(.al_ax_eax_rax, size, outcome.accumulator);
                 }
+                self.atomic_cmpxchg.record(matched);
+                if (!matched and self.timer_queue_watch.active and d.addr == self.timer_queue_watch.state_addr) {
+                    const expected_name = guest_assertion_recovery.timerQueueStateName(@as(u8, @truncate(expected)));
+                    const actual_name = guest_assertion_recovery.timerQueueStateName(@as(u8, @truncate(actual)));
+                    machoCapturePrint(
+                        "  timer queue CMPXCHG mismatch on watched state: expected={s}({d}) actual={s}({d}) addr=0x{x} rip=0x{x} thread=0x{x}\n",
+                        .{ expected_name, @as(u8, @truncate(expected)), actual_name, @as(u8, @truncate(actual)), d.addr, self.regs.rip, self.active_guest_thread },
+                    );
+                }
+                self.logAtomicDiagnostic(matched, size, d.addr, expected, actual, replacement, d.lock, rax_before, rflags_before);
+                if (d.lock) releaseBarrier();
             },
 
             .cmpxchg8b_mem, .cmpxchg16b_mem => {
                 const is_16b = d.op == .cmpxchg16b_mem;
-                // CMPXCHG8B compares EDX:EAX with m64; CMPXCHG16B compares RDX:RAX with m128
                 const expected_lo = self.regVal(.al_ax_eax_rax, .bits32);
                 const expected_hi = self.regVal(.dl_dx_edx_rdx, if (is_16b) .bits64 else .bits32);
                 const replacement_lo = self.regVal(.cl_cx_ecx_rcx, if (is_16b) .bits64 else .bits32);
                 const replacement_hi = self.regVal(.bl_bx_ebx_rbx, if (is_16b) .bits64 else .bits32);
+                const rax_before = self.regs.rax;
+                const rflags_before = self.regs.rflags;
 
-                const total_bytes: usize = if (is_16b) 16 else 8;
                 const actual_lo = self.readMemVal(d.addr, if (is_16b) .bits64 else .bits32);
                 const actual_hi = if (is_16b) self.readMemVal(d.addr + 8, .bits64) else 0;
 
@@ -10413,41 +10937,32 @@ pub const MachOState = struct {
                 self.regs.rflags &= ~RFL_ZF;
                 self.regs.rflags |= if (matched) RFL_ZF else 0;
 
-                if (total_bytes == 8) {
-                    self.atomic_cmpxchg8.record(matched);
-                    if (self.atomic_cmpxchg8.operations <= 16 or (!matched and self.atomic_cmpxchg8.failures <= 16)) {
-                        const symbol = self.metadata.nearestSymbol(self.regs.rip);
-                        machoCapturePrint(
-                            "macho-processor: atomic cmpxchg8b #{d}: rip=0x{x} {s}+0x{x} target=0x{x} expected=0x{x:0>8}:0x{x:0>8} actual=0x{x:0>8}:0x{x:0>8} replacement=0x{x:0>8}:0x{x:0>8} matched={}\n",
-                            .{ self.atomic_cmpxchg8.operations, self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, d.addr, expected_hi, expected_lo, actual_hi, actual_lo, replacement_hi, replacement_lo, matched },
-                        );
-                    }
+                self.atomic_cmpxchg.record(matched);
+                if (is_16b) {
+                    self.logAtomicDiagnostic(matched, .bits64, d.addr, expected_lo, actual_lo, replacement_lo, d.lock, rax_before, rflags_before);
+                } else {
+                    self.logAtomicDiagnostic(matched, .bits32, d.addr, expected_lo, actual_lo, replacement_lo, d.lock, rax_before, rflags_before);
                 }
+                if (d.lock) releaseBarrier();
             },
 
             .xchg_mem32_reg32 => {
                 // XCHG with memory is architecturally always atomic (implicit LOCK#)
-                if (comptime @import("builtin").target.cpu.arch == .aarch64) {
-                    asm volatile ("dmb ish" ::: .{ .memory = true });
-                } else {
-                    asm volatile ("mfence" ::: .{ .memory = true });
-                }
+                // Acquire+release semantics via full barrier (XCHG implies LOCK)
+                releaseBarrier();
                 const a = self.readMemVal(d.addr, .bits32);
                 const b = self.regVal(d.src_reg, .bits32);
                 self.writeMemVal(d.addr, .bits32, b);
                 self.setReg(d.src_reg, .bits32, a);
+                releaseBarrier();
             },
             .xchg_mem64_reg64 => {
-                // XCHG with memory is architecturally always atomic (implicit LOCK#)
-                if (comptime @import("builtin").target.cpu.arch == .aarch64) {
-                    asm volatile ("dmb ish" ::: .{ .memory = true });
-                } else {
-                    asm volatile ("mfence" ::: .{ .memory = true });
-                }
+                releaseBarrier();
                 const a = self.readMemVal(d.addr, .bits64);
                 const b = self.regVal(d.src_reg, .bits64);
                 self.writeMemVal(d.addr, .bits64, b);
                 self.setReg(d.src_reg, .bits64, a);
+                releaseBarrier();
             },
             .xchg_reg32_reg32 => {
                 const a = self.regVal(d.dst_reg, .bits32);
@@ -10469,6 +10984,7 @@ pub const MachOState = struct {
                 self.writeMemVal(d.addr, sz, result);
                 self.setReg(d.src_reg, sz, old_mem);
                 self.setFlagsAdd(old_mem, old_reg, result, sz);
+                if (d.lock) releaseBarrier();
             },
 
             .xorps_xmm_xmm => {
@@ -10937,7 +11453,6 @@ pub const MachOState = struct {
             },
 
             .ud2 => {
-                if (self.tryRecoverClassifiedAssertionUd2(d.len)) return;
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const assertion_age = self.executed_steps -| self.last_guest_assertion_step;
                 machoCapturePrint(

@@ -354,6 +354,12 @@ pub const InternalCompatibilityTargets = struct {
     imgui_settings_push_back: u64 = 0,
     page_entry_construct_at_end: u64 = 0,
     libcpp_atomic_bool_control_block_vtable: u64 = 0,
+    /// sha1::SHA1::processBytes — resolved at init for entry-tracking
+    sha1_process_bytes: u64 = 0,
+    /// Start of the sha1::SHA1 virtual-method table region (inclusive).
+    sha1_start: u64 = 0,
+    /// End of the sha1::SHA1 virtual-method table region (exclusive).
+    sha1_end: u64 = 0,
 };
 
 pub const InitializerCheckpoint = struct {

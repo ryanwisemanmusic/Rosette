@@ -9,15 +9,18 @@ const c = @cImport({
 
 threadlocal var thread_macho_fd: i32 = -1;
 threadlocal var thread_scheduler_fd: i32 = -1;
+threadlocal var thread_primitive_fd: i32 = -1;
 
-pub fn setThreadFds(macho: i32, scheduler: i32) void {
+pub fn setThreadFds(macho: i32, scheduler: i32, primitive: i32) void {
     thread_macho_fd = macho;
     thread_scheduler_fd = scheduler;
+    thread_primitive_fd = primitive;
 }
 
 pub fn resetThreadFds() void {
     thread_macho_fd = -1;
     thread_scheduler_fd = -1;
+    thread_primitive_fd = -1;
 }
 
 pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
@@ -41,6 +44,16 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
         writeAll(thread_macho_fd, text);
         if (text.len == 0 or text[text.len - 1] != '\n')
             _ = c.write(thread_macho_fd, "\n", 1);
+    }
+}
+
+pub fn primitiveCapturePrint(comptime fmt: []const u8, args: anytype) void {
+    const text = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
+    defer std.heap.page_allocator.free(text);
+    if (thread_primitive_fd >= 0) {
+        writeAll(thread_primitive_fd, text);
+        if (text.len == 0 or text[text.len - 1] != '\n')
+            _ = c.write(thread_primitive_fd, "\n", 1);
     }
 }
 
@@ -92,6 +105,7 @@ pub const Event = struct {
 pub const Logger = struct {
     macho_fd: i32 = -1,
     scheduler_fd: i32 = -1,
+    primitive_fd: i32 = -1,
 
     pub fn isOpen(self: *const Logger) bool {
         return self.macho_fd >= 0;
@@ -142,7 +156,19 @@ pub const Logger = struct {
             }
         }
 
-        setThreadFds(self.macho_fd, self.scheduler_fd);
+        {
+            const prim_path = std.fs.path.join(allocator, &.{ directory, "rosette-primitive.log" }) catch return;
+            defer allocator.free(prim_path);
+            const prim_z = allocator.dupeZ(u8, prim_path) catch return;
+            defer allocator.free(prim_z);
+            const fd = c.open(prim_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c_uint, 0o644));
+            if (fd >= 0) {
+                self.primitive_fd = fd;
+                _ = c.write(fd, "=== rosette-primitive.log opened ===\n", 37);
+            }
+        }
+
+        setThreadFds(self.macho_fd, self.scheduler_fd, self.primitive_fd);
     }
 
     pub fn close(self: *Logger) void {
@@ -155,8 +181,13 @@ pub const Logger = struct {
             _ = c.write(self.scheduler_fd, "=== rosette-scheduler-table.log closed ===\n", 45);
             _ = c.close(self.scheduler_fd);
         }
+        if (self.primitive_fd >= 0) {
+            _ = c.write(self.primitive_fd, "=== rosette-primitive.log closed ===\n", 37);
+            _ = c.close(self.primitive_fd);
+        }
         self.macho_fd = -1;
         self.scheduler_fd = -1;
+        self.primitive_fd = -1;
     }
 
     pub fn captureLine(self: *Logger, text: []const u8) void {
