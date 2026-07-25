@@ -119,6 +119,15 @@ pub const UiHandoffTracker = struct {
         return self.callback_handle != 0 and self.callback_handle == handle;
     }
 
+    /// Update the last-progress timestamp without changing any other
+    /// handoff state.  This lets a long-running callback (e.g. SHA-1
+    /// memory initialisation) suppress false stall diagnostics while
+    /// it makes genuine forward progress inside its guest code.
+    pub fn registerProgress(self: *UiHandoffTracker, step: u64) void {
+        if (!self.isActive()) return;
+        self.last_progress_step = step;
+    }
+
     /// Decide whether a running callback should donate one full quantum to a
     /// producer. This is based on scheduler eligibility, not callback symbols
     /// or application identity, so the same handoff rule applies to any guest.
@@ -235,6 +244,29 @@ test "completed UI handoff returns to its scheduling thread exactly once" {
     try std.testing.expect(tracker.completionResumed(0x7FFF_2020, 50));
     try std.testing.expectEqual(@as(u64, 0), tracker.completionResumeHandle());
     try std.testing.expectEqual(@as(u64, 1), tracker.generation);
+}
+
+test "registerProgress updates last_progress_step without state change" {
+    var tracker = UiHandoffTracker{};
+    try std.testing.expectEqual(Health.idle, tracker.health(100, 10));
+    tracker.registerProgress(50);
+    // idle is not active, so registerProgress is a no-op
+    try std.testing.expectEqual(@as(u64, 0), tracker.last_progress_step);
+
+    tracker.queued(1, 0x1234, 0x7FFF_2020, 0x5678, 10);
+    tracker.callbackStarted(0xFFFF_F900_0000_0001, 0x1234, 20);
+    try std.testing.expectEqual(@as(u64, 20), tracker.last_progress_step);
+    try std.testing.expectEqual(Health.progressing, tracker.health(25, 10));
+
+    // Without registerProgress, the next health check would stall
+    try std.testing.expectEqual(Health.callback_stalled, tracker.health(40, 10));
+
+    // After registerProgress, the stall disappears
+    tracker.registerProgress(35);
+    try std.testing.expectEqual(Health.progressing, tracker.health(40, 10));
+
+    // Phase is unchanged
+    try std.testing.expectEqual(Phase.callback_running, tracker.phase);
 }
 
 test "running UI callback yields a quantum only when a producer is eligible" {
