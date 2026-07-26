@@ -87,6 +87,38 @@ pub const VFMSUBADD213PS = @import("VFMSUBADD213PS.zig");
 pub const VFMSUBADD231PD = @import("VFMSUBADD231PD.zig");
 pub const VFMSUBADD231PS = @import("VFMSUBADD231PS.zig");
 pub const VFMADDRND231PD = @import("VFMADDRND231PD.zig");
+pub const VCVTPD2PS = @import("VCVTPD2PS.zig");
+pub const VCVTPS2PD = @import("VCVTPS2PD.zig");
+pub const VCVTDQ2PS = @import("VCVTDQ2PS.zig");
+pub const VCVTPS2DQ = @import("VCVTPS2DQ.zig");
+pub const VCVTTPS2DQ = @import("VCVTTPS2DQ.zig");
+pub const VINSERTF128 = @import("VINSERTF128.zig");
+pub const VPERMILPS = @import("VPERMILPS.zig");
+pub const VPERMILPD = @import("VPERMILPD.zig");
+pub const PINSRB = @import("PINSRB.zig");
+pub const PINSRD = @import("PINSRD.zig");
+pub const PINSRQ = @import("PINSRQ.zig");
+pub const PINSRW = @import("PINSRW.zig");
+pub const INSERTPS = @import("INSERTPS.zig");
+pub const VBROADCASTSS = @import("VBROADCASTSS.zig");
+pub const VBROADCASTSD = @import("VBROADCASTSD.zig");
+pub const VBROADCASTF128 = @import("VBROADCASTF128.zig");
+pub const MOVHLPS = @import("MOVHLPS.zig");
+pub const VMOVHLPS = @import("VMOVHLPS.zig");
+pub const MOVLHPS = @import("MOVLHPS.zig");
+pub const VMOVLHPS = @import("VMOVLHPS.zig");
+pub const MOVHPD = @import("MOVHPD.zig");
+pub const VMOVHPD = @import("VMOVHPD.zig");
+pub const MOVHPS = @import("MOVHPS.zig");
+pub const VMOVHPS = @import("VMOVHPS.zig");
+pub const MOVLPD = @import("MOVLPD.zig");
+pub const VMOVLPD = @import("VMOVLPD.zig");
+pub const MOVLPS = @import("MOVLPS.zig");
+pub const VMOVLPS = @import("VMOVLPS.zig");
+pub const MOVSD = @import("MOVSD.zig");
+pub const VMOVSD = @import("VMOVSD.zig");
+pub const MOVSS = @import("MOVSS.zig");
+pub const VMOVSS = @import("VMOVSS.zig");
 
 const types = @import("../types.zig");
 
@@ -180,6 +212,38 @@ pub const metas = [_]types.InstructionMeta{
     VFMSUBADD231PD.meta,
     VFMSUBADD231PS.meta,
     VFMADDRND231PD.meta,
+    VCVTPD2PS.meta,
+    VCVTPS2PD.meta,
+    VCVTDQ2PS.meta,
+    VCVTPS2DQ.meta,
+    VCVTTPS2DQ.meta,
+    VINSERTF128.meta,
+    VPERMILPS.meta,
+    VPERMILPD.meta,
+    PINSRB.meta,
+    PINSRD.meta,
+    PINSRQ.meta,
+    PINSRW.meta,
+    INSERTPS.meta,
+    VBROADCASTSS.meta,
+    VBROADCASTSD.meta,
+    VBROADCASTF128.meta,
+    MOVHLPS.meta,
+    VMOVHLPS.meta,
+    MOVLHPS.meta,
+    VMOVLHPS.meta,
+    MOVHPD.meta,
+    VMOVHPD.meta,
+    MOVHPS.meta,
+    VMOVHPS.meta,
+    MOVLPD.meta,
+    VMOVLPD.meta,
+    MOVLPS.meta,
+    VMOVLPS.meta,
+    MOVSD.meta,
+    VMOVSD.meta,
+    MOVSS.meta,
+    VMOVSS.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {
