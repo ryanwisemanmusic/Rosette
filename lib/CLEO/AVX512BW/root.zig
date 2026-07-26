@@ -21,6 +21,13 @@ pub const VPSUBUSB = @import("VPSUBUSB.zig");
 pub const VPSUBUSW = @import("VPSUBUSW.zig");
 pub const VMOVDQU8 = @import("VMOVDQU8.zig");
 pub const VMOVDQU16 = @import("VMOVDQU16.zig");
+pub const VPMOVWB = @import("VPMOVWB.zig");
+pub const VPMOVSWB = @import("VPMOVSWB.zig");
+pub const VPMOVUSWB = @import("VPMOVUSWB.zig");
+pub const VPABSB = @import("VPABSB.zig");
+pub const VPABSW = @import("VPABSW.zig");
+pub const VPAVGB = @import("VPAVGB.zig");
+pub const VPAVGW = @import("VPAVGW.zig");
 
 const types = @import("../types.zig");
 
@@ -48,6 +55,13 @@ pub const metas = [_]types.InstructionMeta{
     VPSUBUSW.meta,
     VMOVDQU8.meta,
     VMOVDQU16.meta,
+    VPMOVWB.meta,
+    VPMOVSWB.meta,
+    VPMOVUSWB.meta,
+    VPABSB.meta,
+    VPABSW.meta,
+    VPAVGB.meta,
+    VPAVGW.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {
