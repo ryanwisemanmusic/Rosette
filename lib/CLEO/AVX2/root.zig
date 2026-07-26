@@ -41,6 +41,33 @@ pub const VPSUBSB = @import("VPSUBSB.zig");
 pub const VPSUBSW = @import("VPSUBSW.zig");
 pub const VPSUBUSB = @import("VPSUBUSB.zig");
 pub const VPSUBUSW = @import("VPSUBUSW.zig");
+pub const VPSLLD = @import("VPSLLD.zig");
+pub const VPSRAD = @import("VPSRAD.zig");
+pub const VPSRLD = @import("VPSRLD.zig");
+pub const VPACKSSDW = @import("VPACKSSDW.zig");
+pub const VPACKUSDW = @import("VPACKUSDW.zig");
+pub const VINSERTI128 = @import("VINSERTI128.zig");
+pub const VPABSB = @import("VPABSB.zig");
+pub const VPABSW = @import("VPABSW.zig");
+pub const VPABSD = @import("VPABSD.zig");
+pub const VPSIGNB = @import("VPSIGNB.zig");
+pub const VPSIGNW = @import("VPSIGNW.zig");
+pub const VPSIGND = @import("VPSIGND.zig");
+pub const VPUNPCKLBW = @import("VPUNPCKLBW.zig");
+pub const VPUNPCKLWD = @import("VPUNPCKLWD.zig");
+pub const VPUNPCKLDQ = @import("VPUNPCKLDQ.zig");
+pub const VPUNPCKLQDQ = @import("VPUNPCKLQDQ.zig");
+pub const VPUNPCKHBW = @import("VPUNPCKHBW.zig");
+pub const VPUNPCKHWD = @import("VPUNPCKHWD.zig");
+pub const VPUNPCKHDQ = @import("VPUNPCKHDQ.zig");
+pub const VPUNPCKHQDQ = @import("VPUNPCKHQDQ.zig");
+pub const VPAVGB = @import("VPAVGB.zig");
+pub const VPAVGW = @import("VPAVGW.zig");
+pub const PSLLDQ = @import("PSLLDQ.zig");
+pub const PSRLDQ = @import("PSRLDQ.zig");
+pub const VPACKSSWB = @import("VPACKSSWB.zig");
+pub const VPACKUSWB = @import("VPACKUSWB.zig");
+pub const VBROADCASTI128 = @import("VBROADCASTI128.zig");
 
 const types = @import("../types.zig");
 
@@ -88,6 +115,33 @@ pub const metas = [_]types.InstructionMeta{
     VPSUBSW.meta,
     VPSUBUSB.meta,
     VPSUBUSW.meta,
+    VPSLLD.meta,
+    VPSRAD.meta,
+    VPSRLD.meta,
+    VPACKSSDW.meta,
+    VPACKUSDW.meta,
+    VINSERTI128.meta,
+    VPABSB.meta,
+    VPABSW.meta,
+    VPABSD.meta,
+    VPSIGNB.meta,
+    VPSIGNW.meta,
+    VPSIGND.meta,
+    VPUNPCKLBW.meta,
+    VPUNPCKLWD.meta,
+    VPUNPCKLDQ.meta,
+    VPUNPCKLQDQ.meta,
+    VPUNPCKHBW.meta,
+    VPUNPCKHWD.meta,
+    VPUNPCKHDQ.meta,
+    VPUNPCKHQDQ.meta,
+    VPAVGB.meta,
+    VPAVGW.meta,
+    PSLLDQ.meta,
+    PSRLDQ.meta,
+    VPACKSSWB.meta,
+    VPACKUSWB.meta,
+    VBROADCASTI128.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {
