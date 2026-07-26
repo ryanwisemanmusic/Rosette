@@ -57,3 +57,10 @@ pub fn move(comptime bits: usize, meta: types.InstructionMeta, value: wide.Wide(
 pub fn movMask(comptime bits: usize, meta: types.InstructionMeta, value: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!u32 {
     return ops.executeMovMask(bits, meta, value, features);
 }
+
+pub fn downConvert(comptime bits: usize, meta: types.InstructionMeta, src: wide.Wide(bits), comptime InT: type, comptime OutT: type, comptime mode: wide.DownConvertMode, features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    try types.validateMeta(meta);
+    try types.requireFeature(meta, features);
+    try types.requireWidth(meta, bits);
+    return wide.downConvert(bits, InT, OutT, src, mode);
+}

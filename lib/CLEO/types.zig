@@ -14,6 +14,8 @@ pub const Feature = enum(u8) {
     avx512vl,
     avx512bw,
     avx512bf16,
+    gfni,
+    sha,
     vaes,
     amx_tile,
     keylocker,
@@ -32,6 +34,8 @@ pub const FeatureSet = struct {
     avx512vl: bool = false,
     avx512bw: bool = false,
     avx512bf16: bool = false,
+    gfni: bool = false,
+    sha: bool = false,
     vaes: bool = false,
     amx_tile: bool = false,
     keylocker: bool = false,
@@ -66,6 +70,8 @@ pub const FeatureSet = struct {
                 result.avx = true;
                 result.avx2 = true;
                 result.fma = true;
+                result.gfni = true;
+                result.sha = true;
             },
             else => {},
         }
@@ -83,6 +89,8 @@ pub const FeatureSet = struct {
             .avx512vl = true,
             .avx512bw = true,
             .avx512bf16 = true,
+            .gfni = true,
+            .sha = true,
             .vaes = true,
             .amx_tile = true,
             .keylocker = true,
@@ -103,6 +111,8 @@ pub const FeatureSet = struct {
             .avx512vl => self.avx512vl,
             .avx512bw => self.avx512bw,
             .avx512bf16 => self.avx512bf16,
+            .gfni => self.gfni,
+            .sha => self.sha,
             .vaes => self.vaes,
             .amx_tile => self.amx_tile,
             .keylocker => self.keylocker,
@@ -211,6 +221,94 @@ pub const Operation = enum {
     pmull,
     psubs,
     psubus,
+    // CONVERT group (P0 — critical for correctness)
+    cvt_pd2ps,
+    cvt_ps2pd,
+    cvt_dq2ps,
+    cvt_ps2dq,
+    cvtt_ps2dq,
+    // SHIFT group (P0 — packed shift operations)
+    psll,
+    psra,
+    psrl,
+    // PACK group (P0 — saturated pack operations)
+    packss,
+    packus,
+    // AVX512 compute stubs (registered but not yet implemented)
+    scale_ps,
+    scale_pd,
+    range_ps,
+    range_pd,
+    fixup_ps,
+    fixup_pd,
+    compress_ps,
+    compress_pd,
+    expand_ps,
+    expand_pd,
+    permute_d,
+    permute_q,
+    // P1 operations (absolute value, sign, bitwise NOT, unpack interleave)
+    pabs,
+    psign,
+    pnot,
+    unpck_low,
+    unpck_high,
+    // P1 operations (broadcast, block insert)
+    broadcast_lane,
+    move_high_low,
+    move_low_high,
+    insert_block,
+    // P2 operations (down-convert, element extract/insert)
+    down_convert_trunc,
+    down_convert_signed,
+    down_convert_unsigned,
+    extract_element,
+    insert_element,
+    insert_ps,
+    // P3 operations (align, average, rotate)
+    @"align",
+    avg,
+    rotate_left,
+    rotate_right,
+    rotate_left_variable,
+    rotate_right_variable,
+    // P3 operations (bitwise ternary, Galois field, rounding, SHA, two-source permute)
+    ternary_logic,
+    gf2p8_mul,
+    gf2p8_affine,
+    gf2p8_affine_inv,
+    round_to_int,
+    sha1_msg1,
+    sha1_msg2,
+    sha1_nexte,
+    sha1_rnds4,
+    sha256_msg1,
+    sha256_msg2,
+    sha256_rnds2,
+    two_source_permute,
+    // GATHER/SCATTER — indexed memory access
+    gather_ps,
+    gather_pd,
+    gather_d,
+    gather_q,
+    scatter_ps,
+    scatter_pd,
+    scatter_d,
+    scatter_q,
+    // CONVERT group additions (P0 — critical conversions)
+    cvt_pd2dq,
+    cvtt_pd2dq,
+    cvt_dq2pd,
+    cvt_ph2ps,
+    cvt_ps2ph,
+    cvt_bf16,
+    // SHIFT group additions (byte shift within 128-bit lane)
+    byte_shift_left,
+    byte_shift_right,
+    // PERMUTE group additional ops
+    permil,
+    // INSERT group element insert
+    // (insert_element already defined above)
 };
 
 pub const Alignment = enum(u16) {
@@ -232,6 +330,75 @@ pub const SafetyError = error{
     UnsupportedInstructionWidth,
     BufferTooSmall,
     MisalignedMemory,
+};
+
+/// MXCSR status flags that should be updated after floating-point SIMD
+/// operations.  Real x86 hardware sets these bits architecturally; CLEO
+/// tracks them so that guest code that reads MXCSR via VSTMXCSR / STMXCSR
+/// gets plausible values rather than always 0x1F80 (all flags clear).
+///
+/// Bit positions match the x86 MXCSR register:
+///   bit 0 = IE (Invalid Operation)
+///   bit 1 = DE (Denormal)
+///   bit 2 = ZE (Divide-by-Zero)
+///   bit 3 = OE (Overflow)
+///   bit 4 = UE (Underflow)
+///   bit 5 = PE (Precision)
+pub const MxcsrFlags = packed struct {
+    ie: bool = false,
+    de: bool = false,
+    ze: bool = false,
+    oe: bool = false,
+    ue: bool = false,
+    pe: bool = false,
+    _padding: u2 = 0,
+    im: bool = true,
+    dm: bool = true,
+    zm: bool = true,
+    om: bool = true,
+    um: bool = true,
+    pm: bool = true,
+    _rsvd: u6 = 0,
+    fz: bool = false,
+    daz: bool = false,
+    _rsvd2: u2 = 0,
+
+    pub fn defaultValue() MxcsrFlags {
+        return .{};
+    }
+
+    pub fn toU32(self: MxcsrFlags) u32 {
+        return @bitCast(self);
+    }
+
+    pub fn fromU32(value: u32) MxcsrFlags {
+        return @bitCast(value);
+    }
+
+    /// After a floating-point operation, update the IE (invalid),
+    /// ZE (divide-by-zero), OE (overflow), UE (underflow), and PE (precision)
+    /// flags based on the inputs and result.
+    /// `has_divisor` should be true for division (may set ZE on x/0),
+    /// `has_negative_src` for unary negation ops (may set IE on sqrt(x<0)),
+    /// `has_inf_diff` for subtraction operations where both infinities
+    /// produce an invalid result (Inf - Inf = NaN).
+    pub fn updateAfterArith(T: type, lhs: T, rhs: T, result: T, has_divisor: bool, has_negative_src: bool, has_inf_diff: bool) MxcsrFlags {
+        var flags = MxcsrFlags{};
+        if (@typeInfo(T) != .float) return flags;
+        const is_inf_lhs = std.math.isInf(lhs);
+        const is_inf_rhs = std.math.isInf(rhs);
+        const is_nan_lhs = std.math.isNan(lhs);
+        const is_nan_rhs = std.math.isNan(rhs);
+        if (is_nan_lhs or is_nan_rhs) flags.ie = true;
+        if (has_divisor and rhs == 0 and lhs != 0) flags.ze = true;
+        if (has_negative_src and lhs < 0) flags.ie = true;
+        // Infinity - Infinity => invalid; Infinity + Infinity is valid
+        if (has_inf_diff and is_inf_lhs and is_inf_rhs) flags.ie = true;
+        if (std.math.isInf(result)) flags.oe = true;
+        if (result != 0 and @abs(result) < std.math.floatMin(T)) flags.ue = true;
+        flags.pe = true;
+        return flags;
+    }
 };
 
 pub const LoweringPlan = struct {
@@ -288,6 +455,62 @@ pub const InstructionMeta = struct {
                 .control,
                 .system_512,
                 .key_256,
+                .cvt_pd2ps,
+                .cvt_ps2pd,
+                .cvt_dq2ps,
+                .cvt_ps2dq,
+                .cvtt_ps2dq,
+                .packss,
+                .packus,
+                .unpck_low,
+                .unpck_high,
+                .pabs,
+                .psign,
+                .pnot,
+                .broadcast_lane,
+                .insert_block,
+                .down_convert_trunc,
+                .down_convert_signed,
+                .down_convert_unsigned,
+                .extract_element,
+                .insert_element,
+                .insert_ps,
+                .@"align",
+                .avg,
+                .rotate_left,
+                .rotate_right,
+                .rotate_left_variable,
+                .rotate_right_variable,
+                .ternary_logic,
+                .gf2p8_mul,
+                .gf2p8_affine,
+                .gf2p8_affine_inv,
+                .round_to_int,
+                .sha1_msg1,
+                .sha1_msg2,
+                .sha1_nexte,
+                .sha1_rnds4,
+                .sha256_msg1,
+                .sha256_msg2,
+                .sha256_rnds2,
+                .two_source_permute,
+                .gather_ps,
+                .gather_pd,
+                .gather_d,
+                .gather_q,
+                .scatter_ps,
+                .scatter_pd,
+                .scatter_d,
+                .scatter_q,
+                .cvt_pd2dq,
+                .cvtt_pd2dq,
+                .cvt_dq2pd,
+                .cvt_ph2ps,
+                .cvt_ps2ph,
+                .cvt_bf16,
+                .byte_shift_left,
+                .byte_shift_right,
+                .permil,
                 => true,
                 else => false,
             },

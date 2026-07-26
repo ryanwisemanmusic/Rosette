@@ -2,11 +2,15 @@ const std = @import("std");
 const types = @import("types.zig");
 pub const AVX = @import("AVX/root.zig");
 pub const AVX2 = @import("AVX2/root.zig");
+pub const GATHER = @import("GATHER/root.zig");
+pub const SCATTER = @import("SCATTER/root.zig");
 pub const AVX512F = @import("AVX512F/root.zig");
 pub const AVX512DQ = @import("AVX512DQ/root.zig");
 pub const AVX512BW = @import("AVX512BW/root.zig");
 pub const AVX512BF16 = @import("AVX512BF16/root.zig");
 pub const VAES = @import("VAES/root.zig");
+pub const GFNI = @import("GFNI/root.zig");
+pub const SHA = @import("SHA/root.zig");
 pub const SYSTEM = @import("SYSTEM/root.zig");
 
 pub const metas = [_]types.InstructionMeta{
@@ -255,6 +259,214 @@ pub const metas = [_]types.InstructionMeta{
     SYSTEM.LDTILECFG.meta,
     SYSTEM.LOADIWKEY.meta,
     SYSTEM.MOVDIR64B.meta,
+    // CONVERT group (P0 — critical)
+    AVX512F.CVTPD2PS.meta,
+    AVX512F.CVTPS2PD.meta,
+    AVX512F.CVTDQ2PS.meta,
+    AVX512F.CVTPS2DQ.meta,
+    AVX512F.CVTTPS2DQ.meta,
+    // SHIFT group (P0 — packed shifts)
+    AVX512F.VPSLLD.meta,
+    AVX512F.VPSRAD.meta,
+    AVX512F.VPSRLD.meta,
+    // PACK group (P0 — saturating pack)
+    AVX512F.VPACKSSDW.meta,
+    AVX512F.VPACKUSDW.meta,
+    // AVX CONVERT variants (256-bit)
+    AVX.VCVTPD2PS.meta,
+    AVX.VCVTPS2PD.meta,
+    AVX.VCVTDQ2PS.meta,
+    AVX.VCVTPS2DQ.meta,
+    AVX.VCVTTPS2DQ.meta,
+    // AVX2 SHIFT + PACK variants (256-bit)
+    AVX2.VPSLLD.meta,
+    AVX2.VPSRAD.meta,
+    AVX2.VPSRLD.meta,
+    AVX2.VPACKSSDW.meta,
+    AVX2.VPACKUSDW.meta,
+    // AVX512F COMPUTE stubs (registered, not yet implemented)
+    AVX512F.VSCALEFPS.meta,
+    AVX512F.VSCALEFPD.meta,
+    AVX512F.VRANGEPS.meta,
+    AVX512F.VRANGEPD.meta,
+    AVX512F.VFIXUPIMMPS.meta,
+    AVX512F.VFIXUPIMMPD.meta,
+    AVX512F.VCOMPRESSPD.meta,
+    AVX512F.VCOMPRESSPS.meta,
+    AVX512F.VEXPANDPD.meta,
+    AVX512F.VEXPANDPS.meta,
+    AVX512F.VALIGND.meta,
+    AVX512F.VALIGNQ.meta,
+    AVX512F.VPERMD.meta,
+    AVX512F.VPERMQ.meta,
+    // P1: ABSOLUTE — absolute value
+    AVX2.VPABSB.meta,
+    AVX2.VPABSW.meta,
+    AVX2.VPABSD.meta,
+    AVX512F.VPABSD.meta,
+    AVX512F.VPABSQ.meta,
+    AVX512BW.VPABSB.meta,
+    AVX512BW.VPABSW.meta,
+    // P1: REVERSE — sign negation
+    AVX2.VPSIGNB.meta,
+    AVX2.VPSIGNW.meta,
+    AVX2.VPSIGND.meta,
+    // P1: PERMUTE — immediate permute (VPERMIL)
+    AVX.VPERMILPS.meta,
+    AVX.VPERMILPD.meta,
+    // P1: INSERT — element + block insertion
+    AVX.PINSRB.meta,
+    AVX.PINSRD.meta,
+    AVX.PINSRQ.meta,
+    AVX.PINSRW.meta,
+    AVX.INSERTPS.meta,
+    AVX.VINSERTF128.meta,
+    // LOAD — broadcast
+    AVX.VBROADCASTSS.meta,
+    AVX.VBROADCASTSD.meta,
+    AVX.VBROADCASTF128.meta,
+    // MOV — partial register moves
+    AVX.MOVHLPS.meta,
+    AVX.VMOVHLPS.meta,
+    AVX.MOVLHPS.meta,
+    AVX.VMOVLHPS.meta,
+    AVX.MOVHPD.meta,
+    AVX.VMOVHPD.meta,
+    AVX.MOVHPS.meta,
+    AVX.VMOVHPS.meta,
+    AVX.MOVLPD.meta,
+    AVX.VMOVLPD.meta,
+    AVX.MOVLPS.meta,
+    AVX.VMOVLPS.meta,
+    AVX.MOVSD.meta,
+    AVX.VMOVSD.meta,
+    AVX.MOVSS.meta,
+    AVX.VMOVSS.meta,
+    AVX2.VBROADCASTI128.meta,
+    AVX2.VINSERTI128.meta,
+    AVX512F.VBROADCASTF32X2.meta,
+    AVX512F.VBROADCASTF32X4.meta,
+    AVX512F.VBROADCASTF32X8.meta,
+    AVX512F.VBROADCASTF64X2.meta,
+    AVX512F.VBROADCASTF64X4.meta,
+    AVX512F.VBROADCASTI32x2.meta,
+    AVX512F.VBROADCASTI32X4.meta,
+    AVX512F.VBROADCASTI32X8.meta,
+    AVX512F.VBROADCASTI64X2.meta,
+    AVX512F.VBROADCASTI64X4.meta,
+    AVX512F.VINSERTF32X4.meta,
+    AVX512F.VINSERTF64X2.meta,
+    AVX512F.VINSERTI32X4.meta,
+    AVX512F.VINSERTI64X2.meta,
+    AVX512F.VINSERTF32X8.meta,
+    AVX512F.VINSERTF64X4.meta,
+    AVX512F.VINSERTI32X8.meta,
+    AVX512F.VINSERTI64X4.meta,
+    // P1: BROADCAST — lane broadcast
+    AVX512F.VPBROADCASTMB2Q.meta,
+    AVX512F.VPBROADCASTMW2D.meta,
+    // P2: DOWN_CONVERT — truncation
+    AVX512F.VPMOVDB.meta,
+    AVX512F.VPMOVDW.meta,
+    AVX512F.VPMOVQB.meta,
+    AVX512F.VPMOVQD.meta,
+    AVX512F.VPMOVQW.meta,
+    AVX512BW.VPMOVWB.meta,
+    // P2: DOWN_CONVERT — signed saturation
+    AVX512F.VPMOVSDB.meta,
+    AVX512F.VPMOVSDW.meta,
+    AVX512F.VPMOVSQB.meta,
+    AVX512F.VPMOVSQD.meta,
+    AVX512F.VPMOVSQW.meta,
+    AVX512BW.VPMOVSWB.meta,
+    // P2: DOWN_CONVERT — unsigned saturation
+    AVX512F.VPMOVUSDB.meta,
+    AVX512F.VPMOVUSDW.meta,
+    AVX512F.VPMOVUSQB.meta,
+    AVX512F.VPMOVUSQD.meta,
+    AVX512F.VPMOVUSQW.meta,
+    AVX512BW.VPMOVUSWB.meta,
+    // P1: COMPLEMENT — bitwise NOT
+    AVX512F.VPNOT.meta,
+    // P1: UNPACK — interleave low/high
+    AVX2.VPUNPCKLBW.meta,
+    AVX2.VPUNPCKLWD.meta,
+    AVX2.VPUNPCKLDQ.meta,
+    AVX2.VPUNPCKLQDQ.meta,
+    AVX2.VPUNPCKHBW.meta,
+    AVX2.VPUNPCKHWD.meta,
+    AVX2.VPUNPCKHDQ.meta,
+    AVX2.VPUNPCKHQDQ.meta,
+    // P3: AVERAGE — unsigned element average
+    AVX2.VPAVGB.meta,
+    AVX2.VPAVGW.meta,
+    AVX512BW.VPAVGB.meta,
+    AVX512BW.VPAVGW.meta,
+    // P3: ROTATE — element rotation
+    AVX512F.VPROLD.meta,
+    AVX512F.VPROLQ.meta,
+    AVX512F.VPRORD.meta,
+    AVX512F.VPRORQ.meta,
+    AVX512F.VPROLVD.meta,
+    AVX512F.VPROLVQ.meta,
+    AVX512F.VPRORVD.meta,
+    AVX512F.VPRORVQ.meta,
+    // P3: BITWISE — ternary logic
+    AVX512F.VPTERNLOGD.meta,
+    AVX512F.VPTERNLOGQ.meta,
+    // P3: GALOIS FIELD — GF(2^8) operations
+    GFNI.GF2P8MULB.meta,
+    GFNI.GF2P8AFFINEQB.meta,
+    GFNI.GF2P8AFFINEINVQB.meta,
+    // P3: ROUND — float rounding (placeholder)
+    // P3: SHA — cryptographic hash operations
+    SHA.SHA1MSG1.meta,
+    SHA.SHA1MSG2.meta,
+    SHA.SHA1NEXTE.meta,
+    SHA.SHA1RNDS4.meta,
+    SHA.SHA256MSG1.meta,
+    SHA.SHA256MSG2.meta,
+    SHA.SHA256RNDS2.meta,
+    // P3: FULL_PERMUTE — two-source permute
+    AVX512F.VPERMI2D.meta,
+    AVX512F.VPERMI2Q.meta,
+    AVX512F.VPERMI2PS.meta,
+    AVX512F.VPERMI2PD.meta,
+    AVX512F.VPERMT2D.meta,
+    AVX512F.VPERMT2Q.meta,
+    AVX512F.VPERMT2PS.meta,
+    AVX512F.VPERMT2PD.meta,
+    // SHIFT — byte shift (PSLLDQ/PSRLDQ)
+    AVX2.PSLLDQ.meta,
+    AVX2.PSRLDQ.meta,
+    // PACK — word saturation (VPACKSSWB/VPACKUSWB)
+    AVX2.VPACKSSWB.meta,
+    AVX2.VPACKUSWB.meta,
+    // CONVERT — critical conversions (pd2dq, dq2pd, half, bf16)
+    AVX512F.CVTPD2DQ.meta,
+    AVX512F.CVTTPD2DQ.meta,
+    AVX512F.CVTDQ2PD.meta,
+    AVX512F.VCVTPH2PS.meta,
+    AVX512F.VCVTPS2PH.meta,
+    AVX512F.VCVTNEPS2BF16.meta,
+    // GATHER — indexed memory load
+    GATHER.VGATHERDPD.meta,
+    GATHER.VGATHERDPS.meta,
+    GATHER.VGATHERQPD.meta,
+    GATHER.VGATHERQPS.meta,
+    GATHER.VPGATHERDD.meta,
+    GATHER.VPGATHERDQ.meta,
+    GATHER.VPGATHERQD.meta,
+    GATHER.VPGATHERQQ.meta,
+    // SCATTER — indexed memory store
+    SCATTER.VSCATTERDPD.meta,
+    SCATTER.VSCATTERDPS.meta,
+    SCATTER.VSCATTERQPD.meta,
+    SCATTER.VSCATTERQPS.meta,
+    SCATTER.VPSCATTERDD.meta,
+    SCATTER.VPSCATTERDQ.meta,
+    SCATTER.VPSCATTERQD.meta,
+    SCATTER.VPSCATTERQQ.meta,
 };
 
 pub fn tableCount() usize {
@@ -311,7 +523,7 @@ pub fn validateRuntimeAbi(runtime_abi: anytype) void {
 }
 
 test "CLEO registry covers current wide ISA tables" {
-    try std.testing.expectEqual(@as(usize, 245), tableCount());
+    try std.testing.expectEqual(@as(usize, 424), tableCount());
     try validateAll();
     const all_features = types.FeatureSet.all();
     try std.testing.expectEqual(tableCount(), completedCount(all_features));
