@@ -1,0 +1,26 @@
+const types = @import("../types.zig");
+const instruction = @import("../instruction.zig");
+const wide = @import("../wide.zig");
+
+pub const meta = types.InstructionMeta{
+    .name = "VPERMI2PS",
+    .family = "PERMUTE",
+    .source_path = "ISA/x86/FULL_PERMUTE/VPERMI2PS.inc",
+    .required_feature = .avx512f,
+    .max_width_bits = 512,
+    .element_bits = 32,
+    .operation = .two_source_permute,
+    .alignment = .any,
+    .supports_masking = true,
+    .supports_broadcast = false,
+};
+
+pub fn plan() types.LoweringPlan { return meta.plan(); }
+pub fn safety(features: types.FeatureSet) types.SafetyReport { return instruction.safety(meta, features); }
+pub fn validate() types.SafetyError!void { try instruction.validate(meta); }
+pub fn executeThreeSource(comptime bits: usize, src1: wide.Wide(bits), src2: wide.Wide(bits), src3: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    return instruction.accumulate(bits, meta, src1, src2, src3, features);
+}
+pub fn move(comptime bits: usize, value: wide.Wide(bits), features: types.FeatureSet) types.SafetyError!wide.Wide(bits) {
+    return instruction.move(bits, meta, value, features);
+}

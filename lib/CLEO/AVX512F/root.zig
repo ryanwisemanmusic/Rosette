@@ -72,6 +72,92 @@ pub const VFMSUBADD213PS = @import("VFMSUBADD213PS.zig");
 pub const VFMSUBADD231PD = @import("VFMSUBADD231PD.zig");
 pub const VFMSUBADD231PS = @import("VFMSUBADD231PS.zig");
 pub const VFMADDRND231PD = @import("VFMADDRND231PD.zig");
+pub const CVTPD2PS = @import("CVTPD2PS.zig");
+pub const CVTPS2PD = @import("CVTPS2PD.zig");
+pub const CVTDQ2PS = @import("CVTDQ2PS.zig");
+pub const CVTPS2DQ = @import("CVTPS2DQ.zig");
+pub const CVTTPS2DQ = @import("CVTTPS2DQ.zig");
+pub const VPSLLD = @import("VPSLLD.zig");
+pub const VPSRAD = @import("VPSRAD.zig");
+pub const VPSRLD = @import("VPSRLD.zig");
+pub const VPACKSSDW = @import("VPACKSSDW.zig");
+pub const VPACKUSDW = @import("VPACKUSDW.zig");
+pub const VSCALEFPS = @import("VSCALEFPS.zig");
+pub const VSCALEFPD = @import("VSCALEFPD.zig");
+pub const VRANGEPS = @import("VRANGEPS.zig");
+pub const VRANGEPD = @import("VRANGEPD.zig");
+pub const VFIXUPIMMPS = @import("VFIXUPIMMPS.zig");
+pub const VFIXUPIMMPD = @import("VFIXUPIMMPD.zig");
+pub const VCOMPRESSPD = @import("VCOMPRESSPD.zig");
+pub const VCOMPRESSPS = @import("VCOMPRESSPS.zig");
+pub const VEXPANDPD = @import("VEXPANDPD.zig");
+pub const VEXPANDPS = @import("VEXPANDPS.zig");
+pub const VALIGND = @import("VALIGND.zig");
+pub const VALIGNQ = @import("VALIGNQ.zig");
+pub const VPERMD = @import("VPERMD.zig");
+pub const VPERMQ = @import("VPERMQ.zig");
+pub const VPMOVDB = @import("VPMOVDB.zig");
+pub const VPMOVDW = @import("VPMOVDW.zig");
+pub const VPMOVQB = @import("VPMOVQB.zig");
+pub const VPMOVQD = @import("VPMOVQD.zig");
+pub const VPMOVQW = @import("VPMOVQW.zig");
+pub const VPMOVSDB = @import("VPMOVSDB.zig");
+pub const VPMOVSDW = @import("VPMOVSDW.zig");
+pub const VPMOVSQB = @import("VPMOVSQB.zig");
+pub const VPMOVSQD = @import("VPMOVSQD.zig");
+pub const VPMOVSQW = @import("VPMOVSQW.zig");
+pub const VPMOVUSDB = @import("VPMOVUSDB.zig");
+pub const VPMOVUSDW = @import("VPMOVUSDW.zig");
+pub const VPMOVUSQB = @import("VPMOVUSQB.zig");
+pub const VPMOVUSQD = @import("VPMOVUSQD.zig");
+pub const VPMOVUSQW = @import("VPMOVUSQW.zig");
+pub const VINSERTF32X4 = @import("VINSERTF32X4.zig");
+pub const VINSERTF64X2 = @import("VINSERTF64X2.zig");
+pub const VINSERTI32X4 = @import("VINSERTI32X4.zig");
+pub const VINSERTI64X2 = @import("VINSERTI64X2.zig");
+pub const VINSERTF32X8 = @import("VINSERTF32X8.zig");
+pub const VINSERTF64X4 = @import("VINSERTF64X4.zig");
+pub const VINSERTI32X8 = @import("VINSERTI32X8.zig");
+pub const VINSERTI64X4 = @import("VINSERTI64X4.zig");
+pub const VPBROADCASTMB2Q = @import("VPBROADCASTMB2Q.zig");
+pub const VPBROADCASTMW2D = @import("VPBROADCASTMW2D.zig");
+pub const VPABSD = @import("VPABSD.zig");
+pub const VPABSQ = @import("VPABSQ.zig");
+pub const VPNOT = @import("VPNOT.zig");
+pub const VPROLD = @import("VPROLD.zig");
+pub const VPROLQ = @import("VPROLQ.zig");
+pub const VPRORD = @import("VPRORD.zig");
+pub const VPRORQ = @import("VPRORQ.zig");
+pub const VPROLVD = @import("VPROLVD.zig");
+pub const VPROLVQ = @import("VPROLVQ.zig");
+pub const VPRORVD = @import("VPRORVD.zig");
+pub const VPRORVQ = @import("VPRORVQ.zig");
+pub const VPTERNLOGD = @import("VPTERNLOGD.zig");
+pub const VPTERNLOGQ = @import("VPTERNLOGQ.zig");
+pub const VPERMI2D = @import("VPERMI2D.zig");
+pub const VPERMI2Q = @import("VPERMI2Q.zig");
+pub const VPERMI2PS = @import("VPERMI2PS.zig");
+pub const VPERMI2PD = @import("VPERMI2PD.zig");
+pub const VPERMT2D = @import("VPERMT2D.zig");
+pub const VPERMT2Q = @import("VPERMT2Q.zig");
+pub const VPERMT2PS = @import("VPERMT2PS.zig");
+pub const VPERMT2PD = @import("VPERMT2PD.zig");
+pub const CVTPD2DQ = @import("CVTPD2DQ.zig");
+pub const CVTTPD2DQ = @import("CVTTPD2DQ.zig");
+pub const CVTDQ2PD = @import("CVTDQ2PD.zig");
+pub const VCVTPH2PS = @import("VCVTPH2PS.zig");
+pub const VCVTPS2PH = @import("VCVTPS2PH.zig");
+pub const VCVTNEPS2BF16 = @import("VCVTNEPS2BF16.zig");
+pub const VBROADCASTF32X2 = @import("VBROADCASTF32X2.zig");
+pub const VBROADCASTF32X4 = @import("VBROADCASTF32X4.zig");
+pub const VBROADCASTF32X8 = @import("VBROADCASTF32X8.zig");
+pub const VBROADCASTF64X2 = @import("VBROADCASTF64X2.zig");
+pub const VBROADCASTF64X4 = @import("VBROADCASTF64X4.zig");
+pub const VBROADCASTI32x2 = @import("VBROADCASTI32x2.zig");
+pub const VBROADCASTI32X4 = @import("VBROADCASTI32X4.zig");
+pub const VBROADCASTI32X8 = @import("VBROADCASTI32X8.zig");
+pub const VBROADCASTI64X2 = @import("VBROADCASTI64X2.zig");
+pub const VBROADCASTI64X4 = @import("VBROADCASTI64X4.zig");
 
 const types = @import("../types.zig");
 
@@ -150,6 +236,92 @@ pub const metas = [_]types.InstructionMeta{
     VFMSUBADD231PD.meta,
     VFMSUBADD231PS.meta,
     VFMADDRND231PD.meta,
+    CVTPD2PS.meta,
+    CVTPS2PD.meta,
+    CVTDQ2PS.meta,
+    CVTPS2DQ.meta,
+    CVTTPS2DQ.meta,
+    VPSLLD.meta,
+    VPSRAD.meta,
+    VPSRLD.meta,
+    VPACKSSDW.meta,
+    VPACKUSDW.meta,
+    VSCALEFPS.meta,
+    VSCALEFPD.meta,
+    VRANGEPS.meta,
+    VRANGEPD.meta,
+    VFIXUPIMMPS.meta,
+    VFIXUPIMMPD.meta,
+    VCOMPRESSPD.meta,
+    VCOMPRESSPS.meta,
+    VEXPANDPD.meta,
+    VEXPANDPS.meta,
+    VALIGND.meta,
+    VALIGNQ.meta,
+    VPERMD.meta,
+    VPERMQ.meta,
+    VPMOVDB.meta,
+    VPMOVDW.meta,
+    VPMOVQB.meta,
+    VPMOVQD.meta,
+    VPMOVQW.meta,
+    VPMOVSDB.meta,
+    VPMOVSDW.meta,
+    VPMOVSQB.meta,
+    VPMOVSQD.meta,
+    VPMOVSQW.meta,
+    VPMOVUSDB.meta,
+    VPMOVUSDW.meta,
+    VPMOVUSQB.meta,
+    VPMOVUSQD.meta,
+    VPMOVUSQW.meta,
+    VINSERTF32X4.meta,
+    VINSERTF64X2.meta,
+    VINSERTI32X4.meta,
+    VINSERTI64X2.meta,
+    VINSERTF32X8.meta,
+    VINSERTF64X4.meta,
+    VINSERTI32X8.meta,
+    VINSERTI64X4.meta,
+    VPBROADCASTMB2Q.meta,
+    VPBROADCASTMW2D.meta,
+    VPABSD.meta,
+    VPABSQ.meta,
+    VPNOT.meta,
+    VPROLD.meta,
+    VPROLQ.meta,
+    VPRORD.meta,
+    VPRORQ.meta,
+    VPROLVD.meta,
+    VPROLVQ.meta,
+    VPRORVD.meta,
+    VPRORVQ.meta,
+    VPTERNLOGD.meta,
+    VPTERNLOGQ.meta,
+    VPERMI2D.meta,
+    VPERMI2Q.meta,
+    VPERMI2PS.meta,
+    VPERMI2PD.meta,
+    VPERMT2D.meta,
+    VPERMT2Q.meta,
+    VPERMT2PS.meta,
+    VPERMT2PD.meta,
+    CVTPD2DQ.meta,
+    CVTTPD2DQ.meta,
+    CVTDQ2PD.meta,
+    VCVTPH2PS.meta,
+    VCVTPS2PH.meta,
+    VCVTNEPS2BF16.meta,
+    VBROADCASTF32X2.meta,
+    VBROADCASTF32X4.meta,
+    VBROADCASTF32X8.meta,
+    VBROADCASTF64X2.meta,
+    VBROADCASTF64X4.meta,
+    VBROADCASTI32x2.meta,
+    VBROADCASTI32X4.meta,
+    VBROADCASTI32X8.meta,
+    VBROADCASTI64X2.meta,
+    VBROADCASTI64X4.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {
