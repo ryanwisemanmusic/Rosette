@@ -1,5 +1,5 @@
 const std = @import("std");
-const machoCapturePrint = @import("event_log.zig").machoCapturePrint;
+const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 pub const ExportRecord = struct {
     name: [64]u8 = [_]u8{0} ** 64,

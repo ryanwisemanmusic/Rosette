@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const guest_sleep = @import("scheduler").guest_sleep;
 const guest_memory_geometry = @import("guest_memory_geometry.zig");
-const machoCapturePrint = @import("event_log.zig").machoCapturePrint;
+const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
