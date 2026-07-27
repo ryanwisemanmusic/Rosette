@@ -10,6 +10,7 @@ const x64_interpreter = @import("x64_interpreter");
 const x64_linux_runtime = @import("x64_linux_runtime");
 const x64_syscalls = @import("x64_syscalls");
 const exit_diagnostics = @import("exit_diagnostics");
+const cleo_routing = @import("cleo_routing");
 
 const SYS_read = x64_syscalls.SYS_read; // 0
 const SYS_write = x64_syscalls.SYS_write; // 1
@@ -437,6 +438,9 @@ pub const ElfState = struct {
     image_high: u64 = 0,
     regs: ElfRegs = .{},
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    // AVX-512 opmask registers (k0-k7). k0 is always all-1s when read as
+    // a mask operand; k1-k7 hold actual mask values for predicated operations.
+    k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
     x87_integer_top: i64 = 0,
     x87_integer_valid: bool = false,
     terminated: bool = false,
@@ -1372,6 +1376,81 @@ pub const ElfState = struct {
     }
 
     pub fn execute(self: *ElfState, d: DecodedInsn) void {
+        // Check if this instruction can be routed to CLEO for wide SIMD execution
+        {
+            const route = cleo_routing.CleoRouter.route(
+                @tagName(d.op),
+                cleo_routing.types.FeatureSet.cleoEmulated(),
+                0,
+            );
+            if (route.can_route) {
+                if (route.meta) |meta| {
+                    const result_wide: ?cleo_routing.wide.Wide(128) = ternary: {
+                        const is_fma = switch (meta.operation) {
+                            .fma_ps, .fma_pd, .fms_ps, .fms_pd, .fnma_ps, .fnma_pd, .fnms_ps, .fnms_pd, .fma_addsub_ps, .fma_addsub_pd, .fma_subadd_ps => true,
+                            else => false,
+                        };
+                        const mask_active = d.opmask != 0;
+                        const mask_val: u64 = if (mask_active) self.k[d.opmask] else 0xFFFF_FFFF_FFFF_FFFF;
+                        const mask_mode: cleo_routing.wide.MaskMode = if (d.zero_mask) .zero else .merge;
+                        if (!is_fma) {
+                            _ = d.evex_broadcast; // Reserved for EVEX broadcast semantics
+                            if (mask_active) {
+                                break :ternary cleo_routing.ops.executeBinaryMasked(
+                                    128,
+                                    meta,
+                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[d.xmm_dst]),
+                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[d.xmm_dst]),
+                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[d.xmm_src]),
+                                    mask_val,
+                                    mask_mode,
+                                    route.features,
+                                ) catch null;
+                            }
+                            break :ternary cleo_routing.ops.executeBinary(
+                                128,
+                                meta,
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[d.xmm_dst]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[d.xmm_src]),
+                                route.features,
+                            ) catch null;
+                        }
+                        const op_name = @tagName(d.op);
+                        const has_132 = std.mem.indexOf(u8, op_name, "132") != null;
+                        const has_213 = std.mem.indexOf(u8, op_name, "213") != null;
+                        const accum = if (has_132) d.xmm_src2 else if (has_213) d.xmm_src else d.xmm_dst;
+                        const lhs = if (has_132) d.xmm_dst else if (has_213) d.xmm_src2 else d.xmm_src2;
+                        const rhs = if (has_132) d.xmm_src else if (has_213) d.xmm_dst else d.xmm_src;
+                        if (mask_active) {
+                            break :ternary cleo_routing.ops.executeAccumulateMasked(
+                                128,
+                                meta,
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[d.xmm_dst]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
+                                mask_val,
+                                mask_mode,
+                                route.features,
+                            ) catch null;
+                        }
+                        break :ternary cleo_routing.ops.executeAccumulate(
+                            128,
+                            meta,
+                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
+                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
+                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
+                            route.features,
+                        ) catch null;
+                    };
+                    if (result_wide) |rw| {
+                        self.xmm[d.xmm_dst] = rw.bytes;
+                        return;
+                    }
+                }
+                // Fall through to interpreter for unsupported operations
+            }
+        }
         switch (d.op) {
             .invalid => unreachable,
             .nop => {},
@@ -2279,7 +2358,7 @@ pub const ElfState = struct {
                 }
                 self.setReg(d.src_reg, size, old_mem);
             },
-            .xadd_mem32_reg32, .xadd_mem64_reg64 => {
+            .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => {
                 const old_mem = self.readMemVal(d.addr, d.size);
                 const old_reg = self.regVal(d.src_reg, d.size);
                 const result = old_mem +% old_reg;
@@ -2648,6 +2727,7 @@ pub const ElfState = struct {
             .vcvtsi2sd_xmm_reg,
             .vcvtsi2sd_xmm_mem,
             .vcvtss2sd,
+            .vcvtsd2ss,
             .vaddss,
             .vaddsd,
             .vaddps,
@@ -2697,7 +2777,176 @@ pub const ElfState = struct {
             .vptest,
             .vpunpckldq,
             .vpunpcklqdq,
+            .vpunpckhqdq,
+            .vmovhlps,
+            .vmovlhps,
+            .vmovmskps,
+            .vmovmskpd,
+            .vsqrtps,
+            .vsqrtpd,
+            .vsqrtss,
+            .vsqrtsd,
+            .vunpcklps,
+            .vunpckhps,
+            .vunpcklpd,
+            .vunpckhpd,
+            .vcvtps2pd,
+            .vcvtpd2ps,
             .vpermilpd,
+            // SSSE3/AVX2 integer 0x38 ops (not decoded for ELF)
+            .vpsignb,
+            .vpsignw,
+            .vpsignd,
+            .vpabsb,
+            .vpabsw,
+            .vpabsd,
+            .vpsrlvw,
+            .vpsravw,
+            .vpsllvw,
+            .vpmovsxbw,
+            .vpmovsxbd,
+            .vpmovsxbq,
+            .vpmovsxwd,
+            .vpmovsxwq,
+            .vpmovsxdq,
+            .vpmovzxbw,
+            .vpmovzxbd,
+            .vpmovzxbq,
+            .vpmovzxwd,
+            .vpmovzxwq,
+            .vpmovzxdq,
+            .vpmuldq,
+            .vpacksswb,
+            .vpackuswb,
+            .vpackusdw,
+            .vpermd,
+            .vextractf128,
+            .vpextrb,
+            .vpextrw,
+            .vpextrd,
+            .vpextrq,
+            .vpminsb,
+            .vpminsd,
+            .vpminuw,
+            .vpminud,
+            .vpmaxsb,
+            .vpmaxsd,
+            .vpmaxuw,
+            .vpmaxud,
+            .vpmulld_38,
+            .vphaddw,
+            .vphaddd,
+            .vphaddsw,
+            .vphsubw,
+            .vphsubd,
+            .vphsubsw,
+            .vfmadd132ps,
+            .vfmadd132pd,
+            .vfmadd213ps,
+            .vfmadd213pd,
+            .vfmadd231ps,
+            .vfmadd231pd,
+            .vfmsub132ps,
+            .vfmsub132pd,
+            .vfmsub213ps,
+            .vfmsub213pd,
+            .vfmsub231ps,
+            .vfmsub231pd,
+            .vfmaddsub132ps,
+            .vfmaddsub132pd,
+            .vfmaddsub213ps,
+            .vfmaddsub213pd,
+            .vfmaddsub231ps,
+            .vfmaddsub231pd,
+            .vfmsubadd132ps,
+            .vfmsubadd132pd,
+            .vfmsubadd213ps,
+            .vfmsubadd213pd,
+            .vfmsubadd231ps,
+            .vfmsubadd231pd,
+            .vphminposuw,
+            .vpsrlvd,
+            .vpsravd,
+            .vpsllvd,
+            .vpblendvb,
+            .vpalignr,
+            .vpermps,
+            .vinsertps,
+            // AVX SIMD float min/max
+            .vminps,
+            .vminpd,
+            .vminss,
+            .vminsd,
+            .vmaxps,
+            .vmaxpd,
+            .vmaxss,
+            .vmaxsd,
+            // AVX horizontal / reciprocal
+            .vhaddps,
+            .vhaddpd,
+            .vhsubps,
+            .vhsubpd,
+            .vrcpps,
+            .vrsqrtps,
+            // AVX SIMD compare
+            .vcmpps,
+            .vcmppd,
+            .vcmpss,
+            .vcmpsd,
+            // AVX512/AVX extensions (not yet decoded for ELF execution)
+            .vscalefps,
+            .vscalefpd,
+            .vrangeps,
+            .vrangepd,
+            .vfixupimmps,
+            .vfixupimmpd,
+            .vcompressps,
+            .vcompresspd,
+            .vexpandps,
+            .vexpandpd,
+            .vbroadcastss,
+            .vbroadcastsd,
+            .vbroadcastf128,
+            .vbroadcasti128,
+            .vpermi2d,
+            .vpermi2q,
+            .vpermi2ps,
+            .vpermi2pd,
+            .vpermt2d,
+            .vpermt2q,
+            .vpermt2ps,
+            .vpermt2pd,
+            .vgatherdps,
+            .vgatherdpd,
+            .vgatherqps,
+            .vgatherqpd,
+            .vpgatherdd,
+            .vpgatherdq,
+            .vscatterdps,
+            .vscatterdpd,
+            .vscatterqps,
+            .vscatterqpd,
+            .vpscatterdd,
+            .vpscatterdq,
+            .vpternlogd,
+            .vpternlogq,
+            .vcvtps2ph,
+            .vcvtph2ps,
+            .vcvtne2ps2bf16,
+            .vcvttps2dq,
+            .vcvtps2dq,
+            .vcvtdq2ps,
+            .vshuff32x4,
+            .vshuff64x2,
+            .vshufi32x4,
+            .vshufi64x2,
+            .valignd,
+            .valignq,
+            .vpmovm2d,
+            .vpmovd2m,
+            .vpmultishiftqb,
+            .vpconflictd,
+            .vpconflictq,
             => unreachable,
         }
 
