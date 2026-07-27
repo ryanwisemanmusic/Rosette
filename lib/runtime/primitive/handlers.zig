@@ -70,6 +70,17 @@ pub fn strcmp(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled;
 }
 
+pub fn llabs(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const val = ctx.readArg(0);
+    // Branchless abs for two's complement: mask = -(val >> 63)
+    // If val >= 0: mask = 0, result = (val ^ 0) - 0 = val
+    // If val < 0:  mask = all_ones, result = (~val) - (-1) = ~val + 1 = -val
+    const mask = 0 -% (val >> 63);
+    const result = (val ^ mask) -% mask;
+    ctx.setResult(result);
+    return .handled;
+}
+
 pub fn strncmp(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     const s1 = ctx.readArg(0);
     const s2 = ctx.readArg(1);
@@ -84,6 +95,93 @@ pub fn strncmp(_: SlotIndex, ctx: *const PrimitiveContext) Result {
         .gt => 1,
     } else if (a.len < n and b.len < n) 0 else if (a.len < b.len) -1 else 1;
     ctx.setResult(@as(u64, @bitCast(@as(i64, if (n == 0) 0 else result))));
+    return .handled;
+}
+
+/// Implements `std::to_string(int)` — formats an int as a decimal string
+/// and writes a libc++ SSO std::string at the hidden pointer in rdi.
+/// ABI: rdi = output string ptr, rsi = int value.
+pub fn to_string(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const output_ptr = ctx.readArg(0); // hidden pointer for return string
+    const raw_value = ctx.readArg(1); // int value as u64
+    const value: i32 = @bitCast(@as(u32, @truncate(raw_value)));
+
+    // Format the integer as a decimal string (i32 max = 11 chars including '-').
+    // Always fits in SSO (max 22 chars).
+    var buf: [12]u8 = undefined;
+    const len = formatIntDecimal(value, &buf);
+
+    // Write SSO libc++ string at output_ptr.
+    // Layout: byte 0 = (length << 1), bytes 1..len = data, byte 1+len = 0, rest = 0.
+    var string_buf: [24]u8 = .{0} ** 24;
+    string_buf[0] = @as(u8, @intCast(len << 1));
+    @memcpy(string_buf[1 .. 1 + len], buf[0..len]);
+    string_buf[1 + len] = 0;
+
+    ctx.writeGuest(output_ptr, &string_buf) orelse return .unsupported;
+    return .handled_void;
+}
+
+/// Formats an i32 as a decimal string. Returns the string length.
+fn formatIntDecimal(value: i32, buf: []u8) usize {
+    if (value == std.math.minInt(i32)) {
+        @memcpy(buf[0..11], "-2147483648");
+        return 11;
+    }
+
+    var v = value;
+    var i: usize = 0;
+
+    if (v < 0) {
+        buf[i] = '-';
+        i += 1;
+        v = -v;
+    }
+
+    if (v == 0) {
+        buf[i] = '0';
+        return i + 1;
+    }
+
+    const digit_start = i;
+    while (v > 0) : (v = @divTrunc(v, 10)) {
+        buf[i] = @as(u8, @intCast(@rem(v, 10))) + '0';
+        i += 1;
+    }
+
+    std.mem.reverse(u8, buf[digit_start..i]);
+    return i;
+}
+
+/// Implements `std::basic_ostream::put(char_type)` — writes a single
+/// character to the output stream.
+/// ABI: rdi = this (ostream), rsi = char value (sign-extended). Returns *ostream.
+pub fn ostreamPut(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const character = @as(u8, @truncate(ctx.readArg(1))); // rsi = char
+    var buf: [1]u8 = .{character};
+    _ = std.c.write(1, &buf, 1);
+
+    ctx.setResult(ctx.readArg(0)); // return ostream pointer (this)
+    return .handled;
+}
+
+/// Implements `std::basic_ostream::write(const char_type*, streamsize)` —
+/// writes data to the output stream. For now, routes content to host stdout
+/// so the guest sees its output.
+/// ABI: rdi = this (ostream), rsi = data ptr, rdx = length. Returns *ostream.
+pub fn ostreamWrite(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const data_ptr = ctx.readArg(1);
+    const length = ctx.readArg(2);
+
+    if (length == 0) {
+        ctx.setResult(ctx.readArg(0));
+        return .handled;
+    }
+
+    const data = ctx.readGuest(data_ptr, @as(usize, @intCast(length))) orelse return .unsupported;
+    _ = std.c.write(1, data.ptr, @as(usize, @intCast(length)));
+
+    ctx.setResult(ctx.readArg(0));
     return .handled;
 }
 

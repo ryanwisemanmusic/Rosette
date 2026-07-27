@@ -40,6 +40,7 @@ pub const PrimitiveRegistry = struct {
 };
 
 const builtin_primitives = [_]PrimitiveDef{
+    .{ .name_pattern = "llabs", .handler = @import("handlers.zig").llabs },
     .{ .name_pattern = "strlen", .handler = @import("handlers.zig").strlen },
     .{ .name_pattern = "memcmp", .handler = @import("handlers.zig").memcmp },
     .{ .name_pattern = "strcmp", .handler = @import("handlers.zig").strcmp },
@@ -47,6 +48,9 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "__cxa_guard_acquire", .handler = @import("handlers.zig").cxaGuardAcquire },
     .{ .name_pattern = "__cxa_guard_release", .handler = @import("handlers.zig").cxaGuardRelease },
     .{ .name_pattern = "__cxa_guard_abort", .handler = @import("handlers.zig").cxaGuardAbort },
+    .{ .name_pattern = "to_string", .handler = @import("handlers.zig").to_string },
+    .{ .name_pattern = "5writeEPKc", .handler = @import("handlers.zig").ostreamWrite },
+    .{ .name_pattern = "3putEc", .handler = @import("handlers.zig").ostreamPut },
 };
 
 pub fn builtin() PrimitiveRegistry {
