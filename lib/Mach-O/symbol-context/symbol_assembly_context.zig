@@ -1,7 +1,7 @@
 const std = @import("std");
 const x64_decoder = @import("x64_decoder");
 const macho_metadata = @import("../metadata.zig");
-const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
+const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 
 const DecodedInsn = x64_decoder.DecodedInsn;
 
