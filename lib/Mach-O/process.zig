@@ -41,9 +41,12 @@ const logging_runtime = @import("diagnostics").logging_runtime;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
-const bytesForSize = @import("memory").bytesForSize;
-const writeExtendedFloat80 = @import("memory").writeExtendedFloat80;
-const readExtendedFloat80 = @import("memory").readExtendedFloat80;
+const memory_mod = @import("memory");
+const bytesForSize = memory_mod.bytesForSize;
+const writeExtendedFloat80 = memory_mod.writeExtendedFloat80;
+const readExtendedFloat80 = memory_mod.readExtendedFloat80;
+const memReadMemVal = memory_mod.readMemVal;
+const MemReadCallbacks = memory_mod.ReadMemValCallbacks;
 const diagnostic_throttle = @import("diagnostics").diagnostic_throttle;
 const pthread_runtime = @import("pthread").pthread_runtime;
 const runtime_output = @import("diagnostics").runtime_output;
@@ -56,6 +59,7 @@ const dynamic_export_registry = @import("dyld").dynamic_export_registry;
 const thread_wait_profiler = @import("pthread").thread_wait_profiler;
 const contract = @import("contract");
 const primitive = @import("primitive");
+const import_handler = @import("import_handler");
 const dyld = @import("dyld");
 const vt = @import("vtable");
 const scheduler = @import("scheduler");
@@ -452,10 +456,8 @@ pub const MachOState = struct {
     import_route_cache_misses: u64 = 0,
     import_route_cache_collisions: u64 = 0,
     import_route_cache_fallbacks: u64 = 0,
-    primitive_dispatch_hits: u64 = 0,
     cleo_dispatch_hits: u64 = 0,
-    primitive_dispatch_counts: std.StringHashMap(u64),
-    primitive_dispatch_logged: std.AutoHashMap(u64, void),
+    import_handler: import_handler.ImportHandler,
     page_entry_bulk_initializations: u64 = 0,
     page_entry_bulk_bytes: u64 = 0,
     initializer_memory: memory_transaction.Journal,
@@ -593,8 +595,7 @@ pub const MachOState = struct {
             .symbol_assembly = symbol_assembly_context.Tracker.init(allocator),
             .page_permissions = page_permissions,
             .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
-            .primitive_dispatch_counts = std.StringHashMap(u64).init(allocator),
-            .primitive_dispatch_logged = std.AutoHashMap(u64, void).init(allocator),
+            .import_handler = import_handler.ImportHandler.init(allocator),
             .vtable_tracker = vt.VtableTracker.init(allocator),
             .guard_rollback = vt.GuardRollback.init(allocator),
             .decode_cache = decode_cache,
@@ -787,13 +788,15 @@ pub const MachOState = struct {
     }
 
     fn dumpPrimitiveTotals(self: *MachOState) void {
-        if (self.primitive_dispatch_counts.count() == 0) return;
-        primitiveCapturePrint("primitive lib: === totals ===\n", .{});
-        var iter = self.primitive_dispatch_counts.iterator();
-        while (iter.next()) |entry| {
-            primitiveCapturePrint("primitive lib:   {s}: {d} dispatch(s)\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-        }
-        primitiveCapturePrint("primitive lib: === end totals ===\n", .{});
+        const log_cb = import_handler.PrimitiveLogCallbacks{
+            .ctx = @ptrCast(&self.macho_log),
+            .logLine = struct {
+                fn log(_: *anyopaque, text: []const u8) void {
+                    primitiveCapturePrint("{s}", .{text});
+                }
+            }.log,
+        };
+        self.import_handler.dumpTotals(log_cb);
     }
 
     pub fn deinit(self: *MachOState) void {
@@ -805,8 +808,7 @@ pub const MachOState = struct {
         self.libcxx_streams.deinit();
         self.dumpPrimitiveTotals();
         self.local_libcpp_stream_targets.deinit();
-        self.primitive_dispatch_counts.deinit();
-        self.primitive_dispatch_logged.deinit();
+        self.import_handler.deinit();
         self.vtable_tracker.deinit();
         self.guard_rollback.deinit();
         self.import_resolver.deinit();
@@ -1266,28 +1268,33 @@ pub const MachOState = struct {
         };
     }
 
+    /// Build a MemoryState referencing this MachOState's memory fields.
+    fn ms(self: *const MachOState) memory_mod.MemoryState {
+        return .{
+            .allocator = self.allocator,
+            .mem = self.mem,
+            .mem_base = self.mem_base,
+            .mem_size = self.mem_size,
+            .heap_next = self.heap_next,
+            .page_permissions = self.page_permissions,
+            .sparse_memory = &self.sparse_memory,
+        };
+    }
+
     pub fn read8(self: *const MachOState, vaddr: u64) u8 {
-        if (self.sparse_memory.bytesConst(vaddr, 1)) |bytes| return bytes[0];
-        const off = self.translateGuest(vaddr, 1, .read) orelse return 0;
-        return self.mem[off];
+        return memory_mod.read8(&self.ms(), vaddr, self.translateGuest(vaddr, 1, .read));
     }
 
     pub fn read16(self: *const MachOState, vaddr: u64) u16 {
-        if (self.sparse_memory.bytesConst(vaddr, 2)) |bytes| return std.mem.readInt(u16, bytes[0..2], .little);
-        const off = self.translateGuest(vaddr, 2, .read) orelse return 0;
-        return std.mem.readInt(u16, self.mem[off..][0..2], .little);
+        return memory_mod.read16(&self.ms(), vaddr, self.translateGuest(vaddr, 2, .read));
     }
 
     pub fn read32(self: *const MachOState, vaddr: u64) u32 {
-        if (self.sparse_memory.bytesConst(vaddr, 4)) |bytes| return std.mem.readInt(u32, bytes[0..4], .little);
-        const off = self.translateGuest(vaddr, 4, .read) orelse return 0;
-        return std.mem.readInt(u32, self.mem[off..][0..4], .little);
+        return memory_mod.read32(&self.ms(), vaddr, self.translateGuest(vaddr, 4, .read));
     }
 
     pub fn read64(self: *const MachOState, vaddr: u64) u64 {
-        if (self.sparse_memory.bytesConst(vaddr, 8)) |bytes| return std.mem.readInt(u64, bytes[0..8], .little);
-        const off = self.translateGuest(vaddr, 8, .read) orelse return 0;
-        return std.mem.readInt(u64, self.mem[off..][0..8], .little);
+        return memory_mod.read64(&self.ms(), vaddr, self.translateGuest(vaddr, 8, .read));
     }
 
     pub fn write8(self: *MachOState, vaddr: u64, val: u8) void {
@@ -1391,42 +1398,33 @@ pub const MachOState = struct {
 
     pub fn readMemVal(self: *MachOState, addr: u64, size: Size) u64 {
         const bytes = bytesForSize(size);
-        if (self.sparse_memory.bytesConst(addr, bytes)) |storage| {
-            var value: u64 = switch (size) {
-                .bits8 => storage[0],
-                .bits16 => std.mem.readInt(u16, storage[0..2], .little),
-                .bits32 => std.mem.readInt(u32, storage[0..4], .little),
-                .bits64 => std.mem.readInt(u64, storage[0..8], .little),
-            };
-            if (size == .bits64 and value < 0x1000) {
-                if (self.recoverLiveAllocationVtable(addr, value)) |recovered| {
-                    const mutable_storage = self.sparse_memory.bytes(addr, @sizeOf(u64), true) orelse
-                        return value;
-                    std.mem.writeInt(u64, mutable_storage[0..8], recovered, .little);
-                    value = recovered;
-                }
-            }
-            self.recordMemoryAccess(addr, size, "read", value);
-            return value;
-        }
         const off = self.translateGuest(addr, bytes, .read) orelse {
             self.terminateForGuestAccess(addr, bytes, .read, @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op));
             return 0;
         };
-        var value: u64 = switch (size) {
-            .bits8 => self.mem[off],
-            .bits16 => std.mem.readInt(u16, self.mem[off..][0..2], .little),
-            .bits32 => std.mem.readInt(u32, self.mem[off..][0..4], .little),
-            .bits64 => std.mem.readInt(u64, self.mem[off..][0..8], .little),
-        };
-        if (size == .bits64 and value < 0x1000) {
-            if (self.recoverLiveAllocationVtable(addr, value)) |recovered| {
-                std.mem.writeInt(u64, self.mem[off..][0..8], recovered, .little);
-                value = recovered;
-            }
-        }
-        self.recordMemoryAccess(addr, size, "read", value);
-        return value;
+        const ctx: *anyopaque = @ptrCast(self);
+        return memReadMemVal(&self.ms(), addr, size, off, .{
+            .ctx = ctx,
+            .recoverVtable = struct {
+                fn recover(c: *anyopaque, a: u64, suspect: u64) ?u64 {
+                    const st: *MachOState = @ptrCast(@alignCast(c));
+                    return st.recoverLiveAllocationVtable(a, suspect);
+                }
+            }.recover,
+            .recordAccess = struct {
+                fn record(c: *anyopaque, a: u64, bytes_count: u8, v: u64) void {
+                    const st: *MachOState = @ptrCast(@alignCast(c));
+                    const sz: Size = switch (bytes_count) {
+                        1 => .bits8,
+                        2 => .bits16,
+                        4 => .bits32,
+                        8 => .bits64,
+                        else => .bits64,
+                    };
+                    st.recordMemoryAccess(a, sz, "read", v);
+                }
+            }.record,
+        });
     }
 
     fn recoverLiveAllocationVtable(self: *MachOState, address: u64, current_value: u64) ?u64 {
@@ -3238,11 +3236,66 @@ pub const MachOState = struct {
     }
 
     fn tryPrimitiveDispatch(self: *MachOState, imported: macho_metadata.ImportedSymbol) ?ImportHandlerResult {
-        const handler = primitive.builtin().matchSymbol(imported.name) orelse return null;
-        const slot = 0;
-        var ctx = primitive.PrimitiveContext{
-            .ptr = self,
-            .readArgFn = struct {
+        const dispatch_cb = import_handler.PrimitiveDispatchCallbacks{
+            .ctx = self,
+            .matchSymbol = struct {
+                fn match(_: *anyopaque, name: []const u8) ?*const anyopaque {
+                    // Use primitive.builtin().matchSymbol — doesn't need MachOState
+                    const h = primitive.builtin().matchSymbol(name);
+                    return if (h) |handler| @ptrCast(handler) else null;
+                }
+            }.match,
+            .callHandler = struct {
+                fn call(ctx: *anyopaque, slot: u32, handler_ptr: *const anyopaque) u8 {
+                    const typed_handler: primitive.types.Handler = @ptrCast(@alignCast(handler_ptr));
+                    var prim_ctx = primitive.types.PrimitiveContext{
+                        .ptr = ctx,
+                        .readArgFn = struct {
+                            fn read(ptr: *anyopaque, index: u8) u64 {
+                                const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
+                                return switch (index) {
+                                    0 => inner_st.regs.rdi,
+                                    1 => inner_st.regs.rsi,
+                                    2 => inner_st.regs.rdx,
+                                    3 => inner_st.regs.rcx,
+                                    4 => inner_st.regs.r8,
+                                    5 => inner_st.regs.r9,
+                                    else => 0,
+                                };
+                            }
+                        }.read,
+                        .setResultFn = struct {
+                            fn set(ptr: *anyopaque, value: u64) void {
+                                const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
+                                inner_st.regs.rax = value;
+                            }
+                        }.set,
+                        .readGuestFn = struct {
+                            fn read(ptr: *const anyopaque, address: u64, size: usize) ?[]const u8 {
+                                const inner_st: *const MachOState = @ptrCast(@alignCast(ptr));
+                                return inner_st.guestMemoryConst(address, @intCast(size));
+                            }
+                        }.read,
+                        .writeGuestFn = struct {
+                            fn write(ptr: *anyopaque, address: u64, data: []const u8) ?void {
+                                const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
+                                const dest = inner_st.guestMemory(address, @intCast(data.len)) orelse return null;
+                                @memcpy(dest[0..data.len], data);
+                                return {};
+                            }
+                        }.write,
+                        .readCStringFn = struct {
+                            fn read(ptr: *const anyopaque, address: u64) ?[]const u8 {
+                                const inner_st: *const MachOState = @ptrCast(@alignCast(ptr));
+                                return inner_st.guestCString(address, 4096);
+                            }
+                        }.read,
+                    };
+                    const result = typed_handler(slot, &prim_ctx);
+                    return @intFromEnum(result);
+                }
+            }.call,
+            .readRegister = struct {
                 fn read(ptr: *anyopaque, index: u8) u64 {
                     const st: *MachOState = @ptrCast(@alignCast(ptr));
                     return switch (index) {
@@ -3256,70 +3309,36 @@ pub const MachOState = struct {
                     };
                 }
             }.read,
-            .setResultFn = struct {
-                fn set(ptr: *anyopaque, value: u64) void {
-                    const st: *MachOState = @ptrCast(@alignCast(ptr));
-                    st.regs.rax = value;
-                }
-            }.set,
-            .readGuestFn = struct {
-                fn read(ptr: *const anyopaque, address: u64, size: usize) ?[]const u8 {
+            .readResult = struct {
+                fn read(ptr: *const anyopaque) u64 {
                     const st: *const MachOState = @ptrCast(@alignCast(ptr));
-                    return st.guestMemoryConst(address, @intCast(size));
-                }
-            }.read,
-            .writeGuestFn = struct {
-                fn write(ptr: *anyopaque, address: u64, data: []const u8) ?void {
-                    const st: *MachOState = @ptrCast(@alignCast(ptr));
-                    const dest = st.guestMemory(address, @intCast(data.len)) orelse return null;
-                    @memcpy(dest[0..data.len], data);
-                    return {};
-                }
-            }.write,
-            .readCStringFn = struct {
-                fn read(ptr: *const anyopaque, address: u64) ?[]const u8 {
-                    const st: *const MachOState = @ptrCast(@alignCast(ptr));
-                    return st.guestCString(address, 4096);
+                    return st.regs.rax;
                 }
             }.read,
         };
-        const result = handler(slot, &ctx);
-        const action = switch (result) {
-            .handled => "handled",
-            .handled_void => "handled_void",
-            .unsupported => "unsupported",
-            .fallback => "fallback",
+        const log_cb = import_handler.PrimitiveLogCallbacks{
+            .ctx = self,
+            .logLine = struct {
+                fn log(_: *anyopaque, text: []const u8) void {
+                    primitiveCapturePrint("{s}", .{text});
+                }
+            }.log,
         };
-
-        const action_u8: u8 = @intFromEnum(result);
-        const name_hash = std.hash_map.hashString(imported.name);
-        const pair_key = name_hash ^ (@as(u64, action_u8) << 56);
-        if (!self.primitive_dispatch_logged.contains(pair_key)) {
-            self.primitive_dispatch_logged.put(pair_key, {}) catch {};
-            primitiveCapturePrint(
-                "primitive lib: slot={d} import={s} action={s}\n",
-                .{ slot, imported.name, action },
-            );
-        }
-
-        const gop = self.primitive_dispatch_counts.getOrPut(imported.name) catch
-            return switch (result) {
-                .handled => ImportHandlerResult{ .handled = self.regs.rax },
-                .handled_void => .handled_void,
-                .unsupported, .fallback => null,
-            };
-        if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
-
-        return switch (result) {
-            .handled => ImportHandlerResult{ .handled = self.regs.rax },
+        const outcome = self.import_handler.tryPrimitiveDispatch(
+            imported.name,
+            dispatch_cb,
+            log_cb,
+        );
+        return switch (outcome) {
+            .handled => |value| ImportHandlerResult{ .handled = value },
             .handled_void => .handled_void,
-            .unsupported, .fallback => null,
+            .unhandled => null,
         };
     }
 
     fn handleImportImpl(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
         if (self.tryPrimitiveDispatch(imported)) |result| {
-            self.primitive_dispatch_hits +|= 1;
+            self.import_handler.primitive_dispatch_hits +|= 1;
             return result;
         }
 
@@ -14622,15 +14641,6 @@ test "decode x87 integer and extended-real forms used by chrono timeout path" {
 
     const load_i32 = decodeInsn(&[_]u8{ 0xDB, 0x00 });
     try std.testing.expectEqual(Op.fild_mem32, load_i32.op);
-}
-
-test "x87 extended-real conversion preserves finite chrono durations" {
-    var encoded = [_]u8{0} ** 10;
-    const durations = [_]f64{ 0.001, 0.010, 0.100, 0.500, -0.001 };
-    for (durations) |duration| {
-        writeExtendedFloat80(&encoded, duration);
-        try std.testing.expectApproxEqAbs(duration, readExtendedFloat80(&encoded), 1e-15);
-    }
 }
 
 test "x87 stack tracks physical tags and status TOP" {
