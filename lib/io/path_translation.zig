@@ -122,3 +122,100 @@ fn environmentPath(name: [*:0]const u8, fallback: []const u8) []const u8 {
     const value = std.c.getenv(name) orelse return fallback;
     return std.mem.span(value);
 }
+
+test "translate returns null for empty path" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+    var buf: [4096]u8 = undefined;
+    const result = translator.translate("", &buf);
+    try std.testing.expectEqual(@as(?Translation, null), result);
+}
+
+test "translate passes through relative paths" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+    var buf: [4096]u8 = undefined;
+    const rel = translator.translate("relative/path.txt", &buf).?;
+    try std.testing.expectEqualStrings("relative/path.txt", rel.translated);
+    try std.testing.expectEqual(false, rel.allocated);
+}
+
+test "translate passes through known absolute paths" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+    var buf: [4096]u8 = undefined;
+    const paths = [_][]const u8{
+        "/var/folders/ab/cd/ef/T/",
+        "/Users/ryan/test.txt",
+        "/usr/local/lib/something.dylib",
+        "/System/Library/Frameworks/CoreFoundation.framework",
+        "/Library/Preferences/test.plist",
+        "/Applications/Xcode.app",
+        "/private/var/log/system.log",
+        "/dev/null",
+        "/etc/hosts",
+    };
+    for (paths) |p| {
+        const result = translator.translate(p, &buf).?;
+        try std.testing.expectEqualStrings(p, result.translated);
+        try std.testing.expectEqual(false, result.allocated);
+    }
+}
+
+test "translate remaps /tmp/ paths to tmp_dir" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+    var buf: [4096]u8 = undefined;
+    const result = translator.translate("/tmp/xenia-mac-startup.log", &buf).?;
+    // Should start with the tmp_dir value (TMPDIR env var or /tmp fallback)
+    try std.testing.expect(result.translated.len > 0);
+    // The suffix should be preserved
+    try std.testing.expect(std.mem.endsWith(u8, result.translated, "xenia-mac-startup.log"));
+    try std.testing.expectEqual(false, result.allocated);
+}
+
+test "translate remaps /home/ paths to home_dir" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+    var buf: [4096]u8 = undefined;
+    const result = translator.translate("/home/user/.config/something.cfg", &buf).?;
+    try std.testing.expect(result.translated.len > 0);
+    try std.testing.expect(std.mem.endsWith(u8, result.translated, "/.config/something.cfg"));
+    try std.testing.expectEqual(false, result.allocated);
+}
+
+test "translate falls through for unknown paths" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+    var buf: [4096]u8 = undefined;
+    const result = translator.translate("/opt/custom/bin/tool", &buf).?;
+    try std.testing.expectEqualStrings("/opt/custom/bin/tool", result.translated);
+    try std.testing.expectEqual(false, result.allocated);
+}
+
+test "translate /root/ falls through to home_dir" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+    var buf: [4096]u8 = undefined;
+    const result = translator.translate("/root/.bashrc", &buf).?;
+    try std.testing.expect(result.translated.len > 0);
+    try std.testing.expect(std.mem.endsWith(u8, result.translated, "/.bashrc"));
+    try std.testing.expectEqual(false, result.allocated);
+}
+
+test "configure sets up cache_dir and content_dir from storage_root" {
+    var translator = Translator.init(std.testing.allocator);
+    defer translator.deinit();
+
+    translator.configure("/tmp/test_storage");
+
+    try std.testing.expect(std.mem.endsWith(u8, translator.storage_root, "test_storage"));
+    try std.testing.expect(std.mem.endsWith(u8, translator.cache_dir, "test_storage/cache"));
+    try std.testing.expect(std.mem.endsWith(u8, translator.content_dir, "test_storage/content"));
+
+    // After configure, /tmp/ paths still remap to tmp_dir
+    var buf: [4096]u8 = undefined;
+    const result = translator.translate("/tmp/test.log", &buf).?;
+    try std.testing.expect(result.translated.len > 0);
+    try std.testing.expectEqual(false, result.allocated);
+}
