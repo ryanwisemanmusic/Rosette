@@ -7,7 +7,7 @@ const macho = @import("macho.zig");
 const constants = @import("constants.zig");
 
 const compat_runtime = @import("macho_compat_runtime");
-const guest_assertion_recovery = @import("resolution/guest_assertion_recovery.zig");
+const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const Op = x64_decoder.Op;
 const Regs = x64_decoder.Regs;
 const DecodedInsn = x64_decoder.DecodedInsn;
