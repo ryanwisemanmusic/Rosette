@@ -7,7 +7,7 @@
 //!   - dyld  (for pointer_firewall, memory_provenance via cxx_object_model,
 //!            itanium_vtable_builder)
 
-pub const event_log = @import("event_log.zig");
+pub const event_log = @import("event_log");
 
 pub const itanium_unwinder = @import("itanium_unwinder.zig");
 pub const itanium_dynamic_cast = @import("itanium_dynamic_cast.zig");

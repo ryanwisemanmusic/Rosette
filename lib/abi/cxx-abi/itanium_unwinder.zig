@@ -1,7 +1,7 @@
 const std = @import("std");
 const compact_unwind = @import("compact_unwind.zig");
 const itanium_dynamic_cast = @import("itanium_dynamic_cast.zig");
-const machoCapturePrint = @import("event_log.zig").machoCapturePrint;
+const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 const MAX_FRAMES: usize = 48;
 const DW_EH_PE_OMIT: u8 = 0xFF;

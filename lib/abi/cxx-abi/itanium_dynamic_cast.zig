@@ -1,5 +1,5 @@
 const std = @import("std");
-const machoCapturePrint = @import("event_log.zig").machoCapturePrint;
+const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 const MAX_HIERARCHY_DEPTH: usize = 32;
 const MAX_BASES_PER_TYPE: u32 = 256;
