@@ -62,7 +62,16 @@ pub const UiHandoffTracker = struct {
     }
 
     pub fn callbackStarted(self: *UiHandoffTracker, handle: u64, rip: u64, step: u64) void {
-        if (self.phase != .queued) return;
+        if (self.phase != .queued) {
+            if (self.diagnostic_count < 32 or (self.diagnostic_count & (self.diagnostic_count - 1) == 0)) {
+                std.debug.print(
+                    "scheduler: UI handoff unexpected callbackStarted: phase={s} expected=queued diagnostic={d}\n",
+                    .{ @tagName(self.phase), self.diagnostic_count + 1 },
+                );
+            }
+            self.diagnostic_count +|= 1;
+            return;
+        }
         self.phase = .callback_running;
         self.callback_handle = handle;
         self.callback_rip = rip;
@@ -71,14 +80,32 @@ pub const UiHandoffTracker = struct {
     }
 
     pub fn callbackSuspended(self: *UiHandoffTracker, step: u64) void {
-        if (self.phase != .callback_running) return;
+        if (self.phase != .callback_running) {
+            if (self.diagnostic_count < 32 or (self.diagnostic_count & (self.diagnostic_count - 1) == 0)) {
+                std.debug.print(
+                    "scheduler: UI handoff unexpected callbackSuspended: phase={s} expected=callback_running diagnostic={d}\n",
+                    .{ @tagName(self.phase), self.diagnostic_count + 1 },
+                );
+            }
+            self.diagnostic_count +|= 1;
+            return;
+        }
         self.phase = .callback_suspended;
         self.callback_suspensions +|= 1;
         self.last_progress_step = step;
     }
 
     pub fn workerStarted(self: *UiHandoffTracker, handle: u64, rip: u64, step: u64) void {
-        if (self.phase != .callback_suspended and self.phase != .worker_running) return;
+        if (self.phase != .callback_suspended and self.phase != .worker_running) {
+            if (self.diagnostic_count < 32 or (self.diagnostic_count & (self.diagnostic_count - 1) == 0)) {
+                std.debug.print(
+                    "scheduler: UI handoff unexpected workerStarted: phase={s} expected=callback_suspended or worker_running diagnostic={d}\n",
+                    .{ @tagName(self.phase), self.diagnostic_count + 1 },
+                );
+            }
+            self.diagnostic_count +|= 1;
+            return;
+        }
         self.phase = .worker_running;
         self.worker_handle = handle;
         self.worker_rip = rip;
@@ -87,7 +114,16 @@ pub const UiHandoffTracker = struct {
     }
 
     pub fn callbackResumed(self: *UiHandoffTracker, rip: u64, step: u64) void {
-        if (self.phase != .callback_suspended and self.phase != .worker_running) return;
+        if (self.phase != .callback_suspended and self.phase != .worker_running) {
+            if (self.diagnostic_count < 32 or (self.diagnostic_count & (self.diagnostic_count - 1) == 0)) {
+                std.debug.print(
+                    "scheduler: UI handoff unexpected callbackResumed: phase={s} expected=callback_suspended or worker_running diagnostic={d}\n",
+                    .{ @tagName(self.phase), self.diagnostic_count + 1 },
+                );
+            }
+            self.diagnostic_count +|= 1;
+            return;
+        }
         self.phase = .callback_running;
         self.callback_rip = rip;
         self.worker_handle = 0;

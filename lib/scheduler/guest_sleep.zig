@@ -50,10 +50,11 @@ pub fn isVirtualSleepImport(name: []const u8) bool {
         name,
         "ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE",
     )) return true;
-    // POSIX sleep variants that should deschedule the guest thread
+    // POSIX sleep/poll variants that should deschedule the guest thread
     if (std.mem.endsWith(u8, name, "nanosleep")) return true;
     if (std.mem.endsWith(u8, name, "usleep")) return true;
     if (std.mem.endsWith(u8, name, "sleep")) return true;
+    if (std.mem.endsWith(u8, name, "poll")) return true;
     return false;
 }
 

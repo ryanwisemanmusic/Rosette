@@ -1,7 +1,7 @@
 const std = @import("std");
 const thread_interceptor = @import("thread_interceptor.zig");
 
-const SwitchAuditCapacity = 32;
+const SwitchAuditCapacity = 128;
 
 const SwitchAuditEntry = struct {
     from_handle: u64 = 0,
@@ -166,7 +166,7 @@ pub const ThreadEntry = struct {
     quantum_instructions: u64 = 0,
 
     /// Switch-out reason frequency table
-    switch_reasons: [6]SwitchReasonEntry = [_]SwitchReasonEntry{.{}} ** 6,
+    switch_reasons: [32]SwitchReasonEntry = [_]SwitchReasonEntry{.{}} ** 32,
 
     /// Whether this entry is active
     active: bool = false,
@@ -185,6 +185,10 @@ pub const ThreadRegistry = struct {
 
     /// Next handle to allocate
     next_handle: u64 = 0x7FFF_2000,
+
+    /// Entropy offset for handle allocation — XOR'd with sequential handles
+    /// to make them less trivially enumerable while remaining unique.
+    handle_entropy: u32 = 0xA5C3B7D1,
 
     /// Next numeric ID to allocate
     next_numeric_id: u64 = 2,
@@ -222,11 +226,20 @@ pub const ThreadRegistry = struct {
         self.next_numeric_id = 2;
     }
 
-    /// Allocate a new thread handle
+    /// Allocate a new thread handle with mild entropy to avoid predictable
+    /// enumeration while keeping handles unique within a session.
     pub fn allocateHandle(self: *ThreadRegistry) u64 {
-        const handle = self.next_handle;
+        const base = self.next_handle;
         self.next_handle += 0x10;
-        return handle;
+        // XOR the low 32 bits with entropy while preserving the high 32-bit
+        // region (0x0000_7FFF) so that handles stay collision-free with
+        // hardcoded constants such as main_thread_handle (0x7FFF_1000) and
+        // callback handles (0xFFFF_F900_...).
+        const high = base & 0xFFFF_FFFF_0000_0000;
+        const low = @as(u32, @truncate(base)) ^ self.handle_entropy;
+        // Rotate entropy so the next handle gets a different mask.
+        self.handle_entropy = (self.handle_entropy << 5) | (self.handle_entropy >> 27);
+        return high | @as(u64, low);
     }
 
     /// Allocate a new numeric thread ID
@@ -337,7 +350,12 @@ pub const ThreadRegistry = struct {
     /// Suspend a thread
     pub fn suspendThread(self: *ThreadRegistry, handle: u64, reason: []const u8, rip: u64, current_step: u64) bool {
         const entry = self.findByHandle(handle) orelse return false;
-        if (entry.state != .running) return false;
+        // Accept .blocked and .waiting in addition to .running so that threads
+        // blocked on a primitive can still be suspended by cooperative yield.
+        switch (entry.state) {
+            .running, .blocked, .waiting => {},
+            else => return false,
+        }
         if (self.suspended_count == self.suspended_queue.len) {
             self.suspended_queue_rejections +|= 1;
             std.debug.print(
@@ -603,7 +621,16 @@ pub const ThreadRegistry = struct {
     }
 
     /// Record a thread switch in the audit trail
+    /// Record a thread switch in the audit trail
     pub fn recordSwitch(self: *ThreadRegistry, from_handle: u64, to_handle: u64, step: u64, rip: u64, reason: []const u8) void {
+        // If the trail is completely full (all entries active), skip recording
+        // rather than losing the oldest diagnostic data without warning.
+        var all_full = true;
+        for (&self.switch_audit) |*e| { if (!e.active) { all_full = false; break; } }
+        if (all_full) {
+            std.debug.print("scheduler: switch audit full ({d} entries); dropping record\n", .{SwitchAuditCapacity});
+            return;
+        }
         const idx = self.switch_audit_index;
         const entry = &self.switch_audit[idx];
         entry.from_handle = from_handle;

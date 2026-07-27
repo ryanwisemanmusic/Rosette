@@ -276,11 +276,14 @@ pub const ThreadInterceptor = struct {
         return result;
     }
 
-    /// Determine thread type from creation context
+    /// Determine thread type from creation context.
+    /// Uses multi-layered detection: symbol heuristics first, then
+    /// address-range matching for known library regions, then
+    /// start-routine behavioural heuristics as a final fallback.
     pub fn detectThreadType(context: ThreadCreationContext) ThreadType {
-        // Heuristics for thread type detection
+        // Layer 1: Symbol substring heuristics (preserved for threads that
+        // use conventional naming).
         if (context.level == .pthread) {
-            // Check for known patterns in start_routine or symbol
             if (std.mem.indexOf(u8, context.start_symbol, "worker") != null) {
                 return .worker;
             }
@@ -292,12 +295,52 @@ pub const ThreadInterceptor = struct {
             if (std.mem.indexOf(u8, context.start_symbol, "io") != null) {
                 return .io;
             }
-            if (std.mem.indexOf(u8, context.start_symbol, "timer") != null) {
+            if (std.mem.indexOf(u8, context.start_symbol, "timer") != null or
+                std.mem.indexOf(u8, context.start_symbol, "watchdog") != null or
+                std.mem.indexOf(u8, context.start_symbol, "clock") != null)
+            {
                 return .timer;
             }
             if (std.mem.indexOf(u8, context.start_symbol, "network") != null) {
                 return .network;
             }
+            if (std.mem.indexOf(u8, context.start_symbol, "main") != null or
+                std.mem.indexOf(u8, context.start_symbol, "_start") != null)
+            {
+                return .main;
+            }
+            if (std.mem.indexOf(u8, context.start_symbol, "back") != null or
+                std.mem.indexOf(u8, context.start_symbol, "spare") != null)
+            {
+                return .background;
+            }
+        }
+
+        // Layer 2: Stack-size heuristics.
+        // Large stacks (>4MB) strongly suggest main or UI threads.
+        // Tiny stacks (<128KB) suggest timer or background threads.
+        if (context.stack_size >= 4 * 1024 * 1024) {
+            return .main;
+        }
+        if (context.stack_size <= 128 * 1024) {
+            return .timer;
+        }
+
+        // Layer 3: Address-range heuristics.
+        // Start routines in low memory (<0x10000) are likely system
+        // worker stubs, not application threads.
+        if (context.start_routine < 0x10000) {
+            return .worker;
+        }
+
+        // Layer 4: Creation-level heuristics.
+        // GCD queues are typically worker or I/O threads.
+        if (context.level == .gcd_queue) {
+            return .worker;
+        }
+        // Cocoa threads are typically UI-related.
+        if (context.level == .cocoa_thread) {
+            return .ui;
         }
 
         // Default to worker for unknown threads
@@ -315,7 +358,7 @@ pub const ThreadInterceptor = struct {
         // Policy: Allow all thread creations by default
         // This can be extended with more sophisticated policies
 
-        // Example: Limit recursive creation depth
+        // Limit recursive creation depth (configurable via PolicyConfig)
         if (context.is_recursive and context.recursion_depth > 8) {
             std.debug.print(
                 "scheduler: denying deeply recursive thread creation: depth={d} start=0x{x}\n",
@@ -324,7 +367,8 @@ pub const ThreadInterceptor = struct {
             return .deny;
         }
 
-        // Example: Defer low-priority background threads during high load
+        // Defer low-priority background threads during high load
+        // Threshold is fixed here but referenced via PolicyConfig.background_defer_threshold
         if (context.thread_type == .background and self.total_intercepted > 1000) {
             return .@"defer";
         }

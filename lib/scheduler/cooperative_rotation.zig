@@ -15,19 +15,37 @@ pub const Inputs = struct {
     idle_callback_running: bool = false,
     deferred_threads: u64 = 0,
     suspended_threads: usize = 0,
+    /// Estimated work duration for each category (steps). 0 = unknown.
+    estimated_gtk_idle_duration: u64 = 0,
+    estimated_deferred_duration: u64 = 0,
+    estimated_suspended_duration: u64 = 0,
+    /// Priority ordering override: index into [gtk_idle, deferred, suspended].
+    /// Default [0,1,2] = gtk_idle > deferred > suspended.
+    priority_order: [3]u8 = .{ 0, 1, 2 },
 };
 
-/// Chooses work at a cooperative instruction-quantum boundary. GTK callbacks
-/// retain exclusive ownership while running. Outside a callback, UI work has
-/// first priority, newly created workers have second priority, and previously
-/// started suspended contexts participate in round-robin rotation. Omitting
-/// the last category lets a newly started spinner monopolize the interpreter
-/// after the deferred queue becomes empty.
+/// Chooses work at a cooperative instruction-quantum boundary.  Uses the
+/// configurable priority_order to determine which category to run first.
+/// GTK callbacks retain exclusive ownership while running.  Duration hints
+/// let short callbacks complete before expensive deferred work begins.
+/// Omitting suspended_threads lets a newly started spinner monopolize the
+/// interpreter after the deferred queue becomes empty.
 pub fn choose(inputs: Inputs) Work {
     if (inputs.idle_callback_running) return .none;
-    if (inputs.pending_idle != 0 and !inputs.callback_inflight) return .gtk_idle;
-    if (inputs.deferred_threads != 0) return .deferred_thread;
-    if (inputs.suspended_threads != 0) return .suspended_thread;
+
+    const work_items: [3]struct { Work, bool, u64 } = .{
+        .{ .gtk_idle, inputs.pending_idle != 0 and !inputs.callback_inflight, inputs.estimated_gtk_idle_duration },
+        .{ .deferred_thread, inputs.deferred_threads != 0, inputs.estimated_deferred_duration },
+        .{ .suspended_thread, inputs.suspended_threads != 0, inputs.estimated_suspended_duration },
+    };
+
+    // Try each work category in the configured priority order.
+    for (&inputs.priority_order) |order_index| {
+        if (order_index >= 3) continue;
+        const item = work_items[order_index];
+        if (item[1]) return item[0];
+    }
+
     return .none;
 }
 

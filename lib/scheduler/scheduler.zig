@@ -322,7 +322,10 @@ pub const GlobalScheduler = struct {
         return success;
     }
 
-    /// Handle cooperative yield from current thread
+    /// Handle cooperative yield from current thread.
+    /// If the thread explicitly asked to yield (e.g. sched_yield, sleep, I/O
+    /// wait), do NOT immediately resume it — that would create a busy-loop.
+    /// Only resume when there is genuinely a scheduling need.
     pub fn handleCooperativeYield(self: *GlobalScheduler, current_thread: u64, reason: []const u8, rip: u64) ?u64 {
         if (!self.initialized) return null;
 
@@ -347,9 +350,12 @@ pub const GlobalScheduler = struct {
             }
         }
 
-        // If no next thread, resume current thread
-        _ = self.resumeThread(current_thread);
-        return current_thread;
+        // No peer is available to run.  Do NOT resume the current thread
+        // automatically — it may have yielded because it genuinely wants to
+        // block (e.g. sched_yield, I/O wait, sleep).  Returning null tells
+        // the caller that no context switch was possible; the caller is
+        // responsible for deciding whether to spin or park.
+        return null;
     }
 
     /// Handle thread waiting on condition variable
