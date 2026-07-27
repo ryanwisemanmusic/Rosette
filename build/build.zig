@@ -1024,6 +1024,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Shared CLEO routing module (used by both ELF and Mach-O processors)
+    const cleo_routing_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/CLEO/cleo_routing.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ELF processor (x86-64 ELF binary loader/emulator)
     {
         const x64_linux_runtime_mod = b.createModule(.{
@@ -1053,6 +1060,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("x64_syscalls", x64_syscalls_mod);
         elf_processor_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
         elf_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        elf_processor_mod.addImport("cleo_routing", cleo_routing_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -1070,6 +1078,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("x64_syscalls", x64_syscalls_mod);
         elf_processor_test_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
         elf_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        elf_processor_test_mod.addImport("cleo_routing", cleo_routing_mod);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&elf_processor_test.step);
 
@@ -1117,8 +1126,31 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        const vtable_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/vtable/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const dyld_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/linker/dyld/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        dyld_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         const scheduler_mod = b.createModule(.{
             .root_source_file = b.path("../lib/scheduler/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        dyld_mod.addImport("scheduler", scheduler_mod);
+        const cxx_abi_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/abi/cxx-abi/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        cxx_abi_mod.addImport("dyld", dyld_mod);
+        const init_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/init/root.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -1135,6 +1167,11 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("contract", contract_mod);
         macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_processor_mod.addImport("primitive", primitive_mod);
+        macho_processor_mod.addImport("vtable", vtable_mod);
+        macho_processor_mod.addImport("dyld", dyld_mod);
+        macho_processor_mod.addImport("cxx_abi", cxx_abi_mod);
+        macho_processor_mod.addImport("init", init_mod);
+        macho_processor_mod.addImport("cleo_routing", cleo_routing_mod);
         macho_processor_mod.addImport("scheduler", scheduler_mod);
         macho_processor_mod.addImport("jit", jit_mod);
         if (is_macos) {
@@ -1167,6 +1204,11 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("contract", contract_mod);
         macho_processor_test_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_processor_test_mod.addImport("primitive", primitive_mod);
+        macho_processor_test_mod.addImport("vtable", vtable_mod);
+        macho_processor_test_mod.addImport("dyld", dyld_mod);
+        macho_processor_test_mod.addImport("cxx_abi", cxx_abi_mod);
+        macho_processor_test_mod.addImport("init", init_mod);
+        macho_processor_test_mod.addImport("cleo_routing", cleo_routing_mod);
         macho_processor_test_mod.addImport("scheduler", scheduler_mod);
         macho_processor_test_mod.addImport("jit", jit_mod);
         if (is_macos) {
