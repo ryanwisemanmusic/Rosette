@@ -41,12 +41,15 @@ const logging_runtime = @import("diagnostics").logging_runtime;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
+const bytesForSize = @import("memory").bytesForSize;
+const writeExtendedFloat80 = @import("memory").writeExtendedFloat80;
+const readExtendedFloat80 = @import("memory").readExtendedFloat80;
 const diagnostic_throttle = @import("diagnostics").diagnostic_throttle;
 const pthread_runtime = @import("pthread").pthread_runtime;
 const runtime_output = @import("diagnostics").runtime_output;
 const tlv_runtime = @import("guest_abi").tlv_runtime;
 const diagnostic_text_accelerator = @import("diagnostics").diagnostic_text_accelerator;
-const symbol_assembly_context = @import("resolution/symbol_assembly_context.zig");
+const symbol_assembly_context = @import("symbol-context/symbol_assembly_context.zig");
 const export_table_manager = @import("dyld").export_table_manager;
 const export_table_lifecycle = @import("dyld").export_table_lifecycle;
 const dynamic_export_registry = @import("dyld").dynamic_export_registry;
@@ -1751,15 +1754,6 @@ pub const MachOState = struct {
         self.timerQueueWatchWrite(addr, size, val);
     }
 
-    fn bytesForSize(size: Size) u8 {
-        return switch (size) {
-            .bits8 => 1,
-            .bits16 => 2,
-            .bits32 => 4,
-            .bits64 => 8,
-        };
-    }
-
     fn deferInitializerRuntimeDependency(self: *MachOState, address: u64, size: Size) bool {
         if (self.initializer_checkpoint == null or address >= 0x1000 or size != .bits64) return false;
 
@@ -1872,69 +1866,6 @@ pub const MachOState = struct {
         if (decoded.rip_relative) decoded.addr +%= entry.rip + decoded.len;
         if (address_size == .bits32) decoded.addr = @as(u32, @truncate(decoded.addr));
         return decoded;
-    }
-
-    fn writeExtendedFloat80(destination: []u8, value: f64) void {
-        std.debug.assert(destination.len >= 10);
-        @memset(destination[0..10], 0);
-        const bits: u64 = @bitCast(value);
-        const sign: u16 = if ((bits >> 63) != 0) 0x8000 else 0;
-        const fraction = bits & 0x000F_FFFF_FFFF_FFFF;
-        const exponent: u16 = @truncate((bits >> 52) & 0x7FF);
-        if (exponent == 0 and fraction == 0) return;
-        if (exponent == 0x7FF) {
-            const significand: u64 = if (fraction == 0) 0x8000_0000_0000_0000 else 0xC000_0000_0000_0000;
-            std.mem.writeInt(u64, destination[0..8], significand, .little);
-            std.mem.writeInt(u16, destination[8..10], sign | 0x7FFF, .little);
-            return;
-        }
-        var significand: u64 = 0;
-        var unbiased: i32 = 0;
-        if (exponent == 0) {
-            // A binary64 subnormal has no hidden bit. Normalize its leading
-            // set bit into x87's explicit integer bit at position 63.
-            const shift: u6 = @intCast(@clz(fraction));
-            significand = fraction << shift;
-            unbiased = -1011 - @as(i32, shift);
-        } else {
-            significand = (fraction | (@as(u64, 1) << 52)) << 11;
-            unbiased = @as(i32, exponent) - 1023;
-        }
-        std.mem.writeInt(u64, destination[0..8], significand, .little);
-        std.mem.writeInt(u16, destination[8..10], sign | @as(u16, @intCast(unbiased + 16383)), .little);
-    }
-
-    fn readExtendedFloat80(source: []const u8) f64 {
-        std.debug.assert(source.len >= 10);
-        const significand = std.mem.readInt(u64, source[0..8], .little);
-        const sign_exponent = std.mem.readInt(u16, source[8..10], .little);
-        const negative = (sign_exponent & 0x8000) != 0;
-        const exponent = sign_exponent & 0x7FFF;
-        const sign_bit: u64 = if (negative) @as(u64, 1) << 63 else 0;
-
-        if (exponent == 0x7FFF) {
-            const special_bits = if ((significand & 0x7FFF_FFFF_FFFF_FFFF) == 0)
-                sign_bit | 0x7FF0_0000_0000_0000
-            else
-                sign_bit | 0x7FF8_0000_0000_0000;
-            return @bitCast(special_bits);
-        }
-        if (significand == 0) return @bitCast(sign_bit);
-
-        // Convert the explicit x87 integer bit and biased exponent to binary64.
-        // Values written by writeExtendedFloat80 round-trip exactly because the
-        // eleven discarded low significand bits are zero.
-        const unbiased: i32 = if (exponent == 0) -16382 else @as(i32, exponent) - 16383;
-        if (unbiased > 1023) return @bitCast(sign_bit | 0x7FF0_0000_0000_0000);
-        if (unbiased >= -1022) {
-            const binary64_exponent: u64 = @intCast(unbiased + 1023);
-            const fraction = (significand >> 11) & 0x000F_FFFF_FFFF_FFFF;
-            return @bitCast(sign_bit | (binary64_exponent << 52) | fraction);
-        }
-        if (unbiased < -1074) return @bitCast(sign_bit);
-        const subnormal_shift: u6 = @intCast(-1011 - unbiased);
-        const fraction = significand >> subnormal_shift;
-        return @bitCast(sign_bit | (fraction & 0x000F_FFFF_FFFF_FFFF));
     }
 
     fn ensureGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) bool {
@@ -14697,8 +14628,8 @@ test "x87 extended-real conversion preserves finite chrono durations" {
     var encoded = [_]u8{0} ** 10;
     const durations = [_]f64{ 0.001, 0.010, 0.100, 0.500, -0.001 };
     for (durations) |duration| {
-        MachOState.writeExtendedFloat80(&encoded, duration);
-        try std.testing.expectApproxEqAbs(duration, MachOState.readExtendedFloat80(&encoded), 1e-15);
+        writeExtendedFloat80(&encoded, duration);
+        try std.testing.expectApproxEqAbs(duration, readExtendedFloat80(&encoded), 1e-15);
     }
 }
 
