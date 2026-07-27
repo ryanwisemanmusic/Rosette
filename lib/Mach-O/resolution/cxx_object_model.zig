@@ -235,7 +235,7 @@ const TestState = struct {
     pub fn write64(self: *@This(), address: u64, value: u64) void {
         std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
     }
-    pub fn registerSyntheticRegion(self: *@This(), _: u64, _: u64, kind: @import("memory_provenance.zig").RegionKind, _: []const u8, _: @import("pointer_firewall.zig").Policy) void {
+    pub fn registerSyntheticRegion(self: *@This(), _: u64, _: u64, kind: @import("dyld").memory_provenance.RegionKind, _: []const u8, _: @import("dyld").pointer_firewall.Policy) void {
         if (kind == .synthetic_object) self.marked_objects +|= 1;
     }
 };

@@ -1,6 +1,6 @@
 const std = @import("std");
-const memory_provenance = @import("memory_provenance.zig");
-const pointer_firewall = @import("pointer_firewall.zig");
+const memory_provenance = @import("dyld").memory_provenance;
+const pointer_firewall = @import("dyld").pointer_firewall;
 
 pub const Spec = struct {
     type_name: []const u8,

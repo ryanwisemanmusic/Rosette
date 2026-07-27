@@ -22,6 +22,10 @@ pub const SyntheticThunk = enum(u8) {
     ctype_widen_range,
     ctype_narrow_char,
     ctype_narrow_range,
+    locale_has_facet,
+    locale_use_facet,
+    locale_destroy,
+    xmodule_get_name,
 };
 
 const NamedHandle = struct {
@@ -66,6 +70,7 @@ pub const Runtime = struct {
     objects: [max_objects]ObjectHandle = [_]ObjectHandle{.{}} ** max_objects,
     object_count: usize = 0,
     locale_impl: u64 = 0,
+    locale_impl_facet: u64 = 0,
     locale_facets: [max_locale_facets]FacetHandle = [_]FacetHandle{.{}} ** max_locale_facets,
     locale_facet_count: usize = 0,
     atexit_entries: [max_atexit_entries]AtexitEntry = [_]AtexitEntry{.{}} ** max_atexit_entries,
@@ -135,8 +140,20 @@ pub const Runtime = struct {
         if (impl == 0) {
             if (self.locale_impl == 0) {
                 self.locale_impl = state.guestAlloc(64, 16) orelse return false;
-                const bytes = state.guestMemory(self.locale_impl, 64) orelse return false;
-                @memset(bytes, 0);
+                // Set up a minimal vtable for the locale implementation so
+                // native libc++ code (pubimbue, ~locale, etc.) can call
+                // virtual functions without crashing on a null vtable pointer.
+                const vtable = state.guestAlloc(32, 16) orelse return false;
+                const vtable_bytes = state.guestMemory(vtable, 32) orelse return false;
+                @memset(vtable_bytes, 0);
+                state.write64(vtable + 0x00, thunkAddress(.locale_destroy));
+                state.write64(vtable + 0x08, thunkAddress(.locale_has_facet));
+                state.write64(vtable + 0x10, thunkAddress(.locale_use_facet));
+                const impl_bytes = state.guestMemory(self.locale_impl, 64) orelse return false;
+                @memset(impl_bytes, 0);
+                state.write64(self.locale_impl, vtable);
+                // Pre-create a ctype facet for this locale implementation
+                self.locale_impl_facet = self.localeFacet(state, 0, .ctype) orelse return false;
             }
             impl = self.locale_impl;
         }
@@ -257,22 +274,26 @@ pub const Runtime = struct {
         self.next_handle +%= 0x10;
         return handle;
     }
-};
-
-pub fn syntheticThunk(address: u64) ?SyntheticThunk {
-    if (address <= synthetic_thunk_base or address > synthetic_thunk_base + std.math.maxInt(u8)) return null;
-    return switch (address - synthetic_thunk_base) {
-        1 => .ctype_toupper_char,
-        2 => .ctype_toupper_range,
-        3 => .ctype_tolower_char,
-        4 => .ctype_tolower_range,
-        5 => .ctype_widen_char,
-        6 => .ctype_widen_range,
-        7 => .ctype_narrow_char,
-        8 => .ctype_narrow_range,
-        else => null,
-    };
-}
+};    pub fn syntheticThunk(address: u64) ?SyntheticThunk {
+        if (address <= synthetic_thunk_base or address > synthetic_thunk_base + std.math.maxInt(u8)) return null;
+        const offset = address - synthetic_thunk_base;
+        const tag: u8 = @intCast(offset);
+        return switch (tag) {
+            1 => .ctype_toupper_char,
+            2 => .ctype_toupper_range,
+            3 => .ctype_tolower_char,
+            4 => .ctype_tolower_range,
+            5 => .ctype_widen_char,
+            6 => .ctype_widen_range,
+            7 => .ctype_narrow_char,
+            8 => .ctype_narrow_range,
+            9 => .locale_has_facet,
+            10 => .locale_use_facet,
+            11 => .locale_destroy,
+            12 => .xmodule_get_name,
+            else => null,
+        };
+    }
 
 pub fn thunkAddress(thunk: SyntheticThunk) u64 {
     return synthetic_thunk_base + @intFromEnum(thunk);

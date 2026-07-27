@@ -373,6 +373,18 @@ pub const Metadata = struct {
         return null;
     }
 
+    /// Returns the import thunk stride derived from the Mach-O `__stubs` section
+    /// stub_size, or 16 (the standard x86_64 dyld stride) as fallback.
+    /// Different linkers or dyld versions may produce a different stub size;
+    /// the synthetic thunk allocator in process.zig uses this value to lay out
+    /// bound import thunks in the reserved address range.
+    pub fn importThunkStride(self: *const Metadata) u64 {
+        if (self.sectionNamed("__TEXT", "__stubs")) |section| {
+            if (section.stub_size > 0) return section.stub_size;
+        }
+        return 16;
+    }
+
     pub fn sectionBytes(self: *const Metadata, section: Section) ?[]const u8 {
         const start: usize = @intCast(section.file_offset);
         const size: usize = @intCast(section.size);

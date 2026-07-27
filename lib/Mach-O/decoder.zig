@@ -747,6 +747,47 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VCVTSD2SS: VEX.LIG.F2.0F.WIG 5A /r
+    if (opcode == 0x5A and prefix == 3) {
+        var decoded = DecodedInsn{ .op = .vcvtsd2ss, .size = .bits64 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPINSRW: VEX.128.66.0F.W0 C4 /r ib — Insert Word
+    // Encoding: ModRM.r/m = destination XMM, ModRM.reg = GPR, VEX.vvvv = merge source
+    if (opcode == 0xC4 and !vector_256 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpinsrw, .size = .bits16 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);  // VEX.vvvv = merge source XMM
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.xmm_dst = decoded.xmm_src;  // merge source is implicit destination
+            decoded.addr = rm.addr;             // memory address
+        } else {
+            decoded.xmm_dst = @intCast(rm.addr);   // ModRM.r/m = destination XMM
+            decoded.xmm_src2 = @intFromEnum(rm.reg);   // ModRM.reg = GPR source
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if ((opcode == 0x2C or opcode == 0x2D) and !vector_256 and (prefix == 2 or prefix == 3) and (vex & 0x78) == 0x78) {
         var decoded = DecodedInsn{ .size = .bits32 };
         var pos = start_pos + 3;
@@ -1741,21 +1782,39 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     if (opcode_map == 1 and opcode == 0x5A) {
-        if (rex_w or vector_256 or prefix != 2) return .{};
-        var decoded = DecodedInsn{ .op = .vcvtss2sd, .size = .bits32 };
-        var pos = start_pos + 4;
-        const is_memory = bytes[pos] < 0xC0;
-        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits32);
-        decoded.xmm_dst = @intFromEnum(rm.reg);
-        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
-        decoded.is_reg_form = !is_memory;
-        if (is_memory) {
-            decoded.addr = rm.addr;
-        } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
+        if (rex_w) return .{};
+        if (prefix == 2 and !vector_256) {
+            var decoded = DecodedInsn{ .op = .vcvtss2sd, .size = .bits32 };
+            var pos = start_pos + 4;
+            const is_memory = bytes[pos] < 0xC0;
+            const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits32);
+            decoded.xmm_dst = @intFromEnum(rm.reg);
+            decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+            decoded.is_reg_form = !is_memory;
+            if (is_memory) {
+                decoded.addr = rm.addr;
+            } else {
+                decoded.xmm_src2 = @intCast(rm.addr);
+            }
+            decoded.len = @intCast(pos);
+            return decoded;
         }
-        decoded.len = @intCast(pos);
-        return decoded;
+        if (prefix == 3) {
+            var decoded = DecodedInsn{ .op = .vcvtsd2ss, .size = .bits64 };
+            var pos = start_pos + 4;
+            const is_memory = bytes[pos] < 0xC0;
+            const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+            decoded.xmm_dst = @intFromEnum(rm.reg);
+            decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+            decoded.is_reg_form = !is_memory;
+            if (is_memory) {
+                decoded.addr = rm.addr;
+            } else {
+                decoded.xmm_src2 = @intCast(rm.addr);
+            }
+            decoded.len = @intCast(pos);
+            return decoded;
+        }
     }
 
     if (opcode_map == 1 and (opcode == 0x2C or opcode == 0x2D)) {
@@ -2286,7 +2345,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decodeMovsx(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
-    if (opcode2 == 0xC1) {
+    if (opcode2 == 0xC0 or opcode2 == 0xC1) {
         return decodeXadd(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
@@ -3351,10 +3410,11 @@ pub fn decodeCmpxchg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bo
         .bits16
     else
         .bits32;
-    // The executor uses DecodedInsn.size for the accumulator, destination,
-    // source and flags. Merely selecting the byte/word Op below is not
-    // sufficient: DecodedInsn defaults to bits32, which made 0F B0 compare
-    // EAX and a dword even though it had decoded as cmpxchg_mem8_reg8.
+    // The Op identifies the CMPXCHG variant, but the executor intentionally
+    // uses DecodedInsn.size for the accumulator, destination, replacement and
+    // flags. Leaving this at its default (bits32) makes 0F B0 operate on four
+    // bytes even though it was decoded as cmpxchg_mem8_reg8. Xenia's
+    // TimerQueue uses lock cmpxchgb for its WaitItem state.
     d.size = sz;
     const modrm = bytes[pos];
     const is_mem = modrm < 0xC0;
@@ -3438,18 +3498,19 @@ pub fn decodeMovsx(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
 }
 
 pub fn decodeXadd(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
-    _ = opcode2;
     var d = DecodedInsn{};
     var pos = start_pos + 1;
     if (pos >= bytes.len) return .{};
     const modrm = bytes[pos];
-    const sz: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
+    // 0F C0 = byte XADD, 0F C1 = word/dword/qword XADD
+    const is_byte = opcode2 == 0xC0;
+    const sz: Size = if (is_byte) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     d.size = sz;
     const is_mem = modrm < 0xC0;
     const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
 
     if (is_mem) {
-        d.op = switch (sz) {
+        d.op = if (is_byte) .xadd_mem8_reg8 else switch (sz) {
             .bits32 => .xadd_mem32_reg32,
             .bits64 => .xadd_mem64_reg64,
             else => .xadd_mem32_reg32,
@@ -3563,9 +3624,8 @@ pub fn decodeMovaps(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: boo
     return d;
 }
 
-test "CMPXCHG decoder preserves the opcode-selected operand width" {
-    // Xenia's TimerQueue compare_exchange_strong emits this exact instruction:
-    // lock cmpxchgb %dl, (%rcx)
+test "CMPXCHG decoder preserves opcode-selected operand width" {
+    // Xenia's TimerQueue compare_exchange_strong emits this exact instruction.
     const byte_memory = decodeInsn(&[_]u8{ 0xF0, 0x0F, 0xB0, 0x11 });
     try std.testing.expectEqual(Op.cmpxchg_mem8_reg8, byte_memory.op);
     try std.testing.expectEqual(Size.bits8, byte_memory.size);

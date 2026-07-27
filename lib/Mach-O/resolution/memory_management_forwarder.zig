@@ -45,6 +45,9 @@ pub const Manager = struct {
         const size = @max(requested_size, 1);
         const alignment = normalizeAlignment(requested_alignment) orelse return null;
         const address = self.reuseBlock(size, alignment) orelse state.guestAlloc(size, alignment) orelse return null;
+        // A recycled allocation address must not inherit pointer provenance
+        // from the object that previously occupied it.
+        state.forgetMemoryWriteProvenance(address);
         self.allocations.put(address, .{ .size = size, .alignment = alignment }) catch return null;
         self.allocation_count +|= 1;
         return address;
@@ -52,7 +55,8 @@ pub const Manager = struct {
 
     pub fn allocateZeroed(self: *Manager, state: anytype, count: u64, element_size: u64) ?u64 {
         const size = std.math.mul(u64, count, element_size) catch return null;
-        const address = self.allocate(state, size, 16) orelse return null;
+        const alignment = @max(element_size, 16);
+        const address = self.allocate(state, size, alignment) orelse return null;
         const storage = state.guestMemory(address, @max(size, 1)) orelse return null;
         @memset(storage, 0);
         return address;
@@ -168,6 +172,8 @@ const TestState = struct {
         if (address + size > self.memory.len) return null;
         return self.memory[@intCast(address)..@intCast(address + size)];
     }
+
+    pub fn forgetMemoryWriteProvenance(_: *TestState, _: u64) void {}
 };
 
 test "reallocate preserves guest bytes" {

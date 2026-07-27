@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const guest_memory_geometry = @import("guest_memory_geometry.zig");
+const guest_memory_geometry = @import("dyld").guest_memory_geometry;
 const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 extern "c" fn mprotect(addr: [*]align(std.heap.page_size_min) u8, len: usize, prot: c_int) c_int;
@@ -224,6 +224,27 @@ pub const Manager = struct {
             machoCapturePrint("macho-processor: sparse fixed mmap rejected: reason=address_overflow guest_base=0x{x} length={d}\n", .{ guest_base, length });
             return false;
         };
+        // Remove any exact-match non-reservation mappings (POSIX MAP_FIXED replaces
+        // existing mappings at the same address, so the new mapping takes precedence).
+        {
+            var i: usize = 0;
+            while (i < self.mappings.items.len) {
+                const mapping = self.mappings.items[i];
+                const mapping_end = mapping.guest_base + mapping.memory.len;
+                if (guest_base == mapping.guest_base and end == mapping_end and !mapping.is_reservation) {
+                    const removed = self.mappings.swapRemove(i);
+                    self.removeActivationsWithin(guest_base, length);
+                    std.posix.munmap(removed.memory);
+                    machoCapturePrint(
+                        "macho-processor: sparse fixed mmap replaced existing: guest_base=0x{x} length={d} prot=0x{x}\n",
+                        .{ guest_base, length, prot_raw },
+                    );
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         var inside_reservation = false;
         for (self.mappings.items) |mapping| {
             const mapping_end = mapping.guest_base + mapping.memory.len;

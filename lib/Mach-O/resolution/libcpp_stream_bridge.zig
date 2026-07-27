@@ -317,10 +317,12 @@ pub const Bridge = struct {
             return .handled_void;
         }
         if (isBasicIosInit(name)) {
-            return if (self.object_model.initializeBasicIos(state, state.regs.rdi, state.regs.rsi))
-                .handled_void
-            else
-                null;
+            const ios = state.regs.rdi;
+            if (!self.object_model.initializeBasicIos(state, ios, state.regs.rsi)) return null;
+            if (@hasDecl(@TypeOf(state.*), "compat")) {
+                _ = state.compat.initLocale(state, ios + cxx_object_model.stream_layout.locale_offset, null);
+            }
+            return .handled_void;
         }
         if (isBasicIosRdbuf(name)) return .{ .handled = self.object_model.rdbuf(state, state.regs.rdi) };
         if (isBasicIosRdstate(name)) return .{ .handled = self.object_model.rdstate(state, state.regs.rdi) };
@@ -342,18 +344,25 @@ pub const Bridge = struct {
         if (isStringStreamStr(name)) return if (self.streamObjectToString(state, state.regs.rsi, state.regs.rdi)) .{ .handled = state.regs.rdi } else null;
 
         if (isIfstreamDefaultConstructor(name)) {
-            return if (self.constructIfstream(state, state.regs.rdi))
-                .{ .handled = state.regs.rdi }
-            else
-                null;
+            if (!self.constructIfstream(state, state.regs.rdi)) return null;
+            if (@hasDecl(@TypeOf(state.*), "compat")) {
+                _ = state.compat.initLocale(state, state.regs.rdi + BASIC_IOS_OFFSET_IN_IFSTREAM + cxx_object_model.stream_layout.locale_offset, null);
+            }
+            return .{ .handled = state.regs.rdi };
         }
         if (isIfstreamCStringConstructor(name)) {
             if (!self.constructIfstream(state, state.regs.rdi)) return null;
+            if (@hasDecl(@TypeOf(state.*), "compat")) {
+                _ = state.compat.initLocale(state, state.regs.rdi + BASIC_IOS_OFFSET_IN_IFSTREAM + cxx_object_model.stream_layout.locale_offset, null);
+            }
             _ = self.openCString(state, fs, state.regs.rdi + FILEBUF_OFFSET_IN_IFSTREAM, state.regs.rsi, state.regs.rdx);
             return .{ .handled = state.regs.rdi };
         }
         if (isIfstreamFilesystemPathConstructor(name)) {
             if (!self.constructIfstream(state, state.regs.rdi)) return null;
+            if (@hasDecl(@TypeOf(state.*), "compat")) {
+                _ = state.compat.initLocale(state, state.regs.rdi + BASIC_IOS_OFFSET_IN_IFSTREAM + cxx_object_model.stream_layout.locale_offset, null);
+            }
             const view = compat_runtime.libcppStringView(state, state.regs.rsi) orelse return null;
             _ = self.openPath(state, fs, state.regs.rdi + FILEBUF_OFFSET_IN_IFSTREAM, view.address, view.length, state.regs.rdx);
             return .{ .handled = state.regs.rdi };
@@ -533,6 +542,9 @@ pub const Bridge = struct {
         if (!self.object_model.initializeStream(state, .basic_ostream, object, streambuf)) {
             self.rejected +|= 1;
             return false;
+        }
+        if (@hasDecl(@TypeOf(state.*), "compat")) {
+            _ = state.compat.initLocale(state, object + cxx_object_model.stream_layout.locale_offset, null);
         }
         self.constructors +|= 1;
         return true;
@@ -717,6 +729,9 @@ pub const Bridge = struct {
         {
             self.rejected +|= 1;
             return false;
+        }
+        if (@hasDecl(@TypeOf(state.*), "compat")) {
+            _ = state.compat.initLocale(state, object + STRINGSTREAM_IOS_OFFSET + cxx_object_model.stream_layout.locale_offset, null);
         }
         const stream = self.ensure(streambuf) orelse {
             self.rejected +|= 1;

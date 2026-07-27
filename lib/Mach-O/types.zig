@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const x64_decoder = @import("x64_decoder");
-const memory_provenance = @import("resolution/memory_provenance.zig");
-const pointer_firewall = @import("resolution/pointer_firewall.zig");
+const memory_provenance = @import("dyld").memory_provenance;
+const pointer_firewall = @import("dyld").pointer_firewall;
 const macho = @import("macho.zig");
 const constants = @import("constants.zig");
 
@@ -360,6 +360,12 @@ pub const InternalCompatibilityTargets = struct {
     sha1_start: u64 = 0,
     /// End of the sha1::SHA1 virtual-method table region (exclusive).
     sha1_end: u64 = 0,
+    /// xe::kernel::XModule vtable, resolved at init for constructor vtable repair
+    xmodule_vtable: u64 = 0,
+    /// Synthetic XModule vtable allocated when real symbol isn't found
+    xmodule_synthetic_vtable: u64 = 0,
+    /// Empty string allocated for xmodule_get_name to return
+    xmodule_empty_string: u64 = 0,
 };
 
 pub const InitializerCheckpoint = struct {

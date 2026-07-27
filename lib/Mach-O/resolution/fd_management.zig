@@ -34,7 +34,10 @@ pub const Manager = struct {
     closed: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
-        const entries = allocator.alloc(FdEntry, INITIAL_FD_TABLE_SIZE) catch @panic("fd_management: OOM");
+        const entries = allocator.alloc(FdEntry, INITIAL_FD_TABLE_SIZE) catch blk: {
+            machoCapturePrint("macho-processor: fd_management OOM on init, falling back to page_allocator\n", .{});
+            break :blk std.heap.page_allocator.alloc(FdEntry, INITIAL_FD_TABLE_SIZE) catch @panic("fd_management: page_allocator OOM");
+        };
         for (0..STREAM_FD_COUNT) |i| {
             entries[i] = .{
                 .host_fd = @intCast(i),

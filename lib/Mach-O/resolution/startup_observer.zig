@@ -86,7 +86,7 @@ pub const Observer = struct {
     hot_symbol_start_fs_read: u64 = 0,
     last_hot_symbol_diagnostic_wall: u64 = 0,
     stall_policy: StallPolicy = .{},
-    timing_stack: [16]PhaseTiming = undefined,
+    timing_stack: [32]PhaseTiming = undefined,
     timing_depth: usize = 0,
 
     pub fn enter(self: *Observer, phase: Phase, step: u64) void {

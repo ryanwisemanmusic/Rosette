@@ -32,6 +32,7 @@ pub const Context = struct {
     pointer_owner: []const u8 = "",
     vtable_header_mapped: bool = true,
     typeinfo_mapped: bool = true,
+    live_allocation_vtable_history: bool = false,
 };
 
 pub const Classification = struct {
@@ -99,11 +100,27 @@ pub fn classify(context: Context) Classification {
             .next_subsystem = "libcpp_shared_control_block / guest heap provenance",
         };
     }
+    if (near_null and
+        std.mem.indexOf(u8, context.instruction, "call") != null and
+        context.live_allocation_vtable_history)
+    {
+        return .{
+            .class = .cxx_object_model_null_vtable,
+            .reason = "a virtual call loaded a null/low vptr from a live allocation whose retained history contains a Mach-O vtable",
+            .next_subsystem = "live vtable guard / guest heap write provenance",
+        };
+    }
     if ((std.mem.indexOf(u8, context.instruction, "jmp") != null or std.mem.indexOf(u8, context.instruction, "call") != null) and near_null) {
         return .{ .class = .bad_import_thunk, .reason = "indirect import control transfer resolved to zero or a low address", .next_subsystem = "import resolver / dyld bindings" };
     }
     if (!context.stack_mapped) {
         return .{ .class = .bad_guest_stack, .reason = "RSP/RBP escaped the registered guest stack", .next_subsystem = "guest scheduler / stack allocator" };
+    }
+    // A stack_push that lands in a mapped-but-not-writable page signals a stack
+    // overflow: the thread's stack has grown into a read-only region immediately
+    // below its writable allocation (e.g. __LINKEDIT or a guard page).
+    if (std.mem.eql(u8, context.instruction, "stack_push") and context.stack_mapped) {
+        return .{ .class = .bad_guest_stack, .reason = "stack_push targeted a mapped but read-only region below the guest stack; the thread's stack has overflowed", .next_subsystem = "guest scheduler / stack allocator" };
     }
     if ((!context.rdi_mapped and context.rdi != 0) or (!context.rsi_mapped and context.rsi != 0)) {
         return .{ .class = .bad_this_pointer, .reason = "pointer-like argument is outside all guest mappings", .next_subsystem = "pointer_firewall / calling convention bridge" };
@@ -195,4 +212,37 @@ test "shared count null virtual dispatch is not classified as an import" {
         .stack_mapped = true,
     });
     try std.testing.expectEqual(FaultClass.cxx_shared_control_block_null_vtable, result.class);
+}
+
+test "live allocation vtable history identifies a virtual dispatch" {
+    const result = classify(.{
+        .instruction = "call_mem64",
+        .symbol = "__ZN2xe3gpu16CommandProcessor16WorkerThreadMainEv",
+        .address = 0x68,
+        .rdi = 0x4761e80,
+        .rsi = 1,
+        .rsp = 0x7edcfa0,
+        .rbp = 0x7ee0520,
+        .rdi_mapped = true,
+        .rsi_mapped = false,
+        .stack_mapped = true,
+        .live_allocation_vtable_history = true,
+    });
+    try std.testing.expectEqual(FaultClass.cxx_object_model_null_vtable, result.class);
+}
+
+test "stack_push to mapped read-only page classifies as bad_guest_stack" {
+    const result = classify(.{
+        .instruction = "stack_push",
+        .symbol = "__ZNSt3__19use_facetB7v160006INS_7codecvtIDic11__mbstate_tEEEERKT_RKNS_6localeE",
+        .address = 0x46bfff8,
+        .rdi = 0x8d80880,
+        .rsi = 0,
+        .rsp = 0x46bfff8,
+        .rbp = 0x46c0010,
+        .rdi_mapped = true,
+        .rsi_mapped = false,
+        .stack_mapped = true,
+    });
+    try std.testing.expectEqual(FaultClass.bad_guest_stack, result.class);
 }

@@ -8,22 +8,23 @@ const macho_runtime = @import("macho_runtime");
 const exit_diagnostics = @import("exit_diagnostics");
 const macho_metadata = @import("metadata.zig");
 const compat_runtime = @import("macho_compat_runtime");
-const import_resolution = @import("resolution/import_engine.zig");
+const import_resolution = @import("dyld").import_engine;
 const initialization_resolution = @import("resolution/initialization_engine.zig");
 const initializer_dependency = @import("resolution/initializer_dependency.zig");
-const abi_data_materializer = @import("resolution/abi_data_materializer.zig");
+const abi_data_materializer = @import("dyld").abi_data_materializer;
 const memory_transaction = @import("resolution/memory_transaction.zig");
-const dynamic_library_forwarder = @import("resolution/dynamic_library_forwarder.zig");
-const guest_memory_geometry = @import("resolution/guest_memory_geometry.zig");
-const lazy_import_stub = @import("resolution/lazy_import_stub.zig");
-const smart_stub_generator = @import("resolution/smart_stub_generator.zig");
+const dynamic_library_forwarder = @import("dyld").dynamic_library_forwarder;
+const guest_memory_geometry = @import("dyld").guest_memory_geometry;
+const lazy_import_stub = @import("dyld").lazy_import_stub;
+const smart_stub_generator = @import("dyld").smart_stub_generator;
 const cxx_exception_diagnostics = @import("resolution/cxx_exception_diagnostics.zig");
 const spirv_cross_diagnostics = @import("resolution/spirv_cross_diagnostics.zig");
 const fs_io_forwarder = @import("resolution/fs_io_forwarder.zig");
 const memory_management_forwarder = @import("resolution/memory_management_forwarder.zig");
 const sparse_virtual_memory = @import("resolution/sparse_virtual_memory.zig");
-const memory_provenance = @import("resolution/memory_provenance.zig");
-const pointer_firewall = @import("resolution/pointer_firewall.zig");
+const memory_provenance = @import("dyld").memory_provenance;
+const memory_write_provenance = @import("resolution/memory_write_provenance.zig");
+const pointer_firewall = @import("dyld").pointer_firewall;
 const semantic_fault_classifier = @import("resolution/semantic_fault_classifier.zig");
 const opaque_lifetime_recovery = @import("resolution/opaque_lifetime_recovery.zig");
 const libcpp_shared_control_block = @import("resolution/libcpp_shared_control_block.zig");
@@ -33,7 +34,7 @@ const itanium_unwinder = @import("resolution/itanium_unwinder.zig");
 const itanium_dynamic_cast = @import("resolution/itanium_dynamic_cast.zig");
 const libcpp_filesystem = @import("resolution/libcpp_filesystem.zig");
 const libcpp_stream_bridge = @import("resolution/libcpp_stream_bridge.zig");
-const vtt_resolution = @import("resolution/vtt_resolver.zig");
+const vtt_resolution = @import("dyld").vtt_resolver;
 const foreign_object_runtime = @import("resolution/foreign_object_runtime.zig");
 const native_window_runtime = @import("resolution/native_window_runtime.zig");
 const logging_runtime = @import("resolution/logging_runtime.zig");
@@ -46,15 +47,18 @@ const runtime_output = @import("resolution/runtime_output.zig");
 const tlv_runtime = @import("resolution/tlv_runtime.zig");
 const diagnostic_text_accelerator = @import("resolution/diagnostic_text_accelerator.zig");
 const symbol_assembly_context = @import("resolution/symbol_assembly_context.zig");
-const export_table_manager = @import("resolution/export_table_manager.zig");
-const export_table_lifecycle = @import("resolution/export_table_lifecycle.zig");
-const dynamic_export_registry = @import("resolution/dynamic_export_registry.zig");
+const export_table_manager = @import("dyld").export_table_manager;
+const export_table_lifecycle = @import("dyld").export_table_lifecycle;
+const dynamic_export_registry = @import("dyld").dynamic_export_registry;
 const thread_wait_profiler = @import("resolution/thread_wait_profiler.zig");
 const contract = @import("contract");
 const primitive = @import("primitive");
+const dyld = @import("dyld");
+const vt = @import("vtable");
 const scheduler = @import("scheduler");
+const cleo_routing = @import("cleo_routing");
 const jit = @import("jit");
-const macho_log = @import("event_log.zig");
+const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const primitiveCapturePrint = macho_log.primitiveCapturePrint;
 
@@ -97,7 +101,9 @@ const UNSUPPORTED_RUNTIME_EXIT_CODE = constants.UNSUPPORTED_RUNTIME_EXIT_CODE;
 const GUEST_FILE_BASE = constants.GUEST_FILE_BASE;
 const GUEST_FILE_MAX = constants.GUEST_FILE_MAX;
 const BOUND_IMPORT_THUNK_BASE = constants.BOUND_IMPORT_THUNK_BASE;
-const BOUND_IMPORT_THUNK_STRIDE = constants.BOUND_IMPORT_THUNK_STRIDE;
+// Thunk stride is now dynamically probed from Mach-O __stubs section via
+// self.metadata.importThunkStride().  The legacy constant (16) is a fallback
+// only; no live code references it directly from this scope.
 const INITIALIZER_RETURN_SENTINEL = constants.INITIALIZER_RETURN_SENTINEL;
 const GUEST_THREAD_RETURN_SENTINEL = constants.GUEST_THREAD_RETURN_SENTINEL;
 const GUEST_SIGNAL_RETURN_SENTINEL = constants.GUEST_SIGNAL_RETURN_SENTINEL;
@@ -236,6 +242,18 @@ const UiHandoffEntry = struct {
     worker_slices: u64 = 0,
 };
 
+/// Records the provenance of a 64-bit write to an allocation base address.
+/// This gives us a write-order trace for every allocation-boundary write,
+/// enabling crash-time diagnosis of heap corruption (e.g., tree node parent
+/// pointers overwritten with function prologue bytes).
+const AllocationWriteRecord = struct {
+    last_value: u64 = 0,
+    writer_rip: u64 = 0,
+    writer_step: u64 = 0,
+    writer_thread: u64 = 0,
+    restore_count: u64 = 0,
+};
+
 pub const MachOState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -246,6 +264,9 @@ pub const MachOState = struct {
     lock_fence: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     regs: Regs = .{},
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    // AVX-512 opmask registers (k0-k7). k0 is always all-1s when read as
+    // a mask operand; k1-k7 hold actual mask values for predicated operations.
+    k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
     ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     cpu_profile: x64_decoder.capabilities.Profile = .xenia,
     compat: compat_runtime.Runtime = .{},
@@ -404,6 +425,12 @@ pub const MachOState = struct {
     memory_forwarder: memory_management_forwarder.Manager,
     sparse_memory: sparse_virtual_memory.Manager,
     memory_regions: memory_provenance.Registry,
+    memory_writes: memory_write_provenance.Tracker = .{},
+    vtable_tracker: vt.VtableTracker,
+    /// Tracks __cxa_guard variables that were acquired during the current
+    /// initializer run.  When the initializer is deferred, these guards are
+    /// cleared so the retry starts from a clean initialization state.
+    guard_rollback: vt.GuardRollback,
     pointer_firewall: pointer_firewall.Firewall,
     page_permissions: []u8,
     smart_stubs: smart_stub_generator.Generator = .{},
@@ -423,6 +450,7 @@ pub const MachOState = struct {
     import_route_cache_collisions: u64 = 0,
     import_route_cache_fallbacks: u64 = 0,
     primitive_dispatch_hits: u64 = 0,
+    cleo_dispatch_hits: u64 = 0,
     primitive_dispatch_counts: std.StringHashMap(u64),
     primitive_dispatch_logged: std.AutoHashMap(u64, void),
     page_entry_bulk_initializations: u64 = 0,
@@ -564,6 +592,8 @@ pub const MachOState = struct {
             .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
             .primitive_dispatch_counts = std.StringHashMap(u64).init(allocator),
             .primitive_dispatch_logged = std.AutoHashMap(u64, void).init(allocator),
+            .vtable_tracker = vt.VtableTracker.init(allocator),
+            .guard_rollback = vt.GuardRollback.init(allocator),
             .decode_cache = decode_cache,
             .mapped_min = mapped_min,
             .executable_min = executable_min,
@@ -694,6 +724,17 @@ pub const MachOState = struct {
             result.internal_targets.sha1_process_bytes;
         result.internal_targets.sha1_end =
             result.internal_targets.sha1_process_bytes +| 0x40;
+        const raw_vtable = result.metadata.symbolAddressWithPrefix(
+            "__ZTVN2xe6kernel7XModuleE",
+        );
+        // Itanium C++ ABI: __ZTV points to the start of the vtable data
+        // (offset_to_top + typeinfo).  The object stores a pointer to vtable[0],
+        // which is 16 bytes past __ZTV.
+        if (raw_vtable) |addr| result.internal_targets.xmodule_vtable = addr + 16;
+        machoCapturePrint(
+            "macho-processor: XModule vtable: resolved=0x{x} (raw=0x{x})\n",
+            .{ result.internal_targets.xmodule_vtable, raw_vtable orelse 0 },
+        );
         machoCapturePrint(
             "macho-processor: SHA1 tracer init: enabled={} sha1_process_bytes=0x{x} sha1_range=0x{x}..0x{x} processBlock=0x{x}\n",
             .{
@@ -763,6 +804,8 @@ pub const MachOState = struct {
         self.local_libcpp_stream_targets.deinit();
         self.primitive_dispatch_counts.deinit();
         self.primitive_dispatch_logged.deinit();
+        self.vtable_tracker.deinit();
+        self.guard_rollback.deinit();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
         self.vtt_resolver.deinit();
@@ -772,6 +815,7 @@ pub const MachOState = struct {
         self.memory_forwarder.deinit();
         self.sparse_memory.deinit();
         self.memory_regions.deinit();
+        self.memory_writes.deinit(self.allocator);
         self.pointer_firewall.deinit();
         if (self.symbol_assembly_catalog) |*catalog| catalog.deinit();
         self.symbol_assembly.deinit();
@@ -898,7 +942,7 @@ pub const MachOState = struct {
             var target = if (!force_bound_thunk) stubs.get(binding.name) orelse 0 else 0;
             if (target == 0) target = blk: {
                 if (thunk_addresses.get(binding.name)) |existing_thunk| break :blk existing_thunk;
-                const thunk_address = BOUND_IMPORT_THUNK_BASE + @as(u64, @intCast(thunks.items.len)) * BOUND_IMPORT_THUNK_STRIDE;
+                const thunk_address = BOUND_IMPORT_THUNK_BASE + @as(u64, @intCast(thunks.items.len)) * self.metadata.importThunkStride();
                 try thunks.append(self.allocator, .{
                     .address = thunk_address,
                     .name = binding.name,
@@ -932,7 +976,7 @@ pub const MachOState = struct {
 
         self.bound_import_thunks = try thunks.toOwnedSlice(self.allocator);
         for (self.bound_import_thunks) |thunk| {
-            self.registerSyntheticThunk(thunk.address, BOUND_IMPORT_THUNK_STRIDE, thunk.name);
+            self.registerSyntheticThunk(thunk.address, self.metadata.importThunkStride(), thunk.name);
         }
 
         if (self.vtt_resolver.totalDeferred() > 0) {
@@ -1072,10 +1116,9 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "  [{d}] active=0x{x} rip=0x{x} {s}+0x{x} op={s} len={d}\n",
                 .{
-                    i, e.thread, e.rip,
-                    if (symbol) |s| s.name else "<unknown>",
-                    if (symbol) |s| s.offset else 0,
-                    op_str, e.len,
+                    i,                                       e.thread,                        e.rip,
+                    if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0, op_str,
+                    e.len,
                 },
             );
         }
@@ -1096,11 +1139,10 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "  [{d}] step={d} rip=0x{x} {s}+0x{x} heap=0x{x} sparse(mappings/activations)={d}/{d} deferred={d} suspended={d}\n",
                 .{
-                    i, e.step, e.rip,
-                    if (symbol) |s| s.name else "<unknown>",
-                    if (symbol) |s| s.offset else 0,
-                    e.heap, e.sparse_mappings, e.sparse_activations,
-                    e.deferred_count, e.suspended_count,
+                    i,                                       e.step,                          e.rip,
+                    if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0, e.heap,
+                    e.sparse_mappings,                       e.sparse_activations,            e.deferred_count,
+                    e.suspended_count,
                 },
             );
         }
@@ -1283,17 +1325,51 @@ pub const MachOState = struct {
             std.mem.writeInt(u32, self.mem[off..][0..4], val, .little);
         }
     }
-
     pub fn write64(self: *MachOState, vaddr: u64, val: u64) void {
+        // Suspicious write: value points into executable (code) memory — likely
+        // a tree node pointer getting corrupted with function prologue bytes.
+        // Values below 0x100000 (1 MB) are not plausible code pointers (Xenia
+        // entry point is at 0x13fa20; MicroProfile token IDs start at 0x10000).
+        // Only function_prologue values are genuinely suspicious; generic
+        // code_address writes are legitimate initialization (Export struct
+        // function pointer storage, hash table bucket counts, CommandVar
+        // default value pointers).
+        if (val >= MIN_PLAUSIBLE_CODE_POINTER and val >= self.executable_min and val < self.executable_max) {
+            if (self.memory_forwarder.allocationSize(vaddr) != null or self.isAddressInMappedMemory(vaddr)) {
+                if (detectFunctionProloguePtr(val)) {
+                    self.vtable_tracker.heap_corruption_detections +|= 1;
+                    const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
+                    machoCapturePrint(
+                        "macho-processor: suspicious allocation write: addr=0x{x} value=0x{x} (function prologue) writer=0x{x} {s}+0x{x} step={d}\n",
+                        .{
+                            vaddr,
+                            val,
+                            self.regs.rip,
+                            if (writer_symbol) |s| s.name else "<unknown>",
+                            if (writer_symbol) |s| s.offset else 0,
+                            self.executed_steps,
+                        },
+                    );
+                }
+            }
+        }
         if (self.sparse_memory.bytes(vaddr, 8, true)) |bytes| {
+            const prev = std.mem.readInt(u64, bytes[0..8], .little);
+            self.memory_writes.record(self.allocator, vaddr, prev, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
             std.mem.writeInt(u64, bytes[0..8], val, .little);
+            // Observe only after the guest write commits.  Failed translations
+            // must not manufacture vptr history.
+            self.recordAllocationWrite(vaddr, .bits64, val);
             return;
         }
         const off = self.translateGuest(vaddr, 8, .write) orelse return;
         if (off + 8 <= self.mem.len) {
+            const prev = std.mem.readInt(u64, self.mem[off..][0..8], .little);
+            self.memory_writes.record(self.allocator, vaddr, prev, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
             self.initializer_memory.capture(self.mem, @intCast(off), 8);
             self.noteGuestWrite(vaddr, 8);
             std.mem.writeInt(u64, self.mem[off..][0..8], val, .little);
+            self.recordAllocationWrite(vaddr, .bits64, val);
         }
     }
 
@@ -1313,12 +1389,20 @@ pub const MachOState = struct {
     pub fn readMemVal(self: *MachOState, addr: u64, size: Size) u64 {
         const bytes = bytesForSize(size);
         if (self.sparse_memory.bytesConst(addr, bytes)) |storage| {
-            const value: u64 = switch (size) {
+            var value: u64 = switch (size) {
                 .bits8 => storage[0],
                 .bits16 => std.mem.readInt(u16, storage[0..2], .little),
                 .bits32 => std.mem.readInt(u32, storage[0..4], .little),
                 .bits64 => std.mem.readInt(u64, storage[0..8], .little),
             };
+            if (size == .bits64 and value < 0x1000) {
+                if (self.recoverLiveAllocationVtable(addr, value)) |recovered| {
+                    const mutable_storage = self.sparse_memory.bytes(addr, @sizeOf(u64), true) orelse
+                        return value;
+                    std.mem.writeInt(u64, mutable_storage[0..8], recovered, .little);
+                    value = recovered;
+                }
+            }
             self.recordMemoryAccess(addr, size, "read", value);
             return value;
         }
@@ -1326,14 +1410,214 @@ pub const MachOState = struct {
             self.terminateForGuestAccess(addr, bytes, .read, @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op));
             return 0;
         };
-        const value: u64 = switch (size) {
+        var value: u64 = switch (size) {
             .bits8 => self.mem[off],
             .bits16 => std.mem.readInt(u16, self.mem[off..][0..2], .little),
             .bits32 => std.mem.readInt(u32, self.mem[off..][0..4], .little),
             .bits64 => std.mem.readInt(u64, self.mem[off..][0..8], .little),
         };
+        if (size == .bits64 and value < 0x1000) {
+            if (self.recoverLiveAllocationVtable(addr, value)) |recovered| {
+                std.mem.writeInt(u64, self.mem[off..][0..8], recovered, .little);
+                value = recovered;
+            }
+        }
         self.recordMemoryAccess(addr, size, "read", value);
         return value;
+    }
+
+    fn recoverLiveAllocationVtable(self: *MachOState, address: u64, current_value: u64) ?u64 {
+        const exact_live_base = self.memory_forwarder.allocationSize(address) != null;
+        const recovery = self.vtable_tracker.assessLowRead(
+            address,
+            current_value,
+            exact_live_base,
+        ) orelse return null;
+        const symbol = self.metadata.nearestSymbol(recovery.value) orelse return null;
+        if (!self.vtable_tracker.noteRecovery(address, recovery.generation)) return null;
+        machoCapturePrint(
+            "macho-processor: trusted vtable low-read recovery: object=0x{x} generation={d} allocation_size={d} observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
+            .{
+                address,
+                recovery.generation,
+                self.memory_forwarder.allocationSize(address) orelse 0,
+                current_value,
+                recovery.value,
+                symbol.name,
+                symbol.offset,
+                recovery.established_by.writer_rip,
+                recovery.established_by.writer_step,
+                recovery.last_write.writer_rip,
+                recovery.last_write.writer_step,
+                recovery.prior_recoveries,
+                self.active_guest_thread,
+            },
+        );
+        return recovery.value;
+    }
+
+    fn logLiveVtableGuardSummary(self: *const MachOState) void {
+        machoCapturePrint(
+            "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} guard_tracked={d} memory_writes={d}; recovery requires a live allocation base and strict mapped Itanium ZTV evidence\n",
+            .{
+                self.vtable_tracker.live_vtable_guard_checks,
+                self.vtable_tracker.live_vtable_guard_recoveries,
+                self.vtable_tracker.live_vtable_write_protections,
+                self.vtable_tracker.trackedAllocationCount(),
+                self.vtable_tracker.trusted_establishments,
+                self.vtable_tracker.trusted_transitions,
+                self.vtable_tracker.rejected_candidates,
+                self.vtable_tracker.low_clears_observed,
+                self.vtable_tracker.retired_records,
+                self.vtable_tracker.heap_corruption_detections,
+                self.guard_rollback.count(),
+                self.memory_writes.entries.count(),
+            },
+        );
+    }
+
+    fn hasLiveAllocationVtableHistory(self: *const MachOState, address: u64) bool {
+        if (self.memory_forwarder.allocationSize(address) == null) return false;
+        return self.vtable_tracker.hasTrustedHistory(address);
+    }
+
+    fn vtableIdentityEvidence(self: *const MachOState, value: u64) vt.IdentityEvidence {
+        var evidence = vt.IdentityEvidence{ .value = value };
+        const symbol = self.metadata.nearestSymbol(value) orelse return evidence;
+        evidence.symbol_name = symbol.name;
+        evidence.symbol_offset = symbol.offset;
+
+        if (value < 16) return evidence;
+        const table = self.guestMemoryConst(value - 16, 24) orelse return evidence;
+        evidence.header_mapped = true;
+        const typeinfo = std.mem.readInt(u64, table[8..16], .little);
+        evidence.typeinfo_plausible =
+            typeinfo == 0 or self.guestMemoryConst(typeinfo, 1) != null;
+        const first_slot = std.mem.readInt(u64, table[16..24], .little);
+        evidence.first_slot_plausible =
+            first_slot == 0 or self.isExecutableAddress(first_slot);
+        return evidence;
+    }
+
+    /// Record only validated vptr identities.  Generic write provenance remains
+    /// in memory_writes and cannot authorize vptr recovery.
+    fn recordAllocationWrite(self: *MachOState, addr: u64, size: Size, val: u64) void {
+        if (size != .bits64) return;
+        if (addr < 0x1000 or (addr & 7) != 0) return;
+        _ = self.memory_forwarder.allocationSize(addr) orelse return;
+        const result = self.vtable_tracker.observeWrite(
+            addr,
+            self.vtableIdentityEvidence(val),
+            .{
+                .writer_rip = self.regs.rip,
+                .writer_step = self.executed_steps,
+                .writer_thread = self.active_guest_thread,
+            },
+        );
+        if (result.disposition == .valid_transition and
+            self.vtable_tracker.trusted_transitions <= 64)
+        {
+            const previous_symbol = self.metadata.nearestSymbol(result.previous_vptr);
+            const current_symbol = self.metadata.nearestSymbol(result.trusted_vptr);
+            machoCapturePrint(
+                "macho-processor: vtable lifecycle transition: object=0x{x} generation={d} previous=0x{x}({s}+0x{x}) current=0x{x}({s}+0x{x}) writer=0x{x} step={d} thread=0x{x}\n",
+                .{
+                    addr,
+                    result.generation,
+                    result.previous_vptr,
+                    if (previous_symbol) |s| s.name else "<unknown>",
+                    if (previous_symbol) |s| s.offset else 0,
+                    result.trusted_vptr,
+                    if (current_symbol) |s| s.name else "<unknown>",
+                    if (current_symbol) |s| s.offset else 0,
+                    self.regs.rip,
+                    self.executed_steps,
+                    self.active_guest_thread,
+                },
+            );
+        }
+    }
+
+    /// Check if a pointer value looks like x86 function prologue bytes.
+    /// Returns true if `value` starts with common push rbp; mov rbp, rsp patterns.
+    /// This indicates heap corruption where code bytes overwrote a data pointer.
+    /// Returns true if `addr` falls within the guest memory heap/data region
+    /// (between the mapped image end and the stack start).  This catches writes
+    /// to tree nodes and other heap allocations that aren't tracked by
+    /// memory_forwarder.allocationSize (which only checks allocation bases).
+    fn isAddressInMappedMemory(self: *const MachOState, addr: u64) bool {
+        const stack_start = self.mem_base + self.mem_size -| self.stack_size;
+        return addr >= self.mapped_min and addr < stack_start;
+    }
+
+    /// Classify a writer's RIP offset within a known function to provide
+    /// semantic context for vtable protection logs.  For example, offset
+    /// 0x23 within __tree_right_rotate is the "mov [rdi+0x48], rsi" write
+    /// that clears a tree node's parent pointer — when the node and vtable
+    /// share the same allocation, this overwrites vtable[9] (offset 0x48).
+    fn classifyWriterRipOffset(name: []const u8, offset: u64) []const u8 {
+        if (std.mem.indexOf(u8, name, "__tree_right_rotate") != null) {
+            if (offset < 0x10) return "tree_rotate_prologue";
+            if (offset < 0x30) return "tree_rotate_parent_write";
+            return "tree_rotate_body";
+        }
+        if (std.mem.indexOf(u8, name, "__tree_left_rotate") != null) {
+            if (offset < 0x10) return "tree_rotate_prologue";
+            if (offset < 0x30) return "tree_rotate_parent_write";
+            return "tree_rotate_body";
+        }
+        if (std.mem.indexOf(u8, name, "__tree_insert_node") != null) {
+            if (offset < 0x10) return "tree_insert_prologue";
+            return "tree_insert_body";
+        }
+        return "unknown";
+    }
+
+    /// Minimum value that could plausibly be a guest code pointer.
+    /// Values below this are clearly small integers (e.g. MicroProfile token
+    /// IDs starting at 0x10000). Xenia's entry point is at 0x13fa20 (~1.3 MB).
+    const MIN_PLAUSIBLE_CODE_POINTER: u64 = 0x100000;
+
+    fn detectFunctionProloguePtr(value: u64) bool {
+        if (value & 0xFF != 0x55) return false; // must start with push rbp
+        const byte1 = @as(u8, @truncate((value >> 8) & 0xFF));
+        // 55 48 89 e5 (push rbp; mov rbp, rsp)
+        // 55 48 8b ec (push rbp; mov rbp, rsp)
+        // 55 48 81 ec (push rbp; sub rsp, imm32)
+        if (byte1 == 0x48) {
+            const byte2 = @as(u8, @truncate((value >> 16) & 0xFF));
+            return byte2 == 0x89 or byte2 == 0x8b or byte2 == 0x81;
+        }
+        // 55 53 48 8b ec (push rbp; push rbx; mov rbp, rsp)
+        if (byte1 == 0x53) {
+            const byte2 = @as(u8, @truncate((value >> 16) & 0xFF));
+            return byte2 == 0x48;
+        }
+        return false;
+    }
+
+    /// Dump heap corruption diagnostics when a pointer value looks like
+    /// x86 function prologue bytes rather than a valid data address.
+    /// `value` is the corrupted pointer value (e.g., from rax register).
+    /// `fault_rip` is the instruction that attempted to dereference it.
+    fn dumpHeapCorruptionDiagnostics(self: *MachOState, value: u64, fault_rip: u64) void {
+        if (value < 0x1000) return;
+        if (!detectFunctionProloguePtr(value)) return;
+        self.vtable_tracker.heap_corruption_detections +|= 1;
+        machoCapturePrint(
+            "macho-processor: heap corruption detected: value=0x{x} matches function prologue pattern (55 48 89 e5 ...) fault_rip=0x{x}\n",
+            .{ value, fault_rip },
+        );
+        // We can't infer the corrupted storage address from the value alone,
+        // so report the faulting symbol and leave storage provenance to the
+        // generic memory-write tracker.
+        const writer_symbol = self.metadata.nearestSymbol(fault_rip);
+        if (writer_symbol) |s| {
+            machoCapturePrint(
+                "macho-processor:   fault context: {s}+0x{x}\n",
+                .{ s.name, s.offset },
+            );
+        }
     }
 
     fn timerQueueWatchWrite(self: *MachOState, addr: u64, size: Size, val: u64) void {
@@ -1365,11 +1649,49 @@ pub const MachOState = struct {
         const bytes = bytesForSize(size);
         if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
             self.recordMemoryAccess(addr, size, "write", val);
+            if (size == .bits64) {
+                self.memory_writes.record(
+                    self.allocator,
+                    addr,
+                    std.mem.readInt(u64, storage[0..8], .little),
+                    val,
+                    self.regs.rip,
+                    self.executed_steps,
+                    self.active_guest_thread,
+                );
+            }
             switch (size) {
                 .bits8 => storage[0] = @truncate(val),
                 .bits16 => std.mem.writeInt(u16, storage[0..2], @truncate(val), .little),
                 .bits32 => std.mem.writeInt(u32, storage[0..4], @truncate(val), .little),
                 .bits64 => std.mem.writeInt(u64, storage[0..8], val, .little),
+            }
+            self.recordAllocationWrite(addr, size, val);
+            // Suspicious write: 64-bit value pointing into executable (code) segment
+            // written to any heap/data memory — tree node structural corruption pattern.
+            // Values below 0x100000 are not plausible code pointers (e.g. MicroProfile token IDs).
+            // Only function_prologue values are genuinely suspicious; generic
+            // code_address writes are legitimate initialization (Export struct
+            // function pointer storage, hash table bucket counts, CommandVar
+            // default value pointers).
+            if (size == .bits64 and val >= MIN_PLAUSIBLE_CODE_POINTER and val >= self.executable_min and val < self.executable_max) {
+                if (self.memory_forwarder.allocationSize(addr) != null or self.isAddressInMappedMemory(addr)) {
+                    if (detectFunctionProloguePtr(val)) {
+                        self.vtable_tracker.heap_corruption_detections +|= 1;
+                        const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
+                        machoCapturePrint(
+                            "macho-processor: suspicious allocation write (writeMemVal sparse): addr=0x{x} value=0x{x} (function prologue) writer=0x{x} {s}+0x{x} step={d}\n",
+                            .{
+                                addr,
+                                val,
+                                self.regs.rip,
+                                if (writer_symbol) |s| s.name else "<unknown>",
+                                if (writer_symbol) |s| s.offset else 0,
+                                self.executed_steps,
+                            },
+                        );
+                    }
+                }
             }
             self.timerQueueWatchWrite(addr, size, val);
             return;
@@ -1380,6 +1702,17 @@ pub const MachOState = struct {
             return;
         };
         self.recordMemoryAccess(addr, size, "write", val);
+        if (size == .bits64) {
+            self.memory_writes.record(
+                self.allocator,
+                addr,
+                std.mem.readInt(u64, self.mem[off..][0..8], .little),
+                val,
+                self.regs.rip,
+                self.executed_steps,
+                self.active_guest_thread,
+            );
+        }
         self.initializer_memory.capture(self.mem, @intCast(off), bytes);
         self.noteGuestWrite(addr, bytes);
         switch (size) {
@@ -1387,6 +1720,33 @@ pub const MachOState = struct {
             .bits16 => std.mem.writeInt(u16, self.mem[off..][0..2], @truncate(val), .little),
             .bits32 => std.mem.writeInt(u32, self.mem[off..][0..4], @truncate(val), .little),
             .bits64 => std.mem.writeInt(u64, self.mem[off..][0..8], val, .little),
+        }
+        self.recordAllocationWrite(addr, size, val);
+        // Suspicious write: 64-bit value pointing into executable (code) segment
+        // written to any heap/data memory — tree node structural corruption pattern.
+        // Values below 0x100000 are not plausible code pointers (e.g. MicroProfile token IDs).
+        // Only function_prologue values are genuinely suspicious; generic
+        // code_address writes are legitimate initialization (Export struct
+        // function pointer storage, hash table bucket counts, CommandVar
+        // default value pointers).
+        if (size == .bits64 and val >= 0x100000 and val >= self.executable_min and val < self.executable_max) {
+            if (self.memory_forwarder.allocationSize(addr) != null or self.isAddressInMappedMemory(addr)) {
+                if (detectFunctionProloguePtr(val)) {
+                    self.vtable_tracker.heap_corruption_detections +|= 1;
+                    const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
+                    machoCapturePrint(
+                        "macho-processor: suspicious allocation write (writeMemVal reg): addr=0x{x} value=0x{x} (function prologue) writer=0x{x} {s}+0x{x} step={d}\n",
+                        .{
+                            addr,
+                            val,
+                            self.regs.rip,
+                            if (writer_symbol) |s| s.name else "<unknown>",
+                            if (writer_symbol) |s| s.offset else 0,
+                            self.executed_steps,
+                        },
+                    );
+                }
+            }
         }
         self.timerQueueWatchWrite(addr, size, val);
     }
@@ -1663,6 +2023,14 @@ pub const MachOState = struct {
             .fault = fault,
             .mapped = description.mapped,
         };
+        // Check for heap corruption when the access involves reading a pointer
+        // that looks like function prologue bytes — a common symptom of buffer
+        // overflow or use-after-free where code bytes overwrote data pointers.
+        if (bytes == 8 or bytes == 4) {
+            // The offending value may be in rax (if this was a dereference of
+            // a computed address), or we check the fault address itself.
+            self.dumpHeapCorruptionDiagnostics(self.regs.rax, self.regs.rip);
+        }
         self.dumpStepTraceBuffer();
         self.dumpGtkBootstrapTrace();
         self.dumpMemInitTrace();
@@ -1689,9 +2057,8 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "  step={d} rip=0x{x} at {s}+0x{x}\n",
                 .{
-                    e.step, e.rip,
-                    if (symbol) |s| s.name else "<unknown>",
-                    if (symbol) |s| s.offset else 0,
+                    e.step,                                  e.rip,
+                    if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0,
                 },
             );
         }
@@ -1783,6 +2150,61 @@ pub const MachOState = struct {
 
         if (decoded.sib_has_base) self.dumpRegisterTransition(decoded.sib_base_reg, base_value, "base");
         if (decoded.sib_has_index) self.dumpRegisterTransition(decoded.sib_index_reg, index_value, "index");
+        self.dumpNearNullProducerSlot();
+    }
+
+    fn dumpNearNullProducerSlot(self: *const MachOState) void {
+        const count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
+        var reverse_index = count;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const index = if (self.memory_trace_filled)
+                (self.memory_trace_index + reverse_index) % MEMORY_TRACE_BUFFER_LEN
+            else
+                reverse_index;
+            const access = self.memory_trace_entries[index];
+            if (!std.mem.eql(u8, access.access, "read") or access.value != 0 or
+                access.bytes != @sizeOf(u64) or access.address < 0x1000 or
+                access.instruction_address == self.regs.rip)
+            {
+                continue;
+            }
+
+            const reader = self.metadata.nearestSymbol(access.instruction_address);
+            machoCapturePrint(
+                "macho-processor: near-null producer slot: loaded_zero_from=0x{x} reader=0x{x} {s}+0x{x} op={s}\n",
+                .{
+                    access.address,
+                    access.instruction_address,
+                    if (reader) |symbol| symbol.name else "<unknown>",
+                    if (reader) |symbol| symbol.offset else 0,
+                    access.instruction,
+                },
+            );
+            if (self.memory_writes.lookup(access.address)) |writer| {
+                const symbol = self.metadata.nearestSymbol(writer.instruction_address);
+                machoCapturePrint(
+                    "macho-processor: near-null producer last writer: slot=0x{x} previous=0x{x} value=0x{x} writer=0x{x} {s}+0x{x} step={d} age_steps={d} thread=0x{x}\n",
+                    .{
+                        writer.address,
+                        writer.previous_value,
+                        writer.value,
+                        writer.instruction_address,
+                        if (symbol) |resolved| resolved.name else "<unknown>",
+                        if (symbol) |resolved| resolved.offset else 0,
+                        writer.step,
+                        self.executed_steps -| writer.step,
+                        writer.thread,
+                    },
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: near-null producer last writer: slot=0x{x} not retained (tracked_slots={d} dropped_slots={d})\n",
+                    .{ access.address, self.memory_writes.entries.count(), self.memory_writes.dropped_slots },
+                );
+            }
+            return;
+        }
     }
 
     fn dumpRegisterTransition(self: *const MachOState, register: RegId, terminal_value: u64, role: []const u8) void {
@@ -2047,10 +2469,19 @@ pub const MachOState = struct {
 
     pub fn guestHeapRelease(self: *MachOState, address: u64) void {
         self.memory_forwarder.release(address);
+        self.vtable_tracker.forgetAddress(address);
     }
 
     pub fn guestHeapContains(self: *const MachOState, address: u64) bool {
         return self.memory_forwarder.allocationSize(address) != null;
+    }
+
+    pub fn forgetMemoryWriteProvenance(self: *MachOState, address: u64) void {
+        self.memory_writes.forget(address);
+        // Allocation start/reuse is a hard lifecycle boundary.  Retire any
+        // trusted vptr belonging to the former occupant before the new
+        // allocation becomes visible.
+        self.vtable_tracker.forgetAddress(address);
     }
 
     pub fn guestMapFile(self: *MachOState, address: u64, length: u64, prot: u32, flags: u32, host_fd: std.posix.fd_t, offset: u64) bool {
@@ -3704,6 +4135,8 @@ pub const MachOState = struct {
 
         if (std.mem.eql(u8, name, "___cxa_guard_acquire")) {
             const result = compat_runtime.cxaGuardAcquire(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
+            // Track the guard address so we can clear it on initializer deferral
+            self.guard_rollback.track(self.regs.rdi);
             return .{ .handled = result };
         }
         if (std.mem.eql(u8, name, "___cxa_guard_release")) {
@@ -3816,6 +4249,19 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "__ZNSt3__16localeD1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeD2Ev")) {
             return if (self.compat.destroyLocale(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
         }
+        // XModule constructors may resolve through unresolved imports during XEX
+        // import table loading.  Write the vtable into the object so virtual
+        // dispatch (XModule::Matches etc) works.  If the real vtable wasn't
+        // found at init time, create a synthetic one using synthetic thunks.
+        if (std.mem.indexOf(u8, name, "7XModuleC1") != null or
+            std.mem.indexOf(u8, name, "7XModuleC2") != null)
+        {
+            const xmodule_vtable = self.ensureXmoduleVtable() orelse 0;
+            if (xmodule_vtable != 0) {
+                self.write64(self.regs.rdi, xmodule_vtable);
+            }
+            return .{ .handled = self.regs.rdi };
+        }
         if (std.mem.eql(u8, name, "__ZNKSt3__16locale9use_facetERNS0_2idE")) {
             const return_address = self.read64(self.regs.rsp);
             const caller_name = if (self.metadata.nearestSymbol(return_address)) |caller| caller.name else "";
@@ -3876,6 +4322,7 @@ pub const MachOState = struct {
         if (std.mem.eql(u8, name, "___cxa_free_exception")) {
             if (self.cxx_exceptions.freeException(self.regs.rdi)) |allocation| {
                 self.memory_forwarder.release(allocation.storage_address);
+                self.vtable_tracker.forgetAddress(allocation.storage_address);
             }
             return .handled_void;
         }
@@ -4047,6 +4494,7 @@ pub const MachOState = struct {
         {
             self.resolving_import_route = .release;
             self.memory_forwarder.release(self.regs.rdi);
+            self.vtable_tracker.forgetAddress(self.regs.rdi);
             return .handled_void;
         }
         if (std.mem.endsWith(u8, name, "_realloc")) {
@@ -4719,6 +5167,7 @@ pub const MachOState = struct {
             .allocate => .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 },
             .release => blk: {
                 self.memory_forwarder.release(self.regs.rdi);
+                self.vtable_tracker.forgetAddress(self.regs.rdi);
                 break :blk .handled_void;
             },
             .reallocate => .{ .handled = self.memory_forwarder.reallocate(self, self.regs.rdi, self.regs.rsi) orelse 0 },
@@ -5518,6 +5967,146 @@ pub const MachOState = struct {
         }
     }
 
+    const NearNullBaseTransition = struct {
+        object_address: u64,
+        previous_value: u64,
+        producer_rip: u64,
+        distance: usize,
+    };
+
+    fn isXModuleMatchesSymbol(symbol: []const u8) bool {
+        return std.mem.indexOf(u8, symbol, "XModule") != null and
+            std.mem.indexOf(u8, symbol, "Matches") != null;
+    }
+
+    fn findNearNullBaseTransition(self: *MachOState, register: RegId, terminal_value: u64) ?NearNullBaseTransition {
+        const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        if (count < 2) return null;
+
+        // recordTrace() runs before the instruction executes, so the newest
+        // same-thread entry is the faulting load itself. Skip that entry and
+        // require the next one to be the producer that changed the base.
+        var skipped_current = false;
+        const after = terminal_value;
+        var same_thread_distance: usize = 0;
+        var reverse_index = count;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const index = if (self.trace_filled)
+                (self.trace_index + reverse_index) % TRACE_BUFFER_LEN
+            else
+                reverse_index;
+            const entry = self.trace_entries[index];
+            if (entry.thread_handle != self.active_guest_thread) continue;
+
+            if (!skipped_current) {
+                if (entry.rip != self.regs.rip) return null;
+                skipped_current = true;
+                continue;
+            }
+
+            same_thread_distance += 1;
+            const before = traceRegisterValue(entry, register);
+            if (before == after) continue;
+            if (before == 0) return null;
+
+            const producer = self.decodeTraceInstruction(entry) orelse return null;
+            if (producer.op != .mov_reg64_mem64 or producer.dst_reg != register) return null;
+            const source = self.guestMemoryConst(producer.addr, @sizeOf(u64)) orelse return null;
+            if (std.mem.readInt(u64, source[0..8], .little) != 0) return null;
+
+            return .{
+                .object_address = producer.addr,
+                .previous_value = before,
+                .producer_rip = entry.rip,
+                .distance = same_thread_distance,
+            };
+        }
+        return null;
+    }
+
+    /// Return a callable XModule vtable address. The ABI data materializer
+    /// intentionally leaves unknown vtable slots null; XModule::Matches is a
+    /// verified exception because Xenia uses slot +0x28 while resolving XEX
+    /// import libraries. Prefer the real table only when that exact slot is
+    /// already callable, otherwise install the narrow synthetic name thunk.
+    fn ensureXmoduleVtable(self: *MachOState) ?u64 {
+        const real = self.internal_targets.xmodule_vtable;
+        if (real != 0) {
+            if (self.guestMemoryConst(real + 0x28, @sizeOf(u64))) |slot| {
+                const target = std.mem.readInt(u64, slot[0..8], .little);
+                if (target != 0 and
+                    (self.isExecutableAddress(target) or
+                        compat_runtime.syntheticThunk(target) != null or
+                        self.metadata.importAtStub(target) != null))
+                {
+                    return real;
+                }
+            }
+        }
+
+        if (self.internal_targets.xmodule_synthetic_vtable == 0) {
+            // Comprehensive synthetic vtable: XModule inherits from XObject
+            // and guest code calls multiple virtual functions during
+            // name matching and reference-counting (XObject::Release,
+            // XModule::Matches, etc.).  Allocate 256 bytes (32 entries)
+            // and populate every slot with the safe get_name thunk so
+            // that ANY virtual dispatch returns a valid, harmless thunk.
+            const vtable_mem = self.guestAlloc(256, 16) orelse return null;
+            const bytes = self.guestMemory(vtable_mem, 256) orelse return null;
+            @memset(bytes, 0);
+            const get_name = compat_runtime.thunkAddress(.xmodule_get_name);
+            var i: u8 = 0;
+            while (i < 32) : (i += 1) {
+                self.write64(vtable_mem + @as(u64, i) * 8, get_name);
+            }
+            self.internal_targets.xmodule_synthetic_vtable = vtable_mem;
+
+            const empty = self.guestAlloc(1, 1) orelse return null;
+            const empty_bytes = self.guestMemory(empty, 1) orelse return null;
+            empty_bytes[0] = 0;
+            self.internal_targets.xmodule_empty_string = empty;
+        }
+        return self.internal_targets.xmodule_synthetic_vtable;
+    }
+
+    /// Recover the one verified near-null base transition currently emitted by
+    /// Xenia's XModule import lookup. This runs before readMemVal(), because a
+    /// page-zero access would otherwise become terminal before the transition
+    /// can repair the missing object vptr.
+    fn recoverNearNullBaseRegister(self: *MachOState, d: *DecodedInsn) bool {
+        if (!d.sib_has_base or d.has_0x67) return false;
+
+        const base_register = d.sib_base_reg;
+        const base_value = self.regVal(base_register, .bits64);
+        if (base_value >= 0x1000 or (base_value & 0x8000_0000_0000_0000) != 0) return false;
+        if (d.addr >= 0x1000 and (d.addr & 0x8000_0000_0000_0000) == 0) return false;
+        if (self.guestMemoryConst(d.addr, @sizeOf(u64)) != null) return false;
+
+        const symbol = self.metadata.nearestSymbol(self.regs.rip) orelse return false;
+        if (!isXModuleMatchesSymbol(symbol.name)) return false;
+
+        const transition = self.findNearNullBaseTransition(base_register, base_value) orelse return false;
+        if (transition.object_address != self.regs.rdi or
+            self.guestMemoryConst(transition.object_address, @sizeOf(u64)) == null or
+            self.read64(transition.object_address) != 0)
+        {
+            return false;
+        }
+
+        const resolved_vtable = self.ensureXmoduleVtable() orelse return false;
+        self.write64(transition.object_address, resolved_vtable);
+        // The producer already executed. Make the current load observe the
+        // repaired vptr, then preserve its displacement/index components.
+        self.setReg(base_register, .bits64, resolved_vtable);
+        d.addr = d.addr -% base_value +% resolved_vtable;
+        machoCapturePrint(
+            "macho-processor: near-null base register recovery: thread=0x{x} register={s} before=0x{x} after=0x0 object=0x{x} vtable=0x{x} producer=0x{x} distance={d} fault_rip=0x{x} symbol={s}+0x{x} action=restore_vptr_and_retry_load\n",
+            .{ self.active_guest_thread, @tagName(base_register), transition.previous_value, transition.object_address, resolved_vtable, transition.producer_rip, transition.distance, self.regs.rip, symbol.name, symbol.offset },
+        );
+        return true;
+    }
+
     /// Attempt to repair a zero vtable/function-pointer slot at `operand_address`
     /// by matching against the cached codecvt vtable entries. This handles the
     /// common case where a guest C++ locale facet (__narrow_to_utf8, codecvt)
@@ -5533,16 +6122,14 @@ pub const MachOState = struct {
         const caller = self.metadata.nearestSymbol(instruction_address) orelse return null;
         if (std.mem.indexOf(u8, caller.name, "codecvt") == null and
             std.mem.indexOf(u8, caller.name, "__narrow_to_utf8") == null) return null;
-        // Scan codecvt imports, preferring do_in (the most common null-slot
-        // hit at vtable+0x18 during __narrow_to_utf8::operator() in filesystem
-        // path conversion). All codecvt virtual functions share compatible
-        // signatures (mbstate_t&, char*, wchar_t*), so using any matching
-        // import as fallback is safe in this recovery path.
-        var fallback: u64 = 0;
+        // Scan codecvt imports for do_in, the common null-slot hit at
+        // vtable+0x18 during __narrow_to_utf8::operator(). Do not substitute
+        // an arbitrary codecvt symbol: constructors, accessors and the other
+        // virtual methods have different ABIs and may recurse back through
+        // use_facet indefinitely while consuming the translated thread stack.
         for (self.metadata.imports) |imported| {
             if (std.mem.indexOf(u8, imported.name, "codecvt") == null) continue;
             if (imported.stub_address == 0) continue;
-            // do_in is the function at vtable+0x18 = the crash site.
             if (std.mem.indexOf(u8, imported.name, "do_in") != null) {
                 _ = self.write64(operand_address, imported.stub_address);
                 machoCapturePrint(
@@ -5551,17 +6138,11 @@ pub const MachOState = struct {
                 );
                 return imported.stub_address;
             }
-            if (fallback == 0) fallback = imported.stub_address;
         }
-        // Fallback: use any codecvt import if no do_in found.
-        if (fallback != 0) {
-            _ = self.write64(operand_address, fallback);
-            machoCapturePrint(
-                "macho-processor: null vtable slot repair (fallback): instruction=0x{x} operand=0x{x} stub=0x{x}\n",
-                .{ instruction_address, operand_address, fallback },
-            );
-            return fallback;
-        }
+        machoCapturePrint(
+            "macho-processor: codecvt virtual dispatch unresolved: instruction=0x{x} operand=0x{x} caller={s}+0x{x} required=do_in action=reject_abi_unsafe_fallback\n",
+            .{ instruction_address, operand_address, caller.name, caller.offset },
+        );
         return null;
     }
 
@@ -6890,6 +7471,8 @@ pub const MachOState = struct {
         self.regs = launch_regs;
         self.initializer_abort_requested = false;
         self.initializer_abort_reason = .none;
+        // Clear the guard tracker for a fresh initializer run
+        self.guard_rollback.reset();
 
         if (is_retry) {
             if (!self.initializer_resolver.retry(
@@ -6937,6 +7520,26 @@ pub const MachOState = struct {
             return .failed;
         }
 
+        // Log vtable state at start of each attempt so we can correlate
+        // write-protection recoveries across retries of the same initializer.
+        machoCapturePrint(
+            "macho-processor: running initializer [{d}/{d}] {s}+0x{x} vtable(write_protections={d} recoveries={d} detections={d} guards={d})\n",
+            .{
+                index + 1,
+                self.metadata.initializer_addresses.len,
+                symbol_name,
+                if (nearest_symbol) |item| item.offset else address,
+                self.vtable_tracker.live_vtable_write_protections,
+                self.vtable_tracker.live_vtable_guard_recoveries,
+                self.vtable_tracker.heap_corruption_detections,
+                self.guard_rollback.count(),
+            },
+        );
+
+        // Flush log before executing the initializer so diagnostics from a
+        // crash are captured even without explicit fsync calls between lines.
+        macho_log.checkPointSync();
+
         self.push(INITIALIZER_RETURN_SENTINEL);
         self.regs.rip = address;
 
@@ -6964,6 +7567,38 @@ pub const MachOState = struct {
                 self.terminated = true;
                 return .failed;
             }
+            // Clear all __cxa_guard variables acquired during this initializer run
+            // so the retry starts from a clean initialization state.
+            {
+                const cleared_count = self.guard_rollback.clearAndReset(self, struct {
+                    fn writeByte(ctx: *anyopaque, addr: u64, off: u64, val: u8) bool {
+                        const st: *MachOState = @ptrCast(@alignCast(ctx));
+                        if (st.guestMemory(addr, 8)) |bytes| {
+                            bytes[@as(usize, @intCast(off))] = val;
+                            return true;
+                        }
+                        return false;
+                    }
+                }.writeByte);
+                if (cleared_count > 0) {
+                    machoCapturePrint(
+                        "macho-processor: initializer [{d}/{d}] cleared {d} guard(s) on deferral vtable(protections={d} recoveries={d} detections={d})\n",
+                        .{
+                            index + 1,
+                            self.metadata.initializer_addresses.len,
+                            cleared_count,
+                            self.vtable_tracker.live_vtable_write_protections,
+                            self.vtable_tracker.live_vtable_guard_recoveries,
+                            self.vtable_tracker.heap_corruption_detections,
+                        },
+                    );
+                }
+            }
+
+            // Flush log before deferring the initializer so diagnostics
+            // from guard clearing are captured even if the process crashes.
+            macho_log.checkPointSync();
+
             self.initializer_resolver.deferCurrent(
                 steps,
                 final_abi,
@@ -6973,6 +7608,7 @@ pub const MachOState = struct {
             );
             self.initializer_abort_requested = false;
             self.initializer_abort_reason = .none;
+
             if (deferral_reason != .runtime_dependency or deferral_attempt <= 1) {
                 machoCapturePrint(
                     "macho-processor: deferred initializer [{d}/{d}] {s} reason={s}\n",
@@ -6984,9 +7620,19 @@ pub const MachOState = struct {
         if (self.terminated) {
             const final_abi = self.initializerAbi();
             machoCapturePrint(
-                "macho-processor: initializer [{d}/{d}] terminated at rip=0x{x} reason={s} exit_code=0x{x}\n",
-                .{ index + 1, self.metadata.initializer_addresses.len, self.regs.rip, @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)), self.exit_code },
+                "macho-processor: initializer [{d}/{d}] terminated at rip=0x{x} reason={s} exit_code=0x{x} vtable(protections={d} recoveries={d} detections={d})\n",
+                .{
+                    index + 1,
+                    self.metadata.initializer_addresses.len,
+                    self.regs.rip,
+                    @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)),
+                    self.exit_code,
+                    self.vtable_tracker.live_vtable_write_protections,
+                    self.vtable_tracker.live_vtable_guard_recoveries,
+                    self.vtable_tracker.heap_corruption_detections,
+                },
             );
+            macho_log.checkPointSync();
             self.dumpRecentTrace();
             _ = self.rollbackInitializerTransaction();
             self.initializer_resolver.fail(
@@ -7008,8 +7654,29 @@ pub const MachOState = struct {
                 "macho-processor: initializer [{d}/{d}] exceeded {d} steps at {s}+0x{x}; terminal_rip=0x{x}\n",
                 .{ index + 1, self.metadata.initializer_addresses.len, INITIALIZER_STEP_LIMIT, symbol_name, if (nearest_symbol) |item| item.offset else address, self.regs.rip },
             );
+            macho_log.checkPointSync();
             self.dumpRecentTrace();
             _ = self.rollbackInitializerTransaction();
+            // Clear all __cxa_guard variables acquired during this initializer run
+            // so the retry starts from a clean initialization state.
+            {
+                const cleared_count = self.guard_rollback.clearAndReset(self, struct {
+                    fn writeByte(ctx: *anyopaque, addr: u64, off: u64, val: u8) bool {
+                        const st: *MachOState = @ptrCast(@alignCast(ctx));
+                        if (st.guestMemory(addr, 8)) |bytes| {
+                            bytes[@as(usize, @intCast(off))] = val;
+                            return true;
+                        }
+                        return false;
+                    }
+                }.writeByte);
+                if (cleared_count > 0) {
+                    machoCapturePrint(
+                        "macho-processor: initializer [{d}/{d}] cleared {d} guard(s) on deferral\n",
+                        .{ index + 1, self.metadata.initializer_addresses.len, cleared_count },
+                    );
+                }
+            }
             self.initializer_resolver.deferCurrent(
                 steps,
                 final_abi,
@@ -7018,8 +7685,15 @@ pub const MachOState = struct {
                 .step_limit,
             );
             machoCapturePrint(
-                "macho-processor: deferred initializer [{d}/{d}] {s} after step limit\n",
-                .{ index + 1, self.metadata.initializer_addresses.len, symbol_name },
+                "macho-processor: deferred initializer [{d}/{d}] {s} after step limit vtable(protections={d} recoveries={d} detections={d})\n",
+                .{
+                    index + 1,
+                    self.metadata.initializer_addresses.len,
+                    symbol_name,
+                    self.vtable_tracker.live_vtable_write_protections,
+                    self.vtable_tracker.live_vtable_guard_recoveries,
+                    self.vtable_tracker.heap_corruption_detections,
+                },
             );
             return .deferred;
         }
@@ -7235,6 +7909,7 @@ pub const MachOState = struct {
                 const destination = self.guestMemory(new_data, used) orelse return false;
                 std.mem.copyForwards(u8, destination, source);
                 self.memory_forwarder.release(data);
+                self.vtable_tracker.forgetAddress(data);
             }
             data = new_data;
             capacity = new_capacity;
@@ -7385,6 +8060,7 @@ pub const MachOState = struct {
             self.regs.rip == self.internal_targets.imgui_mem_free)
         {
             self.memory_forwarder.release(self.regs.rdi);
+            self.vtable_tracker.forgetAddress(self.regs.rdi);
             self.regs.rip = self.pop();
             return true;
         }
@@ -7399,6 +8075,7 @@ pub const MachOState = struct {
             self.regs.rip == self.internal_targets.imgui_default_free)
         {
             self.memory_forwarder.release(self.regs.rdi);
+            self.vtable_tracker.forgetAddress(self.regs.rdi);
             self.regs.rip = self.pop();
             return true;
         }
@@ -8001,7 +8678,7 @@ pub const MachOState = struct {
                 machoCapturePrint(
                     "macho-processor: GTK worker bootstrapping successful: thread=0x{x} first_rip=0x{x} last_rip=0x{x} first_symbol={s}\n",
                     .{
-                        first.thread, first.rip, last.rip,
+                        first.thread,                            first.rip, last.rip,
                         if (symbol) |s| s.name else "<unknown>",
                     },
                 );
@@ -8399,7 +9076,7 @@ pub const MachOState = struct {
             self.cooperative_self_resumes +|= 1;
             if (self.cooperative_self_resumes <= 8 or self.cooperative_self_resumes % 1000 == 0) {
                 machoCapturePrint(
-                    "scheduler: cooperative yield found no alternate runnable context: thread=0x{x} reason={s} suspended={d} deferred={d} self_resumes={d}\n",
+                    "scheduler: cooperative yield resumed caller (no alternate runnable context; not blocked): thread=0x{x} reason={s} suspended={d} deferred={d} self_resumes={d}\n",
                     .{ waiter, reason, self.suspended_guest_thread_count, self.pthreads.deferred_threads, self.cooperative_self_resumes },
                 );
             }
@@ -8934,13 +9611,12 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "  [{d}] step={d} rip=0x{x} {s}+0x{x} thread=0x{x} deferred={d} suspended={d}/{d}/{d} switches={d} yields(wait/quantum/rot)={d}/{d}/{d} idle={d} dispatch={s}\n",
                 .{
-                    i, e.step, e.rip,
-                    if (symbol) |s| s.name else "<unknown>",
-                    if (symbol) |s| s.offset else 0,
-                    e.thread, e.deferred,
-                    e.suspended_total, e.suspended_runnable, e.suspended_blocked,
-                    e.switches, e.wait_yields, e.quantum_yields, e.rotation_yields,
-                    e.idle_pending, @tagName(e.dispatch_block),
+                    i,                                       e.step,                          e.rip,
+                    if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0, e.thread,
+                    e.deferred,                              e.suspended_total,               e.suspended_runnable,
+                    e.suspended_blocked,                     e.switches,                      e.wait_yields,
+                    e.quantum_yields,                        e.rotation_yields,               e.idle_pending,
+                    @tagName(e.dispatch_block),
                 },
             );
         }
@@ -8960,11 +9636,11 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "  [{d}] step={d} rip=0x{x} generation={d} phase={s} source={d} callback=0x{x}/0x{x} worker=0x{x}/0x{x} no_progress={d} suspend/resume/slices={d}/{d}/{d}\n",
                 .{
-                    i, e.step, e.rip,
-                    e.generation, @tagName(e.phase), e.source_id,
-                    e.callback_handle, e.callback_rip,
-                    e.worker_handle, e.worker_rip,
-                    e.no_progress, e.suspensions, e.resumes, e.worker_slices,
+                    i,                 e.step,            e.rip,
+                    e.generation,      @tagName(e.phase), e.source_id,
+                    e.callback_handle, e.callback_rip,    e.worker_handle,
+                    e.worker_rip,      e.no_progress,     e.suspensions,
+                    e.resumes,         e.worker_slices,
                 },
             );
         }
@@ -9035,6 +9711,39 @@ pub const MachOState = struct {
                 const destination = self.guestMemory(self.regs.r8, count);
                 if (source != null and destination != null) std.mem.copyForwards(u8, destination.?, source.?);
                 self.regs.rax = source_end;
+            },
+            .locale_destroy => {
+                // No-op: our locale implementation objects are never freed.
+                self.regs.rax = 0;
+            },
+            .locale_has_facet => {
+                // Always return true — we always have the facet available.
+                self.regs.rax = 1;
+            },
+            .locale_use_facet => {
+                // Return the precreated ctype facet handle.
+                self.regs.rax = self.compat.locale_impl_facet;
+            },
+            .xmodule_get_name => {
+                // Allocate the empty string on demand when the XModule
+                // constructor handler (which normally allocates it) is not
+                // reached — e.g. the constructor executes natively through
+                // a resolved import thunk outside the interpreter.
+                if (self.internal_targets.xmodule_empty_string == 0) {
+                    const empty = self.guestAlloc(1, 1) orelse {
+                        self.regs.rax = 0;
+                        self.regs.rdx = 0;
+                        return false;
+                    };
+                    if (self.guestMemory(empty, 1)) |b| b[0] = 0;
+                    self.internal_targets.xmodule_empty_string = empty;
+                }
+                self.regs.rax = self.internal_targets.xmodule_empty_string;
+                // XModule::Matches passes/returns a string_view through the
+                // SysV pair (RAX=data, RDX=size). Clearing the size keeps the
+                // synthetic empty name self-consistent while remaining
+                // harmless for pointer-returning builds.
+                self.regs.rdx = 0;
             },
         }
 
@@ -9583,6 +10292,7 @@ pub const MachOState = struct {
                 .pointer_owner = if (fault_policy) |policy| policy.owner else "",
                 .vtable_header_mapped = vtable_header_mapped,
                 .typeinfo_mapped = typeinfo_mapped,
+                .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
             });
             report.semantic_fault = .{
                 .class = @tagName(classification.class),
@@ -9634,6 +10344,7 @@ pub const MachOState = struct {
                 .stack_mapped = self.guestMemoryConst(self.regs.rsp, 1) != null,
                 .pointer_opaque = if (target_policy) |policy| policy.kind == .opaque_identity and !policy.may_execute else false,
                 .pointer_owner = if (target_policy) |policy| policy.owner else "",
+                .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
             });
             report.semantic_fault = .{
                 .class = @tagName(classification.class),
@@ -10123,6 +10834,82 @@ pub const MachOState = struct {
     };
 
     pub fn execute(self: *MachOState, initial_d: DecodedInsn) void {
+        // Check if CLEO can route this instruction for wide execution
+        {
+            const result = cleo_routing.CleoRouter.route(
+                @tagName(initial_d.op),
+                cleo_routing.types.FeatureSet.cleoEmulated(),
+                0, // skip width check; decoder determines width
+            );
+            if (result.can_route) {
+                self.cleo_dispatch_hits +|= 1;
+                if (result.meta) |meta| {
+                    const result_wide: ?cleo_routing.wide.Wide(128) = ternary: {
+                        const is_fma = switch (meta.operation) {
+                            .fma_ps, .fma_pd, .fms_ps, .fms_pd, .fnma_ps, .fnma_pd, .fnms_ps, .fnms_pd, .fma_addsub_ps, .fma_addsub_pd, .fma_subadd_ps => true,
+                            else => false,
+                        };
+                        const mask_active = initial_d.opmask != 0;
+                        const mask_val: u64 = if (mask_active) self.k[initial_d.opmask] else 0xFFFF_FFFF_FFFF_FFFF;
+                        const mask_mode: cleo_routing.wide.MaskMode = if (initial_d.zero_mask) .zero else .merge;
+                        if (!is_fma) {
+                            _ = initial_d.evex_broadcast; // Reserved for EVEX broadcast semantics
+                            if (mask_active) {
+                                break :ternary cleo_routing.ops.executeBinaryMasked(
+                                    128,
+                                    meta,
+                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
+                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
+                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_src]),
+                                    mask_val,
+                                    mask_mode,
+                                    result.features,
+                                ) catch null;
+                            }
+                            break :ternary cleo_routing.ops.executeBinary(
+                                128,
+                                meta,
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_src]),
+                                result.features,
+                            ) catch null;
+                        }
+                        const op_name = @tagName(initial_d.op);
+                        const has_132 = std.mem.indexOf(u8, op_name, "132") != null;
+                        const has_213 = std.mem.indexOf(u8, op_name, "213") != null;
+                        const accum = if (has_132) initial_d.xmm_src2 else if (has_213) initial_d.xmm_src else initial_d.xmm_dst;
+                        const lhs = if (has_132) initial_d.xmm_dst else if (has_213) initial_d.xmm_src2 else initial_d.xmm_src2;
+                        const rhs = if (has_132) initial_d.xmm_src else if (has_213) initial_d.xmm_dst else initial_d.xmm_src;
+                        if (mask_active) {
+                            break :ternary cleo_routing.ops.executeAccumulateMasked(
+                                128,
+                                meta,
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
+                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
+                                mask_val,
+                                mask_mode,
+                                result.features,
+                            ) catch null;
+                        }
+                        break :ternary cleo_routing.ops.executeAccumulate(
+                            128,
+                            meta,
+                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
+                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
+                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
+                            result.features,
+                        ) catch null;
+                    };
+                    if (result_wide) |rw| {
+                        self.xmm[initial_d.xmm_dst] = rw.bytes;
+                        return;
+                    }
+                }
+                // Fall through to interpreter for unsupported operations
+            }
+        }
         var d = initial_d;
         // Detect LOCK prefix (0xF0) from raw instruction bytes at RIP.
         if (self.guestMemoryConst(self.regs.rip, 1)) |bytes| {
@@ -10207,6 +10994,7 @@ pub const MachOState = struct {
                 self.setReg(d.dst_reg, .bits32, self.readMemVal(d.addr, .bits32));
             },
             .mov_reg64_mem64 => {
+                _ = self.recoverNearNullBaseRegister(&d);
                 self.setReg(d.dst_reg, .bits64, self.readMemVal(d.addr, .bits64));
             },
 
@@ -11192,8 +11980,8 @@ pub const MachOState = struct {
                 self.setReg(d.dst_reg, .bits64, b);
                 self.setReg(d.src_reg, .bits64, a);
             },
-            .xadd_mem32_reg32, .xadd_mem64_reg64 => {
-                const sz: Size = if (d.op == .xadd_mem64_reg64) .bits64 else .bits32;
+            .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => {
+                const sz: Size = if (d.op == .xadd_mem64_reg64) .bits64 else if (d.op == .xadd_mem8_reg8) .bits8 else .bits32;
                 const old_mem = self.readMemVal(d.addr, sz);
                 const old_reg = self.regVal(d.src_reg, sz);
                 const result = old_mem +% old_reg;
@@ -11417,6 +12205,16 @@ pub const MachOState = struct {
                 const converted: f64 = @floatCast(@as(f32, @bitCast(source_bits)));
                 std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
             },
+            .vcvtsd2ss => {
+                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+                const source_bits = if (d.is_reg_form)
+                    std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
+                else
+                    self.readMemVal(d.addr, .bits64);
+                const converted: f32 = @floatCast(@as(f64, @bitCast(source_bits)));
+                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(converted), .little);
+            },
             .vaddss, .vmulss, .vsubss, .vdivss => {
                 self.executeVexScalarF32(d, vexArithmeticForOp(d.op));
             },
@@ -11566,9 +12364,20 @@ pub const MachOState = struct {
 
                 // Insert the element
                 if (d.is_reg_form) {
-                    // From XMM register (low dword/qword/word)
-                    const src_xmm = self.xmm[d.xmm_src2];
-                    @memcpy(self.xmm[d.xmm_dst][offset..][0..element_size], src_xmm[0..element_size]);
+                    // From GPR register (low dword/qword/word)
+                    const gpr_val = self.regVal(@as(RegId, @enumFromInt(d.xmm_src2)), switch (d.op) {
+                        .vpinsrd => .bits32,
+                        .vpinsrq => .bits64,
+                        .vpinsrw => .bits16,
+                        else => .bits32,
+                    });
+                    if (d.op == .vpinsrd) {
+                        std.mem.writeInt(u32, self.xmm[d.xmm_dst][offset..][0..4], @truncate(gpr_val), .little);
+                    } else if (d.op == .vpinsrq) {
+                        std.mem.writeInt(u64, self.xmm[d.xmm_dst][offset..][0..8], gpr_val, .little);
+                    } else {
+                        std.mem.writeInt(u16, self.xmm[d.xmm_dst][offset..][0..2], @truncate(gpr_val), .little);
+                    }
                 } else {
                     // From memory (read 32/64/16 bits)
                     const mem_value = if (d.op == .vpinsrd)
@@ -12382,6 +13191,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.pthreads.logSummary();
         state.logCooperativeSchedulerSummary();
         state.memory_forwarder.logSummary();
+        state.logLiveVtableGuardSummary();
         state.launch_options.logSummary();
         state.startup.logSummary();
         state.cxx_exceptions.logSummary();
@@ -12430,6 +13240,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.pthreads.logSummary();
     state.logCooperativeSchedulerSummary();
     state.memory_forwarder.logSummary();
+    state.logLiveVtableGuardSummary();
     state.launch_options.logSummary();
     state.startup.logSummary();
     state.startup.timingSummary();
@@ -13335,6 +14146,16 @@ test "decode VCVTSS2SD register and memory forms" {
     try std.testing.expectEqual(@as(u64, 0x10), memory.addr);
 }
 
+test "decode VCVTSD2SS register form" {
+    // VCVTSD2SS xmm0, xmm0, xmm1: C5 FB 5A C1 (F2 prefix, VEX.L=1)
+    const decoded = decodeInsn(&[_]u8{ 0xC5, 0xFB, 0x5A, 0xC1 });
+    try std.testing.expectEqual(Op.vcvtsd2ss, decoded.op);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src2);
+    try std.testing.expect(decoded.is_reg_form);
+}
+
 test "decode VEX scalar and packed arithmetic" {
     const boundary = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x58, 0xC0 });
     try std.testing.expectEqual(Op.vaddss, boundary.op);
@@ -13810,6 +14631,14 @@ test "dyld data bindings materialize callable constant and GOT slots" {
     try std.testing.expect(!MachOState.isBridgedLibcppDataSymbol("__ZTVN10__cxxabiv117__class_type_infoE"));
     try std.testing.expect(MachOState.bindingRequiresBoundThunk(got_section));
     try std.testing.expect(!MachOState.bindingRequiresBoundThunk(constant_section));
+}
+
+test "near-null XModule recovery guard is limited to Matches" {
+    try std.testing.expect(MachOState.isXModuleMatchesSymbol(
+        "__ZNK2xe6kernel7XModule7MatchesENSt3__117basic_string_viewIcNS2_11char_traitsIcEEEE",
+    ));
+    try std.testing.expect(!MachOState.isXModuleMatchesSymbol("__ZN2xe6kernel7XModuleC1Ev"));
+    try std.testing.expect(!MachOState.isXModuleMatchesSymbol("__ZNSt3__16locale9use_facetEv"));
 }
 
 test "Mach-O PAGEZERO is excluded from guest memory" {

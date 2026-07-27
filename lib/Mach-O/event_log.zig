@@ -38,6 +38,7 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
         return;
     }
 
+    // Always write to stderr first so diagnostics survive a crash
     std.debug.print("{s}", .{text});
 
     if (thread_macho_fd >= 0) {
@@ -50,6 +51,10 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
 pub fn primitiveCapturePrint(comptime fmt: []const u8, args: anytype) void {
     const text = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
     defer std.heap.page_allocator.free(text);
+
+    // Always write to stderr first so diagnostics survive a crash
+    std.debug.print("{s}", .{text});
+
     if (thread_primitive_fd >= 0) {
         writeAll(thread_primitive_fd, text);
         if (text.len == 0 or text[text.len - 1] != '\n')
@@ -197,6 +202,12 @@ pub const Logger = struct {
             _ = c.write(self.macho_fd, "\n", 1);
     }
 
+    pub fn flush(self: *Logger) void {
+        if (self.macho_fd >= 0) _ = c.fsync(self.macho_fd);
+        if (self.scheduler_fd >= 0) _ = c.fsync(self.scheduler_fd);
+        if (self.primitive_fd >= 0) _ = c.fsync(self.primitive_fd);
+    }
+
     pub fn emit(self: *Logger, event: Event) void {
         if (self.macho_fd < 0) return;
         var buffer: [4096]u8 = undefined;
@@ -257,6 +268,12 @@ fn writeAll(fd: i32, bytes: []const u8) void {
         if (result <= 0) return;
         written += @intCast(result);
     }
+}
+
+pub fn checkPointSync() void {
+    if (thread_macho_fd >= 0) _ = c.fsync(thread_macho_fd);
+    if (thread_scheduler_fd >= 0) _ = c.fsync(thread_scheduler_fd);
+    if (thread_primitive_fd >= 0) _ = c.fsync(thread_primitive_fd);
 }
 
 fn routeRoot() ?[]const u8 {
