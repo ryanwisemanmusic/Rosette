@@ -1,6 +1,6 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
-const cxx_object_model = @import("cxx_object_model.zig");
+const cxx_object_model = @import("cxx_abi").cxx_object_model;
 const machoCapturePrint = @import("../event_log.zig").machoCapturePrint;
 
 const MAX_STREAMS = 256; // was 64 — raised for IO-5
@@ -1281,10 +1281,10 @@ pub const Bridge = struct {
             );
         }
 
-    // Stream operation is recorded in the trace ring buffer above.
-    // The verbose machoCapturePrint for each read/peek is intentionally
-    // suppressed during normal operation; dumpPatchTomlDiagnostics
-    // emits the full trace on fault.
+        // Stream operation is recorded in the trace ring buffer above.
+        // The verbose machoCapturePrint for each read/peek is intentionally
+        // suppressed during normal operation; dumpPatchTomlDiagnostics
+        // emits the full trace on fault.
     }
 
     fn tracePatchSeek(self: *Bridge, stream: *Stream, operation: []const u8, offset: i64, direction: std.c.whence_t, result: i64) void {
