@@ -13,7 +13,7 @@
 //!   - macho_compat_runtime  (used by import_engine)
 //!   - scheduler             (used by dynamic_library_forwarder)
 
-pub const event_log = @import("event_log.zig");
+pub const event_log = @import("event_log");
 pub const pointer_firewall = @import("pointer_firewall.zig");
 pub const memory_provenance = @import("memory_provenance.zig");
 pub const guest_memory_geometry = @import("guest_memory_geometry.zig");

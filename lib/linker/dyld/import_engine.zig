@@ -1,7 +1,7 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
 const pointer_firewall = @import("pointer_firewall.zig");
-const machoCapturePrint = @import("event_log.zig").machoCapturePrint;
+const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 pub const Outcome = enum {
     resolved,

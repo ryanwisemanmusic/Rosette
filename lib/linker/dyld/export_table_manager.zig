@@ -1,5 +1,5 @@
 const std = @import("std");
-const machoCapturePrint = @import("event_log.zig").machoCapturePrint;
+const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 pub const TableEntry = struct {
     address: u64,
