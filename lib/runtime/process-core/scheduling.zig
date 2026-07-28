@@ -1,4 +1,4 @@
-//! Cooperative thread scheduling and GTK idle callback dispatch.
+//! Cooperative thread scheduling and cooperative idle callback dispatch.
 //! Extracted from MachOState (process.zig) to reduce file size.
 //!
 //! Uses `anytype` for the `self` parameter to avoid circular imports.
@@ -12,23 +12,23 @@ const pthread_runtime = @import("pthread").pthread_runtime;
 
 // Types referenced explicitly in parameter/return types or function bodies
 const SuspendedGuestThread = @import("macho_core").types.SuspendedGuestThread;
-const GtkIdleQueueSnapshot = @import("macho_core").types.GtkIdleQueueSnapshot;
-const GtkIdleDispatchBlock = @import("macho_core").types.GtkIdleDispatchBlock;
+const IdleQueueSnapshot = @import("macho_core").types.IdleQueueSnapshot;
+const IdleDispatchBlock = @import("macho_core").types.IdleDispatchBlock;
 const RunnableSuspendedSnapshot = @import("macho_core").types.RunnableSuspendedSnapshot;
-const gtkIdleQueueSnapshotFor = @import("macho_core").types.gtkIdleQueueSnapshotFor;
+const idleQueueSnapshotFor = @import("macho_core").types.idleQueueSnapshotFor;
 
 // Constants used in function bodies
 const DEFAULT_GUEST_THREAD_STACK_SIZE = @import("macho_core").constants.DEFAULT_GUEST_THREAD_STACK_SIZE;
 const COOPERATIVE_THREAD_QUANTUM_STEPS = @import("macho_core").constants.COOPERATIVE_THREAD_QUANTUM_STEPS;
-const GTK_IDLE_STARVATION_STEPS = @import("macho_core").constants.GTK_IDLE_STARVATION_STEPS;
+const IDLE_STARVATION_STEPS = @import("macho_core").constants.IDLE_STARVATION_STEPS;
 const GUEST_THREAD_RETURN_SENTINEL = @import("macho_core").constants.GUEST_THREAD_RETURN_SENTINEL;
-const MAX_GTK_IDLE_CALLBACKS = @import("macho_core").types.MAX_GTK_IDLE_CALLBACKS;
-const GTK_IDLE_CALLBACK_HANDLE_BASE = @import("macho_core").types.GTK_IDLE_CALLBACK_HANDLE_BASE;
+const MAX_IDLE_CALLBACKS = @import("macho_core").types.MAX_IDLE_CALLBACKS;
+const IDLE_CALLBACK_HANDLE_BASE = @import("macho_core").types.IDLE_CALLBACK_HANDLE_BASE;
 
 // Utility functions
 const alignDown = @import("macho_core").utils.alignDown;
 
-pub fn beginGtkMainLoop(self: anytype) bool {
+pub fn beginCooperativeMainLoop(self: anytype) bool {
     if (self.cooperative_ui_context != null) return false;
     const deferred = self.pthreads.takeNewestDeferred() orelse return false;
     self.cooperative_ui_context = .{
@@ -67,8 +67,8 @@ pub fn startDeferredGuestThread(self: anytype, deferred: pthread_runtime.Deferre
     self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
     self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
     self.x87 = .{};
-    self.gtk_bootstrap_active = true;
-    self.gtk_bootstrap_index = 0;
+    self.coop_bootstrap_active = true;
+    self.coop_bootstrap_index = 0;
     self.regs.rip = deferred.start_routine;
     self.regs.rdi = deferred.argument;
     self.regs.rsp = alignDown(stack_base + stack_size, 16);
@@ -219,13 +219,72 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
     return false;
 }
 
+/// Converts a globally parked cooperative scheduler back into executable work.
+/// This is shared by explicit waits and by the thread-return boundary so the
+/// latter cannot mistake "nothing runnable at this instant" for "all threads
+/// completed". Finite virtual deadlines take priority; only when none exists
+/// do we use the POSIX-permitted, generation-bounded condvar spurious wake.
+fn recoverQuiescentGuestThread(self: anytype, reason: []const u8, waiter: u64) bool {
+    if (self.pthreads.earliestWaitDeadline()) |deadline| {
+        _ = self.guest_time.advanceTo(deadline);
+        var emitted_deadline = false;
+        while (self.guest_time.popDue()) |timer| {
+            emitted_deadline = true;
+            self.scheduler_log.emit(.{
+                .kind = .timer_due,
+                .step = self.executed_steps,
+                .thread = timer.thread,
+                .object = timer.wait_object,
+                .generation = timer.wait_generation,
+                .deadline_ns = timer.deadline_ns,
+                .blocked = self.pthreads.blocked_threads,
+                .reason = "idle_advance_to_deadline",
+            });
+        }
+        if (!emitted_deadline) {
+            self.scheduler_log.emit(.{
+                .kind = .timer_due,
+                .step = self.executed_steps,
+                .thread = waiter,
+                .deadline_ns = deadline,
+                .blocked = self.pthreads.blocked_threads,
+                .reason = "unregistered_wait_deadline",
+            });
+        }
+        return self.resumeSuspendedGuestThread();
+    }
+
+    const preferred = if (self.ui_handoff.isActive()) self.ui_handoff.scheduling_thread else 0;
+    if (self.pthreads.wakeOldestCondvarForQuiescence(preferred, self.executed_steps)) |woken| {
+        self.cooperative_quiescence_recoveries +|= 1;
+        const advanced_now = self.guest_time.advanceForQuiescence();
+        if (self.cooperative_quiescence_recoveries <= 8 or self.cooperative_quiescence_recoveries % 100 == 0) {
+            machoCapturePrint(
+                "scheduler: global quiescence recovery #{d}: POSIX spurious wake thread=0x{x} preferred=0x{x} blocked={d} virtual_now_ns={d} reason={s}; advanced one bounded idle tick because no runnable producer or finite deadline remained\n",
+                .{ self.cooperative_quiescence_recoveries, woken, preferred, self.pthreads.blocked_threads, advanced_now, reason },
+            );
+        }
+        return self.resumeSuspendedGuestThread();
+    }
+
+    self.scheduler_log.emit(.{
+        .kind = .deadlock,
+        .step = self.executed_steps,
+        .thread = waiter,
+        .runnable = 0,
+        .blocked = self.pthreads.blocked_threads,
+        .reason = reason,
+    });
+    return false;
+}
+
 pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
     if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return false;
-    if (self.pthreads.deferred_threads == 0 and self.suspended_guest_thread_count == 0 and self.pendingGtkIdleCallbackCount() == 0) return false;
+    if (self.pthreads.deferred_threads == 0 and self.suspended_guest_thread_count == 0 and self.pendingIdleCallbackCount() == 0) return false;
     const waiter = self.active_guest_thread;
     if (!self.saveActiveGuestThread(reason)) return false;
     var worker: u64 = 0;
-    if (self.active_gtk_idle_source == 0 and self.startNextGtkIdleCallback(reason, true)) {
+    if (self.active_idle_source == 0 and self.startNextIdleCallback(reason, true)) {
         worker = self.active_guest_thread;
     } else if (self.pthreads.takeNewestDeferred()) |next| {
         if (!self.startDeferredGuestThread(next)) {
@@ -235,61 +294,7 @@ pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
         worker = next.handle;
     } else {
         if (!self.resumeSuspendedGuestThread()) {
-            var recovered_quiescence = false;
-            const deadline = self.pthreads.earliestWaitDeadline() orelse quiescent: {
-                const preferred = if (self.ui_handoff.isActive()) self.ui_handoff.scheduling_thread else 0;
-                if (self.pthreads.wakeOldestCondvarForQuiescence(preferred, self.executed_steps)) |woken| {
-                    self.cooperative_quiescence_recoveries +|= 1;
-                    const advanced_now = self.guest_time.advanceForQuiescence();
-                    if (self.cooperative_quiescence_recoveries <= 8 or self.cooperative_quiescence_recoveries % 100 == 0) {
-                        machoCapturePrint(
-                            "scheduler: global quiescence recovery #{d}: POSIX spurious wake thread=0x{x} preferred=0x{x} blocked={d} virtual_now_ns={d} reason={s}; advanced one bounded idle tick because no runnable producer or finite deadline remained\n",
-                            .{ self.cooperative_quiescence_recoveries, woken, preferred, self.pthreads.blocked_threads, advanced_now, reason },
-                        );
-                    }
-                    if (self.resumeSuspendedGuestThread()) {
-                        recovered_quiescence = true;
-                        break :quiescent self.guest_time.now();
-                    }
-                }
-                self.scheduler_log.emit(.{
-                    .kind = .deadlock,
-                    .step = self.executed_steps,
-                    .thread = waiter,
-                    .runnable = 0,
-                    .blocked = self.pthreads.blocked_threads,
-                    .reason = reason,
-                });
-                return false;
-            };
-            if (!recovered_quiescence) {
-                _ = self.guest_time.advanceTo(deadline);
-                var emitted_deadline = false;
-                while (self.guest_time.popDue()) |timer| {
-                    emitted_deadline = true;
-                    self.scheduler_log.emit(.{
-                        .kind = .timer_due,
-                        .step = self.executed_steps,
-                        .thread = timer.thread,
-                        .object = timer.wait_object,
-                        .generation = timer.wait_generation,
-                        .deadline_ns = timer.deadline_ns,
-                        .blocked = self.pthreads.blocked_threads,
-                        .reason = "idle_advance_to_deadline",
-                    });
-                }
-                if (!emitted_deadline) {
-                    self.scheduler_log.emit(.{
-                        .kind = .timer_due,
-                        .step = self.executed_steps,
-                        .thread = waiter,
-                        .deadline_ns = deadline,
-                        .blocked = self.pthreads.blocked_threads,
-                        .reason = "unregistered_wait_deadline",
-                    });
-                }
-                if (!self.resumeSuspendedGuestThread()) return false;
-            }
+            if (!recoverQuiescentGuestThread(self, reason, waiter)) return false;
         }
         worker = self.active_guest_thread;
     }
@@ -316,7 +321,7 @@ pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
     if (self.cooperative_wait_yields <= 16 or self.cooperative_wait_yields % 100 == 0) {
         machoCapturePrint(
             "macho-processor: cooperative wait yield #{d}: waiter=0x{x} -> worker=0x{x} reason={s} deferred_remaining={d} suspended={d} gtk_idle_pending={d}\n",
-            .{ self.cooperative_wait_yields, waiter, worker, reason, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.pendingGtkIdleCallbackCount() },
+            .{ self.cooperative_wait_yields, waiter, worker, reason, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.pendingIdleCallbackCount() },
         );
     }
     if (self.ui_handoff.isActive() or self.cooperative_wait_yields <= 8) {
@@ -335,10 +340,10 @@ pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
 // a bounded execution slice so one spinner cannot starve their producers.
 pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
     if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return;
-    const pending_idle = self.pendingGtkIdleCallbackCount();
-    const idle_callback_inflight = self.active_gtk_idle_source != 0;
+    const pending_idle = self.pendingIdleCallbackCount();
+    const idle_callback_inflight = self.active_idle_source != 0;
     const idle_callback_running = idle_callback_inflight and
-        self.isGtkIdleCallbackHandle(self.active_guest_thread);
+        self.isSyntheticCallbackHandle(self.active_guest_thread);
     const suspended = self.runnableSuspendedSnapshot();
 
     if (idle_callback_running) {
@@ -380,20 +385,20 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
         const scheduling_thread = self.active_guest_thread;
         self.cooperative_quantum_steps = 0;
         if (!self.yieldActiveGuestThreadForWait("GTK idle wake")) {
-            self.gtk_idle_dispatch_failures +|= 1;
+            self.idle_dispatch_failures +|= 1;
             const block = self.gtkIdleDispatchBlock();
-            if (self.gtk_idle_dispatch_failures <= 8 or self.gtk_idle_dispatch_failures % 100 == 0) {
+            if (self.idle_dispatch_failures <= 8 or self.idle_dispatch_failures % 100 == 0) {
                 machoCapturePrint(
                     "macho-processor: GTK idle wake blocked: failure={d} reason={s} active=0x{x} pending={d} suspended={d}/{d}\n",
-                    .{ self.gtk_idle_dispatch_failures, @tagName(block), scheduling_thread, pending_idle, self.suspended_guest_thread_count, self.suspended_guest_threads.len },
+                    .{ self.idle_dispatch_failures, @tagName(block), scheduling_thread, pending_idle, self.suspended_guest_thread_count, self.suspended_guest_threads.len },
                 );
             }
             return;
         }
-        self.gtk_idle_wakeups +|= 1;
+        self.idle_wakeups +|= 1;
         machoCapturePrint(
             "macho-processor: GTK idle wake dispatched: wake={d} from_thread=0x{x} source={d} pending={d}\n",
-            .{ self.gtk_idle_wakeups, scheduling_thread, self.active_gtk_idle_source, self.pendingGtkIdleCallbackCount() },
+            .{ self.idle_wakeups, scheduling_thread, self.active_idle_source, self.pendingIdleCallbackCount() },
         );
         return;
     }
@@ -424,21 +429,21 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
 
 pub fn finishActiveGuestThread(self: anytype) void {
     if (self.active_guest_thread != 0) {
-        if (self.isGtkIdleCallbackHandle(self.active_guest_thread)) {
-            const source = self.active_gtk_idle_source;
-            const callback = self.active_gtk_idle_callback;
-            const duration = self.executed_steps -| self.active_gtk_idle_started_step;
-            self.gtk_idle_completed +|= 1;
+        if (self.isSyntheticCallbackHandle(self.active_guest_thread)) {
+            const source = self.active_idle_source;
+            const callback = self.active_idle_callback;
+            const duration = self.executed_steps -| self.active_idle_started_step;
+            self.idle_completed +|= 1;
             self.ui_handoff.completed(self.executed_steps);
             machoCapturePrint(
                 "macho-processor: GTK idle callback completed: source={d} callback=0x{x} duration_steps={d} completed={d} pending={d}\n",
-                .{ source, callback, duration, self.gtk_idle_completed, self.pendingGtkIdleCallbackCount() },
+                .{ source, callback, duration, self.idle_completed, self.pendingIdleCallbackCount() },
             );
             self.logThreadTable("GTK idle callback completed");
             self.active_guest_thread = 0;
-            self.active_gtk_idle_source = 0;
-            self.active_gtk_idle_callback = 0;
-            self.active_gtk_idle_started_step = 0;
+            self.active_idle_source = 0;
+            self.active_idle_callback = 0;
+            self.active_idle_started_step = 0;
         } else {
             self.pthreads.markCompleted(self.active_guest_thread);
             self.cooperative_thread_returns +|= 1;
@@ -446,15 +451,39 @@ pub fn finishActiveGuestThread(self: anytype) void {
             self.active_guest_thread = 0;
         }
     }
-    if (self.startNextGtkIdleCallback("idle-return", false)) return;
+    if (self.startNextIdleCallback("idle-return", false)) return;
     if (self.pthreads.takeNewestDeferred()) |next| {
         if (self.startDeferredGuestThread(next)) return;
     }
     if (self.resumeSuspendedGuestThread()) return;
-    self.restoreGtkMainLoopCaller("all cooperative guest threads returned");
+
+    // A returned worker is not proof that the application is done. Parked
+    // condvar and timer contexts still represent live application work and
+    // must be made runnable before GTK's intercepted caller can be restored.
+    if (self.suspended_guest_thread_count != 0 or self.pthreads.blocked_threads != 0) {
+        if (recoverQuiescentGuestThread(
+            self,
+            "thread return with parked cooperative contexts",
+            0,
+        )) return;
+
+        // Preserve the main-loop ownership invariant. Leaving RIP at the
+        // return sentinel retries recovery at the next scheduler boundary;
+        // restoring the caller here would make Xenia run OnDestroy and exit
+        // while live workers still exist.
+        self.cooperative_starvation_warnings +|= 1;
+        if (self.cooperative_starvation_warnings <= 8 or self.cooperative_starvation_warnings % 1000 == 0) {
+            machoCapturePrint(
+                "scheduler: refusing GTK main-loop exit with parked work: suspended={d} blocked={d} deferred={d} idle_pending={d} warning={d}\n",
+                .{ self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pthreads.deferred_threads, self.pendingIdleCallbackCount(), self.cooperative_starvation_warnings },
+            );
+        }
+        return;
+    }
+    self.restoreMainLoopCaller("all cooperative guest threads returned");
 }
 
-pub fn scheduleGtkIdleCallback(self: anytype, function: u64, data: u64, tag: []const u8) u64 {
+pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []const u8) u64 {
     if (function == 0 or !self.isExecutableAddress(function)) {
         machoCapturePrint(
             "macho-processor: GTK idle rejected: callback=0x{x} executable={} tag={s}\n",
@@ -462,7 +491,7 @@ pub fn scheduleGtkIdleCallback(self: anytype, function: u64, data: u64, tag: []c
         );
         return 0;
     }
-    for (&self.gtk_idle_callbacks) |*entry| {
+    for (&self.idle_callbacks) |*entry| {
         if (entry.active) continue;
         const source = self.gtk_idle_next_source;
         self.gtk_idle_next_source +|= 1;
@@ -476,11 +505,11 @@ pub fn scheduleGtkIdleCallback(self: anytype, function: u64, data: u64, tag: []c
             .scheduling_thread = self.active_guest_thread,
             .scheduling_rip = self.regs.rip,
         };
-        self.gtk_idle_scheduled +|= 1;
+        self.idle_scheduled +|= 1;
         self.ui_handoff.queued(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
         machoCapturePrint(
             "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
-            .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingGtkIdleCallbackCount() },
+            .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingIdleCallbackCount() },
         );
         self.logThreadTable("GTK idle scheduled");
         return source;
@@ -492,41 +521,41 @@ pub fn scheduleGtkIdleCallback(self: anytype, function: u64, data: u64, tag: []c
     return 0;
 }
 
-pub fn pendingGtkIdleCallbackCount(self: anytype) usize {
+pub fn pendingIdleCallbackCount(self: anytype) usize {
     var count: usize = 0;
-    for (&self.gtk_idle_callbacks) |*entry| {
+    for (&self.idle_callbacks) |*entry| {
         if (entry.active) count += 1;
     }
     return count;
 }
 
-pub fn gtkIdleQueueSnapshot(self: anytype) GtkIdleQueueSnapshot {
-    return gtkIdleQueueSnapshotFor(&self.gtk_idle_callbacks);
+pub fn idleQueueSnapshot(self: anytype) IdleQueueSnapshot {
+    return idleQueueSnapshotFor(&self.idle_callbacks);
 }
 
-pub fn gtkIdleDispatchBlock(self: anytype) GtkIdleDispatchBlock {
+pub fn idleDispatchBlock(self: anytype) IdleDispatchBlock {
     if (self.cooperative_ui_context == null) return .no_ui_context;
     if (self.active_guest_thread == 0) return .no_active_guest_thread;
-    if (self.active_gtk_idle_source != 0) return .callback_already_running;
+    if (self.active_idle_source != 0) return .callback_already_running;
     if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return .suspended_queue_full;
     return .ready;
 }
 
-pub fn removeGtkIdleSource(self: anytype, source: u64) bool {
-    for (&self.gtk_idle_callbacks) |*entry| {
+pub fn removeIdleSource(self: anytype, source: u64) bool {
+    for (&self.idle_callbacks) |*entry| {
         if (!entry.active or entry.source_id != source) continue;
         entry.* = .{};
-        self.gtk_idle_removed +|= 1;
-        machoCapturePrint("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.pendingGtkIdleCallbackCount() });
+        self.idle_removed +|= 1;
+        machoCapturePrint("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.pendingIdleCallbackCount() });
         return true;
     }
     return false;
 }
 
-pub fn startNextGtkIdleCallback(self: anytype, reason: []const u8, active_already_saved: bool) bool {
+pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_saved: bool) bool {
     self.pumpNativeWindowEvents();
     const context = self.cooperative_ui_context orelse return false;
-    for (&self.gtk_idle_callbacks) |*entry| {
+    for (&self.idle_callbacks) |*entry| {
         if (!entry.active) continue;
         if (!self.isExecutableAddress(entry.function)) {
             machoCapturePrint(
@@ -553,16 +582,16 @@ pub fn startNextGtkIdleCallback(self: anytype, reason: []const u8, active_alread
         self.regs.rdi = data;
         self.regs.rsp = alignDown(context.regs.rsp, 16);
         self.push(GUEST_THREAD_RETURN_SENTINEL);
-        self.active_guest_thread = GTK_IDLE_CALLBACK_HANDLE_BASE + source;
-        self.active_gtk_idle_source = source;
-        self.active_gtk_idle_callback = function;
-        self.active_gtk_idle_started_step = self.executed_steps;
-        self.gtk_idle_started +|= 1;
+        self.active_guest_thread = IDLE_CALLBACK_HANDLE_BASE + source;
+        self.active_idle_source = source;
+        self.active_idle_callback = function;
+        self.active_idle_started_step = self.executed_steps;
+        self.idle_started +|= 1;
         self.ui_handoff.callbackStarted(self.active_guest_thread, self.regs.rip, self.executed_steps);
         self.cooperative_thread_switches +|= 1;
         machoCapturePrint(
             "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
-            .{ source, function, data, tag, reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingGtkIdleCallbackCount() },
+            .{ source, function, data, tag, reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingIdleCallbackCount() },
         );
         self.logThreadTable("GTK idle callback started");
         return true;
@@ -570,26 +599,26 @@ pub fn startNextGtkIdleCallback(self: anytype, reason: []const u8, active_alread
     return false;
 }
 
-pub fn isGtkIdleCallbackHandle(self: anytype, handle: u64) bool {
+pub fn isSyntheticCallbackHandle(self: anytype, handle: u64) bool {
     _ = self;
-    return handle >= GTK_IDLE_CALLBACK_HANDLE_BASE and handle < GTK_IDLE_CALLBACK_HANDLE_BASE + MAX_GTK_IDLE_CALLBACKS + 1024;
+    return handle >= IDLE_CALLBACK_HANDLE_BASE and handle < IDLE_CALLBACK_HANDLE_BASE + MAX_IDLE_CALLBACKS + 1024;
 }
 
 pub fn currentCooperativeThreadHandle(self: anytype) u64 {
-    if (self.active_guest_thread == 0 or self.isGtkIdleCallbackHandle(self.active_guest_thread)) {
+    if (self.active_guest_thread == 0 or self.isSyntheticCallbackHandle(self.active_guest_thread)) {
         return self.pthreads.main_thread_handle;
     }
     return self.active_guest_thread;
 }
 
 pub fn threadNumericId(self: anytype, handle: u64) u64 {
-    if (handle == 0 or handle == self.pthreads.main_thread_handle or self.isGtkIdleCallbackHandle(handle)) return 1;
+    if (handle == 0 or handle == self.pthreads.main_thread_handle or self.isSyntheticCallbackHandle(handle)) return 1;
     if (self.pthreads.snapshotForHandle(handle)) |snapshot| return snapshot.numeric_id;
     return 0;
 }
 
 pub fn threadRole(self: anytype, handle: u64, address: u64) []const u8 {
-    if (self.isGtkIdleCallbackHandle(handle)) return "ui_callback";
+    if (self.isSyntheticCallbackHandle(handle)) return "ui_callback";
     if (handle == self.pthreads.main_thread_handle) return "main_ui";
     const symbol = self.metadata.nearestSymbol(address) orelse return "worker";
     if (std.mem.indexOf(u8, symbol.name, "WindowedAppContext") != null or
@@ -682,7 +711,7 @@ pub fn logThreadTable(self: anytype, reason: []const u8) void {
     machoCapturePrint("scheduler: THREAD TABLE END reason={s}\n", .{reason});
 }
 
-pub fn restoreGtkMainLoopCaller(self: anytype, reason: []const u8) void {
+pub fn restoreMainLoopCaller(self: anytype, reason: []const u8) void {
     const context = self.cooperative_ui_context orelse return;
     self.regs = context.regs;
     self.xmm = context.xmm;
@@ -690,9 +719,9 @@ pub fn restoreGtkMainLoopCaller(self: anytype, reason: []const u8) void {
     self.x87 = context.x87;
     self.cooperative_ui_context = null;
     self.active_guest_thread = 0;
-    self.active_gtk_idle_source = 0;
-    self.active_gtk_idle_callback = 0;
-    self.active_gtk_idle_started_step = 0;
+    self.active_idle_source = 0;
+    self.active_idle_callback = 0;
+    self.active_idle_started_step = 0;
     self.ui_handoff.reset();
     self.foreign_objects.main_loop_depth -|= 1;
     const return_address = self.pop();
@@ -712,7 +741,7 @@ pub fn logCooperativeSchedulerSummary(self: anytype) void {
     if (self.cooperative_thread_switches == 0 and self.cooperative_wait_yields == 0) return;
     machoCapturePrint(
         "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
-        .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.gtk_idle_scheduled, self.gtk_idle_started, self.gtk_idle_completed, self.gtk_idle_removed, self.pendingGtkIdleCallbackCount(), self.gtk_idle_wakeups, self.gtk_idle_dispatch_failures, self.gtk_idle_starvation_warnings },
+        .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.idle_scheduled, self.idle_started, self.idle_completed, self.idle_removed, self.pendingIdleCallbackCount(), self.idle_wakeups, self.idle_dispatch_failures, self.idle_starvation_warnings },
     );
 }
 
@@ -724,8 +753,8 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
     const suspended_age = if (suspended.oldest_handle != 0) self.executed_steps -| suspended.oldest_step else 0;
     const dispatch_block = self.gtkIdleDispatchBlock();
     {
-        const idx = self.gtk_heartbeat_index;
-        self.gtk_heartbeat_entries[idx] = .{
+        const idx = self.coop_heartbeat_index;
+        self.coop_heartbeat_entries[idx] = .{
             .step = self.executed_steps,
             .rip = self.regs.rip,
             .thread = self.active_guest_thread,
@@ -738,14 +767,14 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
             .quantum_yields = self.cooperative_quantum_yields,
             .rotation_yields = self.cooperative_rotation_yields,
             .idle_pending = idle.pending,
-            .active_idle_source = self.active_gtk_idle_source,
-            .active_idle_callback = self.active_gtk_idle_callback,
+            .active_idle_source = self.active_idle_source,
+            .active_idle_callback = self.active_idle_callback,
             .dispatch_block = dispatch_block,
         };
-        self.gtk_heartbeat_index +|= 1;
-        if (self.gtk_heartbeat_index >= 5) {
-            self.gtk_heartbeat_index = 0;
-            self.gtk_heartbeat_filled = true;
+        self.coop_heartbeat_index +|= 1;
+        if (self.coop_heartbeat_index >= 5) {
+            self.coop_heartbeat_index = 0;
+            self.coop_heartbeat_filled = true;
         }
     }
     if (self.ui_handoff.isActive()) {
@@ -771,8 +800,8 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
             self.ui_handoff_filled = true;
         }
     }
-    if (suspended.runnable != 0 and suspended_age >= GTK_IDLE_STARVATION_STEPS and
-        self.executed_steps -| self.last_cooperative_starvation_step >= GTK_IDLE_STARVATION_STEPS)
+    if (suspended.runnable != 0 and suspended_age >= IDLE_STARVATION_STEPS and
+        self.executed_steps -| self.last_cooperative_starvation_step >= IDLE_STARVATION_STEPS)
     {
         self.last_cooperative_starvation_step = self.executed_steps;
         self.cooperative_starvation_warnings +|= 1;
@@ -783,27 +812,27 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
         );
         self.logThreadTable("runnable context starvation");
     }
-    if (idle.pending != 0 and idle_age >= GTK_IDLE_STARVATION_STEPS and dispatch_block != .callback_already_running) {
-        self.gtk_idle_starvation_warnings +|= 1;
+    if (idle.pending != 0 and idle_age >= IDLE_STARVATION_STEPS and dispatch_block != .callback_already_running) {
+        self.idle_starvation_warnings +|= 1;
         machoCapturePrint(
-            "macho-processor: GTK IDLE STARVATION: warning={d} source={d} callback=0x{x} tag={s} queued_for={d} steps scheduling_thread=0x{x} scheduling_rip=0x{x} active=0x{x} block={s} suspended={d}/{d}\n",
-            .{ self.gtk_idle_starvation_warnings, idle.oldest_source, idle.oldest_callback, idle.oldest_tag, idle_age, idle.oldest_scheduling_thread, idle.oldest_scheduling_rip, self.active_guest_thread, @tagName(dispatch_block), self.suspended_guest_thread_count, self.suspended_guest_threads.len },
+            "macho-processor: IDLE STARVATION: warning={d} source={d} callback=0x{x} tag={s} queued_for={d} steps scheduling_thread=0x{x} scheduling_rip=0x{x} active=0x{x} block={s} suspended={d}/{d}\n",
+            .{ self.idle_starvation_warnings, idle.oldest_source, idle.oldest_callback, idle.oldest_tag, idle_age, idle.oldest_scheduling_thread, idle.oldest_scheduling_rip, self.active_guest_thread, @tagName(dispatch_block), self.suspended_guest_thread_count, self.suspended_guest_threads.len },
         );
     }
-    self.ui_handoff.diagnose(self.executed_steps, GTK_IDLE_STARVATION_STEPS, self.active_guest_thread, self.regs.rip, self.suspended_guest_thread_count);
+    self.ui_handoff.diagnose(self.executed_steps, IDLE_STARVATION_STEPS, self.active_guest_thread, self.regs.rip, self.suspended_guest_thread_count);
 }
 
-pub fn dumpGtkHeartbeatTrace(self: anytype) void {
-    if (!self.gtk_heartbeat_filled and self.gtk_heartbeat_index == 0) return;
-    const count: usize = if (self.gtk_heartbeat_filled) 5 else self.gtk_heartbeat_index;
-    const start: usize = if (self.gtk_heartbeat_filled) self.gtk_heartbeat_index else 0;
+pub fn dumpCoopHeartbeatTrace(self: anytype) void {
+    if (!self.coop_heartbeat_filled and self.coop_heartbeat_index == 0) return;
+    const count: usize = if (self.coop_heartbeat_filled) 5 else self.coop_heartbeat_index;
+    const start: usize = if (self.coop_heartbeat_filled) self.coop_heartbeat_index else 0;
     machoCapturePrint(
-        "macho-processor: GTK cooperative heartbeat (most recent {d} entries):\n",
+        "macho-processor: cooperative heartbeat (most recent {d} entries):\n",
         .{count},
     );
     for (0..count) |i| {
         const idx = (start + i) % 5;
-        const e = &self.gtk_heartbeat_entries[idx];
+        const e = &self.coop_heartbeat_entries[idx];
         const symbol = self.metadata.nearestSymbol(e.rip);
         machoCapturePrint(
             "  [{d}] step={d} rip=0x{x} {s}+0x{x} thread=0x{x} deferred={d} suspended={d}/{d}/{d} switches={d} yields(wait/quantum/rot)={d}/{d}/{d} idle={d} dispatch={s}\n",

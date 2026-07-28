@@ -279,20 +279,88 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
 
 pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u64) ?u64 {
     const exact_live_base = self.memory_forwarder.allocationSize(address) != null;
-    const recovery = self.vtable_tracker.assessLowRead(
+
+    // Phase 1: low-read recovery (value < 0x1000, e.g. cleared to 0 or small sentinel)
+    if (self.vtable_tracker.assessLowRead(
         address,
         current_value,
         exact_live_base,
-    ) orelse return null;
+    )) |recovery| {
+        return logAndReturnRecovery(self, address, recovery, current_value);
+    }
+
+    // Phase 2: non-zero corruption recovery (value >= 0x1000 but NOT a valid vtable)
+    // Build evidence for the current value.  If the evidence is rejected, the
+    // allocation's vptr has been corrupted to a non-zero invalid pointer.
+    // Skip the expensive evidence-building when the address has no vtable
+    // history — only tracked vtables can be restored.
+    if (current_value >= 0x1000 and exact_live_base) {
+        if (!self.vtable_tracker.hasTrustedHistory(address)) return null;
+        const current_evidence = vtableIdentityEvidence(self, current_value);
+        const current_rejection = current_evidence.rejection(self.vtable_tracker.policy);
+        if (self.vtable_tracker.assessCorruption(
+            address,
+            current_value,
+            current_rejection,
+            exact_live_base,
+        )) |corruption| {
+            return logAndReturnRecovery(self, address, corruption, current_value);
+        }
+    }
+
+    // Phase 3: modeled/stack-local object recovery — fallback for objects
+    // whose vtable was written by Rosette's synthetic C++ object model
+    // (e.g. basic_streambuf subobjects in stringstreams).  These are not
+    // tracked by memory_forwarder.allocationSize(), so the heap-based
+    // recovery above returns null even when a known vptr was corrupted.
+    //
+    // Only low-value reads are repaired; non-zero corruption recovery
+    // for modeled objects is intentionally not supported to avoid false
+    // positives from objects that legitimately change their vptr.
+    if (current_value < 0x1000) {
+        if (self.vtable_stack_registry.assessLowRead(address, current_value)) |recovery| {
+            if (!self.vtable_stack_registry.noteRecovery(address, recovery.generation)) return null;
+            const recovered = recovery.value;
+            const kind = "stack-modeled low-read";
+            const symbol = self.metadata.nearestSymbol(recovered);
+            const prior = recovery.prior_recoveries;
+            machoCapturePrint(
+                "macho-processor: trusted vtable {s} recovery: object=0x{x} generation={d} allocation_size=0 observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
+                .{
+                    kind,
+                    address,
+                    recovery.generation,
+                    current_value,
+                    recovered,
+                    if (symbol) |s| s.name else "<unknown>",
+                    if (symbol) |s| s.offset else 0,
+                    recovery.established_by.writer_rip,
+                    recovery.established_by.writer_step,
+                    recovery.last_write.writer_rip,
+                    recovery.last_write.writer_step,
+                    prior,
+                    self.active_guest_thread,
+                },
+            );
+            return recovered;
+        }
+    }
+
+    return null;
+}
+
+fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recovery, observed: u64) ?u64 {
     const symbol = self.metadata.nearestSymbol(recovery.value) orelse return null;
     if (!self.vtable_tracker.noteRecovery(address, recovery.generation)) return null;
+    const kind = if (observed < 0x1000) "low-read" else "corruption";
     machoCapturePrint(
-        "macho-processor: trusted vtable low-read recovery: object=0x{x} generation={d} allocation_size={d} observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
+        "macho-processor: trusted vtable {s} recovery: object=0x{x} generation={d} allocation_size={d} observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
         .{
+            kind,
             address,
             recovery.generation,
             self.memory_forwarder.allocationSize(address) orelse 0,
-            current_value,
+            observed,
             recovery.value,
             symbol.name,
             symbol.offset,
@@ -383,6 +451,74 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
                 if (current_symbol) |s| s.name else "<unknown>",
                 if (current_symbol) |s| s.offset else 0,
                 self.regs.rip,
+                self.executed_steps,
+                self.active_guest_thread,
+            },
+        );
+    }
+
+    // Log when a known vtable allocation base is cleared to zero (or a small
+    // sentinel < 0x1000).  The first 8 events are logged individually; after
+    // that only power-of-two milestones.  This matches the transition throttle
+    // pattern and prevents log flooding while still revealing the writer RIP
+    // for the earliest occurrences.
+    if (result.disposition == .trusted_value_cleared and
+        result.previous_vptr >= 0x1000 and
+        (self.vtable_tracker.low_clears_observed <= 8 or
+            std.math.isPowerOfTwo(self.vtable_tracker.low_clears_observed)))
+    {
+        const vtable_symbol = self.metadata.nearestSymbol(result.previous_vptr);
+        const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
+        const writer_name = if (writer_symbol) |s| s.name else "<unknown>";
+        const writer_off = if (writer_symbol) |s| s.offset else 0;
+        machoCapturePrint(
+            "macho-processor: vtable cleared: object=0x{x} gen={d} vtable=0x{x}({s}+0x{x}) writer=0x{x} {s}+0x{x} step={d} thread=0x{x}\n",
+            .{
+                addr,
+                result.generation,
+                result.previous_vptr,
+                if (vtable_symbol) |s| s.name else "<unknown>",
+                if (vtable_symbol) |s| s.offset else 0,
+                self.regs.rip,
+                writer_name,
+                writer_off,
+                self.executed_steps,
+                self.active_guest_thread,
+            },
+        );
+    }
+
+    // Write-side vptr protection: when a zero/small-value write clears a
+    // trusted vtable pointer at a still-live allocation base, immediately
+    // restore the vptr.  This prevents the cascade where a zeroed vptr gets
+    // read before the allocation is retired (forgetAddress), and prevents
+    // corrupted reads during shutdown.  The write-back is direct (bypassing
+    // write64/writeMemVal) to avoid re-entering recordAllocationWrite.
+    if (result.disposition == .trusted_value_cleared and
+        result.previous_vptr >= 0x1000)
+    {
+        if (self.sparse_memory.bytes(addr, 8, true)) |storage| {
+            std.mem.writeInt(u64, storage[0..8], result.previous_vptr, .little);
+        } else {
+            const off = translateGuest(self, addr, 8, .write) orelse return;
+            if (off + 8 <= self.mem.len) {
+                std.mem.writeInt(u64, self.mem[off..][0..8], result.previous_vptr, .little);
+            }
+        }
+        self.vtable_tracker.live_vtable_write_protections +|= 1;
+        const vtable_symbol = self.metadata.nearestSymbol(result.previous_vptr);
+        const prot_writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
+        machoCapturePrint(
+            "macho-processor: vptr write-protection: object=0x{x} gen={d} vtable=0x{x}({s}+0x{x}) restored_by=0x{x} {s}+0x{x} step={d} thread=0x{x}\n",
+            .{
+                addr,
+                result.generation,
+                result.previous_vptr,
+                if (vtable_symbol) |s| s.name else "<unknown>",
+                if (vtable_symbol) |s| s.offset else 0,
+                self.regs.rip,
+                if (prot_writer_symbol) |s| s.name else "<unknown>",
+                if (prot_writer_symbol) |s| s.offset else 0,
                 self.executed_steps,
                 self.active_guest_thread,
             },
@@ -812,9 +948,9 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
         dumpHeapCorruptionDiagnostics(self, self.regs.rax, self.regs.rip);
     }
     dumpStepTraceBuffer(self);
-    self.dumpGtkBootstrapTrace();
+    self.dumpCoopBootstrapTrace();
     self.dumpMemInitTrace();
-    self.dumpGtkHeartbeatTrace();
+    self.dumpCoopHeartbeatTrace();
     self.dumpUiHandoffTrace();
     self.faulted = true;
     self.terminated = true;
