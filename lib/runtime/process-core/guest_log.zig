@@ -8,8 +8,8 @@ const std = @import("std");
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const startup_observer = @import("diagnostics").startup_observer;
-const constants = @import("../constants.zig");
-const utils = @import("../utils.zig");
+const constants = @import("../../Mach-O/constants.zig");
+const utils = @import("../../Mach-O/utils.zig");
 
 const GUEST_LOG_BUFFER_SIZE = constants.GUEST_LOG_BUFFER_SIZE;
 const GUEST_FILE_BASE = constants.GUEST_FILE_BASE;

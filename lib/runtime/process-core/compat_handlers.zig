@@ -3,9 +3,9 @@ const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const compat_runtime = @import("macho_compat_runtime");
 const launch_argument_accelerator = @import("diagnostics").launch_argument_accelerator;
-const decoder = @import("../decoder.zig");
-const utils = @import("../utils.zig");
-const constants = @import("../constants.zig");
+const decoder = @import("../../Mach-O/decoder.zig");
+const utils = @import("../../Mach-O/utils.zig");
+const constants = @import("../../Mach-O/constants.zig");
 
 const calculateBulkConstructionRange = utils.calculateBulkConstructionRange;
 const isAsciiBytes = utils.isAsciiBytes;
@@ -14,7 +14,7 @@ const isPatchDbNullIsArraySequence = utils.isPatchDbNullIsArraySequence;
 const profileIdFromUserDevice = utils.profileIdFromUserDevice;
 const decodeInsn = decoder.decodeInsn;
 
-const TomlAsciiBlock = @import("../types.zig").TomlAsciiBlock;
+const TomlAsciiBlock = @import("../../Mach-O/types.zig").TomlAsciiBlock;
 
 const GUEST_LOG_BUFFER_SIZE = constants.GUEST_LOG_BUFFER_SIZE;
 const TOML_CODEPOINT_CAPACITY = constants.TOML_CODEPOINT_CAPACITY;

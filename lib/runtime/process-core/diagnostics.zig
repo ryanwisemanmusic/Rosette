@@ -4,7 +4,7 @@
 const std = @import("std");
 const x64_decoder = @import("x64_decoder");
 const Size = x64_decoder.OperandSize;
-const execution_helpers = @import("../execution_helpers.zig");
+const execution_helpers = @import("../../Mach-O/execution_helpers.zig");
 const maskForSize = execution_helpers.maskForSize;
 const signBitForSize = execution_helpers.signBitForSize;
 const exit_diagnostics = @import("exit_diagnostics");
@@ -12,7 +12,7 @@ const semantic_fault_classifier = @import("diagnostics").semantic_fault_classifi
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const primitiveCapturePrint = macho_log.primitiveCapturePrint;
-const constants = @import("../constants.zig");
+const constants = @import("../../Mach-O/constants.zig");
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
 const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
 const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;

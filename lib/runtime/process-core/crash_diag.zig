@@ -9,13 +9,13 @@ const exit_diagnostics = @import("exit_diagnostics");
 const libcpp_shared_control_block = @import("cxx_abi").libcpp_shared_control_block;
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
-const constants = @import("../constants.zig");
+const constants = @import("../../Mach-O/constants.zig");
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
 const UNSUPPORTED_RUNTIME_EXIT_CODE = constants.UNSUPPORTED_RUNTIME_EXIT_CODE;
-const types = @import("../types.zig");
+const types = @import("../../Mach-O/types.zig");
 const TraceEntry = types.TraceEntry;
 const ControlTransferContext = types.ControlTransferContext;
-const decoder = @import("../decoder.zig");
+const decoder = @import("../../Mach-O/decoder.zig");
 const decodeInsn = decoder.decodeInsn;
 const scheduler = @import("scheduler");
 

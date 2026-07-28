@@ -9,8 +9,8 @@ const macho_runtime = @import("macho_runtime");
 const exit_diagnostics = @import("exit_diagnostics");
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
-const PAGE_SIZE = @import("../constants.zig").PAGE_SIZE;
-const mappedOffset = @import("../utils.zig").mappedOffset;
+const PAGE_SIZE = @import("../../Mach-O/constants.zig").PAGE_SIZE;
+const mappedOffset = @import("../../Mach-O/utils.zig").mappedOffset;
 
 fn resolveSyscallFd(self: anytype, guest_fd: u64) i32 {
     if (guest_fd < self.guest_fds.len) {

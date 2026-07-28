@@ -8,7 +8,7 @@ const std = @import("std");
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const exit_diagnostics = @import("exit_diagnostics");
-const utils = @import("../utils.zig");
+const utils = @import("../../Mach-O/utils.zig");
 
 const guestSignalIndex = utils.guestSignalIndex;
 const signalFailureResult = utils.signalFailureResult;
@@ -20,7 +20,7 @@ const writeDarwinUcontext = utils.writeDarwinUcontext;
 const readDarwinMcontext = utils.readDarwinMcontext;
 const resolveGuestSignalReturn = utils.resolveGuestSignalReturn;
 
-const constants = @import("../constants.zig");
+const constants = @import("../../Mach-O/constants.zig");
 const DARWIN_SIGACTION_SIZE = constants.DARWIN_SIGACTION_SIZE;
 const DARWIN_SIGINFO_SIZE = constants.DARWIN_SIGINFO_SIZE;
 const DARWIN_MCONTEXT_SIZE = constants.DARWIN_MCONTEXT_SIZE;
@@ -32,8 +32,8 @@ const SA_NODEFER = constants.SA_NODEFER;
 const SA_RESETHAND = constants.SA_RESETHAND;
 const SA_SIGINFO = constants.SA_SIGINFO;
 
-const GuestSignalFrame = @import("../types.zig").GuestSignalFrame;
-const GuestAccess = @import("../types.zig").GuestAccess;
+const GuestSignalFrame = @import("../../Mach-O/types.zig").GuestSignalFrame;
+const GuestAccess = @import("../../Mach-O/types.zig").GuestAccess;
 
 pub fn handleSigaction(self: anytype) u64 {
     const signal_index = guestSignalIndex(self.regs.rdi) orelse return signalFailureResult();

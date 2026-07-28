@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const macho = @import("macho.zig");
+const macho = @import("macho_core").macho;
 const fat = @import("fat.zig");
 const x64_decoder = @import("x64_decoder");
 const x64_interpreter = @import("x64_interpreter");
@@ -68,20 +68,20 @@ const jit = @import("jit");
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const primitiveCapturePrint = macho_log.primitiveCapturePrint;
-const syscalls = @import("process/syscalls.zig");
-const native_window = @import("process/native_window.zig");
-const scheduling = @import("process/scheduling.zig");
-const guest_log = @import("process/guest_log.zig");
+const syscalls = @import("process_core").syscalls;
+const native_window = @import("process_core").native_window;
+const scheduling = @import("process_core").scheduling;
+const guest_log = @import("process_core").guest_log;
 const guest_fs = @import("guest_fs.zig");
-const proc_diag = @import("process/diagnostics.zig");
+const proc_diag = @import("process_core").diagnostics;
 const thunk_handler = @import("thunk_handler.zig");
-const execution_helpers = @import("execution_helpers.zig");
-const execute_impl = @import("process/execute.zig");
-const packed_ops = @import("packed_ops.zig");
-const signal_handling = @import("process/signal_handling.zig");
-const initializers = @import("process/initializers.zig");
-const compat_handlers = @import("process/compat_handlers.zig");
-const crash_diag = @import("process/crash_diag.zig");
+const execution_helpers = @import("macho_core").execution_helpers;
+const execute_impl = @import("process_core").execute;
+const packed_ops = @import("macho_core").packed_ops;
+const signal_handling = @import("process_core").signal_handling;
+const initializers = @import("process_core").initializers;
+const compat_handlers = @import("process_core").compat_handlers;
+const crash_diag = @import("process_core").crash_diag;
 
 test {
     std.testing.refAllDecls(symbol_assembly_context);
@@ -109,7 +109,7 @@ const RFL_SF = x64_decoder.RFL_SF;
 const RFL_OF = x64_decoder.RFL_OF;
 const RFL_DF: u32 = 1 << 10;
 
-const constants = @import("constants.zig");
+const constants = @import("macho_core").constants;
 const STACK_SIZE = constants.STACK_SIZE;
 const MEM_SIZE = constants.MEM_SIZE;
 const envMemSizeMb = constants.envMemSizeMb;
@@ -161,7 +161,7 @@ const TOML_UTF8_READER_MIN_SIZE = constants.TOML_UTF8_READER_MIN_SIZE;
 const PROGRESS_REPORT_INTERVAL = constants.PROGRESS_REPORT_INTERVAL;
 const HEARTBEAT_INTERVAL = constants.HEARTBEAT_INTERVAL;
 
-const types = @import("types.zig");
+const types = @import("macho_core").types;
 const TomlAsciiBlock = types.TomlAsciiBlock;
 const TomlCodepointRepair = types.TomlCodepointRepair;
 const GuestAccess = types.GuestAccess;
@@ -7058,7 +7058,7 @@ pub const MachOState = struct {
     }
 };
 
-const utils = @import("utils.zig");
+const utils = @import("macho_core").utils;
 const nextPrime = utils.nextPrime;
 const alignDown = utils.alignDown;
 const importRouteCacheIndex = utils.importRouteCacheIndex;
@@ -7387,7 +7387,7 @@ fn extractX8664Slice(allocator: std.mem.Allocator, data: []const u8) ![]const u8
     };
 }
 
-const decoder = @import("decoder.zig");
+const decoder = @import("macho_core").decoder;
 
 const decodeInsn = decoder.decodeInsn;
 const decodeVex2 = decoder.decodeVex2;
