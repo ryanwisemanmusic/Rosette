@@ -68,6 +68,20 @@ const jit = @import("jit");
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const primitiveCapturePrint = macho_log.primitiveCapturePrint;
+const syscalls = @import("process/syscalls.zig");
+const native_window = @import("process/native_window.zig");
+const scheduling = @import("process/scheduling.zig");
+const guest_log = @import("process/guest_log.zig");
+const guest_fs = @import("guest_fs.zig");
+const proc_diag = @import("process/diagnostics.zig");
+const thunk_handler = @import("thunk_handler.zig");
+const execution_helpers = @import("execution_helpers.zig");
+const execute_impl = @import("process/execute.zig");
+const packed_ops = @import("packed_ops.zig");
+const signal_handling = @import("process/signal_handling.zig");
+const initializers = @import("process/initializers.zig");
+const compat_handlers = @import("process/compat_handlers.zig");
+const crash_diag = @import("process/crash_diag.zig");
 
 test {
     std.testing.refAllDecls(symbol_assembly_context);
@@ -137,8 +151,6 @@ const DARWIN_SIGACTION_SIZE = constants.DARWIN_SIGACTION_SIZE;
 const DARWIN_SIGINFO_SIZE = constants.DARWIN_SIGINFO_SIZE;
 const DARWIN_UCONTEXT_SIZE = constants.DARWIN_UCONTEXT_SIZE;
 const DARWIN_MCONTEXT_SIZE = constants.DARWIN_MCONTEXT_SIZE;
-const PROFILE_ACCOUNT_INFO_BYTES = constants.PROFILE_ACCOUNT_INFO_BYTES;
-const PROFILE_ENCRYPTED_ACCOUNT_BYTES = constants.PROFILE_ENCRYPTED_ACCOUNT_BYTES;
 const TOML_CODEPOINT_CAPACITY = constants.TOML_CODEPOINT_CAPACITY;
 const TOML_CODEPOINT_STRIDE = constants.TOML_CODEPOINT_STRIDE;
 const TOML_READER_ISTREAM_OFFSET = constants.TOML_READER_ISTREAM_OFFSET;
@@ -1254,11 +1266,11 @@ pub const MachOState = struct {
         };
     }
 
-    fn isExecutableAddress(self: *const MachOState, address: u64) bool {
+    pub fn isExecutableAddress(self: *const MachOState, address: u64) bool {
         return self.sparse_memory.isExecutable(address, 1) or self.translateGuest(address, 1, .execute) != null;
     }
 
-    fn diagnosticSymbol(self: *const MachOState, address: u64) ?exit_diagnostics.SymbolizedAddress {
+    pub fn diagnosticSymbol(self: *const MachOState, address: u64) ?exit_diagnostics.SymbolizedAddress {
         if (address == 0) return null;
         const symbol = self.metadata.nearestSymbol(address) orelse return null;
         return .{
@@ -1477,7 +1489,7 @@ pub const MachOState = struct {
         );
     }
 
-    fn hasLiveAllocationVtableHistory(self: *const MachOState, address: u64) bool {
+    pub fn hasLiveAllocationVtableHistory(self: *const MachOState, address: u64) bool {
         if (self.memory_forwarder.allocationSize(address) == null) return false;
         return self.vtable_tracker.hasTrustedHistory(address);
     }
@@ -1844,7 +1856,7 @@ pub const MachOState = struct {
         return false;
     }
 
-    fn decodeTraceInstruction(self: *const MachOState, entry: TraceEntry) ?DecodedInsn {
+    pub fn decodeTraceInstruction(self: *const MachOState, entry: TraceEntry) ?DecodedInsn {
         const instruction_bytes: []const u8 = if (self.sparse_memory.executableBytesConst(entry.rip, 16)) |sparse_code|
             sparse_code
         else blk: {
@@ -1875,7 +1887,7 @@ pub const MachOState = struct {
         return false;
     }
 
-    fn terminateForGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) void {
+    pub fn terminateForGuestAccess(self: *MachOState, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) void {
         if (self.terminal_memory_failure != null) return;
         if (self.tryQuarantineOpaqueDestructor(address)) return;
         const description = self.describeGuestAccess(address, bytes, access);
@@ -2313,78 +2325,47 @@ pub const MachOState = struct {
         _ = self.pointer_firewall.register(address, 1, .{ .kind = .opaque_identity, .may_dereference = false, .owner = owner });
     }
 
-    fn registerNativeWindowHandles(self: *MachOState) void {
-        if (self.native_window_handles_registered) return;
-        self.registerOpaqueHandle(native_window_runtime.APPLICATION_TOKEN, "native NSApplication identity");
-        self.registerOpaqueHandle(native_window_runtime.WINDOW_TOKEN, "native NSWindow identity");
-        self.registerOpaqueHandle(native_window_runtime.VIEW_TOKEN, "native NSView identity");
-        self.registerOpaqueHandle(native_window_runtime.METAL_LAYER_TOKEN, "native CAMetalLayer identity");
-        self.native_window_handles_registered = true;
+    pub fn registerNativeWindowHandles(self: *MachOState) void {
+        return native_window.registerNativeWindowHandles(self);
     }
-
     pub fn ensureNativeApplication(self: *MachOState) bool {
-        const ready = self.native_window.ensureApplication();
-        if (ready) self.registerNativeWindowHandles();
-        return ready;
+        return native_window.ensureNativeApplication(self);
     }
-
     pub fn ensureNativeWindow(self: *MachOState) bool {
-        const ready = self.native_window.ensureWindow();
-        if (ready) self.registerNativeWindowHandles();
-        return ready;
+        return native_window.ensureNativeWindow(self);
     }
-
     pub fn setNativeWindowTitle(self: *MachOState, title: []const u8) bool {
-        const ready = self.native_window.setTitle(title);
-        if (ready) self.registerNativeWindowHandles();
-        return ready;
+        return native_window.setNativeWindowTitle(self, title);
     }
-
     pub fn setNativeWindowSize(self: *MachOState, width: i32, height: i32) bool {
-        const ready = self.native_window.setSize(width, height);
-        if (ready) self.registerNativeWindowHandles();
-        return ready;
+        return native_window.setNativeWindowSize(self, width, height);
     }
-
     pub fn showNativeWindow(self: *MachOState) bool {
-        const ready = self.native_window.show();
-        if (ready) self.registerNativeWindowHandles();
-        return ready;
+        return native_window.showNativeWindow(self);
     }
-
     pub fn setNativeWindowFullscreen(self: *MachOState, fullscreen: bool) bool {
-        return self.native_window.setFullscreen(fullscreen);
+        return native_window.setNativeWindowFullscreen(self, fullscreen);
     }
-
     pub fn nativeViewToken(self: *MachOState) u64 {
-        const token = self.native_window.viewToken();
-        if (token != 0) self.registerNativeWindowHandles();
-        return token;
+        return native_window.nativeViewToken(self);
     }
-
     pub fn nativeWindowWidth(self: *MachOState) u32 {
-        return self.native_window.width();
+        return native_window.nativeWindowWidth(self);
     }
-
     pub fn nativeWindowHeight(self: *MachOState) u32 {
-        return self.native_window.height();
+        return native_window.nativeWindowHeight(self);
     }
-
     pub fn validateNativeMetalLayerToken(self: *MachOState, token: u64) bool {
-        return self.native_window.validateLayerToken(token);
+        return native_window.validateNativeMetalLayerToken(self, token);
     }
-
     pub fn nativeMetalLayerHostPointer(self: *MachOState) usize {
-        return self.native_window.hostMetalLayer();
+        return native_window.nativeMetalLayerHostPointer(self);
     }
-
     pub fn noteNativeVulkanSurfaceBound(self: *MachOState, layer_token: u64, guest_surface: u64, host_surface: u64) void {
-        self.native_window.noteSurfaceBound(layer_token, guest_surface, host_surface);
+        return native_window.noteNativeVulkanSurfaceBound(self, layer_token, guest_surface, host_surface);
     }
-
-    fn pumpNativeWindowEvents(self: *MachOState) void {
-        if (self.native_window.application_ensure_attempts == 0) return;
-        _ = self.native_window.pumpEvents();
+    pub fn pumpNativeWindowEvents(self: *MachOState) void {
+        return native_window.pumpNativeWindowEvents(self);
     }
 
     pub fn registerSyntheticThunk(self: *MachOState, address: u64, size: u64, owner: []const u8) void {
@@ -2526,12 +2507,12 @@ pub const MachOState = struct {
         return available[0..end];
     }
 
-    fn cxxExceptionTypeName(self: *const MachOState, type_info_address: u64) ?[]const u8 {
+    pub fn cxxExceptionTypeName(self: *const MachOState, type_info_address: u64) ?[]const u8 {
         const name_address = self.read64(type_info_address +| 8);
         return self.guestCString(name_address, 4096);
     }
 
-    fn cxxExceptionMessage(self: *const MachOState, object_address: u64) ?[]const u8 {
+    pub fn cxxExceptionMessage(self: *const MachOState, object_address: u64) ?[]const u8 {
         const runtime_error_message = self.read64(object_address +| 8);
         if (self.guestCString(runtime_error_message, 4096)) |message| {
             if (message.len != 0) return message;
@@ -2554,412 +2535,71 @@ pub const MachOState = struct {
         return false;
     }
 
-    fn standardStreamPointer(self: *MachOState, symbol_name: []const u8) ?u64 {
-        const stream: struct { slot: *u64, handle: u64 } = if (std.mem.eql(u8, symbol_name, "___stdinp"))
-            .{ .slot = &self.guest_stdin_pointer_address, .handle = GUEST_FILE_BASE }
-        else if (std.mem.eql(u8, symbol_name, "___stdoutp"))
-            .{ .slot = &self.guest_stdout_pointer_address, .handle = GUEST_FILE_BASE + 1 }
-        else if (std.mem.eql(u8, symbol_name, "___stderrp"))
-            .{ .slot = &self.guest_stderr_pointer_address, .handle = GUEST_FILE_BASE + 2 }
-        else
-            return null;
-        if (stream.slot.* == 0) {
-            stream.slot.* = self.guestAlloc(@sizeOf(u64), @alignOf(u64)) orelse return null;
-            self.write64(stream.slot.*, stream.handle);
-        }
-        return stream.slot.*;
+    pub fn standardStreamPointer(self: *MachOState, symbol_name: []const u8) ?u64 {
+        return guest_log.standardStreamPointer(self, symbol_name);
     }
 
-    fn configureGuestLogMirror(self: *MachOState, args: []const []const u8) void {
-        machoCapturePrint("ROSETTE: configureGuestLogMirror called\n", .{});
-        const prefix = "--log_file=";
-        var found_log_file = false;
-        for (args) |arg| {
-            if (!std.mem.startsWith(u8, arg, prefix) or arg.len == prefix.len) continue;
-            const path = arg[prefix.len..];
-            machoCapturePrint("ROSETTE: Found --log_file= argument: '{s}'\n", .{path});
-            found_log_file = true;
-            const path_z = self.allocator.dupeZ(u8, path) catch return;
-            defer self.allocator.free(path_z);
-            const flags = parseFopenFlags("a") orelse return;
-            const fd = std.c.open(
-                path_z.ptr,
-                @bitCast(@as(u32, @intCast(flags))),
-                @as(c_int, 0o666),
-            );
-            if (fd < 0) {
-                machoCapturePrint("ROSETTE: guest log mirror could not open {s}\n", .{path});
-                return;
-            }
-            if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
-            self.guest_log_mirror_fd = fd;
-            machoCapturePrint(
-                "ROSETTE: guest log mirror configured: {s}; captures synchronous Xenia logs and modeled guest stdout/stderr\n",
-                .{path},
-            );
-            return;
-        }
-        if (!found_log_file) {
-            machoCapturePrint("ROSETTE: No --log_file= argument found - Xenia logs will not be mirrored to file\n", .{});
-            machoCapturePrint("ROSETTE: Add --log_file=/path/to/log.txt to capture Xenia output\n", .{});
-        }
+    pub fn configureGuestLogMirror(self: *MachOState, args: []const []const u8) void {
+        return guest_log.configureGuestLogMirror(self, args);
     }
 
-    fn hostWriteFdAll(fd: i32, bytes: []const u8) bool {
-        if (fd < 0) return false;
-        var written: usize = 0;
-        while (written < bytes.len) {
-            const result = std.c.write(fd, bytes.ptr + written, bytes.len - written);
-            if (result <= 0) return false;
-            written += @intCast(result);
-        }
-        return true;
+    pub fn hostWriteFdAll(fd: i32, bytes: []const u8) bool {
+        return guest_log.hostWriteFdAll(fd, bytes);
     }
 
-    fn shouldSummarizeGuestLog(level: u8, message: []const u8) bool {
-        if (level == 'F' or level == 'E' or level == 'e' or level == 'W' or level == 'w') return true;
-        const markers = [_][]const u8{
-            "RunTitle",
-            "LaunchPath",
-            "LaunchDiscImage",
-            "CompleteLaunch",
-            "MountPath",
-            "GetFileSignature",
-            "DiscImage",
-            "UserModule",
-            "XexModule",
-            "LoadUserModule",
-            "LaunchModule",
-            "SetExecutableModule",
-            "GraphicsSystem",
-            "VulkanPresenter",
-            "RING BUFFER",
-            "main thread",
-            "stage=",
-            "FAILED",
-            "failed",
-            "assert",
-        };
-        for (markers) |marker| {
-            if (std.mem.indexOf(u8, message, marker) != null) return true;
-        }
-        return false;
+    pub fn shouldSummarizeGuestLog(level: u8, message: []const u8) bool {
+        return guest_log.shouldSummarizeGuestLog(level, message);
     }
 
-    fn shouldSuppressRuntimeGuestLog(message: []const u8) bool {
-        return std.mem.startsWith(u8, message, "FRAME LIMITER heartbeat:");
+    pub fn shouldSuppressRuntimeGuestLog(message: []const u8) bool {
+        return guest_log.shouldSuppressRuntimeGuestLog(message);
     }
 
-    fn emitRuntimeSummaryHeartbeat(self: *const MachOState, snapshot: startup_observer.Snapshot) void {
-        if (self.summary_output_fd < 0) return;
-        var buffer: [2048]u8 = undefined;
-        const line = std.fmt.bufPrint(
-            &buffer,
-            "step={d} heartbeat thread=0x{x} rip=0x{x} symbol={s}+0x{x} heap=0x{x} imports={d} fs_open/read/write={d}/{d}/{d} runnable={d} blocked={d} condvar_waits={d}\n",
-            .{
-                snapshot.step,
-                snapshot.thread_id,
-                snapshot.rip,
-                snapshot.symbol,
-                snapshot.symbol_offset,
-                snapshot.heap_next,
-                snapshot.import_calls,
-                snapshot.fs_open,
-                snapshot.fs_read,
-                snapshot.fs_write,
-                self.pthreads.activeCount(),
-                snapshot.pthread_blocked,
-                snapshot.pthread_waits_collapsed,
-            },
-        ) catch return;
-        _ = hostWriteFdAll(self.summary_output_fd, line);
+    pub fn emitRuntimeSummaryHeartbeat(self: *const MachOState, snapshot: startup_observer.Snapshot) void {
+        return guest_log.emitRuntimeSummaryHeartbeat(self, snapshot);
     }
 
-    fn emitGuestLog(self: *MachOState, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
-        const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
-        const message = self.guestMemoryConst(address, length) orelse return false;
-        self.observeBackendGuestLog(message);
-        const raw_char: u8 = @truncate(prefix_char_raw);
-        const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
-        var prefix_buffer: [32]u8 = undefined;
-        const prefix = std.fmt.bufPrint(&prefix_buffer, "[xenia] {c}> ", .{prefix_char}) catch return false;
-
-        // Keep high-frequency frame-limiter telemetry in Xenia's own log and
-        // the Mach-O event log without duplicating it in rosette-runtime.log.
-        if (!shouldSuppressRuntimeGuestLog(message)) {
-            _ = hostWriteFdAll(self.diagnostic_output_fd, prefix);
-            _ = hostWriteFdAll(self.diagnostic_output_fd, message);
-            if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.diagnostic_output_fd, "\n");
-        }
-        if (self.macho_log.isOpen()) {
-            var xenia_buffer: [4096]u8 = undefined;
-            const xenia_line = std.fmt.bufPrint(&xenia_buffer, "{s}{s}", .{ prefix, message }) catch "";
-            self.macho_log.captureLine(xenia_line);
-        }
-        if (self.summary_output_fd >= 0 and shouldSummarizeGuestLog(prefix_char, message)) {
-            var step_buffer: [64]u8 = undefined;
-            const step_prefix = std.fmt.bufPrint(&step_buffer, "step={d} ", .{self.executed_steps}) catch "";
-            _ = hostWriteFdAll(self.summary_output_fd, step_prefix);
-            _ = hostWriteFdAll(self.summary_output_fd, prefix);
-            _ = hostWriteFdAll(self.summary_output_fd, message);
-            if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.summary_output_fd, "\n");
-        }
-
-        if (std.mem.startsWith(u8, message, "HostPathDevice::ResolvePath(User_")) {
-            const storage_root = self.fs_forwarder.storageRoot();
-            machoCapturePrint(
-                "macho-processor: profile resolution trace: Xenia is resolving an internal User_<profile-id>: device; storage_root={s}; this is before any host open syscall\n",
-                .{if (storage_root.len != 0) storage_root else "<not configured>"},
-            );
-            if (profileIdFromUserDevice(message)) |profile_id| {
-                self.logProfileHostPreflight(profile_id);
-            }
-        }
-        if (std.mem.indexOf(u8, message, "Failed to open Account file: C000000F") != null) {
-            if (self.profile_account_flow.active) self.profile_account_flow.stage = .open_failed;
-            machoCapturePrint(
-                "macho-processor: profile resolution failure: X_STATUS_NO_SUCH_FILE (0xC000000F); the Xenia User_<profile-id>: device has no Account-file backing path. Check the following fs open/status diagnostics for a host-path attempt; if none follows, the missing mapping is inside Xenia's virtual device layer.\n",
-                .{},
-            );
-        }
-        if (std.mem.indexOf(u8, message, "Failed to decrypt account data file for XUID") != null) {
-            if (self.profile_account_flow.active) self.profile_account_flow.stage = .decrypt_failed;
-            machoCapturePrint(
-                "macho-processor: profile crypto diagnosis: both retail and devkit Account HMAC/RC4 verification paths rejected the 404-byte payload; this is a real Account failure, unlike a success-path device dismount\n",
-                .{},
-            );
-        }
-        if (std.mem.startsWith(u8, message, "Unregistered device: User_")) {
-            const stage = self.profile_account_flow.stage;
-            machoCapturePrint(
-                "macho-processor: profile device lifecycle: temporary User_<profile-id>: mount was unregistered at stage={s}; interpretation={s}\n",
-                .{ @tagName(stage), if (stage == .decrypted or stage == .inserting or stage == .completed) "expected LoadAccount cleanup after successful Account decryption; the decoded account remains eligible for accounts_ insertion" else "early cleanup associated with an incomplete Account load" },
-            );
-        }
-
-        if (self.guest_log_mirror_fd >= 0) {
-            _ = hostWriteFdAll(self.guest_log_mirror_fd, prefix);
-            _ = hostWriteFdAll(self.guest_log_mirror_fd, message);
-            if (message.len == 0 or message[message.len - 1] != '\n') {
-                _ = hostWriteFdAll(self.guest_log_mirror_fd, "\n");
-            }
-        }
-        self.guest_log_line_count +|= 1;
-        return true;
+    pub fn emitGuestLog(self: *MachOState, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
+        return guest_log.emitGuestLog(self, prefix_char_raw, address, length_raw);
     }
 
-    fn logProfileHostPreflight(self: *MachOState, profile_id: []const u8) void {
-        self.profile_host_preflight_checks +|= 1;
-        const storage_root = self.fs_forwarder.storageRoot();
-        if (storage_root.len == 0) {
-            machoCapturePrint(
-                "macho-processor: profile host preflight #{d}: profile={s} unavailable because no storage root is configured\n",
-                .{ self.profile_host_preflight_checks, profile_id },
-            );
-            return;
-        }
-
-        var path_buffer: [4096]u8 = undefined;
-        const account_path = std.fmt.bufPrint(
-            &path_buffer,
-            "{s}/content/{s}/FFFE07D1/00010000/{s}/Account",
-            .{ storage_root, profile_id, profile_id },
-        ) catch {
-            machoCapturePrint(
-                "macho-processor: profile host preflight #{d}: profile={s} expected Account path exceeds diagnostic buffer\n",
-                .{ self.profile_host_preflight_checks, profile_id },
-            );
-            return;
-        };
-        const file_stat = std.Io.Dir.cwd().statFile(self.io, account_path, .{}) catch |err| {
-            machoCapturePrint(
-                "macho-processor: profile host preflight #{d}: profile={s} account={s} host_status={s}; VFS failure may be genuine\n",
-                .{ self.profile_host_preflight_checks, profile_id, account_path, @errorName(err) },
-            );
-            return;
-        };
-        machoCapturePrint(
-            "macho-processor: profile host preflight #{d}: profile={s} account={s} host_status=present kind={s} bytes={d}; a later C000000F without an Account open is a guest VFS path-resolution failure\n",
-            .{ self.profile_host_preflight_checks, profile_id, account_path, @tagName(file_stat.kind), file_stat.size },
-        );
+    pub fn logProfileHostPreflight(self: *MachOState, profile_id: []const u8) void {
+        return guest_log.logProfileHostPreflight(self, profile_id);
     }
 
-    fn observeProfileAccountFlow(self: *MachOState) void {
-        const load_entry = self.internal_targets.profile_manager_load_account;
-        if (load_entry != 0 and self.regs.rip == load_entry) {
-            const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
-            self.profile_account_flow.active = true;
-            self.profile_account_flow.manager = self.regs.rdi;
-            self.profile_account_flow.xuid = self.regs.rsi;
-            self.profile_account_flow.return_address = return_address;
-            self.profile_account_flow.started_step = self.executed_steps;
-            self.profile_account_flow.stage = .loading;
-            self.profile_account_flow.account_guest_fd = std.math.maxInt(u64);
-            self.profile_account_flow.requested_bytes = 0;
-            self.profile_account_flow.bytes_read = 0;
-            self.profile_account_flow.attempts +|= 1;
-            const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-            machoCapturePrint(
-                "macho-processor: profile Account flow #{d} started: manager=0x{x} xuid={x:0>16} return=0x{x} {s}+0x{x} step={d}\n",
-                .{ self.profile_account_flow.attempts, self.regs.rdi, self.regs.rsi, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.executed_steps },
-            );
-            return;
-        }
-
-        if (!self.profile_account_flow.active) return;
-
-        const dismount_entry = self.internal_targets.profile_manager_dismount_profile;
-        if (dismount_entry != 0 and self.regs.rip == dismount_entry) {
-            const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
-            const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-            if (caller) |symbol| {
-                if (classifyProfileDismountCaller(symbol.name, symbol.offset)) |stage| self.profile_account_flow.stage = stage;
-            }
-            machoCapturePrint(
-                "macho-processor: profile temporary dismount: xuid={x:0>16} stage={s} caller=0x{x} {s}+0x{x} bytes_read={d} minimum_account_bytes={d} interpretation={s}\n",
-                .{ self.profile_account_flow.xuid, @tagName(self.profile_account_flow.stage), return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, if (self.profile_account_flow.stage == .decrypted) "expected success-path cleanup before accounts_ insertion" else "early LoadAccount cleanup" },
-            );
-            return;
-        }
-
-        const insert_entry = self.internal_targets.profile_account_insert_or_assign;
-        if (insert_entry != 0 and self.regs.rip == insert_entry) {
-            self.profile_account_flow.stage = .inserting;
-            const key = if (self.guestMemoryConst(self.regs.rsi, 8) != null) self.read64(self.regs.rsi) else 0;
-            machoCapturePrint(
-                "macho-processor: profile accounts_ insertion checkpoint: map=0x{x} key_ptr=0x{x} key={x:0>16} account=0x{x} expected_xuid={x:0>16} key_matches={}\n",
-                .{ self.regs.rdi, self.regs.rsi, key, self.regs.rdx, self.profile_account_flow.xuid, key == self.profile_account_flow.xuid },
-            );
-            return;
-        }
-
-        if (self.profile_account_flow.return_address != 0 and
-            self.regs.rip == self.profile_account_flow.return_address)
-        {
-            const succeeded = self.regs.rax & 1 != 0;
-            if (succeeded) {
-                self.profile_account_flow.successes +|= 1;
-                self.profile_account_flow.stage = .completed;
-            } else {
-                self.profile_account_flow.failures +|= 1;
-            }
-            machoCapturePrint(
-                "macho-processor: profile Account flow completed: xuid={x:0>16} success={} final_stage={s} bytes_read={d}/{d} elapsed_steps={d}; device dismount before this return is {s}\n",
-                .{ self.profile_account_flow.xuid, succeeded, @tagName(self.profile_account_flow.stage), self.profile_account_flow.bytes_read, self.profile_account_flow.requested_bytes, self.executed_steps -| self.profile_account_flow.started_step, if (succeeded) "normal and the decoded account is now in accounts_" else "associated with an earlier load failure" },
-            );
-            self.profile_account_flow.active = false;
-            self.profile_account_flow.account_guest_fd = std.math.maxInt(u64);
-        }
+    pub fn observeProfileAccountFlow(self: *MachOState) void {
+        return guest_log.observeProfileAccountFlow(self);
     }
 
-    fn noteProfileAccountOpen(self: *MachOState, path: []const u8, guest_fd: u64) void {
-        const account_path = std.mem.eql(u8, path, "Account") or
-            std.mem.endsWith(u8, path, "/Account") or
-            std.mem.endsWith(u8, path, "\\Account");
-        if (!self.profile_account_flow.active or !account_path) return;
-        if (guest_fd == std.math.maxInt(u64)) {
-            self.profile_account_flow.stage = .open_failed;
-            return;
-        }
-        self.profile_account_flow.stage = .host_opened;
-        self.profile_account_flow.account_guest_fd = guest_fd;
-        machoCapturePrint(
-            "macho-processor: profile Account host descriptor bound: xuid={x:0>16} guest_fd={d} stage=host_opened\n",
-            .{ self.profile_account_flow.xuid, guest_fd },
-        );
+    pub fn noteProfileAccountOpen(self: *MachOState, path: []const u8, guest_fd: u64) void {
+        return guest_log.noteProfileAccountOpen(self, path, guest_fd);
     }
 
-    fn noteProfileAccountRead(self: *MachOState, guest_fd: u64, requested: u64, result: i64, offset: u64) void {
-        if (!self.profile_account_flow.active or guest_fd != self.profile_account_flow.account_guest_fd) return;
-        self.profile_account_flow.requested_bytes +|= requested;
-        if (result > 0) self.profile_account_flow.bytes_read +|= @intCast(result);
-        self.profile_account_flow.stage = .reading;
-        machoCapturePrint(
-            "macho-processor: profile Account read checkpoint: xuid={x:0>16} guest_fd={d} offset={d} requested={d} returned={d} cumulative={d} minimum={d} complete_encrypted_file={}\n",
-            .{ self.profile_account_flow.xuid, guest_fd, offset, requested, result, self.profile_account_flow.bytes_read, PROFILE_ACCOUNT_INFO_BYTES, self.profile_account_flow.bytes_read >= PROFILE_ENCRYPTED_ACCOUNT_BYTES },
-        );
+    pub fn noteProfileAccountRead(self: *MachOState, guest_fd: u64, requested: u64, result: i64, offset: u64) void {
+        return guest_log.noteProfileAccountRead(self, guest_fd, requested, result, offset);
     }
 
-    fn observeBackendGuestLog(self: *MachOState, message: []const u8) void {
-        const observation = self.backend_diagnostics.observeLine(message, self.executed_steps) orelse return;
-        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
-        const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        machoCapturePrint(
-            "macho-processor: x64 backend event #{d}: event={s} phase={s}->{s} step={d} delta={d} active=0x{x} caller=0x{x} {s}+0x{x}\n",
-            .{
-                observation.sequence,
-                @tagName(observation.event),
-                @tagName(observation.previous_phase),
-                @tagName(observation.phase),
-                observation.step,
-                observation.delta_steps,
-                self.active_guest_thread,
-                return_address,
-                if (caller) |symbol| symbol.name else "<unknown>",
-                if (caller) |symbol| symbol.offset else 0,
-            },
-        );
-
-        if (observation.event == .indirection_table_failed) {
-            const mapping = self.backend_diagnostics.last_mapping;
-            if (!mapping.valid) {
-                machoCapturePrint(
-                    "macho-processor: x64 code-cache warning correlation: no mmap call was observed after backend initialization began; allocation may have used an unmodeled route\n",
-                    .{},
-                );
-            } else {
-                machoCapturePrint(
-                    "macho-processor: x64 code-cache warning correlation: latest mmap route={s} address=0x{x} length={d} prot=0x{x} flags=0x{x} result_known={} succeeded={} result=0x{x} stage={s}\n",
-                    .{ mapping.route, mapping.address, mapping.length, mapping.prot, mapping.flags, mapping.result_known, mapping.succeeded, mapping.result, if (mapping.stage.len != 0) mapping.stage else "<pending>" },
-                );
-                if (mapping.address == 0) {
-                    machoCapturePrint(
-                        "macho-processor: x64 code-cache warning interpretation: the macOS guest requested OS-selected placement (address=0), so the guest's 0x80000000-0x9fffffff warning text does not describe the actual mmap hint used on this path\n",
-                        .{},
-                    );
-                }
-            }
-        }
-        if (observation.event == .backend_initialize_succeeded and self.backend_diagnostics.capstone_assertions != 0) {
-            machoCapturePrint(
-                "macho-processor: x64 backend recovery evidence: initialization reached completed-successfully after {d} Capstone constructor assertion(s); backend object existence is proven, while Capstone-dependent diagnostics remain degraded\n",
-                .{self.backend_diagnostics.capstone_assertions},
-            );
-        }
+    pub fn observeBackendGuestLog(self: *MachOState, message: []const u8) void {
+        return guest_log.observeBackendGuestLog(self, message);
     }
 
     pub fn backendMemoryDiagnosticsActive(self: *const MachOState) bool {
-        return self.backend_diagnostics.mappingWindowActive();
+        return guest_log.backendMemoryDiagnosticsActive(self);
     }
 
     pub fn noteBackendMmapAttempt(self: *MachOState, route: []const u8, address: u64, length: u64, prot: u64, flags: u64, fixed: bool, anonymous: bool) void {
-        if (!self.backend_diagnostics.noteMmapAttempt(route, address, length, prot, flags, fixed, anonymous, self.executed_steps)) return;
-        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
-        const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        machoCapturePrint(
-            "macho-processor: x64 backend mmap attempt #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} flags=0x{x} fixed={} anonymous={} caller=0x{x} {s}+0x{x}\n",
-            .{ self.backend_diagnostics.mmap_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, flags, fixed, anonymous, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0 },
-        );
+        return guest_log.noteBackendMmapAttempt(self, route, address, length, prot, flags, fixed, anonymous);
     }
 
     pub fn noteBackendMmapResult(self: *MachOState, succeeded: bool, result: u64, stage: []const u8) void {
-        if (!self.backend_diagnostics.last_mapping.valid or self.backend_diagnostics.last_mapping.step != self.executed_steps) return;
-        self.backend_diagnostics.noteMmapResult(succeeded, result, stage);
-        machoCapturePrint(
-            "macho-processor: x64 backend mmap result: attempt={d} succeeded={} result=0x{x} stage={s}\n",
-            .{ self.backend_diagnostics.mmap_attempts_during_backend, succeeded, result, stage },
-        );
+        return guest_log.noteBackendMmapResult(self, succeeded, result, stage);
     }
 
     pub fn noteBackendMprotect(self: *MachOState, route: []const u8, address: u64, length: u64, prot: u64, succeeded: bool) void {
-        if (!self.backend_diagnostics.noteMprotectAttempt()) return;
-        machoCapturePrint(
-            "macho-processor: x64 backend mprotect #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} succeeded={}\n",
-            .{ self.backend_diagnostics.mprotect_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, succeeded },
-        );
+        return guest_log.noteBackendMprotect(self, route, address, length, prot, succeeded);
     }
 
-    fn allocGuestFile(self: *MachOState, fd: i32, kind: GuestFileKind) ?u64 {
+    pub fn allocGuestFile(self: *MachOState, fd: i32, kind: GuestFileKind) ?u64 {
         for (&self.guest_files, 0..) |*file, idx| {
             if (!file.active) {
                 file.* = .{
@@ -2975,7 +2615,7 @@ pub const MachOState = struct {
         return null;
     }
 
-    fn guestFileFromHandle(self: *MachOState, handle: u64) ?*GuestFile {
+    pub fn guestFileFromHandle(self: *MachOState, handle: u64) ?*GuestFile {
         if (handle < GUEST_FILE_BASE) return null;
         const idx_u64 = handle - GUEST_FILE_BASE;
         if (idx_u64 >= GUEST_FILE_MAX) return null;
@@ -3009,7 +2649,7 @@ pub const MachOState = struct {
         return null;
     }
 
-    fn logControlFlow(self: *const MachOState, kind: []const u8, from_rip: u64, to_rip: u64, decoded_len: u64, return_addr: ?u64) void {
+    pub fn logControlFlow(self: *const MachOState, kind: []const u8, from_rip: u64, to_rip: u64, decoded_len: u64, return_addr: ?u64) void {
         if (!self.verbose_trace) return;
         if (return_addr) |ret_addr| {
             log.info("cf({s}): rip=0x{x} -> 0x{x} len={d} ret=0x{x} rsp=0x{x}", .{ kind, from_rip, to_rip, decoded_len, ret_addr, self.regs.rsp });
@@ -5339,11 +4979,11 @@ pub const MachOState = struct {
         return switched;
     }
 
-    fn handleVirtualSleepSchedulingBoundary(self: *MachOState, reason: []const u8) bool {
+    pub fn handleVirtualSleepSchedulingBoundary(self: *MachOState, reason: []const u8) bool {
         return self.handleSleepSchedulingBoundary(self.dynamic_forwarder.lastVirtualSleepDecision(), reason);
     }
 
-    fn handleDirectImportCall(self: *MachOState, imported: macho_metadata.ImportedSymbol) void {
+    pub fn handleDirectImportCall(self: *MachOState, imported: macho_metadata.ImportedSymbol) void {
         const boundary = x64_decoder.highway.systemBoundary(.macho64, .import, imported.stub_address, imported.name);
         if (boundary.disposition != .forward) {
             self.faulted = true;
@@ -5640,29 +5280,11 @@ pub const MachOState = struct {
         return !self.terminated;
     }
 
-    fn handleSigaction(self: *MachOState) u64 {
-        const signal_index = guestSignalIndex(self.regs.rdi) orelse return signalFailureResult();
-        const previous = self.signal_actions[signal_index];
-
-        if (self.regs.rdx != 0) {
-            const output = self.guestMemory(self.regs.rdx, DARWIN_SIGACTION_SIZE) orelse return signalFailureResult();
-            writeDarwinSigaction(output, previous);
-        }
-        if (self.regs.rsi != 0) {
-            const input = self.guestMemoryConst(self.regs.rsi, DARWIN_SIGACTION_SIZE) orelse return signalFailureResult();
-            self.signal_actions[signal_index] = readDarwinSigaction(input) orelse return signalFailureResult();
-        }
-        if (self.verbose_trace) {
-            const action = self.signal_actions[signal_index];
-            machoCapturePrint(
-                "    [signal] sigaction signal={d} handler=0x{x} flags=0x{x} mask=0x{x}\n",
-                .{ self.regs.rdi, action.handler, action.flags, action.mask },
-            );
-        }
-        return 0;
+    pub fn handleSigaction(self: *MachOState) u64 {
+        return signal_handling.handleSigaction(self);
     }
 
-    fn deliverGuestSignal(
+    pub fn deliverGuestSignal(
         self: *MachOState,
         signal: u8,
         fault_rip: u64,
@@ -5670,1396 +5292,179 @@ pub const MachOState = struct {
         fault_address: u64,
         fault_access: ?GuestAccess,
     ) bool {
-        const signal_index = guestSignalIndex(signal) orelse return false;
-        const action = self.signal_actions[signal_index];
-        if (action.handler == 0) return false; // SIG_DFL: retain Rosette's diagnostic termination.
-        if (action.handler == 1) { // SIG_IGN: make forward progress without synthesizing a callback.
-            self.regs.rip +%= instruction_len;
-            machoCapturePrint("macho-processor: guest ignored signal {d} at rip=0x{x}\n", .{ signal, fault_rip });
-            return true;
-        }
-        if (action.flags & SA_NODEFER == 0 and self.signalIsActive(signal)) {
-            if (signal != GUEST_SIGILL) return false;
-            // POSIX blocks the signal currently being handled unless
-            // SA_NODEFER is requested. Queueing is unnecessary for UD2: the
-            // outer handler already owns the exception and the nested trap is
-            // an assertion in that handler's diagnostic path.
-            self.regs.rip = fault_rip +% instruction_len;
-            machoCapturePrint(
-                "macho-processor: deferred recursive guest signal {d} at rip=0x{x}; outer handler remains active\n",
-                .{ signal, fault_rip },
-            );
-            if (self.last_guest_assertion_class == .breakpoint_untracked_thread) {
-                machoCapturePrint(
-                    "macho-processor: recursive signal provenance: Processor::OnThreadBreakpointHit asserted because the active modeled thread was absent from Xenia's debugger registry; this nested UD2 is handler fallout, not a second independent backend failure\n",
-                    .{},
-                );
-            }
-            return true;
-        }
-        if (!self.isExecutableAddress(action.handler) or self.signal_frame_count >= self.signal_frames.len) return false;
-
-        const frame = &self.signal_frames[self.signal_frame_count];
-        if (!self.ensureGuestSignalFrameStorage(frame)) return false;
-        const siginfo_bytes = self.guestMemory(frame.siginfo, DARWIN_SIGINFO_SIZE) orelse return false;
-        const mcontext_bytes = self.guestMemory(frame.mcontext, DARWIN_MCONTEXT_SIZE) orelse return false;
-        const ucontext_bytes = self.guestMemory(frame.ucontext, DARWIN_UCONTEXT_SIZE) orelse return false;
-
-        const protection_fault = signal == GUEST_SIGSEGV;
-        const signal_code: i32 = if (protection_fault) 2 else 1; // SEGV_ACCERR / ILL_ILLOPC
-        const trap_number: u16 = if (protection_fault) 14 else 6; // #PF / #UD
-        const error_code: u32 = if (protection_fault)
-            1 | (if (fault_access == .write) @as(u32, 2) else 0)
-        else
-            0;
-        writeDarwinSiginfo(siginfo_bytes, signal, signal_code, fault_address);
-        writeDarwinMcontext(mcontext_bytes, self.regs, trap_number, error_code, fault_address);
-        writeDarwinUcontext(ucontext_bytes, frame.mcontext);
-
-        if (action.flags & SA_RESETHAND != 0) self.signal_actions[signal_index] = .{};
-        frame.signal = signal;
-        frame.instruction_len = instruction_len;
-        frame.fault_rip = fault_rip;
-        frame.assertion_class = self.last_guest_assertion_class;
-        self.signal_frame_count += 1;
-        self.push(GUEST_SIGNAL_RETURN_SENTINEL);
-        if (self.terminated) {
-            self.signal_frame_count -= 1;
-            return false;
-        }
-        self.regs.rdi = signal;
-        if (action.flags & SA_SIGINFO != 0) {
-            self.regs.rsi = frame.siginfo;
-            self.regs.rdx = frame.ucontext;
-        } else {
-            self.regs.rsi = 0;
-            self.regs.rdx = 0;
-        }
-        self.regs.rip = action.handler;
-        self.guest_signal_deliveries +|= 1;
-        const backend_correlated = self.backend_diagnostics.signalCorrelates(self.executed_steps, fault_rip);
-        if (backend_correlated) self.backend_diagnostics.noteSignalDelivery();
-        machoCapturePrint(
-            "macho-processor: delivered guest signal {d} to 0x{x}; fault_rip=0x{x} fault_address=0x{x} access={s} siginfo=0x{x} ucontext=0x{x}\n",
-            .{ signal, action.handler, fault_rip, fault_address, if (fault_access) |access| @tagName(access) else "instruction", frame.siginfo, frame.ucontext },
-        );
-        if (backend_correlated) {
-            machoCapturePrint(
-                "macho-processor: guest signal correlation: signal={d} fault_rip=0x{x} is linked to backend assertion kind={s} assertion_return=0x{x} step_delta={d}\n",
-                .{ signal, fault_rip, @tagName(self.backend_diagnostics.last_backend_assertion_binding), self.backend_diagnostics.last_backend_assertion_rip, self.executed_steps -| self.backend_diagnostics.last_backend_assertion_step },
-            );
-        }
-        const assertion_distance = if (fault_rip >= self.last_guest_assertion_return)
-            fault_rip - self.last_guest_assertion_return
-        else
-            self.last_guest_assertion_return - fault_rip;
-        if (self.last_guest_assertion_class != .none and
-            self.executed_steps -| self.last_guest_assertion_step <= 4096 and
-            assertion_distance <= 16)
-        {
-            machoCapturePrint(
-                "macho-processor: guest signal assertion provenance: signal={d} fault_rip=0x{x} assertion={s} assertion_return=0x{x} address_delta={d} step_delta={d}\n",
-                .{ signal, fault_rip, @tagName(self.last_guest_assertion_class), self.last_guest_assertion_return, assertion_distance, self.executed_steps -| self.last_guest_assertion_step },
-            );
-        }
-        return true;
+        return signal_handling.deliverGuestSignal(self, signal, fault_rip, instruction_len, fault_address, fault_access);
     }
 
-    fn signalIsActive(self: *const MachOState, signal: u8) bool {
-        for (self.signal_frames[0..self.signal_frame_count]) |frame| {
-            if (frame.signal == signal) return true;
-        }
-        return false;
+    pub fn signalIsActive(self: *const MachOState, signal: u8) bool {
+        return signal_handling.signalIsActive(self, signal);
     }
 
-    fn ensureGuestSignalFrameStorage(self: *MachOState, frame: *GuestSignalFrame) bool {
-        if (frame.siginfo == 0) frame.siginfo = self.guestAlloc(DARWIN_SIGINFO_SIZE, 16) orelse return false;
-        if (frame.mcontext == 0) frame.mcontext = self.guestAlloc(DARWIN_MCONTEXT_SIZE, 16) orelse return false;
-        if (frame.ucontext == 0) frame.ucontext = self.guestAlloc(DARWIN_UCONTEXT_SIZE, 16) orelse return false;
-        return true;
+    pub fn ensureGuestSignalFrameStorage(self: *MachOState, frame: *GuestSignalFrame) bool {
+        return signal_handling.ensureGuestSignalFrameStorage(self, frame);
     }
 
-    fn finishGuestSignalReturn(self: *MachOState) bool {
-        if (self.signal_frame_count == 0) {
-            self.faulted = true;
-            self.terminated = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
-            return false;
-        }
-        self.signal_frame_count -= 1;
-        const frame = self.signal_frames[self.signal_frame_count];
-        const bytes = self.guestMemoryConst(frame.mcontext, DARWIN_MCONTEXT_SIZE) orelse {
-            self.faulted = true;
-            self.terminated = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
-            return false;
-        };
-        if (!readDarwinMcontext(bytes, &self.regs)) {
-            self.faulted = true;
-            self.terminated = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
-            return false;
-        }
-        const fault_bytes = self.guestMemoryConst(frame.fault_rip, frame.instruction_len) orelse &.{};
-        const resume_rip = resolveGuestSignalReturn(frame, self.regs.rip, fault_bytes) orelse {
-            machoCapturePrint(
-                "macho-processor: guest signal {d} handler returned without resolving fault at rip=0x{x}\n",
-                .{ frame.signal, frame.fault_rip },
-            );
-            self.faulted = true;
-            self.terminated = true;
-            self.exit_code = 128 + frame.signal;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unhandled_guest_signal);
-            return false;
-        };
-        if (resume_rip != self.regs.rip) {
-            machoCapturePrint(
-                "macho-processor: guest signal {d} handler returned with unchanged UD2 at rip=0x{x}; resuming at 0x{x}\n",
-                .{ frame.signal, frame.fault_rip, resume_rip },
-            );
-            self.regs.rip = resume_rip;
-        }
-        if (self.backend_diagnostics.signalReturnCorrelates(frame.fault_rip)) {
-            self.backend_diagnostics.noteSignalReturn();
-            machoCapturePrint(
-                "macho-processor: guest signal correlation resolved: signal={d} backend_assertion={s} fault_rip=0x{x} resume_rip=0x{x}; execution continued\n",
-                .{ frame.signal, @tagName(self.backend_diagnostics.last_backend_assertion_binding), frame.fault_rip, self.regs.rip },
-            );
-        }
-        if (self.verbose_trace) {
-            machoCapturePrint(
-                "macho-processor: guest signal {d} returned; fault_rip=0x{x} resume_rip=0x{x}\n",
-                .{ frame.signal, frame.fault_rip, self.regs.rip },
-            );
-        }
-        return true;
+    pub fn finishGuestSignalReturn(self: *MachOState) bool {
+        return signal_handling.finishGuestSignalReturn(self);
     }
 
-    fn terminateForUnresolvedImport(self: *MachOState) void {
-        self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
-        self.terminated = true;
+    pub fn terminateForUnresolvedImport(self: *MachOState) void {
+        crash_diag.terminateForUnresolvedImport(self);
     }
 
-    fn recoverLibcppSharedControlBlockCall(
+    pub fn recoverLibcppSharedControlBlockCall(
         self: *MachOState,
         instruction_address: u64,
         operand_address: u64,
     ) ?u64 {
-        const caller = self.metadata.nearestSymbol(instruction_address) orelse return null;
-        const object = self.regs.rdi;
-        const object_bytes = self.guestMemoryConst(object, 3 * @sizeOf(u64));
-        const vtable_symbol = self.internal_targets.libcpp_atomic_bool_control_block_vtable;
-        const address_point = std.math.add(
-            u64,
-            vtable_symbol,
-            libcpp_shared_control_block.vtable_address_point_offset,
-        ) catch 0;
-        const slot_address = std.math.add(
-            u64,
-            address_point,
-            libcpp_shared_control_block.on_zero_shared_slot_offset,
-        ) catch 0;
-        const vtable_mapped = vtable_symbol != 0 and self.guestMemoryConst(vtable_symbol, 5 * @sizeOf(u64)) != null;
-        const slot_target = if (vtable_mapped) self.read64(slot_address) else 0;
-        const decision = libcpp_shared_control_block.assess(.{
-            .operation = "call_mem64",
-            .caller_symbol = caller.name,
-            .operand_address = operand_address,
-            .object_address = object,
-            .current_vptr = if (object_bytes != null) self.read64(object) else 0,
-            .strong_count = if (object_bytes != null) self.read64(object + 8) else 0,
-            .weak_count = if (object_bytes != null) self.read64(object + 16) else 0,
-            .vtable_symbol_address = vtable_symbol,
-            .slot_target = slot_target,
-            .object_mapped = object_bytes != null,
-            .vtable_mapped = vtable_mapped,
-            .target_executable = self.isExecutableAddress(slot_target),
-        });
-        self.libcpp_shared_control_blocks.record(decision);
-        switch (decision) {
-            .not_applicable => return null,
-            .rejected => |reason| {
-                machoCapturePrint(
-                    "macho-processor: libc++ shared control-block recovery rejected: object=0x{x} operand=0x{x} vptr=0x{x} strong=0x{x} weak=0x{x} reason={s}\n",
-                    .{
-                        object,
-                        operand_address,
-                        if (object_bytes != null) self.read64(object) else 0,
-                        if (object_bytes != null) self.read64(object + 8) else 0,
-                        if (object_bytes != null) self.read64(object + 16) else 0,
-                        reason,
-                    },
-                );
-                return null;
-            },
-            .recover => |recovery| {
-                self.write64(object, recovery.address_point);
-                machoCapturePrint(
-                    "macho-processor: libc++ shared control-block vptr restored: object=0x{x} vtable_symbol=0x{x} address_point=0x{x} slot=0x{x} target=0x{x} strong=0x{x} weak=0x{x} caller={s}+0x{x}; continuing verified __on_zero_shared dispatch\n",
-                    .{
-                        object,
-                        vtable_symbol,
-                        recovery.address_point,
-                        recovery.slot_address,
-                        recovery.target,
-                        self.read64(object + 8),
-                        self.read64(object + 16),
-                        caller.name,
-                        caller.offset,
-                    },
-                );
-                return recovery.target;
-            },
-        }
+        return crash_diag.recoverLibcppSharedControlBlockCall(self, instruction_address, operand_address);
     }
 
-    const NearNullBaseTransition = struct {
-        object_address: u64,
-        previous_value: u64,
-        producer_rip: u64,
-        distance: usize,
-    };
-
-    fn isXModuleMatchesSymbol(symbol: []const u8) bool {
-        return std.mem.indexOf(u8, symbol, "XModule") != null and
-            std.mem.indexOf(u8, symbol, "Matches") != null;
+    /// Static helper: matches XModule vtable symbols.
+    pub fn isXModuleMatchesSymbol(symbol: []const u8) bool {
+        return crash_diag.isXModuleMatchesSymbol(symbol);
     }
 
-    fn findNearNullBaseTransition(self: *MachOState, register: RegId, terminal_value: u64) ?NearNullBaseTransition {
-        const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
-        if (count < 2) return null;
-
-        // recordTrace() runs before the instruction executes, so the newest
-        // same-thread entry is the faulting load itself. Skip that entry and
-        // require the next one to be the producer that changed the base.
-        var skipped_current = false;
-        const after = terminal_value;
-        var same_thread_distance: usize = 0;
-        var reverse_index = count;
-        while (reverse_index != 0) {
-            reverse_index -= 1;
-            const index = if (self.trace_filled)
-                (self.trace_index + reverse_index) % TRACE_BUFFER_LEN
-            else
-                reverse_index;
-            const entry = self.trace_entries[index];
-            if (entry.thread_handle != self.active_guest_thread) continue;
-
-            if (!skipped_current) {
-                if (entry.rip != self.regs.rip) return null;
-                skipped_current = true;
-                continue;
-            }
-
-            same_thread_distance += 1;
-            const before = traceRegisterValue(entry, register);
-            if (before == after) continue;
-            if (before == 0) return null;
-
-            const producer = self.decodeTraceInstruction(entry) orelse return null;
-            if (producer.op != .mov_reg64_mem64 or producer.dst_reg != register) return null;
-            const source = self.guestMemoryConst(producer.addr, @sizeOf(u64)) orelse return null;
-            if (std.mem.readInt(u64, source[0..8], .little) != 0) return null;
-
-            return .{
-                .object_address = producer.addr,
-                .previous_value = before,
-                .producer_rip = entry.rip,
-                .distance = same_thread_distance,
-            };
-        }
-        return null;
+    pub fn findNearNullBaseTransition(self: *MachOState, register: RegId, terminal_value: u64) ?crash_diag.NearNullBaseTransition {
+        return crash_diag.findNearNullBaseTransition(self, register, terminal_value);
     }
 
-    /// Return a callable XModule vtable address. The ABI data materializer
-    /// intentionally leaves unknown vtable slots null; XModule::Matches is a
-    /// verified exception because Xenia uses slot +0x28 while resolving XEX
-    /// import libraries. Prefer the real table only when that exact slot is
-    /// already callable, otherwise install the narrow synthetic name thunk.
-    fn ensureXmoduleVtable(self: *MachOState) ?u64 {
-        const real = self.internal_targets.xmodule_vtable;
-        if (real != 0) {
-            if (self.guestMemoryConst(real + 0x28, @sizeOf(u64))) |slot| {
-                const target = std.mem.readInt(u64, slot[0..8], .little);
-                if (target != 0 and
-                    (self.isExecutableAddress(target) or
-                        compat_runtime.syntheticThunk(target) != null or
-                        self.metadata.importAtStub(target) != null))
-                {
-                    return real;
-                }
-            }
-        }
-
-        if (self.internal_targets.xmodule_synthetic_vtable == 0) {
-            // Comprehensive synthetic vtable: XModule inherits from XObject
-            // and guest code calls multiple virtual functions during
-            // name matching and reference-counting (XObject::Release,
-            // XModule::Matches, etc.).  Allocate 256 bytes (32 entries)
-            // and populate every slot with the safe get_name thunk so
-            // that ANY virtual dispatch returns a valid, harmless thunk.
-            const vtable_mem = self.guestAlloc(256, 16) orelse return null;
-            const bytes = self.guestMemory(vtable_mem, 256) orelse return null;
-            @memset(bytes, 0);
-            const get_name = compat_runtime.thunkAddress(.xmodule_get_name);
-            var i: u8 = 0;
-            while (i < 32) : (i += 1) {
-                self.write64(vtable_mem + @as(u64, i) * 8, get_name);
-            }
-            self.internal_targets.xmodule_synthetic_vtable = vtable_mem;
-
-            const empty = self.guestAlloc(1, 1) orelse return null;
-            const empty_bytes = self.guestMemory(empty, 1) orelse return null;
-            empty_bytes[0] = 0;
-            self.internal_targets.xmodule_empty_string = empty;
-        }
-        return self.internal_targets.xmodule_synthetic_vtable;
+    pub fn ensureXmoduleVtable(self: *MachOState) ?u64 {
+        return crash_diag.ensureXmoduleVtable(self);
     }
 
-    /// Recover the one verified near-null base transition currently emitted by
-    /// Xenia's XModule import lookup. This runs before readMemVal(), because a
-    /// page-zero access would otherwise become terminal before the transition
-    /// can repair the missing object vptr.
-    fn recoverNearNullBaseRegister(self: *MachOState, d: *DecodedInsn) bool {
-        if (!d.sib_has_base or d.has_0x67) return false;
-
-        const base_register = d.sib_base_reg;
-        const base_value = self.regVal(base_register, .bits64);
-        if (base_value >= 0x1000 or (base_value & 0x8000_0000_0000_0000) != 0) return false;
-        if (d.addr >= 0x1000 and (d.addr & 0x8000_0000_0000_0000) == 0) return false;
-        if (self.guestMemoryConst(d.addr, @sizeOf(u64)) != null) return false;
-
-        const symbol = self.metadata.nearestSymbol(self.regs.rip) orelse return false;
-        if (!isXModuleMatchesSymbol(symbol.name)) return false;
-
-        const transition = self.findNearNullBaseTransition(base_register, base_value) orelse return false;
-        if (transition.object_address != self.regs.rdi or
-            self.guestMemoryConst(transition.object_address, @sizeOf(u64)) == null or
-            self.read64(transition.object_address) != 0)
-        {
-            return false;
-        }
-
-        const resolved_vtable = self.ensureXmoduleVtable() orelse return false;
-        self.write64(transition.object_address, resolved_vtable);
-        // The producer already executed. Make the current load observe the
-        // repaired vptr, then preserve its displacement/index components.
-        self.setReg(base_register, .bits64, resolved_vtable);
-        d.addr = d.addr -% base_value +% resolved_vtable;
-        machoCapturePrint(
-            "macho-processor: near-null base register recovery: thread=0x{x} register={s} before=0x{x} after=0x0 object=0x{x} vtable=0x{x} producer=0x{x} distance={d} fault_rip=0x{x} symbol={s}+0x{x} action=restore_vptr_and_retry_load\n",
-            .{ self.active_guest_thread, @tagName(base_register), transition.previous_value, transition.object_address, resolved_vtable, transition.producer_rip, transition.distance, self.regs.rip, symbol.name, symbol.offset },
-        );
-        return true;
+    pub fn recoverNearNullBaseRegister(self: *MachOState, d: *DecodedInsn) bool {
+        return crash_diag.recoverNearNullBaseRegister(self, d);
     }
 
-    /// Attempt to repair a zero vtable/function-pointer slot at `operand_address`
-    /// by matching against the cached codecvt vtable entries. This handles the
-    /// common case where a guest C++ locale facet (__narrow_to_utf8, codecvt)
-    /// was allocated but its vtable entries were never populated because the ABI
-    /// data materializer left guest virtual-method-table slots as zeros.
-    /// Attempt to repair a null function-pointer slot in a guest C++ object's
-    /// vtable or function-pointer table. Only fires when the crash site is in
-    /// known codecvt / __narrow_to_utf8 code (filesystem path conversion during
-    /// XEX loading). Scans the binary's imports for the correct codecvt virtual
-    /// function by matching the vtable offset against the expected function name.
-    fn recoverNullVtableSlot(self: *MachOState, instruction_address: u64, operand_address: u64) ?u64 {
-        // Only attempt recovery if the caller is in codecvt/narrow_to_utf8 code.
-        const caller = self.metadata.nearestSymbol(instruction_address) orelse return null;
-        if (std.mem.indexOf(u8, caller.name, "codecvt") == null and
-            std.mem.indexOf(u8, caller.name, "__narrow_to_utf8") == null) return null;
-        // Scan codecvt imports for do_in, the common null-slot hit at
-        // vtable+0x18 during __narrow_to_utf8::operator(). Do not substitute
-        // an arbitrary codecvt symbol: constructors, accessors and the other
-        // virtual methods have different ABIs and may recurse back through
-        // use_facet indefinitely while consuming the translated thread stack.
-        for (self.metadata.imports) |imported| {
-            if (std.mem.indexOf(u8, imported.name, "codecvt") == null) continue;
-            if (imported.stub_address == 0) continue;
-            if (std.mem.indexOf(u8, imported.name, "do_in") != null) {
-                _ = self.write64(operand_address, imported.stub_address);
-                machoCapturePrint(
-                    "macho-processor: null vtable slot repair: instruction=0x{x} operand=0x{x} func=do_in stub=0x{x}\n",
-                    .{ instruction_address, operand_address, imported.stub_address },
-                );
-                return imported.stub_address;
-            }
-        }
-        machoCapturePrint(
-            "macho-processor: codecvt virtual dispatch unresolved: instruction=0x{x} operand=0x{x} caller={s}+0x{x} required=do_in action=reject_abi_unsafe_fallback\n",
-            .{ instruction_address, operand_address, caller.name, caller.offset },
-        );
-        return null;
+    pub fn recoverNullVtableSlot(self: *MachOState, instruction_address: u64, operand_address: u64) ?u64 {
+        return crash_diag.recoverNullVtableSlot(self, instruction_address, operand_address);
     }
 
-    fn terminateForInvalidControlTransfer(self: *MachOState, context: ControlTransferContext) void {
-        var failure = exit_diagnostics.ControlTransferFailure{
-            .kind = context.kind,
-            .instruction_address = context.instruction_address,
-            .operand_address = context.operand_address,
-            .target_address = context.target_address,
-            .return_address = context.return_address,
-            .operand_mapped = context.operand_address != 0 and self.addrToOffset(context.operand_address) != null,
-            .target_mapped = self.addrToOffset(context.target_address) != null,
-            .target_executable = self.isExecutableAddress(context.target_address),
-        };
-        if (self.guestMemoryConst(context.instruction_address, 16)) |bytes| {
-            const byte_count: usize = @min(bytes.len, failure.instruction_bytes.len);
-            @memcpy(failure.instruction_bytes[0..byte_count], bytes[0..byte_count]);
-            failure.instruction_byte_count = @intCast(byte_count);
-            const decoded = decodeInsn(bytes[0..byte_count]);
-            failure.decoded_operation = @tagName(decoded.op);
-            failure.decoded_length = decoded.len;
-        }
-        if (context.operand_address != 0) {
-            if (self.guestMemoryConst(context.operand_address, 8)) |_| {
-                failure.operand_value = self.read64(context.operand_address);
-            }
-        }
-        if (self.metadata.nearestSymbol(context.instruction_address)) |caller| {
-            failure.caller_symbol = caller.name;
-            failure.caller_offset = caller.offset;
-        }
-        if (self.metadata.nearestSymbol(context.target_address)) |target| {
-            failure.target_symbol = target.name;
-            failure.target_offset = target.offset;
-        }
-        for (self.metadata.imports) |imported| {
-            if (imported.stub_address == context.instruction_address or
-                (context.operand_address != 0 and imported.lazy_pointer_address == context.operand_address))
-            {
-                failure.candidate_import = imported.name;
-                failure.candidate_image = imported.dylib;
-                break;
-            }
-        }
-        self.pending_control_transfer = null;
-        self.terminal_control_transfer = failure;
-        machoCapturePrint(
-            "macho-processor: invalid control transfer: kind={s} instruction=0x{x} operand=0x{x} target=0x{x} return=0x{x} candidate_import={s}\n",
-            .{
-                failure.kind,
-                failure.instruction_address,
-                failure.operand_address,
-                failure.target_address,
-                failure.return_address,
-                if (failure.candidate_import.len != 0) failure.candidate_import else "<none>",
-            },
-        );
-        if (failure.instruction_byte_count != 0) {
-            machoCapturePrint(
-                "macho-processor: transfer decode: op={s} len={d} bytes={any} indirect=[0x{x}]=0x{x} mapped={} executable={} import_image={s}\n",
-                .{
-                    failure.decoded_operation,
-                    failure.decoded_length,
-                    failure.instruction_bytes[0..failure.instruction_byte_count],
-                    failure.operand_address,
-                    failure.operand_value,
-                    failure.target_mapped,
-                    failure.target_executable,
-                    if (failure.candidate_image.len != 0) failure.candidate_image else "<none>",
-                },
-            );
-        }
-        self.logCrashDiagnostics(context);
-        self.faulted = true;
-        self.exit_code = 127;
-        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
-        self.terminated = true;
+    pub fn logCrashDiagnostics(self: *MachOState, context: ControlTransferContext) void {
+        crash_diag.logCrashDiagnostics(self, context);
     }
 
-    /// Log extensive crash diagnostics around an invalid control transfer.
-    /// Called before the process is marked as faulted.
-    fn logCrashDiagnostics(self: *MachOState, context: ControlTransferContext) void {
-        machoCapturePrint("macho-processor: CRASH DIAGNOSTICS BEGIN\n", .{});
-
-        // 1. Thread info
-        const thread_handle = self.active_guest_thread;
-        const thread_id = self.threadNumericId(thread_handle);
-        const thread_role = self.threadRole(thread_handle, self.regs.rip);
-        machoCapturePrint(
-            "macho-processor:   thread: handle=0x{x} numeric_id={d} role={s} rip=0x{x} rsp=0x{x} rbp=0x{x}\n",
-            .{ thread_handle, thread_id, thread_role, self.regs.rip, self.regs.rsp, self.regs.rbp },
-        );
-
-        // 2. Full register dump
-        machoCapturePrint(
-            "macho-processor:   regs: rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n" ++ "macho-processor:         rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n" ++ "macho-processor:         r8=0x{x}  r9=0x{x}  r10=0x{x} r11=0x{x}\n" ++ "macho-processor:         r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n" ++ "macho-processor:         rip=0x{x} rflags=0x{x}\n",
-            .{
-                self.regs.rax, self.regs.rbx,    self.regs.rcx, self.regs.rdx,
-                self.regs.rsi, self.regs.rdi,    self.regs.rbp, self.regs.rsp,
-                self.regs.r8,  self.regs.r9,     self.regs.r10, self.regs.r11,
-                self.regs.r12, self.regs.r13,    self.regs.r14, self.regs.r15,
-                self.regs.rip, self.regs.rflags,
-            },
-        );
-
-        // 3. Instruction context (re-decode showing addressing mode)
-        {
-            const insn_bytes = self.guestMemoryConst(context.instruction_address, 16);
-            if (insn_bytes) |bytes| {
-                const dec = decodeInsn(bytes[0..@min(bytes.len, 15)]);
-                const addrmode = if (dec.rip_relative)
-                    "rip_relative"
-                else if (dec.sib_has_index)
-                    "sib_indexed"
-                else
-                    "direct";
-                const dst_reg = @tagName(dec.dst_reg);
-                machoCapturePrint(
-                    "macho-processor:   instr decode: op={s} addr_mode={s} addr=0x{x} dst_reg={s}\n",
-                    .{ @tagName(dec.op), addrmode, dec.addr, dst_reg },
-                );
-                if (dec.sib_has_index) {
-                    const idx_reg = @tagName(dec.sib_index_reg);
-                    const base_reg = if (dec.sib_has_base) @tagName(dec.sib_base_reg) else "none";
-                    machoCapturePrint(
-                        "macho-processor:     sib: index={s} scale={d} base={s}\n",
-                        .{ idx_reg, dec.sib_scale, base_reg },
-                    );
-                }
-            }
-        }
-
-        // 4. Operand memory region info and nearby jump table dump
-        if (context.operand_address != 0) {
-            const op_offset = self.addrToOffset(context.operand_address);
-            const op_mapped = op_offset != null;
-            if (op_mapped) {
-                const op_sym = self.metadata.nearestSymbol(context.operand_address);
-                const op_value = self.read64(context.operand_address);
-                machoCapturePrint(
-                    "macho-processor:   operand 0x{x}: mapped=yes offset=0x{x} value=0x{x}\n",
-                    .{ context.operand_address, op_offset.?, op_value },
-                );
-                // Show nearest symbol with stale-match warning
-                if (op_sym) |s| {
-                    const stale = if (s.offset > 1024) " (STALE MATCH: offset > 1024)" else "";
-                    machoCapturePrint(
-                        "macho-processor:   nearest symbol: {s}+0x{x}{s}\n",
-                        .{ s.name, s.offset, stale },
-                    );
-                }
-            } else {
-                machoCapturePrint(
-                    "macho-processor:   operand 0x{x}: mapped=no offset=<none>\n",
-                    .{context.operand_address},
-                );
-            }
-
-            // Segment/region info for operand address
-            {
-                var found_seg = false;
-                for (self.segments) |seg| {
-                    if (context.operand_address >= seg.vmaddr and context.operand_address < seg.vmaddr + seg.vmsize) {
-                        const rel_off = context.operand_address - seg.vmaddr;
-                        machoCapturePrint(
-                            "macho-processor:   address region: Mach-O segment {s} [0x{x}-0x{x}] offset_in_segment=0x{x} prot=",
-                            .{ seg.name, seg.vmaddr, seg.vmaddr + seg.vmsize - 1, rel_off },
-                        );
-                        if (seg.initprot & 1 != 0) {
-                            machoCapturePrint("r", .{});
-                        } else {
-                            machoCapturePrint("-", .{});
-                        }
-                        if (seg.initprot & 2 != 0) {
-                            machoCapturePrint("w", .{});
-                        } else {
-                            machoCapturePrint("-", .{});
-                        }
-                        if (seg.initprot & 4 != 0) {
-                            machoCapturePrint("x", .{});
-                        } else {
-                            machoCapturePrint("-", .{});
-                        }
-                        machoCapturePrint("\n", .{});
-                        found_seg = true;
-                        break;
-                    }
-                }
-                if (!found_seg) {
-                    // Not in a Mach-O segment; check if it's a sparse mapping
-                    const in_sparse = self.sparse_memory.contains(context.operand_address, 8);
-                    machoCapturePrint(
-                        "macho-processor:   address region: outside Mach-O segments sparse_mapped={}\n",
-                        .{in_sparse},
-                    );
-                }
-            }
-
-            // Dump nearby entries (16 qwords: 8 before, the operand, 8 after)
-            machoCapturePrint("macho-processor:   jump table dump [0x{x} +/- 64 bytes]:\n", .{context.operand_address});
-            const dump_start = context.operand_address -| 64;
-            const dump_end = context.operand_address + 72;
-            var dump_addr = dump_start;
-            while (dump_addr < dump_end) : (dump_addr += 8) {
-                const marker = if (dump_addr == context.operand_address) " <-- OPERAND" else "";
-                if (self.addrToOffset(dump_addr)) |_| {
-                    const val = self.read64(dump_addr);
-                    const val_sym = self.metadata.nearestSymbol(val);
-                    machoCapturePrint(
-                        "macho-processor:     [0x{x}]=0x{x}{s}",
-                        .{ dump_addr, val, marker },
-                    );
-                    if (val_sym) |s| {
-                        machoCapturePrint(" {s}+0x{x}", .{ s.name, s.offset });
-                    }
-                    machoCapturePrint("\n", .{});
-                } else {
-                    machoCapturePrint("macho-processor:     [0x{x}]=<unmapped>{s}\n", .{ dump_addr, marker });
-                }
-            }
-
-            // Corruption pattern analysis on jump table entries
-            {
-                var hi32_const: ?u32 = null;
-                var hi32_all_same = true;
-                var lo32_prev: ?u32 = null;
-                var lo32_step: ?i64 = null;
-                var lo32_arith_prog = true;
-                var lo32_counts: u32 = 0;
-                var lo32_all_small = true;
-
-                var scan_addr = context.operand_address -| 64;
-                const scan_end = context.operand_address + 72;
-                while (scan_addr < scan_end) : (scan_addr += 8) {
-                    if (self.addrToOffset(scan_addr) == null) continue;
-                    const val = self.read64(scan_addr);
-                    if (val == 0) continue; // skip zero entries for pattern analysis
-                    const hi32 = @as(u32, @truncate(val >> 32));
-                    const lo32 = @as(u32, @truncate(val));
-                    lo32_counts += 1;
-                    if (lo32 >= 0x1000000000) lo32_all_small = false;
-
-                    // Hi32 constancy check
-                    if (hi32_const) |h| {
-                        if (h != hi32) hi32_all_same = false;
-                    } else {
-                        hi32_const = hi32;
-                    }
-
-                    // Lo32 arithmetic progression check
-                    if (lo32_prev) |p| {
-                        const diff = @as(i64, lo32) - @as(i64, p);
-                        if (lo32_step) |known_step| {
-                            if (diff != known_step) lo32_arith_prog = false;
-                        } else {
-                            lo32_step = diff;
-                        }
-                    }
-                    lo32_prev = lo32;
-                }
-
-                // Print hi32 analysis
-                if (lo32_counts > 1 and hi32_const != null and hi32_all_same) {
-                    const hi = hi32_const.?;
-                    machoCapturePrint(
-                        "macho-processor:   corruption pattern: all entries have constant high 32 bits = 0x{x}",
-                        .{hi},
-                    );
-                    if (hi == 0xfffffc00) {
-                        machoCapturePrint(" (kernel-space range, possible sign-extended 32-bit address)\n", .{});
-                    } else if (hi == 0x00000000) {
-                        machoCapturePrint(" (entries are valid 32-bit addresses in low 4GB)\n", .{});
-                    } else if (hi == 0xffffffff) {
-                        machoCapturePrint(" (possible -1 / invalid pattern)\n", .{});
-                    } else if (hi == 0x00007fff) {
-                        machoCapturePrint(" (possible userspace address on macOS)\n", .{});
-                    } else {
-                        machoCapturePrint("\n", .{});
-                    }
-
-                    // Interpret the entries as 32-bit pointers
-                    machoCapturePrint("macho-processor:   interpreting as 32-bit pointer table:\n", .{});
-                    scan_addr = context.operand_address -| 64;
-                    while (scan_addr < scan_end) : (scan_addr += 8) {
-                        if (self.addrToOffset(scan_addr) == null) continue;
-                        const val = self.read64(scan_addr);
-                        if (val == 0) continue;
-                        const lo32 = @as(u32, @truncate(val));
-                        const lo_sym = self.metadata.nearestSymbol(lo32);
-                        const lo_small = if (lo32 < 0x1000) " (looks like a small offset, not a pointer)" else "";
-                        if (lo_sym) |s| {
-                            machoCapturePrint(
-                                "macho-processor:     0x{x} -> 0x{x} (lo32) {s}+0x{x}{s}\n",
-                                .{ scan_addr, lo32, s.name, s.offset, lo_small },
-                            );
-                        } else {
-                            machoCapturePrint(
-                                "macho-processor:     0x{x} -> 0x{x} (lo32){s}\n",
-                                .{ scan_addr, lo32, lo_small },
-                            );
-                        }
-                    }
-                }
-
-                // Print lo32 arithmetic progression analysis
-                if (lo32_counts > 1 and lo32_arith_prog and lo32_step != null) {
-                    const step_val = lo32_step.?;
-                    machoCapturePrint(
-                        "macho-processor:   corruption pattern: lo32 entries form arithmetic progression (step={d}, decreasing={}). Table was shifted by one entry (read as wrong-type entries).\n",
-                        .{ @abs(step_val), step_val < 0 },
-                    );
-                }
-
-                // Print lo32 small offset warning
-                if (lo32_counts > 1 and lo32_all_small) {
-                    machoCapturePrint(
-                        "macho-processor:   corruption pattern: all lo32 values are small (< 4GB). Entries may be 32-bit offsets, not addresses.\n",
-                        .{},
-                    );
-                }
-            }
-        }
-
-        // 5. Suspended thread table snapshot
-        if (self.suspended_guest_thread_count > 0) {
-            machoCapturePrint("macho-processor:   suspended threads ({d}):\n", .{self.suspended_guest_thread_count});
-            for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |st, i| {
-                const st_sym = self.metadata.nearestSymbol(st.regs.rip);
-                machoCapturePrint(
-                    "macho-processor:     [{d}] handle=0x{x} rip=0x{x} rsp=0x{x} reason={s} suspended_step={d}",
-                    .{ i, st.handle, st.regs.rip, st.regs.rsp, st.reason, st.suspended_step },
-                );
-                if (st_sym) |s| {
-                    machoCapturePrint(" {s}+0x{x}", .{ s.name, s.offset });
-                }
-                machoCapturePrint("\n", .{});
-            }
-        }
-
-        // 6. Guest backtrace (walk stack via rbp chain)
-        machoCapturePrint("macho-processor:   guest backtrace (rbp chain):\n", .{});
-        var frame_rbp = self.regs.rbp;
-        var frame_rip = self.regs.rip;
-        var frame_depth: usize = 0;
-        while (frame_depth < 16) : (frame_depth += 1) {
-            const frame_sym = self.metadata.nearestSymbol(frame_rip);
-            machoCapturePrint(
-                "macho-processor:     #{d} rip=0x{x} rbp=0x{x}",
-                .{ frame_depth, frame_rip, frame_rbp },
-            );
-            if (frame_sym) |s| {
-                machoCapturePrint(" {s}+0x{x}", .{ s.name, s.offset });
-            }
-            machoCapturePrint("\n", .{});
-            // Walk to next frame: saved rbp is at [rbp], saved return address is at [rbp+8]
-            if (frame_rbp == 0 or self.addrToOffset(frame_rbp) == null) break;
-            const next_rbp = self.read64(frame_rbp);
-            const next_rip_offset = frame_rbp + 8;
-            if (next_rbp == 0 or next_rbp <= frame_rbp) {
-                // rbp chain broken; try reading return address at known stack slot
-                if (self.addrToOffset(next_rip_offset) != null) {
-                    frame_rip = self.read64(next_rip_offset);
-                    break;
-                }
-                break;
-            }
-            if (self.addrToOffset(next_rip_offset) == null) break;
-            frame_rip = self.read64(next_rip_offset);
-            frame_rbp = next_rbp;
-        }
-
-        // 7. Scheduler counters
-        machoCapturePrint(
-            "macho-processor:   scheduler: active=0x{x} suspended={d} switches={d} returns={d}" ++ " wait_yields={d} quantum_yields={d} rotation_yields={d}" ++ " preserved_resumes={d} wait_resumes={d} self_resumes={d}" ++ " quiescence_recoveries={d} starvation_warnings={d}\n",
-            .{
-                self.active_guest_thread,
-                self.suspended_guest_thread_count,
-                self.cooperative_thread_switches,
-                self.cooperative_thread_returns,
-                self.cooperative_wait_yields,
-                self.cooperative_quantum_yields,
-                self.cooperative_rotation_yields,
-                self.cooperative_preserved_register_resumes,
-                self.cooperative_wait_result_resumes,
-                self.cooperative_self_resumes,
-                self.cooperative_quiescence_recoveries,
-                self.cooperative_starvation_warnings,
-            },
-        );
-        machoCapturePrint("macho-processor: CRASH DIAGNOSTICS END\n", .{});
+    pub fn terminateForInvalidControlTransfer(self: *MachOState, context: ControlTransferContext) void {
+        crash_diag.terminateForInvalidControlTransfer(self, context);
     }
 
-    fn handleOpen(self: *MachOState) u64 {
-        const path = self.guestCString(self.regs.rdi, 4096) orelse return @bitCast(@as(i64, -1));
-        var path_buffer = std.ArrayList(u8).empty;
-        defer path_buffer.deinit(self.allocator);
-        path_buffer.appendSlice(self.allocator, path) catch return @bitCast(@as(i64, -1));
-        path_buffer.append(self.allocator, 0) catch return @bitCast(@as(i64, -1));
-
-        const host_fd = std.c.open(
-            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
-            @bitCast(@as(u32, @truncate(self.regs.rsi))),
-            @as(c_int, @intCast(self.regs.rdx & 0xFFFF)),
-        );
-        if (host_fd < 0) return @bitCast(@as(i64, -1));
-        return self.registerGuestFd(host_fd) orelse @bitCast(@as(i64, -1));
+    pub fn handleOpen(self: *MachOState) u64 {
+        return guest_fs.handleOpen(self);
     }
 
-    fn registerGuestFd(self: *MachOState, host_fd: c_int) ?u64 {
-        var guest_fd: usize = @intCast(@max(self.next_guest_fd, 3));
-        while (guest_fd < self.guest_fds.len and self.guest_fds[guest_fd] >= 0) : (guest_fd += 1) {}
-        if (guest_fd >= self.guest_fds.len) {
-            _ = std.c.close(host_fd);
-            return null;
-        }
-        self.guest_fds[guest_fd] = host_fd;
-        self.next_guest_fd = guest_fd + 1;
-        return guest_fd;
+    pub fn registerGuestFd(self: *MachOState, host_fd: c_int) ?u64 {
+        return guest_fs.registerGuestFd(self, host_fd);
     }
 
     pub fn setGuestErrno(self: *MachOState, value: c_int) void {
-        if (self.guest_errno_address == 0) {
-            self.guest_errno_address = self.guestAlloc(@sizeOf(c_int), @alignOf(c_int)) orelse return;
-        }
-        const storage = self.guestMemory(self.guest_errno_address, @sizeOf(c_int)) orelse return;
-        std.mem.writeInt(c_int, storage[0..@sizeOf(c_int)], value, .little);
+        guest_fs.setGuestErrno(self, value);
     }
 
-    fn hostFd(self: *MachOState, guest_or_host_fd: u64) ?c_int {
-        if (guest_or_host_fd < self.guest_fds.len) {
-            const guest_fd: usize = @intCast(guest_or_host_fd);
-            if (self.guest_fds[guest_fd] >= 0) return self.guest_fds[guest_fd];
-        }
-        if (guest_or_host_fd > std.math.maxInt(c_int)) return null;
-        return @intCast(guest_or_host_fd);
+    pub fn hostFd(self: *MachOState, guest_or_host_fd: u64) ?c_int {
+        return guest_fs.hostFd(self, guest_or_host_fd);
     }
 
-    fn handleFstatat(self: *MachOState) u64 {
-        const directory_fd = self.hostFd(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        const path = self.guestCString(self.regs.rsi, 4096) orelse return @bitCast(@as(i64, -1));
-        var path_buffer = std.ArrayList(u8).empty;
-        defer path_buffer.deinit(self.allocator);
-        path_buffer.appendSlice(self.allocator, path) catch return @bitCast(@as(i64, -1));
-        path_buffer.append(self.allocator, 0) catch return @bitCast(@as(i64, -1));
-        var host_stat: std.c.Stat = undefined;
-        const result = std.c.fstatat(
-            directory_fd,
-            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
-            &host_stat,
-            @truncate(self.regs.rcx),
-        );
-        if (result != 0) {
-            self.setGuestErrno(2);
-            return @bitCast(@as(i64, -1));
-        }
-        const destination = self.guestMemory(self.regs.rdx, @sizeOf(std.c.Stat)) orelse return @bitCast(@as(i64, -1));
-        @memcpy(destination, std.mem.asBytes(&host_stat));
-        return 0;
+    pub fn handleFstatat(self: *MachOState) u64 {
+        return guest_fs.handleFstatat(self);
     }
 
-    fn handleOpenat(self: *MachOState) u64 {
-        const directory_fd = self.hostFd(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        const path = self.guestCString(self.regs.rsi, 4096) orelse return @bitCast(@as(i64, -1));
-        var path_buffer = std.ArrayList(u8).empty;
-        defer path_buffer.deinit(self.allocator);
-        path_buffer.appendSlice(self.allocator, path) catch return @bitCast(@as(i64, -1));
-        path_buffer.append(self.allocator, 0) catch return @bitCast(@as(i64, -1));
-        const host_fd = std.c.openat(
-            directory_fd,
-            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
-            @bitCast(@as(u32, @truncate(self.regs.rdx))),
-            @as(c_int, @intCast(self.regs.rcx & 0xFFFF)),
-        );
-        if (host_fd < 0) {
-            self.setGuestErrno(2);
-            return @bitCast(@as(i64, -1));
-        }
-        return self.registerGuestFd(host_fd) orelse @bitCast(@as(i64, -1));
+    pub fn handleOpenat(self: *MachOState) u64 {
+        return guest_fs.handleOpenat(self);
     }
 
-    fn handleFstat(self: *MachOState) u64 {
-        const host_fd = self.hostFd(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        var host_stat: std.c.Stat = undefined;
-        if (std.c.fstat(host_fd, &host_stat) != 0) {
-            self.setGuestErrno(2);
-            return @bitCast(@as(i64, -1));
-        }
-        const destination = self.guestMemory(self.regs.rsi, @sizeOf(std.c.Stat)) orelse return @bitCast(@as(i64, -1));
-        @memcpy(destination, std.mem.asBytes(&host_stat));
-        return 0;
+    pub fn handleFstat(self: *MachOState) u64 {
+        return guest_fs.handleFstat(self);
     }
 
-    fn handleFtruncate(self: *MachOState) u64 {
-        const host_fd = self.hostFd(self.regs.rdi) orelse {
-            self.setGuestErrno(9);
-            return @bitCast(@as(i64, -1));
-        };
-        const result = std.c.ftruncate(host_fd, @bitCast(self.regs.rsi));
-        if (result != 0) self.setGuestErrno(22);
-        return @bitCast(@as(i64, result));
+    pub fn handleFtruncate(self: *MachOState) u64 {
+        return guest_fs.handleFtruncate(self);
     }
 
-    fn handleOpendir(self: *MachOState) ?u64 {
-        const path = self.guestCString(self.regs.rdi, 4096) orelse return null;
-        var path_buffer = std.ArrayList(u8).empty;
-        defer path_buffer.deinit(self.allocator);
-        path_buffer.appendSlice(self.allocator, path) catch return null;
-        path_buffer.append(self.allocator, 0) catch return null;
-        const host_fd = std.c.open(
-            @as([*:0]const u8, @ptrCast(path_buffer.items.ptr)),
-            std.c.O{ .DIRECTORY = true },
-            @as(c_int, 0),
-        );
-        if (host_fd < 0) return null;
-        return self.allocGuestFile(host_fd, .regular) orelse {
-            _ = std.c.close(host_fd);
-            return null;
-        };
+    pub fn handleOpendir(self: *MachOState) ?u64 {
+        return guest_fs.handleOpendir(self);
     }
 
-    fn handleClosedir(self: *MachOState) u64 {
-        const directory = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        if (directory.fd >= 0 and std.c.close(directory.fd) != 0) return @bitCast(@as(i64, -1));
-        directory.* = .{};
-        return 0;
+    pub fn handleClosedir(self: *MachOState) u64 {
+        return guest_fs.handleClosedir(self);
     }
 
-    fn handleWrite(self: *MachOState) u64 {
-        const guest_fd: usize = @intCast(self.regs.rdi);
-        if (guest_fd >= self.guest_fds.len or self.guest_fds[guest_fd] < 0) return @bitCast(@as(i64, -1));
-        const bytes = self.guestMemoryConst(self.regs.rsi, self.regs.rdx) orelse return @bitCast(@as(i64, -1));
-        const written = std.c.write(self.guest_fds[guest_fd], bytes.ptr, bytes.len);
-        return if (written < 0) @bitCast(@as(i64, -1)) else @intCast(written);
+    pub fn handleWrite(self: *MachOState) u64 {
+        return guest_fs.handleWrite(self);
     }
 
-    fn handleClose(self: *MachOState) u64 {
-        const guest_fd: usize = @intCast(self.regs.rdi);
-        if (guest_fd >= self.guest_fds.len or self.guest_fds[guest_fd] < 0) return @bitCast(@as(i64, -1));
-        const result = std.c.close(self.guest_fds[guest_fd]);
-        self.guest_fds[guest_fd] = -1;
-        if (guest_fd < self.next_guest_fd) self.next_guest_fd = @max(guest_fd, 3);
-        return if (result == 0) 0 else @bitCast(@as(i64, -1));
+    pub fn handleClose(self: *MachOState) u64 {
+        return guest_fs.handleClose(self);
     }
 
-    fn hostWriteAll(self: *MachOState, file: *GuestFile, bytes: []const u8) bool {
-        if (file.fd < 0) return false;
-        var written: usize = 0;
-        while (written < bytes.len) {
-            const rc = std.c.write(file.fd, bytes.ptr + written, bytes.len - written);
-            if (rc < 0) {
-                self.setGuestErrno(@intCast(@intFromEnum(std.c.errno(rc))));
-                file.error_flag = true;
-                return false;
-            }
-            if (rc == 0) break;
-            written += @intCast(rc);
-        }
-        if (file.kind == .regular) file.position += @intCast(written);
-        const completed = written == bytes.len;
-        if (completed and file.kind != .regular) {
-            self.guest_stdio_write_count +|= 1;
-            switch (file.kind) {
-                .stdout => self.guest_stdout_byte_count +|= written,
-                .stderr => self.guest_stderr_byte_count +|= written,
-                .regular => unreachable,
-            }
-            if (self.guest_log_mirror_fd >= 0 and
-                self.guest_log_mirror_fd != file.fd and
-                !hostWriteFdAll(self.guest_log_mirror_fd, bytes))
-            {
-                self.guest_stdio_mirror_failures +|= 1;
-            }
-            if (self.guest_stdio_write_count == 1) {
-                machoCapturePrint(
-                    "macho-processor: guest stdio capture active: first_stream={s} log_mirror_active={}\n",
-                    .{ @tagName(file.kind), self.guest_log_mirror_fd >= 0 },
-                );
-            }
-        }
-        return completed;
+    pub fn hostWriteAll(self: *MachOState, file: *GuestFile, bytes: []const u8) bool {
+        return guest_fs.hostWriteAll(self, file, bytes);
     }
 
-    fn handleFopen(self: *MachOState) ?u64 {
-        const path = self.guestCString(self.regs.rdi, 4096) orelse return null;
-        const mode = self.guestCString(self.regs.rsi, 32) orelse return null;
-        const flags = parseFopenFlags(mode) orelse return null;
-        var temp_buf: [4096]u8 = undefined;
-        var translated_path: []const u8 = path;
-        if (self.fs_forwarder.resolveHostPath(path, &temp_buf)) |t| {
-            translated_path = t;
-        }
-        var path_buf = std.ArrayList(u8).empty;
-        defer path_buf.deinit(self.allocator);
-        path_buf.appendSlice(self.allocator, translated_path) catch return null;
-        path_buf.append(self.allocator, 0) catch return null;
-        const zpath: [*:0]const u8 = @ptrCast(path_buf.items.ptr);
-        const oflags: std.c.O = @bitCast(@as(u32, @intCast(flags)));
-        var fd = std.c.open(zpath, oflags, @as(c_int, 0o666));
-        if (fd < 0) {
-            const err = std.c.errno(fd);
-            if (self.fs_forwarder.tryOpenFallback(translated_path, oflags, 0o666, err)) |fallback_fd| {
-                fd = fallback_fd;
-            } else {
-                return null;
-            }
-        }
-        return self.allocGuestFile(fd, .regular);
+    pub fn handleFopen(self: *MachOState) ?u64 {
+        return guest_fs.handleFopen(self);
     }
 
-    fn handleFdopen(self: *MachOState) ?u64 {
-        const mode = self.guestCString(self.regs.rsi, 32) orelse {
-            self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
-            machoCapturePrint("macho-processor: fdopen rejected: unreadable mode pointer=0x{x}\n", .{self.regs.rsi});
-            return null;
-        };
-        const guest_fd = self.regs.rdi;
-        const host_fd = self.fs_forwarder.fd_manager.take(guest_fd) orelse {
-            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
-            machoCapturePrint("macho-processor: fdopen rejected: invalid guest_fd={d} mode={s}\n", .{ guest_fd, mode });
-            return null;
-        };
-        const handle = self.allocGuestFile(host_fd, .regular) orelse {
-            _ = std.c.close(host_fd);
-            self.setGuestErrno(@intFromEnum(std.c.E.NOMEM));
-            return null;
-        };
-        machoCapturePrint(
-            "macho-processor: fdopen: guest_fd={d} host_fd={d} mode={s} -> FILE=0x{x}\n",
-            .{ guest_fd, host_fd, mode, handle },
-        );
-        return handle;
+    pub fn handleFdopen(self: *MachOState) ?u64 {
+        return guest_fs.handleFdopen(self);
     }
 
-    fn handleFileno(self: *MachOState) u64 {
-        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        if (file.descriptor_alias != std.math.maxInt(u64) and
-            self.fs_forwarder.fd_manager.hostFd(file.descriptor_alias) != null)
-        {
-            return file.descriptor_alias;
-        }
-        const duplicate = std.c.dup(file.fd);
-        if (duplicate < 0) return @bitCast(@as(i64, -1));
-        const guest_fd = self.fs_forwarder.fd_manager.register(duplicate, .file) orelse return @bitCast(@as(i64, -1));
-        file.descriptor_alias = guest_fd;
-        return guest_fd;
+    pub fn handleFileno(self: *MachOState) u64 {
+        return guest_fs.handleFileno(self);
     }
 
-    fn handleFclose(self: *MachOState) u64 {
-        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        if (file.descriptor_alias != std.math.maxInt(u64)) {
-            _ = self.fs_forwarder.fd_manager.close(file.descriptor_alias);
-            file.descriptor_alias = std.math.maxInt(u64);
-        }
-        if (file.kind == .regular and file.fd >= 0) {
-            if (std.c.close(file.fd) != 0) {
-                file.error_flag = true;
-                return @bitCast(@as(i64, -1));
-            }
-        }
-        file.* = .{};
-        return 0;
+    pub fn handleFclose(self: *MachOState) u64 {
+        return guest_fs.handleFclose(self);
     }
 
-    fn handleFputs(self: *MachOState) u64 {
-        const text = self.guestCString(self.regs.rdi, 1 << 20) orelse return @bitCast(@as(i64, -1));
-        const file = self.guestFileFromHandle(self.regs.rsi) orelse return @bitCast(@as(i64, -1));
-        if (!self.hostWriteAll(file, text)) return @bitCast(@as(i64, -1));
-        return @intCast(text.len);
+    pub fn handleFputs(self: *MachOState) u64 {
+        return guest_fs.handleFputs(self);
     }
 
-    fn handleFwrite(self: *MachOState) u64 {
-        const element_size = self.regs.rsi;
-        const element_count = self.regs.rdx;
-        if (element_size == 0 or element_count == 0) return 0;
-        const byte_count = std.math.mul(u64, element_size, element_count) catch {
-            self.setGuestErrno(@intFromEnum(std.c.E.OVERFLOW));
-            return 0;
-        };
-        const bytes = self.guestMemoryConst(self.regs.rdi, byte_count) orelse {
-            self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
-            machoCapturePrint("macho-processor: fwrite rejected: source=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
-            return 0;
-        };
-        const file = self.guestFileFromHandle(self.regs.rcx) orelse {
-            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
-            machoCapturePrint("macho-processor: fwrite rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
-            return 0;
-        };
-        if (!self.hostWriteAll(file, bytes)) {
-            machoCapturePrint("macho-processor: fwrite failed: FILE=0x{x} host_fd={d} requested={d}\n", .{ self.regs.rcx, file.fd, byte_count });
-            return 0;
-        }
-        machoCapturePrint("macho-processor: fwrite: FILE=0x{x} host_fd={d} bytes={d} elements={d}\n", .{ self.regs.rcx, file.fd, byte_count, element_count });
-        return element_count;
+    pub fn handleFwrite(self: *MachOState) u64 {
+        return guest_fs.handleFwrite(self);
     }
 
-    fn handleFread(self: *MachOState) u64 {
-        const element_size = self.regs.rsi;
-        const element_count = self.regs.rdx;
-        if (element_size == 0 or element_count == 0) return 0;
-        const byte_count = std.math.mul(u64, element_size, element_count) catch {
-            self.setGuestErrno(@intFromEnum(std.c.E.OVERFLOW));
-            self.guest_stdio_failures +|= 1;
-            return 0;
-        };
-        const destination = self.guestMemory(self.regs.rdi, byte_count) orelse {
-            self.setGuestErrno(@intFromEnum(std.c.E.FAULT));
-            self.guest_stdio_failures +|= 1;
-            machoCapturePrint("macho-processor: fread rejected: destination=0x{x} bytes={d}\n", .{ self.regs.rdi, byte_count });
-            return 0;
-        };
-        const file = self.guestFileFromHandle(self.regs.rcx) orelse {
-            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
-            self.guest_stdio_failures +|= 1;
-            machoCapturePrint("macho-processor: fread rejected: FILE=0x{x} bytes={d}\n", .{ self.regs.rcx, byte_count });
-            return 0;
-        };
-        if (file.fd < 0) {
-            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
-            file.error_flag = true;
-            self.guest_stdio_failures +|= 1;
-            return 0;
-        }
-
-        const initial_position = file.position;
-        var bytes_read: usize = 0;
-        while (bytes_read < destination.len) {
-            const result = std.c.read(file.fd, destination.ptr + bytes_read, destination.len - bytes_read);
-            if (result < 0) {
-                self.setGuestErrno(@intCast(@intFromEnum(std.c.errno(result))));
-                file.error_flag = true;
-                self.guest_stdio_failures +|= 1;
-                break;
-            }
-            if (result == 0) break;
-            bytes_read += @intCast(result);
-        }
-        file.position += @intCast(bytes_read);
-        self.guest_stdio_read_count +|= 1;
-        self.guest_stdio_read_bytes +|= bytes_read;
-        const complete_elements = bytes_read / @as(usize, @intCast(element_size));
-        if (self.guest_stdio_read_count <= 8 or self.guest_stdio_read_count % 1000 == 0) {
-            machoCapturePrint(
-                "macho-processor: fread #{d}: FILE=0x{x} host_fd={d} position={d}->{d} requested={d} read={d} elements={d}/{d}\n",
-                .{ self.guest_stdio_read_count, self.regs.rcx, file.fd, initial_position, file.position, byte_count, bytes_read, complete_elements, element_count },
-            );
-        }
-        return complete_elements;
+    pub fn handleFread(self: *MachOState) u64 {
+        return guest_fs.handleFread(self);
     }
 
-    fn handleFflush(self: *MachOState) u64 {
-        if (self.regs.rdi == 0) return 0;
-        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        if (std.c.fsync(file.fd) != 0 and file.kind == .regular) {
-            file.error_flag = true;
-            return @bitCast(@as(i64, -1));
-        }
-        return 0;
+    pub fn handleFflush(self: *MachOState) u64 {
+        return guest_fs.handleFflush(self);
     }
 
-    fn handleFtell(self: *MachOState) u64 {
-        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        return @bitCast(file.position);
+    pub fn handleFtell(self: *MachOState) u64 {
+        return guest_fs.handleFtell(self);
     }
 
-    fn handleFseek(self: *MachOState) u64 {
-        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        const offset: i64 = @bitCast(self.regs.rsi);
-        const whence: i32 = @intCast(self.regs.rdx);
-        self.guest_stdio_seek_count +|= 1;
-        if (file.fd < 0) {
-            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
-            self.guest_stdio_failures +|= 1;
-            return @bitCast(@as(i64, -1));
-        }
-        const initial_position = file.position;
-        const pos = std.c.lseek(file.fd, offset, whence);
-        if (pos < 0) {
-            self.setGuestErrno(@intCast(@intFromEnum(std.c.errno(pos))));
-            file.error_flag = true;
-            self.guest_stdio_failures +|= 1;
-            return @bitCast(@as(i64, -1));
-        }
-        file.position = pos;
-        if (self.guest_stdio_seek_count <= 8 or self.guest_stdio_seek_count % 1000 == 0) {
-            machoCapturePrint(
-                "macho-processor: fseek #{d}: FILE=0x{x} host_fd={d} position={d}->{d} offset={d} whence={d}\n",
-                .{ self.guest_stdio_seek_count, self.regs.rdi, file.fd, initial_position, pos, offset, whence },
-            );
-        }
-        return 0;
+    pub fn handleFseek(self: *MachOState) u64 {
+        return guest_fs.handleFseek(self);
     }
 
-    fn handleFerror(self: *MachOState) u64 {
-        const file = self.guestFileFromHandle(self.regs.rdi) orelse return 1;
-        return if (file.error_flag) 1 else 0;
+    pub fn handleFerror(self: *MachOState) u64 {
+        return guest_fs.handleFerror(self);
     }
 
-    fn handleFprintf(self: *MachOState) u64 {
-        const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
-        const arguments = [_]u64{ self.regs.rdx, self.regs.rcx, self.regs.r8, self.regs.r9 };
-        return self.handlePrintfLike(file, self.regs.rsi, &arguments);
+    pub fn handleFprintf(self: *MachOState) u64 {
+        return guest_fs.handleFprintf(self);
     }
 
-    fn handleSnprintf(self: *MachOState) u64 {
-        const destination = self.regs.rdi;
-        const capacity: usize = @intCast(self.regs.rsi);
-        const format = self.guestCString(self.regs.rdx, 1 << 20) orelse return @bitCast(@as(i64, -1));
-        var output = std.ArrayList(u8).empty;
-        defer output.deinit(self.allocator);
-        const arguments = [_]u64{ self.regs.rcx, self.regs.r8, self.regs.r9 };
-        var argument_index: usize = 0;
-        var stack_argument = self.regs.rsp + 8;
-        var index: usize = 0;
-        while (index < format.len) : (index += 1) {
-            if (format[index] != '%') {
-                output.append(self.allocator, format[index]) catch return @bitCast(@as(i64, -1));
-                continue;
-            }
-            index += 1;
-            if (index >= format.len) break;
-            if (format[index] == '%') {
-                output.append(self.allocator, '%') catch return @bitCast(@as(i64, -1));
-                continue;
-            }
-            while (index < format.len and (format[index] == '-' or format[index] == '+' or format[index] == ' ' or format[index] == '#' or format[index] == '0')) : (index += 1) {}
-            while (index < format.len and std.ascii.isDigit(format[index])) : (index += 1) {}
-            if (index < format.len and format[index] == '.') {
-                index += 1;
-                while (index < format.len and std.ascii.isDigit(format[index])) : (index += 1) {}
-            }
-            while (index < format.len and (format[index] == 'l' or format[index] == 'h' or format[index] == 'z' or format[index] == 't' or format[index] == 'j')) : (index += 1) {}
-            if (index >= format.len) break;
-            const argument = self.nextVarArg(&arguments, &argument_index, &stack_argument);
-            switch (format[index]) {
-                's' => output.appendSlice(self.allocator, self.guestCString(argument, 1 << 20) orelse "(null)") catch return @bitCast(@as(i64, -1)),
-                'c' => output.append(self.allocator, @truncate(argument)) catch return @bitCast(@as(i64, -1)),
-                'd', 'i' => {
-                    const rendered = std.fmt.allocPrint(self.allocator, "{d}", .{@as(i64, @bitCast(argument))}) catch return @bitCast(@as(i64, -1));
-                    defer self.allocator.free(rendered);
-                    output.appendSlice(self.allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                'u' => {
-                    const rendered = std.fmt.allocPrint(self.allocator, "{d}", .{argument}) catch return @bitCast(@as(i64, -1));
-                    defer self.allocator.free(rendered);
-                    output.appendSlice(self.allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                'x', 'X', 'p' => {
-                    const rendered = std.fmt.allocPrint(self.allocator, "{x}", .{argument}) catch return @bitCast(@as(i64, -1));
-                    defer self.allocator.free(rendered);
-                    if (format[index] == 'p') output.appendSlice(self.allocator, "0x") catch return @bitCast(@as(i64, -1));
-                    output.appendSlice(self.allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                // Floating-point varargs are carried in XMM registers. Preserve a
-                // valid numeric field until the formatter gains full width and
-                // precision handling rather than exposing an unresolved import.
-                'f', 'F', 'e', 'E', 'g', 'G', 'a', 'A' => output.append(self.allocator, '0') catch return @bitCast(@as(i64, -1)),
-                else => {
-                    output.append(self.allocator, '%') catch return @bitCast(@as(i64, -1));
-                    output.append(self.allocator, format[index]) catch return @bitCast(@as(i64, -1));
-                },
-            }
-        }
-        if (capacity != 0) {
-            const target = self.guestMemory(destination, capacity) orelse return @bitCast(@as(i64, -1));
-            const written = @min(output.items.len, capacity - 1);
-            @memcpy(target[0..written], output.items[0..written]);
-            target[written] = 0;
-        }
-        return output.items.len;
+    pub fn handleSnprintf(self: *MachOState) u64 {
+        return guest_fs.handleSnprintf(self);
     }
 
-    fn handlePrintfLike(self: *MachOState, file_opt: ?*GuestFile, format_address: u64, arguments: []const u64) u64 {
-        const format = self.guestCString(format_address, 1 << 20) orelse return @bitCast(@as(i64, -1));
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        var output = std.ArrayList(u8).empty;
-        defer output.deinit(allocator);
-
-        var gp_index: usize = 0;
-        var stack_arg_addr = self.regs.rsp + 8;
-        var i: usize = 0;
-        while (i < format.len) : (i += 1) {
-            if (format[i] != '%') {
-                output.append(allocator, format[i]) catch return @bitCast(@as(i64, -1));
-                continue;
-            }
-            i += 1;
-            if (i >= format.len) break;
-            if (format[i] == '%') {
-                output.append(allocator, '%') catch return @bitCast(@as(i64, -1));
-                continue;
-            }
-
-            while (i < format.len and (format[i] == '-' or format[i] == '+' or format[i] == ' ' or format[i] == '#' or format[i] == '0')) : (i += 1) {}
-            while (i < format.len and std.ascii.isDigit(format[i])) : (i += 1) {}
-            if (i < format.len and format[i] == '.') {
-                i += 1;
-                while (i < format.len and std.ascii.isDigit(format[i])) : (i += 1) {}
-            }
-            while (i < format.len and
-                (format[i] == 'l' or format[i] == 'h' or format[i] == 'z' or
-                    format[i] == 't' or format[i] == 'j' or format[i] == 'L')) : (i += 1)
-            {}
-            if (i >= format.len) break;
-
-            const spec = format[i];
-            const arg = self.nextVarArg(arguments, &gp_index, &stack_arg_addr);
-            switch (spec) {
-                's' => {
-                    const text = self.guestCString(arg, 1 << 20) orelse "(null)";
-                    output.appendSlice(allocator, text) catch return @bitCast(@as(i64, -1));
-                },
-                'd', 'i' => {
-                    const val: i64 = @bitCast(arg);
-                    const rendered = std.fmt.allocPrint(allocator, "{}", .{val}) catch return @bitCast(@as(i64, -1));
-                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                'u' => {
-                    const rendered = std.fmt.allocPrint(allocator, "{}", .{arg}) catch return @bitCast(@as(i64, -1));
-                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                'x' => {
-                    const rendered = std.fmt.allocPrint(allocator, "{x}", .{arg}) catch return @bitCast(@as(i64, -1));
-                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                'X' => {
-                    const rendered = std.fmt.allocPrint(allocator, "{X}", .{arg}) catch return @bitCast(@as(i64, -1));
-                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                'p' => {
-                    const rendered = std.fmt.allocPrint(allocator, "0x{x}", .{arg}) catch return @bitCast(@as(i64, -1));
-                    output.appendSlice(allocator, rendered) catch return @bitCast(@as(i64, -1));
-                },
-                'c' => {
-                    output.append(allocator, @intCast(arg & 0xFF)) catch return @bitCast(@as(i64, -1));
-                },
-                else => {
-                    output.append(allocator, '%') catch return @bitCast(@as(i64, -1));
-                    output.append(allocator, spec) catch return @bitCast(@as(i64, -1));
-                },
-            }
-        }
-
-        const sink = file_opt orelse self.guestFileFromHandle(GUEST_FILE_BASE + 1).?;
-        if (!self.hostWriteAll(sink, output.items)) return @bitCast(@as(i64, -1));
-        return output.items.len;
+    pub fn handlePrintfLike(self: *MachOState, file_opt: ?*GuestFile, format_address: u64, arguments: []const u64) u64 {
+        return guest_fs.handlePrintfLike(self, file_opt, format_address, arguments);
     }
 
-    fn handlePutchar(self: *MachOState) u64 {
-        const ch: u8 = @intCast(self.regs.rdi & 0xFF);
-        const sink = self.guestFileFromHandle(GUEST_FILE_BASE + 1) orelse return @bitCast(@as(i64, -1));
-        if (!self.hostWriteAll(sink, &[_]u8{ch})) return @bitCast(@as(i64, -1));
-        return ch;
+    pub fn handlePutchar(self: *MachOState) u64 {
+        return guest_fs.handlePutchar(self);
     }
 
-    fn handleGtkInitCheck(self: *MachOState) u64 {
-        const argc_ptr = self.regs.rdi;
-        const argv_ptr = self.regs.rsi;
-        _ = argc_ptr;
-        _ = argv_ptr;
-        machoCapturePrint("    [import] _gtk_init_check compatibility shim → success\n", .{});
-        return 1;
+    pub fn handleGtkInitCheck(self: *MachOState) u64 {
+        return guest_fs.handleGtkInitCheck(self);
     }
 
-    fn nextVarArg(self: *const MachOState, arguments: []const u64, gp_index: *usize, stack_arg_addr: *u64) u64 {
+    pub fn nextVarArg(self: *const MachOState, arguments: []const u64, gp_index: *usize, stack_arg_addr: *u64) u64 {
         if (gp_index.* < arguments.len) {
             defer gp_index.* += 1;
             return arguments[gp_index.*];
@@ -7104,7 +5509,7 @@ pub const MachOState = struct {
         return false;
     }
 
-    fn dumpRecentTrace(self: *const MachOState) void {
+    pub fn dumpRecentTrace(self: *const MachOState) void {
         const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
         if (count == 0) return;
         log.err("recent trace dump (most recent last, count={d})", .{count});
@@ -7129,31 +5534,31 @@ pub const MachOState = struct {
         }
     }
 
-    fn regVal(self: *const MachOState, id: RegId, size: Size) u64 {
+    pub fn regVal(self: *const MachOState, id: RegId, size: Size) u64 {
         return x64_decoder.regVal(&self.regs, id, size);
     }
 
-    fn setReg(self: *MachOState, id: RegId, size: Size, val: u64) void {
+    pub fn setReg(self: *MachOState, id: RegId, size: Size, val: u64) void {
         x64_decoder.setReg(&self.regs, id, size, val);
     }
 
-    fn setFlagsSub(self: *MachOState, a: u64, b: u64, result: u64, size: Size) void {
+    pub fn setFlagsSub(self: *MachOState, a: u64, b: u64, result: u64, size: Size) void {
         x64_decoder.applySub(&self.regs.rflags, a, b, result, size);
     }
 
-    fn setFlagsAdd(self: *MachOState, a: u64, b: u64, result: u64, size: Size) void {
+    pub fn setFlagsAdd(self: *MachOState, a: u64, b: u64, result: u64, size: Size) void {
         x64_decoder.applyAdd(&self.regs.rflags, a, b, result, size);
     }
 
-    fn setFlagsIncDec(self: *MachOState, input: u64, result: u64, size: Size, is_inc: bool) void {
+    pub fn setFlagsIncDec(self: *MachOState, input: u64, result: u64, size: Size, is_inc: bool) void {
         x64_decoder.applyIncDec(&self.regs.rflags, input, result, size, is_inc);
     }
 
-    fn setFlagsLogic(self: *MachOState, result: u64, size: Size) void {
+    pub fn setFlagsLogic(self: *MachOState, result: u64, size: Size) void {
         x64_decoder.applyLogic(&self.regs.rflags, result, size);
     }
 
-    fn executeHighwayRegisterBinary(self: *MachOState, d: DecodedInsn, op: x64_decoder.highway.BinaryOp, size: Size) void {
+    pub fn executeHighwayRegisterBinary(self: *MachOState, d: DecodedInsn, op: x64_decoder.highway.BinaryOp, size: Size) void {
         const width: x64_decoder.highway.Width = switch (size) {
             .bits8 => .bits8,
             .bits16 => .bits16,
@@ -7165,7 +5570,7 @@ pub const MachOState = struct {
         if (evaluated.writeback) self.setReg(d.dst_reg, size, evaluated.value);
     }
 
-    fn executeHighwayMemoryBinary(
+    pub fn executeHighwayMemoryBinary(
         self: *MachOState,
         d: DecodedInsn,
         op: x64_decoder.highway.BinaryOp,
@@ -7187,7 +5592,7 @@ pub const MachOState = struct {
         if (evaluated.write_memory) self.writeMemVal(d.addr, size, evaluated.value);
     }
 
-    fn executeHighwayImmediate(self: *MachOState, d: DecodedInsn, op: x64_decoder.highway.BinaryOp, size: Size, memory: bool) void {
+    pub fn executeHighwayImmediate(self: *MachOState, d: DecodedInsn, op: x64_decoder.highway.BinaryOp, size: Size, memory: bool) void {
         const width: x64_decoder.highway.Width = switch (size) {
             .bits8 => .bits8,
             .bits16 => .bits16,
@@ -7206,7 +5611,7 @@ pub const MachOState = struct {
         }
     }
 
-    fn setFlag(self: *MachOState, flag: u32, enabled: bool) void {
+    pub fn setFlag(self: *MachOState, flag: u32, enabled: bool) void {
         if (enabled) {
             self.regs.rflags |= flag;
         } else {
@@ -7214,14 +5619,14 @@ pub const MachOState = struct {
         }
     }
 
-    fn executeBtrRegister(self: *MachOState, d: DecodedInsn) void {
+    pub fn executeBtrRegister(self: *MachOState, d: DecodedInsn) void {
         const value = self.regVal(d.dst_reg, d.size);
         const result = x64_decoder.bitTestAndResetRegister(d.size, value, self.regVal(d.src_reg, d.size));
         self.setFlag(RFL_CF, result.carry);
         self.setReg(d.dst_reg, d.size, result.value);
     }
 
-    fn executeBtrMemory(self: *MachOState, d: DecodedInsn) void {
+    pub fn executeBtrMemory(self: *MachOState, d: DecodedInsn) void {
         const operand = x64_decoder.bitTestMemoryOperand(d.size, d.addr, self.regVal(d.src_reg, d.size)) orelse {
             self.faulted = true;
             self.terminated = true;
@@ -7243,31 +5648,16 @@ pub const MachOState = struct {
         self.terminateForGuestAccess(check.address, check.bytes, access, instruction);
     }
 
-    fn bitWidth(size: Size) u7 {
-        return switch (size) {
-            .bits8 => 8,
-            .bits16 => 16,
-            .bits32 => 32,
-            .bits64 => 64,
-        };
+    pub fn bitWidth(size: Size) u7 {
+        return execution_helpers.bitWidth(size);
     }
 
-    fn maskForSize(size: Size) u64 {
-        return switch (size) {
-            .bits8 => 0xFF,
-            .bits16 => 0xFFFF,
-            .bits32 => 0xFFFF_FFFF,
-            .bits64 => 0xFFFF_FFFF_FFFF_FFFF,
-        };
+    pub fn maskForSize(size: Size) u64 {
+        return execution_helpers.maskForSize(size);
     }
 
-    fn signBitForSize(size: Size) u64 {
-        return switch (size) {
-            .bits8 => 0x80,
-            .bits16 => 0x8000,
-            .bits32 => 0x8000_0000,
-            .bits64 => 0x8000_0000_0000_0000,
-        };
+    pub fn signBitForSize(size: Size) u64 {
+        return execution_helpers.signBitForSize(size);
     }
 
     fn arithmeticShiftRight(value: u64, size: Size, count: u6) u64 {
@@ -7371,1137 +5761,76 @@ pub const MachOState = struct {
         machoCapturePrint("ROSETTE: setupMachOState complete - RIP set to 0x{x}\n", .{self.regs.rip});
     }
 
-    fn initializerAbi(self: *const MachOState) initialization_resolution.AbiSnapshot {
-        return .{
-            .rsp = self.regs.rsp,
-            .rbx = self.regs.rbx,
-            .rbp = self.regs.rbp,
-            .r12 = self.regs.r12,
-            .r13 = self.regs.r13,
-            .r14 = self.regs.r14,
-            .r15 = self.regs.r15,
-        };
+    pub fn initializerAbi(self: *const MachOState) initialization_resolution.AbiSnapshot {
+        return initializers.initializerAbi(self);
     }
 
-    fn beginInitializerTransaction(self: *MachOState) void {
-        self.initializer_memory.begin();
-        self.initializer_checkpoint = .{
-            .heap_next = self.heap_next,
-            .compat = self.compat,
-            .monotonic_nanoseconds = self.guest_time.now(),
-            .ios_xalloc_next = self.ios_xalloc_next,
-            .cxxopts_split_accelerations = self.cxxopts_split_accelerations,
-            .guest_errno_address = self.guest_errno_address,
-        };
+    pub fn beginInitializerTransaction(self: *MachOState) void {
+        initializers.beginInitializerTransaction(self);
     }
 
-    fn rollbackInitializerTransaction(self: *MachOState) bool {
-        const checkpoint = self.initializer_checkpoint orelse return false;
-        const complete = self.initializer_memory.rollback(self.mem);
-        self.heap_next = checkpoint.heap_next;
-        self.compat = checkpoint.compat;
-        self.guest_time.monotonic_ns = checkpoint.monotonic_nanoseconds;
-        self.ios_xalloc_next = checkpoint.ios_xalloc_next;
-        self.cxxopts_split_accelerations = checkpoint.cxxopts_split_accelerations;
-        self.guest_errno_address = checkpoint.guest_errno_address;
-        self.initializer_checkpoint = null;
-        return complete;
+    pub fn rollbackInitializerTransaction(self: *MachOState) bool {
+        return initializers.rollbackInitializerTransaction(self);
     }
 
-    fn commitInitializerTransaction(self: *MachOState) bool {
-        if (self.initializer_checkpoint == null) return false;
-        self.initializer_checkpoint = null;
-        return self.initializer_memory.commit();
+    pub fn commitInitializerTransaction(self: *MachOState) bool {
+        return initializers.commitInitializerTransaction(self);
     }
 
-    fn runOneInitializer(self: *MachOState, launch_regs: Regs, index: usize, is_retry: bool) InitializerRunOutcome {
-        const address = self.metadata.initializer_addresses[index];
-        const nearest_symbol = self.metadata.nearestSymbol(address);
-        const symbol_name = if (nearest_symbol) |symbol| symbol.name else "<unknown>";
-        self.regs = launch_regs;
-        self.initializer_abort_requested = false;
-        self.initializer_abort_reason = .none;
-        // Clear the guard tracker for a fresh initializer run
-        self.guard_rollback.reset();
-
-        if (is_retry) {
-            if (!self.initializer_resolver.retry(
-                index,
-                self.initializerAbi(),
-                self.unresolved_import_count,
-                self.guest_assertion_count,
-            )) return .failed;
-        } else {
-            if (!self.initializer_resolver.begin(
-                index,
-                address,
-                symbol_name,
-                self.initializerAbi(),
-                self.unresolved_import_count,
-                self.guest_assertion_count,
-            )) {
-                self.faulted = true;
-                self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.initializer_transaction_failure);
-                self.terminated = true;
-                return .failed;
-            }
-        }
-
-        self.beginInitializerTransaction();
-
-        if (!self.isExecutableAddress(address)) {
-            machoCapturePrint(
-                "macho-processor: initializer [{d}/{d}] has invalid target 0x{x}\n",
-                .{ index + 1, self.metadata.initializer_addresses.len, address },
-            );
-            self.faulted = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
-            self.terminated = true;
-            _ = self.rollbackInitializerTransaction();
-            self.initializer_resolver.fail(
-                .invalid_target,
-                0,
-                self.initializerAbi(),
-                self.unresolved_import_count,
-                self.guest_assertion_count,
-            );
-            return .failed;
-        }
-
-        // Log vtable state at start of each attempt so we can correlate
-        // write-protection recoveries across retries of the same initializer.
-        machoCapturePrint(
-            "macho-processor: running initializer [{d}/{d}] {s}+0x{x} vtable(write_protections={d} recoveries={d} detections={d} guards={d})\n",
-            .{
-                index + 1,
-                self.metadata.initializer_addresses.len,
-                symbol_name,
-                if (nearest_symbol) |item| item.offset else address,
-                self.vtable_tracker.live_vtable_write_protections,
-                self.vtable_tracker.live_vtable_guard_recoveries,
-                self.vtable_tracker.heap_corruption_detections,
-                self.guard_rollback.count(),
-            },
-        );
-
-        // Flush log before executing the initializer so diagnostics from a
-        // crash are captured even without explicit fsync calls between lines.
-        macho_log.checkPointSync();
-
-        self.push(INITIALIZER_RETURN_SENTINEL);
-        self.regs.rip = address;
-
-        var steps: u64 = 0;
-        while (!self.terminated and !self.initializer_abort_requested and
-            self.regs.rip != INITIALIZER_RETURN_SENTINEL and steps < INITIALIZER_STEP_LIMIT) : (steps +|= 1)
-        {
-            if (!self.step()) break;
-        }
-        if (self.initializer_abort_requested) {
-            const final_abi = self.initializerAbi();
-            const deferral_reason = self.initializer_abort_reason;
-            const deferral_attempt = if (self.initializer_resolver.current()) |record| record.attempts else 0;
-            if (!self.rollbackInitializerTransaction()) {
-                self.initializer_resolver.fail(
-                    .transaction_failed,
-                    steps,
-                    final_abi,
-                    self.unresolved_import_count,
-                    self.guest_assertion_count,
-                );
-                self.faulted = true;
-                self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.initializer_transaction_failure);
-                self.terminated = true;
-                return .failed;
-            }
-            // Clear all __cxa_guard variables acquired during this initializer run
-            // so the retry starts from a clean initialization state.
-            {
-                const cleared_count = self.guard_rollback.clearAndReset(self, struct {
-                    fn writeByte(ctx: *anyopaque, addr: u64, off: u64, val: u8) bool {
-                        const st: *MachOState = @ptrCast(@alignCast(ctx));
-                        if (st.guestMemory(addr, 8)) |bytes| {
-                            bytes[@as(usize, @intCast(off))] = val;
-                            return true;
-                        }
-                        return false;
-                    }
-                }.writeByte);
-                if (cleared_count > 0) {
-                    machoCapturePrint(
-                        "macho-processor: initializer [{d}/{d}] cleared {d} guard(s) on deferral vtable(protections={d} recoveries={d} detections={d})\n",
-                        .{
-                            index + 1,
-                            self.metadata.initializer_addresses.len,
-                            cleared_count,
-                            self.vtable_tracker.live_vtable_write_protections,
-                            self.vtable_tracker.live_vtable_guard_recoveries,
-                            self.vtable_tracker.heap_corruption_detections,
-                        },
-                    );
-                }
-            }
-
-            // Flush log before deferring the initializer so diagnostics
-            // from guard clearing are captured even if the process crashes.
-            macho_log.checkPointSync();
-
-            self.initializer_resolver.deferCurrent(
-                steps,
-                final_abi,
-                self.unresolved_import_count,
-                self.guest_assertion_count,
-                deferral_reason,
-            );
-            self.initializer_abort_requested = false;
-            self.initializer_abort_reason = .none;
-
-            if (deferral_reason != .runtime_dependency or deferral_attempt <= 1) {
-                machoCapturePrint(
-                    "macho-processor: deferred initializer [{d}/{d}] {s} reason={s}\n",
-                    .{ index + 1, self.metadata.initializer_addresses.len, symbol_name, @tagName(deferral_reason) },
-                );
-            }
-            return .deferred;
-        }
-        if (self.terminated) {
-            const final_abi = self.initializerAbi();
-            machoCapturePrint(
-                "macho-processor: initializer [{d}/{d}] terminated at rip=0x{x} reason={s} exit_code=0x{x} vtable(protections={d} recoveries={d} detections={d})\n",
-                .{
-                    index + 1,
-                    self.metadata.initializer_addresses.len,
-                    self.regs.rip,
-                    @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)),
-                    self.exit_code,
-                    self.vtable_tracker.live_vtable_write_protections,
-                    self.vtable_tracker.live_vtable_guard_recoveries,
-                    self.vtable_tracker.heap_corruption_detections,
-                },
-            );
-            macho_log.checkPointSync();
-            self.dumpRecentTrace();
-            _ = self.rollbackInitializerTransaction();
-            self.initializer_resolver.fail(
-                .terminated,
-                steps,
-                final_abi,
-                self.unresolved_import_count,
-                self.guest_assertion_count,
-            );
-            machoCapturePrint(
-                "macho-processor: initializer [{d}/{d}] failed at {s}+0x{x}\n",
-                .{ index + 1, self.metadata.initializer_addresses.len, symbol_name, if (nearest_symbol) |item| item.offset else address },
-            );
-            return .failed;
-        }
-        if (self.regs.rip != INITIALIZER_RETURN_SENTINEL) {
-            const final_abi = self.initializerAbi();
-            machoCapturePrint(
-                "macho-processor: initializer [{d}/{d}] exceeded {d} steps at {s}+0x{x}; terminal_rip=0x{x}\n",
-                .{ index + 1, self.metadata.initializer_addresses.len, INITIALIZER_STEP_LIMIT, symbol_name, if (nearest_symbol) |item| item.offset else address, self.regs.rip },
-            );
-            macho_log.checkPointSync();
-            self.dumpRecentTrace();
-            _ = self.rollbackInitializerTransaction();
-            // Clear all __cxa_guard variables acquired during this initializer run
-            // so the retry starts from a clean initialization state.
-            {
-                const cleared_count = self.guard_rollback.clearAndReset(self, struct {
-                    fn writeByte(ctx: *anyopaque, addr: u64, off: u64, val: u8) bool {
-                        const st: *MachOState = @ptrCast(@alignCast(ctx));
-                        if (st.guestMemory(addr, 8)) |bytes| {
-                            bytes[@as(usize, @intCast(off))] = val;
-                            return true;
-                        }
-                        return false;
-                    }
-                }.writeByte);
-                if (cleared_count > 0) {
-                    machoCapturePrint(
-                        "macho-processor: initializer [{d}/{d}] cleared {d} guard(s) on deferral\n",
-                        .{ index + 1, self.metadata.initializer_addresses.len, cleared_count },
-                    );
-                }
-            }
-            self.initializer_resolver.deferCurrent(
-                steps,
-                final_abi,
-                self.unresolved_import_count,
-                self.guest_assertion_count,
-                .step_limit,
-            );
-            machoCapturePrint(
-                "macho-processor: deferred initializer [{d}/{d}] {s} after step limit vtable(protections={d} recoveries={d} detections={d})\n",
-                .{
-                    index + 1,
-                    self.metadata.initializer_addresses.len,
-                    symbol_name,
-                    self.vtable_tracker.live_vtable_write_protections,
-                    self.vtable_tracker.live_vtable_guard_recoveries,
-                    self.vtable_tracker.heap_corruption_detections,
-                },
-            );
-            return .deferred;
-        }
-
-        const final_abi = self.initializerAbi();
-        if (!self.commitInitializerTransaction()) {
-            self.initializer_resolver.fail(
-                .transaction_failed,
-                steps,
-                final_abi,
-                self.unresolved_import_count,
-                self.guest_assertion_count,
-            );
-            self.faulted = true;
-            self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.initializer_transaction_failure);
-            self.terminated = true;
-            return .failed;
-        }
-
-        const degraded_before = self.initializer_resolver.degraded;
-        self.initializer_resolver.finish(
-            steps,
-            final_abi,
-            self.unresolved_import_count,
-            self.guest_assertion_count,
-        );
-        if (self.strict_initializers and self.initializer_resolver.degraded != degraded_before) {
-            machoCapturePrint(
-                "macho-processor: strict initializer mode rejected [{d}/{d}] {s}\n",
-                .{ index + 1, self.metadata.initializer_addresses.len, symbol_name },
-            );
-            self.faulted = true;
-            self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
-            self.terminated = true;
-            return .failed;
-        }
-        return .completed;
+    pub fn runOneInitializer(self: *MachOState, launch_regs: Regs, index: usize, is_retry: bool) InitializerRunOutcome {
+        return initializers.runOneInitializer(self, launch_regs, index, is_retry);
     }
 
-    fn runInitializers(self: *MachOState) bool {
-        if (self.metadata.initializer_addresses.len == 0) return true;
-
-        const launch_regs = self.regs;
-        self.export_table_lc.enterPhase(.initializers_in_progress);
-
-        var pending: std.ArrayList(usize) = .empty;
-        defer pending.deinit(self.allocator);
-        var next_pending: std.ArrayList(usize) = .empty;
-        defer next_pending.deinit(self.allocator);
-
-        for (self.metadata.initializer_addresses, 0..) |_, index| {
-            switch (self.runOneInitializer(launch_regs, index, false)) {
-                .completed => {},
-                .deferred => pending.append(self.allocator, index) catch return false,
-                .failed => return false,
-            }
-            if ((index + 1) % 50 == 0 or index + 1 == self.metadata.initializer_addresses.len) {
-                machoCapturePrint(
-                    "macho-processor: processed initializer {d}/{d}\n",
-                    .{ index + 1, self.metadata.initializer_addresses.len },
-                );
-            }
-        }
-
-        self.export_table_lc.enterPhase(.exports_resolved);
-
-        if (pending.items.len != 0) {
-            var growth_buf: [4]export_table_lifecycle.VectorGrowthRequest = undefined;
-            const growth_count = self.export_table_lc.popGrowthRequests(&growth_buf);
-            if (growth_count > 0) {
-                machoCapturePrint(
-                    "macho-processor: pre-populating {d} export vector(s) before retry pass\n",
-                    .{growth_count},
-                );
-            }
-            for (growth_buf[0..growth_count]) |req| {
-                const var_name = std.mem.sliceTo(&req.variable_name, 0);
-                const current_size = if (self.guestMemoryConst(req.vector_address, 16) != null)
-                    self.read32(req.vector_address)
-                else
-                    0;
-                machoCapturePrint(
-                    "macho-processor:   pre-populating vector={s} at 0x{x} current_size={d} needed_size={d} element_size={d}\n",
-                    .{ var_name, req.vector_address, current_size, req.needed_size, req.element_size },
-                );
-                if (current_size >= req.needed_size) {
-                    machoCapturePrint(
-                        "macho-processor:   vector already has enough entries ({d} >= {d}); skipping growth\n",
-                        .{ current_size, req.needed_size },
-                    );
-                    continue;
-                }
-                if (current_size > 0) {
-                    machoCapturePrint(
-                        "macho-processor:   vector has {d} entries but needs {d}; growing\n",
-                        .{ current_size, req.needed_size },
-                    );
-                }
-                const dummy_item = self.memory_forwarder.allocate(self, req.element_size, 16) orelse {
-                    machoCapturePrint(
-                        "macho-processor:   failed to allocate dummy item for vector pre-population\n",
-                        .{},
-                    );
-                    continue;
-                };
-                {
-                    const slice = self.guestMemory(dummy_item, req.element_size) orelse {
-                        machoCapturePrint(
-                            "macho-processor:   dummy item memory not writable after allocation\n",
-                            .{},
-                        );
-                        continue;
-                    };
-                    @memset(slice, 0);
-                }
-                const item_addr = dummy_item;
-                var append_count: u32 = 0;
-                while (self.read32(req.vector_address) < req.needed_size) {
-                    if (!self.appendTrivialVector(req.vector_address, item_addr, req.element_size, req.needed_size)) {
-                        machoCapturePrint(
-                            "macho-processor:   appendTrivialVector failed after {d} appends\n",
-                            .{append_count},
-                        );
-                        break;
-                    }
-                    append_count += 1;
-                }
-                machoCapturePrint(
-                    "macho-processor:   vector pre-population: appended {d} entries, new size={d}\n",
-                    .{ append_count, self.read32(req.vector_address) },
-                );
-            }
-        }
-
-        var retry_round: u8 = 0;
-        while (pending.items.len != 0 and retry_round < 3) : (retry_round += 1) {
-            self.export_table_lc.retry_pass = retry_round + 1;
-            machoCapturePrint(
-                "macho-processor: retrying {d} deferred initializer(s), pass {d}\n",
-                .{ pending.items.len, retry_round + 1 },
-            );
-            for (pending.items) |index| {
-                switch (self.runOneInitializer(launch_regs, index, true)) {
-                    .completed => {},
-                    .deferred => next_pending.append(self.allocator, index) catch return false,
-                    .failed => return false,
-                }
-            }
-            self.export_table_lc.onRetryPass(retry_round + 1);
-            pending.clearRetainingCapacity();
-            std.mem.swap(std.ArrayList(usize), &pending, &next_pending);
-        }
-
-        if (pending.items.len != 0) {
-            machoCapturePrint(
-                "macho-processor: {d} initializer(s) remained deferred after 3 retry passes\n",
-                .{pending.items.len},
-            );
-            self.faulted = true;
-            self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unresolved_import_result);
-            self.terminated = true;
-            return false;
-        }
-
-        self.regs = launch_regs;
-        return true;
+    pub fn runInitializers(self: *MachOState) bool {
+        return initializers.runInitializers(self);
     }
 
-    fn appendTrivialVector(self: *MachOState, vector: u64, item: u64, element_size: u64, minimum_capacity: u32) bool {
-        const header_size: u64 = 16;
-        if (element_size == 0 or self.guestMemory(vector, header_size) == null or self.guestMemoryConst(item, element_size) == null) {
-            const bad_address = if (self.guestMemory(vector, header_size) == null) vector else item;
-            self.terminateForGuestAccess(bad_address, @intCast(@min(@max(element_size, header_size), std.math.maxInt(u8))), .read, "trivial_vector_push_back");
-            return false;
-        }
-
-        const size = self.read32(vector);
-        var capacity = self.read32(vector + 4);
-        var data = self.read64(vector + 8);
-        const storage_is_valid = data != 0 and capacity >= size and
-            self.guestMemoryConst(data, @as(u64, capacity) * element_size) != null;
-
-        // A non-empty vector without backing storage cannot be repaired without
-        // inventing missing elements. Stop at the violated invariant instead
-        // of allowing a later near-null dereference to obscure the cause.
-        if (size != 0 and !storage_is_valid) {
-            self.terminateForGuestAccess(data, @intCast(@min(element_size, std.math.maxInt(u8))), .read, "trivial_vector_invalid_storage");
-            return false;
-        }
-
-        if (!storage_is_valid or size == capacity) {
-            const requested = size +| 1;
-            const grown = if (capacity == 0) minimum_capacity else capacity +| capacity / 2;
-            const new_capacity = @max(requested, grown);
-            const allocation_size = std.math.mul(u64, new_capacity, element_size) catch {
-                self.terminated = true;
-                self.faulted = true;
-                self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-                return false;
-            };
-            const new_data = self.memory_forwarder.allocate(self, allocation_size, 16) orelse {
-                self.terminated = true;
-                self.faulted = true;
-                self.exit_code = UNSUPPORTED_RUNTIME_EXIT_CODE;
-                return false;
-            };
-            if (size != 0) {
-                const used = @as(u64, size) * element_size;
-                const source = self.guestMemoryConst(data, used) orelse return false;
-                const destination = self.guestMemory(new_data, used) orelse return false;
-                std.mem.copyForwards(u8, destination, source);
-                self.memory_forwarder.release(data);
-                self.vtable_tracker.forgetAddress(data);
-            }
-            data = new_data;
-            capacity = new_capacity;
-            self.write32(vector + 4, capacity);
-            self.write64(vector + 8, data);
-        }
-
-        const destination_address = data + @as(u64, size) * element_size;
-        const source = self.guestMemoryConst(item, element_size) orelse return false;
-        const destination = self.guestMemory(destination_address, element_size) orelse return false;
-        std.mem.copyForwards(u8, destination, source);
-        self.write32(vector, size +| 1);
-        return true;
+    pub fn appendTrivialVector(self: *MachOState, vector: u64, item: u64, element_size: u64, minimum_capacity: u32) bool {
+        return initializers.appendTrivialVector(self, vector, item, element_size, minimum_capacity);
     }
 
-    fn handleLibcppBasicStringSubstr(self: *MachOState) bool {
-        const entry = self.internal_targets.libcxx_basic_string_substr;
-        if (entry == 0 or self.regs.rip != entry) return false;
-
-        const destination = self.regs.rdi;
-        const source_object = self.regs.rsi;
-        const position = self.regs.rdx;
-        const count = self.regs.rcx;
-        const source_view = compat_runtime.libcppStringView(self, source_object) orelse {
-            machoCapturePrint(
-                "macho-processor: libc++ basic_string::substr rejected unreadable source object=0x{x} destination=0x{x}\n",
-                .{ source_object, destination },
-            );
-            return false;
-        };
-        if (source_view.length > 1 << 20 or
-            self.guestMemoryConst(source_view.address, source_view.length) == null)
-        {
-            machoCapturePrint(
-                "macho-processor: libc++ basic_string::substr rejected corrupt source: object=0x{x} data=0x{x} length={d} pos={d} count={d}\n",
-                .{ source_object, source_view.address, source_view.length, position, count },
-            );
-            return false;
-        }
-        if (position > source_view.length) {
-            // Preserve libc++'s std::out_of_range path instead of converting a
-            // programming error into a different string.
-            machoCapturePrint(
-                "macho-processor: libc++ basic_string::substr out-of-range delegated to guest: source_length={d} pos={d} count={d}\n",
-                .{ source_view.length, position, count },
-            );
-            return false;
-        }
-
-        const source_bytes = self.guestMemoryConst(source_view.address, source_view.length).?;
-        const profile_device = std.mem.startsWith(u8, source_bytes, "User_") and
-            std.mem.endsWith(u8, source_bytes, ":");
-        var preview_buffer: [256]u8 = undefined;
-        const preview_length = @min(source_bytes.len, preview_buffer.len);
-        @memcpy(preview_buffer[0..preview_length], source_bytes[0..preview_length]);
-        const preview = preview_buffer[0..preview_length];
-        const result_length = compat_runtime.substringLibcppString(
-            self,
-            destination,
-            source_object,
-            position,
-            count,
-        ) orelse return false;
-        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
-        const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        const vfs_resolution = if (caller) |symbol|
-            std.mem.indexOf(u8, symbol.name, "VirtualFileSystem11ResolvePath") != null
-        else
-            false;
-        self.libcxx_string_substr_fast_paths +|= 1;
-        if (self.libcxx_string_substr_fast_paths <= 16 or vfs_resolution or profile_device) {
-            machoCapturePrint(
-                "macho-processor: libc++ basic_string::substr fast path #{d}: source_object=0x{x} destination=0x{x} source_length={d} pos={d} count={d} result_length={d} caller=0x{x} {s}+0x{x} source='{s}'\n",
-                .{ self.libcxx_string_substr_fast_paths, source_object, destination, source_view.length, position, count, result_length, return_address, if (caller) |symbol| symbol.name else "<unknown>", if (caller) |symbol| symbol.offset else 0, preview },
-            );
-        }
-        if (vfs_resolution) {
-            machoCapturePrint(
-                "macho-processor: VFS relative-path checkpoint: mount_length={d} normalized_length={d} relative_length={d} root_resolution={}; HostPathDevice must receive only this suffix, never the User_<profile-id>: prefix\n",
-                .{ position, source_view.length, result_length, result_length == 0 },
-            );
-        }
-        if (profile_device and position == source_view.length and result_length == 0) {
-            machoCapturePrint(
-                "macho-processor: profile device root normalized successfully: source='{s}' pos==size and substr result is empty; ResolvePath should now return the mounted HostPathDevice root before Account child lookup\n",
-                .{preview},
-            );
-            if (profileIdFromUserDevice(preview)) |profile_id| {
-                self.logProfileHostPreflight(profile_id);
-            }
-        }
-
-        self.regs.rax = destination;
-        self.regs.rip = self.pop();
-        return true;
+    pub fn handleLibcppBasicStringSubstr(self: *MachOState) bool {
+        return compat_handlers.handleLibcppBasicStringSubstr(self);
     }
 
-    fn handleInternalCompatibility(self: *MachOState) bool {
-        if (self.handleLibcppBasicStringSubstr()) return true;
-        if (self.handleLocalLibcppStreamCompatibility()) return true;
-        // Xenia's backend dispatches through a host-populated CPU feature
-        // detector. Under guest execution that dispatch table has no host
-        // implementation, leaving its first slot null. The function is void;
-        // completing it here preserves the backend's portable fallback path.
-        if (self.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info != 0 and
-            self.regs.rip == self.internal_targets.xenia_cpu_feature_detector_initialize_cpu_info)
-        {
-            machoCapturePrint("macho-processor: modeled x64 CPU feature detection\n", .{});
-            self.regs.rip = self.pop();
-            return true;
-        }
-        // A presentation provider is intentionally absent when the guest's
-        // Vulkan probe finds no compatible surface. Let its caller observe a
-        // null device rather than dereferencing the absent provider as `this`.
-        if (self.internal_targets.xenia_vulkan_provider_vulkan_device != 0 and
-            self.regs.rip == self.internal_targets.xenia_vulkan_provider_vulkan_device and
-            self.regs.rdi == 0)
-        {
-            machoCapturePrint("macho-processor: Vulkan provider unavailable; returning null Vulkan device\n", .{});
-            self.regs.rax = 0;
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.page_entry_construct_at_end != 0 and
-            self.regs.rip == self.internal_targets.page_entry_construct_at_end and
-            self.handlePageEntryBulkInitialization())
-        {
-            return true;
-        }
-        if (self.internal_targets.imgui_settings_push_back != 0 and
-            self.regs.rip == self.internal_targets.imgui_settings_push_back)
-        {
-            _ = self.appendTrivialVector(self.regs.rdi, self.regs.rsi, 0x48, 8);
-            if (!self.terminated) self.regs.rip = self.pop();
-            return true;
-        }
-        // ImGui::MemAlloc dispatches through a writable global callback. Model
-        // the stable allocator boundary directly while dyld data bindings are
-        // synthetic, preventing Size > 0 / Data == null container states.
-        if (self.internal_targets.imgui_mem_alloc != 0 and
-            self.regs.rip == self.internal_targets.imgui_mem_alloc)
-        {
-            self.regs.rax = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0;
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.imgui_mem_free != 0 and
-            self.regs.rip == self.internal_targets.imgui_mem_free)
-        {
-            self.memory_forwarder.release(self.regs.rdi);
-            self.vtable_tracker.forgetAddress(self.regs.rdi);
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.imgui_default_malloc != 0 and
-            self.regs.rip == self.internal_targets.imgui_default_malloc)
-        {
-            self.regs.rax = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0;
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.imgui_default_free != 0 and
-            self.regs.rip == self.internal_targets.imgui_default_free)
-        {
-            self.memory_forwarder.release(self.regs.rdi);
-            self.vtable_tracker.forgetAddress(self.regs.rdi);
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.parse_launch_arguments != 0 and
-            self.regs.rip == self.internal_targets.parse_launch_arguments)
-        {
-            self.startup.enter(.launch_arguments, self.executed_steps);
-            self.capturePositionalLaunchOptions();
-        }
-        if (self.internal_targets.initialize_logging != 0 and
-            self.regs.rip == self.internal_targets.initialize_logging)
-        {
-            self.startup.enter(.logging, self.executed_steps);
-            const app_name = self.guestMemoryConst(self.regs.rdi, @min(self.regs.rsi, 1024)) orelse "";
-            if (self.logging.initialize(app_name)) {
-                if (self.guest_log_buffer_address == 0) {
-                    self.guest_log_buffer_address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return false;
-                }
-                self.regs.rip = self.pop();
-                self.startup.enter(.logging_ready, self.executed_steps);
-                return true;
-            }
-        }
-        if (self.internal_targets.shutdown_logging != 0 and
-            self.regs.rip == self.internal_targets.shutdown_logging and
-            self.logging.shutdown())
-        {
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.handleGuestLogBridge()) return true;
-        for (self.internal_targets.cvar_add_to_launch_options[0..self.internal_targets.cvar_add_to_launch_options_count]) |target| {
-            if (self.regs.rip != target) continue;
-            const view = compat_runtime.libcppStringView(self, self.regs.rdi + 8) orelse return false;
-            const name = self.guestMemoryConst(view.address, view.length) orelse return false;
-            if (self.launch_options.shouldRegister(name)) return false;
-            if (self.launch_options.registrations_skipped == 1 or
-                self.launch_options.registrations_skipped % 100 == 0)
-            {
-                machoCapturePrint(
-                    "macho-processor: launch option fast path skipped {d} unused registration(s); latest={s}\n",
-                    .{ self.launch_options.registrations_skipped, name },
-                );
-            }
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.cxxopts_split_option_names != 0 and
-            self.regs.rip == self.internal_targets.cxxopts_split_option_names)
-        {
-            return self.handleCxxoptsSplitOptionNames();
-        }
-        if (self.internal_targets.libcxx_basic_streambuf_pubsetbuf != 0 and
-            self.regs.rip == self.internal_targets.libcxx_basic_streambuf_pubsetbuf)
-        {
-            self.regs.rax = self.libcxx_streams.handlePubsetbuf(self.regs.rdi, self.regs.rsi, self.regs.rdx);
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.libcxx_basic_ifstream_default_constructor != 0 and
-            self.regs.rip == self.internal_targets.libcxx_basic_ifstream_default_constructor)
-        {
-            if (!self.libcxx_streams.constructIfstream(self, self.regs.rdi)) return false;
-            self.regs.rax = self.regs.rdi;
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if ((self.internal_targets.libcxx_basic_ifstream_destructor_1 != 0 and
-            self.regs.rip == self.internal_targets.libcxx_basic_ifstream_destructor_1) or
-            (self.internal_targets.libcxx_basic_ifstream_destructor_2 != 0 and
-                self.regs.rip == self.internal_targets.libcxx_basic_ifstream_destructor_2))
-        {
-            self.libcxx_streams.destroyIfstream(self, self.regs.rdi);
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if ((self.internal_targets.libcxx_getline != 0 and self.regs.rip == self.internal_targets.libcxx_getline) or
-            (self.internal_targets.libcxx_getline_delimiter != 0 and self.regs.rip == self.internal_targets.libcxx_getline_delimiter))
-        {
-            const delimiter: u8 = if (self.regs.rip == self.internal_targets.libcxx_getline_delimiter) @truncate(self.regs.rdx) else '\n';
-            _ = self.libcxx_streams.readLine(self, self.regs.rdi, self.regs.rsi, delimiter);
-            self.regs.rax = self.regs.rdi;
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.print_config_to_log != 0 and
-            self.regs.rip == self.internal_targets.print_config_to_log)
-        {
-            self.startup.enter(.config_load, self.executed_steps);
-            if (self.diagnostic_text.buildConfigDump(self, &self.fs_forwarder, self.regs.rdi)) |dump| {
-                const emitted = self.emitGuestLog('i', dump.address, dump.length);
-                self.logging.recordEmission(dump.length, emitted);
-                self.regs.rip = self.pop();
-                return true;
-            }
-        }
-        return false;
+    pub fn handleInternalCompatibility(self: *MachOState) bool {
+        return compat_handlers.handleInternalCompatibility(self);
     }
 
-    fn handlePageEntryBulkInitialization(self: *MachOState) bool {
-        const split_buffer = self.regs.rdi;
-        const count = self.regs.rsi;
-        if (self.guestMemoryConst(split_buffer, 32) == null) return false;
-
-        const begin = self.read64(split_buffer + 8);
-        const end = self.read64(split_buffer + 16);
-        const capacity_end = self.read64(split_buffer + 24);
-        if (begin == 0 or end < begin or capacity_end < end) return false;
-
-        const range = calculateBulkConstructionRange(begin, end, capacity_end, count, 16) orelse return false;
-        if (range.byte_count != 0) {
-            const destination = self.guestMemory(end, range.byte_count) orelse return false;
-            @memset(destination, 0);
-        }
-        self.write64(split_buffer + 16, range.new_end);
-        self.page_entry_bulk_initializations +|= 1;
-        self.page_entry_bulk_bytes +|= range.byte_count;
-        const return_address = self.read64(self.regs.rsp);
-        const caller = self.metadata.nearestSymbol(return_address);
-        machoCapturePrint(
-            "macho-processor: bulk default construction: PageEntry count={d} bytes={d} range=0x{x}-0x{x} return={s}+0x{x}\n",
-            .{ count, range.byte_count, end, range.new_end, if (caller) |resolved| resolved.name else "<unknown>", if (caller) |resolved| resolved.offset else 0 },
-        );
-        self.regs.rip = self.pop();
-        return !self.terminated;
+    pub fn handlePageEntryBulkInitialization(self: *MachOState) bool {
+        return compat_handlers.handlePageEntryBulkInitialization(self);
     }
 
-    fn handleLocalLibcppStreamCompatibility(self: *MachOState) bool {
-        const symbol = self.local_libcpp_stream_targets.get(self.regs.rip) orelse return false;
-        const resolution = self.libcxx_streams.dispatch(self, &self.fs_forwarder, symbol) orelse return false;
-        switch (resolution) {
-            .handled => |value| self.regs.rax = value,
-            .handled_void => {},
-        }
-        self.regs.rip = self.pop();
-        return true;
+    pub fn handleLocalLibcppStreamCompatibility(self: *MachOState) bool {
+        return compat_handlers.handleLocalLibcppStreamCompatibility(self);
     }
 
-    fn capturePositionalLaunchOptions(self: *MachOState) void {
-        if (self.positional_options_captured) return;
-        self.positional_options_captured = true;
-
-        const vector = self.regs.r8;
-        const begin = self.read64(vector);
-        const end = self.read64(vector + 8);
-        if (begin == 0 or end < begin or (end - begin) % 24 != 0) {
-            machoCapturePrint("macho-processor: launch option acceleration could not decode positional option vector at 0x{x}\n", .{vector});
-            return;
-        }
-        const count = @min((end - begin) / 24, launch_argument_accelerator.MAX_REQUESTED_OPTIONS);
-        for (0..@as(usize, @intCast(count))) |index| {
-            const object = begin + index * 24;
-            const view = compat_runtime.libcppStringView(self, object) orelse continue;
-            const name = self.guestMemoryConst(view.address, view.length) orelse continue;
-            self.launch_options.request(name);
-            machoCapturePrint("macho-processor: launch option acceleration retained positional option: {s}\n", .{name});
-        }
+    pub fn capturePositionalLaunchOptions(self: *MachOState) void {
+        compat_handlers.capturePositionalLaunchOptions(self);
     }
 
-    fn handleGuestLogBridge(self: *MachOState) bool {
-        if (self.internal_targets.guest_log_get_thread_buffer != 0 and
-            self.regs.rip == self.internal_targets.guest_log_get_thread_buffer)
-        {
-            if (self.guest_log_buffer_address == 0) {
-                self.guest_log_buffer_address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return false;
-                machoCapturePrint(
-                    "macho-processor: synchronous Xenia log bridge enabled at buffer=0x{x}\n",
-                    .{self.guest_log_buffer_address},
-                );
-            }
-            self.regs.rax = self.guest_log_buffer_address;
-            self.regs.rdx = GUEST_LOG_BUFFER_SIZE;
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.guest_log_append_formatted != 0 and
-            self.regs.rip == self.internal_targets.guest_log_append_formatted)
-        {
-            var emitted = false;
-            if (self.guest_log_buffer_address != 0) {
-                emitted = self.emitGuestLog(self.regs.rsi, self.guest_log_buffer_address, self.regs.rdx);
-            }
-            self.logging.recordEmission(self.regs.rdx, emitted);
-            self.regs.rip = self.pop();
-            return true;
-        }
-        if (self.internal_targets.guest_log_append_view != 0 and
-            self.regs.rip == self.internal_targets.guest_log_append_view)
-        {
-            const emitted = self.emitGuestLog(self.regs.rsi, self.regs.rdx, self.regs.rcx);
-            self.logging.recordEmission(self.regs.rcx, emitted);
-            self.regs.rip = self.pop();
-            return true;
-        }
-        return false;
+    pub fn handleGuestLogBridge(self: *MachOState) bool {
+        return compat_handlers.handleGuestLogBridge(self);
     }
 
-    fn handleCxxoptsSplitOptionNames(self: *MachOState) bool {
-        const output = self.regs.rdi;
-        const input = self.regs.rsi;
-        const view = compat_runtime.libcppStringView(self, input) orelse return false;
-        const bytes = self.guestMemoryConst(view.address, view.length) orelse return false;
-        if (bytes.len == 0 or self.guestMemory(output, 24) == null) return false;
-
-        var token_count: u64 = 1;
-        var token_start: usize = 0;
-        for (bytes, 0..) |byte, index| {
-            if (byte != ',') continue;
-            var end = index;
-            while (end > token_start and bytes[end - 1] == ' ') end -= 1;
-            while (token_start < end and bytes[token_start] == ' ') token_start += 1;
-            if (token_start == end) return false;
-            token_count += 1;
-            token_start = index + 1;
-        }
-        var final_end = bytes.len;
-        while (final_end > token_start and bytes[final_end - 1] == ' ') final_end -= 1;
-        while (token_start < final_end and bytes[token_start] == ' ') token_start += 1;
-        if (token_start == final_end) return false;
-
-        const storage_size = std.math.mul(u64, token_count, 24) catch return false;
-        const storage = self.guestAlloc(storage_size, 8) orelse return false;
-        @memset(self.guestMemory(output, 24).?, 0);
-
-        token_start = 0;
-        var token_index: u64 = 0;
-        var cursor: usize = 0;
-        while (cursor <= bytes.len) : (cursor += 1) {
-            if (cursor != bytes.len and bytes[cursor] != ',') continue;
-            var start = token_start;
-            var end = cursor;
-            while (start < end and bytes[start] == ' ') start += 1;
-            while (end > start and bytes[end - 1] == ' ') end -= 1;
-            const object = storage + token_index * 24;
-            if (!compat_runtime.initLibcppString(self, object, view.address + start, end - start)) return false;
-            token_index += 1;
-            token_start = cursor + 1;
-        }
-
-        self.write64(output, storage);
-        self.write64(output + 8, storage + storage_size);
-        self.write64(output + 16, storage + storage_size);
-        self.cxxopts_split_accelerations += 1;
-        if (self.cxxopts_split_accelerations == 1 or self.cxxopts_split_accelerations % 250 == 0) {
-            machoCapturePrint(
-                "macho-processor: cxxopts option-name fast path handled {d} call(s)\n",
-                .{self.cxxopts_split_accelerations},
-            );
-        }
-        self.regs.rax = output;
-        self.regs.rip = self.pop();
-        return true;
+    pub fn handleCxxoptsSplitOptionNames(self: *MachOState) bool {
+        return compat_handlers.handleCxxoptsSplitOptionNames(self);
     }
 
-    fn decodeAt(self: *MachOState) ?DecodedInsn {
-        const instruction_bytes: []const u8 = if (self.sparse_memory.executableBytesConst(self.regs.rip, 16)) |sparse_code|
-            sparse_code
-        else blk: {
-            const off = self.translateGuest(self.regs.rip, 1, .execute) orelse {
-                self.terminateForGuestAccess(self.regs.rip, 1, .execute, "instruction_fetch");
-                return null;
-            };
-            break :blk self.mem[off..];
-        };
-        const cache_hash = self.regs.rip *% 0x9E37_79B9_7F4A_7C15;
-        const cache_index: usize = @intCast(cache_hash >> DECODE_CACHE_HASH_SHIFT);
-        const entry = &self.decode_cache[cache_index];
-        var d: DecodedInsn = if (entry.rip == self.regs.rip and entry.code_generation == self.code_generation) blk: {
-            self.decode_cache_hits += 1;
-            break :blk entry.decoded;
-        } else blk: {
-            self.decode_cache_misses += 1;
-            const decoded = decodeInsn(instruction_bytes);
-            entry.* = .{
-                .rip = self.regs.rip,
-                .code_generation = self.code_generation,
-                .decoded = decoded,
-            };
-            break :blk decoded;
-        };
-
-        const addr_size: Size = if (d.has_0x67) .bits32 else .bits64;
-        if (d.sib_has_index) {
-            const index_val = self.regVal(d.sib_index_reg, addr_size);
-            d.addr +%= index_val << @as(u6, d.sib_scale);
-        }
-        if (d.sib_has_base) {
-            const base_val = self.regVal(d.sib_base_reg, addr_size);
-            d.addr +%= base_val;
-        }
-        if (d.rip_relative) {
-            d.addr +%= self.regs.rip + d.len;
-        }
-
-        return d;
+    pub fn handleTomlAsciiFastPath(self: *MachOState) bool {
+        return compat_handlers.handleTomlAsciiFastPath(self);
     }
 
-    /// toml++'s `is_ascii(const char*, size_t)` is a pure, bounded predicate.
-    /// Xenia's debug build emits an AVX implementation for it.  A valid
-    /// 32-byte patch-file read was repeatedly observed executing that loop for
-    /// tens of millions of guest steps, even though the source buffer and
-    /// length were both verified.  Execute the ABI-equivalent predicate here
-    /// so the parser receives the same result without relying on that faulty
-    /// guest AVX loop.
-    fn handleTomlAsciiFastPath(self: *MachOState) bool {
-        const entry = self.toml_ascii_entry orelse return false;
-        if (self.regs.rip != entry) return false;
-
-        const raw_length = self.regs.rsi;
-        const data_ptr = self.regs.rdi;
-
-        // basic_istream::read() is modeled, but gcount() may execute from a
-        // locally-linked libc++ body. The stream bridge mirrors __gc_ into
-        // guest memory so raw_length is normally the exact block size. Any
-        // mismatch is diagnostic evidence.
-        // For .patch.toml files findPatchTomlByteCount() yields the correct
-        // block size. For all other file types (profiles, etc.) that suffer
-        // from the same buffer_.__size_ corruption, we cannot know the correct
-        // block length; return ascii=false to force the parser's slow path
-        // (codepoint-by-codepoint stream reads) which bypasses the corrupted
-        // size entirely.
-        const expected_length = self.libcxx_streams.findPatchTomlByteCount();
-        const length_mismatch = raw_length > 1024 * 1024 or
-            (expected_length != null and raw_length != expected_length.?);
-        const safe_length: u64 = if (length_mismatch) expected_length orelse 0 else raw_length;
-        const have_bytes = if (length_mismatch and expected_length == null)
-            null
-        else
-            self.guestMemoryConst(data_ptr, safe_length);
-        const ascii = if (have_bytes) |bytes| isAsciiBytes(bytes) else false;
-        if (have_bytes == null and raw_length > 1024 * 1024) {
-            machoCapturePrint(
-                "macho-processor: toml++ is_ascii fast path UNCERTAIN: pointer=0x{x} raw_bytes={d} forced_ascii=false; parser will use slow path\n",
-                .{ data_ptr, raw_length },
-            );
-        } else if (have_bytes == null) {
-            machoCapturePrint(
-                "macho-processor: toml++ is_ascii fast path rejected unreadable input: pointer=0x{x} raw_bytes={d} capped={d}\n",
-                .{ data_ptr, raw_length, safe_length },
-            );
-        } else if (length_mismatch) {
-            machoCapturePrint(
-                "macho-processor: toml++ is_ascii ABI LENGTH MISMATCH: pointer=0x{x} raw={d} expected={?d} bounded={d} ascii={}; no guest parser fields were modified\n",
-                .{ data_ptr, raw_length, expected_length, safe_length, ascii },
-            );
-            self.libcxx_streams.dumpPatchTomlDiagnostics("is_ascii length mismatch");
-        }
-
-        // In this toml++ build, is_ascii() is called by read_next_block()
-        // with its 32-byte raw buffer on the caller's stack. Capture the
-        // verified bytes and the owning reader now, then validate the emitted
-        // utf8_codepoint block at the next read_next() entry. Every address is
-        // checked against both guest memory and the active patch istream.
-        if (!length_mismatch and ascii and safe_length <= TOML_CODEPOINT_CAPACITY and self.regs.rbp >= 0x128) {
-            const reader_slot = self.regs.rbp - 0x128;
-            if (self.guestMemoryConst(reader_slot, 8) != null) {
-                const reader = self.read64(reader_slot);
-                if (reader != 0 and self.guestMemoryConst(reader, TOML_UTF8_READER_MIN_SIZE) != null) {
-                    const istream = self.read64(reader + TOML_READER_ISTREAM_OFFSET);
-                    if (self.libcxx_streams.isActivePatchTomlIstream(istream)) {
-                        var block = TomlAsciiBlock{ .reader = reader, .length = @intCast(safe_length) };
-                        @memcpy(block.bytes[0..block.length], have_bytes.?[0..block.length]);
-                        self.toml_ascii_block = block;
-                        // Checkpoint arming recorded implicitly.
-                    }
-                }
-            }
-        }
-
-        self.regs.rax = @intFromBool(ascii);
-        self.regs.rip = self.pop();
-        self.toml_ascii_fast_paths +|= 1;
-        if (self.toml_ascii_fast_paths <= 8 or self.toml_ascii_fast_paths % 256 == 0) {
-            machoCapturePrint(
-                "macho-processor: toml++ is_ascii fast path #{d}: pointer=0x{x} bytes={d} ascii={} return=0x{x}\n",
-                .{ self.toml_ascii_fast_paths, data_ptr, safe_length, ascii, self.regs.rip },
-            );
-        }
-        return true;
+    pub fn handleTomlReadNextIntegrity(self: *MachOState) void {
+        compat_handlers.handleTomlReadNextIntegrity(self);
     }
 
-    fn handleTomlReadNextIntegrity(self: *MachOState) void {
-        const entry = self.toml_read_next_entry orelse return;
-        if (self.regs.rip != entry) return;
-        const pending = self.toml_ascii_block orelse return;
-        if (pending.validated or self.regs.rdi != pending.reader) return;
-
-        const reader = pending.reader;
-        const expected = pending.bytes[0..pending.length];
-        const storage_length: u64 = @as(u64, pending.length) * @as(u64, TOML_CODEPOINT_STRIDE);
-        const storage = self.guestMemory(reader + TOML_CODEPOINTS_OFFSET, storage_length) orelse {
-            machoCapturePrint(
-                "macho-processor: toml++ ASCII codepoint checkpoint FAILED: reader=0x{x} storage is not writable bytes={d}\n",
-                .{ reader, storage_length },
-            );
-            self.libcxx_streams.dumpPatchTomlDiagnostics("codepoint block unavailable");
-            if (self.toml_ascii_block) |*block| block.validated = true;
-            return;
-        };
-
-        const guest_current = self.read64(reader + TOML_CODEPOINT_CURRENT_OFFSET);
-        const guest_count = self.read64(reader + TOML_CODEPOINT_COUNT_OFFSET);
-        const report = repairAsciiCodepointBlock(storage, expected);
-        if (guest_count != pending.length) {
-            self.write64(reader + TOML_CODEPOINT_COUNT_OFFSET, pending.length);
-        }
-
-        // Codepoint checkpoint details suppressed during normal operation.
-        // dumpPatchTomlDiagnostics emits full I/O trace on fault.
-        if (guest_current > pending.length or guest_count != pending.length or report.scalar_repairs != 0 or report.raw_repairs != 0) {
-            machoCapturePrint(
-                "macho-processor: toml++ codepoint integrity mismatch repaired from host-validated ASCII bytes; current index was left unchanged\n",
-                .{},
-            );
-            self.libcxx_streams.dumpPatchTomlDiagnostics("ASCII codepoint integrity mismatch");
-        }
-        if (self.toml_ascii_block) |*block| block.validated = true;
+    pub fn handlePatchDbEmptyPatchArray(self: *MachOState) bool {
+        return compat_handlers.handlePatchDbEmptyPatchArray(self);
     }
 
-    fn handlePatchDbEmptyPatchArray(self: *MachOState) bool {
-        if (self.regs.rdi != 0 or !self.libcxx_streams.latestPatchSchemaHasEmptyPatchSet()) return false;
-        const symbol = self.metadata.nearestSymbol(self.regs.rip) orelse return false;
-        if (std.mem.indexOf(u8, symbol.name, "PatchDB13ReadPatchFile") == null or symbol.offset != 0x419) return false;
-        const bytes = self.guestMemoryConst(self.regs.rip, 14) orelse return false;
-        if (!isPatchDbNullIsArraySequence(bytes)) return false;
-
-        self.patch_db_empty_array_recoveries +|= 1;
-        self.libcxx_streams.logEmptyPatchCompatibility("empty-patch compatibility");
-        machoCapturePrint(
-            "macho-processor: PatchDB empty-patch compatibility #{d}: rip=0x{x} {s}+0x{x} patch_node=0x0; skipping null virtual is_array() call and selecting Xenia's existing non-array return path at 0x{x}\n",
-            .{ self.patch_db_empty_array_recoveries, self.regs.rip, symbol.name, symbol.offset, self.regs.rip + 14 },
-        );
-        machoCapturePrint(
-            "macho-processor: PatchDB compatibility semantics: equivalent source guard is if (!patch_array || !patch_array->is_array()) return patch_file; parser output and decoded instruction semantics were not modified\n",
-            .{},
-        );
-        self.regs.rax = 0;
-        self.setFlagsLogic(0, .bits8);
-        self.regs.rip += 14;
-        return true;
-    }
-
-    fn logStalledInstructionDetails(self: *MachOState) void {
-        const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse {
-            machoCapturePrint("macho-processor: stuck-pc decode unavailable: rip=0x{x} instruction bytes are unreadable\n", .{self.regs.rip});
-            return;
-        };
-        const decoded = decodeInsn(bytes);
-        const symbol = self.metadata.nearestSymbol(self.regs.rip);
-        self.stalled_instruction_reports +|= 1;
-        machoCapturePrint(
-            "macho-processor: stuck-pc decode #{d}: rip=0x{x} {s}+0x{x} op={s} len={d} bytes={any} regs(rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp/rflags)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}/0x{x}\n",
-            .{
-                self.stalled_instruction_reports,
-                self.regs.rip,
-                if (symbol) |entry| entry.name else "<unknown>",
-                if (symbol) |entry| entry.offset else 0,
-                @tagName(decoded.op),
-                decoded.len,
-                bytes,
-                self.regs.rax,
-                self.regs.rbx,
-                self.regs.rcx,
-                self.regs.rdx,
-                self.regs.rsi,
-                self.regs.rdi,
-                self.regs.rbp,
-                self.regs.rsp,
-                self.regs.rflags,
-            },
-        );
-        self.dumpRecentTrace();
-        machoCapturePrint(
-            "macho-processor: unchanged execution-state capture complete; execution remains active and scheduler recovery is still permitted\n",
-            .{},
-        );
+    pub fn logStalledInstructionDetails(self: *MachOState) void {
+        compat_handlers.logStalledInstructionDetails(self);
     }
 
     fn executionFingerprint(self: *const MachOState) u64 {
@@ -8519,7 +5848,7 @@ pub const MachOState = struct {
         return if (hash == 0) 1 else hash;
     }
 
-    fn step(self: *MachOState) bool {
+    pub fn step(self: *MachOState) bool {
         self.observeProfileAccountFlow();
         if (self.regs.rip == GUEST_ATEXIT_RETURN_SENTINEL) {
             return self.continueGuestExit();
@@ -8715,343 +6044,26 @@ pub const MachOState = struct {
         return !self.terminated;
     }
 
-    fn beginGtkMainLoop(self: *MachOState) bool {
-        if (self.cooperative_ui_context != null) return false;
-        const deferred = self.pthreads.takeNewestDeferred() orelse return false;
-        self.cooperative_ui_context = .{
-            .regs = self.regs,
-            .xmm = self.xmm,
-            .ymm_hi = self.ymm_hi,
-            .x87 = self.x87,
-        };
-        self.foreign_objects.main_loop_entries +|= 1;
-        self.foreign_objects.main_loop_depth +|= 1;
-        if (!self.startDeferredGuestThread(deferred)) {
-            self.cooperative_ui_context = null;
-            self.foreign_objects.main_loop_depth -|= 1;
-            return false;
-        }
-        self.startup.enter(.gtk_init, self.executed_steps);
-        self.startup.enter(.main_loop, self.executed_steps);
-        machoCapturePrint(
-            "macho-processor: GTK cooperative main loop entered: guest_thread=0x{x} start=0x{x} deferred_remaining={d}\n",
-            .{ deferred.handle, deferred.start_routine, self.pthreads.deferred_threads },
-        );
-        self.logThreadTable("GTK main loop entered");
-        return true;
+    pub fn beginGtkMainLoop(self: *MachOState) bool {
+        return scheduling.beginGtkMainLoop(self);
     }
 
-    fn startDeferredGuestThread(self: *MachOState, deferred: pthread_runtime.DeferredThread) bool {
-        if (!self.isExecutableAddress(deferred.start_routine)) {
-            machoCapturePrint("macho-processor: deferred guest thread rejected: start=0x{x} is not executable\n", .{deferred.start_routine});
-            return false;
-        }
-        const requested_stack = if (deferred.stack_size == 0) DEFAULT_GUEST_THREAD_STACK_SIZE else deferred.stack_size;
-        const stack_size = std.math.clamp(requested_stack, @as(u64, 64 * 1024), @as(u64, 32 * 1024 * 1024));
-        const stack_base = self.guestAlloc(stack_size, 16) orelse return false;
-
-        // Create thread creation context for scheduler
-        // const symbol = self.metadata.nearestSymbol(deferred.start_routine);
-        // const creation_context = scheduler.ThreadCreationContext{
-        //     .level = scheduler.ThreadCreationLevel.pthread,
-        //     .thread_type = scheduler.ThreadType.worker, // Default to worker type
-        //     .start_routine = deferred.start_routine,
-        //     .argument = deferred.argument,
-        //     .stack_size = stack_size,
-        //     .creator_handle = self.active_guest_thread,
-        //     .creation_step = self.executed_steps,
-        //     .start_symbol = if (symbol) |s| s.name else "",
-        // };
-
-        // Handle thread creation through scheduler
-        // const scheduler_handle = self.thread_scheduler.handleThreadCreation(creation_context, stack_base, stack_size) catch |err| {
-        //     machoCapturePrint("macho-processor: scheduler rejected thread creation: {s}\n", .{@errorName(err)});
-        //     return false;
-        // };
-
-        self.regs = .{};
-        self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
-        self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
-        self.x87 = .{};
-        self.gtk_bootstrap_active = true;
-        self.gtk_bootstrap_index = 0;
-        self.regs.rip = deferred.start_routine;
-        self.regs.rdi = deferred.argument;
-        self.regs.rsp = alignDown(stack_base + stack_size, 16);
-        self.push(GUEST_THREAD_RETURN_SENTINEL);
-        self.active_guest_thread = deferred.handle; // Use pthread handle for now
-        self.pthreads.markRunning(deferred.handle);
-        self.cooperative_thread_switches +|= 1;
-
-        if (self.ui_handoff.isActive()) {
-            self.ui_handoff.workerStarted(deferred.handle, self.regs.rip, self.executed_steps);
-            self.logThreadTable("UI handoff worker started");
-        }
-
-        // Mark thread as started in scheduler
-        // self.thread_scheduler.threadStarted(scheduler_handle);
-
-        return true;
+    pub fn startDeferredGuestThread(self: *MachOState, deferred: pthread_runtime.DeferredThread) bool {
+        return scheduling.startDeferredGuestThread(self, deferred);
     }
 
-    fn saveActiveGuestThread(self: *MachOState, reason: []const u8) bool {
-        if (self.active_guest_thread == 0) return false;
-        if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return false;
-
-        // Save thread state to local suspended guest threads (for compatibility)
-        self.suspended_guest_threads[self.suspended_guest_thread_count] = .{
-            .handle = self.active_guest_thread,
-            .suspended_step = self.executed_steps,
-            .reason = reason,
-            .regs = self.regs,
-            .xmm = self.xmm,
-            .ymm_hi = self.ymm_hi,
-            .x87 = self.x87,
-        };
-        self.suspended_guest_thread_count += 1;
-        self.pthreads.markContextSuspended(self.active_guest_thread);
-        self.scheduler_log.emit(.{
-            .kind = .thread_blocked,
-            .step = self.executed_steps,
-            .thread = self.active_guest_thread,
-            .runnable = self.pthreads.activeCount(),
-            .blocked = self.pthreads.blocked_threads,
-            .reason = reason,
-        });
-
-        if (self.ui_handoff.ownsCallbackHandle(self.active_guest_thread)) {
-            self.ui_handoff.callbackSuspended(self.executed_steps);
-        }
-
-        // Also suspend thread in scheduler
-        // _ = self.thread_scheduler.suspendThread(self.active_guest_thread, "cooperative_yield", self.regs.rip);
-
-        self.active_guest_thread = 0;
-        return true;
+    pub fn saveActiveGuestThread(self: *MachOState, reason: []const u8) bool {
+        return scheduling.saveActiveGuestThread(self, reason);
     }
 
     // Suspended workers are a FIFO queue.  A LIFO pop would immediately resume
     // the same worker that just yielded once all deferred threads had started.
-    fn resumeSuspendedGuestThread(self: *MachOState) bool {
-        // Finite waits must progress even when another guest context remains
-        // continuously runnable. The virtual clock is derived from translated
-        // instruction steps, keeping scheduling deterministic and independent
-        // of host execution speed.
-        _ = self.guest_time.advanceForExecution(self.executed_steps);
-        if (self.suspended_guest_thread_count == 0) return false;
-        const completed_handoff_thread = self.ui_handoff.completionResumeHandle();
-        var attempts = self.suspended_guest_thread_count;
-        while (attempts > 0) : (attempts -= 1) {
-            var selected_index: usize = 0;
-            if (attempts == self.suspended_guest_thread_count) {
-                if (completed_handoff_thread != 0) {
-                    for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
-                        if (candidate.handle != completed_handoff_thread) continue;
-                        selected_index = index;
-                        machoCapturePrint(
-                            "scheduler: UI handoff completion-affinity resume: generation={d} scheduling_thread=0x{x} skipped_fifo_entries={d} callback_completed_step={d} step={d}\n",
-                            .{ self.ui_handoff.generation, candidate.handle, index, self.ui_handoff.completed_step, self.executed_steps },
-                        );
-                        break;
-                    }
-                } else if (self.ui_handoff.shouldPreferCallback(self.executed_steps, COOPERATIVE_THREAD_QUANTUM_STEPS)) {
-                    for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
-                        if (!self.ui_handoff.ownsCallbackHandle(candidate.handle)) continue;
-                        selected_index = index;
-                        const resume_ordinal = self.ui_handoff.callback_resumptions +| 1;
-                        if (resume_ordinal <= 8 or resume_ordinal % 1000 == 0) {
-                            machoCapturePrint(
-                                "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d} resume={d}\n",
-                                .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps, resume_ordinal },
-                            );
-                        }
-                        break;
-                    }
-                }
-            }
-            const context = self.suspended_guest_threads[selected_index];
-            if (selected_index + 1 < self.suspended_guest_thread_count) {
-                std.mem.copyForwards(
-                    SuspendedGuestThread,
-                    self.suspended_guest_threads[selected_index .. self.suspended_guest_thread_count - 1],
-                    self.suspended_guest_threads[selected_index + 1 .. self.suspended_guest_thread_count],
-                );
-            }
-            self.suspended_guest_thread_count -= 1;
-            self.suspended_guest_threads[self.suspended_guest_thread_count] = .{};
-
-            const resume_decision = self.pthreads.resumeCooperativeContext(context.handle, self.guest_time.now());
-            if (resume_decision == null) {
-                // An unsignaled ordinary condvar wait must stay blocked. Put
-                // it at the back of the FIFO and allow another runnable
-                // worker or a timed wait to make progress.
-                self.suspended_guest_threads[self.suspended_guest_thread_count] = context;
-                self.suspended_guest_thread_count += 1;
-                continue;
-            }
-
-            // Resume thread in scheduler
-            // _ = self.thread_scheduler.resumeThread(context.handle);
-
-            self.regs = context.regs;
-            self.xmm = context.xmm;
-            self.ymm_hi = context.ymm_hi;
-            self.x87 = context.x87;
-            const saved_rax = self.regs.rax;
-            self.regs.rax = resume_decision.?.restoredRax(saved_rax);
-            if (resume_decision.?.cancel_deadline_sequence != 0) {
-                _ = self.guest_time.cancel(resume_decision.?.cancel_deadline_sequence);
-            }
-            if (resume_decision.?.rax_override != null) {
-                self.cooperative_wait_result_resumes +|= 1;
-            } else {
-                self.cooperative_preserved_register_resumes +|= 1;
-            }
-            self.active_guest_thread = context.handle;
-            self.pthreads.markRunning(context.handle);
-            self.cooperative_thread_switches +|= 1;
-            self.scheduler_log.emit(.{
-                .kind = .thread_resumed,
-                .step = self.executed_steps,
-                .thread = context.handle,
-                .runnable = self.pthreads.activeCount(),
-                .blocked = self.pthreads.blocked_threads,
-                .reason = context.reason,
-            });
-            const resume_count = self.cooperative_preserved_register_resumes + self.cooperative_wait_result_resumes;
-            if (resume_count <= 16 or resume_count % 1000 == 0) {
-                machoCapturePrint(
-                    "scheduler: guest context resume #{d}: thread=0x{x} reason={s} suspended_step={d} rip=0x{x} rsp=0x{x} rax(saved/restored)=0x{x}/0x{x} policy={s}\n",
-                    .{ resume_count, context.handle, context.reason, context.suspended_step, self.regs.rip, self.regs.rsp, saved_rax, self.regs.rax, if (resume_decision.?.rax_override != null) "wait_result_override" else "preserve_all_registers" },
-                );
-            }
-            if (context.handle == completed_handoff_thread and self.ui_handoff.completionResumed(context.handle, self.executed_steps)) {
-                machoCapturePrint(
-                    "scheduler: UI handoff dependency resolved: resumed scheduling_thread=0x{x} after callback cleanup; FIFO fallback remains available for unrelated workers\n",
-                    .{context.handle},
-                );
-                self.logThreadTable("UI handoff scheduling thread resumed");
-            } else if (self.ui_handoff.ownsCallbackHandle(context.handle)) {
-                self.ui_handoff.callbackResumed(self.regs.rip, self.executed_steps);
-                if (self.ui_handoff.callback_resumptions <= 8 or self.ui_handoff.callback_resumptions % 1000 == 0) {
-                    self.logThreadTable("UI callback resumed");
-                }
-            } else if (self.ui_handoff.isActive()) {
-                self.ui_handoff.workerStarted(context.handle, self.regs.rip, self.executed_steps);
-            }
-            return true;
-        }
-        return false;
+    pub fn resumeSuspendedGuestThread(self: *MachOState) bool {
+        return scheduling.resumeSuspendedGuestThread(self);
     }
 
-    fn yieldActiveGuestThreadForWait(self: *MachOState, reason: []const u8) bool {
-        if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return false;
-        if (self.pthreads.deferred_threads == 0 and self.suspended_guest_thread_count == 0 and self.pendingGtkIdleCallbackCount() == 0) return false;
-        const waiter = self.active_guest_thread;
-        if (!self.saveActiveGuestThread(reason)) return false;
-        var worker: u64 = 0;
-        if (self.active_gtk_idle_source == 0 and self.startNextGtkIdleCallback(reason, true)) {
-            worker = self.active_guest_thread;
-        } else if (self.pthreads.takeNewestDeferred()) |next| {
-            if (!self.startDeferredGuestThread(next)) {
-                _ = self.resumeSuspendedGuestThread();
-                return false;
-            }
-            worker = next.handle;
-        } else {
-            if (!self.resumeSuspendedGuestThread()) {
-                // If every modeled context is blocked and the only remaining
-                // dependency is a timed condition wait, advance virtual time
-                // to the earliest deadline. Never do this while another
-                // runnable worker can still deliver the real notification.
-                var recovered_quiescence = false;
-                const deadline = self.pthreads.earliestWaitDeadline() orelse quiescent: {
-                    const preferred = if (self.ui_handoff.isActive()) self.ui_handoff.scheduling_thread else 0;
-                    if (self.pthreads.wakeOldestCondvarForQuiescence(preferred, self.executed_steps)) |woken| {
-                        self.cooperative_quiescence_recoveries +|= 1;
-                        const advanced_now = self.guest_time.advanceForQuiescence();
-                        if (self.cooperative_quiescence_recoveries <= 8 or self.cooperative_quiescence_recoveries % 100 == 0) {
-                            machoCapturePrint(
-                                "scheduler: global quiescence recovery #{d}: POSIX spurious wake thread=0x{x} preferred=0x{x} blocked={d} virtual_now_ns={d} reason={s}; advanced one bounded idle tick because no runnable producer or finite deadline remained\n",
-                                .{ self.cooperative_quiescence_recoveries, woken, preferred, self.pthreads.blocked_threads, advanced_now, reason },
-                            );
-                        }
-                        if (self.resumeSuspendedGuestThread()) {
-                            recovered_quiescence = true;
-                            break :quiescent self.guest_time.now();
-                        }
-                    }
-                    self.scheduler_log.emit(.{
-                        .kind = .deadlock,
-                        .step = self.executed_steps,
-                        .thread = waiter,
-                        .runnable = 0,
-                        .blocked = self.pthreads.blocked_threads,
-                        .reason = reason,
-                    });
-                    return false;
-                };
-                if (!recovered_quiescence) {
-                    _ = self.guest_time.advanceTo(deadline);
-                    var emitted_deadline = false;
-                    while (self.guest_time.popDue()) |timer| {
-                        emitted_deadline = true;
-                        self.scheduler_log.emit(.{
-                            .kind = .timer_due,
-                            .step = self.executed_steps,
-                            .thread = timer.thread,
-                            .object = timer.wait_object,
-                            .generation = timer.wait_generation,
-                            .deadline_ns = timer.deadline_ns,
-                            .blocked = self.pthreads.blocked_threads,
-                            .reason = "idle_advance_to_deadline",
-                        });
-                    }
-                    if (!emitted_deadline) {
-                        self.scheduler_log.emit(.{
-                            .kind = .timer_due,
-                            .step = self.executed_steps,
-                            .thread = waiter,
-                            .deadline_ns = deadline,
-                            .blocked = self.pthreads.blocked_threads,
-                            .reason = "unregistered_wait_deadline",
-                        });
-                    }
-                    if (!self.resumeSuspendedGuestThread()) return false;
-                }
-            }
-            worker = self.active_guest_thread;
-        }
-        if (worker == waiter) {
-            self.cooperative_self_resumes +|= 1;
-            if (self.cooperative_self_resumes <= 8 or self.cooperative_self_resumes % 1000 == 0) {
-                machoCapturePrint(
-                    "scheduler: cooperative yield resumed caller (no alternate runnable context; not blocked): thread=0x{x} reason={s} suspended={d} deferred={d} self_resumes={d}\n",
-                    .{ waiter, reason, self.suspended_guest_thread_count, self.pthreads.deferred_threads, self.cooperative_self_resumes },
-                );
-            }
-            return false;
-        }
-        self.cooperative_wait_yields +|= 1;
-        self.scheduler_log.emit(.{
-            .kind = .context_switch,
-            .step = self.executed_steps,
-            .thread = waiter,
-            .peer = worker,
-            .runnable = self.pthreads.activeCount(),
-            .blocked = self.pthreads.blocked_threads,
-            .reason = reason,
-        });
-        if (self.cooperative_wait_yields <= 16 or self.cooperative_wait_yields % 100 == 0) {
-            machoCapturePrint(
-                "macho-processor: cooperative wait yield #{d}: waiter=0x{x} -> worker=0x{x} reason={s} deferred_remaining={d} suspended={d} gtk_idle_pending={d}\n",
-                .{ self.cooperative_wait_yields, waiter, worker, reason, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.pendingGtkIdleCallbackCount() },
-            );
-        }
-        if (self.ui_handoff.isActive() or self.cooperative_wait_yields <= 8) {
-            self.logThreadTable(reason);
-        }
-        return true;
+    pub fn yieldActiveGuestThreadForWait(self: *MachOState, reason: []const u8) bool {
+        return scheduling.yieldActiveGuestThreadForWait(self, reason);
     }
 
     // GTK idle scheduling is a wake-up, not merely queue bookkeeping. Dispatch
@@ -9062,262 +6074,40 @@ pub const MachOState = struct {
     // Guest startup code may also wait by spinning on atomics before it reaches
     // a pthread or libc++ condition-variable call. Give not-yet-started workers
     // a bounded execution slice so one spinner cannot starve their producers.
-    fn maybeYieldActiveGuestThreadForQuantum(self: *MachOState) void {
-        if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return;
-        const pending_idle = self.pendingGtkIdleCallbackCount();
-        const idle_callback_inflight = self.active_gtk_idle_source != 0;
-        const idle_callback_running = idle_callback_inflight and
-            self.isGtkIdleCallbackHandle(self.active_guest_thread);
-        const suspended = self.runnableSuspendedSnapshot();
-
-        // A UI callback normally keeps ownership, but it cannot monopolize the
-        // only host interpreter while a worker capable of satisfying its
-        // dependency is waiting for a slice. Preempt only at a full quantum;
-        // the callback context remains stored and retains handoff ownership.
-        if (idle_callback_running) {
-            // Always count quantum steps while the callback is running so
-            // that we periodically register progress.  The tracker only
-            // updates last_progress_step on explicit state transitions
-            // (callbackStarted, callbackSuspended, workerStarted, …), so
-            // a long pure-computation inside the callback (e.g. SHA-1
-            // hash for memory initialisation) would otherwise trigger a
-            // false callback_stalled health with no_progress > stall_steps.
-            self.cooperative_quantum_steps +|= 1;
-            if (self.cooperative_quantum_steps >= COOPERATIVE_THREAD_QUANTUM_STEPS) {
-                self.cooperative_quantum_steps = 0;
-                self.ui_handoff.registerProgress(self.executed_steps);
-
-                if (self.ui_handoff.callbackQuantumAction(self.pthreads.deferred_threads, suspended.runnable) == .rendezvous_worker) {
-                    self.ui_callback_retained_quanta +|= 1;
-                    const callback = self.active_guest_thread;
-                    if (self.yieldActiveGuestThreadForWait("UI callback worker rendezvous")) {
-                        self.cooperative_quantum_yields +|= 1;
-                        if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
-                            machoCapturePrint(
-                                "scheduler: UI callback rendezvous: quantum={d} callback=0x{x} -> worker=0x{x} deferred={d} runnable_suspended={d}; callback ownership retained\n",
-                                .{ self.ui_callback_retained_quanta, callback, self.active_guest_thread, self.pthreads.deferred_threads, suspended.runnable },
-                            );
-                        }
-                    } else if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
-                        machoCapturePrint(
-                            "scheduler: retained active UI callback: quantum={d} callback_handle=0x{x} rip=0x{x} deferred_workers={d} runnable_suspended={d}; no eligible rendezvous target\n",
-                            .{ self.ui_callback_retained_quanta, self.active_guest_thread, self.regs.rip, self.pthreads.deferred_threads, suspended.runnable },
-                        );
-                    }
-                }
-            }
-            return;
-        }
-
-        const work = scheduler.chooseCooperativeWork(.{
-            .pending_idle = pending_idle,
-            // An in-flight callback may be suspended on a real dependency.
-            // Preserve its UI ownership, but keep rotating runnable workers
-            // until the callback itself is selected again. Starting another
-            // idle callback here would overwrite the in-flight callback's
-            // source and handoff state.
-            .callback_inflight = idle_callback_inflight,
-            .idle_callback_running = idle_callback_running,
-            .deferred_threads = self.pthreads.deferred_threads,
-            .suspended_threads = suspended.runnable,
-        });
-        if (work == .gtk_idle) {
-            const scheduling_thread = self.active_guest_thread;
-            self.cooperative_quantum_steps = 0;
-            if (!self.yieldActiveGuestThreadForWait("GTK idle wake")) {
-                self.gtk_idle_dispatch_failures +|= 1;
-                const block = self.gtkIdleDispatchBlock();
-                if (self.gtk_idle_dispatch_failures <= 8 or self.gtk_idle_dispatch_failures % 100 == 0) {
-                    machoCapturePrint(
-                        "macho-processor: GTK idle wake blocked: failure={d} reason={s} active=0x{x} pending={d} suspended={d}/{d}\n",
-                        .{ self.gtk_idle_dispatch_failures, @tagName(block), scheduling_thread, pending_idle, self.suspended_guest_thread_count, self.suspended_guest_threads.len },
-                    );
-                }
-                return;
-            }
-            self.gtk_idle_wakeups +|= 1;
-            machoCapturePrint(
-                "macho-processor: GTK idle wake dispatched: wake={d} from_thread=0x{x} source={d} pending={d}\n",
-                .{ self.gtk_idle_wakeups, scheduling_thread, self.active_gtk_idle_source, self.pendingGtkIdleCallbackCount() },
-            );
-            return;
-        }
-        if (work != .deferred_thread and work != .suspended_thread) return;
-        self.cooperative_quantum_steps +|= 1;
-        if (self.cooperative_quantum_steps < COOPERATIVE_THREAD_QUANTUM_STEPS) return;
-        self.cooperative_quantum_steps = 0;
-        const previous_thread = self.active_guest_thread;
-        const reason = if (work == .suspended_thread) "runnable rotation quantum" else "deferred thread quantum";
-        self.scheduler_log.emit(.{
-            .kind = .quantum_expired,
-            .step = self.executed_steps,
-            .thread = previous_thread,
-            .runnable = self.pthreads.activeCount(),
-            .blocked = self.pthreads.blocked_threads,
-            .reason = reason,
-        });
-        if (!self.yieldActiveGuestThreadForWait(reason)) return;
-        self.cooperative_quantum_yields +|= 1;
-        if (work == .suspended_thread) self.cooperative_rotation_yields +|= 1;
-        if (self.cooperative_quantum_yields <= 8 or self.cooperative_quantum_yields % 100 == 0) {
-            machoCapturePrint(
-                "macho-processor: cooperative quantum yield #{d}: work={s} from=0x{x} to=0x{x} deferred={d} suspended={d} runnable_rotations={d}\n",
-                .{ self.cooperative_quantum_yields, @tagName(work), previous_thread, self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.cooperative_rotation_yields },
-            );
-        }
+    pub fn maybeYieldActiveGuestThreadForQuantum(self: *MachOState) void {
+        scheduling.maybeYieldActiveGuestThreadForQuantum(self);
     }
 
-    fn finishActiveGuestThread(self: *MachOState) void {
-        if (self.active_guest_thread != 0) {
-            if (self.isGtkIdleCallbackHandle(self.active_guest_thread)) {
-                const source = self.active_gtk_idle_source;
-                const callback = self.active_gtk_idle_callback;
-                const duration = self.executed_steps -| self.active_gtk_idle_started_step;
-                self.gtk_idle_completed +|= 1;
-                self.ui_handoff.completed(self.executed_steps);
-                machoCapturePrint(
-                    "macho-processor: GTK idle callback completed: source={d} callback=0x{x} duration_steps={d} completed={d} pending={d}\n",
-                    .{ source, callback, duration, self.gtk_idle_completed, self.pendingGtkIdleCallbackCount() },
-                );
-                self.logThreadTable("GTK idle callback completed");
-                self.active_guest_thread = 0;
-                self.active_gtk_idle_source = 0;
-                self.active_gtk_idle_callback = 0;
-                self.active_gtk_idle_started_step = 0;
-            } else {
-                self.pthreads.markCompleted(self.active_guest_thread);
-                self.cooperative_thread_returns +|= 1;
-                machoCapturePrint("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
-                self.active_guest_thread = 0;
-            }
-        }
-        if (self.startNextGtkIdleCallback("idle-return", false)) return;
-        if (self.pthreads.takeNewestDeferred()) |next| {
-            if (self.startDeferredGuestThread(next)) return;
-        }
-        if (self.resumeSuspendedGuestThread()) return;
-        self.restoreGtkMainLoopCaller("all cooperative guest threads returned");
+    pub fn finishActiveGuestThread(self: *MachOState) void {
+        scheduling.finishActiveGuestThread(self);
     }
 
-    fn scheduleGtkIdleCallback(self: *MachOState, function: u64, data: u64, tag: []const u8) u64 {
-        if (function == 0 or !self.isExecutableAddress(function)) {
-            machoCapturePrint(
-                "macho-processor: GTK idle rejected: callback=0x{x} executable={} tag={s}\n",
-                .{ function, self.isExecutableAddress(function), tag },
-            );
-            return 0;
-        }
-        for (&self.gtk_idle_callbacks) |*entry| {
-            if (entry.active) continue;
-            const source = self.gtk_idle_next_source;
-            self.gtk_idle_next_source +|= 1;
-            entry.* = .{
-                .source_id = source,
-                .function = function,
-                .data = data,
-                .active = true,
-                .tag = tag,
-                .scheduled_step = self.executed_steps,
-                .scheduling_thread = self.active_guest_thread,
-                .scheduling_rip = self.regs.rip,
-            };
-            self.gtk_idle_scheduled +|= 1;
-            self.ui_handoff.queued(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
-            machoCapturePrint(
-                "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
-                .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingGtkIdleCallbackCount() },
-            );
-            self.logThreadTable("GTK idle scheduled");
-            return source;
-        }
-        machoCapturePrint(
-            "macho-processor: GTK idle rejected: queue full callback=0x{x} data=0x{x} tag={s}\n",
-            .{ function, data, tag },
-        );
-        return 0;
+    pub fn scheduleGtkIdleCallback(self: *MachOState, function: u64, data: u64, tag: []const u8) u64 {
+        return scheduling.scheduleGtkIdleCallback(self, function, data, tag);
     }
 
-    fn pendingGtkIdleCallbackCount(self: *const MachOState) usize {
-        var count: usize = 0;
-        for (&self.gtk_idle_callbacks) |*entry| {
-            if (entry.active) count += 1;
-        }
-        return count;
+    pub fn pendingGtkIdleCallbackCount(self: *const MachOState) usize {
+        return scheduling.pendingGtkIdleCallbackCount(self);
     }
 
-    fn gtkIdleQueueSnapshot(self: *const MachOState) GtkIdleQueueSnapshot {
-        return gtkIdleQueueSnapshotFor(&self.gtk_idle_callbacks);
+    pub fn gtkIdleQueueSnapshot(self: *const MachOState) GtkIdleQueueSnapshot {
+        return scheduling.gtkIdleQueueSnapshot(self);
     }
 
-    fn gtkIdleDispatchBlock(self: *const MachOState) GtkIdleDispatchBlock {
-        if (self.cooperative_ui_context == null) return .no_ui_context;
-        if (self.active_guest_thread == 0) return .no_active_guest_thread;
-        if (self.active_gtk_idle_source != 0) return .callback_already_running;
-        if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return .suspended_queue_full;
-        return .ready;
+    pub fn gtkIdleDispatchBlock(self: *const MachOState) GtkIdleDispatchBlock {
+        return scheduling.gtkIdleDispatchBlock(self);
     }
 
-    fn removeGtkIdleSource(self: *MachOState, source: u64) bool {
-        for (&self.gtk_idle_callbacks) |*entry| {
-            if (!entry.active or entry.source_id != source) continue;
-            entry.* = .{};
-            self.gtk_idle_removed +|= 1;
-            machoCapturePrint("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.pendingGtkIdleCallbackCount() });
-            return true;
-        }
-        return false;
+    pub fn removeGtkIdleSource(self: *MachOState, source: u64) bool {
+        return scheduling.removeGtkIdleSource(self, source);
     }
 
-    fn startNextGtkIdleCallback(self: *MachOState, reason: []const u8, active_already_saved: bool) bool {
-        self.pumpNativeWindowEvents();
-        const context = self.cooperative_ui_context orelse return false;
-        for (&self.gtk_idle_callbacks) |*entry| {
-            if (!entry.active) continue;
-            if (!self.isExecutableAddress(entry.function)) {
-                machoCapturePrint(
-                    "macho-processor: GTK idle dropped non-executable callback: source={d} callback=0x{x} tag={s}\n",
-                    .{ entry.source_id, entry.function, entry.tag },
-                );
-                entry.* = .{};
-                continue;
-            }
-            if (!active_already_saved and self.active_guest_thread != 0 and !self.saveActiveGuestThread("GTK idle dispatch")) return false;
-            const source = entry.source_id;
-            const function = entry.function;
-            const data = entry.data;
-            const tag = entry.tag;
-            const scheduled_step = entry.scheduled_step;
-            const scheduling_thread = entry.scheduling_thread;
-            const scheduling_rip = entry.scheduling_rip;
-            entry.* = .{};
-            self.regs = context.regs;
-            self.xmm = context.xmm;
-            self.ymm_hi = context.ymm_hi;
-            self.x87 = context.x87;
-            self.regs.rip = function;
-            self.regs.rdi = data;
-            self.regs.rsp = alignDown(context.regs.rsp, 16);
-            self.push(GUEST_THREAD_RETURN_SENTINEL);
-            self.active_guest_thread = GTK_IDLE_CALLBACK_HANDLE_BASE + source;
-            self.active_gtk_idle_source = source;
-            self.active_gtk_idle_callback = function;
-            self.active_gtk_idle_started_step = self.executed_steps;
-            self.gtk_idle_started +|= 1;
-            self.ui_handoff.callbackStarted(self.active_guest_thread, self.regs.rip, self.executed_steps);
-            self.cooperative_thread_switches +|= 1;
-            machoCapturePrint(
-                "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
-                .{ source, function, data, tag, reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingGtkIdleCallbackCount() },
-            );
-            self.logThreadTable("GTK idle callback started");
-            return true;
-        }
-        return false;
+    pub fn startNextGtkIdleCallback(self: *MachOState, reason: []const u8, active_already_saved: bool) bool {
+        return scheduling.startNextGtkIdleCallback(self, reason, active_already_saved);
     }
 
-    fn isGtkIdleCallbackHandle(self: *const MachOState, handle: u64) bool {
-        _ = self;
-        return handle >= GTK_IDLE_CALLBACK_HANDLE_BASE and handle < GTK_IDLE_CALLBACK_HANDLE_BASE + MAX_GTK_IDLE_CALLBACKS + 1024;
+    pub fn isGtkIdleCallbackHandle(self: *const MachOState, handle: u64) bool {
+        return scheduling.isGtkIdleCallbackHandle(self, handle);
     }
 
     pub fn currentCooperativeThreadHandle(self: *const MachOState) u64 {
@@ -9327,273 +6117,44 @@ pub const MachOState = struct {
         return self.active_guest_thread;
     }
 
-    fn threadNumericId(self: *const MachOState, handle: u64) u64 {
-        if (handle == 0 or handle == self.pthreads.main_thread_handle or self.isGtkIdleCallbackHandle(handle)) return 1;
-        if (self.pthreads.snapshotForHandle(handle)) |snapshot| return snapshot.numeric_id;
-        return 0;
+    pub fn threadNumericId(self: *const MachOState, handle: u64) u64 {
+        return scheduling.threadNumericId(self, handle);
     }
 
-    fn threadRole(self: *const MachOState, handle: u64, address: u64) []const u8 {
-        if (self.isGtkIdleCallbackHandle(handle)) return "ui_callback";
-        if (handle == self.pthreads.main_thread_handle) return "main_ui";
-        const symbol = self.metadata.nearestSymbol(address) orelse return "worker";
-        if (std.mem.indexOf(u8, symbol.name, "WindowedAppContext") != null or
-            std.mem.indexOf(u8, symbol.name, "CallInUIThread") != null or
-            std.mem.indexOf(u8, symbol.name, "gtk") != null or
-            std.mem.indexOf(u8, symbol.name, "GTK") != null)
-        {
-            return "ui_worker";
-        }
-        if (std.mem.indexOf(u8, symbol.name, "Timer") != null or std.mem.indexOf(u8, symbol.name, "timer") != null) return "timer";
-        if (std.mem.indexOf(u8, symbol.name, "logging") != null or std.mem.indexOf(u8, symbol.name, "Logger") != null) return "logging";
-        if (std.mem.indexOf(u8, symbol.name, "io") != null or std.mem.indexOf(u8, symbol.name, "IO") != null) return "io";
-        return "worker";
+    pub fn threadRole(self: *const MachOState, handle: u64, address: u64) []const u8 {
+        return scheduling.threadRole(self, handle, address);
     }
 
-    fn contextContainsHandle(self: *const MachOState, handle: u64) bool {
-        if (self.active_guest_thread == handle) return true;
-        for (self.suspended_guest_threads[0..self.suspended_guest_thread_count]) |context| {
-            if (context.handle == handle) return true;
-        }
-        return false;
+    pub fn contextContainsHandle(self: *const MachOState, handle: u64) bool {
+        return scheduling.contextContainsHandle(self, handle);
     }
 
-    fn runnableSuspendedSnapshot(self: *const MachOState) RunnableSuspendedSnapshot {
-        var result = RunnableSuspendedSnapshot{};
-        for (self.suspended_guest_threads[0..self.suspended_guest_thread_count]) |context| {
-            const thread = self.pthreads.snapshotForHandle(context.handle);
-            const runnable = if (thread) |snapshot| switch (snapshot.state) {
-                .runnable => true,
-                .waiting_condvar => snapshot.spurious_wake_pending or
-                    snapshot.notified_generation > snapshot.wait_generation or
-                    (snapshot.wait_deadline_nanoseconds != 0 and snapshot.wait_deadline_nanoseconds <= self.guest_time.now()),
-                .sleeping_until_deadline => snapshot.wait_deadline_nanoseconds != 0 and snapshot.wait_deadline_nanoseconds <= self.guest_time.now(),
-                else => false,
-            } else true;
-            if (!runnable) {
-                result.blocked += 1;
-                continue;
-            }
-            result.runnable += 1;
-            if (result.oldest_handle != 0 and context.suspended_step >= result.oldest_step) continue;
-            result.oldest_handle = context.handle;
-            result.oldest_rip = context.regs.rip;
-            result.oldest_step = context.suspended_step;
-            result.oldest_reason = context.reason;
-        }
-        return result;
+    pub fn runnableSuspendedSnapshot(self: *const MachOState) RunnableSuspendedSnapshot {
+        return scheduling.runnableSuspendedSnapshot(self);
     }
 
-    fn logThreadTable(self: *const MachOState, reason: []const u8) void {
-        machoCapturePrint(
-            "scheduler: THREAD TABLE BEGIN reason={s} step={d} active=0x{x} contexts(active/suspended)={d}/{d} pthread_entries={d} deferred={d} ui_phase={s}\n",
-            .{ reason, self.executed_steps, self.active_guest_thread, @intFromBool(self.active_guest_thread != 0), self.suspended_guest_thread_count, self.pthreads.created_threads, self.pthreads.deferred_threads, @tagName(self.ui_handoff.phase) },
-        );
-        machoCapturePrint("scheduler: CTX  slot handle             tid role         state      age_steps rip                symbol/reason\n", .{});
-        if (self.active_guest_thread != 0) {
-            const symbol = self.metadata.nearestSymbol(self.regs.rip);
-            machoCapturePrint(
-                "scheduler: CTX  run  0x{x:0>16} {d: >3} {s: <12} running    {d: >9} 0x{x:0>16} {s}\n",
-                .{ self.active_guest_thread, self.threadNumericId(self.active_guest_thread), self.threadRole(self.active_guest_thread, self.regs.rip), 0, self.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>" },
-            );
-        }
-        for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |context, index| {
-            const symbol = self.metadata.nearestSymbol(context.regs.rip);
-            machoCapturePrint(
-                "scheduler: CTX  q{d:0>2}  0x{x:0>16} {d: >3} {s: <12} suspended  {d: >9} 0x{x:0>16} {s} | {s}\n",
-                .{ index, context.handle, self.threadNumericId(context.handle), self.threadRole(context.handle, context.regs.rip), self.executed_steps -| context.suspended_step, context.regs.rip, if (symbol) |resolved| resolved.name else "<unknown>", context.reason },
-            );
-        }
-        machoCapturePrint("scheduler: REG  slot handle             tid role         pthread_state context stored start              blocked_for wait\n", .{});
-        for (0..self.pthreads.tableCapacity()) |slot| {
-            const snapshot = self.pthreads.snapshotAt(slot) orelse continue;
-            const start_symbol = self.metadata.nearestSymbol(snapshot.start_routine);
-            machoCapturePrint(
-                "scheduler: REG  {d:0>2}   0x{x:0>16} {d: >3} {s: <12} {s: <13} {s: <7} {s: <6} 0x{x:0>16} {d: >11} {s}\n",
-                .{
-                    slot,
-                    snapshot.handle,
-                    snapshot.numeric_id,
-                    self.threadRole(snapshot.handle, snapshot.start_routine),
-                    @tagName(snapshot.state),
-                    if (snapshot.handle == self.active_guest_thread) "active" else if (self.contextContainsHandle(snapshot.handle)) "queue" else "none",
-                    if (snapshot.started) "yes" else "no",
-                    snapshot.start_routine,
-                    if (snapshot.state == .runnable or snapshot.blocked_since_step == 0) 0 else self.executed_steps -| snapshot.blocked_since_step,
-                    if (snapshot.blocked_reason.len != 0) snapshot.blocked_reason else if (start_symbol) |resolved| resolved.name else "<unknown>",
-                },
-            );
-        }
-        machoCapturePrint("scheduler: THREAD TABLE END reason={s}\n", .{reason});
+    pub fn logThreadTable(self: *const MachOState, reason: []const u8) void {
+        scheduling.logThreadTable(self, reason);
     }
 
-    fn restoreGtkMainLoopCaller(self: *MachOState, reason: []const u8) void {
-        const context = self.cooperative_ui_context orelse return;
-        self.regs = context.regs;
-        self.xmm = context.xmm;
-        self.ymm_hi = context.ymm_hi;
-        self.x87 = context.x87;
-        self.cooperative_ui_context = null;
-        self.active_guest_thread = 0;
-        self.active_gtk_idle_source = 0;
-        self.active_gtk_idle_callback = 0;
-        self.active_gtk_idle_started_step = 0;
-        self.ui_handoff.reset();
-        // The GTK loop returning does not terminate worker threads. Preserve
-        // their saved contexts so a later scheduler entry can resume a real
-        // notification, cancellation, or finite deadline. Clearing this FIFO
-        // orphaned pthread records and made correctly indefinite sleepers look
-        // like live threads whose machine contexts had vanished.
-        self.foreign_objects.main_loop_depth -|= 1;
-        const return_address = self.pop();
-        if (return_address == 0 or !self.isExecutableAddress(return_address)) {
-            self.terminateForInvalidControlTransfer(.{
-                .kind = "gtk_main cooperative return",
-                .instruction_address = self.regs.rip,
-                .target_address = return_address,
-            });
-            return;
-        }
-        self.regs.rip = return_address;
-        machoCapturePrint("macho-processor: GTK cooperative main loop exited: {s}\n", .{reason});
+    pub fn restoreGtkMainLoopCaller(self: *MachOState, reason: []const u8) void {
+        scheduling.restoreGtkMainLoopCaller(self, reason);
     }
 
-    fn logCooperativeSchedulerSummary(self: *const MachOState) void {
-        if (self.cooperative_thread_switches == 0 and self.cooperative_wait_yields == 0) return;
-        machoCapturePrint(
-            "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
-            .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.gtk_idle_scheduled, self.gtk_idle_started, self.gtk_idle_completed, self.gtk_idle_removed, self.pendingGtkIdleCallbackCount(), self.gtk_idle_wakeups, self.gtk_idle_dispatch_failures, self.gtk_idle_starvation_warnings },
-        );
+    pub fn logCooperativeSchedulerSummary(self: *const MachOState) void {
+        scheduling.logCooperativeSchedulerSummary(self);
     }
 
-    fn logCooperativeHeartbeat(self: *MachOState) void {
-        if (self.cooperative_ui_context == null) return;
-        const idle = self.gtkIdleQueueSnapshot();
-        const idle_age = if (idle.pending != 0) self.executed_steps -| idle.oldest_scheduled_step else 0;
-        const suspended = self.runnableSuspendedSnapshot();
-        const suspended_age = if (suspended.oldest_handle != 0) self.executed_steps -| suspended.oldest_step else 0;
-        const dispatch_block = self.gtkIdleDispatchBlock();
-        // Buffer GTK heartbeat into ring buffer instead of verbose log
-        {
-            const idx = self.gtk_heartbeat_index;
-            self.gtk_heartbeat_entries[idx] = .{
-                .step = self.executed_steps,
-                .rip = self.regs.rip,
-                .thread = self.active_guest_thread,
-                .deferred = self.pthreads.deferred_threads,
-                .suspended_total = self.suspended_guest_thread_count,
-                .suspended_runnable = suspended.runnable,
-                .suspended_blocked = suspended.blocked,
-                .switches = self.cooperative_thread_switches,
-                .wait_yields = self.cooperative_wait_yields,
-                .quantum_yields = self.cooperative_quantum_yields,
-                .rotation_yields = self.cooperative_rotation_yields,
-                .idle_pending = idle.pending,
-                .active_idle_source = self.active_gtk_idle_source,
-                .active_idle_callback = self.active_gtk_idle_callback,
-                .dispatch_block = dispatch_block,
-            };
-            self.gtk_heartbeat_index +|= 1;
-            if (self.gtk_heartbeat_index >= 5) {
-                self.gtk_heartbeat_index = 0;
-                self.gtk_heartbeat_filled = true;
-            }
-        }
-        // Buffer UI handoff into ring buffer instead of verbose log
-        if (self.ui_handoff.isActive()) {
-            const idx = self.ui_handoff_index;
-            self.ui_handoff_entries[idx] = .{
-                .step = self.executed_steps,
-                .rip = self.regs.rip,
-                .generation = self.ui_handoff.generation,
-                .phase = self.ui_handoff.phase,
-                .source_id = self.ui_handoff.source_id,
-                .callback_handle = self.ui_handoff.callback_handle,
-                .callback_rip = self.ui_handoff.callback_rip,
-                .worker_handle = self.ui_handoff.worker_handle,
-                .worker_rip = self.ui_handoff.worker_rip,
-                .no_progress = self.executed_steps -| self.ui_handoff.last_progress_step,
-                .suspensions = self.ui_handoff.callback_suspensions,
-                .resumes = self.ui_handoff.callback_resumptions,
-                .worker_slices = self.ui_handoff.worker_slices,
-            };
-            self.ui_handoff_index +|= 1;
-            if (self.ui_handoff_index >= 5) {
-                self.ui_handoff_index = 0;
-                self.ui_handoff_filled = true;
-            }
-        }
-        // Starvation alerts still print
-        if (suspended.runnable != 0 and suspended_age >= GTK_IDLE_STARVATION_STEPS and
-            self.executed_steps -| self.last_cooperative_starvation_step >= GTK_IDLE_STARVATION_STEPS)
-        {
-            self.last_cooperative_starvation_step = self.executed_steps;
-            self.cooperative_starvation_warnings +|= 1;
-            const oldest_symbol = self.metadata.nearestSymbol(suspended.oldest_rip);
-            machoCapturePrint(
-                "scheduler: RUNNABLE CONTEXT STARVATION: warning={d} handle=0x{x} rip=0x{x} {s}+0x{x} age={d} reason={s} active=0x{x} runnable/blocked={d}/{d}; round-robin quantum rotation should cap this near {d} steps\n",
-                .{ self.cooperative_starvation_warnings, suspended.oldest_handle, suspended.oldest_rip, if (oldest_symbol) |resolved| resolved.name else "<unknown>", if (oldest_symbol) |resolved| resolved.offset else 0, suspended_age, suspended.oldest_reason, self.active_guest_thread, suspended.runnable, suspended.blocked, COOPERATIVE_THREAD_QUANTUM_STEPS * @as(u64, @intCast(suspended.runnable + 1)) },
-            );
-            self.logThreadTable("runnable context starvation");
-        }
-        if (idle.pending != 0 and idle_age >= GTK_IDLE_STARVATION_STEPS and dispatch_block != .callback_already_running) {
-            self.gtk_idle_starvation_warnings +|= 1;
-            machoCapturePrint(
-                "macho-processor: GTK IDLE STARVATION: warning={d} source={d} callback=0x{x} tag={s} queued_for={d} steps scheduling_thread=0x{x} scheduling_rip=0x{x} active=0x{x} block={s} suspended={d}/{d}\n",
-                .{ self.gtk_idle_starvation_warnings, idle.oldest_source, idle.oldest_callback, idle.oldest_tag, idle_age, idle.oldest_scheduling_thread, idle.oldest_scheduling_rip, self.active_guest_thread, @tagName(dispatch_block), self.suspended_guest_thread_count, self.suspended_guest_threads.len },
-            );
-        }
-        self.ui_handoff.diagnose(self.executed_steps, GTK_IDLE_STARVATION_STEPS, self.active_guest_thread, self.regs.rip, self.suspended_guest_thread_count);
+    pub fn logCooperativeHeartbeat(self: *MachOState) void {
+        scheduling.logCooperativeHeartbeat(self);
     }
 
     fn dumpGtkHeartbeatTrace(self: *const MachOState) void {
-        if (!self.gtk_heartbeat_filled and self.gtk_heartbeat_index == 0) return;
-        const count: usize = if (self.gtk_heartbeat_filled) 5 else self.gtk_heartbeat_index;
-        const start: usize = if (self.gtk_heartbeat_filled) self.gtk_heartbeat_index else 0;
-        machoCapturePrint(
-            "macho-processor: GTK cooperative heartbeat (most recent {d} entries):\n",
-            .{count},
-        );
-        for (0..count) |i| {
-            const idx = (start + i) % 5;
-            const e = &self.gtk_heartbeat_entries[idx];
-            const symbol = self.metadata.nearestSymbol(e.rip);
-            machoCapturePrint(
-                "  [{d}] step={d} rip=0x{x} {s}+0x{x} thread=0x{x} deferred={d} suspended={d}/{d}/{d} switches={d} yields(wait/quantum/rot)={d}/{d}/{d} idle={d} dispatch={s}\n",
-                .{
-                    i,                                       e.step,                          e.rip,
-                    if (symbol) |s| s.name else "<unknown>", if (symbol) |s| s.offset else 0, e.thread,
-                    e.deferred,                              e.suspended_total,               e.suspended_runnable,
-                    e.suspended_blocked,                     e.switches,                      e.wait_yields,
-                    e.quantum_yields,                        e.rotation_yields,               e.idle_pending,
-                    @tagName(e.dispatch_block),
-                },
-            );
-        }
+        scheduling.dumpGtkHeartbeatTrace(self);
     }
 
     fn dumpUiHandoffTrace(self: *const MachOState) void {
-        if (!self.ui_handoff_filled and self.ui_handoff_index == 0) return;
-        const count: usize = if (self.ui_handoff_filled) 5 else self.ui_handoff_index;
-        const start: usize = if (self.ui_handoff_filled) self.ui_handoff_index else 0;
-        machoCapturePrint(
-            "scheduler: UI handoff heartbeat (most recent {d} entries):\n",
-            .{count},
-        );
-        for (0..count) |i| {
-            const idx = (start + i) % 5;
-            const e = &self.ui_handoff_entries[idx];
-            machoCapturePrint(
-                "  [{d}] step={d} rip=0x{x} generation={d} phase={s} source={d} callback=0x{x}/0x{x} worker=0x{x}/0x{x} no_progress={d} suspend/resume/slices={d}/{d}/{d}\n",
-                .{
-                    i,                 e.step,            e.rip,
-                    e.generation,      @tagName(e.phase), e.source_id,
-                    e.callback_handle, e.callback_rip,    e.worker_handle,
-                    e.worker_rip,      e.no_progress,     e.suspensions,
-                    e.resumes,         e.worker_slices,
-                },
-            );
-        }
+        scheduling.dumpUiHandoffTrace(self);
     }
 
     // Once the Xenia PageEntry tables have been allocated, setup can spend a
@@ -9601,173 +6162,23 @@ pub const MachOState = struct {
     // boundary. Keep a compact, high-frequency checkpoint so a stalled
     // backing-map or heap pass is observable in the next external run.
     fn logMemoryInitializationProgress(self: *MachOState, steps: u64) void {
-        // On first entry, log a concise start message
-        if (!self.mem_init_started) {
-            self.mem_init_started = true;
-            machoCapturePrint(
-                "macho-processor: memory initialization started: step={d} rip=0x{x}\n",
-                .{ steps, self.regs.rip },
-            );
-        }
-        // Push into ring buffer instead of logging every 1M steps
-        const idx = self.mem_init_index;
-        self.mem_init_entries[idx] = .{
-            .step = steps,
-            .rip = self.regs.rip,
-            .heap = self.heap_next,
-            .sparse_mappings = self.sparse_memory.mappings.items.len,
-            .sparse_activations = self.sparse_memory.activations.items.len,
-            .deferred_count = self.pthreads.deferred_threads,
-            .suspended_count = self.suspended_guest_thread_count,
-        };
-        self.mem_init_index +|= 1;
-        if (self.mem_init_index == 8) {
-            self.mem_init_index = 0;
-            self.mem_init_filled = true;
-        }
+        scheduling.logMemoryInitializationProgress(self, steps);
     }
 
-    fn handleSyntheticRuntimeThunk(self: *MachOState) bool {
-        const thunk = compat_runtime.syntheticThunk(self.regs.rip) orelse return false;
-        const source_begin = self.regs.rsi;
-        const source_end = self.regs.rdx;
-
-        switch (thunk) {
-            .ctype_toupper_char => self.regs.rax = std.ascii.toUpper(@as(u8, @truncate(self.regs.rsi))),
-            .ctype_tolower_char => self.regs.rax = std.ascii.toLower(@as(u8, @truncate(self.regs.rsi))),
-            .ctype_toupper_range, .ctype_tolower_range => {
-                if (source_end < source_begin) {
-                    self.regs.rax = source_begin;
-                } else if (self.guestMemory(source_begin, source_end - source_begin)) |bytes| {
-                    for (bytes) |*byte| {
-                        byte.* = if (thunk == .ctype_toupper_range) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
-                    }
-                    self.regs.rax = source_end;
-                } else {
-                    self.regs.rax = source_begin;
-                }
-            },
-            .ctype_widen_char, .ctype_narrow_char => self.regs.rax = self.regs.rsi & 0xFF,
-            .ctype_widen_range => {
-                const count = source_end -| source_begin;
-                const source = self.guestMemoryConst(source_begin, count);
-                const destination = self.guestMemory(self.regs.rcx, count);
-                if (source != null and destination != null) std.mem.copyForwards(u8, destination.?, source.?);
-                self.regs.rax = source_end;
-            },
-            .ctype_narrow_range => {
-                const count = source_end -| source_begin;
-                const source = self.guestMemoryConst(source_begin, count);
-                const destination = self.guestMemory(self.regs.r8, count);
-                if (source != null and destination != null) std.mem.copyForwards(u8, destination.?, source.?);
-                self.regs.rax = source_end;
-            },
-            .locale_destroy => {
-                // No-op: our locale implementation objects are never freed.
-                self.regs.rax = 0;
-            },
-            .locale_has_facet => {
-                // Always return true — we always have the facet available.
-                self.regs.rax = 1;
-            },
-            .locale_use_facet => {
-                // Return the precreated ctype facet handle.
-                self.regs.rax = self.compat.locale_impl_facet;
-            },
-            .xmodule_get_name => {
-                // Allocate the empty string on demand when the XModule
-                // constructor handler (which normally allocates it) is not
-                // reached — e.g. the constructor executes natively through
-                // a resolved import thunk outside the interpreter.
-                if (self.internal_targets.xmodule_empty_string == 0) {
-                    const empty = self.guestAlloc(1, 1) orelse {
-                        self.regs.rax = 0;
-                        self.regs.rdx = 0;
-                        return false;
-                    };
-                    if (self.guestMemory(empty, 1)) |b| b[0] = 0;
-                    self.internal_targets.xmodule_empty_string = empty;
-                }
-                self.regs.rax = self.internal_targets.xmodule_empty_string;
-                // XModule::Matches passes/returns a string_view through the
-                // SysV pair (RAX=data, RDX=size). Clearing the size keeps the
-                // synthetic empty name self-consistent while remaining
-                // harmless for pointer-returning builds.
-                self.regs.rdx = 0;
-            },
-        }
-
-        const return_address = self.pop();
-        if (self.verbose_trace) machoCapturePrint("    [synthetic runtime] {s} -> rax=0x{x} return=0x{x}\n", .{ @tagName(thunk), self.regs.rax, return_address });
-        if (return_address == 0) {
-            self.faulted = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
-            self.terminated = true;
-        } else {
-            self.regs.rip = return_address;
-        }
-        return true;
+    pub fn handleSyntheticRuntimeThunk(self: *MachOState) bool {
+        return thunk_handler.handleSyntheticRuntimeThunk(self);
     }
 
-    fn handleTlvBootstrap(self: *MachOState) bool {
-        if (!tlv_runtime.Runtime.handles(self.regs.rip)) return false;
-        const descriptor = self.regs.rdi;
-        self.regs.rax = self.tlv.resolve(self, descriptor, self.active_guest_thread) orelse 0;
-        const return_address = self.pop();
-        if (self.regs.rax == 0 or return_address == 0 or !self.isExecutableAddress(return_address)) {
-            self.terminateForInvalidControlTransfer(.{
-                .kind = "Darwin TLV bootstrap return",
-                .instruction_address = tlv_runtime.bootstrap_thunk,
-                .operand_address = descriptor,
-                .target_address = return_address,
-            });
-        } else {
-            self.regs.rip = return_address;
-        }
-        return true;
+    pub fn handleTlvBootstrap(self: *MachOState) bool {
+        return thunk_handler.handleTlvBootstrap(self);
     }
 
-    fn handleBoundImportThunk(self: *MachOState) bool {
-        if (self.regs.rip < BOUND_IMPORT_THUNK_BASE) return false;
-        for (self.bound_import_thunks) |thunk| {
-            if (thunk.address != self.regs.rip) continue;
-            self.handleDirectImportCall(.{
-                .name = thunk.name,
-                .dylib = thunk.dylib,
-                .stub_address = thunk.address,
-                .lazy_pointer_address = 0,
-                .symbol_index = 0,
-            });
-            return true;
-        }
-        return false;
+    pub fn handleBoundImportThunk(self: *MachOState) bool {
+        return thunk_handler.handleBoundImportThunk(self);
     }
 
-    fn handleDynamicLibraryThunk(self: *MachOState) bool {
-        const thunk_address = self.regs.rip;
-        const virtual_sleep_calls_before = self.dynamic_forwarder.virtualSleepCallCount();
-        if (!self.dynamic_forwarder.dispatchGuestSymbol(self, thunk_address)) return false;
-        const return_address = self.pop();
-        if (self.verbose_trace) {
-            machoCapturePrint(
-                "    [dynamic loader thunk] address=0x{x} -> rax=0x{x} return=0x{x}\n",
-                .{ thunk_address, self.regs.rax, return_address },
-            );
-        }
-        if (return_address == 0 or !self.isExecutableAddress(return_address)) {
-            self.terminateForInvalidControlTransfer(.{
-                .kind = "dynamic-library thunk return",
-                .instruction_address = thunk_address,
-                .target_address = return_address,
-            });
-        } else {
-            self.regs.rip = return_address;
-            if (self.dynamic_forwarder.virtualSleepCallCount() != virtual_sleep_calls_before) {
-                _ = self.handleVirtualSleepSchedulingBoundary("libc++ virtual sleep thunk");
-            }
-        }
-        return true;
+    pub fn handleDynamicLibraryThunk(self: *MachOState) bool {
+        return thunk_handler.handleDynamicLibraryThunk(self);
     }
 
     pub fn run(self: *MachOState) void {
@@ -10040,498 +6451,27 @@ pub const MachOState = struct {
     }
 
     fn logDecodeCacheSummary(self: *const MachOState) void {
-        const total = self.decode_cache_hits + self.decode_cache_misses;
-        const hit_percent = if (total == 0) 0 else self.decode_cache_hits * 100 / total;
-        machoCapturePrint(
-            "macho-processor: decode cache: entries={d} hits={d} misses={d} hit_rate={d}% code_generation={d}\n",
-            .{ self.decode_cache.len, self.decode_cache_hits, self.decode_cache_misses, hit_percent, self.code_generation },
-        );
+        proc_diag.logDecodeCacheSummary(self);
     }
 
     fn logPerformanceAccelerationSummary(self: *const MachOState) void {
-        const total = self.import_route_cache_hits + self.import_route_cache_misses;
-        const hit_percent = if (total == 0) 0 else self.import_route_cache_hits * 100 / total;
-        machoCapturePrint(
-            "macho-processor: import route cache: entries={d} hits={d} misses={d} hit_rate={d}% collisions={d} fallbacks={d}\n",
-            .{ IMPORT_ROUTE_CACHE_SIZE, self.import_route_cache_hits, self.import_route_cache_misses, hit_percent, self.import_route_cache_collisions, self.import_route_cache_fallbacks },
-        );
-        machoCapturePrint(
-            "macho-processor: bulk construction acceleration: page_entry_runs={d} bytes={d}\n",
-            .{ self.page_entry_bulk_initializations, self.page_entry_bulk_bytes },
-        );
-        if (self.lazy_import_direct_dispatches != 0) {
-            machoCapturePrint(
-                "macho-processor: lazy import safety: typed_direct_dispatches={d} dyld_stub_binder_entries=0\n",
-                .{self.lazy_import_direct_dispatches},
-            );
-        }
-        if (self.patch_db_empty_array_recoveries != 0) {
-            machoCapturePrint(
-                "macho-processor: PatchDB empty-patch compatibility: recoveries={d}\n",
-                .{self.patch_db_empty_array_recoveries},
-            );
-        }
-        if (self.libcxx_string_substr_fast_paths != 0 or self.profile_host_preflight_checks != 0) {
-            machoCapturePrint(
-                "macho-processor: libc++ path slicing: substr_fast_paths={d} profile_host_preflights={d}\n",
-                .{ self.libcxx_string_substr_fast_paths, self.profile_host_preflight_checks },
-            );
-        }
-        if (self.opaque_destructor_quarantines != 0) {
-            machoCapturePrint(
-                "macho-processor: opaque lifetime safety: destructor_quarantines={d}; only registered opaque identities with validated caller frames were skipped\n",
-                .{self.opaque_destructor_quarantines},
-            );
-        }
-        if (self.profile_account_flow.attempts != 0) {
-            machoCapturePrint(
-                "macho-processor: profile Account lifecycle: attempts={d} successes={d} failures={d} active={} final_stage={s} last_xuid={x:0>16} last_bytes_read={d}/{d}\n",
-                .{ self.profile_account_flow.attempts, self.profile_account_flow.successes, self.profile_account_flow.failures, self.profile_account_flow.active, @tagName(self.profile_account_flow.stage), self.profile_account_flow.xuid, self.profile_account_flow.bytes_read, self.profile_account_flow.requested_bytes },
-            );
-        }
-        if (self.atomic_cmpxchg.operations != 0) {
-            machoCapturePrint(
-                "macho-processor: atomic outcomes: cmpxchg(operations/matches/mismatches)={d}/{d}/{d}; mismatches are architectural outcomes, not runtime failures\n",
-                .{ self.atomic_cmpxchg.operations, self.atomic_cmpxchg.matches, self.atomic_cmpxchg.mismatches },
-            );
-        }
-
-        // === SHA1 verification diagnostics ===
-        if (self.sha1_tracer.initial_report_done) {
-            machoCapturePrint(
-                "macho-processor: SHA1 hash verification: hot_function_rip=0x{x} this=0x{x} data=0x{x} length={d} last_block_index={d} last_byte_count={d} step_first_detected={d}\n",
-                .{
-                    self.sha1_tracer.hot_function_rip,
-                    self.sha1_tracer.sha1_this_ptr,
-                    self.sha1_tracer.sha1_data_ptr,
-                    self.sha1_tracer.sha1_byte_len,
-                    self.sha1_tracer.last_block_index,
-                    self.sha1_tracer.last_byte_count,
-                    self.sha1_tracer.detected_at_step,
-                },
-            );
-            machoCapturePrint(
-                "macho-processor: SHA1 processBytes summary: entry_count={d} repeat_count={d} repeat_detected={} last_data=0x{x} last_length={d}\n",
-                .{
-                    self.sha1_tracer.process_bytes_entry_count,
-                    self.sha1_tracer.pb_repeat_count,
-                    self.sha1_tracer.pb_repeat_detected,
-                    self.sha1_tracer.pb_data_ptr,
-                    self.sha1_tracer.pb_byte_len,
-                },
-            );
-            if (self.guest_assertion_count == 0) {
-                machoCapturePrint(
-                    "macho-processor: SHA1 progress: no assertion recovery or guest assertion was observed while the hash loop advanced\n",
-                    .{},
-                );
-            }
-        }
-
-        // === generic verification gate ===
-        if (self.guest_assertion_count == 0) {
-            machoCapturePrint(
-                "macho-processor: runtime invariant check: PASS — cmpxchg operations={d} matches={d} mismatches={d}; no guest assertion\n",
-                .{ self.atomic_cmpxchg.operations, self.atomic_cmpxchg.matches, self.atomic_cmpxchg.mismatches },
-            );
-        } else {
-            machoCapturePrint(
-                "macho-processor: runtime invariant check: FAIL — guest_assertions={d}; cmpxchg mismatches={d} are reported only as context\n",
-                .{ self.guest_assertion_count, self.atomic_cmpxchg.mismatches },
-            );
-        }
-        self.diagnostic_throttler.logSummary();
-        self.logSharedControlBlockSummary();
+        proc_diag.logPerformanceAccelerationSummary(self);
     }
 
     fn logSharedControlBlockSummary(self: *const MachOState) void {
-        if (self.libcpp_shared_control_blocks.candidates == 0) return;
-        machoCapturePrint(
-            "macho-processor: libc++ shared control-block robustness: candidates={d} verified_vptr_restorations={d} rejected={d}\n",
-            .{
-                self.libcpp_shared_control_blocks.candidates,
-                self.libcpp_shared_control_blocks.recoveries,
-                self.libcpp_shared_control_blocks.rejected,
-            },
-        );
+        proc_diag.logSharedControlBlockSummary(self);
     }
 
     fn logExitDiagnostics(self: *MachOState) void {
-        const reason: exit_diagnostics.TerminationReason = exit_diagnostics.reasonFromValue(self.termination_reason);
-        const attribution = exit_diagnostics.attribute(.{
-            .reason = reason,
-            .faulted = self.faulted,
-            .unresolved_import_calls = self.unresolved_import_count,
-        });
-        var report = exit_diagnostics.ExitReport{
-            .exit_code = self.exit_code,
-            .reason = reason,
-            .faulted = self.faulted,
-            .rip = self.regs.rip,
-            .regs = .{
-                .rax = self.regs.rax,
-                .rbx = self.regs.rbx,
-                .rcx = self.regs.rcx,
-                .rdx = self.regs.rdx,
-                .rsi = self.regs.rsi,
-                .rdi = self.regs.rdi,
-                .rbp = self.regs.rbp,
-                .rsp = self.regs.rsp,
-                .r8 = self.regs.r8,
-                .r9 = self.regs.r9,
-                .r10 = self.regs.r10,
-                .r11 = self.regs.r11,
-                .r12 = self.regs.r12,
-                .r13 = self.regs.r13,
-                .r14 = self.regs.r14,
-                .r15 = self.regs.r15,
-            },
-            .unresolved_import_calls = self.unresolved_import_count,
-            .attribution = attribution,
-            .execution_authoritative = attribution.authority == .authoritative,
-            .control_transfer_failure = self.terminal_control_transfer,
-            .memory_access_failure = self.terminal_memory_failure,
-            .runtime_context = .{
-                .phase = @tagName(self.startup.phase),
-                .steps = self.executed_steps,
-                .phase_start_step = self.startup.phase_start_step,
-                .initializer = if (self.initializer_resolver.current()) |initializer| initializer.symbol else "",
-            },
-        };
-
-        if (self.isExecutableAddress(self.regs.rip)) {
-            if (self.metadata.nearestSymbol(self.regs.rip)) |symbol| {
-                report.terminal_symbol = .{
-                    .address = symbol.address,
-                    .symbol = symbol.name,
-                    .symbol_offset = symbol.offset,
-                };
-            }
-        }
-
-        if (self.terminal_memory_failure) |failure| {
-            const terminal_symbol = self.metadata.nearestSymbol(failure.instruction_address);
-            const symbol_name = if (terminal_symbol) |symbol| symbol.name else "";
-            const fault_policy = self.pointer_firewall.policyAt(failure.address);
-            var vtable_header_mapped = true;
-            var typeinfo_mapped = true;
-            if (self.guestMemoryConst(self.regs.rdi, 8) != null) {
-                const vptr = self.read64(self.regs.rdi);
-                if (vptr == 0 or vptr < 16 or self.guestMemoryConst(vptr - 16, 16) == null) {
-                    vtable_header_mapped = false;
-                } else {
-                    const typeinfo = self.read64(vptr - 8);
-                    typeinfo_mapped = typeinfo != 0 and self.guestMemoryConst(typeinfo, 16) != null;
-                }
-            }
-            const classification = semantic_fault_classifier.classify(.{
-                .instruction = failure.instruction,
-                .symbol = symbol_name,
-                .address = failure.address,
-                .rdi = self.regs.rdi,
-                .rsi = self.regs.rsi,
-                .rdx = self.regs.rdx,
-                .rsp = self.regs.rsp,
-                .rbp = self.regs.rbp,
-                .rdi_mapped = self.guestMemoryConst(self.regs.rdi, 1) != null,
-                .rsi_mapped = self.guestMemoryConst(self.regs.rsi, 1) != null,
-                .rdx_mapped = self.guestMemoryConst(self.regs.rdx, 1) != null,
-                .stack_mapped = self.guestMemoryConst(self.regs.rsp, 1) != null and
-                    (self.regs.rbp == 0 or self.guestMemoryConst(self.regs.rbp, 1) != null),
-                .pointer_opaque = if (fault_policy) |policy| policy.kind == .opaque_identity and !policy.may_dereference else false,
-                .pointer_owner = if (fault_policy) |policy| policy.owner else "",
-                .vtable_header_mapped = vtable_header_mapped,
-                .typeinfo_mapped = typeinfo_mapped,
-                .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
-            });
-            report.semantic_fault = .{
-                .class = @tagName(classification.class),
-                .reason = classification.reason,
-                .next_subsystem = classification.next_subsystem,
-                .current_symbol = symbol_name,
-                .instruction = failure.instruction,
-                .effective_address = failure.address,
-            };
-            var provenance = self.memory_regions.find(failure.address, @as(u64, failure.bytes));
-            if (provenance == null) provenance = self.memory_regions.find(self.regs.rdi, 1);
-            if (provenance == null) provenance = self.memory_regions.find(self.regs.rsi, 1);
-            if (provenance) |region| {
-                report.semantic_fault.?.region_kind = @tagName(region.kind);
-                report.semantic_fault.?.region_owner = region.owner;
-                report.semantic_fault.?.region_start = region.start;
-                report.semantic_fault.?.region_end = region.end;
-                report.semantic_fault.?.region_readable = region.permissions.read;
-                report.semantic_fault.?.region_writable = region.permissions.write;
-                report.semantic_fault.?.region_executable = region.permissions.execute;
-                report.semantic_fault.?.region_synthetic = region.isSynthetic();
-            }
-            var diagnostic_policy = fault_policy;
-            if (diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rdi);
-            if (diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rsi);
-            if (diagnostic_policy) |policy| {
-                report.semantic_fault.?.pointer_kind = @tagName(policy.kind);
-                report.semantic_fault.?.pointer_owner = policy.owner;
-                report.semantic_fault.?.pointer_may_dereference = policy.may_dereference;
-                report.semantic_fault.?.pointer_may_execute = policy.may_execute;
-            }
-            if (symbol_name.len != 0) self.import_resolver.markCrashNearby(symbol_name);
-        } else if (self.terminal_control_transfer) |failure| {
-            const terminal_symbol = self.metadata.nearestSymbol(failure.instruction_address);
-            const symbol_name = if (terminal_symbol) |symbol| symbol.name else "";
-            const target_policy = self.pointer_firewall.policyAt(failure.target_address);
-            const classification = semantic_fault_classifier.classify(.{
-                .instruction = failure.kind,
-                .symbol = symbol_name,
-                .address = failure.target_address,
-                .rdi = self.regs.rdi,
-                .rsi = self.regs.rsi,
-                .rdx = self.regs.rdx,
-                .rsp = self.regs.rsp,
-                .rbp = self.regs.rbp,
-                .rdi_mapped = self.guestMemoryConst(self.regs.rdi, 1) != null,
-                .rsi_mapped = self.guestMemoryConst(self.regs.rsi, 1) != null,
-                .rdx_mapped = self.guestMemoryConst(self.regs.rdx, 1) != null,
-                .stack_mapped = self.guestMemoryConst(self.regs.rsp, 1) != null,
-                .pointer_opaque = if (target_policy) |policy| policy.kind == .opaque_identity and !policy.may_execute else false,
-                .pointer_owner = if (target_policy) |policy| policy.owner else "",
-                .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
-            });
-            report.semantic_fault = .{
-                .class = @tagName(classification.class),
-                .reason = classification.reason,
-                .next_subsystem = classification.next_subsystem,
-                .current_symbol = symbol_name,
-                .instruction = failure.kind,
-                .effective_address = failure.target_address,
-            };
-            if (self.memory_regions.find(failure.target_address, 1)) |region| {
-                report.semantic_fault.?.region_kind = @tagName(region.kind);
-                report.semantic_fault.?.region_owner = region.owner;
-                report.semantic_fault.?.region_start = region.start;
-                report.semantic_fault.?.region_end = region.end;
-                report.semantic_fault.?.region_readable = region.permissions.read;
-                report.semantic_fault.?.region_writable = region.permissions.write;
-                report.semantic_fault.?.region_executable = region.permissions.execute;
-                report.semantic_fault.?.region_synthetic = region.isSynthetic();
-            }
-            if (target_policy) |policy| {
-                report.semantic_fault.?.pointer_kind = @tagName(policy.kind);
-                report.semantic_fault.?.pointer_owner = policy.owner;
-                report.semantic_fault.?.pointer_may_dereference = policy.may_dereference;
-                report.semantic_fault.?.pointer_may_execute = policy.may_execute;
-            }
-        } else if (self.faulted) {
-            report.semantic_fault = .{
-                .class = @tagName(reason),
-                .reason = attribution.evidence,
-                .next_subsystem = attribution.next_action,
-                .current_symbol = if (report.terminal_symbol) |symbol| symbol.symbol else "",
-                .instruction = if (report.terminal_instruction) |instruction| instruction.op else "",
-                .effective_address = self.regs.rip,
-            };
-        }
-
-        const terminal_trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
-        if (terminal_trace_count > 0) {
-            const latest_index = if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1;
-            const latest = self.trace_entries[latest_index];
-            var terminal = exit_diagnostics.TerminalInstruction{
-                .address = latest.rip,
-                .op = @tagName(latest.op),
-                .length = latest.len,
-            };
-            if (self.guestMemoryConst(latest.rip, terminal.bytes.len)) |bytes| {
-                terminal.byte_count = @intCast(@min(bytes.len, terminal.bytes.len));
-                @memcpy(terminal.bytes[0..terminal.byte_count], bytes[0..terminal.byte_count]);
-            }
-            report.terminal_instruction = terminal;
-            if (report.semantic_fault) |*semantic| {
-                if (semantic.instruction.len == 0) semantic.instruction = terminal.op;
-            }
-        }
-
-        var stack_buf: [16]exit_diagnostics.StackEntry = undefined;
-        var stack_count: usize = 0;
-        var stack_address = self.regs.rsp;
-        while (stack_count < stack_buf.len) : (stack_address +%= 8) {
-            const offset = self.addrToOffset(stack_address) orelse break;
-            if (offset + 8 > self.mem.len) break;
-            const value = self.read64(stack_address);
-            stack_buf[stack_count] = .{ .slot_address = stack_address, .value = value };
-            if (self.metadata.nearestSymbol(value)) |symbol| {
-                stack_buf[stack_count].symbol = symbol.name;
-                stack_buf[stack_count].symbol_offset = symbol.offset;
-            }
-            stack_count += 1;
-        }
-        report.stack_entries = stack_buf[0..stack_count];
-
-        if (self.cxx_exceptions.last_throw) |thrown| {
-            var exception_report = exit_diagnostics.CxxExceptionReport{
-                .object_address = thrown.object_address,
-                .type_info_address = thrown.type_info_address,
-                .type_name = self.cxxExceptionTypeName(thrown.type_info_address) orelse "",
-                .type_symbol = self.diagnosticSymbol(thrown.type_info_address),
-                .destructor_address = thrown.destructor_address,
-                .destructor_symbol = self.diagnosticSymbol(thrown.destructor_address),
-                .throw_site = self.diagnosticSymbol(thrown.caller_address),
-                .message = self.cxxExceptionMessage(thrown.object_address) orelse "",
-                .catch_completed = self.cxx_exceptions.last_throw_caught,
-                .active_catches = self.cxx_exceptions.active_catch_count,
-                .classification = if (self.spirv_cross.last_classification != .unrelated)
-                    self.spirv_cross.lastLabel()
-                else
-                    "general_cxx_exception",
-            };
-            if (thrown.allocation) |allocation| {
-                exception_report.allocation_matched = true;
-                exception_report.allocation_size = allocation.object_size;
-                exception_report.allocation_site = self.diagnosticSymbol(allocation.caller_address);
-            }
-            if (self.last_unwind_inspection) |inspection| {
-                exception_report.unwinder_available = inspection.metadata_frames != 0;
-                exception_report.unwind_frames = inspection.frame_count;
-                exception_report.cleanup_frames = inspection.cleanup_frames;
-                exception_report.frame_chain_valid = inspection.frame_chain_valid;
-                if (inspection.handler) |handler| {
-                    exception_report.handler_found = true;
-                    exception_report.handler_address = handler.landing_pad;
-                }
-                exception_report.phase_two_supported = inspection.phase_two_supported;
-                exception_report.phase_two_installed = inspection.phase_two_installed;
-                exception_report.cleanups_exhausted_without_handler = self.unwinder.exhaustedWithoutHandler();
-            }
-            report.cxx_exception = exception_report;
-            // Don't flag as unresolved if this is a recognized SPIRV-Cross dummy probe
-            const is_expected_probe = std.mem.eql(u8, exception_report.classification, "expected_dummy_probe_unwinding") or
-                std.mem.eql(u8, exception_report.classification, "expected_dummy_probe_caught");
-
-            if (!exception_report.catch_completed and !is_expected_probe) {
-                report.detail = if (exception_report.cleanups_exhausted_without_handler)
-                    "Rosette executed every verified Itanium cleanup landing pad, but the active LSDA route contains no matching catch handler."
-                else if (exception_report.phase_two_supported)
-                    "Rosette installed a verified Itanium phase-two landing-pad context before the later diagnostic stop."
-                else
-                    "Rosette completed Itanium phase-one frame and catch inspection; this frame was not safe for phase-two context installation.";
-            }
-        }
-
-        const memory_trace_count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
-        var memory_trace_buf: [MEMORY_TRACE_BUFFER_LEN]exit_diagnostics.MemoryAccessEvent = undefined;
-        for (0..memory_trace_count) |i| {
-            const index = if (self.memory_trace_filled)
-                (self.memory_trace_index + i) % MEMORY_TRACE_BUFFER_LEN
-            else
-                i;
-            memory_trace_buf[i] = self.memory_trace_entries[index];
-        }
-        report.recent_memory_accesses = memory_trace_buf[0..memory_trace_count];
-
-        const import_trace_count: usize = if (self.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else self.import_trace_index;
-        if (import_trace_count > 0) {
-            var import_trace_buf: [IMPORT_TRACE_BUFFER_LEN]exit_diagnostics.DependencyCall = undefined;
-            for (0..import_trace_count) |i| {
-                const idx = if (self.import_trace_filled)
-                    (self.import_trace_index + i) % IMPORT_TRACE_BUFFER_LEN
-                else
-                    i;
-                const entry = self.import_trace_entries[idx];
-                import_trace_buf[i] = .{
-                    .symbol = entry.symbol,
-                    .image = entry.dylib,
-                    .stub_address = entry.stub_address,
-                    .return_address = entry.return_address,
-                    .synthetic_result = entry.synthetic_result,
-                    .caller_symbol = entry.caller_symbol,
-                    .caller_offset = entry.caller_offset,
-                };
-            }
-            report.dependency_calls = import_trace_buf[0..import_trace_count];
-            report.detail = "The interpreter did not execute these dynamic-library functions; the guest exit code is not authoritative.";
-        }
-
-        const trace_count: usize = terminal_trace_count;
-        if (trace_count > 0) {
-            var trace_buf: [TRACE_BUFFER_LEN]exit_diagnostics.TraceEntry = undefined;
-            for (0..trace_count) |i| {
-                const idx = if (self.trace_filled)
-                    (self.trace_index + i) % TRACE_BUFFER_LEN
-                else
-                    i;
-                const entry = self.trace_entries[idx];
-                trace_buf[i] = .{
-                    .thread_handle = entry.thread_handle,
-                    .rip = entry.rip,
-                    .op = @tagName(entry.op),
-                    .len = entry.len,
-                    .rsp = entry.rsp,
-                    .rax = entry.rax,
-                    .rbx = entry.rbx,
-                    .rcx = entry.rcx,
-                    .rdx = entry.rdx,
-                    .rsi = entry.rsi,
-                    .rdi = entry.rdi,
-                    .rbp = entry.rbp,
-                    .r8 = entry.r8,
-                    .r9 = entry.r9,
-                    .r10 = entry.r10,
-                    .r11 = entry.r11,
-                    .r12 = entry.r12,
-                    .r13 = entry.r13,
-                    .r14 = entry.r14,
-                    .r15 = entry.r15,
-                };
-            }
-            report.last_instructions = trace_buf[0..trace_count];
-        }
-
-        exit_diagnostics.logExitReport(report);
+        proc_diag.logExitDiagnostics(self);
     }
 
     fn releaseBarrier() void {
-        if (comptime @import("builtin").target.cpu.arch == .aarch64) {
-            asm volatile ("dmb ish" ::: .{ .memory = true });
-        } else {
-            asm volatile ("mfence" ::: .{ .memory = true });
-        }
+        proc_diag.releaseBarrier();
     }
 
-    fn logAtomicDiagnostic(self: *MachOState, matched: bool, size: Size, addr: u64, expected: u64, actual: u64, replacement: u64, is_locked: bool, rax_before: u64, rflags_before: u32) void {
-        const op_num = self.atomic_cmpxchg.operations;
-        if (op_num <= 16 or (!matched and self.atomic_cmpxchg.mismatches <= 16)) {
-            const symbol = self.metadata.nearestSymbol(self.regs.rip);
-            const subtract_expected_vs_actual = (expected -% actual) & maskForSize(size);
-            const cf: u8 = @intFromBool((expected & maskForSize(size)) < (actual & maskForSize(size)));
-            const of: u8 = @intFromBool(((expected ^ actual) & (expected ^ subtract_expected_vs_actual) & signBitForSize(size)) != 0);
-            primitiveCapturePrint(
-                "macho-processor: CMPXCHG#{d}: rip=0x{x} size={s} lock={} matched={} addr=0x{x} " ++
-                    "expected(ACC)=0x{x} actual(DEST)=0x{x} replacement(SRC)=0x{x} " ++
-                    "RAX_before=0x{x:0>16} subtract(AL-DEST)=0x{x} " ++
-                    "rflags_before=0x{x:0>8} rflags_after=0x{x:0>8} " ++
-                    "CF_expected={d} OF_expected={d} ZF={d} step={d} thread=0x{x} owner={s}\n",
-                .{
-                    op_num,
-                    self.regs.rip,
-                    @tagName(size),
-                    is_locked,
-                    matched,
-                    addr,
-                    expected,
-                    actual,
-                    replacement,
-                    rax_before,
-                    subtract_expected_vs_actual,
-                    rflags_before,
-                    self.regs.rflags,
-                    cf,
-                    of,
-                    @as(u8, @intFromBool(matched)),
-                    self.executed_steps,
-                    self.active_guest_thread,
-                    if (symbol) |s| s.name else "<unknown>",
-                },
-            );
-        }
+    pub fn logAtomicDiagnostic(self: *MachOState, matched: bool, size: Size, addr: u64, expected: u64, actual: u64, replacement: u64, is_locked: bool, rax_before: u64, rflags_before: u32) void {
+        proc_diag.logAtomicDiagnostic(self, matched, size, addr, expected, actual, replacement, is_locked, rax_before, rflags_before);
     }
 
     /// Tracks hot functions that dominate execution and dumps SHA1 diagnostics.
@@ -10784,1880 +6724,61 @@ pub const MachOState = struct {
     };
 
     pub fn execute(self: *MachOState, initial_d: DecodedInsn) void {
-        // Check if CLEO can route this instruction for wide execution
-        {
-            const result = cleo_routing.CleoRouter.route(
-                @tagName(initial_d.op),
-                cleo_routing.types.FeatureSet.cleoEmulated(),
-                0, // skip width check; decoder determines width
-            );
-            if (result.can_route) {
-                self.cleo_dispatch_hits +|= 1;
-                if (result.meta) |meta| {
-                    const result_wide: ?cleo_routing.wide.Wide(128) = ternary: {
-                        const is_fma = switch (meta.operation) {
-                            .fma_ps, .fma_pd, .fms_ps, .fms_pd, .fnma_ps, .fnma_pd, .fnms_ps, .fnms_pd, .fma_addsub_ps, .fma_addsub_pd, .fma_subadd_ps => true,
-                            else => false,
-                        };
-                        const mask_active = initial_d.opmask != 0;
-                        const mask_val: u64 = if (mask_active) self.k[initial_d.opmask] else 0xFFFF_FFFF_FFFF_FFFF;
-                        const mask_mode: cleo_routing.wide.MaskMode = if (initial_d.zero_mask) .zero else .merge;
-                        if (!is_fma) {
-                            _ = initial_d.evex_broadcast; // Reserved for EVEX broadcast semantics
-                            if (mask_active) {
-                                break :ternary cleo_routing.ops.executeBinaryMasked(
-                                    128,
-                                    meta,
-                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
-                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
-                                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_src]),
-                                    mask_val,
-                                    mask_mode,
-                                    result.features,
-                                ) catch null;
-                            }
-                            break :ternary cleo_routing.ops.executeBinary(
-                                128,
-                                meta,
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_src]),
-                                result.features,
-                            ) catch null;
-                        }
-                        const op_name = @tagName(initial_d.op);
-                        const has_132 = std.mem.indexOf(u8, op_name, "132") != null;
-                        const has_213 = std.mem.indexOf(u8, op_name, "213") != null;
-                        const accum = if (has_132) initial_d.xmm_src2 else if (has_213) initial_d.xmm_src else initial_d.xmm_dst;
-                        const lhs = if (has_132) initial_d.xmm_dst else if (has_213) initial_d.xmm_src2 else initial_d.xmm_src2;
-                        const rhs = if (has_132) initial_d.xmm_src else if (has_213) initial_d.xmm_dst else initial_d.xmm_src;
-                        if (mask_active) {
-                            break :ternary cleo_routing.ops.executeAccumulateMasked(
-                                128,
-                                meta,
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
-                                mask_val,
-                                mask_mode,
-                                result.features,
-                            ) catch null;
-                        }
-                        break :ternary cleo_routing.ops.executeAccumulate(
-                            128,
-                            meta,
-                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
-                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
-                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
-                            result.features,
-                        ) catch null;
-                    };
-                    if (result_wide) |rw| {
-                        self.xmm[initial_d.xmm_dst] = rw.bytes;
-                        return;
-                    }
-                }
-                // Fall through to interpreter for unsupported operations
-            }
-        }
-        var d = initial_d;
-        // Detect LOCK prefix (0xF0) from raw instruction bytes at RIP.
-        if (self.guestMemoryConst(self.regs.rip, 1)) |bytes| {
-            if (bytes[0] == 0xF0) d.lock = true;
-        }
-        if (d.lock) {
-            // Acquire barrier: all prior loads/stores complete before the
-            // LOCK-prefixed RMW executes (x86 LOCK# acquire semantic).
-            releaseBarrier();
-        }
-        switch (d.op) {
-            .invalid => {
-                machoCapturePrint("macho-processor: undecoded instruction at rip=0x{x} opcode_prefix=0x{x}\n", .{ self.regs.rip, self.readMemVal(self.regs.rip, .bits8) });
-                self.faulted = true;
-                self.exit_code = 1;
-                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
-                self.terminated = true;
-                return;
-            },
-            .nop => {},
-            .cmc => self.regs.rflags ^= RFL_CF,
-            .clc => self.regs.rflags &= ~RFL_CF,
-            .stc => self.regs.rflags |= RFL_CF,
-
-            .fild_mem16 => _ = self.x87.push(@floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(self.readMemVal(d.addr, .bits16))))))),
-            .fild_mem32 => _ = self.x87.push(@floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(self.readMemVal(d.addr, .bits32))))))),
-            .fild_mem64 => _ = self.x87.push(@floatFromInt(@as(i64, @bitCast(self.readMemVal(d.addr, .bits64))))),
-            .fld_mem32 => _ = self.x87.push(@as(f64, @floatCast(@as(f32, @bitCast(@as(u32, @truncate(self.readMemVal(d.addr, .bits32)))))))),
-            .fld_mem64 => _ = self.x87.push(@bitCast(self.readMemVal(d.addr, .bits64))),
-            .fld_mem80 => {
-                const input = self.guestMemoryConst(d.addr, 10) orelse {
-                    self.terminateForGuestAccess(d.addr, 10, .read, "fld_mem80");
-                    return;
-                };
-                _ = self.x87.push(readExtendedFloat80(input));
-            },
-            .fstp_mem80 => {
-                const output = self.guestMemory(d.addr, 10) orelse {
-                    self.terminateForGuestAccess(d.addr, 10, .write, "fstp_mem80");
-                    return;
-                };
-                if (self.x87.pop()) |value| writeExtendedFloat80(output, value) else @memset(output[0..10], 0);
-            },
-            .fstp_mem32 => {
-                if (self.x87.pop()) |value| {
-                    self.writeMemVal(d.addr, .bits32, @as(u64, @as(u32, @bitCast(@as(f32, @floatCast(value))))));
-                }
-            },
-            .fstp_mem64 => {
-                if (self.x87.pop()) |value| self.writeMemVal(d.addr, .bits64, @as(u64, @bitCast(value)));
-            },
-            .fld_st => {
-                if (self.x87.get(@truncate(d.imm))) |value| _ = self.x87.push(value);
-            },
-            .fstp_st => {
-                if (self.x87.get(0)) |value| {
-                    _ = self.x87.set(@truncate(d.imm), value);
-                    _ = self.x87.pop();
-                }
-            },
-            .fxch_st => _ = self.x87.exchange(@truncate(d.imm)),
-            .ffree_st => self.x87.free(@truncate(d.imm)),
-            .fninit => self.x87.reset(),
-            .fnstsw_ax => self.setReg(.al_ax_eax_rax, .bits16, self.x87.statusWord()),
-            .fnstcw_mem16 => self.writeMemVal(d.addr, .bits16, self.x87.control),
-            .fldcw_mem16 => self.x87.control = @truncate(self.readMemVal(d.addr, .bits16)),
-            .x87_binary => self.x87.binary(
-                @truncate((d.imm >> 3) & 7),
-                @truncate((d.imm >> 6) & 7),
-                @truncate(d.imm),
-                (d.imm & (1 << 9)) != 0,
-            ),
-            .fucomip_st => self.executeFucomip(@truncate(d.imm)),
-
-            .mov_reg8_mem8 => {
-                self.setReg(d.dst_reg, .bits8, self.readMemVal(d.addr, .bits8));
-            },
-            .mov_reg16_mem16 => {
-                self.setReg(d.dst_reg, .bits16, self.readMemVal(d.addr, .bits16));
-            },
-            .mov_reg32_mem32 => {
-                self.setReg(d.dst_reg, .bits32, self.readMemVal(d.addr, .bits32));
-            },
-            .mov_reg64_mem64 => {
-                _ = self.recoverNearNullBaseRegister(&d);
-                self.setReg(d.dst_reg, .bits64, self.readMemVal(d.addr, .bits64));
-            },
-
-            .mov_mem8_reg8 => {
-                self.writeMemVal(d.addr, .bits8, self.regVal(d.src_reg, .bits8));
-            },
-            .mov_mem16_reg16 => {
-                self.writeMemVal(d.addr, .bits16, self.regVal(d.src_reg, .bits16));
-            },
-            .mov_mem32_reg32 => {
-                self.writeMemVal(d.addr, .bits32, self.regVal(d.src_reg, .bits32));
-            },
-            .mov_mem64_reg64 => {
-                self.writeMemVal(d.addr, .bits64, self.regVal(d.src_reg, .bits64));
-            },
-
-            .mov_reg_imm => {
-                self.setReg(d.dst_reg, d.size, d.imm);
-            },
-
-            .mov_mem8_imm8 => {
-                self.writeMemVal(d.addr, .bits8, d.imm);
-            },
-            .mov_mem16_imm16 => {
-                self.writeMemVal(d.addr, .bits16, d.imm);
-            },
-            .mov_mem32_imm32 => {
-                self.writeMemVal(d.addr, .bits32, d.imm);
-            },
-            .mov_mem64_imm32 => {
-                self.writeMemVal(d.addr, .bits64, d.imm);
-            },
-
-            .mov_reg8_reg8 => {
-                self.setReg(d.dst_reg, .bits8, self.regVal(d.src_reg, .bits8));
-            },
-            .mov_reg16_reg16 => {
-                self.setReg(d.dst_reg, .bits16, self.regVal(d.src_reg, .bits16));
-            },
-            .mov_reg32_reg32 => {
-                self.setReg(d.dst_reg, .bits32, self.regVal(d.src_reg, .bits32));
-            },
-            .mov_reg64_reg64 => {
-                self.setReg(d.dst_reg, .bits64, self.regVal(d.src_reg, .bits64));
-            },
-
-            .add_accum_imm => self.executeAddRegImm(d, d.size),
-            .or_accum_imm => {
-                const result = self.regVal(.al_ax_eax_rax, d.size) | d.imm;
-                self.setReg(.al_ax_eax_rax, d.size, result);
-                self.setFlagsLogic(result, d.size);
-            },
-            .adc_accum_imm => {
-                const input = self.regVal(.al_ax_eax_rax, d.size);
-                const carry: u64 = @intFromBool((self.regs.rflags & RFL_CF) != 0);
-                const addend = d.imm +% carry;
-                const result = input +% addend;
-                self.setReg(.al_ax_eax_rax, d.size, result);
-                self.setFlagsAdd(input, addend, result, d.size);
-            },
-            .sbb_accum_imm => {
-                const input = self.regVal(.al_ax_eax_rax, d.size);
-                const carry: u64 = @intFromBool((self.regs.rflags & RFL_CF) != 0);
-                const subtrahend = d.imm +% carry;
-                const result = input -% subtrahend;
-                self.setReg(.al_ax_eax_rax, d.size, result);
-                self.setFlagsSub(input, subtrahend, result, d.size);
-            },
-            .and_accum_imm => {
-                const result = self.regVal(.al_ax_eax_rax, d.size) & d.imm;
-                self.setReg(.al_ax_eax_rax, d.size, result);
-                self.setFlagsLogic(result, d.size);
-            },
-            .sub_accum_imm => self.executeSubRegImm(d, d.size),
-            .xor_accum_imm => {
-                const result = self.regVal(.al_ax_eax_rax, d.size) ^ d.imm;
-                self.setReg(.al_ax_eax_rax, d.size, result);
-                self.setFlagsLogic(result, d.size);
-            },
-            .cmp_accum_imm => {
-                const input = self.regVal(.al_ax_eax_rax, d.size);
-                self.setFlagsSub(input, d.imm, input -% d.imm, d.size);
-            },
-
-            .add_reg8_reg8, .add_reg16_reg16, .add_reg32_reg32, .add_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .add, sz);
-            },
-            .add_reg8_mem8, .add_reg16_mem16, .add_reg32_mem32, .add_reg64_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_mem8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .add, sz, .memory_to_register);
-            },
-            .add_mem8_reg8, .add_mem16_reg16, .add_mem32_reg32, .add_mem64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_mem8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .add, sz, .register_to_memory);
-            },
-
-            .add_reg8_imm8 => self.executeAddRegImm(d, .bits8),
-            .add_reg16_imm8 => self.executeAddRegImm(d, .bits16),
-            .add_reg32_imm8 => self.executeAddRegImm(d, .bits32),
-            .add_reg64_imm8 => self.executeAddRegImm(d, .bits64),
-            .add_reg16_imm32 => self.executeAddRegImm(d, .bits16),
-            .add_reg32_imm32 => self.executeAddRegImm(d, .bits32),
-            .add_reg64_imm32 => self.executeAddRegImm(d, .bits64),
-
-            .sub_reg8_reg8, .sub_reg16_reg16, .sub_reg32_reg32, .sub_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .sub, sz);
-            },
-            .sub_reg8_mem8, .sub_reg16_mem16, .sub_reg32_mem32, .sub_reg64_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_mem8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .sub, sz, .memory_to_register);
-            },
-            .sub_mem8_reg8, .sub_mem16_reg16, .sub_mem32_reg32, .sub_mem64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_mem8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .sub, sz, .register_to_memory);
-            },
-            .sbb_reg8_reg8, .sbb_reg16_reg16, .sbb_reg32_reg32, .sbb_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sbb_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .sbb, sz);
-            },
-            .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_imm8) + @intFromEnum(Size.bits8));
-                self.executeSubRegImm(d, sz);
-            },
-            .sbb_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = d.imm;
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a -% b -% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
-            .adc_reg8_imm8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = d.imm;
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a +% b +% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
-            .adc_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a +% b +% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
-            .sbb_reg8_mem8 => {
-                const a = self.regVal(d.dst_reg, .bits8);
-                const b = self.readMemVal(d.addr, .bits8);
-                const cf = (self.regs.rflags & RFL_CF) != 0;
-                const r = a -% b -% @as(u8, @intFromBool(cf));
-                self.setReg(d.dst_reg, .bits8, r);
-                self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
-            },
-
-            .and_reg8_reg8, .and_reg16_reg16, .and_reg32_reg32, .and_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.and_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .bit_and, sz);
-            },
-            .and_reg8_mem8, .and_reg16_mem16, .and_reg32_mem32, .and_reg64_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.and_reg8_mem8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .bit_and, sz, .memory_to_register);
-            },
-            .and_mem8_reg8, .and_mem16_reg16, .and_mem32_reg32, .and_mem64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.and_mem8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .bit_and, sz, .register_to_memory);
-            },
-            .and_reg8_imm8, .and_reg16_imm8, .and_reg32_imm8, .and_reg64_imm8 => self.executeAndRegImm(d),
-            .and_reg16_imm32, .and_reg32_imm32, .and_reg64_imm32 => self.executeAndRegImm(d),
-
-            .or_reg8_reg8, .or_reg16_reg16, .or_reg32_reg32, .or_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .bit_or, sz);
-            },
-            .or_reg8_mem8, .or_reg16_mem16, .or_reg32_mem32, .or_reg64_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_reg8_mem8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .bit_or, sz, .memory_to_register);
-            },
-            .or_mem8_reg8, .or_mem16_reg16, .or_mem32_reg32, .or_mem64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_mem8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .bit_or, sz, .register_to_memory);
-            },
-            .or_reg8_imm8, .or_reg16_imm8, .or_reg32_imm8, .or_reg64_imm8 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.or_reg8_imm8) + @intFromEnum(Size.bits8));
-                self.executeHighwayImmediate(d, .bit_or, sz, false);
-            },
-            .or_mem8_imm8,
-            .or_mem16_imm8,
-            .or_mem32_imm8,
-            .or_mem64_imm8,
-            .or_mem16_imm32,
-            .or_mem32_imm32,
-            .or_mem64_imm32,
-            => {
-                self.executeHighwayImmediate(d, .bit_or, d.size, true);
-            },
-
-            .xor_reg8_reg8, .xor_reg16_reg16, .xor_reg32_reg32, .xor_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .bit_xor, sz);
-            },
-            .xor_reg8_mem8, .xor_reg16_mem16, .xor_reg32_mem32, .xor_reg64_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_reg8_mem8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .bit_xor, sz, .memory_to_register);
-            },
-            .xor_mem8_reg8, .xor_mem16_reg16, .xor_mem32_reg32, .xor_mem64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_mem8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .bit_xor, sz, .register_to_memory);
-            },
-            .xor_reg8_imm8, .xor_reg16_imm8, .xor_reg32_imm8, .xor_reg64_imm8 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.xor_reg8_imm8) + @intFromEnum(Size.bits8));
-                self.executeHighwayImmediate(d, .bit_xor, sz, false);
-            },
-
-            .cmp_reg8_reg8, .cmp_reg16_reg16, .cmp_reg32_reg32, .cmp_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .cmp, sz);
-            },
-            .cmp_reg8_mem8, .cmp_reg16_mem16, .cmp_reg32_mem32, .cmp_reg64_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_reg8_mem8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .cmp, sz, .memory_to_register);
-            },
-            .cmp_mem8_reg8, .cmp_mem16_reg16, .cmp_mem32_reg32, .cmp_mem64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_mem8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .cmp, sz, .register_to_memory);
-            },
-            .cmp_reg8_imm8, .cmp_reg16_imm8, .cmp_reg32_imm8, .cmp_reg64_imm8 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_reg8_imm8) + @intFromEnum(Size.bits8));
-                self.executeHighwayImmediate(d, .cmp, sz, false);
-            },
-            .cmp_mem8_imm8, .cmp_mem16_imm8, .cmp_mem32_imm8, .cmp_mem64_imm8 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_mem8_imm8) + @intFromEnum(Size.bits8));
-                self.executeHighwayImmediate(d, .cmp, sz, true);
-            },
-
-            .test_reg8_reg8, .test_reg16_reg16, .test_reg32_reg32, .test_reg64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.test_reg8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayRegisterBinary(d, .test_bits, sz);
-            },
-            .test_mem8_reg8, .test_mem16_reg16, .test_mem32_reg32, .test_mem64_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.test_mem8_reg8) + @intFromEnum(Size.bits8));
-                self.executeHighwayMemoryBinary(d, .test_bits, sz, .register_to_memory);
-            },
-            .test_reg8_imm8, .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => self.executeHighwayImmediate(d, .test_bits, d.size, false),
-            .test_mem8_imm8, .test_mem16_imm16, .test_mem32_imm32, .test_mem64_imm32 => self.executeHighwayImmediate(d, .test_bits, d.size, true),
-
-            .inc_mem8, .inc_mem16, .inc_mem32, .inc_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.inc_mem8) + @intFromEnum(Size.bits8));
-                const a = self.readMemVal(d.addr, sz);
-                const r = a +% 1;
-                self.writeMemVal(d.addr, sz, r);
-                self.setFlagsIncDec(a, r, sz, true);
-            },
-            .inc_reg8, .inc_reg16, .inc_reg32, .inc_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.inc_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const r = a +% 1;
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsIncDec(a, r, sz, true);
-            },
-            .dec_mem8, .dec_mem16, .dec_mem32, .dec_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.dec_mem8) + @intFromEnum(Size.bits8));
-                const a = self.readMemVal(d.addr, sz);
-                const r = a -% 1;
-                self.writeMemVal(d.addr, sz, r);
-                self.setFlagsIncDec(a, r, sz, false);
-            },
-            .dec_reg8, .dec_reg16, .dec_reg32, .dec_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.dec_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const r = a -% 1;
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsIncDec(a, r, sz, false);
-            },
-
-            .neg_reg8, .neg_reg16, .neg_reg32, .neg_reg64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.neg_reg8) + @intFromEnum(Size.bits8));
-                const a = self.regVal(d.dst_reg, sz);
-                const r = (~a +% 1) & maskForSize(sz);
-                self.setReg(d.dst_reg, sz, r);
-                self.setFlagsSub(0, a, r, sz);
-            },
-            .neg_mem8, .neg_mem16, .neg_mem32, .neg_mem64 => {
-                const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.neg_mem8) + @intFromEnum(Size.bits8));
-                const a = self.readMemVal(d.addr, sz);
-                const r = (~a +% 1) & maskForSize(sz);
-                self.writeMemVal(d.addr, sz, r);
-                self.setFlagsSub(0, a, r, sz);
-            },
-            .not_reg8, .not_reg16, .not_reg32, .not_reg64 => {
-                self.setReg(d.dst_reg, d.size, ~self.regVal(d.dst_reg, d.size));
-            },
-            .not_mem8, .not_mem16, .not_mem32, .not_mem64 => {
-                self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
-            },
-
-            .btr_reg_reg => self.executeBtrRegister(d),
-            .btr_mem_reg => self.executeBtrMemory(d),
-
-            .push_reg => {
-                self.push(self.regVal(d.dst_reg, .bits64));
-            },
-            .push_mem64 => {
-                self.push(self.readMemVal(d.addr, .bits64));
-            },
-            .push_imm => {
-                self.push(d.imm);
-            },
-
-            .pop_reg => {
-                self.setReg(d.dst_reg, .bits64, self.pop());
-            },
-            .pop_mem64 => {
-                self.writeMemVal(d.addr, .bits64, self.pop());
-            },
-
-            .lods => {
-                const src_addr = self.regs.rsi;
-                switch (d.size) {
-                    .bits8 => self.setReg(.al_ax_eax_rax, .bits8, self.readMemVal(src_addr, .bits8)),
-                    .bits16 => self.setReg(.al_ax_eax_rax, .bits16, self.readMemVal(src_addr, .bits16)),
-                    .bits32 => self.setReg(.al_ax_eax_rax, .bits32, self.readMemVal(src_addr, .bits32)),
-                    .bits64 => self.setReg(.al_ax_eax_rax, .bits64, self.readMemVal(src_addr, .bits64)),
-                }
-                const stride: u64 = switch (d.size) {
-                    .bits8 => 1,
-                    .bits16 => 2,
-                    .bits32 => 4,
-                    .bits64 => 8,
-                };
-                if ((self.regs.rflags & RFL_DF) != 0) {
-                    self.regs.rsi -|= stride;
-                } else {
-                    self.regs.rsi +|= stride;
-                }
-            },
-
-            .call_rel32 => {
-                const from_rip = self.regs.rip;
-                const transfer = x64_decoder.highway.directControl(.call, from_rip, d.len, d.addr, true);
-                const target = transfer.target;
-                const return_addr = transfer.return_address.?;
-                self.pending_control_transfer = .{
-                    .kind = "call_rel32",
-                    .instruction_address = from_rip,
-                    .target_address = target,
-                    .return_address = return_addr,
-                };
-                self.push(return_addr);
-                self.regs.rip = target;
-                self.logControlFlow("call_rel32", from_rip, target, d.len, return_addr);
-                if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
-                    const stk = self.sha1_tracer.depth;
-                    self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
-                    self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
-                    self.sha1_tracer.saved_call_site[stk] = self.sha1_tracer.call_site;
-                    self.sha1_tracer.depth += 1;
-                    self.sha1_tracer.entry_rip = target;
-                    self.sha1_tracer.call_site = from_rip;
-                    self.sha1_tracer.instruction_count = 0;
-                }
-            },
-            .call_reg64 => {
-                const from_rip = self.regs.rip;
-                const target = self.regVal(d.dst_reg, .bits64);
-                const return_addr = self.regs.rip + d.len;
-                if (target == 0) {
-                    self.logControlFlow("call_reg64_null", from_rip, target, d.len, return_addr);
-                    self.terminateForInvalidControlTransfer(.{
-                        .kind = "call_reg64_null",
-                        .instruction_address = from_rip,
-                        .target_address = target,
-                        .return_address = return_addr,
-                    });
-                } else {
-                    self.pending_control_transfer = .{
-                        .kind = "call_reg64",
-                        .instruction_address = from_rip,
-                        .target_address = target,
-                        .return_address = return_addr,
-                    };
-                    self.push(return_addr);
-                    self.regs.rip = target;
-                    self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
-                    if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
-                        const stk = self.sha1_tracer.depth;
-                        self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
-                        self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
-                        self.sha1_tracer.saved_call_site[stk] = self.sha1_tracer.call_site;
-                        self.sha1_tracer.depth += 1;
-                        self.sha1_tracer.entry_rip = target;
-                        self.sha1_tracer.call_site = from_rip;
-                        self.sha1_tracer.instruction_count = 0;
-                    }
-                }
-            },
-            .call_mem64 => {
-                const from_rip = self.regs.rip;
-                const return_addr = self.regs.rip + d.len;
-                // Do not record a terminal page-zero read before a narrowly
-                // verified virtual-dispatch recovery has inspected the real
-                // C++ object. readMemVal() is intentionally terminal on an
-                // unmapped operand, so recovery must precede that side effect.
-                const operand_mapped = self.guestMemoryConst(d.addr, @sizeOf(u64)) != null;
-                var target: u64 = if (operand_mapped) self.readMemVal(d.addr, .bits64) else 0;
-                if (target == 0) {
-                    target = self.recoverLibcppSharedControlBlockCall(from_rip, d.addr) orelse 0;
-                }
-                if ((target == 0 or (target != 0 and !self.isExecutableAddress(target))) and operand_mapped) {
-                    target = self.recoverNullVtableSlot(from_rip, d.addr) orelse target;
-                }
-                if (target == 0) {
-                    if (!operand_mapped) {
-                        self.terminateForGuestAccess(d.addr, @sizeOf(u64), .read, "call_mem64");
-                        return;
-                    }
-                    self.logControlFlow("call_mem64_null", from_rip, target, d.len, return_addr);
-                    self.terminateForInvalidControlTransfer(.{
-                        .kind = "call_mem64_null",
-                        .instruction_address = from_rip,
-                        .operand_address = d.addr,
-                        .target_address = target,
-                        .return_address = return_addr,
-                    });
-                } else if (!self.isExecutableAddress(target) and compat_runtime.syntheticThunk(target) == null and !tlv_runtime.Runtime.handles(target)) {
-                    self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
-                    self.terminateForInvalidControlTransfer(.{
-                        .kind = "call_mem64",
-                        .instruction_address = from_rip,
-                        .operand_address = d.addr,
-                        .target_address = target,
-                        .return_address = return_addr,
-                    });
-                } else {
-                    self.pending_control_transfer = .{
-                        .kind = "call_mem64",
-                        .instruction_address = from_rip,
-                        .operand_address = d.addr,
-                        .target_address = target,
-                        .return_address = return_addr,
-                    };
-                    self.push(return_addr);
-                    self.regs.rip = target;
-                    self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
-                    if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
-                        const stk = self.sha1_tracer.depth;
-                        self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
-                        self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
-                        self.sha1_tracer.saved_call_site[stk] = self.sha1_tracer.call_site;
-                        self.sha1_tracer.depth += 1;
-                        self.sha1_tracer.entry_rip = target;
-                        self.sha1_tracer.call_site = from_rip;
-                        self.sha1_tracer.instruction_count = 0;
-                    }
-                }
-            },
-            .ret => {
-                if (d.imm > 0) {
-                    self.regs.rsp +|= d.imm;
-                }
-                const ret_addr = self.pop();
-                if (ret_addr == 0) {
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.ret_stack_empty);
-                    self.terminated = true;
-                    self.exit_code = self.regs.rax;
-                    return;
-                }
-                self.logControlFlow("ret", self.regs.rip, ret_addr, d.len, null);
-                self.regs.rip = ret_addr;
-                if (self.sha1_tracer.enabled and self.sha1_tracer.depth > 0) {
-                    self.sha1_tracer.depth -= 1;
-                    const stk = self.sha1_tracer.depth;
-                    self.sha1_tracer.entry_rip = self.sha1_tracer.saved_entry[stk];
-                    self.sha1_tracer.instruction_count = self.sha1_tracer.saved_count[stk];
-                    self.sha1_tracer.call_site = self.sha1_tracer.saved_call_site[stk];
-                }
-            },
-
-            .jmp_rel8 => {
-                const transfer = x64_decoder.highway.directControl(.jump, self.regs.rip, d.len, d.addr, true);
-                self.pending_control_transfer = .{
-                    .kind = "jmp_rel8",
-                    .instruction_address = self.regs.rip,
-                    .target_address = transfer.target,
-                };
-                self.logControlFlow("jmp", self.regs.rip, transfer.target, d.len, null);
-                self.regs.rip = transfer.target;
-            },
-            .jmp_reg64 => {
-                const target = self.regVal(d.dst_reg, .bits64);
-                if (target == 0) {
-                    self.logControlFlow("jmp_reg64_null", self.regs.rip, target, d.len, null);
-                    self.terminateForInvalidControlTransfer(.{
-                        .kind = "jmp_reg64_null",
-                        .instruction_address = self.regs.rip,
-                        .target_address = target,
-                    });
-                } else {
-                    self.pending_control_transfer = .{
-                        .kind = "jmp_reg64",
-                        .instruction_address = self.regs.rip,
-                        .target_address = target,
-                    };
-                    self.logControlFlow("jmp_reg64", self.regs.rip, target, d.len, null);
-                    self.regs.rip = target;
-                }
-            },
-            .jmp_mem64 => {
-                const stub_rip = self.regs.rip;
-                const target = self.readMemVal(d.addr, .bits64);
-                const imported = self.metadata.importAtStub(stub_rip);
-                if (imported != null and isCooperativeYieldImport(imported.?.name)) {
-                    self.pending_import_stub_rip = null;
-                    self.lazy_import_direct_dispatches +|= 1;
-                    const import = imported.?;
-                    self.handleDirectImportCall(import);
-                    return;
-                }
-                const target_is_lazy_helper = target >= self.stub_helper_start and target < self.stub_helper_end;
-                switch (lazy_import_stub.chooseDispatch(imported != null, target, target_is_lazy_helper)) {
-                    .typed_import => {
-                        self.pending_import_stub_rip = null;
-                        self.lazy_import_direct_dispatches +|= 1;
-                        const import = imported.?;
-                        self.handleDirectImportCall(import);
-                    },
-                    .invalid_null_target => {
-                        self.logControlFlow("jmp_mem64_null", stub_rip, target, d.len, null);
-                        self.terminateForInvalidControlTransfer(.{
-                            .kind = "jmp_mem64_null",
-                            .instruction_address = stub_rip,
-                            .operand_address = d.addr,
-                            .target_address = target,
-                        });
-                    },
-                    .follow_target => {
-                        self.pending_import_stub_rip = null;
-                        self.pending_control_transfer = .{
-                            .kind = "jmp_mem64",
-                            .instruction_address = stub_rip,
-                            .operand_address = d.addr,
-                            .target_address = target,
-                        };
-                        self.logControlFlow("jmp_mem64", stub_rip, target, d.len, null);
-                        self.regs.rip = target;
-                    },
-                }
-            },
-
-            .jcc_rel8, .jcc_rel32 => {
-                const condMet = x64_decoder.evalCond(self.regs.rflags, d.cond);
-                const transfer = x64_decoder.highway.directControl(.conditional_jump, self.regs.rip, d.len, d.addr, condMet);
-                if (condMet) {
-                    self.logControlFlow("jcc_taken", self.regs.rip, transfer.target, d.len, null);
-                    self.regs.rip = transfer.target;
-                }
-            },
-
-            .bsf_reg_reg,
-            .bsf_reg_mem,
-            .bsr_reg_reg,
-            .bsr_reg_mem,
-            .tzcnt_reg_reg,
-            .tzcnt_reg_mem,
-            .lzcnt_reg_reg,
-            .lzcnt_reg_mem,
-            => self.executeBitScan(d),
-
-            .popcnt_reg_reg, .popcnt_reg_mem => {
-                const source = if (d.op == .popcnt_reg_mem)
-                    self.readMemVal(d.addr, d.size)
-                else
-                    self.regVal(d.src_reg, d.size);
-                const result = populationCount(d.size, source, self.regs.rflags);
-                self.setReg(d.dst_reg, d.size, result.value);
-                self.regs.rflags = result.rflags;
-            },
-
-            .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
-
-            .crc32_reg_reg, .crc32_reg_mem => {
-                const source = if (d.op == .crc32_reg_mem)
-                    self.readMemVal(d.addr, d.size)
-                else
-                    self.regVal(d.src_reg, d.size);
-                const crc = crc32cAccumulator(@truncate(self.regVal(d.dst_reg, .bits32)), source, d.size);
-                self.setReg(d.dst_reg, d.dst_size, crc);
-            },
-
-            .rol_reg_cl,
-            .rol_mem_cl,
-            .ror_reg_cl,
-            .ror_mem_cl,
-            .rol_reg_imm,
-            .rol_mem_imm,
-            .ror_reg_imm,
-            .ror_mem_imm,
-            => self.executeRotate(d),
-
-            .shl_reg_cl, .shl_mem_cl => {
-                const sz = d.size;
-                const is_mem = d.op == .shl_mem_cl;
-                const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
-                const r = (a & maskForSize(sz)) << @as(u6, @intCast(count));
-                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
-            },
-            .shr_reg_cl, .shr_mem_cl => {
-                const sz = d.size;
-                const is_mem = d.op == .shr_mem_cl;
-                const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
-                const r = (a & maskForSize(sz)) >> @as(u6, @intCast(count));
-                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
-            },
-            .sar_reg_cl, .sar_mem_cl => {
-                const sz = d.size;
-                const is_mem = d.op == .sar_mem_cl;
-                const count = self.regVal(.cl_cx_ecx_rcx, .bits8) & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
-                const r = arithmeticShiftRight(a, sz, @intCast(count));
-                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
-            },
-            .shr_reg_imm, .shr_mem_imm => {
-                const sz = d.size;
-                const is_mem = d.op == .shr_mem_imm;
-                const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
-                const r = (a & maskForSize(sz)) >> @as(u6, @intCast(count));
-                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
-            },
-            .shl_reg_imm, .shl_mem_imm => {
-                const sz = d.size;
-                const is_mem = d.op == .shl_mem_imm;
-                const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
-                const r = (a & maskForSize(sz)) << @as(u6, @intCast(count));
-                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
-            },
-            .sar_reg_imm, .sar_mem_imm => {
-                const sz = d.size;
-                const is_mem = d.op == .sar_mem_imm;
-                const count = d.imm & @as(u64, if (sz == .bits64) 0x3F else 0x1F);
-                const a = if (is_mem) self.readMemVal(d.addr, sz) else self.regVal(d.dst_reg, sz);
-                const r = arithmeticShiftRight(a, sz, @intCast(count));
-                if (is_mem) self.writeMemVal(d.addr, sz, r) else self.setReg(d.dst_reg, sz, r);
-            },
-
-            .mul_reg8 => {
-                const a = self.regVal(.al_ax_eax_rax, .bits8);
-                const b = self.regVal(d.dst_reg, .bits8);
-                const r = a * b;
-                self.setReg(.al_ax_eax_rax, .bits16, r);
-                self.setFlag(RFL_CF, r >> 8 != 0);
-                self.setFlag(RFL_OF, r >> 8 != 0);
-            },
-            .mul_reg16 => {
-                const a = self.regVal(.al_ax_eax_rax, .bits16);
-                const b = self.regVal(d.dst_reg, .bits16);
-                const r: u32 = @as(u32, @truncate(a)) * @as(u32, @truncate(b));
-                self.setReg(.al_ax_eax_rax, .bits16, @truncate(r));
-                self.setReg(.dl_dx_edx_rdx, .bits16, @truncate(r >> 16));
-                self.setFlag(RFL_CF, r >> 16 != 0);
-                self.setFlag(RFL_OF, r >> 16 != 0);
-            },
-            .mul_reg32 => {
-                const a = self.regVal(.al_ax_eax_rax, .bits32);
-                const b = self.regVal(d.dst_reg, .bits32);
-                const r: u64 = @as(u64, a) * @as(u64, b);
-                self.setReg(.al_ax_eax_rax, .bits32, @truncate(r));
-                self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(r >> 32));
-                self.setFlag(RFL_CF, r >> 32 != 0);
-                self.setFlag(RFL_OF, r >> 32 != 0);
-            },
-            .mul_reg64 => {
-                const a = self.regs.rax;
-                const b = self.regVal(d.dst_reg, .bits64);
-                @setRuntimeSafety(false);
-                const r = @as(u128, a) * @as(u128, b);
-                self.regs.rax = @truncate(r);
-                self.regs.rdx = @truncate(r >> 64);
-                self.setFlag(RFL_CF, self.regs.rdx != 0);
-                self.setFlag(RFL_OF, self.regs.rdx != 0);
-            },
-
-            .div_mem16, .div_reg16 => {
-                const divisor: u16 = @truncate(if (d.op == .div_mem16) self.readMemVal(d.addr, .bits16) else self.regVal(d.dst_reg, .bits16));
-                if (divisor == 0) return self.raiseDivideError();
-                const dividend = (@as(u32, @truncate(self.regs.rdx)) << 16) | @as(u16, @truncate(self.regs.rax));
-                const quotient = dividend / divisor;
-                if (quotient > std.math.maxInt(u16)) return self.raiseDivideError();
-                self.setReg(.al_ax_eax_rax, .bits16, quotient);
-                self.setReg(.dl_dx_edx_rdx, .bits16, dividend % divisor);
-            },
-            .div_mem32, .div_reg32 => {
-                const divisor: u32 = @truncate(if (d.op == .div_mem32) self.readMemVal(d.addr, .bits32) else self.regVal(d.dst_reg, .bits32));
-                if (divisor == 0) return self.raiseDivideError();
-                const dividend = (@as(u64, @truncate(self.regs.rdx)) << 32) | @as(u32, @truncate(self.regs.rax));
-                const quotient = dividend / divisor;
-                if (quotient > std.math.maxInt(u32)) return self.raiseDivideError();
-                self.setReg(.al_ax_eax_rax, .bits32, quotient);
-                self.setReg(.dl_dx_edx_rdx, .bits32, dividend % divisor);
-            },
-            .div_mem64, .div_reg64 => {
-                const divisor = if (d.op == .div_mem64) self.readMemVal(d.addr, .bits64) else self.regVal(d.dst_reg, .bits64);
-                if (divisor == 0) return self.raiseDivideError();
-                const dividend = (@as(u128, self.regs.rdx) << 64) | self.regs.rax;
-                const quotient = dividend / divisor;
-                if (quotient > std.math.maxInt(u64)) return self.raiseDivideError();
-                self.regs.rax = @truncate(quotient);
-                self.regs.rdx = @truncate(dividend % divisor);
-            },
-            .idiv_mem16, .idiv_reg16 => {
-                const raw_divisor = if (d.op == .idiv_mem16) self.readMemVal(d.addr, .bits16) else self.regVal(d.dst_reg, .bits16);
-                const divisor: i16 = @bitCast(@as(u16, @truncate(raw_divisor)));
-                if (divisor == 0) return self.raiseDivideError();
-                const dividend_bits = (@as(u32, @truncate(self.regs.rdx)) << 16) | @as(u16, @truncate(self.regs.rax));
-                const dividend: i32 = @bitCast(dividend_bits);
-                const quotient = @divTrunc(dividend, @as(i32, divisor));
-                if (quotient < std.math.minInt(i16) or quotient > std.math.maxInt(i16)) return self.raiseDivideError();
-                const remainder = @rem(dividend, @as(i32, divisor));
-                self.setReg(.al_ax_eax_rax, .bits16, @as(u16, @bitCast(@as(i16, @intCast(quotient)))));
-                self.setReg(.dl_dx_edx_rdx, .bits16, @as(u16, @bitCast(@as(i16, @intCast(remainder)))));
-            },
-            .idiv_mem32, .idiv_reg32 => {
-                const raw_divisor = if (d.op == .idiv_mem32) self.readMemVal(d.addr, .bits32) else self.regVal(d.dst_reg, .bits32);
-                const divisor: i32 = @bitCast(@as(u32, @truncate(raw_divisor)));
-                if (divisor == 0) return self.raiseDivideError();
-                const dividend_bits = (@as(u64, @truncate(self.regs.rdx)) << 32) | @as(u32, @truncate(self.regs.rax));
-                const dividend: i64 = @bitCast(dividend_bits);
-                const quotient = @divTrunc(dividend, @as(i64, divisor));
-                if (quotient < std.math.minInt(i32) or quotient > std.math.maxInt(i32)) return self.raiseDivideError();
-                const remainder = @rem(dividend, @as(i64, divisor));
-                self.setReg(.al_ax_eax_rax, .bits32, @as(u32, @bitCast(@as(i32, @intCast(quotient)))));
-                self.setReg(.dl_dx_edx_rdx, .bits32, @as(u32, @bitCast(@as(i32, @intCast(remainder)))));
-            },
-            .idiv_mem64, .idiv_reg64 => {
-                const raw_divisor = if (d.op == .idiv_mem64) self.readMemVal(d.addr, .bits64) else self.regVal(d.dst_reg, .bits64);
-                const divisor: i64 = @bitCast(raw_divisor);
-                if (divisor == 0) return self.raiseDivideError();
-                const dividend_bits = (@as(u128, self.regs.rdx) << 64) | self.regs.rax;
-                const dividend: i128 = @bitCast(dividend_bits);
-                const quotient = @divTrunc(dividend, @as(i128, divisor));
-                if (quotient < std.math.minInt(i64) or quotient > std.math.maxInt(i64)) return self.raiseDivideError();
-                const remainder = @rem(dividend, @as(i128, divisor));
-                self.regs.rax = @bitCast(@as(i64, @intCast(quotient)));
-                self.regs.rdx = @bitCast(@as(i64, @intCast(remainder)));
-            },
-            .imul_reg64_reg64, .imul_reg32_reg32 => {
-                const sz = if (d.op == .imul_reg64_reg64) Size.bits64 else Size.bits32;
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.regVal(d.src_reg, sz);
-                const r = a *% b;
-                self.setReg(d.dst_reg, sz, r);
-            },
-            .imul_reg64_mem64, .imul_reg32_mem32 => {
-                const sz = if (d.op == .imul_reg64_mem64) Size.bits64 else Size.bits32;
-                const a = self.regVal(d.dst_reg, sz);
-                const b = self.readMemVal(d.addr, sz);
-                const r = a *% b;
-                self.setReg(d.dst_reg, sz, r);
-            },
-            .imul_reg64_reg64_imm8, .imul_reg32_reg32_imm8 => {
-                const sz = if (d.op == .imul_reg64_reg64_imm8) Size.bits64 else Size.bits32;
-                // Three-operand IMUL reads r/m as its source and does not use
-                // the old destination value. Using dst here corrupts pointer
-                // and index scaling whenever source and destination differ.
-                const r = threeOperandImulResult(&self.regs, d, sz);
-                self.setReg(d.dst_reg, sz, r);
-            },
-            .imul_reg64_mem64_imm8, .imul_reg32_mem32_imm8 => {
-                const sz = if (d.op == .imul_reg64_mem64_imm8) Size.bits64 else Size.bits32;
-                const a = self.readMemVal(d.addr, sz);
-                const r = a *% d.imm;
-                self.setReg(d.dst_reg, sz, r);
-            },
-
-            .lea_reg_mem => {
-                self.setReg(d.dst_reg, d.size, d.addr);
-            },
-
-            .movzx_reg32_mem8 => {
-                const val = if (d.is_reg_form)
-                    self.regVal(d.src_reg, .bits8)
-                else
-                    self.readMemVal(d.addr, .bits8);
-                self.setReg(d.dst_reg, d.size, val);
-            },
-            .movzx_reg32_mem16 => {
-                const val = if (d.is_reg_form)
-                    self.regVal(d.src_reg, .bits16)
-                else
-                    self.readMemVal(d.addr, .bits16);
-                self.setReg(d.dst_reg, d.size, val);
-            },
-            .movsx_reg32_mem8 => {
-                const val = if (d.is_reg_form)
-                    self.regVal(d.src_reg, .bits8)
-                else
-                    self.readMemVal(d.addr, .bits8);
-                const signed_val = @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(val)))))));
-                self.setReg(d.dst_reg, d.size, signed_val);
-            },
-            .movsx_reg32_mem16 => {
-                const val = if (d.is_reg_form)
-                    self.regVal(d.src_reg, .bits16)
-                else
-                    self.readMemVal(d.addr, .bits16);
-                const signed_val = @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(val)))))));
-                self.setReg(d.dst_reg, d.size, signed_val);
-            },
-            .movsxd_reg64_reg32 => {
-                const val = self.regVal(d.src_reg, .bits32);
-                const signed_val = @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(val)))))));
-                self.setReg(d.dst_reg, .bits64, signed_val);
-            },
-            .movsxd_reg64_mem32 => {
-                const val = self.readMemVal(d.addr, .bits32);
-                const signed_val = @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(val)))))));
-                self.setReg(d.dst_reg, .bits64, signed_val);
-            },
-
-            .cbw => {
-                self.setReg(.al_ax_eax_rax, .bits16, @as(u16, @bitCast(@as(i16, @as(i8, @bitCast(@as(u8, @truncate(self.regs.rax))))))));
-            },
-            .cwde => {
-                self.setReg(.al_ax_eax_rax, .bits32, @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(self.regs.rax))))))));
-            },
-            .cdqe => {
-                self.regs.rax = @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(self.regs.rax)))))));
-            },
-            .cwd => {
-                const val = self.regVal(.al_ax_eax_rax, .bits16);
-                const sign = @as(u16, @bitCast(@as(i16, @intCast(val)))) >> 15;
-                self.setReg(.dl_dx_edx_rdx, .bits16, if (sign != 0) 0xFFFF else 0);
-            },
-            .cdq => {
-                const val = self.regVal(.al_ax_eax_rax, .bits32);
-                const sign = @as(u32, @bitCast(@as(i32, @intCast(val)))) >> 31;
-                self.setReg(.dl_dx_edx_rdx, .bits32, if (sign != 0) 0xFFFF_FFFF else 0);
-            },
-            .cqo => {
-                const val = self.regs.rax;
-                const sign = (val & 0x8000_0000_0000_0000) != 0;
-                self.regs.rdx = if (sign) 0xFFFF_FFFF_FFFF_FFFF else 0;
-            },
-
-            .cmovcc_reg_reg => {
-                if (x64_decoder.evalCond(self.regs.rflags, d.cond)) {
-                    self.setReg(d.dst_reg, d.size, self.regVal(d.src_reg, d.size));
-                }
-            },
-            .cmovcc_reg_mem => {
-                if (x64_decoder.evalCond(self.regs.rflags, d.cond)) {
-                    self.setReg(d.dst_reg, d.size, self.readMemVal(d.addr, d.size));
-                }
-            },
-
-            .setcc_reg8 => {
-                if (x64_decoder.evalCond(self.regs.rflags, d.cond)) {
-                    self.setReg(d.dst_reg, .bits8, 1);
-                } else {
-                    self.setReg(d.dst_reg, .bits8, 0);
-                }
-            },
-            .setcc_mem8 => {
-                if (x64_decoder.evalCond(self.regs.rflags, d.cond)) {
-                    self.writeMemVal(d.addr, .bits8, 1);
-                } else {
-                    self.writeMemVal(d.addr, .bits8, 0);
-                }
-            },
-
-            .cmpxchg_mem8_reg8,
-            .cmpxchg_mem16_reg16,
-            .cmpxchg_mem32_reg32,
-            .cmpxchg_mem64_reg64,
-            .cmpxchg_reg8_reg8,
-            .cmpxchg_reg16_reg16,
-            .cmpxchg_reg32_reg32,
-            .cmpxchg_reg64_reg64,
-            => {
-                const size = d.size;
-                const expected = self.regVal(.al_ax_eax_rax, size);
-                const actual = if (d.is_reg_form)
-                    self.regVal(d.dst_reg, size)
-                else
-                    self.readMemVal(d.addr, size);
-                const replacement = self.regVal(d.src_reg, size);
-                const rax_before = self.regs.rax;
-                const rflags_before = self.regs.rflags;
-                const outcome = atomic_compare_exchange.evaluate(expected, actual, replacement);
-                const matched = outcome.matched;
-                // x86 CMPXCHG: flags reflect AL − DEST (= expected − actual)
-                const subtract_result = expected -% actual;
-                self.setFlagsSub(expected, actual, subtract_result, size);
-                if (matched) {
-                    if (d.is_reg_form) {
-                        self.setReg(d.dst_reg, size, outcome.destination);
-                    } else {
-                        self.writeMemVal(d.addr, size, outcome.destination);
-                    }
-                } else {
-                    self.setReg(.al_ax_eax_rax, size, outcome.accumulator);
-                }
-                self.atomic_cmpxchg.record(matched);
-                if (!matched and self.timer_queue_watch.active and d.addr == self.timer_queue_watch.state_addr) {
-                    const expected_name = guest_assertion_recovery.timerQueueStateName(@as(u8, @truncate(expected)));
-                    const actual_name = guest_assertion_recovery.timerQueueStateName(@as(u8, @truncate(actual)));
-                    machoCapturePrint(
-                        "  timer queue CMPXCHG mismatch on watched state: expected={s}({d}) actual={s}({d}) addr=0x{x} rip=0x{x} thread=0x{x}\n",
-                        .{ expected_name, @as(u8, @truncate(expected)), actual_name, @as(u8, @truncate(actual)), d.addr, self.regs.rip, self.active_guest_thread },
-                    );
-                }
-                self.logAtomicDiagnostic(matched, size, d.addr, expected, actual, replacement, d.lock, rax_before, rflags_before);
-                if (d.lock) releaseBarrier();
-            },
-
-            .cmpxchg8b_mem, .cmpxchg16b_mem => {
-                const is_16b = d.op == .cmpxchg16b_mem;
-                const expected_lo = self.regVal(.al_ax_eax_rax, .bits32);
-                const expected_hi = self.regVal(.dl_dx_edx_rdx, if (is_16b) .bits64 else .bits32);
-                const replacement_lo = self.regVal(.cl_cx_ecx_rcx, if (is_16b) .bits64 else .bits32);
-                const replacement_hi = self.regVal(.bl_bx_ebx_rbx, if (is_16b) .bits64 else .bits32);
-                const rax_before = self.regs.rax;
-                const rflags_before = self.regs.rflags;
-
-                const actual_lo = self.readMemVal(d.addr, if (is_16b) .bits64 else .bits32);
-                const actual_hi = if (is_16b) self.readMemVal(d.addr + 8, .bits64) else 0;
-
-                const matched = expected_lo == actual_lo and expected_hi == actual_hi;
-
-                if (matched) {
-                    self.writeMemVal(d.addr, if (is_16b) .bits64 else .bits32, replacement_lo);
-                    if (is_16b) self.writeMemVal(d.addr + 8, .bits64, replacement_hi);
-                } else {
-                    self.setReg(.al_ax_eax_rax, if (is_16b) .bits64 else .bits32, actual_lo);
-                    self.setReg(.dl_dx_edx_rdx, if (is_16b) .bits64 else .bits32, actual_hi);
-                }
-
-                self.regs.rflags &= ~RFL_ZF;
-                self.regs.rflags |= if (matched) RFL_ZF else 0;
-
-                self.atomic_cmpxchg.record(matched);
-                if (is_16b) {
-                    self.logAtomicDiagnostic(matched, .bits64, d.addr, expected_lo, actual_lo, replacement_lo, d.lock, rax_before, rflags_before);
-                } else {
-                    self.logAtomicDiagnostic(matched, .bits32, d.addr, expected_lo, actual_lo, replacement_lo, d.lock, rax_before, rflags_before);
-                }
-                if (d.lock) releaseBarrier();
-            },
-
-            .xchg_mem32_reg32 => {
-                // XCHG with memory is architecturally always atomic (implicit LOCK#)
-                // Acquire+release semantics via full barrier (XCHG implies LOCK)
-                releaseBarrier();
-                const a = self.readMemVal(d.addr, .bits32);
-                const b = self.regVal(d.src_reg, .bits32);
-                self.writeMemVal(d.addr, .bits32, b);
-                self.setReg(d.src_reg, .bits32, a);
-                releaseBarrier();
-            },
-            .xchg_mem64_reg64 => {
-                releaseBarrier();
-                const a = self.readMemVal(d.addr, .bits64);
-                const b = self.regVal(d.src_reg, .bits64);
-                self.writeMemVal(d.addr, .bits64, b);
-                self.setReg(d.src_reg, .bits64, a);
-                releaseBarrier();
-            },
-            .xchg_reg32_reg32 => {
-                const a = self.regVal(d.dst_reg, .bits32);
-                const b = self.regVal(d.src_reg, .bits32);
-                self.setReg(d.dst_reg, .bits32, b);
-                self.setReg(d.src_reg, .bits32, a);
-            },
-            .xchg_reg64_reg64 => {
-                const a = self.regVal(d.dst_reg, .bits64);
-                const b = self.regVal(d.src_reg, .bits64);
-                self.setReg(d.dst_reg, .bits64, b);
-                self.setReg(d.src_reg, .bits64, a);
-            },
-            .xadd_mem8_reg8, .xadd_mem32_reg32, .xadd_mem64_reg64 => {
-                const sz: Size = if (d.op == .xadd_mem64_reg64) .bits64 else if (d.op == .xadd_mem8_reg8) .bits8 else .bits32;
-                const old_mem = self.readMemVal(d.addr, sz);
-                const old_reg = self.regVal(d.src_reg, sz);
-                const result = old_mem +% old_reg;
-                self.writeMemVal(d.addr, sz, result);
-                self.setReg(d.src_reg, sz, old_mem);
-                self.setFlagsAdd(old_mem, old_reg, result, sz);
-                if (d.lock) releaseBarrier();
-            },
-
-            .xorps_xmm_xmm => {
-                const dst = d.xmm_dst;
-                const src = d.xmm_src;
-                for (&self.xmm[dst], self.xmm[src]) |*d8, s8| d8.* = d8.* ^ s8;
-            },
-            .movups_xmm_xmm, .movaps_xmm_xmm => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            },
-            .movups_xmm_mem, .movaps_xmm_mem => {
-                self.xmm[d.xmm_dst] = self.readMem128(d.addr);
-            },
-            .movups_mem_xmm, .movaps_mem_xmm => {
-                self.writeMem128(d.addr, self.xmm[d.xmm_src]);
-            },
-            .vmovd_xmm_reg32, .vmovd_xmm_mem32 => {
-                const value: u32 = @truncate(if (d.op == .vmovd_xmm_reg32)
-                    self.regVal(d.src_reg, .bits32)
-                else
-                    self.readMemVal(d.addr, .bits32));
-                @memset(&self.xmm[d.xmm_dst], 0);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
-            },
-            .vmovq_xmm_reg64, .vmovq_xmm_mem64 => {
-                const value = if (d.op == .vmovq_xmm_reg64)
-                    self.regVal(d.src_reg, .bits64)
-                else
-                    self.readMemVal(d.addr, .bits64);
-                @memset(&self.xmm[d.xmm_dst], 0);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], value, .little);
-            },
-            .vmovq_reg64_xmm, .vmovq_mem64_xmm => {
-                const value = std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little);
-                if (d.op == .vmovq_reg64_xmm) {
-                    self.setReg(d.dst_reg, .bits64, value);
-                } else {
-                    self.writeMemVal(d.addr, .bits64, value);
-                }
-            },
-            .vpinsrb_xmm_xmm_reg32, .vpinsrb_xmm_xmm_mem8 => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                const value: u8 = @truncate(if (d.op == .vpinsrb_xmm_xmm_reg32)
-                    self.regVal(d.src_reg, .bits32)
-                else
-                    self.readMemVal(d.addr, .bits8));
-                self.xmm[d.xmm_dst][@intCast(d.imm & 0x0F)] = value;
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            },
-            .vpshufb => {
-                const source_low = self.xmm[d.xmm_src];
-                const mask_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = shuffleBytes(source_low, mask_low);
-                if (d.vector_256) {
-                    const source_high = self.ymm_hi[d.xmm_src];
-                    const mask_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = shuffleBytes(source_high, mask_high);
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpcmpeqb, .vpcmpeqw, .vpcmpeqd, .vpcmpeqq, .vpcmpgtb, .vpcmpgtw, .vpcmpgtd, .vpcmpgtq => {
-                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = applyVexCompare(self.xmm[d.xmm_src], rhs_low, d.op);
-                if (d.vector_256) {
-                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = applyVexCompare(self.ymm_hi[d.xmm_src], rhs_high, d.op);
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vptest => {
-                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                const low_zf = bitwiseAndAllZero(self.xmm[d.xmm_src], rhs_low);
-                const low_cf = bitwiseAndNotAllZero(self.xmm[d.xmm_src], rhs_low);
-                if (d.vector_256) {
-                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
-                    if (low_zf and bitwiseAndAllZero(self.ymm_hi[d.xmm_src], rhs_high)) self.regs.rflags |= RFL_ZF;
-                    if (low_cf and bitwiseAndNotAllZero(self.ymm_hi[d.xmm_src], rhs_high)) self.regs.rflags |= RFL_CF;
-                } else {
-                    self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
-                    if (low_zf) self.regs.rflags |= RFL_ZF;
-                    if (low_cf) self.regs.rflags |= RFL_CF;
-                }
-            },
-            .vpunpckldq => {
-                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = unpackLowDwords(self.xmm[d.xmm_src], rhs_low);
-                if (d.vector_256) {
-                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = unpackLowDwords(self.ymm_hi[d.xmm_src], rhs_high);
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpunpcklqdq => {
-                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = unpackLowQwords(self.xmm[d.xmm_src], rhs_low);
-                if (d.vector_256) {
-                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = unpackLowQwords(self.ymm_hi[d.xmm_src], rhs_high);
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpermilpd => {
-                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = permutePackedDoubles(source_low, @truncate(d.imm));
-                if (d.vector_256) {
-                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = permutePackedDoubles(source_high, @truncate(d.imm >> 2));
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vmovdqu_xmm_xmm, .vmovdqa_xmm_xmm, .vmovups_xmm_xmm, .vmovaps_xmm_xmm, .vmovupd_xmm_xmm, .vmovapd_xmm_xmm => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            },
-            .vmovdqu_xmm_mem, .vmovdqa_xmm_mem, .vmovups_xmm_mem, .vmovaps_xmm_mem, .vmovupd_xmm_mem, .vmovapd_xmm_mem => {
-                self.xmm[d.xmm_dst] = self.readMem128(d.addr);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            },
-            .vmovdqu_mem_xmm, .vmovdqa_mem_xmm, .vmovups_mem_xmm, .vmovaps_mem_xmm, .vmovupd_mem_xmm, .vmovapd_mem_xmm => {
-                self.writeMem128(d.addr, self.xmm[d.xmm_src]);
-            },
-            .vmovdqu_ymm_ymm, .vmovdqa_ymm_ymm, .vmovups_ymm_ymm, .vmovaps_ymm_ymm, .vmovupd_ymm_ymm, .vmovapd_ymm_ymm => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                self.ymm_hi[d.xmm_dst] = self.ymm_hi[d.xmm_src];
-            },
-            .vmovdqu_ymm_mem, .vmovdqa_ymm_mem, .vmovups_ymm_mem, .vmovaps_ymm_mem, .vmovupd_ymm_mem, .vmovapd_ymm_mem => {
-                self.xmm[d.xmm_dst] = self.readMem128(d.addr);
-                self.ymm_hi[d.xmm_dst] = self.readMem128(d.addr + 16);
-            },
-            .vmovdqu_mem_ymm, .vmovdqa_mem_ymm, .vmovups_mem_ymm, .vmovaps_mem_ymm, .vmovupd_mem_ymm, .vmovapd_mem_ymm => {
-                self.writeMem128(d.addr, self.xmm[d.xmm_src]);
-                self.writeMem128(d.addr + 16, self.ymm_hi[d.xmm_src]);
-            },
-            .vmovss_xmm_mem => {
-                @memset(&self.xmm[d.xmm_dst], 0);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @truncate(self.readMemVal(d.addr, .bits32)), .little);
-            },
-            .vmovss_mem_xmm => {
-                self.writeMemVal(d.addr, .bits32, std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little));
-            },
-            .vmovsd_xmm_mem => {
-                @memset(&self.xmm[d.xmm_dst], 0);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], self.readMemVal(d.addr, .bits64), .little);
-            },
-            .vmovsd_mem_xmm => {
-                self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
-            },
-            .vmovlps_xmm_xmm_mem64, .vmovlpd_xmm_xmm_mem64 => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], self.readMemVal(d.addr, .bits64), .little);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            },
-            .vmovlps_mem64_xmm, .vmovlpd_mem64_xmm => {
-                self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
-            },
-            .vmovhps_xmm_xmm_mem64, .vmovhpd_xmm_xmm_mem64 => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                std.mem.writeInt(u64, self.xmm[d.xmm_dst][8..16], self.readMemVal(d.addr, .bits64), .little);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            },
-            .vmovhps_mem64_xmm, .vmovhpd_mem64_xmm => {
-                self.writeMemVal(d.addr, .bits64, std.mem.readInt(u64, self.xmm[d.xmm_src][8..16], .little));
-            },
-            .vmovshdup, .vmovsldup, .vmovddup => {
-                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = duplicateVectorElements(d.op, source_low);
-                if (d.vector_256) {
-                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = duplicateVectorElements(d.op, source_high);
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vzeroupper => {
-                for (&self.ymm_hi) |*upper| @memset(upper, 0);
-            },
-            .vcvtsi2ss_xmm_reg, .vcvtsi2ss_xmm_mem => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                const integer: i64 = if (d.size == .bits64)
-                    @bitCast(if (d.op == .vcvtsi2ss_xmm_reg) self.regVal(d.src_reg, .bits64) else self.readMemVal(d.addr, .bits64))
-                else
-                    @as(i32, @bitCast(@as(u32, @truncate(if (d.op == .vcvtsi2ss_xmm_reg) self.regVal(d.src_reg, .bits32) else self.readMemVal(d.addr, .bits32)))));
-                const converted: f32 = @floatFromInt(integer);
-                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(converted), .little);
-            },
-            .vcvtsi2sd_xmm_reg, .vcvtsi2sd_xmm_mem => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                const integer: i64 = if (d.size == .bits64)
-                    @bitCast(if (d.op == .vcvtsi2sd_xmm_reg) self.regVal(d.src_reg, .bits64) else self.readMemVal(d.addr, .bits64))
-                else
-                    @as(i32, @bitCast(@as(u32, @truncate(if (d.op == .vcvtsi2sd_xmm_reg) self.regVal(d.src_reg, .bits32) else self.readMemVal(d.addr, .bits32)))));
-                const converted: f64 = @floatFromInt(integer);
-                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
-            },
-            .vcvtss2sd => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                const source_bits = if (d.is_reg_form)
-                    std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
-                else
-                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
-                const converted: f64 = @floatCast(@as(f32, @bitCast(source_bits)));
-                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(converted), .little);
-            },
-            .vcvtsd2ss => {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-                const source_bits = if (d.is_reg_form)
-                    std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
-                else
-                    self.readMemVal(d.addr, .bits64);
-                const converted: f32 = @floatCast(@as(f64, @bitCast(source_bits)));
-                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(converted), .little);
-            },
-            .vaddss, .vmulss, .vsubss, .vdivss => {
-                self.executeVexScalarF32(d, vexArithmeticForOp(d.op));
-            },
-            .vaddsd, .vmulsd, .vsubsd, .vdivsd => {
-                self.executeVexScalarF64(d, vexArithmeticForOp(d.op));
-            },
-            .vaddps, .vmulps, .vsubps, .vdivps => {
-                self.executeVexPackedF32(d, vexArithmeticForOp(d.op));
-            },
-            .vaddpd, .vmulpd, .vsubpd, .vdivpd => {
-                self.executeVexPackedF64(d, vexArithmeticForOp(d.op));
-            },
-            .vucomiss => {
-                const lhs: f32 = @bitCast(std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little));
-                const rhs_bits = if (d.is_reg_form)
-                    std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
-                else
-                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
-                self.setVexComparisonFlags(lhs, @as(f32, @bitCast(rhs_bits)));
-            },
-            .vucomisd => {
-                const lhs: f64 = @bitCast(std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little));
-                const rhs_bits = if (d.is_reg_form)
-                    std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
-                else
-                    self.readMemVal(d.addr, .bits64);
-                self.setVexComparisonFlags(lhs, @as(f64, @bitCast(rhs_bits)));
-            },
-            .vroundss => {
-                const source1 = self.xmm[d.xmm_src];
-                const source2_bits = if (d.is_reg_form)
-                    std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
-                else
-                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
-                self.xmm[d.xmm_dst] = source1;
-                std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(roundVexFloat(f32, @bitCast(source2_bits), @truncate(d.imm))), .little);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            },
-            .vroundsd => {
-                const source1 = self.xmm[d.xmm_src];
-                const source2_bits = if (d.is_reg_form)
-                    std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
-                else
-                    self.readMemVal(d.addr, .bits64);
-                self.xmm[d.xmm_dst] = source1;
-                std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(roundVexFloat(f64, @bitCast(source2_bits), @truncate(d.imm))), .little);
-                @memset(&self.ymm_hi[d.xmm_dst], 0);
-            },
-            .vroundps => {
-                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = roundVexPackedF32(source_low, @truncate(d.imm));
-                if (d.vector_256) {
-                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = roundVexPackedF32(source_high, @truncate(d.imm));
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vroundpd => {
-                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = roundVexPackedF64(source_low, @truncate(d.imm));
-                if (d.vector_256) {
-                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = roundVexPackedF64(source_high, @truncate(d.imm));
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vcvttss2si, .vcvtss2si => {
-                const source_bits = if (d.is_reg_form)
-                    std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little)
-                else
-                    @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
-                const source: f32 = @bitCast(source_bits);
-                self.setReg(d.dst_reg, d.size, convertVexFloatToSigned(f32, source, d.size, d.op == .vcvttss2si));
-            },
-            .vcvttsd2si, .vcvtsd2si => {
-                const source_bits = if (d.is_reg_form)
-                    std.mem.readInt(u64, self.xmm[d.xmm_src][0..8], .little)
-                else
-                    self.readMemVal(d.addr, .bits64);
-                const source: f64 = @bitCast(source_bits);
-                self.setReg(d.dst_reg, d.size, convertVexFloatToSigned(f64, source, d.size, d.op == .vcvttsd2si));
-            },
-            .pmovmskb, .vpmovmskb => {
-                var mask: u32 = 0;
-                for (self.xmm[d.xmm_src], 0..) |byte, i| {
-                    if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(i);
-                }
-                self.setReg(d.dst_reg, .bits32, mask);
-            },
-            .vpmovmskb_ymm => {
-                var mask: u32 = 0;
-                for (self.xmm[d.xmm_src], 0..) |byte, i| {
-                    if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(i);
-                }
-                for (self.ymm_hi[d.xmm_src], 0..) |byte, i| {
-                    if (byte & 0x80 != 0) mask |= @as(u32, 1) << @intCast(i + 16);
-                }
-                self.setReg(d.dst_reg, .bits32, mask);
-            },
-            .vandps, .vandpd, .vandnps, .vandnpd, .vorps, .vorpd, .vxorps, .vxorpd, .vpor, .vpand, .vpandn, .vpxor => {
-                self.executeVexBitwise(d, vexBitwiseForOp(d.op));
-            },
-            .vpshufd => {
-                const control: u8 = @truncate(d.imm);
-                const source_low = if (d.is_reg_form) self.xmm[d.xmm_src] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = shufflePackedDwords(source_low, control);
-                if (d.vector_256) {
-                    const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = shufflePackedDwords(source_high, control);
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpmuludq => {
-                const source1_low = self.xmm[d.xmm_src];
-                const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = multiplyUnsignedEvenDwords(source1_low, source2_low);
-                if (d.vector_256) {
-                    const source1_high = self.ymm_hi[d.xmm_src];
-                    const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = multiplyUnsignedEvenDwords(source1_high, source2_high);
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpblendw => {
-                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = blendPackedWords(self.xmm[d.xmm_src], rhs_low, @truncate(d.imm));
-                if (d.vector_256) {
-                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = blendPackedWords(self.ymm_hi[d.xmm_src], rhs_high, @truncate(d.imm));
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpinsrd, .vpinsrq, .vpinsrw => {
-                const index: u8 = @truncate(d.imm);
-                const lane_count: u8 = if (d.op == .vpinsrd) 4 else if (d.op == .vpinsrq) 2 else 8;
-                const element_size: u8 = if (d.op == .vpinsrd) 4 else if (d.op == .vpinsrq) 8 else 2;
-                const clamped_index = index % lane_count;
-                const offset = clamped_index * element_size;
-
-                // Copy source XMM to destination
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-
-                // Insert the element
-                if (d.is_reg_form) {
-                    // From GPR register (low dword/qword/word)
-                    const gpr_val = self.regVal(@as(RegId, @enumFromInt(d.xmm_src2)), switch (d.op) {
-                        .vpinsrd => .bits32,
-                        .vpinsrq => .bits64,
-                        .vpinsrw => .bits16,
-                        else => .bits32,
-                    });
-                    if (d.op == .vpinsrd) {
-                        std.mem.writeInt(u32, self.xmm[d.xmm_dst][offset..][0..4], @truncate(gpr_val), .little);
-                    } else if (d.op == .vpinsrq) {
-                        std.mem.writeInt(u64, self.xmm[d.xmm_dst][offset..][0..8], gpr_val, .little);
-                    } else {
-                        std.mem.writeInt(u16, self.xmm[d.xmm_dst][offset..][0..2], @truncate(gpr_val), .little);
-                    }
-                } else {
-                    // From memory (read 32/64/16 bits)
-                    const mem_value = if (d.op == .vpinsrd)
-                        self.readMemVal(d.addr, .bits32)
-                    else if (d.op == .vpinsrq)
-                        self.readMemVal(d.addr, .bits64)
-                    else
-                        self.readMemVal(d.addr, .bits16);
-
-                    if (d.op == .vpinsrd) {
-                        std.mem.writeInt(u32, self.xmm[d.xmm_dst][offset..][0..4], @intCast(mem_value), .little);
-                    } else if (d.op == .vpinsrq) {
-                        std.mem.writeInt(u64, self.xmm[d.xmm_dst][offset..][0..8], mem_value, .little);
-                    } else {
-                        std.mem.writeInt(u16, self.xmm[d.xmm_dst][offset..][0..2], @intCast(mem_value), .little);
-                    }
-                }
-
-                if (d.vector_256) {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpunpckhbw, .vpunpckhwd, .vpunpckhdq, .vpunpcklbw, .vpunpcklwd => {
-                // VPUNPCK unpack operations - no-op for now
-                // TODO: Implement actual unpack semantics
-                if (d.is_reg_form) {
-                    self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-                } else {
-                    self.xmm[d.xmm_dst] = self.readMem128(d.addr);
-                }
-                if (d.vector_256) {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpslld, .vpsllq, .vpsllw, .vpslldq, .vpsrld, .vpsrlq, .vpsrlw, .vpsrldq => {
-                const source_low = if (d.uses_imm and !d.is_reg_form) self.readMem128(d.addr) else self.xmm[d.xmm_src];
-                const count = if (d.uses_imm)
-                    d.imm
-                else blk: {
-                    const count_source = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                    break :blk std.mem.readInt(u64, count_source[0..8], .little);
-                };
-                const left = d.op == .vpsllw or d.op == .vpslld or d.op == .vpsllq or d.op == .vpslldq;
-                if (d.op == .vpslldq or d.op == .vpsrldq) {
-                    self.xmm[d.xmm_dst] = shiftPackedBytes(source_low, count, left);
-                } else {
-                    self.xmm[d.xmm_dst] = shiftPackedElements(source_low, packedShiftLaneBits(d.op), count, left);
-                }
-                if (d.vector_256) {
-                    const source_high = if (d.uses_imm and !d.is_reg_form) self.readMem128(d.addr + 16) else self.ymm_hi[d.xmm_src];
-                    if (d.op == .vpslldq or d.op == .vpsrldq) {
-                        self.ymm_hi[d.xmm_dst] = shiftPackedBytes(source_high, count, left);
-                    } else {
-                        self.ymm_hi[d.xmm_dst] = shiftPackedElements(source_high, packedShiftLaneBits(d.op), count, left);
-                    }
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-            .vpsubb, .vpsubd, .vpsubq, .vpsubw, .vpaddb, .vpaddd, .vpaddq, .vpaddw, .vpmullw => {
-                const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-                self.xmm[d.xmm_dst] = packedIntegerBinary(
-                    self.xmm[d.xmm_src],
-                    rhs_low,
-                    packedIntegerLaneBits(d.op),
-                    packedIntegerOperation(d.op),
-                );
-                if (d.vector_256) {
-                    const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-                    self.ymm_hi[d.xmm_dst] = packedIntegerBinary(
-                        self.ymm_hi[d.xmm_src],
-                        rhs_high,
-                        packedIntegerLaneBits(d.op),
-                        packedIntegerOperation(d.op),
-                    );
-                } else {
-                    @memset(&self.ymm_hi[d.xmm_dst], 0);
-                }
-            },
-
-            .syscall => {
-                const boundary = x64_decoder.highway.systemBoundary(.macho64, .syscall, self.regs.rax, "");
-                if (boundary.disposition != .forward) {
-                    self.faulted = true;
-                    self.terminated = true;
-                    self.exit_code = 126;
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.system_policy_rejected);
-                    return;
-                }
-                self.dispatchMacOSSyscall(
-                    self.regs.rdi,
-                    self.regs.rsi,
-                    self.regs.rdx,
-                    self.regs.r10,
-                    self.regs.r8,
-                    self.regs.r9,
-                );
-            },
-
-            .ud2 => {
-                const symbol = self.metadata.nearestSymbol(self.regs.rip);
-                const assertion_age = self.executed_steps -| self.last_guest_assertion_step;
-                machoCapturePrint(
-                    "macho-processor: UD2 encounter: rip=0x{x} {s}+0x{x} active=0x{x} signal_depth={d} assertion={s} assertion_age={d} assertion_return=0x{x} bytes=0f0b\n",
-                    .{ self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(self.last_guest_assertion_class), assertion_age, self.last_guest_assertion_return },
-                );
-                if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len, self.regs.rip, null)) return;
-                machoCapturePrint("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});
-                self.faulted = true;
-                self.terminated = true;
-                self.exit_code = 128 + GUEST_SIGILL;
-                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unhandled_guest_signal);
-                return;
-            },
-
-            .cpuid => {
-                const leaf: u32 = @truncate(self.regs.rax);
-                const subleaf: u32 = @truncate(self.regs.rcx);
-                const result = x64_decoder.capabilities.cpuid(self.cpu_profile, leaf, subleaf);
-                log.info(
-                    "cpuid: leaf=0x{x} subleaf=0x{x} -> eax=0x{x} ebx=0x{x} ecx=0x{x} edx=0x{x}",
-                    .{ leaf, subleaf, result.eax, result.ebx, result.ecx, result.edx },
-                );
-                self.setReg(.al_ax_eax_rax, .bits32, result.eax);
-                self.setReg(.bl_bx_ebx_rbx, .bits32, result.ebx);
-                self.setReg(.cl_cx_ecx_rcx, .bits32, result.ecx);
-                self.setReg(.dl_dx_edx_rdx, .bits32, result.edx);
-            },
-
-            .xgetbv => {
-                const xcr0 = if (@as(u32, @truncate(self.regs.rcx)) == 0)
-                    x64_decoder.capabilities.xcr0(self.cpu_profile)
-                else
-                    0;
-                log.info("xgetbv: xcr=0x{x} -> xcr0=0x{x} profile={s}", .{ self.regs.rcx, xcr0, self.cpu_profile.label() });
-                self.setReg(.al_ax_eax_rax, .bits32, @truncate(xcr0));
-                self.setReg(.dl_dx_edx_rdx, .bits32, @truncate(xcr0 >> 32));
-            },
-
-            .hlt => {
-                const boundary = x64_decoder.highway.systemBoundary(.macho64, .process_exit, self.regs.rax, "HLT");
-                if (boundary.disposition != .emulate) unreachable;
-                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.hlt);
-                self.terminated = true;
-                self.exit_code = self.regs.rax;
-            },
-
-            else => {
-                log.warn("unimplemented instruction: {s} at rip=0x{x}", .{ @tagName(d.op), self.regs.rip });
-                self.faulted = true;
-                self.exit_code = 127;
-                self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unimplemented_instruction);
-                self.terminated = true;
-            },
-        }
+        return execute_impl.execute(self, initial_d);
     }
 
-    fn executeFucomip(self: *MachOState, source: u3) void {
-        const lhs = self.x87.get(0) orelse return;
-        const rhs = self.x87.get(source) orelse return;
-        self.regs.rflags &= ~(RFL_ZF | RFL_PF | RFL_CF);
-        if (std.math.isNan(lhs) or std.math.isNan(rhs)) {
-            self.regs.rflags |= RFL_ZF | RFL_PF | RFL_CF;
-        } else if (lhs < rhs) {
-            self.regs.rflags |= RFL_CF;
-        } else if (lhs == rhs) {
-            self.regs.rflags |= RFL_ZF;
-        }
-        _ = self.x87.pop();
+    pub fn executeFucomip(self: *MachOState, source: u3) void {
+        execution_helpers.executeFucomip(self, source);
     }
 
-    fn executeBitScan(self: *MachOState, d: DecodedInsn) void {
-        const is_memory = switch (d.op) {
-            .bsf_reg_mem, .bsr_reg_mem, .tzcnt_reg_mem, .lzcnt_reg_mem => true,
-            else => false,
-        };
-        const kind: BitScanKind = switch (d.op) {
-            .bsf_reg_reg, .bsf_reg_mem => .bsf,
-            .bsr_reg_reg, .bsr_reg_mem => .bsr,
-            .tzcnt_reg_reg, .tzcnt_reg_mem => .tzcnt,
-            .lzcnt_reg_reg, .lzcnt_reg_mem => .lzcnt,
-            else => unreachable,
-        };
-        const source = if (is_memory) self.readMemVal(d.addr, d.size) else self.regVal(d.src_reg, d.size);
-        const result = bitScan(d.size, kind, source);
-
-        if (result.write_destination) self.setReg(d.dst_reg, d.size, result.value);
-        self.setFlag(RFL_ZF, result.zero_flag);
-        if (result.carry_flag) |carry| self.setFlag(RFL_CF, carry);
+    pub fn executeBitScan(self: *MachOState, d: DecodedInsn) void {
+        execution_helpers.executeBitScan(self, d);
     }
 
-    fn executeRotate(self: *MachOState, d: DecodedInsn) void {
-        const is_mem = switch (d.op) {
-            .rol_mem_cl, .ror_mem_cl, .rol_mem_imm, .ror_mem_imm => true,
-            else => false,
-        };
-        const rotate_left = switch (d.op) {
-            .rol_reg_cl, .rol_mem_cl, .rol_reg_imm, .rol_mem_imm => true,
-            else => false,
-        };
-        const uses_cl = switch (d.op) {
-            .rol_reg_cl, .rol_mem_cl, .ror_reg_cl, .ror_mem_cl => true,
-            else => false,
-        };
-        const raw_count = if (uses_cl) self.regVal(.cl_cx_ecx_rcx, .bits8) else d.imm;
-        const masked_count = raw_count & @as(u64, if (d.size == .bits64) 0x3F else 0x1F);
-        const width: u64 = bitWidth(d.size);
-        const count: u6 = @intCast(masked_count % width);
-        if (count == 0) return;
-
-        const mask = maskForSize(d.size);
-        const old = (if (is_mem) self.readMemVal(d.addr, d.size) else self.regVal(d.dst_reg, d.size)) & mask;
-        const inverse: u6 = @intCast(width - count);
-        const result = if (rotate_left)
-            ((old << count) | (old >> inverse)) & mask
-        else
-            ((old >> count) | (old << inverse)) & mask;
-
-        if (is_mem) self.writeMemVal(d.addr, d.size, result) else self.setReg(d.dst_reg, d.size, result);
-        if (rotate_left) {
-            const carry = (result & 1) != 0;
-            self.setFlag(RFL_CF, carry);
-            if (count == 1) self.setFlag(RFL_OF, ((result & signBitForSize(d.size)) != 0) != carry);
-        } else {
-            const carry = (result & signBitForSize(d.size)) != 0;
-            self.setFlag(RFL_CF, carry);
-            if (count == 1) {
-                const next_sign = (result & (signBitForSize(d.size) >> 1)) != 0;
-                self.setFlag(RFL_OF, carry != next_sign);
-            }
-        }
+    pub fn executeRotate(self: *MachOState, d: DecodedInsn) void {
+        execution_helpers.executeRotate(self, d);
     }
 
-    fn executeVexScalarF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
-        const source1 = self.xmm[d.xmm_src];
-        const source2_bits = if (d.is_reg_form)
-            std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
-        else
-            @as(u32, @truncate(self.readMemVal(d.addr, .bits32)));
-        const source1_value: f32 = @bitCast(std.mem.readInt(u32, source1[0..4], .little));
-        const source2_value: f32 = @bitCast(source2_bits);
-
-        self.xmm[d.xmm_dst] = source1;
-        std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(applyVexArithmetic(f32, source1_value, source2_value, operation)), .little);
-        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    pub fn executeVexScalarF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        execution_helpers.executeVexScalarF32(self, d, operation);
     }
 
-    fn executeVexScalarF64(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
-        const source1 = self.xmm[d.xmm_src];
-        const source2_bits = if (d.is_reg_form)
-            std.mem.readInt(u64, self.xmm[d.xmm_src2][0..8], .little)
-        else
-            self.readMemVal(d.addr, .bits64);
-        const source1_value: f64 = @bitCast(std.mem.readInt(u64, source1[0..8], .little));
-        const source2_value: f64 = @bitCast(source2_bits);
-
-        self.xmm[d.xmm_dst] = source1;
-        std.mem.writeInt(u64, self.xmm[d.xmm_dst][0..8], @bitCast(applyVexArithmetic(f64, source1_value, source2_value, operation)), .little);
-        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    pub fn executeVexScalarF64(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        execution_helpers.executeVexScalarF64(self, d, operation);
     }
 
-    fn executeVexPackedF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
-        const source1_low = self.xmm[d.xmm_src];
-        const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-        self.xmm[d.xmm_dst] = applyVexPackedF32(source1_low, source2_low, operation);
-
-        if (d.vector_256) {
-            const source1_high = self.ymm_hi[d.xmm_src];
-            const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-            self.ymm_hi[d.xmm_dst] = applyVexPackedF32(source1_high, source2_high, operation);
-        } else {
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
-        }
+    pub fn executeVexPackedF32(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        execution_helpers.executeVexPackedF32(self, d, operation);
     }
 
-    fn executeVexPackedF64(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
-        const source1_low = self.xmm[d.xmm_src];
-        const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-        self.xmm[d.xmm_dst] = applyVexPackedF64(source1_low, source2_low, operation);
-
-        if (d.vector_256) {
-            const source1_high = self.ymm_hi[d.xmm_src];
-            const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-            self.ymm_hi[d.xmm_dst] = applyVexPackedF64(source1_high, source2_high, operation);
-        } else {
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
-        }
+    pub fn executeVexPackedF64(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
+        execution_helpers.executeVexPackedF64(self, d, operation);
     }
 
-    fn setVexComparisonFlags(self: *MachOState, lhs: anytype, rhs: @TypeOf(lhs)) void {
-        self.regs.rflags &= ~(RFL_OF | RFL_SF | RFL_ZF | RFL_AF | RFL_PF | RFL_CF);
-        if (std.math.isNan(lhs) or std.math.isNan(rhs)) {
-            self.regs.rflags |= RFL_ZF | RFL_PF | RFL_CF;
-        } else if (lhs < rhs) {
-            self.regs.rflags |= RFL_CF;
-        } else if (lhs == rhs) {
-            self.regs.rflags |= RFL_ZF;
-        }
+    pub fn setVexComparisonFlags(self: *MachOState, lhs: anytype, rhs: @TypeOf(lhs)) void {
+        execution_helpers.setVexComparisonFlags(self, lhs, rhs);
     }
 
-    fn executeVexBitwise(self: *MachOState, d: DecodedInsn, operation: VexBitwise) void {
-        const source1_low = self.xmm[d.xmm_src];
-        const source2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
-        self.xmm[d.xmm_dst] = applyVexBitwise(source1_low, source2_low, operation);
-
-        if (d.vector_256) {
-            const source1_high = self.ymm_hi[d.xmm_src];
-            const source2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
-            self.ymm_hi[d.xmm_dst] = applyVexBitwise(source1_high, source2_high, operation);
-        } else {
-            @memset(&self.ymm_hi[d.xmm_dst], 0);
-        }
+    pub fn executeVexBitwise(self: *MachOState, d: DecodedInsn, operation: VexBitwise) void {
+        execution_helpers.executeVexBitwise(self, d, operation);
     }
 
-    fn executeAddRegImm(self: *MachOState, d: DecodedInsn, sz: Size) void {
+    pub fn executeAddRegImm(self: *MachOState, d: DecodedInsn, sz: Size) void {
         self.executeHighwayImmediate(d, .add, sz, false);
     }
 
-    fn raiseDivideError(self: *MachOState) void {
+    pub fn raiseDivideError(self: *MachOState) void {
         self.faulted = true;
         self.terminated = true;
         self.exit_code = 136;
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.divide_by_zero);
     }
 
-    fn executeSubRegImm(self: *MachOState, d: DecodedInsn, sz: Size) void {
+    pub fn executeSubRegImm(self: *MachOState, d: DecodedInsn, sz: Size) void {
         self.executeHighwayImmediate(d, .sub, sz, false);
     }
 
-    fn executeAndRegImm(self: *MachOState, d: DecodedInsn) void {
+    pub fn executeAndRegImm(self: *MachOState, d: DecodedInsn) void {
         self.executeHighwayImmediate(d, .bit_and, d.size, false);
     }
 
@@ -12670,7 +6791,7 @@ pub const MachOState = struct {
         return -1;
     }
 
-    fn dispatchMacOSSyscall(self: *MachOState, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) void {
+    pub fn dispatchMacOSSyscall(self: *MachOState, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) void {
         const number = self.regs.rax;
         log.info("syscall: number=0x{x} ({s}) args=({d}, {d}, {d}, {d}, {d}, {d})", .{
             number, macho_runtime.syscallName(number),
@@ -12944,13 +7065,11 @@ const importRouteCacheIndex = utils.importRouteCacheIndex;
 const calculateBulkConstructionRange = utils.calculateBulkConstructionRange;
 const mappedOffset = utils.mappedOffset;
 const applyBindingAddend = utils.applyBindingAddend;
-const parseFopenFlags = utils.parseFopenFlags;
 const guestSignalIndex = utils.guestSignalIndex;
 const signalFailureResult = utils.signalFailureResult;
 const signalHandlerMadeProgress = utils.signalHandlerMadeProgress;
 const isAsciiBytes = utils.isAsciiBytes;
 const profileIdFromUserDevice = utils.profileIdFromUserDevice;
-const classifyProfileDismountCaller = utils.classifyProfileDismountCaller;
 const repairAsciiCodepointBlock = utils.repairAsciiCodepointBlock;
 const isPatchDbNullIsArraySequence = utils.isPatchDbNullIsArraySequence;
 const threeOperandImulResult = utils.threeOperandImulResult;
@@ -13330,47 +7449,22 @@ const integerIndefinite = decoder.integerIndefinite;
 const duplicateVectorElements = decoder.duplicateVectorElements;
 
 fn multiplyUnsignedEvenDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
-    var result = [_]u8{0} ** 16;
-    for (0..2) |lane| {
-        const source_offset = lane * 8;
-        const destination_offset = lane * 8;
-        const left = std.mem.readInt(u32, lhs[source_offset..][0..4], .little);
-        const right = std.mem.readInt(u32, rhs[source_offset..][0..4], .little);
-        std.mem.writeInt(u64, result[destination_offset..][0..8], @as(u64, left) * @as(u64, right), .little);
-    }
-    return result;
+    return packed_ops.multiplyUnsignedEvenDwords(lhs, rhs);
 }
 
 fn shufflePackedDwords(source: [16]u8, control: u8) [16]u8 {
-    var result: [16]u8 = undefined;
-    for (0..4) |destination_lane| {
-        const shift: u3 = @intCast(destination_lane * 2);
-        const source_lane = (control >> shift) & 0x03;
-        const destination_offset = destination_lane * 4;
-        const source_offset = @as(usize, source_lane) * 4;
-        @memcpy(result[destination_offset..][0..4], source[source_offset..][0..4]);
-    }
-    return result;
+    return packed_ops.shufflePackedDwords(source, control);
 }
 
 fn unpackLowQwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
-    var result: [16]u8 = undefined;
-    @memcpy(result[0..8], lhs[0..8]);
-    @memcpy(result[8..16], rhs[0..8]);
-    return result;
+    return packed_ops.unpackLowQwords(lhs, rhs);
 }
 
 fn blendPackedWords(lhs: [16]u8, rhs: [16]u8, control: u8) [16]u8 {
-    var result: [16]u8 = undefined;
-    for (0..8) |lane| {
-        const offset = lane * 2;
-        const source = if (control & (@as(u8, 1) << @intCast(lane)) != 0) rhs else lhs;
-        @memcpy(result[offset..][0..2], source[offset..][0..2]);
-    }
-    return result;
+    return packed_ops.blendPackedWords(lhs, rhs, control);
 }
 
-const PackedIntegerOperation = enum { add, sub, mul_low };
+const PackedIntegerOperation = packed_ops.PackedIntegerOperation;
 
 fn packedIntegerOperation(op: Op) PackedIntegerOperation {
     return switch (op) {
@@ -13392,51 +7486,7 @@ fn packedIntegerLaneBits(op: Op) u8 {
 }
 
 fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: PackedIntegerOperation) [16]u8 {
-    var result: [16]u8 = undefined;
-    switch (lane_bits) {
-        8 => for (0..16) |lane| {
-            result[lane] = switch (operation) {
-                .add => lhs[lane] +% rhs[lane],
-                .sub => lhs[lane] -% rhs[lane],
-                .mul_low => lhs[lane] *% rhs[lane],
-            };
-        },
-        16 => for (0..8) |lane| {
-            const offset = lane * 2;
-            const left = std.mem.readInt(u16, lhs[offset..][0..2], .little);
-            const right = std.mem.readInt(u16, rhs[offset..][0..2], .little);
-            const value = switch (operation) {
-                .add => left +% right,
-                .sub => left -% right,
-                .mul_low => left *% right,
-            };
-            std.mem.writeInt(u16, result[offset..][0..2], value, .little);
-        },
-        32 => for (0..4) |lane| {
-            const offset = lane * 4;
-            const left = std.mem.readInt(u32, lhs[offset..][0..4], .little);
-            const right = std.mem.readInt(u32, rhs[offset..][0..4], .little);
-            const value = switch (operation) {
-                .add => left +% right,
-                .sub => left -% right,
-                .mul_low => left *% right,
-            };
-            std.mem.writeInt(u32, result[offset..][0..4], value, .little);
-        },
-        64 => for (0..2) |lane| {
-            const offset = lane * 8;
-            const left = std.mem.readInt(u64, lhs[offset..][0..8], .little);
-            const right = std.mem.readInt(u64, rhs[offset..][0..8], .little);
-            const value = switch (operation) {
-                .add => left +% right,
-                .sub => left -% right,
-                .mul_low => left *% right,
-            };
-            std.mem.writeInt(u64, result[offset..][0..8], value, .little);
-        },
-        else => unreachable,
-    }
-    return result;
+    return packed_ops.packedIntegerBinary(lhs, rhs, lane_bits, operation);
 }
 
 fn packedShiftLaneBits(op: Op) u8 {
@@ -13449,39 +7499,11 @@ fn packedShiftLaneBits(op: Op) u8 {
 }
 
 fn shiftPackedElements(source: [16]u8, lane_bits: u8, count: u64, left: bool) [16]u8 {
-    var result = [_]u8{0} ** 16;
-    if (count >= lane_bits) return result;
-    switch (lane_bits) {
-        16 => for (0..8) |lane| {
-            const offset = lane * 2;
-            const value = std.mem.readInt(u16, source[offset..][0..2], .little);
-            std.mem.writeInt(u16, result[offset..][0..2], if (left) value << @intCast(count) else value >> @intCast(count), .little);
-        },
-        32 => for (0..4) |lane| {
-            const offset = lane * 4;
-            const value = std.mem.readInt(u32, source[offset..][0..4], .little);
-            std.mem.writeInt(u32, result[offset..][0..4], if (left) value << @intCast(count) else value >> @intCast(count), .little);
-        },
-        64 => for (0..2) |lane| {
-            const offset = lane * 8;
-            const value = std.mem.readInt(u64, source[offset..][0..8], .little);
-            std.mem.writeInt(u64, result[offset..][0..8], if (left) value << @intCast(count) else value >> @intCast(count), .little);
-        },
-        else => unreachable,
-    }
-    return result;
+    return packed_ops.shiftPackedElements(source, lane_bits, count, left);
 }
 
 fn shiftPackedBytes(source: [16]u8, count: u64, left: bool) [16]u8 {
-    var result = [_]u8{0} ** 16;
-    if (count >= 16) return result;
-    const amount: usize = @intCast(count);
-    if (left) {
-        @memcpy(result[amount..], source[0 .. 16 - amount]);
-    } else {
-        @memcpy(result[0 .. 16 - amount], source[amount..]);
-    }
-    return result;
+    return packed_ops.shiftPackedBytes(source, count, left);
 }
 
 /// Darwin's `_SC_PAGESIZE` selector is 29. Process-level page queries describe

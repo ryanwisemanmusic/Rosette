@@ -382,6 +382,8 @@ pub const CooperativeUiContext = struct {
     xmm: [16][16]u8,
     ymm_hi: [16][16]u8,
     x87: X87State,
+    thread: u64 = 0,
+    caller: u64 = 0,
 };
 
 pub const MAX_GTK_IDLE_CALLBACKS = 32;
