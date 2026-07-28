@@ -3,15 +3,11 @@
 //! Extracted from MachOState (lib/Mach-O/process.zig) to make the import
 //! dispatch logic independently testable and maintainable.
 //!
-//! === Current Extraction ===
-//! Phase 1 complete: ImportHandler struct owns primitive dispatch maps
-//! and logging/throttling logic. MachOState delegates to ImportHandler
-//! via PrimitiveDispatchCallbacks.
-//!
-//! === Future Phases ===
-//! Phase 2: Move import_route_cache and importRouteCacheIndex
-//! Phase 3: Move handleImportSlow and handleImportImpl
-//! Phase 4: Wire into MachOState and remove old code
+//! ImportHandler owns primitive dispatch accounting. `dispatch.zig` owns the
+//! route cache policy, compatibility contracts, cooperative import boundaries,
+//! unresolved-symbol analysis, and guest-exit callback sequencing. MachOState
+//! retains state ownership and exposes these operations through function
+//! aliases.
 //!
 //! Note: This module deliberately does NOT import the `primitive` module,
 //! to avoid dependency issues with different build paths (build.zig vs.
@@ -19,6 +15,8 @@
 //! through opaque callbacks.
 
 const std = @import("std");
+
+pub const dispatch = @import("dispatch.zig");
 
 /// Callbacks for MachOState-specific operations needed for primitive dispatch.
 /// Uses an opaque context pointer so that the parent (e.g. MachOState)
