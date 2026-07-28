@@ -172,10 +172,11 @@ pub fn readMemVal(
 }
 
 test {
-    try std.testing.expectEqual(@as(u8, 1), bytesForSize(.bits8));
-    try std.testing.expectEqual(@as(u8, 2), bytesForSize(.bits16));
-    try std.testing.expectEqual(@as(u8, 4), bytesForSize(.bits32));
-    try std.testing.expectEqual(@as(u8, 8), bytesForSize(.bits64));
+    const TestSize = enum { bits8, bits16, bits32, bits64 };
+    try std.testing.expectEqual(@as(u8, 1), bytesForSize(TestSize.bits8));
+    try std.testing.expectEqual(@as(u8, 2), bytesForSize(TestSize.bits16));
+    try std.testing.expectEqual(@as(u8, 4), bytesForSize(TestSize.bits32));
+    try std.testing.expectEqual(@as(u8, 8), bytesForSize(TestSize.bits64));
 
     _ = readMemVal;
     _ = ReadMemValCallbacks;
@@ -186,4 +187,52 @@ test {
         writeExtendedFloat80(&encoded, duration);
         try std.testing.expectApproxEqAbs(duration, readExtendedFloat80(&encoded), 1e-15);
     }
+}
+
+test "scalar read accepts sparse backing without a contiguous image offset" {
+    var sparse = sparse_virtual_memory.Manager.init(std.testing.allocator);
+    defer sparse.deinit();
+
+    const base: u64 = 0x37D7_C0000;
+    const fixed_anonymous_private: u32 = 0x0010 | 0x1000 | 0x0002;
+    try std.testing.expect(sparse.mapFixed(
+        base,
+        sparse_virtual_memory.PAGE_64K,
+        3,
+        fixed_anonymous_private,
+        -1,
+        0,
+    ));
+    const storage = sparse.bytes(base + 0x120, @sizeOf(u32), true) orelse
+        return error.TestUnexpectedResult;
+    std.mem.writeInt(u32, storage[0..4], 0xA1B2_C3D4, .little);
+
+    var image: [1]u8 = .{0};
+    var permissions: [1]u8 = .{0};
+    const state = MemoryState{
+        .allocator = std.testing.allocator,
+        .mem = &image,
+        .mem_base = 0,
+        .mem_size = image.len,
+        .heap_next = 0,
+        .page_permissions = &permissions,
+        .sparse_memory = &sparse,
+    };
+    const Size = enum { bits8, bits16, bits32, bits64 };
+    const callbacks = ReadMemValCallbacks{
+        .ctx = @ptrCast(&image),
+        .recoverVtable = struct {
+            fn recover(_: *anyopaque, _: u64, _: u64) ?u64 {
+                return null;
+            }
+        }.recover,
+        .recordAccess = struct {
+            fn record(_: *anyopaque, _: u64, _: u8, _: u64) void {}
+        }.record,
+    };
+
+    try std.testing.expectEqual(
+        @as(u64, 0xA1B2_C3D4),
+        readMemVal(&state, base + 0x120, Size.bits32, null, callbacks),
+    );
 }

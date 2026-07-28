@@ -6,6 +6,12 @@ const Allocation = struct {
     alignment: u64,
 };
 
+pub const ContainingAllocation = struct {
+    base: u64,
+    size: u64,
+    offset: u64,
+};
+
 const FreeBlock = struct {
     address: u64,
     size: u64,
@@ -97,6 +103,26 @@ pub const Manager = struct {
     pub fn allocationSize(self: *const Manager, address: u64) ?u64 {
         const allocation = self.allocations.get(address) orelse return null;
         return allocation.size;
+    }
+
+    /// Finds the live forwarded allocation containing an interior address.
+    /// This is diagnostic-only and intentionally linear: it runs only while
+    /// explaining a terminal fault, never on the guest execution hot path.
+    pub fn containingAllocation(self: *const Manager, address: u64) ?ContainingAllocation {
+        var iterator = self.allocations.iterator();
+        while (iterator.next()) |entry| {
+            const base = entry.key_ptr.*;
+            const size = entry.value_ptr.size;
+            const end = std.math.add(u64, base, size) catch continue;
+            if (address >= base and address < end) {
+                return .{
+                    .base = base,
+                    .size = size,
+                    .offset = address - base,
+                };
+            }
+        }
+        return null;
     }
 
     pub fn summary(self: *const Manager) Summary {
