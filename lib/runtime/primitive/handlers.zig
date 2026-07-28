@@ -185,6 +185,16 @@ pub fn ostreamWrite(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled;
 }
 
+/// Implements `std::terminate()` — called by `__clang_call_terminate` when a
+/// `noexcept` violation occurs during C++ exception stack unwinding.
+/// ABI: no arguments. This function never returns — it calls host `abort()`.
+pub fn stdTerminate(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    _ = ctx;
+    const msg = "std::terminate() called from guest code; aborting\n";
+    _ = std.c.write(2, msg.ptr, msg.len);
+    std.c.abort();
+}
+
 test "handlers: strlen reads cstring and returns length" {
     const TestState = struct {
         args: [6]u64 = .{0} ** 6,
