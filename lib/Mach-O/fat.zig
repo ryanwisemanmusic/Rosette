@@ -1,5 +1,5 @@
 const std = @import("std");
-const macho = @import("macho.zig");
+const macho = @import("macho_core").macho;
 
 pub const FAT_MAGIC: u32 = 0xCAFEBABE;
 pub const FAT_CIGAM: u32 = 0xBEBAFECA;

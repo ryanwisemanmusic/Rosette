@@ -1,5 +1,5 @@
 const std = @import("std");
-const macho = @import("macho_core").macho;
+const macho = @import("macho.zig");
 
 const LC_DYLD_INFO_ONLY: u32 = 0x22 | 0x8000_0000;
 const LC_LOAD_WEAK_DYLIB: u32 = 0x18 | 0x8000_0000;

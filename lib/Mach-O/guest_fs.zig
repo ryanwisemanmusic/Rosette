@@ -7,9 +7,9 @@
 //! `*MachOState`.
 
 const std = @import("std");
-const types = @import("types.zig");
-const constants = @import("constants.zig");
-const utils = @import("utils.zig");
+const types = @import("macho_core").types;
+const constants = @import("macho_core").constants;
+const utils = @import("macho_core").utils;
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 
