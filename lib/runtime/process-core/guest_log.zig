@@ -8,8 +8,8 @@ const std = @import("std");
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const startup_observer = @import("diagnostics").startup_observer;
-const constants = @import("../../Mach-O/constants.zig");
-const utils = @import("../../Mach-O/utils.zig");
+const constants = @import("macho_core").constants;
+const utils = @import("macho_core").utils;
 
 const GUEST_LOG_BUFFER_SIZE = constants.GUEST_LOG_BUFFER_SIZE;
 const GUEST_FILE_BASE = constants.GUEST_FILE_BASE;
@@ -144,6 +144,7 @@ pub fn emitRuntimeSummaryHeartbeat(self: anytype, snapshot: startup_observer.Sna
 pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
     const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
     const message = self.guestMemoryConst(address, length) orelse return false;
+    observeXeniaPipelineGuestLog(self, message);
     self.observeBackendGuestLog(message);
     const raw_char: u8 = @truncate(prefix_char_raw);
     const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
@@ -210,6 +211,38 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     }
     self.guest_log_line_count +|= 1;
     return true;
+}
+
+pub fn observeXeniaPipelineGuestLog(self: anytype, message: []const u8) void {
+    const observation = self.xenia_pipeline.observeLine(message, self.executed_steps) orelse return;
+    if (!observation.first_observation) return;
+
+    const spec = @import("diagnostics").xenia_pipeline_contracts.spec(observation.stage);
+    machoCapturePrint(
+        "macho-processor: Xenia pipeline milestone: stage={s} subsystem={s} step={d} prerequisite_missing={} frontier={s} evidence={s}\n",
+        .{
+            @tagName(observation.stage),
+            @tagName(spec.subsystem),
+            observation.step,
+            observation.prerequisite_missing,
+            if (observation.frontier) |stage| @tagName(stage) else "none",
+            spec.description,
+        },
+    );
+    if (self.summary_output_fd < 0) return;
+    var buffer: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buffer,
+        "step={d} event=xenia_pipeline stage={s} subsystem={s} frontier={s} prerequisite_missing={}\n",
+        .{
+            observation.step,
+            @tagName(observation.stage),
+            @tagName(spec.subsystem),
+            if (observation.frontier) |stage| @tagName(stage) else "none",
+            observation.prerequisite_missing,
+        },
+    ) catch return;
+    _ = hostWriteFdAll(self.summary_output_fd, line);
 }
 
 pub fn logProfileHostPreflight(self: anytype, profile_id: []const u8) void {

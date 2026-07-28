@@ -3,6 +3,8 @@
 //! Uses `anytype` for `self` parameter (inferred as `*MachOState` at call sites).
 
 pub const compat_handlers = @import("compat_handlers.zig");
+pub const memory_access = @import("memory_access.zig");
+pub const near_null_causality = @import("near_null_causality.zig");
 pub const crash_diag = @import("crash_diag.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const execute = @import("execute.zig");

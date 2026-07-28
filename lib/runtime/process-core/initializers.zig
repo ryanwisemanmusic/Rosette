@@ -13,10 +13,10 @@ const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const export_table_lifecycle = @import("dyld").export_table_lifecycle;
 
-const types = @import("../../Mach-O/types.zig");
+const types = @import("macho_core").types;
 const InitializerRunOutcome = types.InitializerRunOutcome;
 
-const constants = @import("../../Mach-O/constants.zig");
+const constants = @import("macho_core").constants;
 const INITIALIZER_RETURN_SENTINEL = constants.INITIALIZER_RETURN_SENTINEL;
 const INITIALIZER_STEP_LIMIT = constants.INITIALIZER_STEP_LIMIT;
 const UNSUPPORTED_RUNTIME_EXIT_CODE = constants.UNSUPPORTED_RUNTIME_EXIT_CODE;

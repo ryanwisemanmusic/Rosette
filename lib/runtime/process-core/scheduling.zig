@@ -11,22 +11,22 @@ const scheduler = @import("scheduler");
 const pthread_runtime = @import("pthread").pthread_runtime;
 
 // Types referenced explicitly in parameter/return types or function bodies
-const SuspendedGuestThread = @import("../../Mach-O/types.zig").SuspendedGuestThread;
-const GtkIdleQueueSnapshot = @import("../../Mach-O/types.zig").GtkIdleQueueSnapshot;
-const GtkIdleDispatchBlock = @import("../../Mach-O/types.zig").GtkIdleDispatchBlock;
-const RunnableSuspendedSnapshot = @import("../../Mach-O/types.zig").RunnableSuspendedSnapshot;
-const gtkIdleQueueSnapshotFor = @import("../../Mach-O/types.zig").gtkIdleQueueSnapshotFor;
+const SuspendedGuestThread = @import("macho_core").types.SuspendedGuestThread;
+const GtkIdleQueueSnapshot = @import("macho_core").types.GtkIdleQueueSnapshot;
+const GtkIdleDispatchBlock = @import("macho_core").types.GtkIdleDispatchBlock;
+const RunnableSuspendedSnapshot = @import("macho_core").types.RunnableSuspendedSnapshot;
+const gtkIdleQueueSnapshotFor = @import("macho_core").types.gtkIdleQueueSnapshotFor;
 
 // Constants used in function bodies
-const DEFAULT_GUEST_THREAD_STACK_SIZE = @import("../../Mach-O/constants.zig").DEFAULT_GUEST_THREAD_STACK_SIZE;
-const COOPERATIVE_THREAD_QUANTUM_STEPS = @import("../../Mach-O/constants.zig").COOPERATIVE_THREAD_QUANTUM_STEPS;
-const GTK_IDLE_STARVATION_STEPS = @import("../../Mach-O/constants.zig").GTK_IDLE_STARVATION_STEPS;
-const GUEST_THREAD_RETURN_SENTINEL = @import("../../Mach-O/constants.zig").GUEST_THREAD_RETURN_SENTINEL;
-const MAX_GTK_IDLE_CALLBACKS = @import("../../Mach-O/types.zig").MAX_GTK_IDLE_CALLBACKS;
-const GTK_IDLE_CALLBACK_HANDLE_BASE = @import("../../Mach-O/types.zig").GTK_IDLE_CALLBACK_HANDLE_BASE;
+const DEFAULT_GUEST_THREAD_STACK_SIZE = @import("macho_core").constants.DEFAULT_GUEST_THREAD_STACK_SIZE;
+const COOPERATIVE_THREAD_QUANTUM_STEPS = @import("macho_core").constants.COOPERATIVE_THREAD_QUANTUM_STEPS;
+const GTK_IDLE_STARVATION_STEPS = @import("macho_core").constants.GTK_IDLE_STARVATION_STEPS;
+const GUEST_THREAD_RETURN_SENTINEL = @import("macho_core").constants.GUEST_THREAD_RETURN_SENTINEL;
+const MAX_GTK_IDLE_CALLBACKS = @import("macho_core").types.MAX_GTK_IDLE_CALLBACKS;
+const GTK_IDLE_CALLBACK_HANDLE_BASE = @import("macho_core").types.GTK_IDLE_CALLBACK_HANDLE_BASE;
 
 // Utility functions
-const alignDown = @import("../../Mach-O/utils.zig").alignDown;
+const alignDown = @import("macho_core").utils.alignDown;
 
 pub fn beginGtkMainLoop(self: anytype) bool {
     if (self.cooperative_ui_context != null) return false;

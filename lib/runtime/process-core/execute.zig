@@ -6,12 +6,12 @@ const macho_log = @import("dyld").event_log;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
 const memory_mod = @import("memory");
 const proc_diag = @import("diagnostics.zig");
-const execution_helpers = @import("../../Mach-O/execution_helpers.zig");
-const packed_ops = @import("../../Mach-O/packed_ops.zig");
-const decoder = @import("../../Mach-O/decoder.zig");
-const utils = @import("../../Mach-O/utils.zig");
-const types = @import("../../Mach-O/types.zig");
-const constants = @import("../../Mach-O/constants.zig");
+const execution_helpers = @import("macho_core").execution_helpers;
+const packed_ops = @import("macho_core").packed_ops;
+const decoder = @import("macho_core").decoder;
+const utils = @import("macho_core").utils;
+const types = @import("macho_core").types;
+const constants = @import("macho_core").constants;
 const compat_runtime = @import("macho_compat_runtime");
 const tlv_runtime = @import("guest_abi").tlv_runtime;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
@@ -628,7 +628,10 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.push(return_addr);
             self.regs.rip = target;
             self.logControlFlow("call_rel32", from_rip, target, d.len, return_addr);
-            if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
+            if (self.sha1_tracer.enabled and
+                self.sha1_tracer.isActiveThread(self) and
+                self.sha1_tracer.depth < 4)
+            {
                 const stk = self.sha1_tracer.depth;
                 self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
                 self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
@@ -661,7 +664,10 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 self.push(return_addr);
                 self.regs.rip = target;
                 self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
-                if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
+                if (self.sha1_tracer.enabled and
+                    self.sha1_tracer.isActiveThread(self) and
+                    self.sha1_tracer.depth < 4)
+                {
                     const stk = self.sha1_tracer.depth;
                     self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
                     self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
@@ -721,7 +727,10 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 self.push(return_addr);
                 self.regs.rip = target;
                 self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
-                if (self.sha1_tracer.enabled and self.sha1_tracer.depth < 4) {
+                if (self.sha1_tracer.enabled and
+                    self.sha1_tracer.isActiveThread(self) and
+                    self.sha1_tracer.depth < 4)
+                {
                     const stk = self.sha1_tracer.depth;
                     self.sha1_tracer.saved_entry[stk] = self.sha1_tracer.entry_rip;
                     self.sha1_tracer.saved_count[stk] = self.sha1_tracer.instruction_count;
@@ -746,12 +755,18 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             }
             self.logControlFlow("ret", self.regs.rip, ret_addr, d.len, null);
             self.regs.rip = ret_addr;
-            if (self.sha1_tracer.enabled and self.sha1_tracer.depth > 0) {
-                self.sha1_tracer.depth -= 1;
-                const stk = self.sha1_tracer.depth;
-                self.sha1_tracer.entry_rip = self.sha1_tracer.saved_entry[stk];
-                self.sha1_tracer.instruction_count = self.sha1_tracer.saved_count[stk];
-                self.sha1_tracer.call_site = self.sha1_tracer.saved_call_site[stk];
+            if (self.sha1_tracer.enabled and
+                self.sha1_tracer.isActiveThread(self))
+            {
+                if (ret_addr == self.sha1_tracer.return_address) {
+                    self.sha1_tracer.finishProcessBytes(self);
+                } else if (self.sha1_tracer.depth > 0) {
+                    self.sha1_tracer.depth -= 1;
+                    const stk = self.sha1_tracer.depth;
+                    self.sha1_tracer.entry_rip = self.sha1_tracer.saved_entry[stk];
+                    self.sha1_tracer.instruction_count = self.sha1_tracer.saved_count[stk];
+                    self.sha1_tracer.call_site = self.sha1_tracer.saved_call_site[stk];
+                }
             }
         },
 
