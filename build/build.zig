@@ -1155,7 +1155,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const macho_processor_mod = b.createModule(.{
-            .root_source_file = b.path("../lib/Mach-O/main.zig"),
+        const macho_core_mod = b.createModule(.{            .root_source_file = b.path("../lib/Mach-O/shared_core.zig"),            .target = target,            .optimize = optimize,        });        macho_core_mod.addImport("x64_decoder", x64_decoder_mod);        macho_core_mod.addImport("dyld", dyld_mod);        macho_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);        const process_core_mod = b.createModule(.{            .root_source_file = b.path("../lib/runtime/process-core/root.zig"),            .target = target,            .optimize = optimize,        });        process_core_mod.addImport("macho_core", macho_core_mod);        process_core_mod.addImport("x64_decoder", x64_decoder_mod);        process_core_mod.addImport("dyld", dyld_mod);        process_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);        process_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);        process_core_mod.addImport("cxx_abi", cxx_abi_mod);        process_core_mod.addImport("scheduler", scheduler_mod);        process_core_mod.addImport("cleo_routing", cleo_routing_mod);        process_core_mod.addImport("init", init_mod);        process_core_mod.addImport("macho_runtime", macho_runtime_mod);        process_core_mod.addImport("contract", contract_mod);            .root_source_file = b.path("../lib/Mach-O/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -1174,6 +1174,8 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("cleo_routing", cleo_routing_mod);
         macho_processor_mod.addImport("scheduler", scheduler_mod);
         macho_processor_mod.addImport("jit", jit_mod);
+        macho_processor_mod.addImport("macho_core", macho_core_mod);
+        macho_processor_mod.addImport("process_core", process_core_mod);
         if (is_macos) {
             macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
             macho_processor_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
@@ -1211,6 +1213,8 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("cleo_routing", cleo_routing_mod);
         macho_processor_test_mod.addImport("scheduler", scheduler_mod);
         macho_processor_test_mod.addImport("jit", jit_mod);
+        macho_processor_test_mod.addImport("macho_core", macho_core_mod);
+        macho_processor_test_mod.addImport("process_core", process_core_mod);
         if (is_macos) {
             macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
             macho_processor_test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
