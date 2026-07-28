@@ -17,6 +17,17 @@ pub const Policy = struct {
     /// arbitrary heap pointer with a very distant vtable symbol.
     max_symbol_offset: u64 = 0x1000,
     require_mapped_header: bool = true,
+
+    /// When `true`, the tracker may also propose recovery when a value at a
+    /// tracked allocation base is read as non-zero (>= 0x1000) but is NOT a
+    /// valid vtable identity.  This covers corruption patterns where the
+    /// vptr is overwritten with a non-zero invalid pointer rather than
+    /// cleared to zero.
+    ///
+    /// The caller is responsible for passing the rejection (if any) of the
+    /// current value via `assessCorruption`.  The tracker itself has no
+    /// access to symbol metadata and cannot build IdentityEvidence.
+    repair_nonzero_corruption: bool = false,
 };
 
 pub const Provenance = struct {

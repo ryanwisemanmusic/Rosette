@@ -151,6 +151,46 @@ pub const VtableTracker = struct {
         };
     }
 
+    /// Propose recovery when a value at a tracked allocation base is read as
+    /// non-zero but is NOT a valid vtable identity.  The caller must pass the
+    /// rejection reason (or null if the current value IS a trusted vtable).
+    ///
+    /// Unlike `assessLowRead` (which requires `current_value < 0x1000`), this
+    /// method handles corruption patterns where the vptr is overwritten with
+    /// a non-zero invalid pointer (e.g. a kernel-space address, a scrambled
+    /// offset, or a small integer that happens to land at ≥ 0x1000).
+    pub fn assessCorruption(
+        self: *VtableTracker,
+        address: u64,
+        current_value: u64,
+        current_rejection: ?types.IdentityRejection,
+        exact_live_allocation_base: bool,
+    ) ?types.Recovery {
+        self.live_vtable_guard_checks +|= 1;
+        if (!self.policy.repair_nonzero_corruption) return null;
+        if (!exact_live_allocation_base) return null;
+        // If current value IS a valid vtable identity, there's no corruption.
+        // The object legitimately has a (possibly new) vtable.
+        if (current_rejection == null) return null;
+        // Don't intervene when the current value is low (< 0x1000) — that
+        // path is handled by assessLowRead already.
+        if (current_value < 0x1000) return null;
+        const record = self.records.get(address) orelse return null;
+        // If the current value is the same as the trusted vptr yet the
+        // tracker says the value was rejected, something went wrong in the
+        // evidence collection (e.g. the symbol was unloaded).  Treat this
+        // as a stable state, not corruption — don't oscillate.
+        if (record.trusted_vptr == current_value) return null;
+        return .{
+            .value = record.trusted_vptr,
+            .generation = record.generation,
+            .symbol_offset = record.trusted_symbol_offset,
+            .established_by = record.established_by,
+            .last_write = record.last_write,
+            .prior_recoveries = record.recoveries,
+        };
+    }
+
     pub fn noteRecovery(self: *VtableTracker, address: u64, generation: u64) bool {
         const record = self.records.getPtr(address) orelse return false;
         if (record.generation != generation) return false;
@@ -262,4 +302,74 @@ test "observe-only policy never proposes mutation" {
 
     _ = tracker.observeWrite(0x4000, trustedEvidence(0x1950b28, 0x50), .{});
     try std.testing.expect(tracker.assessLowRead(0x4000, 0, true) == null);
+}
+
+test "assessCorruption returns recovery for non-zero invalid value at trusted address" {
+    var tracker = VtableTracker.initWithPolicy(std.testing.allocator, .{
+        .repair_nonzero_corruption = true,
+    });
+    defer tracker.deinit();
+
+    _ = tracker.observeWrite(0x4000, trustedEvidence(0x1950b28, 0x50), .{});
+
+    // Current value is a kernel-space address — not a valid vtable.
+    const corrupted_evidence = types.IdentityEvidence{
+        .value = 0xfffffc0000000042,
+        .symbol_name = null,
+        .symbol_offset = std.math.maxInt(u64),
+        .header_mapped = false,
+    };
+    const rejection = corrupted_evidence.rejection(tracker.policy);
+    try std.testing.expect(rejection != null);
+
+    const recovery = tracker.assessCorruption(
+        0x4000,
+        0xfffffc0000000042,
+        rejection,
+        true,
+    );
+    try std.testing.expect(recovery != null);
+    try std.testing.expectEqual(@as(u64, 0x1950b28), recovery.?.value);
+
+    // When the current value matches the trusted vptr (and yet evidence says rejected),
+    // assessCorruption should NOT return a recovery — it's a stable state.
+    const stable = tracker.assessCorruption(
+        0x4000,
+        0x1950b28,
+        types.IdentityRejection.missing_symbol, // evidence says rejected (e.g. symbol was unloaded)
+        true,
+    );
+    try std.testing.expect(stable == null);
+}
+
+test "assessCorruption returns null when repair_nonzero_corruption is false" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    _ = tracker.observeWrite(0x4000, trustedEvidence(0x1950b28, 0x50), .{});
+
+    const result = tracker.assessCorruption(
+        0x4000,
+        0xdeadbeef,
+        types.IdentityRejection.missing_symbol,
+        true,
+    );
+    try std.testing.expect(result == null);
+}
+
+test "assessCorruption returns null when not exact live allocation" {
+    var tracker = VtableTracker.initWithPolicy(std.testing.allocator, .{
+        .repair_nonzero_corruption = true,
+    });
+    defer tracker.deinit();
+
+    _ = tracker.observeWrite(0x4000, trustedEvidence(0x1950b28, 0x50), .{});
+
+    const result = tracker.assessCorruption(
+        0x4000,
+        0xdeadbeef,
+        types.IdentityRejection.missing_symbol,
+        false, // not exact live allocation base
+    );
+    try std.testing.expect(result == null);
 }

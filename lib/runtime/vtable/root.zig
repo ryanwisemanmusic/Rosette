@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const types = @import("types.zig");
 pub const tracker = @import("tracker.zig");
-pub const guard_rollback = @import("guard_rollback.zig");
+pub const stack_registry = @import("stack_registry.zig");
 
 pub const RecoveryMode = types.RecoveryMode;
 pub const Policy = types.Policy;
@@ -18,10 +18,10 @@ pub const isAddressInMappedMemory = types.isAddressInMappedMemory;
 pub const detectFunctionProloguePtr = types.detectFunctionProloguePtr;
 pub const isItaniumVtableSymbol = types.isItaniumVtableSymbol;
 pub const VtableTracker = tracker.VtableTracker;
-pub const GuardRollback = guard_rollback.GuardRollback;
+pub const StackRegistry = stack_registry.StackRegistry;
 
 test {
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(tracker);
-    std.testing.refAllDecls(guard_rollback);
+    std.testing.refAllDecls(stack_registry);
 }
