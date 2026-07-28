@@ -149,6 +149,16 @@ pub fn readMemVal(
                     value = recovered;
                 }
             }
+        } else if (size == .bits64) {
+            // Non-zero corruption recovery: even when value >= 0x1000, ask
+            // the callback whether this looks like a corrupted vtable pointer
+            // (e.g. overwritten with a kernel-space address or scrambled offset).
+            if (callbacks.recoverVtable(callbacks.ctx, vaddr, value)) |recovered| {
+                if (@constCast(state.sparse_memory).bytes(vaddr, @sizeOf(u64), true)) |mutable_storage| {
+                    std.mem.writeInt(u64, mutable_storage[0..8], recovered, .little);
+                    value = recovered;
+                }
+            }
         }
         callbacks.recordAccess(callbacks.ctx, vaddr, byte_count, value);
         return value;
@@ -162,6 +172,12 @@ pub fn readMemVal(
         .bits64 => std.mem.readInt(u64, state.mem[offset..][0..8], .little),
     };
     if (size == .bits64 and value < 0x1000) {
+        if (callbacks.recoverVtable(callbacks.ctx, vaddr, value)) |recovered| {
+            std.mem.writeInt(u64, state.mem[offset..][0..8], recovered, .little);
+            value = recovered;
+        }
+    } else if (size == .bits64) {
+        // Non-zero corruption recovery path.
         if (callbacks.recoverVtable(callbacks.ctx, vaddr, value)) |recovered| {
             std.mem.writeInt(u64, state.mem[offset..][0..8], recovered, .little);
             value = recovered;
