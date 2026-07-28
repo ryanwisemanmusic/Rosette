@@ -1154,12 +1154,93 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+
+        const event_log_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/event-log/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        dyld_mod.addImport("event_log", event_log_mod);
+        const diagnostics_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/diagnostics/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        diagnostics_mod.addImport("event_log", event_log_mod);
+        diagnostics_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        const memory_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/memory/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        memory_mod.addImport("dyld", dyld_mod);
+        memory_mod.addImport("event_log", event_log_mod);
+        const pthread_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/pthread/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        pthread_mod.addImport("scheduler", scheduler_mod);
+        pthread_mod.addImport("event_log", event_log_mod);
+        const guest_abi_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/guest-abi/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        guest_abi_mod.addImport("event_log", event_log_mod);
+
+        const macho_core_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/Mach-O/shared_core.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        macho_core_mod.addImport("x64_decoder", x64_decoder_mod);
+        macho_core_mod.addImport("dyld", dyld_mod);
+        macho_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        macho_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        macho_core_mod.addImport("guest_abi", guest_abi_mod);
+        const process_core_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/process-core/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        process_core_mod.addImport("macho_core", macho_core_mod);
+        process_core_mod.addImport("x64_decoder", x64_decoder_mod);
+        process_core_mod.addImport("dyld", dyld_mod);
+        process_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        process_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        process_core_mod.addImport("cxx_abi", cxx_abi_mod);
+        process_core_mod.addImport("scheduler", scheduler_mod);
+        process_core_mod.addImport("cleo_routing", cleo_routing_mod);
+        process_core_mod.addImport("init", init_mod);
+        process_core_mod.addImport("macho_runtime", macho_runtime_mod);
+        process_core_mod.addImport("contract", contract_mod);
+        process_core_mod.addImport("diagnostics", diagnostics_mod);
+        process_core_mod.addImport("memory", memory_mod);
+        process_core_mod.addImport("pthread", pthread_mod);
+        process_core_mod.addImport("guest_abi", guest_abi_mod);
+        process_core_mod.addImport("vtable", vtable_mod);
+        const import_handler_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/import-handler/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        import_handler_mod.addImport("macho_core", macho_core_mod);
+        import_handler_mod.addImport("x64_decoder", x64_decoder_mod);
+        import_handler_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        import_handler_mod.addImport("contract", contract_mod);
+        import_handler_mod.addImport("dyld", dyld_mod);
+        import_handler_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        import_handler_mod.addImport("guest_abi", guest_abi_mod);
+        import_handler_mod.addImport("diagnostics", diagnostics_mod);
+        import_handler_mod.addImport("scheduler", scheduler_mod);
         const macho_processor_mod = b.createModule(.{
-        const macho_core_mod = b.createModule(.{            .root_source_file = b.path("../lib/Mach-O/shared_core.zig"),            .target = target,            .optimize = optimize,        });        macho_core_mod.addImport("x64_decoder", x64_decoder_mod);        macho_core_mod.addImport("dyld", dyld_mod);        macho_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);        const process_core_mod = b.createModule(.{            .root_source_file = b.path("../lib/runtime/process-core/root.zig"),            .target = target,            .optimize = optimize,        });        process_core_mod.addImport("macho_core", macho_core_mod);        process_core_mod.addImport("x64_decoder", x64_decoder_mod);        process_core_mod.addImport("dyld", dyld_mod);        process_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);        process_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);        process_core_mod.addImport("cxx_abi", cxx_abi_mod);        process_core_mod.addImport("scheduler", scheduler_mod);        process_core_mod.addImport("cleo_routing", cleo_routing_mod);        process_core_mod.addImport("init", init_mod);        process_core_mod.addImport("macho_runtime", macho_runtime_mod);        process_core_mod.addImport("contract", contract_mod);            .root_source_file = b.path("../lib/Mach-O/main.zig"),
+            .root_source_file = b.path("../lib/Mach-O/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
+
         macho_processor_mod.addImport("x64_decoder", x64_decoder_mod);
         macho_processor_mod.addImport("x64_interpreter", x64_interpreter_mod);
         macho_processor_mod.addImport("macho_runtime", macho_runtime_mod);
@@ -1176,6 +1257,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("jit", jit_mod);
         macho_processor_mod.addImport("macho_core", macho_core_mod);
         macho_processor_mod.addImport("process_core", process_core_mod);
+        macho_processor_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
             macho_processor_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
@@ -1215,6 +1297,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("jit", jit_mod);
         macho_processor_test_mod.addImport("macho_core", macho_core_mod);
         macho_processor_test_mod.addImport("process_core", process_core_mod);
+        macho_processor_test_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
             macho_processor_test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{macos_sdk_root}) });
@@ -1227,6 +1310,11 @@ pub fn build(b: *std.Build) void {
             macho_processor_test_mod.linkFramework("Metal", .{});
         }
         const macho_processor_test = b.addTest(.{ .root_module = macho_processor_test_mod });
+        const macho_processor_check = b.step(
+            "macho-processor-check",
+            "Compile the focused Mach-O processor and decoder regression suite",
+        );
+        macho_processor_check.dependOn(&macho_processor_test.step);
         check_step.dependOn(&macho_processor_test.step);
     }
 
