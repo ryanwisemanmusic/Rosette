@@ -8,6 +8,7 @@ const PATCH_TOML_TRACE_CAPACITY = 128;
 const MAX_REASONABLE_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB safety cap (was 1MB — raised for IO-3)
 const FILEBUF_OFFSET_IN_IFSTREAM = cxx_object_model.FILEBUF_OFFSET_IN_IFSTREAM;
 const BASIC_IOS_OFFSET_IN_IFSTREAM = cxx_object_model.BASIC_IOS_OFFSET_IN_IFSTREAM;
+const FILEBUF_OFFSET_IN_OFSTREAM = cxx_object_model.FILEBUF_OFFSET_IN_OFSTREAM;
 const STRINGSTREAM_OSTREAM_OFFSET: u64 = 16;
 const STRINGSTREAM_BUFFER_OFFSET: u64 = 24;
 const STRINGSTREAM_IOS_OFFSET: u64 = 128;
@@ -21,7 +22,7 @@ const LIBCPP_STREAM_LAYOUT_VERSION: u32 = 16;
 const LIBCPP_STREAM_LAYOUT_NOTE: []const u8 = "libc++ v160006 specific; adjust for libstdc++ or other versions";
 const CURRENT_THREAD_HANDLE: u64 = 0x7FFF_1000;
 const SYNTHETIC_THREAD_BASE: u64 = 0x7FFF_2000;
-const GTK_IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
+const IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
 
 const OPENMODE_APP: u64 = 1 << 0;
 const OPENMODE_ATE: u64 = 1 << 1;
@@ -40,7 +41,13 @@ pub const Outcome = union(enum) {
 
 const Stream = struct {
     active: bool = false,
+    /// Canonical basic_streambuf/basic_filebuf subobject used for all I/O.
     object: u64 = 0,
+    /// Complete object that owns `object` (for example basic_stringstream).
+    owner_object: u64 = 0,
+    /// Primary basic_istream/basic_ostream subobject, when distinct.
+    stream_object: u64 = 0,
+    /// Virtual basic_ios subobject used for state and rdbuf access.
     ios_object: u64 = 0,
     fd: std.c.fd_t = -1,
     buffer: u64 = 0,
@@ -246,7 +253,10 @@ pub const Bridge = struct {
     peeks: u64 = 0,
     buffer_changes: u64 = 0,
     base_destructors: u64 = 0,
+    ofstream_destructors: u64 = 0,
     thread_id_insertions: u64 = 0,
+    rdbuf_alias_resolutions: u64 = 0,
+    modeled_streambuf_imbues: u64 = 0,
     rejected: u64 = 0,
     next_generation: u64 = 1,
     io_sequence: u64 = 0,
@@ -311,8 +321,11 @@ pub const Bridge = struct {
         if (isStringStreamDestructor(name)) {
             // The complete-object destructor normally loads its hidden VTT
             // from dyld ABI data before entering D2. The modeled base stream
-            // owns no host resource here, so destruction is intentionally a
-            // no-op rather than dereferencing an unavailable VTT.
+            // owns no native C++ resource, but its registry entries must still
+            // be retired before this stack storage is reused by another
+            // object. Otherwise the stack-vtable guard may restore a stale
+            // streambuf vptr into the new occupant.
+            self.destroy(state, state.regs.rdi);
             self.base_destructors +|= 1;
             return .handled_void;
         }
@@ -324,7 +337,16 @@ pub const Bridge = struct {
             }
             return .handled_void;
         }
-        if (isBasicIosRdbuf(name)) return .{ .handled = self.object_model.rdbuf(state, state.regs.rdi) };
+        if (isBasicIosRdbuf(name)) return .{ .handled = self.resolveRdbuf(state, state.regs.rdi) };
+        if (isBasicStreambufPubimbue(name) or isBasicStreambufImbue(name)) {
+            const stream = self.findOwned(state.regs.rdi) orelse return null;
+            // These are only safe to model for the canonical synthetic
+            // streambuf. Do not hide a bad `this` alias or intercept native
+            // stream buffers that Rosette does not own.
+            if (state.regs.rdi != stream.object) return null;
+            self.modeled_streambuf_imbues +|= 1;
+            return .handled_void;
+        }
         if (isBasicIosRdstate(name)) return .{ .handled = self.object_model.rdstate(state, state.regs.rdi) };
         if (isBasicIosClear(name)) {
             return if (self.object_model.clear(state, state.regs.rdi, @truncate(state.regs.rsi))) .handled_void else null;
@@ -369,6 +391,26 @@ pub const Bridge = struct {
         }
         if (isIfstreamDestructor(name)) {
             self.destroyIfstream(state, state.regs.rdi);
+            return .handled_void;
+        }
+        if (isOfstreamDestructor(name)) {
+            // ofstream constructors may execute their locally linked libc++
+            // body while basic_filebuf operations are modeled here. Its D2
+            // body expects a real compiler-emitted VTT and otherwise replaces
+            // the synthetic vptr with zero before reading vtable[-3]. Retire
+            // the modeled filebuf directly instead.
+            const object = state.regs.rdi;
+            const filebuf = object + FILEBUF_OFFSET_IN_OFSTREAM;
+            const tracked = self.findAny(filebuf) != null;
+            self.destroyOfstream(state, object);
+            self.ofstream_destructors +|= 1;
+            if (self.ofstream_destructors <= 4) {
+                machoCapturePrint(
+                    "macho-processor: libc++ ofstream destructor modeled: object=0x{x} filebuf=0x{x} tracked={}\n",
+                    .{ object, filebuf, tracked },
+                );
+            }
+            self.base_destructors +|= 1;
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj")) {
@@ -473,6 +515,8 @@ pub const Bridge = struct {
             isBaseDestructor(name) or
             isBasicIosInit(name) or
             isBasicIosRdbuf(name) or
+            isBasicStreambufPubimbue(name) or
+            isBasicStreambufImbue(name) or
             isBasicIosRdstate(name) or
             isBasicIosClear(name) or
             isBasicIosSetstate(name) or
@@ -490,6 +534,7 @@ pub const Bridge = struct {
             isIfstreamCStringConstructor(name) or
             isIfstreamFilesystemPathConstructor(name) or
             isIfstreamDestructor(name) or
+            isOfstreamDestructor(name) or
             std.mem.eql(u8, name, "_ZNSt3__113basic_filebufIcNS_11char_traitsIcEEE4openEPKcj") or
             std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEE4openEPKcj") or
             std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEE4openERKNS_12basic_stringIcS2_NS_9allocatorIcEEEEj") or
@@ -522,6 +567,10 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         }
+        if (!self.installStreambufVirtuals(state, .basic_filebuf)) {
+            self.rejected +|= 1;
+            return false;
+        }
         self.ifstream_vtable = state.read64(object);
         self.filebuf_vtable = state.read64(object + FILEBUF_OFFSET_IN_IFSTREAM);
         self.basic_ios_vtable = state.read64(object + BASIC_IOS_OFFSET_IN_IFSTREAM);
@@ -529,7 +578,9 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         };
+        self.setOwnership(stream, object, object, object + BASIC_IOS_OFFSET_IN_IFSTREAM);
         stream.ios_object = object + BASIC_IOS_OFFSET_IN_IFSTREAM;
+        registerStackVtable(state, object + FILEBUF_OFFSET_IN_IFSTREAM);
         self.constructors +|= 1;
         return true;
     }
@@ -555,10 +606,15 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         }
+        if (!self.installStreambufVirtuals(state, .basic_streambuf)) {
+            self.rejected +|= 1;
+            return false;
+        }
         const stream = self.ensure(object) orelse {
             self.rejected +|= 1;
             return false;
         };
+        self.setOwnership(stream, object, 0, 0);
         closeStream(stream);
         stream.fd = -1;
         stream.buffer = 0;
@@ -569,6 +625,7 @@ pub const Bridge = struct {
         stream.patch_toml_trace_next = 0;
         stream.patch_toml_trace_full = false;
         self.resetStringBuffer(stream);
+        registerStackVtable(state, object);
         self.constructors +|= 1;
         return true;
     }
@@ -682,9 +739,9 @@ pub const Bridge = struct {
     }
 
     fn streamForOstream(self: *Bridge, state: anytype, object: u64) ?*Stream {
-        if (self.find(object)) |stream| return stream;
+        if (self.findOwned(object)) |stream| return stream;
         if (state.guestMemoryConst(object + cxx_object_model.stream_layout.rdbuf_offset, 8) != null) {
-            const streambuf = self.object_model.rdbuf(state, object);
+            const streambuf = self.resolveRdbuf(state, object);
             if (streambuf != 0) {
                 if (self.findFlexible(streambuf)) |stream| return stream;
             }
@@ -730,6 +787,10 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         }
+        if (!self.installStreambufVirtuals(state, .basic_streambuf)) {
+            self.rejected +|= 1;
+            return false;
+        }
         if (@hasDecl(@TypeOf(state.*), "compat")) {
             _ = state.compat.initLocale(state, object + STRINGSTREAM_IOS_OFFSET + cxx_object_model.stream_layout.locale_offset, null);
         }
@@ -737,7 +798,14 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         };
+        self.setOwnership(
+            stream,
+            object,
+            object + STRINGSTREAM_OSTREAM_OFFSET,
+            object + STRINGSTREAM_IOS_OFFSET,
+        );
         self.resetStringBuffer(stream);
+        registerStackVtable(state, streambuf);
         if (object != self.last_logged_stringstream_object) {
             self.last_logged_stringstream_object = object;
             self.constructors +|= 1;
@@ -749,8 +817,44 @@ pub const Bridge = struct {
         return true;
     }
 
+    fn installStreambufVirtuals(self: *Bridge, state: anytype, kind: cxx_object_model.Kind) bool {
+        // Itanium slot 2 is basic_streambuf::imbue, called by the locally
+        // linked pubimbue body. It must be a real callable target even though
+        // direct imports of imbue are also modeled by this bridge.
+        return self.object_model.setVirtualSlot(
+            state,
+            kind,
+            2,
+            compat_runtime.thunkAddress(.streambuf_imbue),
+        );
+    }
+
     pub fn destroyIfstream(self: *Bridge, state: anytype, object: u64) void {
         self.destroy(state, object + FILEBUF_OFFSET_IN_IFSTREAM);
+    }
+
+    pub fn destroyOfstream(self: *Bridge, state: anytype, object: u64) void {
+        self.destroy(state, object + FILEBUF_OFFSET_IN_OFSTREAM);
+    }
+
+    /// Register a streambuf's vtable with the stack vtable registry so that
+    /// corruption (e.g. heap reuse overwriting the vptr) can be recovered.
+    /// Uses an anonymous struct literal for provenance to avoid importing
+    /// vtable types (io module doesn't include vtable in its dep tree).
+    fn registerStackVtable(state: anytype, address: u64) void {
+        if (comptime !@hasField(@TypeOf(state.*), "vtable_stack_registry")) return;
+        const vptr = state.read64(address);
+        state.vtable_stack_registry.register(address, vptr, .{
+            .writer_rip = if (@hasField(@TypeOf(state.*), "regs")) state.regs.rip else 0,
+            .writer_step = if (@hasField(@TypeOf(state.*), "regs")) state.executed_steps else 0,
+            .writer_thread = if (@hasField(@TypeOf(state.*), "regs")) state.active_guest_thread else 0,
+        });
+    }
+
+    /// Forget a streambuf's vtable entry when the stream is destroyed.
+    fn forgetStackVtable(state: anytype, address: u64) void {
+        if (comptime !@hasField(@TypeOf(state.*), "vtable_stack_registry")) return;
+        state.vtable_stack_registry.forget(address);
     }
 
     pub fn readLine(self: *Bridge, state: anytype, object: u64, string_object: u64, delimiter: u8) bool {
@@ -838,17 +942,27 @@ pub const Bridge = struct {
             if (stream.active and (stream.fd >= 0 or stream.synthetic_proc_maps)) live += 1;
         }
         machoCapturePrint(
-            "macho-processor: libc++ stream bridge: constructors={d} open={d} open_failed={d} close={d} read={d} seek={d} peek={d} buffers={d} base_dtors={d} live={d} rejected={d}\n",
-            .{ self.constructors, self.opens, self.open_failures, self.closes, self.reads, self.seeks, self.peeks, self.buffer_changes, self.base_destructors, live, self.rejected },
+            "macho-processor: libc++ stream bridge: constructors={d} open={d} open_failed={d} close={d} read={d} seek={d} peek={d} buffers={d} base_dtors={d} ofstream_dtors={d} rdbuf_aliases={d} modeled_imbues={d} live={d} rejected={d}\n",
+            .{ self.constructors, self.opens, self.open_failures, self.closes, self.reads, self.seeks, self.peeks, self.buffer_changes, self.base_destructors, self.ofstream_destructors, self.rdbuf_alias_resolutions, self.modeled_streambuf_imbues, live, self.rejected },
         );
     }
 
     fn destroy(self: *Bridge, state: anytype, object: u64) void {
-        _ = state;
-        const stream = self.findAny(object) orelse return;
+        const stream = self.findAny(object) orelse {
+            // Preserve support for callers that already pass the canonical
+            // streambuf address even if its Bridge entry was retired first.
+            forgetStackVtable(state, object);
+            return;
+        };
+        // `object` may be the complete stringstream, ostream, or basic_ios
+        // alias. The stack-vtable registry is keyed by the canonical
+        // streambuf subobject.
+        forgetStackVtable(state, stream.object);
         closeStream(stream);
         stream.active = false;
         stream.fd = -1;
+        stream.owner_object = 0;
+        stream.stream_object = 0;
         stream.ios_object = 0;
         stream.buffer = 0;
         stream.buffer_size = 0;
@@ -1691,6 +1805,42 @@ pub const Bridge = struct {
         return null;
     }
 
+    fn setOwnership(self: *Bridge, stream: *Stream, owner_object: u64, stream_object: u64, ios_object: u64) void {
+        _ = self;
+        stream.owner_object = owner_object;
+        stream.stream_object = stream_object;
+        stream.ios_object = ios_object;
+    }
+
+    fn ownsAddress(stream: *const Stream, address: u64) bool {
+        if (!stream.active or address == 0) return false;
+        return address == stream.object or
+            (stream.owner_object != 0 and address == stream.owner_object) or
+            (stream.stream_object != 0 and address == stream.stream_object) or
+            (stream.ios_object != 0 and address == stream.ios_object);
+    }
+
+    fn findOwned(self: *Bridge, address: u64) ?*Stream {
+        for (&self.streams) |*stream| {
+            if (ownsAddress(stream, address)) return stream;
+        }
+        return null;
+    }
+
+    fn resolveRdbuf(self: *Bridge, state: anytype, object: u64) u64 {
+        if (self.findOwned(object)) |stream| {
+            self.rdbuf_alias_resolutions +|= 1;
+            return stream.object;
+        }
+
+        const candidate = self.object_model.rdbuf(state, object);
+        if (self.findOwned(candidate)) |stream| {
+            self.rdbuf_alias_resolutions +|= 1;
+            return stream.object;
+        }
+        return candidate;
+    }
+
     fn find(self: *Bridge, object: u64) ?*Stream {
         for (&self.streams) |*stream| {
             if (stream.active and stream.object == object) return stream;
@@ -1699,7 +1849,7 @@ pub const Bridge = struct {
     }
 
     fn findFlexible(self: *Bridge, object: u64) ?*Stream {
-        if (self.find(object)) |stream| return stream;
+        if (self.findOwned(object)) |stream| return stream;
         if (self.find(object + FILEBUF_OFFSET_IN_IFSTREAM)) |stream| return stream;
         for (&self.streams) |*stream| {
             if (!stream.active or stream.object < FILEBUF_OFFSET_IN_IFSTREAM) continue;
@@ -1711,7 +1861,10 @@ pub const Bridge = struct {
 
     fn findAny(self: *Bridge, object: u64) ?*Stream {
         for (&self.streams) |*stream| {
-            if (stream.object == object) return stream;
+            if (stream.object == object or
+                stream.owner_object == object or
+                stream.stream_object == object or
+                stream.ios_object == object) return stream;
         }
         return null;
     }
@@ -1794,6 +1947,14 @@ fn isBasicIosRdbuf(name: []const u8) bool {
     return isBasicIosMethod(name, "5rdbuf");
 }
 
+fn isBasicStreambufPubimbue(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEE8pubimbue") != null;
+}
+
+fn isBasicStreambufImbue(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "basic_streambufIcNS_11char_traitsIcEEE5imbue") != null;
+}
+
 fn isBasicIosRdstate(name: []const u8) bool {
     return isBasicIosMethod(name, "7rdstate");
 }
@@ -1867,7 +2028,7 @@ fn isStringStreamStr(name: []const u8) bool {
 
 fn displayThreadId(raw_id: u64) u64 {
     if (raw_id == 0 or raw_id == CURRENT_THREAD_HANDLE) return 1;
-    if (raw_id >= GTK_IDLE_CALLBACK_HANDLE_BASE) return 1;
+    if (raw_id >= IDLE_CALLBACK_HANDLE_BASE) return 1;
     if (raw_id >= SYNTHETIC_THREAD_BASE and raw_id < SYNTHETIC_THREAD_BASE + 0x10000) {
         return 2 + ((raw_id - SYNTHETIC_THREAD_BASE) / 0x10);
     }
@@ -1906,6 +2067,11 @@ fn isIfstreamFilesystemPathConstructor(name: []const u8) bool {
 fn isIfstreamDestructor(name: []const u8) bool {
     return std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED1Ev") or
         std.mem.eql(u8, name, "_ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED2Ev");
+}
+
+fn isOfstreamDestructor(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_ZNSt3__114basic_ofstreamIcNS_11char_traitsIcEEED1Ev") or
+        std.mem.eql(u8, name, "_ZNSt3__114basic_ofstreamIcNS_11char_traitsIcEEED2Ev");
 }
 
 fn seekDirection(value: u64) std.c.whence_t {
@@ -2051,6 +2217,8 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
     try std.testing.expect(isIfstreamDefaultConstructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC2Ev")));
     try std.testing.expect(isIfstreamCStringConstructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEC1EPKcj")));
     try std.testing.expect(isIfstreamDestructor(normalizeSymbol("__ZNSt3__114basic_ifstreamIcNS_11char_traitsIcEEED2Ev")));
+    try std.testing.expect(isOfstreamDestructor(normalizeSymbol("__ZNSt3__114basic_ofstreamIcNS_11char_traitsIcEEED1Ev")));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_ofstreamIcNS_11char_traitsIcEEED2Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__114basic_iostreamIcNS_11char_traitsIcEEEC2B7v160006EPNS_15basic_streambufIcS2_EE"));
@@ -2066,16 +2234,42 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__119basic_istringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE7rdstateB7v160006Ev"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE8pubimbueB7v160006ERKNS_6localeE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5imbueERKNS_6localeE"));
 }
 
 test "stream bridge forwards guest file operations through typed host calls" {
+    const TestStackVtableRegistry = struct {
+        address: u64 = 0,
+        vptr: u64 = 0,
+
+        pub fn register(self: *@This(), address: u64, vptr: u64, provenance: anytype) void {
+            _ = provenance;
+            self.address = address;
+            self.vptr = vptr;
+        }
+
+        pub fn forget(self: *@This(), address: u64) void {
+            if (self.address != address) return;
+            self.address = 0;
+            self.vptr = 0;
+        }
+
+        pub fn contains(self: *const @This(), address: u64) bool {
+            return self.address == address and self.vptr != 0;
+        }
+    };
     const TestState = struct {
         mem: [4096]u8 = [_]u8{0} ** 4096,
         next_alloc: u64 = 2048,
+        executed_steps: u64 = 0,
+        active_guest_thread: u64 = 0,
+        vtable_stack_registry: TestStackVtableRegistry = .{},
         regs: struct {
             rdi: u64 = 0,
             rsi: u64 = 0,
             rdx: u64 = 0,
+            rip: u64 = 0,
         } = .{},
 
         pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
@@ -2194,6 +2388,40 @@ test "stream bridge forwards guest file operations through typed host calls" {
     const output_string: u64 = 768;
     state.regs = .{ .rdi = stringstream };
     try std.testing.expect(stringstream_bridge.dispatch(&state, &fs, "__ZNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEC1B7v160006Ev") != null);
+    const modeled_stringstream = stringstream_bridge.find(streambuf_for_stringstream).?;
+    try std.testing.expectEqual(stringstream, modeled_stringstream.owner_object);
+    try std.testing.expectEqual(stringstream + STRINGSTREAM_OSTREAM_OFFSET, modeled_stringstream.stream_object);
+    try std.testing.expectEqual(stringstream + STRINGSTREAM_IOS_OFFSET, modeled_stringstream.ios_object);
+    const streambuf_vptr = state.read64(streambuf_for_stringstream);
+    try std.testing.expectEqual(
+        compat_runtime.thunkAddress(.streambuf_imbue),
+        state.read64(streambuf_vptr + 2 * @sizeOf(u64)),
+    );
+    for ([_]u64{
+        stringstream,
+        stringstream + STRINGSTREAM_OSTREAM_OFFSET,
+        stringstream + STRINGSTREAM_IOS_OFFSET,
+    }) |alias| {
+        state.regs = .{ .rdi = alias };
+        const rdbuf_result = stringstream_bridge.dispatch(
+            &state,
+            &fs,
+            "__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE5rdbufB7v160006Ev",
+        ).?;
+        try std.testing.expectEqual(streambuf_for_stringstream, rdbuf_result.handled);
+    }
+    state.regs = .{ .rdi = streambuf_for_stringstream, .rsi = 0x40 };
+    const pubimbue_result = stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE8pubimbueB7v160006ERKNS_6localeE",
+    ).?;
+    switch (pubimbue_result) {
+        .handled_void => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 3), stringstream_bridge.rdbuf_alias_resolutions);
+    try std.testing.expectEqual(@as(u64, 1), stringstream_bridge.modeled_streambuf_imbues);
     state.regs = .{ .rdi = stringstream + STRINGSTREAM_OSTREAM_OFFSET, .rsi = SYNTHETIC_THREAD_BASE + 0x10 };
     try std.testing.expect(stringstream_bridge.dispatch(&state, &fs, "__ZNSt3__1lsB7v160006IcNS_11char_traitsIcEEERNS_13basic_ostreamIT_T0_EES7_NS_6thread2idE") != null);
     state.regs = .{ .rdi = output_string, .rsi = streambuf_for_stringstream };
@@ -2201,6 +2429,19 @@ test "stream bridge forwards guest file operations through typed host calls" {
     const thread_id_text = compat_runtime.libcppStringView(&state, output_string).?;
     const thread_id_bytes = state.guestMemoryConst(thread_id_text.address, thread_id_text.length).?;
     try std.testing.expectEqualStrings("3", thread_id_bytes);
+    try std.testing.expect(state.vtable_stack_registry.contains(streambuf_for_stringstream));
+    state.regs = .{ .rdi = stringstream };
+    const stringstream_destructor = stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev",
+    ).?;
+    switch (stringstream_destructor) {
+        .handled_void => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!state.vtable_stack_registry.contains(streambuf_for_stringstream));
+    try std.testing.expect(stringstream_bridge.find(streambuf_for_stringstream) == null);
 
     var ostringstream_bridge = Bridge{};
     defer ostringstream_bridge.deinit();
@@ -2230,4 +2471,26 @@ test "stream bridge forwards guest file operations through typed host calls" {
     try std.testing.expect(ostream_bridge.dispatch(&state, &fs, "__ZNSt3__19basic_iosIcNS_11char_traitsIcEEE8setstateEj") != null);
     state.regs = .{ .rdi = ostream };
     try std.testing.expectEqual(@as(u64, 1), ostream_bridge.dispatch(&state, &fs, "__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE4failB7v160006Ev").?.handled);
+
+    var ofstream_bridge = Bridge{};
+    defer ofstream_bridge.deinit();
+    state = .{};
+    const ofstream: u64 = 64;
+    const ofstream_filebuf = ofstream + FILEBUF_OFFSET_IN_OFSTREAM;
+    const modeled_ofstream = ofstream_bridge.ensure(ofstream_filebuf).?;
+    ofstream_bridge.setOwnership(modeled_ofstream, ofstream, ofstream, 0);
+    state.vtable_stack_registry.register(ofstream_filebuf, 0xAA55, .{});
+    state.regs = .{ .rdi = ofstream };
+    const ofstream_destructor = ofstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__114basic_ofstreamIcNS_11char_traitsIcEEED2Ev",
+    ).?;
+    switch (ofstream_destructor) {
+        .handled_void => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(u64, 1), ofstream_bridge.ofstream_destructors);
+    try std.testing.expect(ofstream_bridge.find(ofstream_filebuf) == null);
+    try std.testing.expect(!state.vtable_stack_registry.contains(ofstream_filebuf));
 }
