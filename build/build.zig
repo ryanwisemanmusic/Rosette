@@ -1131,6 +1131,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        const guard_rollback_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/guard-rollback/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         const dyld_mod = b.createModule(.{
             .root_source_file = b.path("../lib/linker/dyld/root.zig"),
             .target = target,
@@ -1249,6 +1254,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_processor_mod.addImport("primitive", primitive_mod);
         macho_processor_mod.addImport("vtable", vtable_mod);
+        macho_processor_mod.addImport("guard_rollback", guard_rollback_mod);
         macho_processor_mod.addImport("dyld", dyld_mod);
         macho_processor_mod.addImport("cxx_abi", cxx_abi_mod);
         macho_processor_mod.addImport("init", init_mod);
@@ -1289,6 +1295,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_processor_test_mod.addImport("primitive", primitive_mod);
         macho_processor_test_mod.addImport("vtable", vtable_mod);
+        macho_processor_test_mod.addImport("guard_rollback", guard_rollback_mod);
         macho_processor_test_mod.addImport("dyld", dyld_mod);
         macho_processor_test_mod.addImport("cxx_abi", cxx_abi_mod);
         macho_processor_test_mod.addImport("init", init_mod);
