@@ -2598,6 +2598,14 @@ pub const ElfState = struct {
                 @memset(&self.xmm[d.xmm_dst], 0);
                 std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
             },
+            .vmovd_reg32_xmm, .vmovd_mem32_xmm => {
+                const value = std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little);
+                if (d.op == .vmovd_reg32_xmm) {
+                    self.setReg(d.dst_reg, .bits32, value);
+                } else {
+                    self.writeMemVal(d.addr, .bits32, value);
+                }
+            },
             .vmovq_xmm_reg64, .vmovq_xmm_mem64 => {
                 const value = if (d.op == .vmovq_xmm_reg64)
                     self.regVal(d.src_reg, .bits64)
