@@ -31,7 +31,7 @@ const ImportTraceEntry = types.ImportTraceEntry;
 const GuestAssertionClass = types.GuestAssertionClass;
 const classifyGuestAssertion = types.classifyGuestAssertion;
 const timerQueueStateName = types.timerQueueStateName;
-const gtkIdleQueueSnapshotFor = types.gtkIdleQueueSnapshotFor;
+const idleQueueSnapshotFor = types.idleQueueSnapshotFor;
 const isGtkIdleAddImport = types.isGtkIdleAddImport;
 const isGtkEventsPendingImport = types.isGtkEventsPendingImport;
 const isGtkMainIterationImport = types.isGtkMainIterationImport;
@@ -90,7 +90,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.foreign_objects.main_loop_bypasses != 0)
     {
         machoCapturePrint(
-            "macho-processor: guest exit attribution: follows {d} bypassed GTK main loop(s); this is UI event-loop shutdown, not a filesystem or config-write failure\n",
+            "macho-processor: guest exit attribution: follows {d} bypassed cooperative main loop(s); this is UI event-loop shutdown, not a filesystem or config-write failure\n",
             .{self.foreign_objects.main_loop_bypasses},
         );
     }
@@ -113,7 +113,9 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const count = self.regs.rdx;
         if (count != 0) {
             const buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
+            const mutation = self.captureMemoryMutation(dst, count);
             @memset(buf, val);
+            self.commitMemoryMutation(mutation, .bulk_fill);
         }
         return .{ .handled = dst };
     }
@@ -133,7 +135,9 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const count = self.regs.rsi;
         if (count != 0) {
             const buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
+            const mutation = self.captureMemoryMutation(dst, count);
             @memset(buf, 0);
+            self.commitMemoryMutation(mutation, .bulk_fill);
         }
         return .{ .handled = 0 };
     }
@@ -184,34 +188,36 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .handled_void;
     }
-    if (std.mem.eql(u8, name, "_gtk_main") and self.beginGtkMainLoop()) {
-        self.resolving_import_route = .gtk_main;
-        return .control_transferred;
-    }
-    if (std.mem.eql(u8, name, "_gtk_main_quit") and self.cooperative_ui_context != null) {
-        self.resolving_import_route = .gtk_main_quit;
-        self.foreign_objects.main_loop_quits +|= 1;
-        self.restoreGtkMainLoopCaller("gtk_main_quit");
-        return .control_transferred;
-    }
-    if (isGtkIdleAddImport(name)) {
-        self.resolving_import_route = .gtk_idle_add;
-        return handleGtkIdleAdd(self, name);
-    }
-    if (std.mem.eql(u8, name, "_g_source_remove")) {
-        self.resolving_import_route = .g_source_remove;
-        return handleGSourceRemove(self);
-    }
-    if (isGtkEventsPendingImport(name)) {
-        self.resolving_import_route = .gtk_events_pending;
-        self.pumpNativeWindowEvents();
-        return .{ .handled = @intFromBool(self.pendingGtkIdleCallbackCount() != 0) };
-    }
-    if (isGtkMainIterationImport(name)) {
-        self.resolving_import_route = .gtk_main_iteration;
-        self.pumpNativeWindowEvents();
-        if (self.startNextGtkIdleCallback(name, false)) return .control_transferred;
-        return .{ .handled = 0 };
+    if (self.main_loop_type == .gtk) {
+        if (std.mem.eql(u8, name, "_gtk_main") and self.beginCooperativeMainLoop()) {
+            self.resolving_import_route = .coop_main;
+            return .control_transferred;
+        }
+        if (std.mem.eql(u8, name, "_gtk_main_quit") and self.cooperative_ui_context != null) {
+            self.resolving_import_route = .coop_main_quit;
+            self.foreign_objects.main_loop_quits +|= 1;
+            self.restoreMainLoopCaller("gtk_main_quit");
+            return .control_transferred;
+        }
+        if (isGtkIdleAddImport(name)) {
+            self.resolving_import_route = .idle_add;
+            return handleIdleAdd(self, name);
+        }
+        if (std.mem.eql(u8, name, "_g_source_remove")) {
+            self.resolving_import_route = .idle_source_remove;
+            return handleIdleSourceRemove(self);
+        }
+        if (isGtkEventsPendingImport(name)) {
+            self.resolving_import_route = .events_pending;
+            self.pumpNativeWindowEvents();
+            return .{ .handled = @intFromBool(self.pendingIdleCallbackCount() != 0) };
+        }
+        if (isGtkMainIterationImport(name)) {
+            self.resolving_import_route = .coop_main_iteration;
+            self.pumpNativeWindowEvents();
+            if (self.startNextIdleCallback(name, false)) return .control_transferred;
+            return .{ .handled = 0 };
+        }
     }
     if (self.metadata.definedSymbolAddress(name)) |target| {
         if (target != imported.stub_address and self.isExecutableAddress(target)) {
@@ -377,7 +383,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const expression = self.guestCString(self.regs.rcx, 4096) orelse "<unknown>";
         const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
         const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
-        const assertion_class = classifyGuestAssertion(file_name, function_name, expression);
+        const assertion_class = classifyGuestAssertion(function_name, expression);
         self.last_guest_assertion_class = assertion_class;
         self.last_guest_assertion_step = self.executed_steps;
         self.last_guest_assertion_return = return_address;
@@ -443,7 +449,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 );
                 machoCapturePrint(
                     "  timer queue assertion context: cooperative active_thread=0x{x} deferred_threads={d} suspended_threads={d} pending_idle={d}; inspect wait-item arm/disarm transitions before treating the breakpoint handler as the root cause\n",
-                    .{ self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, gtkIdleQueueSnapshotFor(&self.gtk_idle_callbacks).pending },
+                    .{ self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, idleQueueSnapshotFor(&self.idle_callbacks).pending },
                 );
                 if (guest_assertion_recovery.timerQueueSnapshot(self, self.regs.rbp)) |snapshot| {
                     machoCapturePrint(
@@ -917,12 +923,11 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if (std.mem.eql(u8, name, "__ZNSt3__16localeD1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeD2Ev")) {
         return if (self.compat.destroyLocale(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
     }
-    // XModule constructors may resolve through unresolved imports during XEX
-    // import table loading.  Write the vtable into the object so virtual
-    // dispatch (XModule::Matches etc) works.  If the real vtable wasn't
-    // found at init time, create a synthetic one using synthetic thunks.
-    if (std.mem.indexOf(u8, name, "7XModuleC1") != null or
-        std.mem.indexOf(u8, name, "7XModuleC2") != null)
+    // XModule constructors — Xenia-specific. Self-gating for non-Xenia
+    // binaries (only triggered when guest has XModule symbols).
+    if (self.has_xenia_compat and
+        (std.mem.indexOf(u8, name, "7XModuleC1") != null or
+            std.mem.indexOf(u8, name, "7XModuleC2") != null))
     {
         const xmodule_vtable = self.ensureXmoduleVtable() orelse 0;
         if (xmodule_vtable != 0) {
@@ -1206,7 +1211,9 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             self.terminateForGuestAccess(dst, @intCast(@min(count, std.math.maxInt(u8))), .write, "_memset");
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         };
+        const mutation = self.captureMemoryMutation(dst, count);
         @memset(buf, value);
+        self.commitMemoryMutation(mutation, .bulk_fill);
         if (self.verbose_trace) machoCapturePrint("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
         return .{ .handled = dst };
     }
@@ -1218,7 +1225,9 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             self.terminateForGuestAccess(dst, @intCast(@min(count, std.math.maxInt(u8))), .write, "___bzero");
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         };
+        const mutation = self.captureMemoryMutation(dst, count);
         @memset(buf, 0);
+        self.commitMemoryMutation(mutation, .bulk_fill);
         if (self.verbose_trace) machoCapturePrint("    [import] _bzero(dst=0x{x}, count={d})\n", .{ dst, count });
         return .handled_void;
     }
@@ -1236,7 +1245,9 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             self.terminateForGuestAccess(dst, @intCast(@min(count, std.math.maxInt(u8))), .write, name);
             return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
         };
+        const mutation = self.captureMemoryMutation(dst, count);
         std.mem.copyForwards(u8, dst_buf, src_buf);
+        self.commitMemoryMutation(mutation, .bulk_copy);
         return .{ .handled = dst };
     }
 
@@ -1753,22 +1764,22 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
             }
             break :blk .{ .handled = 0 };
         },
-        .gtk_main => if (self.beginGtkMainLoop()) .control_transferred else null,
-        .gtk_main_quit => blk: {
+        .coop_main => if (self.beginCooperativeMainLoop()) .control_transferred else null,
+        .coop_main_quit => blk: {
             if (self.cooperative_ui_context == null) break :blk null;
             self.foreign_objects.main_loop_quits +|= 1;
-            self.restoreGtkMainLoopCaller("gtk_main_quit");
+            self.restoreMainLoopCaller("gtk_main_quit");
             break :blk .control_transferred;
         },
-        .gtk_idle_add => handleGtkIdleAdd(self, name),
-        .g_source_remove => handleGSourceRemove(self),
-        .gtk_events_pending => blk: {
+        .idle_add => handleIdleAdd(self, name),
+        .idle_source_remove => handleIdleSourceRemove(self),
+        .events_pending => blk: {
             self.pumpNativeWindowEvents();
-            break :blk .{ .handled = @intFromBool(self.pendingGtkIdleCallbackCount() != 0) };
+            break :blk .{ .handled = @intFromBool(self.pendingIdleCallbackCount() != 0) };
         },
-        .gtk_main_iteration => blk: {
+        .coop_main_iteration => blk: {
             self.pumpNativeWindowEvents();
-            if (self.startNextGtkIdleCallback(name, false)) break :blk .control_transferred;
+            if (self.startNextIdleCallback(name, false)) break :blk .control_transferred;
             break :blk .{ .handled = 0 };
         },
         .local_definition => blk: {
@@ -1852,16 +1863,16 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
     };
 }
 
-pub fn handleGtkIdleAdd(self: anytype, name: []const u8) ImportHandlerResult {
+pub fn handleIdleAdd(self: anytype, name: []const u8) ImportHandlerResult {
     const full = std.mem.eql(u8, name, "_g_idle_add_full") or std.mem.eql(u8, name, "_gdk_threads_add_idle_full");
     const callback = if (full) self.regs.rsi else self.regs.rdi;
     const data = if (full) self.regs.rdx else self.regs.rsi;
-    const source = self.scheduleGtkIdleCallback(callback, data, name);
+    const source = self.scheduleIdleCallback(callback, data, name);
     return .{ .handled = source };
 }
 
-pub fn handleGSourceRemove(self: anytype) ImportHandlerResult {
-    const removed = self.removeGtkIdleSource(self.regs.rdi);
+pub fn handleIdleSourceRemove(self: anytype) ImportHandlerResult {
+    const removed = self.removeIdleSource(self.regs.rdi);
     return .{ .handled = @intFromBool(removed) };
 }
 
@@ -1906,11 +1917,13 @@ pub fn handleGuestMemoryCopy(self: anytype, name: []const u8) ImportHandlerResul
     const source = self.guestMemoryConst(source_address, count);
     const destination = self.guestMemory(destination_address, count);
     if (source != null and destination != null) {
+        const mutation = self.captureMemoryMutation(destination_address, count);
         if (destination_address > source_address and destination_address - source_address < count) {
             std.mem.copyBackwards(u8, destination.?, source.?);
         } else {
             std.mem.copyForwards(u8, destination.?, source.?);
         }
+        self.commitMemoryMutation(mutation, .bulk_copy);
     } else if (self.verbose_trace) {
         machoCapturePrint(
             "macho-processor: {s} skipped: source=0x{x} destination=0x{x} bytes={d} source_backed={} destination_backed={}\n",
@@ -2317,10 +2330,12 @@ pub fn beginGuestExit(self: anytype, exit_code: u64) bool {
 pub fn dispatchNextAtexit(self: anytype) void {
     while (self.compat.takeLastAtexit()) |entry| {
         if (entry.function == 0 or !self.isExecutableAddress(entry.function)) {
-            machoCapturePrint(
-                "macho-processor: skipping invalid atexit callback 0x{x} argument=0x{x} dso=0x{x}\n",
-                .{ entry.function, entry.argument, entry.dso },
-            );
+            if (self.compat.atexit_invalid_skipped <= 5) {
+                machoCapturePrint(
+                    "macho-processor: skipping invalid atexit callback 0x{x} argument=0x{x} dso=0x{x}\n",
+                    .{ entry.function, entry.argument, entry.dso },
+                );
+            }
             continue;
         }
         self.push(GUEST_ATEXIT_RETURN_SENTINEL);
@@ -2344,6 +2359,12 @@ pub fn dispatchNextAtexit(self: anytype) void {
         "macho-processor: guest exit callbacks complete: invoked={d} exit_code={d}\n",
         .{ self.atexit_callbacks_invoked, self.exit_code },
     );
+    if (self.compat.atexit_invalid_skipped > 5) {
+        machoCapturePrint(
+            "macho-processor: {d} additional invalid atexit callback(s) suppressed\n",
+            .{self.compat.atexit_invalid_skipped - 5},
+        );
+    }
 }
 
 pub fn continueGuestExit(self: anytype) bool {
