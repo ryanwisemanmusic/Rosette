@@ -49,16 +49,17 @@ pub fn timerQueueSnapshot(state: anytype, rbp: u64) ?TimerQueueSnapshot {
     };
 }
 
-pub fn classify(file_name: []const u8, function_name: []const u8, expression: []const u8) Class {
-    if (std.mem.endsWith(u8, file_name, "threading_timer_queue.cc") and
-        std.mem.indexOf(u8, function_name, "TimerThreadMain") != null and
-        std.mem.indexOf(u8, expression, "kDisarmed") != null)
+pub fn classify(function_name: []const u8, expression: []const u8) Class {
+
+    // Match on expression content and function name rather than Xenia source file paths.
+    // The key semantic content (kDisarmed, ordinal bounds, breakpoint handler) is
+    // embedded in the expression string passed by Apple's __assert_rtn.
+    if (std.mem.indexOf(u8, expression, "kDisarmed") != null and
+        std.mem.indexOf(u8, function_name, "TimerThread") != null)
     {
         return .timer_queue_wait_item_state;
     }
-    if (std.mem.endsWith(u8, file_name, "processor_mac.cc") and
-        std.mem.indexOf(u8, function_name, "OnThreadBreakpointHit") != null)
-    {
+    if (std.mem.indexOf(u8, function_name, "OnThreadBreakpointHit") != null) {
         return .breakpoint_untracked_thread;
     }
     if (std.mem.indexOf(u8, function_name, "RegisterExport") != null and
@@ -82,21 +83,18 @@ pub fn timerQueueStateName(state: u8) []const u8 {
 
 test "assertion classifier separates timer cause from breakpoint fallout" {
     try std.testing.expectEqual(Class.timer_queue_wait_item_state, classify(
-        "threading_timer_queue.cc",
         "TimerThreadMain",
         "WaitItem::State::kDisarmed == state",
     ));
     try std.testing.expectEqual(Class.breakpoint_untracked_thread, classify(
-        "processor_mac.cc",
         "OnThreadBreakpointHit",
         "false",
     ));
     try std.testing.expectEqual(Class.export_ordinal_bounds, classify(
-        "xbdm_module.cc",
         "RegisterExport_xbdm",
         "export_entry->ordinal < xbdm_exports.size()",
     ));
-    try std.testing.expectEqual(Class.none, classify("other.cc", "func", "false"));
+    try std.testing.expectEqual(Class.none, classify("func", "false"));
 }
 
 test "timer snapshot is diagnostic-only and does not mutate state" {
