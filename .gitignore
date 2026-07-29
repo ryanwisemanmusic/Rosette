@@ -52,3 +52,6 @@ app/bundling/app_image/rosette_app_icon.icns
 /Rosette_Brain/.obsidian
 Rosette_Brain/docs/books/x86 Books/325462-sdm-vol-1-2abcd-3abcd-4 1.pdf
 Rosette_Brain/docs/books/x86 Books/x86 Intel SDM Vol 1-5.md
+/build/zig-cache
+/build/zig-global-cache
+/zig-global-cache
