@@ -38,10 +38,16 @@ pub const stream_layout = StreamLayout{
 
 pub const FILEBUF_OFFSET_IN_IFSTREAM: u64 = 16;
 pub const BASIC_IOS_OFFSET_IN_IFSTREAM: u64 = 424;
+// basic_ostream has no basic_istream::__gc_ field, so basic_ofstream's
+// filebuf and virtual basic_ios subobjects are each 8 bytes earlier than the
+// corresponding basic_ifstream subobjects in libc++ v160006.
+pub const FILEBUF_OFFSET_IN_OFSTREAM: u64 = 8;
+pub const BASIC_IOS_OFFSET_IN_OFSTREAM: u64 = 416;
 // libc++ stores basic_istream::__gc_ immediately after the vptr.  It must be
 // initialized before a parser inspects gcount() for the first time.
 pub const BASIC_ISTREAM_GCOUNT_OFFSET: u64 = 8;
 pub const IFSTREAM_SIZE: u64 = BASIC_IOS_OFFSET_IN_IFSTREAM + stream_layout.size;
+pub const OFSTREAM_SIZE: u64 = BASIC_IOS_OFFSET_IN_OFSTREAM + stream_layout.size;
 pub const BADBIT: u32 = 1;
 pub const EOFBIT: u32 = 2;
 pub const FAILBIT: u32 = 4;
@@ -49,6 +55,7 @@ pub const FAILBIT: u32 = 4;
 const TypeRecord = struct {
     typeinfo: u64 = 0,
     vtable: u64 = 0,
+    virtual_slot_count: u8 = 0,
 };
 
 pub const Model = struct {
@@ -81,14 +88,44 @@ pub const Model = struct {
             );
         }
         const virtual_bases: []const i64 = if (virtual_base_offset) |offset| &.{offset} else &.{};
+        var virtual_slots = [_]u64{0} ** 16;
+        const virtual_slot_count = minimumVirtualSlotCount(kind);
         const table = self.builder.create(state, .{
             .type_name = name,
             .typeinfo = typeinfo,
             .virtual_base_offsets = virtual_bases,
-            .virtual_slots = &.{0},
+            .virtual_slots = virtual_slots[0..virtual_slot_count],
         }) orelse return null;
-        record.* = .{ .typeinfo = typeinfo, .vtable = table.address_point };
+        record.* = .{
+            .typeinfo = typeinfo,
+            .vtable = table.address_point,
+            .virtual_slot_count = @intCast(virtual_slot_count),
+        };
         return record.*;
+    }
+
+    /// Installs a callable in a slot that is already owned by the synthetic
+    /// table. Callers must provide a verified Rosette thunk or guest
+    /// executable address. The table is deliberately sized before later ABI
+    /// allocations so a missing virtual never reads a neighboring type name
+    /// as a function pointer.
+    pub fn setVirtualSlot(
+        self: *Model,
+        state: anytype,
+        kind: Kind,
+        index: usize,
+        target: u64,
+    ) bool {
+        const record = &self.types[@intFromEnum(kind)];
+        if (record.vtable == 0 or index >= record.virtual_slot_count) return false;
+        state.write64(record.vtable + @as(u64, @intCast(index * @sizeOf(u64))), target);
+        return state.read64(record.vtable + @as(u64, @intCast(index * @sizeOf(u64)))) == target;
+    }
+
+    pub fn virtualSlot(self: *const Model, state: anytype, kind: Kind, index: usize) ?u64 {
+        const record = self.types[@intFromEnum(kind)];
+        if (record.vtable == 0 or index >= record.virtual_slot_count) return null;
+        return state.read64(record.vtable + @as(u64, @intCast(index * @sizeOf(u64))));
     }
 
     pub fn initializeBasicIos(self: *Model, state: anytype, object: u64, streambuf: u64) bool {
@@ -202,6 +239,18 @@ pub const Model = struct {
     }
 };
 
+fn minimumVirtualSlotCount(kind: Kind) usize {
+    // libc++ basic_streambuf has two destructor entries followed by the
+    // virtual stream operations (imbue through overflow). basic_filebuf
+    // overrides the same surface. Keeping the complete slot range mapped
+    // makes every unimplemented virtual fail as an explicit null slot rather
+    // than falling through into the next synthetic ABI allocation.
+    return switch (kind) {
+        .basic_streambuf, .basic_filebuf => 14,
+        else => 1,
+    };
+}
+
 const TestState = struct {
     mem: [4096]u8 = [_]u8{0} ** 4096,
     next: u64 = 1024,
@@ -262,4 +311,16 @@ test "C++ object model gives ifstream coherent base subobjects" {
     try std.testing.expect(state.read64(64 + FILEBUF_OFFSET_IN_IFSTREAM) != 0);
     try std.testing.expect(state.read64(64 + BASIC_IOS_OFFSET_IN_IFSTREAM) != 0);
     try std.testing.expectEqual(@as(u64, 64 + FILEBUF_OFFSET_IN_IFSTREAM), model.rdbuf(&state, 64 + BASIC_IOS_OFFSET_IN_IFSTREAM));
+}
+
+test "streambuf virtual surface cannot bleed into later ABI allocations" {
+    var state = TestState{};
+    var model = Model{};
+    const record = model.ensureType(&state, .basic_streambuf, null).?;
+    try std.testing.expect(record.virtual_slot_count >= 14);
+    try std.testing.expect(model.setVirtualSlot(&state, .basic_streambuf, 2, 0xAA55));
+    const later = state.guestAlloc(16, 8).?;
+    @memset(state.guestMemory(later, 16).?, 0x73);
+    try std.testing.expectEqual(@as(?u64, 0xAA55), model.virtualSlot(&state, .basic_streambuf, 2));
+    try std.testing.expectEqual(@as(?u64, 0), model.virtualSlot(&state, .basic_streambuf, 13));
 }
