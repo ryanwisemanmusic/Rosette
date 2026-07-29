@@ -186,6 +186,17 @@ pub const ControlTransferFailure = struct {
     target_executable: bool = false,
     candidate_import: []const u8 = "",
     candidate_image: []const u8 = "",
+    fault_class: []const u8 = "",
+    fault_owner: []const u8 = "",
+    fault_evidence: []const u8 = "",
+    next_subsystem: []const u8 = "",
+    object_address: u64 = 0,
+    object_vptr: u64 = 0,
+    virtual_slot_offset: u64 = 0,
+    vptr_region_kind: []const u8 = "",
+    vptr_region_owner: []const u8 = "",
+    vptr_region_synthetic: bool = false,
+    target_looks_ascii: bool = false,
 };
 
 pub const CxxExceptionReport = struct {
@@ -436,6 +447,28 @@ pub fn logExitReport(report: ExitReport) void {
             );
         } else {
             std.debug.print("    candidate import=<none; this is not a known Mach-O import slot>\n", .{});
+        }
+        if (failure.fault_class.len != 0) {
+            std.debug.print(
+                "    attribution: owner={s} class={s}\n",
+                .{ failure.fault_owner, failure.fault_class },
+            );
+            std.debug.print("    evidence: {s}\n", .{failure.fault_evidence});
+            std.debug.print("    next subsystem: {s}\n", .{failure.next_subsystem});
+        }
+        if (failure.object_vptr != 0) {
+            std.debug.print(
+                "    virtual dispatch: object=0x{x} vptr=0x{x} slot_offset=0x{x} vptr_region={s} owner={s} synthetic={} target_ascii={}\n",
+                .{
+                    failure.object_address,
+                    failure.object_vptr,
+                    failure.virtual_slot_offset,
+                    if (failure.vptr_region_kind.len != 0) failure.vptr_region_kind else "<untracked>",
+                    if (failure.vptr_region_owner.len != 0) failure.vptr_region_owner else "<unknown>",
+                    failure.vptr_region_synthetic,
+                    failure.target_looks_ascii,
+                },
+            );
         }
     }
 
