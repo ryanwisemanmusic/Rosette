@@ -52,6 +52,7 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "5writeEPKc", .handler = @import("handlers.zig").ostreamWrite },
     .{ .name_pattern = "3putEc", .handler = @import("handlers.zig").ostreamPut },
     .{ .name_pattern = "terminatev", .handler = @import("handlers.zig").stdTerminate },
+    .{ .name_pattern = "qsort", .handler = @import("handlers.zig").qsort },
 };
 
 pub fn builtin() PrimitiveRegistry {

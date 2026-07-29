@@ -18,6 +18,11 @@ pub const PrimitiveContext = struct {
     readGuestFn: *const fn (ptr: *const anyopaque, address: u64, size: usize) ?[]const u8,
     writeGuestFn: *const fn (ptr: *anyopaque, address: u64, data: []const u8) ?void,
     readCStringFn: *const fn (ptr: *const anyopaque, address: u64) ?[]const u8,
+    /// Call a guest function synchronously and return its rax value.
+    /// The guest function is called with up to 6 integer arguments (rdi–r9)
+    /// and must follow the System V AMD64 ABI (caller must not be noreturn).
+    /// Returns 0 if the call cannot be completed.
+    callGuestFn: *const fn (ptr: *anyopaque, fn_address: u64, args: [6]u64) u64,
 
     pub fn readArg(self: *const PrimitiveContext, index: u8) u64 {
         return self.readArgFn(self.ptr, index);
@@ -37,6 +42,10 @@ pub const PrimitiveContext = struct {
 
     pub fn readCString(self: *const PrimitiveContext, address: u64) ?[]const u8 {
         return self.readCStringFn(self.ptr, address);
+    }
+
+    pub fn callGuest(self: *const PrimitiveContext, fn_address: u64, args: [6]u64) u64 {
+        return self.callGuestFn(self.ptr, fn_address, args);
     }
 };
 
@@ -80,6 +89,11 @@ test "PrimitiveContext function dispatch works through vtable" {
         .readGuestFn = TestState.readGuest,
         .writeGuestFn = TestState.writeGuest,
         .readCStringFn = TestState.readCString,
+        .callGuestFn = struct {
+            fn call(_: *anyopaque, _: u64, _: [6]u64) u64 {
+                return 0;
+            }
+        }.call,
     };
     try std.testing.expectEqual(@as(u64, 42), ctx.readArg(0));
     try std.testing.expectEqual(@as(u64, 99), ctx.readArg(1));
