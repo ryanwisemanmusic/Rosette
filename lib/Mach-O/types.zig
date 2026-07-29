@@ -243,12 +243,12 @@ pub const ImportRoute = enum(u8) {
     guest_memory_copy,
     memset,
     bzero,
-    gtk_main,
-    gtk_main_quit,
-    gtk_idle_add,
-    g_source_remove,
-    gtk_events_pending,
-    gtk_main_iteration,
+    coop_main,
+    coop_main_quit,
+    idle_add,
+    idle_source_remove,
+    events_pending,
+    coop_main_iteration,
     local_definition,
     libcxx_stream,
     foreign_object,
@@ -386,10 +386,32 @@ pub const CooperativeUiContext = struct {
     caller: u64 = 0,
 };
 
-pub const MAX_GTK_IDLE_CALLBACKS = 32;
-pub const GTK_IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
+/// Main loop type for cooperative UI-thread scheduling.
+/// Determines which import-handler dispatch paths are active and how the
+/// main loop entry/exit is detected.  Defaults to `.gtk` for Xenia
+/// compatibility.
+///
+/// NOTE: Only `.gtk` currently has wired dispatch logic. The other variants
+/// are forward-looking scaffolding — they define the type so consuming code
+/// can set the field, but `dispatch.zig` only activates GTK interception
+/// when `main_loop_type == .gtk`.
+pub const MainLoopType = enum {
+    /// GTK main loop (g_idle_add, gtk_main, gtk_main_quit, etc.)
+    gtk,
+    /// macOS NSApplication main loop (NSApplicationMain, NSRunLoop, etc.)
+    ns_application,
+    /// SDL2 main loop (SDL_PollEvent, SDL_WaitEvent, etc.)
+    sdl,
+    /// Generic/other main loop — imports are not specially intercepted;
+    /// cooperative scheduling still applies but must be triggered by
+    /// custom import bindings or direct function patching.
+    generic,
+};
 
-pub const GtkIdleCallback = struct {
+pub const MAX_IDLE_CALLBACKS = 32;
+pub const IDLE_CALLBACK_HANDLE_BASE: u64 = 0xFFFF_F900_0000_0000;
+
+pub const IdleCallback = struct {
     source_id: u64 = 0,
     function: u64 = 0,
     data: u64 = 0,
@@ -400,7 +422,7 @@ pub const GtkIdleCallback = struct {
     scheduling_rip: u64 = 0,
 };
 
-pub const GtkIdleDispatchBlock = enum {
+pub const IdleDispatchBlock = enum {
     ready,
     no_ui_context,
     no_active_guest_thread,
@@ -408,7 +430,7 @@ pub const GtkIdleDispatchBlock = enum {
     suspended_queue_full,
 };
 
-pub const GtkIdleQueueSnapshot = struct {
+pub const IdleQueueSnapshot = struct {
     pending: usize = 0,
     oldest_source: u64 = 0,
     oldest_callback: u64 = 0,
@@ -427,8 +449,8 @@ pub const RunnableSuspendedSnapshot = struct {
     oldest_reason: []const u8 = "",
 };
 
-pub fn gtkIdleQueueSnapshotFor(callbacks: []const GtkIdleCallback) GtkIdleQueueSnapshot {
-    var snapshot = GtkIdleQueueSnapshot{};
+pub fn idleQueueSnapshotFor(callbacks: []const IdleCallback) IdleQueueSnapshot {
+    var snapshot = IdleQueueSnapshot{};
     for (callbacks) |entry| {
         if (!entry.active) continue;
         snapshot.pending += 1;

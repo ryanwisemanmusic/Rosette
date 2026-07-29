@@ -69,6 +69,12 @@ pub fn handleSyntheticRuntimeThunk(self: anytype) bool {
             self.regs.rax = self.internal_targets.xmodule_empty_string;
             self.regs.rdx = 0;
         },
+        .streambuf_imbue => {
+            // basic_streambuf::imbue is a void customization hook. Modeled
+            // stream buffers own no host locale state, so retaining the
+            // replacement locale in basic_ios is sufficient.
+            self.regs.rax = 0;
+        },
     }
 
     const return_address = self.pop();

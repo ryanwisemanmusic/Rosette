@@ -65,6 +65,7 @@ const import_handler = @import("import_handler");
 const import_dispatch = import_handler.dispatch;
 const dyld = @import("dyld");
 const vt = @import("vtable");
+const guard_rollback_lib = @import("guard_rollback");
 const scheduler = @import("scheduler");
 const cleo_routing = @import("cleo_routing");
 const jit = @import("jit");
@@ -137,7 +138,7 @@ const GUEST_SIGNAL_RETURN_SENTINEL = constants.GUEST_SIGNAL_RETURN_SENTINEL;
 const GUEST_ATEXIT_RETURN_SENTINEL = constants.GUEST_ATEXIT_RETURN_SENTINEL;
 const DEFAULT_GUEST_THREAD_STACK_SIZE = constants.DEFAULT_GUEST_THREAD_STACK_SIZE;
 const COOPERATIVE_THREAD_QUANTUM_STEPS = constants.COOPERATIVE_THREAD_QUANTUM_STEPS;
-const GTK_IDLE_STARVATION_STEPS = constants.GTK_IDLE_STARVATION_STEPS;
+const IDLE_STARVATION_STEPS = constants.IDLE_STARVATION_STEPS;
 const INITIALIZER_STEP_LIMIT = constants.INITIALIZER_STEP_LIMIT;
 const GUEST_LOG_BUFFER_SIZE = constants.GUEST_LOG_BUFFER_SIZE;
 const DECODE_CACHE_ENTRY_COUNT = constants.DECODE_CACHE_ENTRY_COUNT;
@@ -190,22 +191,23 @@ const BoundImportThunk = types.BoundImportThunk;
 const InternalCompatibilityTargets = types.InternalCompatibilityTargets;
 const InitializerCheckpoint = types.InitializerCheckpoint;
 const CooperativeUiContext = types.CooperativeUiContext;
-const GtkIdleCallback = types.GtkIdleCallback;
-const GtkIdleDispatchBlock = types.GtkIdleDispatchBlock;
-const GtkIdleQueueSnapshot = types.GtkIdleQueueSnapshot;
+const MainLoopType = types.MainLoopType;
+const IdleCallback = types.IdleCallback;
+const IdleDispatchBlock = types.IdleDispatchBlock;
+const IdleQueueSnapshot = types.IdleQueueSnapshot;
 const RunnableSuspendedSnapshot = types.RunnableSuspendedSnapshot;
 const SuspendedGuestThread = types.SuspendedGuestThread;
 const GuestSignalAction = types.GuestSignalAction;
 const GuestSignalFrame = types.GuestSignalFrame;
 const ProfileAccountStage = types.ProfileAccountStage;
 const ProfileAccountFlow = types.ProfileAccountFlow;
-const MAX_GTK_IDLE_CALLBACKS = types.MAX_GTK_IDLE_CALLBACKS;
-const GTK_IDLE_CALLBACK_HANDLE_BASE = types.GTK_IDLE_CALLBACK_HANDLE_BASE;
+const MAX_IDLE_CALLBACKS = types.MAX_IDLE_CALLBACKS;
+const IDLE_CALLBACK_HANDLE_BASE = types.IDLE_CALLBACK_HANDLE_BASE;
 const MAX_SUSPENDED_GUEST_THREADS = types.MAX_SUSPENDED_GUEST_THREADS;
 const GuestAssertionClass = types.GuestAssertionClass;
 const classifyGuestAssertion = types.classifyGuestAssertion;
 const timerQueueStateName = types.timerQueueStateName;
-const gtkIdleQueueSnapshotFor = types.gtkIdleQueueSnapshotFor;
+const idleQueueSnapshotFor = types.idleQueueSnapshotFor;
 const isGtkIdleAddImport = types.isGtkIdleAddImport;
 const isGtkEventsPendingImport = types.isGtkEventsPendingImport;
 const isGtkMainIterationImport = types.isGtkMainIterationImport;
@@ -248,7 +250,7 @@ const GtkHeartbeatEntry = struct {
     idle_pending: u64 = 0,
     active_idle_source: u64 = 0,
     active_idle_callback: u64 = 0,
-    dispatch_block: GtkIdleDispatchBlock = .ready,
+    dispatch_block: IdleDispatchBlock = .ready,
 };
 
 const UiHandoffEntry = struct {
@@ -355,6 +357,11 @@ pub const MachOState = struct {
     guest_errno_address: u64 = 0,
     classic_locale_object: u64 = 0,
     cooperative_ui_context: ?CooperativeUiContext = null,
+    main_loop_type: MainLoopType = .gtk,
+    /// When true, enables Xenia-specific compatibility handlers
+    /// (XModule vtable synthesis, binary identity checks).
+    /// Set to false for non-Xenia binaries.
+    has_xenia_compat: bool = true,
     active_guest_thread: u64 = 0,
     cooperative_thread_switches: u64 = 0,
     cooperative_thread_returns: u64 = 0,
@@ -373,9 +380,9 @@ pub const MachOState = struct {
     last_cooperative_starvation_step: u64 = 0,
     ui_callback_retained_quanta: u64 = 0,
     cooperative_quantum_steps: u64 = 0,
-    gtk_bootstrap_active: bool = false,
-    gtk_bootstrap_index: u8 = 0,
-    gtk_bootstrap_entries: [24]GtkBootstrapEntry = [_]GtkBootstrapEntry{.{}} ** 24,
+    coop_bootstrap_active: bool = false,
+    coop_bootstrap_index: u8 = 0,
+    coop_bootstrap_entries: [24]GtkBootstrapEntry = [_]GtkBootstrapEntry{.{}} ** 24,
     step_trace_entries: [5]StepTraceEntry = [_]StepTraceEntry{.{}} ** 5,
     step_trace_index: u4 = 0,
     step_trace_filled: bool = false,
@@ -383,24 +390,24 @@ pub const MachOState = struct {
     mem_init_entries: [8]MemInitEntry = [_]MemInitEntry{.{}} ** 8,
     mem_init_index: u8 = 0,
     mem_init_filled: bool = false,
-    gtk_heartbeat_index: u4 = 0,
-    gtk_heartbeat_filled: bool = false,
-    gtk_heartbeat_entries: [5]GtkHeartbeatEntry = [_]GtkHeartbeatEntry{.{}} ** 5,
+    coop_heartbeat_index: u4 = 0,
+    coop_heartbeat_filled: bool = false,
+    coop_heartbeat_entries: [5]GtkHeartbeatEntry = [_]GtkHeartbeatEntry{.{}} ** 5,
     ui_handoff_index: u4 = 0,
     ui_handoff_filled: bool = false,
     ui_handoff_entries: [5]UiHandoffEntry = [_]UiHandoffEntry{.{}} ** 5,
-    gtk_idle_callbacks: [MAX_GTK_IDLE_CALLBACKS]GtkIdleCallback = [_]GtkIdleCallback{.{}} ** MAX_GTK_IDLE_CALLBACKS,
+    idle_callbacks: [MAX_IDLE_CALLBACKS]IdleCallback = [_]IdleCallback{.{}} ** MAX_IDLE_CALLBACKS,
     gtk_idle_next_source: u64 = 1,
-    gtk_idle_scheduled: u64 = 0,
-    gtk_idle_started: u64 = 0,
-    gtk_idle_completed: u64 = 0,
-    gtk_idle_removed: u64 = 0,
-    gtk_idle_wakeups: u64 = 0,
-    gtk_idle_dispatch_failures: u64 = 0,
-    gtk_idle_starvation_warnings: u64 = 0,
-    active_gtk_idle_source: u64 = 0,
-    active_gtk_idle_callback: u64 = 0,
-    active_gtk_idle_started_step: u64 = 0,
+    idle_scheduled: u64 = 0,
+    idle_started: u64 = 0,
+    idle_completed: u64 = 0,
+    idle_removed: u64 = 0,
+    idle_wakeups: u64 = 0,
+    idle_dispatch_failures: u64 = 0,
+    idle_starvation_warnings: u64 = 0,
+    active_idle_source: u64 = 0,
+    active_idle_callback: u64 = 0,
+    active_idle_started_step: u64 = 0,
     ui_handoff: scheduler.UiHandoffTracker = .{},
     suspended_guest_threads: [MAX_SUSPENDED_GUEST_THREADS]SuspendedGuestThread = [_]SuspendedGuestThread{.{}} ** MAX_SUSPENDED_GUEST_THREADS,
     suspended_guest_thread_count: usize = 0,
@@ -453,10 +460,14 @@ pub const MachOState = struct {
     memory_regions: memory_provenance.Registry,
     memory_writes: memory_write_provenance.Tracker = .{},
     vtable_tracker: vt.VtableTracker,
+    /// Tracks vtable writes for non-heap (stack-local / modeled) objects.
+    /// Registered by the stream bridge during stringstream construction
+    /// and checked as a fallback recovery path in readMemVal.
+    vtable_stack_registry: vt.StackRegistry,
     /// Tracks __cxa_guard variables that were acquired during the current
     /// initializer run.  When the initializer is deferred, these guards are
     /// cleared so the retry starts from a clean initialization state.
-    guard_rollback: vt.GuardRollback,
+    guard_rollback: guard_rollback_lib.GuardRollback,
     pointer_firewall: pointer_firewall.Firewall,
     page_permissions: []u8,
     smart_stubs: smart_stub_generator.Generator = .{},
@@ -616,7 +627,8 @@ pub const MachOState = struct {
             .local_libcpp_stream_targets = std.AutoHashMap(u64, []const u8).init(allocator),
             .import_handler = import_handler.ImportHandler.init(allocator),
             .vtable_tracker = vt.VtableTracker.init(allocator),
-            .guard_rollback = vt.GuardRollback.init(allocator),
+            .vtable_stack_registry = vt.StackRegistry.init(allocator),
+            .guard_rollback = guard_rollback_lib.GuardRollback.init(allocator),
             .decode_cache = decode_cache,
             .mapped_min = mapped_min,
             .executable_min = executable_min,
@@ -829,6 +841,7 @@ pub const MachOState = struct {
         self.local_libcpp_stream_targets.deinit();
         self.import_handler.deinit();
         self.vtable_tracker.deinit();
+        self.vtable_stack_registry.deinit();
         self.guard_rollback.deinit();
         self.import_resolver.deinit();
         self.initializer_resolver.deinit();
@@ -1127,14 +1140,14 @@ pub const MachOState = struct {
         return null;
     }
 
-    pub fn dumpGtkBootstrapTrace(self: *const MachOState) void {
-        if (!self.gtk_bootstrap_active or self.gtk_bootstrap_index == 0) return;
+    pub fn dumpCoopBootstrapTrace(self: *const MachOState) void {
+        if (!self.coop_bootstrap_active or self.coop_bootstrap_index == 0) return;
         machoCapturePrint(
             "macho-processor: GTK worker bootstrap trace (incomplete, {d}/{d} entries):\n",
-            .{ self.gtk_bootstrap_index, 24 },
+            .{ self.coop_bootstrap_index, 24 },
         );
-        for (0..self.gtk_bootstrap_index) |i| {
-            const e = &self.gtk_bootstrap_entries[i];
+        for (0..self.coop_bootstrap_index) |i| {
+            const e = &self.coop_bootstrap_entries[i];
             const symbol = self.metadata.nearestSymbol(e.rip);
             const op_str = @tagName(@as(Op, @enumFromInt(e.op)));
             machoCapturePrint(
@@ -1252,6 +1265,8 @@ pub const MachOState = struct {
     const dumpHeapCorruptionDiagnostics = memory_access.dumpHeapCorruptionDiagnostics;
     const timerQueueWatchWrite = memory_access.timerQueueWatchWrite;
     pub const writeMemVal = memory_access.writeMemVal;
+    pub const captureMemoryMutation = memory_access.captureMemoryMutation;
+    pub const commitMemoryMutation = memory_access.commitMemoryMutation;
     const deferInitializerRuntimeDependency = memory_access.deferInitializerRuntimeDependency;
     pub const decodeTraceInstruction = memory_access.decodeTraceInstruction;
     const ensureGuestAccess = memory_access.ensureGuestAccess;
@@ -1728,6 +1743,66 @@ pub const MachOState = struct {
                                 return inner_st.guestCString(address, 4096);
                             }
                         }.read,
+                        .callGuestFn = struct {
+                            fn call(ptr: *anyopaque, fn_address: u64, args: [6]u64) u64 {
+                                const st: *MachOState = @ptrCast(@alignCast(ptr));
+
+                                // Save the complete register state for restoration after the call.
+                                const saved_regs = st.regs;
+
+                                // Set up System V AMD64 ABI arguments for the guest function.
+                                st.regs.rdi = args[0];
+                                st.regs.rsi = args[1];
+                                st.regs.rdx = args[2];
+                                st.regs.rcx = args[3];
+                                st.regs.r8 = args[4];
+                                st.regs.r9 = args[5];
+
+                                // Push a distinctive sentinel return address onto the guest
+                                // stack so we can detect when the callee returns.
+                                const sentinel: u64 = 0xCA11CA11CA11CA11;
+                                st.regs.rsp -%= 8;
+                                if (st.guestMemory(st.regs.rsp, 8)) |dest| {
+                                    std.mem.writeInt(u64, dest[0..8], sentinel, .little);
+                                }
+
+                                st.regs.rip = fn_address;
+
+                                // Inline decode + execute loop.  We avoid calling
+                                // self.step() because that would re-enter import
+                                // dispatch and sentinel checks.  Instead we manually
+                                // decode and execute each instruction until the
+                                // callee rets back to our sentinel.
+                                const max_iters: u32 = 200;
+                                var iter: u32 = 0;
+                                while (iter < max_iters) : (iter += 1) {
+                                    if (st.terminated or st.faulted) break;
+
+                                    const d = st.decodeAt() orelse break;
+                                    if (d.op == .invalid) break;
+
+                                    if (d.op == .ret) {
+                                        // Pop return address from guest stack.
+                                        if (st.guestMemory(st.regs.rsp, 8)) |src| {
+                                            st.regs.rip = std.mem.readInt(u64, src[0..8], .little);
+                                            st.regs.rsp +%= 8;
+                                        }
+                                        if (st.regs.rip == sentinel) break;
+                                        continue;
+                                    }
+
+                                    const old_rip = st.regs.rip;
+                                    st.execute(d);
+                                    if (!st.terminated and st.regs.rip == old_rip) {
+                                        st.regs.rip +%= d.len;
+                                    }
+                                }
+
+                                const result = st.regs.rax;
+                                st.regs = saved_regs;
+                                return result;
+                            }
+                        }.call,
                     };
                     const result = typed_handler(slot, &prim_ctx);
                     return @intFromEnum(result);
@@ -2260,6 +2335,48 @@ pub const MachOState = struct {
             if (std.mem.startsWith(u8, argument, fb_prefix)) {
                 self.fs_forwarder.addFallbackRoot(argument[fb_prefix.len..]);
             }
+            if (std.mem.eql(u8, argument, "--no-xenia-compat")) {
+                self.has_xenia_compat = false;
+                machoCapturePrint(
+                    "macho-processor: Xenia-specific compatibility handlers disabled (--no-xenia-compat)\n",
+                    .{},
+                );
+            }
+            if (std.mem.eql(u8, argument, "--wall-clock-time")) {
+                self.guest_time.time_mode = .wall_clock;
+                self.guest_time.captureWallClockBaseline();
+                machoCapturePrint(
+                    "macho-processor: wall-clock time mode enabled (--wall-clock-time)\n",
+                    .{},
+                );
+            }
+            // Generic alternatives to Xenia-specific --storage_root
+            if (std.mem.eql(u8, argument, "--storage-root") and argument_index + 1 < args.len) {
+                self.fs_forwarder.configurePaths(args[argument_index + 1]);
+                break;
+            }
+            const sr_prefix = "--storage-root=";
+            if (std.mem.startsWith(u8, argument, sr_prefix)) {
+                self.fs_forwarder.configurePaths(argument[sr_prefix.len..]);
+                break;
+            }
+            if (std.mem.eql(u8, argument, "--data-dir") and argument_index + 1 < args.len) {
+                self.fs_forwarder.configurePaths(args[argument_index + 1]);
+                break;
+            }
+            const dd_prefix = "--data-dir=";
+            if (std.mem.startsWith(u8, argument, dd_prefix)) {
+                self.fs_forwarder.configurePaths(argument[dd_prefix.len..]);
+                break;
+            }
+            // Generic alternative to Xenia-specific --fs-fallback
+            if (std.mem.eql(u8, argument, "--fs-fallback-path") and argument_index + 1 < args.len) {
+                self.fs_forwarder.addFallbackRoot(args[argument_index + 1]);
+            }
+            const fbp_prefix = "--fs-fallback-path=";
+            if (std.mem.startsWith(u8, argument, fbp_prefix)) {
+                self.fs_forwarder.addFallbackRoot(argument[fbp_prefix.len..]);
+            }
         }
         var full_args = std.ArrayList([]const u8).empty;
         defer full_args.deinit(self.allocator);
@@ -2472,9 +2589,9 @@ pub const MachOState = struct {
                 machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=<unmapped>\n", .{rip});
             }
             self.dumpStepTraceBuffer();
-            self.dumpGtkBootstrapTrace();
+            self.dumpCoopBootstrapTrace();
             self.dumpMemInitTrace();
-            self.dumpGtkHeartbeatTrace();
+            self.dumpCoopHeartbeatTrace();
             self.dumpUiHandoffTrace();
             self.dumpRecentTrace();
             self.faulted = true;
@@ -2484,19 +2601,19 @@ pub const MachOState = struct {
             return false;
         }
         self.recordTrace(decoded);
-        if (self.gtk_bootstrap_active and self.gtk_bootstrap_index < 24) {
-            const idx = self.gtk_bootstrap_index;
-            self.gtk_bootstrap_entries[idx] = .{
+        if (self.coop_bootstrap_active and self.coop_bootstrap_index < 24) {
+            const idx = self.coop_bootstrap_index;
+            self.coop_bootstrap_entries[idx] = .{
                 .rip = self.regs.rip,
                 .thread = self.active_guest_thread,
                 .op = @intFromEnum(decoded.op),
                 .len = decoded.len,
             };
-            self.gtk_bootstrap_index = idx + 1;
-            if (self.gtk_bootstrap_index == 24) {
-                self.gtk_bootstrap_active = false;
-                const first = &self.gtk_bootstrap_entries[0];
-                const last = &self.gtk_bootstrap_entries[23];
+            self.coop_bootstrap_index = idx + 1;
+            if (self.coop_bootstrap_index == 24) {
+                self.coop_bootstrap_active = false;
+                const first = &self.coop_bootstrap_entries[0];
+                const last = &self.coop_bootstrap_entries[23];
                 const symbol = self.metadata.nearestSymbol(first.rip);
                 machoCapturePrint(
                     "macho-processor: GTK worker bootstrapping successful: thread=0x{x} first_rip=0x{x} last_rip=0x{x} first_symbol={s}\n",
@@ -2570,8 +2687,8 @@ pub const MachOState = struct {
         return !self.terminated;
     }
 
-    pub fn beginGtkMainLoop(self: *MachOState) bool {
-        return scheduling.beginGtkMainLoop(self);
+    pub fn beginCooperativeMainLoop(self: *MachOState) bool {
+        return scheduling.beginCooperativeMainLoop(self);
     }
 
     pub fn startDeferredGuestThread(self: *MachOState, deferred: pthread_runtime.DeferredThread) bool {
@@ -2592,7 +2709,7 @@ pub const MachOState = struct {
         return scheduling.yieldActiveGuestThreadForWait(self, reason);
     }
 
-    // GTK idle scheduling is a wake-up, not merely queue bookkeeping. Dispatch
+    // cooperative idle scheduling is a wake-up, not merely queue bookkeeping. Dispatch
     // newly queued UI work at the first safe interpreter boundary even after
     // every pthread worker has started. This is the path used by Xenia's
     // CallInUIThread presenter creation handoff.
@@ -2608,36 +2725,36 @@ pub const MachOState = struct {
         scheduling.finishActiveGuestThread(self);
     }
 
-    pub fn scheduleGtkIdleCallback(self: *MachOState, function: u64, data: u64, tag: []const u8) u64 {
-        return scheduling.scheduleGtkIdleCallback(self, function, data, tag);
+    pub fn scheduleIdleCallback(self: *MachOState, function: u64, data: u64, tag: []const u8) u64 {
+        return scheduling.scheduleIdleCallback(self, function, data, tag);
     }
 
-    pub fn pendingGtkIdleCallbackCount(self: *const MachOState) usize {
-        return scheduling.pendingGtkIdleCallbackCount(self);
+    pub fn pendingIdleCallbackCount(self: *const MachOState) usize {
+        return scheduling.pendingIdleCallbackCount(self);
     }
 
-    pub fn gtkIdleQueueSnapshot(self: *const MachOState) GtkIdleQueueSnapshot {
-        return scheduling.gtkIdleQueueSnapshot(self);
+    pub fn gtkIdleQueueSnapshot(self: *const MachOState) IdleQueueSnapshot {
+        return scheduling.idleQueueSnapshot(self);
     }
 
-    pub fn gtkIdleDispatchBlock(self: *const MachOState) GtkIdleDispatchBlock {
-        return scheduling.gtkIdleDispatchBlock(self);
+    pub fn gtkIdleDispatchBlock(self: *const MachOState) IdleDispatchBlock {
+        return scheduling.idleDispatchBlock(self);
     }
 
-    pub fn removeGtkIdleSource(self: *MachOState, source: u64) bool {
-        return scheduling.removeGtkIdleSource(self, source);
+    pub fn removeIdleSource(self: *MachOState, source: u64) bool {
+        return scheduling.removeIdleSource(self, source);
     }
 
-    pub fn startNextGtkIdleCallback(self: *MachOState, reason: []const u8, active_already_saved: bool) bool {
-        return scheduling.startNextGtkIdleCallback(self, reason, active_already_saved);
+    pub fn startNextIdleCallback(self: *MachOState, reason: []const u8, active_already_saved: bool) bool {
+        return scheduling.startNextIdleCallback(self, reason, active_already_saved);
     }
 
-    pub fn isGtkIdleCallbackHandle(self: *const MachOState, handle: u64) bool {
-        return scheduling.isGtkIdleCallbackHandle(self, handle);
+    pub fn isSyntheticCallbackHandle(self: *const MachOState, handle: u64) bool {
+        return scheduling.isSyntheticCallbackHandle(self, handle);
     }
 
     pub fn currentCooperativeThreadHandle(self: *const MachOState) u64 {
-        if (self.active_guest_thread == 0 or self.isGtkIdleCallbackHandle(self.active_guest_thread)) {
+        if (self.active_guest_thread == 0 or self.isSyntheticCallbackHandle(self.active_guest_thread)) {
             return self.pthreads.main_thread_handle;
         }
         return self.active_guest_thread;
@@ -2663,8 +2780,8 @@ pub const MachOState = struct {
         scheduling.logThreadTable(self, reason);
     }
 
-    pub fn restoreGtkMainLoopCaller(self: *MachOState, reason: []const u8) void {
-        scheduling.restoreGtkMainLoopCaller(self, reason);
+    pub fn restoreMainLoopCaller(self: *MachOState, reason: []const u8) void {
+        scheduling.restoreMainLoopCaller(self, reason);
     }
 
     pub fn logCooperativeSchedulerSummary(self: *const MachOState) void {
@@ -2675,8 +2792,8 @@ pub const MachOState = struct {
         scheduling.logCooperativeHeartbeat(self);
     }
 
-    pub fn dumpGtkHeartbeatTrace(self: *const MachOState) void {
-        scheduling.dumpGtkHeartbeatTrace(self);
+    pub fn dumpCoopHeartbeatTrace(self: *const MachOState) void {
+        scheduling.dumpCoopHeartbeatTrace(self);
     }
 
     pub fn dumpUiHandoffTrace(self: *const MachOState) void {
@@ -2722,8 +2839,8 @@ pub const MachOState = struct {
             // work. Try real queued work once, then stop with a precise
             // invariant failure instead of manufacturing millions of steps.
             if (self.cooperative_ui_context != null and self.active_guest_thread == 0) {
-                const started_idle = self.pendingGtkIdleCallbackCount() != 0 and
-                    self.startNextGtkIdleCallback("zero-active run guard", true);
+                const started_idle = self.pendingIdleCallbackCount() != 0 and
+                    self.startNextIdleCallback("zero-active run guard", true);
                 const resumed_worker = !started_idle and self.resumeSuspendedGuestThread();
                 if (!started_idle and !resumed_worker) {
                     self.scheduler_log.emit(.{
@@ -2736,7 +2853,7 @@ pub const MachOState = struct {
                     });
                     machoCapturePrint(
                         "macho-processor: runtime invariant failure: no active or runnable guest thread; refusing stale-register execution rip=0x{x} suspended={d} blocked={d} pending_gtk={d}\n",
-                        .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pendingGtkIdleCallbackCount() },
+                        .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pendingIdleCallbackCount() },
                     );
                     self.faulted = true;
                     self.exit_code = 125;
@@ -2751,7 +2868,7 @@ pub const MachOState = struct {
 
             // Update scheduler with current context
             // self.thread_scheduler.setUIContext(self.cooperative_ui_context != null);
-            // self.thread_scheduler.updatePendingIdle(self.pendingGtkIdleCallbackCount());
+            // self.thread_scheduler.updatePendingIdle(self.pendingIdleCallbackCount());
             // self.thread_scheduler.updateDeferredThreads(self.pthreads.deferred_threads);
             if (steps != 0 and steps % PROGRESS_REPORT_INTERVAL == 0) {
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
@@ -3300,6 +3417,22 @@ pub const MachOState = struct {
 
     pub fn executeVexPackedF64(self: *MachOState, d: DecodedInsn, operation: VexArithmetic) void {
         execution_helpers.executeVexPackedF64(self, d, operation);
+    }
+
+    pub fn executeVexSqrtScalarF32(self: *MachOState, d: DecodedInsn) void {
+        execution_helpers.executeVexSqrtScalarF32(self, d);
+    }
+
+    pub fn executeVexSqrtScalarF64(self: *MachOState, d: DecodedInsn) void {
+        execution_helpers.executeVexSqrtScalarF64(self, d);
+    }
+
+    pub fn executeVexSqrtPackedF32(self: *MachOState, d: DecodedInsn) void {
+        execution_helpers.executeVexSqrtPackedF32(self, d);
+    }
+
+    pub fn executeVexSqrtPackedF64(self: *MachOState, d: DecodedInsn) void {
+        execution_helpers.executeVexSqrtPackedF64(self, d);
     }
 
     pub fn setVexComparisonFlags(self: *MachOState, lhs: anytype, rhs: @TypeOf(lhs)) void {
@@ -3993,7 +4126,7 @@ test "Mach-O PAGEZERO is excluded from guest memory" {
     try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0x800));
 }
 
-test "GTK idle wake preempts a running worker after all pthreads have started" {
+test "cooperative idle wake preempts a running worker after all pthreads have started" {
     try std.testing.expectEqual(scheduler.CooperativeWork.gtk_idle, scheduler.chooseCooperativeWork(.{ .pending_idle = 1 }));
     try std.testing.expectEqual(scheduler.CooperativeWork.gtk_idle, scheduler.chooseCooperativeWork(.{ .pending_idle = 1, .deferred_threads = 3 }));
     try std.testing.expectEqual(scheduler.CooperativeWork.none, scheduler.chooseCooperativeWork(.{ .pending_idle = 1, .idle_callback_running = true }));
@@ -4003,13 +4136,13 @@ test "GTK idle wake preempts a running worker after all pthreads have started" {
     try std.testing.expectEqual(scheduler.CooperativeWork.none, scheduler.chooseCooperativeWork(.{}));
 }
 
-test "GTK idle diagnostics retain the oldest queued callback provenance" {
-    const callbacks = [_]GtkIdleCallback{
+test "cooperative idle diagnostics retain the oldest queued callback provenance" {
+    const callbacks = [_]IdleCallback{
         .{ .source_id = 7, .function = 0x7000, .active = true, .tag = "newer", .scheduled_step = 90, .scheduling_thread = 0x77, .scheduling_rip = 0x777 },
         .{},
         .{ .source_id = 3, .function = 0x3000, .active = true, .tag = "presenter", .scheduled_step = 40, .scheduling_thread = 0x33, .scheduling_rip = 0x333 },
     };
-    const snapshot = gtkIdleQueueSnapshotFor(&callbacks);
+    const snapshot = idleQueueSnapshotFor(&callbacks);
     try std.testing.expectEqual(@as(usize, 2), snapshot.pending);
     try std.testing.expectEqual(@as(u64, 3), snapshot.oldest_source);
     try std.testing.expectEqual(@as(u64, 0x3000), snapshot.oldest_callback);

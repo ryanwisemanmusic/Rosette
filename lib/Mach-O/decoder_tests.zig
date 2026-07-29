@@ -78,6 +78,8 @@ const vexBitwiseForOp = decoder.vexBitwiseForOp;
 const applyVexBitwise = decoder.applyVexBitwise;
 const applyVexPackedF32 = decoder.applyVexPackedF32;
 const applyVexPackedF64 = decoder.applyVexPackedF64;
+const sqrtVexPackedF32 = decoder.sqrtVexPackedF32;
+const sqrtVexPackedF64 = decoder.sqrtVexPackedF64;
 const roundVexFloat = decoder.roundVexFloat;
 const roundNearestEven = decoder.roundNearestEven;
 const roundVexPackedF32 = decoder.roundVexPackedF32;
@@ -452,6 +454,24 @@ test "decode VEX dword move and byte insertion" {
     try std.testing.expectEqual(@as(u8, 1), move_memory.xmm_dst);
     try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, move_memory.sib_base_reg);
 
+    const extract_register = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x7E, 0xC0 });
+    try std.testing.expectEqual(Op.vmovd_reg32_xmm, extract_register.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, extract_register.dst_reg);
+    try std.testing.expectEqual(@as(u8, 0), extract_register.xmm_src);
+    try std.testing.expectEqual(Size.bits32, extract_register.size);
+    try std.testing.expectEqual(@as(u8, 4), extract_register.len);
+
+    const extract_memory = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x7E, 0x09 });
+    try std.testing.expectEqual(Op.vmovd_mem32_xmm, extract_memory.op);
+    try std.testing.expectEqual(@as(u8, 1), extract_memory.xmm_src);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, extract_memory.sib_base_reg);
+
+    const extract_register_vex3 = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x79, 0x7E, 0xC8 });
+    try std.testing.expectEqual(Op.vmovd_reg32_xmm, extract_register_vex3.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, extract_register_vex3.dst_reg);
+    try std.testing.expectEqual(@as(u8, 1), extract_register_vex3.xmm_src);
+    try std.testing.expectEqual(@as(u8, 5), extract_register_vex3.len);
+
     const insert_register = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x20, 0xC0, 0x0F });
     try std.testing.expectEqual(Op.vpinsrb_xmm_xmm_reg32, insert_register.op);
     try std.testing.expectEqual(@as(u8, 0), insert_register.xmm_dst);
@@ -788,6 +808,53 @@ test "decode VEX scalar and packed arithmetic" {
     try std.testing.expectEqual(@as(u8, 2), scalar_memory.xmm_src);
     try std.testing.expectEqual(RegId.al_ax_eax_rax, scalar_memory.sib_base_reg);
     try std.testing.expect(!scalar_memory.is_reg_form);
+}
+
+test "decode VEX square root forms including ImGui crash boundary" {
+    // VSQRTSS xmm0, xmm0, xmm1 — the exact instruction encountered while
+    // ImGui was building the presenter font atlas.
+    const imgui_scalar = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x51, 0xC1 });
+    try std.testing.expectEqual(Op.vsqrtss, imgui_scalar.op);
+    try std.testing.expectEqual(Size.bits32, imgui_scalar.size);
+    try std.testing.expectEqual(@as(u8, 0), imgui_scalar.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), imgui_scalar.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), imgui_scalar.xmm_src2);
+    try std.testing.expect(imgui_scalar.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 4), imgui_scalar.len);
+
+    const packed_256 = decodeInsn(&[_]u8{ 0xC5, 0xFC, 0x51, 0xCB });
+    try std.testing.expectEqual(Op.vsqrtps, packed_256.op);
+    try std.testing.expectEqual(@as(u8, 1), packed_256.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 3), packed_256.xmm_src2);
+    try std.testing.expect(packed_256.vector_256);
+    try std.testing.expect(packed_256.is_reg_form);
+
+    const double_memory = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x79, 0x51, 0x48, 0x10 });
+    try std.testing.expectEqual(Op.vsqrtpd, double_memory.op);
+    try std.testing.expectEqual(Size.bits64, double_memory.size);
+    try std.testing.expectEqual(@as(u8, 1), double_memory.xmm_dst);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, double_memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x10), double_memory.addr);
+    try std.testing.expect(!double_memory.is_reg_form);
+}
+
+test "VEX packed square root preserves independent float lanes" {
+    var singles = [_]u8{0} ** 16;
+    for ([_]f32{ 1.0, 4.0, 9.0, 16.0 }, 0..) |value, lane| {
+        std.mem.writeInt(u32, singles[lane * 4 ..][0..4], @bitCast(value), .little);
+    }
+    const single_roots = sqrtVexPackedF32(singles);
+    for ([_]f32{ 1.0, 2.0, 3.0, 4.0 }, 0..) |expected, lane| {
+        const actual: f32 = @bitCast(std.mem.readInt(u32, single_roots[lane * 4 ..][0..4], .little));
+        try std.testing.expectEqual(expected, actual);
+    }
+
+    var doubles = [_]u8{0} ** 16;
+    std.mem.writeInt(u64, doubles[0..8], @bitCast(@as(f64, 25.0)), .little);
+    std.mem.writeInt(u64, doubles[8..16], @bitCast(@as(f64, 36.0)), .little);
+    const double_roots = sqrtVexPackedF64(doubles);
+    try std.testing.expectEqual(@as(f64, 5.0), @as(f64, @bitCast(std.mem.readInt(u64, double_roots[0..8], .little))));
+    try std.testing.expectEqual(@as(f64, 6.0), @as(f64, @bitCast(std.mem.readInt(u64, double_roots[8..16], .little))));
 }
 
 test "decode VEX bitwise vector operations" {

@@ -26,6 +26,7 @@ pub const SyntheticThunk = enum(u8) {
     locale_use_facet,
     locale_destroy,
     xmodule_get_name,
+    streambuf_imbue,
 };
 
 const NamedHandle = struct {
@@ -75,6 +76,12 @@ pub const Runtime = struct {
     locale_facet_count: usize = 0,
     atexit_entries: [max_atexit_entries]AtexitEntry = [_]AtexitEntry{.{}} ** max_atexit_entries,
     atexit_count: usize = 0,
+    /// Tracks invalid atexit entries skipped during dispatch (for log throttling).
+    /// Populated by dispatchNextAtexit in the import-handler when an atexit
+    /// entry has an unexecutable function pointer.  Rejected entries are NOT
+    /// stored by registerAtexit/registerPlainAtexit, so this counter is only
+    /// non-zero for corrupted entries registered before this fix was deployed.
+    atexit_invalid_skipped: u64 = 0,
     next_handle: u64 = handle_base,
 
     pub fn classNamed(self: *Runtime, name: []const u8) u64 {
@@ -209,8 +216,16 @@ pub const Runtime = struct {
         return handle;
     }
 
+    /// Register an atexit callback. Returns false (rejects) when the
+    /// function pointer is clearly invalid -- e.g. a kernel-range address
+    /// like 0xfffffc0000000042 that indicates memory corruption rather than
+    /// a genuine callback.  Real guest function addresses are always in the
+    /// user-space canonical range (below 0x0000_7FFF_FFFF_FFFF) or in the
+    /// synthetic-thunk range.  The bulk of corrupted pointers land in the
+    /// kernel range (high bits set) and are rejected here so the exit
+    /// dispatch loop never sees them.
     pub fn registerAtexit(self: *Runtime, function: u64, argument: u64, dso: u64) bool {
-        if (function == 0 or self.atexit_count >= self.atexit_entries.len) return false;
+        if (function == 0 or function >= 0xFFFF_0000_0000_0000 or self.atexit_count >= self.atexit_entries.len) return false;
         self.atexit_entries[self.atexit_count] = .{
             .function = function,
             .argument = argument,
@@ -221,7 +236,7 @@ pub const Runtime = struct {
     }
 
     pub fn registerPlainAtexit(self: *Runtime, function: u64) bool {
-        if (function == 0 or self.atexit_count >= self.atexit_entries.len) return false;
+        if (function == 0 or function >= 0xFFFF_0000_0000_0000 or self.atexit_count >= self.atexit_entries.len) return false;
         self.atexit_entries[self.atexit_count] = .{
             .function = function,
             .takes_argument = false,
@@ -274,26 +289,28 @@ pub const Runtime = struct {
         self.next_handle +%= 0x10;
         return handle;
     }
-};    pub fn syntheticThunk(address: u64) ?SyntheticThunk {
-        if (address <= synthetic_thunk_base or address > synthetic_thunk_base + std.math.maxInt(u8)) return null;
-        const offset = address - synthetic_thunk_base;
-        const tag: u8 = @intCast(offset);
-        return switch (tag) {
-            1 => .ctype_toupper_char,
-            2 => .ctype_toupper_range,
-            3 => .ctype_tolower_char,
-            4 => .ctype_tolower_range,
-            5 => .ctype_widen_char,
-            6 => .ctype_widen_range,
-            7 => .ctype_narrow_char,
-            8 => .ctype_narrow_range,
-            9 => .locale_has_facet,
-            10 => .locale_use_facet,
-            11 => .locale_destroy,
-            12 => .xmodule_get_name,
-            else => null,
-        };
-    }
+};
+pub fn syntheticThunk(address: u64) ?SyntheticThunk {
+    if (address <= synthetic_thunk_base or address > synthetic_thunk_base + std.math.maxInt(u8)) return null;
+    const offset = address - synthetic_thunk_base;
+    const tag: u8 = @intCast(offset);
+    return switch (tag) {
+        1 => .ctype_toupper_char,
+        2 => .ctype_toupper_range,
+        3 => .ctype_tolower_char,
+        4 => .ctype_tolower_range,
+        5 => .ctype_widen_char,
+        6 => .ctype_widen_range,
+        7 => .ctype_narrow_char,
+        8 => .ctype_narrow_range,
+        9 => .locale_has_facet,
+        10 => .locale_use_facet,
+        11 => .locale_destroy,
+        12 => .xmodule_get_name,
+        13 => .streambuf_imbue,
+        else => null,
+    };
+}
 
 pub fn thunkAddress(thunk: SyntheticThunk) u64 {
     return synthetic_thunk_base + @intFromEnum(thunk);

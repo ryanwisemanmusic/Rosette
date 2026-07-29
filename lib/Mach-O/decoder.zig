@@ -606,6 +606,23 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    if (opcode == 0x7E and (vex & 0x78) == 0x78 and !vector_256 and prefix == 1) {
+        var decoded = DecodedInsn{ .size = .bits32 };
+        var pos = start_pos + 3;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        if (is_mem) {
+            decoded.op = .vmovd_mem32_xmm;
+            decoded.addr = rm.addr;
+        } else {
+            decoded.op = .vmovd_reg32_xmm;
+            decoded.dst_reg = @enumFromInt(rm.addr);
+        }
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode == 0x7E and (vex & 0x78) == 0x78 and !vector_256 and prefix == 2) {
         var decoded = DecodedInsn{ .size = .bits64 };
         var pos = start_pos + 3;
@@ -765,6 +782,38 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VSQRTPS/PD and VSQRTSS/SD: VEX.128/256.[66/F3/F2].0F.WIG 51 /r.
+    // Scalar forms merge the upper 96/64 bits from VEX.vvvv. Packed forms
+    // have a single r/m source, but retaining vvvv here keeps the decoded
+    // shape uniform and makes malformed/reserved encodings diagnosable.
+    if (opcode == 0x51) {
+        if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
+
+        var decoded = DecodedInsn{
+            .size = if (prefix == 1 or prefix == 3) .bits64 else .bits32,
+            .vector_256 = vector_256,
+        };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, decoded.size);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (prefix) {
+            0 => .vsqrtps,
+            1 => .vsqrtpd,
+            2 => .vsqrtss,
+            3 => .vsqrtsd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     // VPINSRW: VEX.128.66.0F.W0 C4 /r ib — Insert Word
     // Encoding: ModRM.r/m = destination XMM, ModRM.reg = GPR, VEX.vvvv = merge source
     if (opcode == 0xC4 and !vector_256 and prefix == 1) {
@@ -772,14 +821,14 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         var pos = start_pos + 3;
         const is_memory = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
-        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);  // VEX.vvvv = merge source XMM
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F); // VEX.vvvv = merge source XMM
         decoded.is_reg_form = !is_memory;
         if (is_memory) {
-            decoded.xmm_dst = decoded.xmm_src;  // merge source is implicit destination
-            decoded.addr = rm.addr;             // memory address
+            decoded.xmm_dst = decoded.xmm_src; // merge source is implicit destination
+            decoded.addr = rm.addr; // memory address
         } else {
-            decoded.xmm_dst = @intCast(rm.addr);   // ModRM.r/m = destination XMM
-            decoded.xmm_src2 = @intFromEnum(rm.reg);   // ModRM.reg = GPR source
+            decoded.xmm_dst = @intCast(rm.addr); // ModRM.r/m = destination XMM
+            decoded.xmm_src2 = @intFromEnum(rm.reg); // ModRM.reg = GPR source
         }
         if (pos >= bytes.len) return .{};
         decoded.imm = bytes[pos];
@@ -1467,6 +1516,26 @@ pub fn applyVexPackedF64(lhs: [16]u8, rhs: [16]u8, operation: VexArithmetic) [16
     return result;
 }
 
+pub fn sqrtVexPackedF32(source: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const source_value: f32 = @bitCast(std.mem.readInt(u32, source[offset..][0..4], .little));
+        std.mem.writeInt(u32, result[offset..][0..4], @bitCast(@sqrt(source_value)), .little);
+    }
+    return result;
+}
+
+pub fn sqrtVexPackedF64(source: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..2) |lane| {
+        const offset = lane * 8;
+        const source_value: f64 = @bitCast(std.mem.readInt(u64, source[offset..][0..8], .little));
+        std.mem.writeInt(u64, result[offset..][0..8], @bitCast(@sqrt(source_value)), .little);
+    }
+    return result;
+}
+
 pub fn roundVexFloat(comptime Float: type, value: Float, immediate: u8) Float {
     if (std.math.isNan(value) or std.math.isInf(value)) return value;
     const mode: u2 = if (immediate & 0x04 != 0) 0 else @truncate(immediate);
@@ -1546,6 +1615,34 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     const rex_w = (vex_control & 0x80) != 0;
     const vector_256 = (vex_control & 0x04) != 0;
     const prefix = vex_control & 0x03;
+
+    if (opcode_map == 1 and opcode == 0x51) {
+        if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
+
+        var decoded = DecodedInsn{
+            .size = if (prefix == 1 or prefix == 3) .bits64 else .bits32,
+            .vector_256 = vector_256,
+        };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, decoded.size);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (prefix) {
+            0 => .vsqrtps,
+            1 => .vsqrtpd,
+            2 => .vsqrtss,
+            3 => .vsqrtsd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
 
     if (opcode_map == 1 and
         (opcode == 0x12 or opcode == 0x13 or opcode == 0x16 or opcode == 0x17) and
@@ -1732,28 +1829,28 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     if (opcode_map == 1 and (opcode == 0x6E or opcode == 0x7E)) {
-        if (!rex_w or vector_256 or prefix != 1 or (vex_control & 0x78) != 0x78) return .{};
+        if (vector_256 or prefix != 1 or (vex_control & 0x78) != 0x78) return .{};
 
-        var decoded = DecodedInsn{ .size = .bits64 };
+        var decoded = DecodedInsn{ .size = if (rex_w) .bits64 else .bits32 };
         var pos = start_pos + 4;
         const is_mem = bytes[pos] < 0xC0;
-        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, decoded.size);
         if (opcode == 0x6E) {
             decoded.xmm_dst = @intFromEnum(rm.reg);
             if (is_mem) {
-                decoded.op = .vmovq_xmm_mem64;
+                decoded.op = if (rex_w) .vmovq_xmm_mem64 else .vmovd_xmm_mem32;
                 decoded.addr = rm.addr;
             } else {
-                decoded.op = .vmovq_xmm_reg64;
+                decoded.op = if (rex_w) .vmovq_xmm_reg64 else .vmovd_xmm_reg32;
                 decoded.src_reg = @enumFromInt(rm.addr);
             }
         } else {
             decoded.xmm_src = @intFromEnum(rm.reg);
             if (is_mem) {
-                decoded.op = .vmovq_mem64_xmm;
+                decoded.op = if (rex_w) .vmovq_mem64_xmm else .vmovd_mem32_xmm;
                 decoded.addr = rm.addr;
             } else {
-                decoded.op = .vmovq_reg64_xmm;
+                decoded.op = if (rex_w) .vmovq_reg64_xmm else .vmovd_reg32_xmm;
                 decoded.dst_reg = @enumFromInt(rm.addr);
             }
         }
