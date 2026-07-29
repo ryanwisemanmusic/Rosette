@@ -11,6 +11,7 @@
 pub const diagnostic_throttle = @import("diagnostic_throttle.zig");
 pub const diagnostic_text_accelerator = @import("diagnostic_text_accelerator.zig");
 pub const semantic_fault_classifier = @import("semantic_fault_classifier.zig");
+pub const control_transfer_classifier = @import("control_transfer_classifier.zig");
 pub const x64_backend_diagnostics = @import("x64_backend_diagnostics.zig");
 pub const xenia_pipeline_contracts = @import("xenia_pipeline_contracts.zig");
 pub const xenia_pipeline = @import("xenia_pipeline.zig");

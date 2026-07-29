@@ -55,15 +55,26 @@ pub fn classify(context: Context) Classification {
         std.mem.indexOf(u8, context.symbol, "basic_istream") != null or
         std.mem.indexOf(u8, context.symbol, "basic_istringstream") != null or
         std.mem.indexOf(u8, context.symbol, "basic_ios") != null;
+    const streambuf_pubimbue_symbol =
+        std.mem.indexOf(u8, context.symbol, "basic_streambuf") != null and
+        std.mem.indexOf(u8, context.symbol, "pubimbue") != null;
     // Missing vtable/typeinfo evidence is meaningful only while executing an
     // object-model operation. A generic mangled C++ function may use RDI for
     // any value at all (cpuid does), so treating every __ZN symbol as an object
     // method produces confident but unrelated diagnoses.
     const cxx_object_symbol = stream_symbol or
+        streambuf_pubimbue_symbol or
         std.mem.indexOf(u8, context.symbol, "dynamic_cast") != null or
         std.mem.indexOf(u8, context.symbol, "__dynamic_cast") != null or
         std.mem.indexOf(u8, context.symbol, "vtable") != null or
         std.mem.indexOf(u8, context.symbol, "type_info") != null;
+    if (streambuf_pubimbue_symbol and near_null and std.mem.indexOf(u8, context.instruction, "call") != null) {
+        return .{
+            .class = .bad_streambuf_pointer,
+            .reason = "basic_streambuf::pubimbue loaded a null virtual target; inspect the modeled rdbuf alias and stream-subobject ownership",
+            .next_subsystem = "libcpp_stream_bridge / cxx_object_model",
+        };
+    }
     if (stream_symbol and near_null and context.rsi < 0x1000 and context.rdx_mapped) {
         return .{
             .class = .cxx_invalid_vtt,
@@ -160,6 +171,22 @@ test "stream near-null faults identify object model rather than arithmetic" {
         .stack_mapped = true,
     });
     try std.testing.expectEqual(FaultClass.cxx_object_model_null_vtable, result.class);
+}
+
+test "streambuf pubimbue near-null call identifies stream ownership rather than import thunk" {
+    const result = classify(.{
+        .instruction = "call_mem64",
+        .symbol = "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE8pubimbueB7v160006ERKNS_6localeE",
+        .address = 0x10,
+        .rdi = 0x68cbbb8,
+        .rsi = 0x1c2f8cb0,
+        .rsp = 0x7fffdd40,
+        .rbp = 0x7fffdd80,
+        .rdi_mapped = true,
+        .rsi_mapped = true,
+        .stack_mapped = true,
+    });
+    try std.testing.expectEqual(FaultClass.bad_streambuf_pointer, result.class);
 }
 
 test "basic ostream C2 fault identifies invalid hidden VTT" {
