@@ -16,6 +16,7 @@ const initialization_resolution = @import("init").initialization_engine;
 const initializer_dependency = @import("init").initializer_dependency;
 const memory_mod = @import("memory");
 const sparse_virtual_memory = memory_mod.sparse_virtual_memory;
+const memory_write_provenance = memory_mod.memory_write_provenance;
 const memory_provenance = @import("dyld").memory_provenance;
 const pointer_firewall = @import("dyld").pointer_firewall;
 const semantic_fault_classifier = @import("diagnostics").semantic_fault_classifier;
@@ -141,40 +142,52 @@ pub fn read64(self: anytype, vaddr: u64) u64 {
 
 pub fn write8(self: anytype, vaddr: u64, val: u8) void {
     if (self.sparse_memory.bytes(vaddr, 1, true)) |bytes| {
+        const mutation = captureMemoryMutation(self, vaddr, 1);
         bytes[0] = val;
+        commitMemoryMutation(self, mutation, .partial_scalar);
         return;
     }
     const off = translateGuest(self, vaddr, 1, .write) orelse return;
     if (off < self.mem.len) {
+        const mutation = captureMemoryMutation(self, vaddr, 1);
         self.initializer_memory.capture(self.mem, @intCast(off), 1);
         noteGuestWrite(self, vaddr, 1);
         self.mem[off] = val;
+        commitMemoryMutation(self, mutation, .partial_scalar);
     }
 }
 
 pub fn write16(self: anytype, vaddr: u64, val: u16) void {
     if (self.sparse_memory.bytes(vaddr, 2, true)) |bytes| {
+        const mutation = captureMemoryMutation(self, vaddr, 2);
         std.mem.writeInt(u16, bytes[0..2], val, .little);
+        commitMemoryMutation(self, mutation, .partial_scalar);
         return;
     }
     const off = translateGuest(self, vaddr, 2, .write) orelse return;
     if (off + 2 <= self.mem.len) {
+        const mutation = captureMemoryMutation(self, vaddr, 2);
         self.initializer_memory.capture(self.mem, @intCast(off), 2);
         noteGuestWrite(self, vaddr, 2);
         std.mem.writeInt(u16, self.mem[off..][0..2], val, .little);
+        commitMemoryMutation(self, mutation, .partial_scalar);
     }
 }
 
 pub fn write32(self: anytype, vaddr: u64, val: u32) void {
     if (self.sparse_memory.bytes(vaddr, 4, true)) |bytes| {
+        const mutation = captureMemoryMutation(self, vaddr, 4);
         std.mem.writeInt(u32, bytes[0..4], val, .little);
+        commitMemoryMutation(self, mutation, .partial_scalar);
         return;
     }
     const off = translateGuest(self, vaddr, 4, .write) orelse return;
     if (off + 4 <= self.mem.len) {
+        const mutation = captureMemoryMutation(self, vaddr, 4);
         self.initializer_memory.capture(self.mem, @intCast(off), 4);
         noteGuestWrite(self, vaddr, 4);
         std.mem.writeInt(u32, self.mem[off..][0..4], val, .little);
+        commitMemoryMutation(self, mutation, .partial_scalar);
     }
 }
 pub fn write64(self: anytype, vaddr: u64, val: u64) void {
@@ -377,7 +390,7 @@ fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recovery, obse
 
 pub fn logLiveVtableGuardSummary(self: anytype) void {
     machoCapturePrint(
-        "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} guard_tracked={d} memory_writes={d}; recovery requires a live allocation base and strict mapped Itanium ZTV evidence\n",
+        "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} guard_tracked={d} memory_writes={d} range_mutations={d} truncated_range_mutations={d}; recovery requires a live allocation base and strict mapped Itanium ZTV evidence\n",
         .{
             self.vtable_tracker.live_vtable_guard_checks,
             self.vtable_tracker.live_vtable_guard_recoveries,
@@ -391,6 +404,8 @@ pub fn logLiveVtableGuardSummary(self: anytype) void {
             self.vtable_tracker.heap_corruption_detections,
             self.guard_rollback.count(),
             self.memory_writes.entries.count(),
+            self.memory_writes.range_mutations,
+            self.memory_writes.truncated_range_mutations,
         },
     );
 }
@@ -637,23 +652,18 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
     const bytes = bytesForSize(size);
     if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
         recordMemoryAccess(self, addr, size, "write", val);
-        if (size == .bits64) {
-            self.memory_writes.record(
-                self.allocator,
-                addr,
-                std.mem.readInt(u64, storage[0..8], .little),
-                val,
-                self.regs.rip,
-                self.executed_steps,
-                self.active_guest_thread,
-            );
-        }
+        const mutation = captureMemoryMutation(self, addr, bytes);
         switch (size) {
             .bits8 => storage[0] = @truncate(val),
             .bits16 => std.mem.writeInt(u16, storage[0..2], @truncate(val), .little),
             .bits32 => std.mem.writeInt(u32, storage[0..4], @truncate(val), .little),
             .bits64 => std.mem.writeInt(u64, storage[0..8], val, .little),
         }
+        commitMemoryMutation(
+            self,
+            mutation,
+            if (size == .bits64 and (addr & 7) == 0) .scalar else .partial_scalar,
+        );
         recordAllocationWrite(self, addr, size, val);
         // Suspicious write: 64-bit value pointing into executable (code) segment
         // written to any heap/data memory — tree node structural corruption pattern.
@@ -690,17 +700,7 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
         return;
     };
     recordMemoryAccess(self, addr, size, "write", val);
-    if (size == .bits64) {
-        self.memory_writes.record(
-            self.allocator,
-            addr,
-            std.mem.readInt(u64, self.mem[off..][0..8], .little),
-            val,
-            self.regs.rip,
-            self.executed_steps,
-            self.active_guest_thread,
-        );
-    }
+    const mutation = captureMemoryMutation(self, addr, bytes);
     self.initializer_memory.capture(self.mem, @intCast(off), bytes);
     noteGuestWrite(self, addr, bytes);
     switch (size) {
@@ -709,6 +709,11 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
         .bits32 => std.mem.writeInt(u32, self.mem[off..][0..4], @truncate(val), .little),
         .bits64 => std.mem.writeInt(u64, self.mem[off..][0..8], val, .little),
     }
+    commitMemoryMutation(
+        self,
+        mutation,
+        if (size == .bits64 and (addr & 7) == 0) .scalar else .partial_scalar,
+    );
     recordAllocationWrite(self, addr, size, val);
     // Suspicious write: 64-bit value pointing into executable (code) segment
     // written to any heap/data memory — tree node structural corruption pattern.
@@ -737,6 +742,30 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
         }
     }
     timerQueueWatchWrite(self, addr, size, val);
+}
+
+pub fn captureMemoryMutation(
+    self: anytype,
+    address: u64,
+    length: u64,
+) memory_write_provenance.MutationCapture {
+    return self.memory_writes.captureMutation(self, address, length);
+}
+
+pub fn commitMemoryMutation(
+    self: anytype,
+    capture: memory_write_provenance.MutationCapture,
+    kind: memory_write_provenance.WriteKind,
+) void {
+    self.memory_writes.commitMutation(
+        self.allocator,
+        self,
+        capture,
+        self.regs.rip,
+        self.executed_steps,
+        self.active_guest_thread,
+        kind,
+    );
 }
 
 pub fn deferInitializerRuntimeDependency(self: anytype, address: u64, size: Size) bool {
@@ -1067,11 +1096,12 @@ pub fn dumpNearNullProducerSlot(self: anytype) void {
         if (self.memory_writes.lookup(access.address)) |writer| {
             const symbol = self.metadata.nearestSymbol(writer.instruction_address);
             machoCapturePrint(
-                "macho-processor: near-null producer last writer: slot=0x{x} previous=0x{x} value=0x{x} writer=0x{x} {s}+0x{x} step={d} age_steps={d} thread=0x{x}\n",
+                "macho-processor: near-null producer last writer: slot=0x{x} previous=0x{x} value=0x{x} kind={s} writer=0x{x} {s}+0x{x} step={d} age_steps={d} thread=0x{x}\n",
                 .{
                     writer.address,
                     writer.previous_value,
                     writer.value,
+                    @tagName(writer.kind),
                     writer.instruction_address,
                     if (symbol) |resolved| resolved.name else "<unknown>",
                     if (symbol) |resolved| resolved.offset else 0,
@@ -1285,8 +1315,8 @@ pub fn guestHeapContains(self: anytype, address: u64) bool {
     return self.memory_forwarder.allocationSize(address) != null;
 }
 
-pub fn forgetMemoryWriteProvenance(self: anytype, address: u64) void {
-    self.memory_writes.forget(address);
+pub fn forgetMemoryWriteProvenance(self: anytype, address: u64, length: u64) void {
+    self.memory_writes.forgetRange(self.allocator, address, length);
     // Allocation start/reuse is a hard lifecycle boundary.  Retire any
     // trusted vptr belonging to the former occupant before the new
     // allocation becomes visible.

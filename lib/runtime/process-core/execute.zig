@@ -1308,6 +1308,15 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             @memset(&self.ymm_hi[d.xmm_dst], 0);
             std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], value, .little);
         },
+        .vmovd_reg32_xmm, .vmovd_mem32_xmm => {
+            const value = std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little);
+            if (d.op == .vmovd_reg32_xmm) {
+                // A 32-bit GPR destination zeroes the upper 32 bits in x86-64.
+                self.setReg(d.dst_reg, .bits32, value);
+            } else {
+                self.writeMemVal(d.addr, .bits32, value);
+            }
+        },
         .vmovq_xmm_reg64, .vmovq_xmm_mem64 => {
             const value = if (d.op == .vmovq_xmm_reg64)
                 self.regVal(d.src_reg, .bits64)
@@ -1520,6 +1529,18 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .vaddpd, .vmulpd, .vsubpd, .vdivpd => {
             self.executeVexPackedF64(d, vexArithmeticForOp(d.op));
+        },
+        .vsqrtss => {
+            self.executeVexSqrtScalarF32(d);
+        },
+        .vsqrtsd => {
+            self.executeVexSqrtScalarF64(d);
+        },
+        .vsqrtps => {
+            self.executeVexSqrtPackedF32(d);
+        },
+        .vsqrtpd => {
+            self.executeVexSqrtPackedF64(d);
         },
         .vucomiss => {
             const lhs: f32 = @bitCast(std.mem.readInt(u32, self.xmm[d.xmm_src][0..4], .little));

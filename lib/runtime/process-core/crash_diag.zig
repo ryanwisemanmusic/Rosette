@@ -18,6 +18,7 @@ const ControlTransferContext = types.ControlTransferContext;
 const decoder = @import("macho_core").decoder;
 const decodeInsn = decoder.decodeInsn;
 const scheduler = @import("scheduler");
+const control_transfer_classifier = @import("diagnostics").control_transfer_classifier;
 
 pub const NearNullBaseTransition = struct {
     object_address: u64,
@@ -303,6 +304,45 @@ pub fn terminateForInvalidControlTransfer(self: anytype, context: ControlTransfe
             break;
         }
     }
+    const object_mapped = self.guestMemoryConst(self.regs.rdi, @sizeOf(u64)) != null;
+    const object_vptr = if (object_mapped) self.read64(self.regs.rdi) else 0;
+    const operand_region = if (context.operand_address != 0)
+        self.memory_regions.find(context.operand_address, @sizeOf(u64))
+    else
+        null;
+    const vptr_region = if (object_vptr != 0)
+        self.memory_regions.find(object_vptr, 1)
+    else
+        null;
+    const classification = control_transfer_classifier.classify(.{
+        .kind = failure.kind,
+        .caller_symbol = failure.caller_symbol,
+        .operand_address = failure.operand_address,
+        .operand_value = failure.operand_value,
+        .operand_mapped = failure.operand_mapped,
+        .operand_region_synthetic = if (operand_region) |region| region.isSynthetic() else false,
+        .operand_region_owner = if (operand_region) |region| region.owner else "",
+        .target_address = failure.target_address,
+        .target_mapped = failure.target_mapped,
+        .target_executable = failure.target_executable,
+        .candidate_import = failure.candidate_import,
+        .object_address = self.regs.rdi,
+        .object_mapped = object_mapped,
+        .object_vptr = object_vptr,
+        .vptr_region_synthetic = if (vptr_region) |region| region.isSynthetic() else false,
+        .vptr_region_owner = if (vptr_region) |region| region.owner else "",
+    });
+    failure.fault_class = @tagName(classification.class);
+    failure.fault_owner = control_transfer_classifier.ownerLabel(classification.owner);
+    failure.fault_evidence = classification.evidence;
+    failure.next_subsystem = classification.next_subsystem;
+    failure.object_address = self.regs.rdi;
+    failure.object_vptr = object_vptr;
+    failure.virtual_slot_offset = classification.virtual_slot_offset;
+    failure.vptr_region_kind = if (vptr_region) |region| @tagName(region.kind) else "";
+    failure.vptr_region_owner = if (vptr_region) |region| region.owner else "";
+    failure.vptr_region_synthetic = if (vptr_region) |region| region.isSynthetic() else false;
+    failure.target_looks_ascii = classification.target_looks_ascii;
     self.pending_control_transfer = null;
     self.terminal_control_transfer = failure;
     machoCapturePrint(
@@ -331,6 +371,22 @@ pub fn terminateForInvalidControlTransfer(self: anytype, context: ControlTransfe
             },
         );
     }
+    machoCapturePrint(
+        "macho-processor: control transfer attribution: owner={s} class={s} object=0x{x} vptr=0x{x} slot_offset=0x{x} vptr_region={s}/{s} synthetic={} target_ascii={} evidence={s} next={s}\n",
+        .{
+            failure.fault_owner,
+            failure.fault_class,
+            failure.object_address,
+            failure.object_vptr,
+            failure.virtual_slot_offset,
+            if (failure.vptr_region_kind.len != 0) failure.vptr_region_kind else "<untracked>",
+            if (failure.vptr_region_owner.len != 0) failure.vptr_region_owner else "<unknown>",
+            failure.vptr_region_synthetic,
+            failure.target_looks_ascii,
+            failure.fault_evidence,
+            failure.next_subsystem,
+        },
+    );
     logCrashDiagnostics(self, context);
     self.faulted = true;
     self.exit_code = 127;

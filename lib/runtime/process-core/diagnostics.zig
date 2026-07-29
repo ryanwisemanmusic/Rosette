@@ -256,32 +256,67 @@ pub fn logExitDiagnostics(self: anytype) void {
         const terminal_symbol = self.metadata.nearestSymbol(failure.instruction_address);
         const symbol_name = if (terminal_symbol) |symbol| symbol.name else "";
         const target_policy = self.pointer_firewall.policyAt(failure.target_address);
-        const classification = semantic_fault_classifier.classify(.{
-            .instruction = failure.kind,
-            .symbol = symbol_name,
-            .address = failure.target_address,
-            .rdi = self.regs.rdi,
-            .rsi = self.regs.rsi,
-            .rdx = self.regs.rdx,
-            .rsp = self.regs.rsp,
-            .rbp = self.regs.rbp,
-            .rdi_mapped = self.guestMemoryConst(self.regs.rdi, 1) != null,
-            .rsi_mapped = self.guestMemoryConst(self.regs.rsi, 1) != null,
-            .rdx_mapped = self.guestMemoryConst(self.regs.rdx, 1) != null,
-            .stack_mapped = self.guestMemoryConst(self.regs.rsp, 1) != null,
-            .pointer_opaque = if (target_policy) |policy| policy.kind == .opaque_identity and !policy.may_execute else false,
-            .pointer_owner = if (target_policy) |policy| policy.owner else "",
-            .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
-        });
-        report.semantic_fault = .{
-            .class = @tagName(classification.class),
-            .reason = classification.reason,
-            .next_subsystem = classification.next_subsystem,
-            .current_symbol = symbol_name,
-            .instruction = failure.kind,
-            .effective_address = failure.target_address,
-        };
-        if (self.memory_regions.find(failure.target_address, 1)) |region| {
+        if (failure.fault_class.len != 0) {
+            report.semantic_fault = .{
+                .class = failure.fault_class,
+                .reason = failure.fault_evidence,
+                .next_subsystem = failure.next_subsystem,
+                .current_symbol = symbol_name,
+                .instruction = failure.kind,
+                .effective_address = failure.target_address,
+            };
+            if (std.mem.eql(u8, failure.fault_owner, "translated guest program")) {
+                report.attribution = .{
+                    .owner = .guest_application,
+                    .authority = .diagnostic_only,
+                    .evidence = failure.fault_evidence,
+                    .next_action = failure.next_subsystem,
+                };
+            } else if (std.mem.eql(u8, failure.fault_owner, "Rosette runtime") or
+                std.mem.eql(u8, failure.fault_owner, "Rosette dyld/import bridge"))
+            {
+                report.attribution = .{
+                    .owner = .rosette_runtime,
+                    .authority = .diagnostic_only,
+                    .evidence = failure.fault_evidence,
+                    .next_action = failure.next_subsystem,
+                };
+            }
+        } else {
+            const classification = semantic_fault_classifier.classify(.{
+                .instruction = failure.kind,
+                .symbol = symbol_name,
+                .address = failure.target_address,
+                .rdi = self.regs.rdi,
+                .rsi = self.regs.rsi,
+                .rdx = self.regs.rdx,
+                .rsp = self.regs.rsp,
+                .rbp = self.regs.rbp,
+                .rdi_mapped = self.guestMemoryConst(self.regs.rdi, 1) != null,
+                .rsi_mapped = self.guestMemoryConst(self.regs.rsi, 1) != null,
+                .rdx_mapped = self.guestMemoryConst(self.regs.rdx, 1) != null,
+                .stack_mapped = self.guestMemoryConst(self.regs.rsp, 1) != null,
+                .pointer_opaque = if (target_policy) |policy| policy.kind == .opaque_identity and !policy.may_execute else false,
+                .pointer_owner = if (target_policy) |policy| policy.owner else "",
+                .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
+            });
+            report.semantic_fault = .{
+                .class = @tagName(classification.class),
+                .reason = classification.reason,
+                .next_subsystem = classification.next_subsystem,
+                .current_symbol = symbol_name,
+                .instruction = failure.kind,
+                .effective_address = failure.target_address,
+            };
+        }
+        var transfer_region = self.memory_regions.find(failure.target_address, 1);
+        if (transfer_region == null and failure.operand_address != 0) {
+            transfer_region = self.memory_regions.find(failure.operand_address, @sizeOf(u64));
+        }
+        if (transfer_region == null and failure.object_vptr != 0) {
+            transfer_region = self.memory_regions.find(failure.object_vptr, 1);
+        }
+        if (transfer_region) |region| {
             report.semantic_fault.?.region_kind = @tagName(region.kind);
             report.semantic_fault.?.region_owner = region.owner;
             report.semantic_fault.?.region_start = region.start;

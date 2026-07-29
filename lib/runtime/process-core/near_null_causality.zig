@@ -17,6 +17,8 @@ const decodeInsn = macho_core.decoder.decodeInsn;
 
 const Transition = struct {
     instruction_address: u64,
+    trace_ordinal: usize,
+    register: RegId,
     before: u64,
     after: u64,
     retained_distance: usize,
@@ -113,7 +115,11 @@ fn dumpRegisterChain(
     var producer: ?Producer = null;
     var producer_before: u64 = 0;
 
-    while (cursor != 0 and chain_depth < 6) {
+    // Container iterators commonly copy a derived address through six or more
+    // helpers before the terminal access. Keep this bounded, but deep enough
+    // to reach the backing-slot load rather than stopping at values such as
+    // 0x40 that were merely added to a null block pointer.
+    while (cursor != 0 and chain_depth < 12) {
         const transition = findPreviousTransition(self, register, after, &cursor) orelse break;
         const symbol = self.metadata.nearestSymbol(transition.instruction_address);
         machoCapturePrint(
@@ -145,7 +151,13 @@ fn dumpRegisterChain(
     }
 
     if (producer) |exact_producer| {
-        dumpRootClassification(self, exact_producer, producer_before);
+        dumpRootClassification(
+            self,
+            exact_producer,
+            producer_before,
+            role,
+            terminal_value,
+        );
     }
 }
 
@@ -190,7 +202,7 @@ fn dumpZeroThisRoot(self: anytype) bool {
     };
 
     dumpProducer(self, producer);
-    dumpRootClassification(self, producer, transition.before);
+    dumpRootClassification(self, producer, transition.before, "this", 0);
     return true;
 }
 
@@ -244,6 +256,8 @@ fn findPreviousTransition(
         if (before != after) {
             return .{
                 .instruction_address = entry.rip,
+                .trace_ordinal = cursor.*,
+                .register = register,
                 .before = before,
                 .after = after,
                 .retained_distance = retained_distance,
@@ -281,7 +295,33 @@ fn findExactProducer(self: anytype, transition: Transition) ?Producer {
             .instruction_address = access.instruction_address,
         };
     }
-    return null;
+
+    // The memory-access ring is intentionally shorter than the instruction
+    // ring. Reconstruct the effective address from the exact historical
+    // instruction snapshot when a helper-heavy libc++ path has already pushed
+    // the read out of the memory ring.
+    const trace_count: usize = if (self.trace_filled)
+        self.trace_entries.len
+    else
+        self.trace_index;
+    if (transition.trace_ordinal >= trace_count) return null;
+    const entry = self.trace_entries[
+        chronologicalTraceIndex(
+            self,
+            trace_count,
+            transition.trace_ordinal,
+        )
+    ];
+    const decoded = self.decodeTraceInstruction(entry) orelse return null;
+    if (decoded.op != .mov_reg64_mem64 or
+        decoded.dst_reg != transition.register)
+    {
+        return null;
+    }
+    return .{
+        .slot = decoded.addr,
+        .instruction_address = transition.instruction_address,
+    };
 }
 
 fn dumpProducer(self: anytype, producer: Producer) void {
@@ -314,11 +354,12 @@ fn dumpProducer(self: anytype, producer: Producer) void {
     if (self.memory_writes.lookup(producer.slot)) |writer| {
         const writer_symbol = self.metadata.nearestSymbol(writer.instruction_address);
         machoCapturePrint(
-            "macho-processor: near-null causality: producer_last_writer slot=0x{x} previous=0x{x} value=0x{x} writer=0x{x} {s}+0x{x} step={d} age_steps={d} thread=0x{x}\n",
+            "macho-processor: near-null causality: producer_last_writer slot=0x{x} previous=0x{x} value=0x{x} kind={s} writer=0x{x} {s}+0x{x} step={d} age_steps={d} thread=0x{x}\n",
             .{
                 writer.address,
                 writer.previous_value,
                 writer.value,
+                @tagName(writer.kind),
                 writer.instruction_address,
                 if (writer_symbol) |resolved| resolved.name else "<unknown>",
                 if (writer_symbol) |resolved| resolved.offset else 0,
@@ -327,6 +368,31 @@ fn dumpProducer(self: anytype, producer: Producer) void {
                 writer.thread,
             },
         );
+        if (writer.value != 0) {
+            machoCapturePrint(
+                "macho-processor: near-null causality: provenance divergence slot=0x{x} tracked_value=0x{x} observed_value=0x0; a write bypassed retained scalar provenance (partial store, bulk fill/copy, or host-side mutation). Range-mutation tracking is required before attributing this to the recorded writer\n",
+                .{ producer.slot, writer.value },
+            );
+        }
+        if (self.memory_writes.lookupPrevious(producer.slot)) |previous_writer| {
+            const previous_symbol =
+                self.metadata.nearestSymbol(previous_writer.instruction_address);
+            machoCapturePrint(
+                "macho-processor: near-null causality: producer_prior_writer slot=0x{x} previous=0x{x} value=0x{x} kind={s} writer=0x{x} {s}+0x{x} step={d} age_steps={d} thread=0x{x}; retained_before_latest_clear_or_replacement=true\n",
+                .{
+                    previous_writer.address,
+                    previous_writer.previous_value,
+                    previous_writer.value,
+                    @tagName(previous_writer.kind),
+                    previous_writer.instruction_address,
+                    if (previous_symbol) |resolved| resolved.name else "<unknown>",
+                    if (previous_symbol) |resolved| resolved.offset else 0,
+                    previous_writer.step,
+                    self.executed_steps -| previous_writer.step,
+                    previous_writer.thread,
+                },
+            );
+        }
     } else {
         machoCapturePrint(
             "macho-processor: near-null causality: producer_last_writer slot=0x{x} absent; no retained pointer-bearing initialization or clear reached this member\n",
@@ -335,7 +401,39 @@ fn dumpProducer(self: anytype, producer: Producer) void {
     }
 }
 
-fn dumpRootClassification(self: anytype, producer: Producer, previous_register_value: u64) void {
+fn dumpRootClassification(
+    self: anytype,
+    producer: Producer,
+    previous_register_value: u64,
+    role: []const u8,
+    terminal_register_value: u64,
+) void {
+    if (!std.mem.eql(u8, role, "this") and terminal_register_value < 0x1000) {
+        if (self.memory_forwarder.containingAllocation(producer.slot)) |allocation| {
+            machoCapturePrint(
+                "macho-processor: near-null ROOT CAUSE: class=zero_container_backing_pointer_to_derived_near_null allocation=0x{x} member_offset=0x{x} source_slot=0x{x} source_value=0x0 derived_{s}=0x{x} displaced_prior_register=0x{x}; inspect the source slot's clear/free/reuse history, not the terminal stdlib helper\n",
+                .{
+                    allocation.base,
+                    allocation.offset,
+                    producer.slot,
+                    role,
+                    terminal_register_value,
+                    previous_register_value,
+                },
+            );
+            return;
+        }
+        machoCapturePrint(
+            "macho-processor: near-null ROOT CAUSE: class=zero_backing_pointer_to_derived_near_null source_slot=0x{x} source_value=0x0 derived_{s}=0x{x} displaced_prior_register=0x{x}; inspect the source slot's clear/free/reuse history, not the terminal stdlib helper\n",
+            .{
+                producer.slot,
+                role,
+                terminal_register_value,
+                previous_register_value,
+            },
+        );
+        return;
+    }
     if (self.memory_forwarder.containingAllocation(producer.slot)) |allocation| {
         machoCapturePrint(
             "macho-processor: near-null ROOT CAUSE: class=null_object_member_to_invalid_this object=0x{x} member_offset=0x{x} member_slot=0x{x} member_value=0x0 displaced_prior_register=0x{x}; inspect object/base-constructor initialization or the call that supplied this dependency, not the terminal container access\n",
