@@ -22,6 +22,8 @@ pub const Summary = struct {
     reallocations: u64,
     frees: u64,
     reused_blocks: u64,
+    overlap_rejections: u64,
+    invalid_frees: u64,
     live_allocations: usize,
 };
 
@@ -33,6 +35,8 @@ pub const Manager = struct {
     reallocation_count: u64 = 0,
     free_count: u64 = 0,
     reused_block_count: u64 = 0,
+    overlap_rejection_count: u64 = 0,
+    invalid_free_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{
@@ -51,10 +55,23 @@ pub const Manager = struct {
         const size = @max(requested_size, 1);
         const alignment = normalizeAlignment(requested_alignment) orelse return null;
         const address = self.reuseBlock(size, alignment) orelse state.guestAlloc(size, alignment) orelse return null;
+        // Never let a stale free-list entry or a regressed backing allocator
+        // replace metadata for a still-live object. Such replacement used to
+        // turn later clears into apparently inexplicable near-null
+        // "collisions".
+        if (self.findLiveOverlap(address, size) != null) {
+            self.overlap_rejection_count +|= 1;
+            return null;
+        }
         // A recycled allocation address must not inherit pointer provenance
         // from the object that previously occupied it.
-        state.forgetMemoryWriteProvenance(address);
-        self.allocations.put(address, .{ .size = size, .alignment = alignment }) catch return null;
+        state.forgetMemoryWriteProvenance(address, size);
+        const result = self.allocations.getOrPut(address) catch return null;
+        if (result.found_existing) {
+            self.overlap_rejection_count +|= 1;
+            return null;
+        }
+        result.value_ptr.* = .{ .size = size, .alignment = alignment };
         self.allocation_count +|= 1;
         return address;
     }
@@ -95,7 +112,10 @@ pub const Manager = struct {
 
     pub fn release(self: *Manager, address: u64) void {
         if (address == 0) return;
-        const removed = self.allocations.fetchRemove(address) orelse return;
+        const removed = self.allocations.fetchRemove(address) orelse {
+            self.invalid_free_count +|= 1;
+            return;
+        };
         self.addFreeBlock(.{ .address = address, .size = removed.value.size });
         self.free_count +|= 1;
     }
@@ -131,6 +151,8 @@ pub const Manager = struct {
             .reallocations = self.reallocation_count,
             .frees = self.free_count,
             .reused_blocks = self.reused_block_count,
+            .overlap_rejections = self.overlap_rejection_count,
+            .invalid_frees = self.invalid_free_count,
             .live_allocations = self.allocations.count(),
         };
     }
@@ -138,18 +160,51 @@ pub const Manager = struct {
     pub fn logSummary(self: *const Manager) void {
         const totals = self.summary();
         machoCapturePrint(
-            "macho-processor: memory forwarding: alloc={d} realloc={d} free={d} reused={d} live={d}\n",
-            .{ totals.allocations, totals.reallocations, totals.frees, totals.reused_blocks, totals.live_allocations },
+            "macho-processor: memory forwarding: alloc={d} realloc={d} free={d} reused={d} live={d} collision_guard(overlap_rejections/invalid_frees)={d}/{d}\n",
+            .{
+                totals.allocations,
+                totals.reallocations,
+                totals.frees,
+                totals.reused_blocks,
+                totals.live_allocations,
+                totals.overlap_rejections,
+                totals.invalid_frees,
+            },
         );
     }
 
     fn reuseBlock(self: *Manager, size: u64, alignment: u64) ?u64 {
-        for (self.free_blocks.items, 0..) |block, index| {
-            const aligned = alignForward(block.address, alignment) orelse continue;
+        var index: usize = 0;
+        while (index < self.free_blocks.items.len) {
+            const block = self.free_blocks.items[index];
+            const aligned = alignForward(block.address, alignment) orelse {
+                _ = self.free_blocks.swapRemove(index);
+                self.overlap_rejection_count +|= 1;
+                continue;
+            };
             const prefix_size = aligned - block.address;
-            if (prefix_size > block.size or size > block.size - prefix_size) continue;
-            const block_end = block.address + block.size;
-            const allocation_end = aligned + size;
+            if (prefix_size > block.size or size > block.size - prefix_size) {
+                index += 1;
+                continue;
+            }
+            const block_end = std.math.add(u64, block.address, block.size) catch {
+                _ = self.free_blocks.swapRemove(index);
+                self.overlap_rejection_count +|= 1;
+                continue;
+            };
+            const allocation_end = std.math.add(u64, aligned, size) catch {
+                _ = self.free_blocks.swapRemove(index);
+                self.overlap_rejection_count +|= 1;
+                continue;
+            };
+            if (self.findLiveOverlap(aligned, size) != null) {
+                // Quarantine the whole stale block. Splitting it would retain
+                // the same contradictory lifetime information and could
+                // produce another collision later.
+                _ = self.free_blocks.swapRemove(index);
+                self.overlap_rejection_count +|= 1;
+                continue;
+            }
             _ = self.free_blocks.swapRemove(index);
             if (prefix_size != 0) self.addFreeBlock(.{ .address = block.address, .size = prefix_size });
             if (allocation_end < block_end) {
@@ -163,7 +218,49 @@ pub const Manager = struct {
 
     fn addFreeBlock(self: *Manager, block: FreeBlock) void {
         if (block.size == 0) return;
-        self.free_blocks.append(self.allocator, block) catch {};
+        var merged = block;
+        var index: usize = 0;
+        while (index < self.free_blocks.items.len) {
+            const existing = self.free_blocks.items[index];
+            const merged_end = std.math.add(u64, merged.address, merged.size) catch return;
+            const existing_end =
+                std.math.add(u64, existing.address, existing.size) catch {
+                    _ = self.free_blocks.swapRemove(index);
+                    self.overlap_rejection_count +|= 1;
+                    continue;
+                };
+            if (merged_end < existing.address or existing_end < merged.address) {
+                index += 1;
+                continue;
+            }
+            const start = @min(merged.address, existing.address);
+            const end = @max(merged_end, existing_end);
+            merged = .{ .address = start, .size = end - start };
+            _ = self.free_blocks.swapRemove(index);
+        }
+        self.free_blocks.append(self.allocator, merged) catch {};
+    }
+
+    fn findLiveOverlap(self: *const Manager, address: u64, size: u64) ?ContainingAllocation {
+        const end = std.math.add(u64, address, size) catch return .{
+            .base = address,
+            .size = size,
+            .offset = 0,
+        };
+        var iterator = self.allocations.iterator();
+        while (iterator.next()) |entry| {
+            const live_base = entry.key_ptr.*;
+            const live_size = entry.value_ptr.size;
+            const live_end = std.math.add(u64, live_base, live_size) catch continue;
+            if (address < live_end and live_base < end) {
+                return .{
+                    .base = live_base,
+                    .size = live_size,
+                    .offset = if (address >= live_base) address - live_base else 0,
+                };
+            }
+        }
+        return null;
     }
 };
 
@@ -199,7 +296,7 @@ const TestState = struct {
         return self.memory[@intCast(address)..@intCast(address + size)];
     }
 
-    pub fn forgetMemoryWriteProvenance(_: *TestState, _: u64) void {}
+    pub fn forgetMemoryWriteProvenance(_: *TestState, _: u64, _: u64) void {}
 };
 
 test "reallocate preserves guest bytes" {
@@ -233,4 +330,37 @@ test "calloc rejects overflow and zeroes storage" {
     try std.testing.expect(manager.allocateZeroed(&state, std.math.maxInt(u64), 2) == null);
     const address = manager.allocateZeroed(&state, 4, 8).?;
     for (state.guestMemoryConst(address, 32).?) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "stale free blocks cannot overlap live allocations" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    var state = TestState{};
+    const live = manager.allocate(&state, 64, 16).?;
+
+    // Simulate contradictory lifetime metadata produced by an upstream
+    // double-retirement bug. The guard must quarantine it, not hand the live
+    // range to a second allocation.
+    try manager.free_blocks.append(std.testing.allocator, .{
+        .address = live,
+        .size = 64,
+    });
+    const next = manager.allocate(&state, 32, 16).?;
+    try std.testing.expect(next != live);
+    try std.testing.expectEqual(@as(u64, 1), manager.summary().overlap_rejections);
+}
+
+test "adjacent free blocks coalesce and invalid frees are counted" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    var state = TestState{};
+    const first = manager.allocate(&state, 32, 16).?;
+    const second = manager.allocate(&state, 32, 16).?;
+    manager.release(first);
+    manager.release(second);
+    try std.testing.expectEqual(@as(usize, 1), manager.free_blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 64), manager.free_blocks.items[0].size);
+
+    manager.release(first);
+    try std.testing.expectEqual(@as(u64, 1), manager.summary().invalid_frees);
 }
