@@ -74,9 +74,12 @@ pub const VexPrefix = struct {
     has_f2_prefix: bool = false,
     has_f3_prefix: bool = false,
     w: bool = false,
-    r: bool = true,
-    x: bool = true,
-    b: bool = true,
+    r: bool = false,
+    // Two-byte VEX has no X/B fields, so both implicit extension bits are
+    // clear. Three-byte VEX decoding overwrites them from the inverted prefix
+    // fields below.
+    x: bool = false,
+    b: bool = false,
     l: bool = false,
     vvvv: u4 = 0,
     m: u5 = 1,
@@ -873,6 +876,8 @@ pub const Op = enum(u16) {
     movaps_mem_xmm,
     vmovd_xmm_reg32,
     vmovd_xmm_mem32,
+    vmovd_reg32_xmm,
+    vmovd_mem32_xmm,
     vmovq_xmm_reg64,
     vmovq_xmm_mem64,
     vmovq_reg64_xmm,
@@ -1852,7 +1857,19 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
         },
         0x6E => {
             // VMOVD (VEX.66.0F 6E) / VMOVQ (VEX.66.REX.W 0F 6E)
-            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vmovd_xmm_reg32 else return null, modrm_decoded);
+            if (!vex.has_66_prefix or vex.l or vex.vvvv != 0) return null;
+            return .{
+                .op = if (vex.w)
+                    (if (modrm_decoded.is_reg_form) .vmovq_xmm_reg64 else .vmovq_xmm_mem64)
+                else
+                    (if (modrm_decoded.is_reg_form) .vmovd_xmm_reg32 else .vmovd_xmm_mem32),
+                .size = if (vex.w) .bits64 else .bits32,
+                .len = @intCast(pos),
+                .src_reg = @enumFromInt(modrm_decoded.src_xmm),
+                .xmm_dst = modrm_decoded.dst_xmm,
+                .is_reg_form = modrm_decoded.is_reg_form,
+                .addr = modrm_decoded.addr,
+            };
         },
         0x6F => {
             // VMOVDQA (VEX.66.0F 6F) / VMOVDQU (VEX.F3.0F 6F)
@@ -1911,6 +1928,24 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
             // VHSUBPS (VEX.0F 7D) / VHSUBPD (VEX.66.0F 7D)
             const op_sel = arith(vex, .{ .vhsubps, .vhsubps, .vhsubpd, .vhsubps });
             return decodeVexReturn(vex, pos, op_sel, modrm_decoded);
+        },
+        0x7E => {
+            // VMOVD (VEX.128.66.0F 7E) / VMOVQ (VEX.128.66.W1.0F 7E).
+            // ModRM.reg is the XMM source; ModRM.r/m is the GPR or memory
+            // destination, the reverse operand direction from opcode 6E.
+            if (!vex.has_66_prefix or vex.l or vex.vvvv != 0) return null;
+            return .{
+                .op = if (vex.w)
+                    (if (modrm_decoded.is_reg_form) .vmovq_reg64_xmm else .vmovq_mem64_xmm)
+                else
+                    (if (modrm_decoded.is_reg_form) .vmovd_reg32_xmm else .vmovd_mem32_xmm),
+                .size = if (vex.w) .bits64 else .bits32,
+                .len = @intCast(pos),
+                .dst_reg = @enumFromInt(modrm_decoded.src_xmm),
+                .xmm_src = modrm_decoded.dst_xmm,
+                .is_reg_form = modrm_decoded.is_reg_form,
+                .addr = modrm_decoded.addr,
+            };
         },
         0x7F => {
             // VMOVDQA (VEX.66.0F 7F) / VMOVDQU (VEX.F3.0F 7F) — store forms
@@ -2331,6 +2366,28 @@ test "shared MOV decoder covers SIB displacement and immediate forms" {
     try std.testing.expectEqual(Segment.fs, fs_load.segment);
     const stack_load = decodeMovForTest(&[_]u8{ 0x48, 0x8B, 0x45, 0xF8 }) orelse return error.ExpectedMov;
     try std.testing.expectEqual(Segment.ss, stack_load.segment);
+}
+
+test "shared VEX decoder handles both VMOVD transfer directions" {
+    const to_gpr = decodeVexInstruction(&[_]u8{ 0xC5, 0xF9, 0x7E, 0xC0 }) orelse
+        return error.ExpectedVmovd;
+    try std.testing.expectEqual(Op.vmovd_reg32_xmm, to_gpr.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, to_gpr.dst_reg);
+    try std.testing.expectEqual(@as(u8, 0), to_gpr.xmm_src);
+    try std.testing.expectEqual(OperandSize.bits32, to_gpr.size);
+    try std.testing.expectEqual(@as(u8, 4), to_gpr.len);
+
+    const to_xmm = decodeVexInstruction(&[_]u8{ 0xC5, 0xF9, 0x6E, 0xC8 }) orelse
+        return error.ExpectedVmovd;
+    try std.testing.expectEqual(Op.vmovd_xmm_reg32, to_xmm.op);
+    try std.testing.expectEqual(@as(u8, 1), to_xmm.xmm_dst);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, to_xmm.src_reg);
+
+    const to_memory = decodeVexInstruction(&[_]u8{ 0xC5, 0xF9, 0x7E, 0x09 }) orelse
+        return error.ExpectedVmovd;
+    try std.testing.expectEqual(Op.vmovd_mem32_xmm, to_memory.op);
+    try std.testing.expectEqual(@as(u8, 1), to_memory.xmm_src);
+    try std.testing.expect(!to_memory.is_reg_form);
 }
 
 test "shared MOV decoder preserves high-byte versus REX low-byte registers" {
