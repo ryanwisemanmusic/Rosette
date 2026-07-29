@@ -226,6 +226,9 @@ pub const Forwarder = struct {
     vulkan_images_acquired: u64 = 0,
     vulkan_queue_submits: u64 = 0,
     vulkan_presents: u64 = 0,
+    vulkan_device_void_calls: u64 = 0,
+    vulkan_modeled_command_calls: u64 = 0,
+    vulkan_surface_capability_queries: u64 = 0,
     vulkan_memory_allocations: u64 = 0,
     vulkan_memory_maps: u64 = 0,
     vulkan_presenter_bind_attempts: u64 = 0,
@@ -353,7 +356,19 @@ pub const Forwarder = struct {
                 .get_device_queue => state.regs.rax = self.writeDeviceQueue(state, state.regs.rcx, "vkGetDeviceQueue"),
                 .get_device_queue2 => state.regs.rax = self.writeDeviceQueue(state, state.regs.rdx, "vkGetDeviceQueue2"),
                 .create_metal_surface => state.regs.rax = self.createMetalSurface(state, entry.library_token, state.regs.rdi, state.regs.rsi, state.regs.rcx),
-                .get_surface_capabilities => state.regs.rax = writeSurfaceCapabilities(state, state.regs.rdx),
+                .get_surface_capabilities => {
+                    self.vulkan_surface_capability_queries +|= 1;
+                    state.regs.rax = writeSurfaceCapabilities(state, state.regs.rdx);
+                    if (self.vulkan_surface_capability_queries == 1 and state.regs.rax == 0) {
+                        const State = @typeInfo(@TypeOf(state)).pointer.child;
+                        const width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 0;
+                        const height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 0;
+                        machoCapturePrint(
+                            "macho-processor: Vulkan surface capabilities: native_extent={d}x{d} min_extent=1x1 max_extent=16384x16384 image_count=2..3 usage=0x13\n",
+                            .{ width, height },
+                        );
+                    }
+                },
                 .get_surface_formats => state.regs.rax = enumerateSurfaceFormats(state),
                 .get_surface_present_modes => state.regs.rax = enumerateSurfacePresentModes(state),
                 .get_surface_support => state.regs.rax = writeBoolResult(state, state.regs.rcx, true),
@@ -381,7 +396,19 @@ pub const Forwarder = struct {
                 .create_graphics_pipelines => state.regs.rax = self.createMultipleVulkanObjects(state, state.regs.rdx, state.regs.r9, entry.name[0..entry.name_length]),
                 .destroy_device_object => state.regs.rax = 0,
                 .device_success => state.regs.rax = 0,
-                .device_void => state.regs.rax = 0,
+                .device_void => {
+                    self.vulkan_device_void_calls +|= 1;
+                    if (std.mem.startsWith(u8, entry.name[0..entry.name_length], "vkCmd")) {
+                        self.vulkan_modeled_command_calls +|= 1;
+                        if (self.vulkan_modeled_command_calls == 1) {
+                            machoCapturePrint(
+                                "macho-processor: Vulkan forwarding boundary: first modeled command={s}; Metal surface is native, but device/command/swapchain submission remains synthetic\n",
+                                .{entry.name[0..entry.name_length]},
+                            );
+                        }
+                    }
+                    state.regs.rax = 0;
+                },
                 // A non-null lookup remains useful for capability discovery,
                 // but calling an untyped ARM64 function through x86 registers
                 // is unsafe. Keep it contained until its Vulkan ABI signature
@@ -587,10 +614,10 @@ pub const Forwarder = struct {
         const info = state.guestMemoryConst(create_info, 32);
         const s_type = if (info != null) state.read32(create_info) else 0;
         const layer = if (info != null) state.read64(create_info + 24) else 0;
-        if (state.active_gtk_idle_source == 0) self.vulkan_presenter_off_ui_calls +|= 1;
+        if (state.active_idle_source == 0) self.vulkan_presenter_off_ui_calls +|= 1;
         machoCapturePrint(
             "macho-processor: Vulkan presenter bind: stage=metal_surface_requested step={d} thread=0x{x} gtk_idle_source={d} instance=0x{x} create_info=0x{x} s_type={d} layer=0x{x} output=0x{x}\n",
-            .{ state.executed_steps, state.active_guest_thread, state.active_gtk_idle_source, instance, create_info, s_type, layer, output },
+            .{ state.executed_steps, state.active_guest_thread, state.active_idle_source, instance, create_info, s_type, layer, output },
         );
         const State = @typeInfo(@TypeOf(state)).pointer.child;
         const layer_valid = if (info == null or layer == 0)
@@ -628,7 +655,7 @@ pub const Forwarder = struct {
             if (self.vulkan_metal_surfaces_created == 1) {
                 machoCapturePrint(
                     "macho-processor: Vulkan milestone: metal_surface_created surface=0x{x} layer=0x{x} output=0x{x} gtk_idle_source={d}\n",
-                    .{ VK_SYNTHETIC_SURFACE, layer, output, state.active_gtk_idle_source },
+                    .{ VK_SYNTHETIC_SURFACE, layer, output, state.active_idle_source },
                 );
             }
         } else {
@@ -644,10 +671,13 @@ pub const Forwarder = struct {
         const info = state.guestMemoryConst(create_info, VK_SWAPCHAIN_CREATE_INFO_SIZE);
         const s_type = if (info != null) state.read32(create_info) else 0;
         const surface = if (info != null) state.read64(create_info + 24) else 0;
-        if (state.active_gtk_idle_source == 0) self.vulkan_presenter_off_ui_calls +|= 1;
+        const image_width = if (info != null) state.read32(create_info + 44) else 0;
+        const image_height = if (info != null) state.read32(create_info + 48) else 0;
+        const image_usage = if (info != null) state.read32(create_info + 56) else 0;
+        if (state.active_idle_source == 0) self.vulkan_presenter_off_ui_calls +|= 1;
         machoCapturePrint(
             "macho-processor: Vulkan presenter bind: stage=swapchain_requested attempt={d} step={d} thread=0x{x} gtk_idle_source={d} device=0x{x} create_info=0x{x} s_type={d} surface=0x{x} output=0x{x}\n",
-            .{ self.vulkan_presenter_bind_attempts, state.executed_steps, state.active_guest_thread, state.active_gtk_idle_source, device, create_info, s_type, surface, output },
+            .{ self.vulkan_presenter_bind_attempts, state.executed_steps, state.active_guest_thread, state.active_idle_source, device, create_info, s_type, surface, output },
         );
         const failure_reason: ?[]const u8 = if (self.vulkan_logical_devices_created == 0)
             "logical_device_not_created"
@@ -687,14 +717,14 @@ pub const Forwarder = struct {
         }
         if (self.vulkan_swapchains_created == 1) {
             machoCapturePrint(
-                "macho-processor: Vulkan milestone: swapchain_created handle=0x{x} output=0x{x} images={d}\n",
-                .{ handle, output, self.vulkan_swapchain_image_count },
+                "macho-processor: Vulkan milestone: swapchain_created handle=0x{x} output=0x{x} images={d} extent={d}x{d} usage=0x{x} backing=synthetic\n",
+                .{ handle, output, self.vulkan_swapchain_image_count, image_width, image_height, image_usage },
             );
         }
         self.vulkan_presenter_stage = .ready;
         machoCapturePrint(
             "macho-processor: Vulkan presenter bind complete: stage=ready attempt={d} surface=0x{x} swapchain=0x{x} gtk_idle_source={d}\n",
-            .{ self.vulkan_presenter_bind_attempts, surface, handle, state.active_gtk_idle_source },
+            .{ self.vulkan_presenter_bind_attempts, surface, handle, state.active_idle_source },
         );
         return 0;
     }
@@ -746,7 +776,10 @@ pub const Forwarder = struct {
     fn queueSubmit(self: *Forwarder) u64 {
         self.vulkan_queue_submits +|= 1;
         if (self.vulkan_queue_submits == 1) {
-            machoCapturePrint("macho-processor: Vulkan milestone: first_queue_submit\n", .{});
+            machoCapturePrint(
+                "macho-processor: Vulkan modeled milestone: first_queue_submit (synthetic success; no native VkQueue submission)\n",
+                .{},
+            );
         }
         return 0;
     }
@@ -754,7 +787,10 @@ pub const Forwarder = struct {
     fn queuePresent(self: *Forwarder) u64 {
         self.vulkan_presents +|= 1;
         if (self.vulkan_presents == 1) {
-            machoCapturePrint("macho-processor: Vulkan milestone: first_present_reached\n", .{});
+            machoCapturePrint(
+                "macho-processor: Vulkan modeled milestone: first_queue_present (synthetic success; no native drawable presentation)\n",
+                .{},
+            );
         }
         return 0;
     }
@@ -1025,6 +1061,10 @@ pub const Forwarder = struct {
             machoCapturePrint(
                 "macho-processor: native Vulkan presenter backing: loader(attempts/failures)={d}/{d} instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
                 .{ self.native_vulkan_loader_attempts, self.native_vulkan_loader_failures, self.native_vulkan_instance_attempts, self.native_vulkan_surface_attempts, self.native_vulkan_failures, if (self.native_vulkan_instance) |instance| @intFromPtr(instance) else 0, self.native_vulkan_surface, self.native_vulkan_library_token },
+            );
+            machoCapturePrint(
+                "macho-processor: Vulkan forwarding contract: native=instance+Metal_surface synthetic=physical_device+logical_device+swapchain+commands+submit+present capability_queries={d} device_void_calls={d} modeled_commands={d}; rendered pixels are not authoritative until native device/command forwarding is installed\n",
+                .{ self.vulkan_surface_capability_queries, self.vulkan_device_void_calls, self.vulkan_modeled_command_calls },
             );
             machoCapturePrint("macho-processor: Vulkan proc inventory:\n", .{});
             for (&self.guest_symbols) |*entry| {
@@ -1646,17 +1686,29 @@ fn writePhysicalDeviceProperties2(state: anytype, output: u64) void {
 
 fn writeSurfaceCapabilities(state: anytype, output: u64) u64 {
     const bytes = state.guestMemory(output, 52) orelse return vkErrorInitializationFailed();
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    const native_width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 0;
+    const native_height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 0;
+    // UINT32_MAX means the surface size is not fixed and the application may
+    // select its own extent. Once the native bridge knows the drawable size,
+    // publish it exactly so Xenia doesn't clamp against zero-filled fields.
+    const current_width = if (native_width != 0) native_width else std.math.maxInt(u32);
+    const current_height = if (native_height != 0) native_height else std.math.maxInt(u32);
+
     @memset(bytes, 0);
-    std.mem.writeInt(u32, bytes[0..4], 2, .little);
-    std.mem.writeInt(u32, bytes[4..8], 3, .little);
-    std.mem.writeInt(u32, bytes[16..20], 1, .little);
-    std.mem.writeInt(u32, bytes[20..24], 16384, .little);
-    std.mem.writeInt(u32, bytes[24..28], 16384, .little);
-    std.mem.writeInt(u32, bytes[28..32], 1, .little);
-    std.mem.writeInt(u32, bytes[32..36], 1, .little);
-    std.mem.writeInt(u32, bytes[36..40], 1, .little);
-    std.mem.writeInt(u32, bytes[40..44], 1, .little);
-    std.mem.writeInt(u32, bytes[44..48], 0x1F, .little);
+    std.mem.writeInt(u32, bytes[0..4], 2, .little); // minImageCount
+    std.mem.writeInt(u32, bytes[4..8], 3, .little); // maxImageCount
+    std.mem.writeInt(u32, bytes[8..12], current_width, .little);
+    std.mem.writeInt(u32, bytes[12..16], current_height, .little);
+    std.mem.writeInt(u32, bytes[16..20], 1, .little); // minImageExtent.width
+    std.mem.writeInt(u32, bytes[20..24], 1, .little); // minImageExtent.height
+    std.mem.writeInt(u32, bytes[24..28], 16384, .little); // maxImageExtent.width
+    std.mem.writeInt(u32, bytes[28..32], 16384, .little); // maxImageExtent.height
+    std.mem.writeInt(u32, bytes[32..36], 1, .little); // maxImageArrayLayers
+    std.mem.writeInt(u32, bytes[36..40], 1, .little); // supportedTransforms: IDENTITY
+    std.mem.writeInt(u32, bytes[40..44], 1, .little); // currentTransform: IDENTITY
+    std.mem.writeInt(u32, bytes[44..48], 0x0F, .little); // supportedCompositeAlpha
+    std.mem.writeInt(u32, bytes[48..52], 0x13, .little); // transfer src/dst + color attachment
     return 0;
 }
 
@@ -1799,10 +1851,10 @@ fn nulTerminate(buffer: []u8, value: []const u8) ?[*:0]const u8 {
 
 const TestState = struct {
     mem: [256]u8 = [_]u8{0} ** 256,
-    regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, r9: u64 = 0, rax: u64 = 0 } = .{},
+    regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, r8: u64 = 0, r9: u64 = 0, rsp: u64 = 0, rax: u64 = 0 } = .{},
     executed_steps: u64 = 10,
     active_guest_thread: u64 = 0x7FFF_2020,
-    active_gtk_idle_source: u64 = 1,
+    active_idle_source: u64 = 1,
     monotonic_nanoseconds: u64 = 0,
     last_opaque_handle: u64 = 0,
     last_opaque_owner: []const u8 = "",
@@ -1841,7 +1893,33 @@ const TestState = struct {
         self.last_opaque_handle = handle;
         self.last_opaque_owner = owner;
     }
+
+    pub fn nativeWindowWidth(_: *@This()) u32 {
+        return 1280;
+    }
+
+    pub fn nativeWindowHeight(_: *@This()) u32 {
+        return 720;
+    }
 };
+
+test "Vulkan surface capabilities preserve native drawable extent and ABI layout" {
+    var state = TestState{};
+    try std.testing.expectEqual(@as(u64, 0), writeSurfaceCapabilities(&state, 16));
+    try std.testing.expectEqual(@as(u32, 2), state.read32(16));
+    try std.testing.expectEqual(@as(u32, 3), state.read32(20));
+    try std.testing.expectEqual(@as(u32, 1280), state.read32(24));
+    try std.testing.expectEqual(@as(u32, 720), state.read32(28));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(32));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(36));
+    try std.testing.expectEqual(@as(u32, 16384), state.read32(40));
+    try std.testing.expectEqual(@as(u32, 16384), state.read32(44));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(48));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(52));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(56));
+    try std.testing.expectEqual(@as(u32, 0x0F), state.read32(60));
+    try std.testing.expectEqual(@as(u32, 0x13), state.read32(64));
+}
 
 test "modeled Vulkan objects register opaque pointer provenance" {
     var forwarder = Forwarder{};
