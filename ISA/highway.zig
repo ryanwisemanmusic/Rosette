@@ -306,7 +306,7 @@ pub const SimdRequest = struct {
 };
 
 pub fn simdProvider(backend: Backend, request: SimdRequest) SimdProvider {
-    if (request.vector_bits > 512 or request.element_bits == 0) return .pending;
+    if (request.vector_bits > 8192 or request.element_bits == 0) return .pending;
     return switch (backend) {
         .elf64, .macho64 => .cleo,
         .pe32 => .pending,
