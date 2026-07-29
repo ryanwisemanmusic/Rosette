@@ -43,6 +43,7 @@ pub const classifyGuestSleep = guest_sleep.classify;
 pub const SchedulerEvent = event_log.Event;
 pub const SchedulerEventKind = event_log.Kind;
 pub const SchedulerEventLog = event_log.Logger;
+pub const TimeMode = guest_time.TimeMode;
 pub const GuestTimeService = guest_time.Service;
 pub const GuestTimerEntry = guest_time.TimerEntry;
 pub const SpinParkingManager = spin_parking.SpinParkingManager;

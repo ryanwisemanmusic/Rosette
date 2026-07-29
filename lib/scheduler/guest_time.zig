@@ -8,12 +8,26 @@ pub const TimerEntry = struct {
     wait_generation: u64,
 };
 
+/// Clock mode: virtual (deterministic step-based, default) or wall-clock (real host time).
+/// Virtual mode advances 1 ns per executed guest instruction (1 GHz nominal).
+/// Wall-clock mode uses the host monotonic clock, suitable for non-emulator apps.
+pub const TimeMode = enum {
+    virtual,
+    wall_clock,
+};
+
 /// One virtual clock domain for guest-visible clocks and scheduler deadlines.
 /// Deadlines are ordered by `(deadline, sequence)`, so equal-deadline wakeups
 /// have stable FIFO behavior without depending on guest addresses or symbols.
 pub const Service = struct {
+    /// Clock mode: virtual (step-based) or wall_clock (host monotonic time).
+    time_mode: TimeMode = .virtual,
     monotonic_ns: u64 = 1_000_000_000,
     wall_epoch_ns: u64 = 1_719_000_000 * 1_000_000_000,
+    /// Host monotonic timestamp captured when wall-clock mode was enabled.
+    host_base_ns: u64 = 0,
+    /// Guest-visible time offset at wall-clock baseline capture.
+    guest_base_ns: u64 = 1_000_000_000,
     next_sequence: u64 = 1,
     quiescence_advances: u64 = 0,
     quiescence_advanced_ns: u64 = 0,
@@ -32,6 +46,7 @@ pub const Service = struct {
     }
 
     pub fn wallNow(self: *const Service) u64 {
+        if (self.time_mode == .wall_clock) return self.monotonic_ns;
         return self.wall_epoch_ns +| self.monotonic_ns;
     }
 
@@ -46,18 +61,41 @@ pub const Service = struct {
     }
 
     /// Advance time only when the cooperative scheduler has proven that no
-    /// guest context can currently run. This gives polling/event loops a real
+    /// guest context can currently run. In wall-clock mode, reads the real
+    /// host time directly. In virtual mode, advances by a bounded scheduler
+    /// tick (1 ms). This gives polling/event loops a real
     /// notion of elapsed time without making clock reads themselves mutate
     /// time or jumping to an unbounded sentinel deadline.
     pub fn advanceForQuiescence(self: *Service) u64 {
+        if (self.time_mode == .wall_clock) {
+            self.monotonic_ns = self.wallClockNow();
+            return self.monotonic_ns;
+        }
         const scheduler_tick_ns: u64 = 1_000_000;
         self.quiescence_advances +|= 1;
         self.quiescence_advanced_ns +|= scheduler_tick_ns;
         return self.advanceBy(scheduler_tick_ns);
     }
 
+    /// Capture the current host monotonic time as the wall-clock baseline.
+    /// After calling this, `now()` and `wallNow()` return host-relative time.
+    pub fn captureWallClockBaseline(self: *Service) void {
+        self.host_base_ns = monotonicHostNs();
+        self.guest_base_ns = self.monotonic_ns;
+    }
+
+    /// Compute the current wall-clock guest time based on elapsed host time
+    /// since the baseline capture.
+    fn wallClockNow(self: *const Service) u64 {
+        if (self.host_base_ns == 0) return self.monotonic_ns;
+        const host_now = monotonicHostNs();
+        const elapsed = host_now -| self.host_base_ns;
+        return self.guest_base_ns +| elapsed;
+    }
+
     /// Keep finite guest waits moving while other guest contexts remain
-    /// runnable. One translated instruction represents one nanosecond of
+    /// runnable. In wall-clock mode the clock advances to real host time.
+    /// One translated instruction represents one nanosecond of
     /// deterministic virtual execution time (a nominal 1 GHz guest clock).
     ///
     /// Previously the clock advanced only during global quiescence. A busy
@@ -65,6 +103,10 @@ pub const Service = struct {
     /// expiring forever, even while the cooperative scheduler kept rotating
     /// contexts. The watermark makes repeated scheduler scans idempotent.
     pub fn advanceForExecution(self: *Service, current_step: u64) u64 {
+        if (self.time_mode == .wall_clock) {
+            self.monotonic_ns = self.wallClockNow();
+            return self.monotonic_ns;
+        }
         const previous_step = self.execution_step_watermark orelse {
             self.execution_step_watermark = current_step;
             return self.monotonic_ns;
@@ -133,6 +175,14 @@ pub const Service = struct {
         return result;
     }
 };
+
+/// Read the host monotonic clock directly. Returns 0 on failure.
+fn monotonicHostNs() u64 {
+    var timestamp: std.c.timespec = undefined;
+    if (std.c.clock_gettime(@as(std.c.clockid_t, .MONOTONIC), &timestamp) != 0) return 0;
+    return @as(u64, @intCast(timestamp.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(timestamp.nsec));
+}
 
 fn lessThan(lhs: TimerEntry, rhs: TimerEntry) bool {
     return lhs.deadline_ns < rhs.deadline_ns or
