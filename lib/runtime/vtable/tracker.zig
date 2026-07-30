@@ -215,6 +215,13 @@ pub const VtableTracker = struct {
         return self.records.contains(address);
     }
 
+    /// Look up the full allocation record for an address.
+    /// Returns null if no trusted vtable history exists at this address.
+    /// This is a public query method for the ownership diagnostics library.
+    pub fn lookupRecord(self: *const VtableTracker, address: u64) ?types.AllocationRecord {
+        return self.records.get(address);
+    }
+
     pub fn trackedAllocationCount(self: *const VtableTracker) usize {
         return self.records.count();
     }
