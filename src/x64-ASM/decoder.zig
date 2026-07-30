@@ -34,8 +34,13 @@ pub const RFL_AF = flags.RFL_AF;
 pub const RFL_ZF = flags.RFL_ZF;
 pub const RFL_SF = flags.RFL_SF;
 pub const RFL_OF = flags.RFL_OF;
+pub const statusByteForLahf = flags.statusByteForLahf;
+pub const applySahf = flags.applySahf;
+pub const BitTestOperation = bit_test.Operation;
+pub const bitTestRegister = bit_test.applyRegister;
 pub const bitTestAndResetRegister = bit_test.resetRegister;
 pub const bitTestMemoryOperand = bit_test.memoryOperand;
+pub const bitTestMemoryOperandImmediate = bit_test.memoryOperandImmediate;
 
 /// Prefix state shared by every legacy x86-64 instruction family. Keeping
 /// this in the decoder prevents each opcode handler from growing its own
@@ -1205,9 +1210,23 @@ pub const Op = enum(u16) {
     vpmultishiftqb,
     vpconflictd,
     vpconflictq,
-    // bit test and reset
+    // bit test family
+    bt_reg_reg,
+    bt_mem_reg,
+    bts_reg_reg,
+    bts_mem_reg,
     btr_reg_reg,
     btr_mem_reg,
+    btc_reg_reg,
+    btc_mem_reg,
+    bt_reg_imm,
+    bt_mem_imm,
+    bts_reg_imm,
+    bts_mem_imm,
+    btr_reg_imm,
+    btr_mem_imm,
+    btc_reg_imm,
+    btc_mem_imm,
     // conditional / unconditional jumps
     jmp_rel8,
     jcc_rel8,
@@ -1222,6 +1241,10 @@ pub const Op = enum(u16) {
     call_mem64,
     call_reg64,
     hlt,
+    // Legacy status-byte transfer. Kept at the end so existing Op numeric
+    // values remain stable for trace and cache consumers.
+    lahf,
+    sahf,
 };
 
 fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {

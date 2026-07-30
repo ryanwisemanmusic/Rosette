@@ -3,6 +3,13 @@ const flags = @import("flags.zig");
 
 pub const OperandSize = flags.OperandSize;
 
+pub const Operation = enum {
+    probe,
+    set,
+    reset,
+    complement,
+};
+
 pub const RegisterResult = struct {
     value: u64,
     carry: bool,
@@ -23,18 +30,27 @@ pub fn operandBitWidth(size: OperandSize) u7 {
     };
 }
 
-/// Implements the architectural register form of BTR. The source index is
-/// reduced modulo the *bit width* of the destination, not the ordinal of the
-/// OperandSize enum.
-pub fn resetRegister(size: OperandSize, value: u64, raw_index: u64) RegisterResult {
+/// Implements the architectural register/immediate forms of BT/BTS/BTR/BTC.
+/// The source index is reduced modulo the *bit width* of the destination, not
+/// the ordinal of the OperandSize enum.
+pub fn applyRegister(size: OperandSize, value: u64, raw_index: u64, operation: Operation) RegisterResult {
     const width = operandBitWidth(size);
     const bit_index: u6 = @intCast(raw_index & (width - 1));
     const mask = @as(u64, 1) << bit_index;
     return .{
-        .value = value & ~mask,
+        .value = switch (operation) {
+            .probe => value,
+            .set => value | mask,
+            .reset => value & ~mask,
+            .complement => value ^ mask,
+        },
         .carry = value & mask != 0,
         .bit_index = bit_index,
     };
+}
+
+pub fn resetRegister(size: OperandSize, value: u64, raw_index: u64) RegisterResult {
+    return applyRegister(size, value, raw_index, .reset);
 }
 
 /// Resolves the architectural memory form of BTR. Unlike the register form,
@@ -56,6 +72,19 @@ pub fn memoryOperand(size: OperandSize, base_address: u64, raw_index: u64) ?Memo
     };
 }
 
+/// Immediate bit offsets select a bit in the addressed storage element. The
+/// assembler may fold high immediate bits into the effective-address
+/// displacement, so the processor masks the encoded immediate to the operand
+/// width rather than treating it as a signed register bit-string index.
+pub fn memoryOperandImmediate(size: OperandSize, base_address: u64, raw_index: u64) ?MemoryOperand {
+    if (size == .bits8) return null;
+    const width = operandBitWidth(size);
+    return .{
+        .address = base_address,
+        .bit_index = @intCast(raw_index & (width - 1)),
+    };
+}
+
 test "BTR register form clears every bit in the architectural width" {
     const bit_two = resetRegister(.bits32, 0b100, 2);
     try std.testing.expectEqual(@as(u64, 0), bit_two.value);
@@ -71,6 +100,24 @@ test "BTR register form clears every bit in the architectural width" {
     try std.testing.expectEqual(@as(u64, 0), wrapped.value);
 }
 
+test "BT family preserves the tested carry and applies the requested mutation" {
+    const tested = applyRegister(.bits32, 0b0100, 2, .probe);
+    try std.testing.expectEqual(@as(u64, 0b0100), tested.value);
+    try std.testing.expect(tested.carry);
+
+    const set = applyRegister(.bits32, 0, 5, .set);
+    try std.testing.expectEqual(@as(u64, 0b10_0000), set.value);
+    try std.testing.expect(!set.carry);
+
+    const reset = applyRegister(.bits32, 0b10_0000, 5, .reset);
+    try std.testing.expectEqual(@as(u64, 0), reset.value);
+    try std.testing.expect(reset.carry);
+
+    const complemented = applyRegister(.bits32, 0b10, 1, .complement);
+    try std.testing.expectEqual(@as(u64, 0), complemented.value);
+    try std.testing.expect(complemented.carry);
+}
+
 test "BTR memory form carries source-index high bits into the address" {
     const following = memoryOperand(.bits32, 0x1000, 35).?;
     try std.testing.expectEqual(@as(u64, 0x1004), following.address);
@@ -79,4 +126,10 @@ test "BTR memory form carries source-index high bits into the address" {
     const preceding = memoryOperand(.bits32, 0x1000, @bitCast(@as(i64, -1))).?;
     try std.testing.expectEqual(@as(u64, 0x0ffc), preceding.address);
     try std.testing.expectEqual(@as(u6, 31), preceding.bit_index);
+}
+
+test "BT immediate memory form masks within the addressed element" {
+    const operand = memoryOperandImmediate(.bits32, 0x2000, 35).?;
+    try std.testing.expectEqual(@as(u64, 0x2000), operand.address);
+    try std.testing.expectEqual(@as(u6, 3), operand.bit_index);
 }

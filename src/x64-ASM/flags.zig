@@ -7,6 +7,19 @@ pub const RFL_ZF: u32 = 1 << 6;
 pub const RFL_SF: u32 = 1 << 7;
 pub const RFL_OF: u32 = 1 << 11;
 
+/// Status flags transferred by LAHF and SAHF. Bit 1 is not stored in RFLAGS
+/// by SAHF, but LAHF always reports it as one in AH.
+pub const RFL_LAHF_SAHF_MASK: u32 = RFL_CF | RFL_PF | RFL_AF | RFL_ZF | RFL_SF;
+
+pub fn statusByteForLahf(rflags: u32) u8 {
+    return @as(u8, @truncate(rflags & RFL_LAHF_SAHF_MASK)) | 0x02;
+}
+
+pub fn applySahf(rflags: *u32, ah: u8) void {
+    rflags.* = (rflags.* & ~RFL_LAHF_SAHF_MASK) |
+        (@as(u32, ah) & RFL_LAHF_SAHF_MASK);
+}
+
 pub const OperandSize = enum(u2) {
     bits8,
     bits16,
@@ -185,4 +198,14 @@ test "parity conditions follow the low result byte" {
     applyLogic(&rflags, 0b1, .bits8);
     try std.testing.expect(!evalCond(rflags, .p));
     try std.testing.expect(evalCond(rflags, .np));
+}
+
+test "LAHF and SAHF transfer only the architectural status flags" {
+    const preserved: u32 = RFL_OF | (1 << 10) | 0x02;
+    const status: u32 = RFL_CF | RFL_AF | RFL_SF;
+    try std.testing.expectEqual(@as(u8, 0x93), statusByteForLahf(preserved | status));
+
+    var rflags = preserved | RFL_PF | RFL_ZF;
+    applySahf(&rflags, 0x91);
+    try std.testing.expectEqual(preserved | RFL_CF | RFL_AF | RFL_SF, rflags);
 }
