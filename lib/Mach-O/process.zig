@@ -500,6 +500,7 @@ pub const MachOState = struct {
     last_trace_rip: u64 = 0,
     last_trace_op: u64 = 0,
     trace_repeat_count: u64 = 0,
+    trace_ring_enabled: bool = false,
     pending_stub_slot: ?u32 = null,
     pending_stub_entry_rip: ?u64 = null,
     pending_import_stub_rip: ?u64 = null,
@@ -2593,7 +2594,7 @@ pub const MachOState = struct {
     }
 
     pub fn step(self: *MachOState) bool {
-        self.observeProfileAccountFlow();
+        if (@import("builtin").mode != .ReleaseFast) self.observeProfileAccountFlow();
         if (self.regs.rip == GUEST_ATEXIT_RETURN_SENTINEL) {
             return self.continueGuestExit();
         }
@@ -2704,7 +2705,7 @@ pub const MachOState = struct {
             self.terminated = true;
             return false;
         }
-        self.recordTrace(decoded);
+        if (self.trace_ring_enabled) self.recordTrace(decoded);
         if (self.coop_bootstrap_active and self.coop_bootstrap_index < 24) {
             const idx = self.coop_bootstrap_index;
             self.coop_bootstrap_entries[idx] = .{
