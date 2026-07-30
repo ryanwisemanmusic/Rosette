@@ -114,6 +114,7 @@ fn dumpRegisterChain(
     var chain_depth: usize = 0;
     var producer: ?Producer = null;
     var producer_before: u64 = 0;
+    var modeled_streambuf: ?u64 = null;
 
     // Container iterators commonly copy a derived address through six or more
     // helpers before the terminal access. Keep this bounded, but deep enough
@@ -137,6 +138,12 @@ fn dumpRegisterChain(
             },
         );
 
+        if (comptime @hasField(@TypeOf(self.*), "libcxx_streams")) {
+            if (self.libcxx_streams.modeledStreamObjectForAddress(transition.before)) |streambuf| {
+                modeled_streambuf = streambuf;
+            }
+        }
+
         if (allow_direct_producer) {
             if (findExactProducer(self, transition)) |exact_producer| {
                 producer = exact_producer;
@@ -151,6 +158,13 @@ fn dumpRegisterChain(
     }
 
     if (producer) |exact_producer| {
+        if (modeled_streambuf) |streambuf| {
+            machoCapturePrint(
+                "macho-processor: near-null ROOT CAUSE: class=modeled_libcpp_streambuf_native_fallback streambuf=0x{x} source_slot=0x{x} derived_{s}=0x{x}; Rosette modeled this stream object but execution escaped into a native libc++ get-area path. Extend libcpp_stream_bridge/local symbol interception; do not repair the terminal near-null address\n",
+                .{ streambuf, exact_producer.slot, role, terminal_value },
+            );
+            return;
+        }
         dumpRootClassification(
             self,
             exact_producer,

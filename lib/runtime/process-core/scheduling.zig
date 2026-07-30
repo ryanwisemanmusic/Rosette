@@ -350,9 +350,17 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
         self.cooperative_quantum_steps +|= 1;
         if (self.cooperative_quantum_steps >= COOPERATIVE_THREAD_QUANTUM_STEPS) {
             self.cooperative_quantum_steps = 0;
-            self.ui_handoff.registerProgress(self.executed_steps);
+            const tracker_owns_callback = self.ui_handoff.ownsCallbackHandle(self.active_guest_thread);
+            if (tracker_owns_callback) {
+                self.ui_handoff.registerProgress(self.executed_steps);
+            }
 
-            if (self.ui_handoff.callbackQuantumAction(self.pthreads.deferred_threads, suspended.runnable) == .rendezvous_worker) {
+            const producer_eligible = self.pthreads.deferred_threads != 0 or suspended.runnable != 0;
+            const should_rendezvous = if (tracker_owns_callback)
+                self.ui_handoff.callbackQuantumAction(self.pthreads.deferred_threads, suspended.runnable) == .rendezvous_worker
+            else
+                producer_eligible;
+            if (should_rendezvous) {
                 self.ui_callback_retained_quanta +|= 1;
                 const callback = self.active_guest_thread;
                 if (self.yieldActiveGuestThreadForWait("UI callback worker rendezvous")) {
@@ -506,7 +514,7 @@ pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []cons
             .scheduling_rip = self.regs.rip,
         };
         self.idle_scheduled +|= 1;
-        self.ui_handoff.queued(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
+        _ = self.ui_handoff.queueIfIdle(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
         machoCapturePrint(
             "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
             .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingIdleCallbackCount() },
@@ -587,7 +595,16 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         self.active_idle_callback = function;
         self.active_idle_started_step = self.executed_steps;
         self.idle_started +|= 1;
-        self.ui_handoff.callbackStarted(self.active_guest_thread, self.regs.rip, self.executed_steps);
+        self.ui_handoff.beginDispatch(
+            source,
+            function,
+            scheduling_thread,
+            scheduling_rip,
+            scheduled_step,
+            self.active_guest_thread,
+            self.regs.rip,
+            self.executed_steps,
+        );
         self.cooperative_thread_switches +|= 1;
         machoCapturePrint(
             "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",

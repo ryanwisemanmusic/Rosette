@@ -86,8 +86,8 @@ pub fn describeGuestAccess(self: anytype, address: u64, size: u64, access: Guest
     const sparse_mapped = self.sparse_memory.containsMapped(address, size);
     const sparse_allowed = switch (access) {
         .read => self.sparse_memory.bytesConst(address, size) != null,
-        .write => false,
-        .execute => false,
+        .write => self.sparse_memory.bytes(address, size, true) != null,
+        .execute => self.sparse_memory.isExecutable(address, size),
     };
     return .{
         .mapped = sparse_mapped or mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address) != null,
@@ -98,7 +98,12 @@ pub fn describeGuestAccess(self: anytype, address: u64, size: u64, access: Guest
 }
 
 pub fn isExecutableAddress(self: anytype, address: u64) bool {
-    return self.sparse_memory.isExecutable(address, 1) or translateGuest(self, address, 1, .execute) != null;
+    // This is called from the instruction hot path. Check mapped executable
+    // memory first; provenance lookup walks the region registry and is only
+    // needed for rare unbacked callback/import thunks.
+    return self.sparse_memory.isExecutable(address, 1) or
+        translateGuest(self, address, 1, .execute) != null or
+        self.memory_regions.permitsSyntheticExecution(address, 1);
 }
 
 pub fn diagnosticSymbol(self: anytype, address: u64) ?exit_diagnostics.SymbolizedAddress {
@@ -291,15 +296,27 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
 }
 
 pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u64) ?u64 {
-    const exact_live_base = self.memory_forwarder.allocationSize(address) != null;
+    // This callback is reached from every interpreted 64-bit memory read.
+    // Reject the overwhelmingly common non-candidate case before consulting
+    // allocation metadata or building symbol evidence. Non-zero recovery is
+    // opt-in and disabled by the default safety policy.
+    if (current_value >= 0x1000 and !self.vtable_tracker.policy.repair_nonzero_corruption) return null;
+
+    const has_heap_history = self.vtable_tracker.hasTrustedHistory(address);
+    const has_modeled_history = current_value < 0x1000 and self.vtable_stack_registry.contains(address);
+    if (!has_heap_history and !has_modeled_history) return null;
+
+    const exact_live_base = has_heap_history and self.memory_forwarder.allocationSize(address) != null;
 
     // Phase 1: low-read recovery (value < 0x1000, e.g. cleared to 0 or small sentinel)
-    if (self.vtable_tracker.assessLowRead(
-        address,
-        current_value,
-        exact_live_base,
-    )) |recovery| {
-        return logAndReturnRecovery(self, address, recovery, current_value);
+    if (has_heap_history) {
+        if (self.vtable_tracker.assessLowRead(
+            address,
+            current_value,
+            exact_live_base,
+        )) |recovery| {
+            return logAndReturnRecovery(self, address, recovery, current_value);
+        }
     }
 
     // Phase 2: non-zero corruption recovery (value >= 0x1000 but NOT a valid vtable)
@@ -308,7 +325,6 @@ pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u
     // Skip the expensive evidence-building when the address has no vtable
     // history — only tracked vtables can be restored.
     if (current_value >= 0x1000 and exact_live_base) {
-        if (!self.vtable_tracker.hasTrustedHistory(address)) return null;
         const current_evidence = vtableIdentityEvidence(self, current_value);
         const current_rejection = current_evidence.rejection(self.vtable_tracker.policy);
         if (self.vtable_tracker.assessCorruption(
@@ -330,7 +346,7 @@ pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u
     // Only low-value reads are repaired; non-zero corruption recovery
     // for modeled objects is intentionally not supported to avoid false
     // positives from objects that legitimately change their vptr.
-    if (current_value < 0x1000) {
+    if (has_modeled_history) {
         if (self.vtable_stack_registry.assessLowRead(address, current_value)) |recovery| {
             if (!self.vtable_stack_registry.noteRecovery(address, recovery.generation)) return null;
             const recovered = recovery.value;
@@ -652,18 +668,20 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
     const bytes = bytesForSize(size);
     if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
         recordMemoryAccess(self, addr, size, "write", val);
-        const mutation = captureMemoryMutation(self, addr, bytes);
-        switch (size) {
-            .bits8 => storage[0] = @truncate(val),
-            .bits16 => std.mem.writeInt(u16, storage[0..2], @truncate(val), .little),
-            .bits32 => std.mem.writeInt(u32, storage[0..4], @truncate(val), .little),
-            .bits64 => std.mem.writeInt(u64, storage[0..8], val, .little),
+        if (size == .bits64 and (addr & 7) == 0) {
+            const previous = std.mem.readInt(u64, storage[0..8], .little);
+            std.mem.writeInt(u64, storage[0..8], val, .little);
+            self.memory_writes.record(self.allocator, addr, previous, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+        } else {
+            const mutation = captureMemoryMutation(self, addr, bytes);
+            switch (size) {
+                .bits8 => storage[0] = @truncate(val),
+                .bits16 => std.mem.writeInt(u16, storage[0..2], @truncate(val), .little),
+                .bits32 => std.mem.writeInt(u32, storage[0..4], @truncate(val), .little),
+                .bits64 => std.mem.writeInt(u64, storage[0..8], val, .little),
+            }
+            commitMemoryMutation(self, mutation, .partial_scalar);
         }
-        commitMemoryMutation(
-            self,
-            mutation,
-            if (size == .bits64 and (addr & 7) == 0) .scalar else .partial_scalar,
-        );
         recordAllocationWrite(self, addr, size, val);
         // Suspicious write: 64-bit value pointing into executable (code) segment
         // written to any heap/data memory — tree node structural corruption pattern.
@@ -700,20 +718,22 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
         return;
     };
     recordMemoryAccess(self, addr, size, "write", val);
-    const mutation = captureMemoryMutation(self, addr, bytes);
     self.initializer_memory.capture(self.mem, @intCast(off), bytes);
     noteGuestWrite(self, addr, bytes);
-    switch (size) {
-        .bits8 => self.mem[off] = @truncate(val),
-        .bits16 => std.mem.writeInt(u16, self.mem[off..][0..2], @truncate(val), .little),
-        .bits32 => std.mem.writeInt(u32, self.mem[off..][0..4], @truncate(val), .little),
-        .bits64 => std.mem.writeInt(u64, self.mem[off..][0..8], val, .little),
+    if (size == .bits64 and (addr & 7) == 0) {
+        const previous = std.mem.readInt(u64, self.mem[off..][0..8], .little);
+        std.mem.writeInt(u64, self.mem[off..][0..8], val, .little);
+        self.memory_writes.record(self.allocator, addr, previous, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+    } else {
+        const mutation = captureMemoryMutation(self, addr, bytes);
+        switch (size) {
+            .bits8 => self.mem[off] = @truncate(val),
+            .bits16 => std.mem.writeInt(u16, self.mem[off..][0..2], @truncate(val), .little),
+            .bits32 => std.mem.writeInt(u32, self.mem[off..][0..4], @truncate(val), .little),
+            .bits64 => std.mem.writeInt(u64, self.mem[off..][0..8], val, .little),
+        }
+        commitMemoryMutation(self, mutation, .partial_scalar);
     }
-    commitMemoryMutation(
-        self,
-        mutation,
-        if (size == .bits64 and (addr & 7) == 0) .scalar else .partial_scalar,
-    );
     recordAllocationWrite(self, addr, size, val);
     // Suspicious write: 64-bit value pointing into executable (code) segment
     // written to any heap/data memory — tree node structural corruption pattern.
@@ -896,8 +916,43 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
     if (tryQuarantineOpaqueDestructor(self, address)) return;
     const description = describeGuestAccess(self, address, bytes, access);
     if (access != .execute and description.mapped and !description.allowed) {
+        if (self.sparse_memory.containsMapped(address, bytes)) {
+            self.sparse_memory.logAccessFailure(address, bytes, access == .write);
+        } else {
+            // Do not label a primary contiguous-mapping denial as a sparse
+            // contract failure. In particular, this exposes mmap/heap page
+            // ownership collisions: a perfectly live allocation may be
+            // denied because an earlier mprotect covered its shared page.
+            const mapped_offset = mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address);
+            const page_index = if (mapped_offset) |offset| offset / PAGE_SIZE else 0;
+            const page_permissions: u8 = if (mapped_offset != null and page_index < self.page_permissions.len)
+                self.page_permissions[@intCast(page_index)]
+            else
+                0;
+            const allocation = self.memory_forwarder.containingAllocation(address);
+            machoCapturePrint(
+                "macho-processor: primary access contract FAILED: address=0x{x} end=0x{x} length={d} access={s} page_index={d} page_range=[0x{x},0x{x}) permissions={c}{c}{c} live_allocation={} allocation_base=0x{x} allocation_size={d} allocation_offset={d} diagnosis={s}\n",
+                .{
+                    address,
+                    address +| bytes,
+                    bytes,
+                    @tagName(access),
+                    page_index,
+                    self.mem_base +| page_index *| PAGE_SIZE,
+                    self.mem_base +| (page_index +| 1) *| PAGE_SIZE,
+                    @as(u8, if (page_permissions & PAGE_READ != 0) 'r' else '-'),
+                    @as(u8, if (page_permissions & PAGE_WRITE != 0) 'w' else '-'),
+                    @as(u8, if (page_permissions & PAGE_EXECUTE != 0) 'x' else '-'),
+                    allocation != null,
+                    if (allocation) |live| live.base else 0,
+                    if (allocation) |live| live.size else 0,
+                    if (allocation) |live| live.offset else 0,
+                    if (allocation != null) "live heap object denied by page permissions; inspect mmap page ownership/mprotect overlap" else "mapped address denied by primary page permissions",
+                },
+            );
+        }
         const instruction_len = currentGuestInstructionLength(self);
-        if (self.deliverGuestSignal(GUEST_SIGSEGV, self.regs.rip, instruction_len, address, access)) {
+        if (self.deliverGuestSignal(GUEST_SIGSEGV, self.regs.rip, instruction_len, address, access, bytes, instruction)) {
             machoCapturePrint(
                 "macho-processor: mapped guest protection fault routed to SIGSEGV handler: rip=0x{x} address=0x{x} bytes={d} access={s} instruction={s}\n",
                 .{ self.regs.rip, address, bytes, @tagName(access), instruction },
@@ -1303,7 +1358,12 @@ pub fn registerSyntheticThunk(self: anytype, address: u64, size: u64, owner: []c
 }
 
 pub fn guestHeapAllocate(self: anytype, size: u64, alignment: u64) ?u64 {
-    return self.memory_forwarder.allocate(self, size, alignment);
+    const address = self.memory_forwarder.allocate(self, size, alignment) orelse return null;
+    // A released heap-backed mmap may have left page permissions read-only or
+    // inaccessible. Allocation is a new lifetime and must re-establish the
+    // ordinary malloc contract before the caller initializes the object.
+    self.setPagePermissions(address, @max(size, 1), PAGE_READ | PAGE_WRITE);
+    return address;
 }
 
 pub fn guestHeapRelease(self: anytype, address: u64) void {
@@ -1429,7 +1489,7 @@ pub fn guestUnmapFile(self: anytype, address: u64, length: u64) bool {
 
 pub fn guestProtectSparseMemory(self: anytype, address: u64, length: u64, prot: u32) bool {
     if (!self.sparse_memory.protect(address, length, prot)) return false;
-    const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return false;
+    const effective_length = sparse_virtual_memory.guestProtectionRoundedLength(address, length) orelse return false;
     _ = self.memory_regions.register(address, effective_length, .{
         .read = prot & 1 != 0,
         .write = prot & 2 != 0,
@@ -1442,6 +1502,30 @@ pub fn guestProtectSparseMemory(self: anytype, address: u64, length: u64, prot: 
         .may_dereference = prot != 0,
         .may_execute = prot & 4 != 0,
         .owner = "sparse guest mprotect",
+    });
+    return true;
+}
+
+/// Applies mprotect semantics to the processor's primary contiguous mapping.
+/// The previous import bridge merely checked whether memory was accessible and
+/// returned success, leaving the page permission table unchanged. That made a
+/// successful mprotect lie to the translated process.
+pub fn guestProtectMappedMemory(self: anytype, address: u64, length: u64, prot: u32) bool {
+    if (length == 0) return false;
+    const offset = mappedOffset(self.mem_base, self.mem_size, self.mapped_min, address) orelse return false;
+    const end = std.math.add(u64, offset, length) catch return false;
+    if (end > self.mem.len) return false;
+    self.setPagePermissions(address, length, @truncate(prot & 0x07));
+    _ = self.memory_regions.register(address, length, .{
+        .read = prot & 1 != 0,
+        .write = prot & 2 != 0,
+        .execute = prot & 4 != 0,
+    }, .guest_mmap, "primary guest mprotect", self.regs.rip);
+    _ = self.pointer_firewall.register(address, length, .{
+        .kind = .guest_backed,
+        .may_dereference = prot != 0,
+        .may_execute = prot & 4 != 0,
+        .owner = "primary guest mprotect",
     });
     return true;
 }

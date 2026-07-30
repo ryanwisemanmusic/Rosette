@@ -64,6 +64,8 @@ pub fn deliverGuestSignal(
     instruction_len: u8,
     fault_address: u64,
     fault_access: ?GuestAccess,
+    fault_width: u8,
+    fault_instruction: []const u8,
 ) bool {
     const signal_index = guestSignalIndex(signal) orelse return false;
     const action = self.signal_actions[signal_index];
@@ -111,6 +113,10 @@ pub fn deliverGuestSignal(
     frame.signal = signal;
     frame.instruction_len = instruction_len;
     frame.fault_rip = fault_rip;
+    frame.fault_address = fault_address;
+    frame.fault_access = fault_access;
+    frame.fault_width = fault_width;
+    frame.fault_instruction = fault_instruction;
     frame.assertion_class = self.last_guest_assertion_class;
     self.signal_frame_count += 1;
     self.push(GUEST_SIGNAL_RETURN_SENTINEL);
@@ -196,14 +202,33 @@ pub fn finishGuestSignalReturn(self: anytype) bool {
     }
     const fault_bytes = self.guestMemoryConst(frame.fault_rip, frame.instruction_len) orelse &.{};
     const resume_rip = resolveGuestSignalReturn(frame, self.regs.rip, fault_bytes) orelse {
-        machoCapturePrint(
-            "macho-processor: guest signal {d} handler returned without resolving fault at rip=0x{x}\n",
-            .{ frame.signal, frame.fault_rip },
-        );
+        if (frame.signal == GUEST_SIGSEGV) {
+            machoCapturePrint(
+                "macho-processor: guest SIGSEGV handler returned without resolving mapped protection fault: rip=0x{x} address=0x{x} bytes={d} access={s} instruction={s}\n",
+                .{ frame.fault_rip, frame.fault_address, frame.fault_width, if (frame.fault_access) |access| @tagName(access) else "unknown", frame.fault_instruction },
+            );
+            self.terminal_memory_failure = .{
+                .instruction_address = frame.fault_rip,
+                .instruction = frame.fault_instruction,
+                .address = frame.fault_address,
+                .bytes = frame.fault_width,
+                .access = if (frame.fault_access) |access| @tagName(access) else "unknown",
+                .fault = "permission_denied",
+                .mapped = true,
+            };
+        } else {
+            machoCapturePrint(
+                "macho-processor: guest signal {d} handler returned without resolving fault at rip=0x{x}\n",
+                .{ frame.signal, frame.fault_rip },
+            );
+        }
         self.faulted = true;
         self.terminated = true;
         self.exit_code = 128 + frame.signal;
-        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unhandled_guest_signal);
+        self.termination_reason = @intFromEnum(if (frame.signal == GUEST_SIGSEGV)
+            exit_diagnostics.TerminationReason.memory_access_violation
+        else
+            exit_diagnostics.TerminationReason.unhandled_guest_signal);
         return false;
     };
     if (resume_rip != self.regs.rip) {

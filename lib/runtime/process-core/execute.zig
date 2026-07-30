@@ -30,6 +30,8 @@ const RFL_AF: u32 = 1 << 4;
 const RFL_ZF = x64_decoder.RFL_ZF;
 const RFL_SF = x64_decoder.RFL_SF;
 const RFL_OF = x64_decoder.RFL_OF;
+const statusByteForLahf = x64_decoder.statusByteForLahf;
+const applySahf = x64_decoder.applySahf;
 const RFL_DF: u32 = 1 << 10;
 const GuestAccess = types.GuestAccess;
 const ControlTransferContext = types.ControlTransferContext;
@@ -212,6 +214,11 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .cmc => self.regs.rflags ^= RFL_CF,
         .clc => self.regs.rflags &= ~RFL_CF,
         .stc => self.regs.rflags |= RFL_CF,
+        .lahf => {
+            const ah = @as(u64, statusByteForLahf(self.regs.rflags));
+            self.regs.rax = (self.regs.rax & 0xFFFF_FFFF_FFFF_00FF) | (ah << 8);
+        },
+        .sahf => applySahf(&self.regs.rflags, @truncate(self.regs.rax >> 8)),
 
         .fild_mem16 => _ = self.x87.push(@floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(self.readMemVal(d.addr, .bits16))))))),
         .fild_mem32 => _ = self.x87.push(@floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(self.readMemVal(d.addr, .bits32))))))),
@@ -378,6 +385,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .add_reg16_imm32 => self.executeAddRegImm(d, .bits16),
         .add_reg32_imm32 => self.executeAddRegImm(d, .bits32),
         .add_reg64_imm32 => self.executeAddRegImm(d, .bits64),
+        .add_mem8_imm8, .add_mem16_imm8, .add_mem32_imm8, .add_mem64_imm8 => {
+            self.executeHighwayImmediate(d, .add, d.size, true);
+        },
 
         .sub_reg8_reg8, .sub_reg16_reg16, .sub_reg32_reg32, .sub_reg64_reg64 => {
             const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_reg8) + @intFromEnum(Size.bits8));
@@ -573,8 +583,22 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
         },
 
-        .btr_reg_reg => self.executeBtrRegister(d),
-        .btr_mem_reg => self.executeBtrMemory(d),
+        .bt_reg_reg => self.executeBitTestRegister(d, .probe, false),
+        .bt_mem_reg => self.executeBitTestMemory(d, .probe, false),
+        .bts_reg_reg => self.executeBitTestRegister(d, .set, false),
+        .bts_mem_reg => self.executeBitTestMemory(d, .set, false),
+        .btr_reg_reg => self.executeBitTestRegister(d, .reset, false),
+        .btr_mem_reg => self.executeBitTestMemory(d, .reset, false),
+        .btc_reg_reg => self.executeBitTestRegister(d, .complement, false),
+        .btc_mem_reg => self.executeBitTestMemory(d, .complement, false),
+        .bt_reg_imm => self.executeBitTestRegister(d, .probe, true),
+        .bt_mem_imm => self.executeBitTestMemory(d, .probe, true),
+        .bts_reg_imm => self.executeBitTestRegister(d, .set, true),
+        .bts_mem_imm => self.executeBitTestMemory(d, .set, true),
+        .btr_reg_imm => self.executeBitTestRegister(d, .reset, true),
+        .btr_mem_imm => self.executeBitTestMemory(d, .reset, true),
+        .btc_reg_imm => self.executeBitTestRegister(d, .complement, true),
+        .btc_mem_imm => self.executeBitTestMemory(d, .complement, true),
 
         .push_reg => {
             self.push(self.regVal(d.dst_reg, .bits64));
@@ -1799,7 +1823,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 "macho-processor: UD2 encounter: rip=0x{x} {s}+0x{x} active=0x{x} signal_depth={d} assertion={s} assertion_age={d} assertion_return=0x{x} bytes=0f0b\n",
                 .{ self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(self.last_guest_assertion_class), assertion_age, self.last_guest_assertion_return },
             );
-            if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len, self.regs.rip, null)) return;
+            if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len, self.regs.rip, null, 0, "ud2")) return;
             machoCapturePrint("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});
             self.faulted = true;
             self.terminated = true;
