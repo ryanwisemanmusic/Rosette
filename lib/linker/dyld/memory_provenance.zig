@@ -89,6 +89,18 @@ pub const Registry = struct {
         return null;
     }
 
+    /// Returns whether an address is an intentionally executable synthetic
+    /// thunk. Synthetic thunks don't have guest memory backing, so normal
+    /// page-permission checks can't recognize them. Keep this decision in the
+    /// provenance registry so the newest-registration-wins rule also applies
+    /// to control transfers.
+    pub fn permitsSyntheticExecution(self: *const Registry, address: u64, size: u64) bool {
+        const region = self.find(address, size) orelse return false;
+        return region.start == address and
+            region.kind == .synthetic_thunk and
+            region.permissions.execute;
+    }
+
     pub fn removeExact(self: *Registry, start: u64) void {
         var index = self.regions.items.len;
         while (index > 0) {
@@ -111,4 +123,32 @@ test "typed regions prefer the newest specific provenance" {
     try std.testing.expectEqualStrings("std::ostream", vtable.owner);
     try std.testing.expect(!vtable.permissions.write);
     try std.testing.expectEqual(RegionKind.guest_heap, registry.find(0x1200, 8).?.kind);
+}
+
+test "only executable synthetic thunks permit unbacked execution" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try std.testing.expect(registry.register(
+        0xFFFF_FC00_0000_000C,
+        6,
+        .{ .read = false, .write = false, .execute = true },
+        .synthetic_thunk,
+        "_calloc",
+        0,
+    ));
+    try std.testing.expect(registry.permitsSyntheticExecution(0xFFFF_FC00_0000_000C, 1));
+    try std.testing.expect(!registry.permitsSyntheticExecution(0xFFFF_FC00_0000_0011, 1));
+    try std.testing.expect(!registry.permitsSyntheticExecution(0xFFFF_FC00_0000_0012, 1));
+
+    try std.testing.expect(registry.register(
+        0xFFFF_FC00_0000_000C,
+        1,
+        .{ .read = false, .write = false, .execute = false },
+        .synthetic_handle,
+        "revoked callback",
+        0,
+    ));
+    try std.testing.expect(!registry.permitsSyntheticExecution(0xFFFF_FC00_0000_000C, 1));
+    try std.testing.expect(!registry.permitsSyntheticExecution(0xFFFF_FC00_0000_000D, 1));
 }

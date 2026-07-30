@@ -206,6 +206,14 @@ const NativeSurfaceResult = struct {
     surface: u64,
 };
 
+const MAX_VULKAN_MEMORY_ALLOCATIONS = 256;
+const VulkanMemoryAllocation = struct {
+    handle: u64 = 0,
+    requested_size: u64 = 0,
+    mapped_base: u64 = 0,
+    mapped_size: u64 = 0,
+};
+
 pub const Forwarder = struct {
     libraries: [MAX_LIBRARIES]Library = [_]Library{.{}} ** MAX_LIBRARIES,
     library_count: usize = 0,
@@ -231,6 +239,9 @@ pub const Forwarder = struct {
     vulkan_surface_capability_queries: u64 = 0,
     vulkan_memory_allocations: u64 = 0,
     vulkan_memory_maps: u64 = 0,
+    vulkan_memory_map_reuses: u64 = 0,
+    vulkan_memory_records: [MAX_VULKAN_MEMORY_ALLOCATIONS]VulkanMemoryAllocation =
+        [_]VulkanMemoryAllocation{.{}} ** MAX_VULKAN_MEMORY_ALLOCATIONS,
     vulkan_presenter_bind_attempts: u64 = 0,
     vulkan_presenter_bind_failures: u64 = 0,
     vulkan_presenter_off_ui_calls: u64 = 0,
@@ -391,7 +402,13 @@ pub const Forwarder = struct {
                 .allocate_command_buffers => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 28, entry.name[0..entry.name_length]),
                 .allocate_descriptor_sets => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 24, entry.name[0..entry.name_length]),
                 .allocate_memory => state.regs.rax = self.allocateVulkanMemory(state, state.regs.rsi, state.regs.rcx),
-                .map_memory => state.regs.rax = self.mapVulkanMemory(state, state.regs.rcx, state.regs.r9),
+                .map_memory => state.regs.rax = self.mapVulkanMemory(
+                    state,
+                    state.regs.rsi,
+                    state.regs.rdx,
+                    state.regs.rcx,
+                    state.regs.r9,
+                ),
                 .get_memory_requirements => state.regs.rax = writeMemoryRequirements(state, state.regs.rdx),
                 .create_graphics_pipelines => state.regs.rax = self.createMultipleVulkanObjects(state, state.regs.rdx, state.regs.r9, entry.name[0..entry.name_length]),
                 .destroy_device_object => state.regs.rax = 0,
@@ -797,36 +814,92 @@ pub const Forwarder = struct {
 
     fn allocateVulkanMemory(self: *Forwarder, state: anytype, info: u64, output: u64) u64 {
         if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
+        // VkMemoryAllocateInfo is {sType, padding, pNext, allocationSize,
+        // memoryTypeIndex}. Reading +8 observes pNext (often a stack address),
+        // not allocationSize, and caused the old model to reserve multi-GB
+        // phantom allocations.
+        if (info == 0 or state.guestMemoryConst(info + 16, 8) == null) return vkErrorInitializationFailed();
+        const requested_size = state.read64(info + 16);
+        if (requested_size == 0) return vkErrorInitializationFailed();
+
+        const record = self.freeVulkanMemoryRecord() orelse return vkErrorOutOfHostMemory();
         const handle = self.nextVulkanObject();
         state.write64(output, handle);
         registerOpaqueHandle(state, handle, "Vulkan device memory");
+        record.* = .{
+            .handle = handle,
+            .requested_size = requested_size,
+        };
         self.vulkan_memory_allocations +|= 1;
-        const size = if (info != 0 and state.guestMemoryConst(info + 8, 8) != null) state.read64(info + 8) else 0;
         if (self.vulkan_memory_allocations <= 8 or self.vulkan_memory_allocations % 64 == 0) {
             machoCapturePrint(
                 "macho-processor: Vulkan memory allocated: handle=0x{x} requested_size={d} output=0x{x}\n",
-                .{ handle, size, output },
+                .{ handle, requested_size, output },
             );
         }
         return 0;
     }
 
-    fn mapVulkanMemory(self: *Forwarder, state: anytype, requested_size: u64, output: u64) u64 {
+    fn mapVulkanMemory(
+        self: *Forwarder,
+        state: anytype,
+        memory_handle: u64,
+        offset: u64,
+        requested_size: u64,
+        output: u64,
+    ) u64 {
         if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
-        const fallback_size: u64 = 16 * 1024 * 1024;
         const max_modeled_size: u64 = 64 * 1024 * 1024;
-        const allocation_size = if (requested_size == 0 or requested_size == std.math.maxInt(u64))
-            fallback_size
+        const record = self.findVulkanMemoryRecord(memory_handle) orelse return vkErrorInitializationFailed();
+        if (offset > record.requested_size) return vkErrorInitializationFailed();
+        const available_size = record.requested_size - offset;
+        const map_size = if (requested_size == std.math.maxInt(u64))
+            available_size
         else
-            @min(requested_size, max_modeled_size);
-        const mapped = state.guestAlloc(allocation_size, 16) orelse return vkErrorOutOfHostMemory();
-        state.write64(output, mapped);
+            requested_size;
+        if (map_size == 0 or map_size > available_size or record.requested_size > max_modeled_size) {
+            return vkErrorOutOfHostMemory();
+        }
+
+        const reused = record.mapped_base != 0;
+        if (!reused) {
+            record.mapped_base = state.guestAlloc(record.requested_size, 16) orelse return vkErrorOutOfHostMemory();
+            record.mapped_size = record.requested_size;
+        } else {
+            self.vulkan_memory_map_reuses +|= 1;
+        }
+        state.write64(output, record.mapped_base + offset);
         self.vulkan_memory_maps +|= 1;
-        machoCapturePrint(
-            "macho-processor: Vulkan memory mapped: ptr=0x{x} modeled_size={d} requested_size={d} output=0x{x}\n",
-            .{ mapped, allocation_size, requested_size, output },
-        );
+        if (self.vulkan_memory_maps <= 8 or self.vulkan_memory_maps % 64 == 0) {
+            machoCapturePrint(
+                "macho-processor: Vulkan memory mapped: handle=0x{x} ptr=0x{x} allocation_size={d} offset={d} requested_size={d} map_size={d} reused={} output=0x{x}\n",
+                .{
+                    memory_handle,
+                    record.mapped_base + offset,
+                    record.requested_size,
+                    offset,
+                    requested_size,
+                    map_size,
+                    reused,
+                    output,
+                },
+            );
+        }
         return 0;
+    }
+
+    fn freeVulkanMemoryRecord(self: *Forwarder) ?*VulkanMemoryAllocation {
+        for (&self.vulkan_memory_records) |*record| {
+            if (record.handle == 0) return record;
+        }
+        return null;
+    }
+
+    fn findVulkanMemoryRecord(self: *Forwarder, handle: u64) ?*VulkanMemoryAllocation {
+        for (&self.vulkan_memory_records) |*record| {
+            if (record.handle == handle) return record;
+        }
+        return null;
     }
 
     fn allocateVulkanObjects(self: *Forwarder, state: anytype, info: u64, output: u64, count_offset: u64, name: []const u8) u64 {
@@ -1039,7 +1112,7 @@ pub const Forwarder = struct {
         );
         if (self.guest_proc_queries != 0) {
             machoCapturePrint(
-                "macho-processor: Vulkan lifecycle: device={d} queue={d} metal_surface={d} swapchain={d} swapchain_images={d} acquired={d} submits={d} presents={d} memory(alloc/maps)={d}/{d} opaque={d} presenter(stage/attempts/failures/off_ui_calls)={s}/{d}/{d}/{d}\n",
+                "macho-processor: Vulkan lifecycle: device={d} queue={d} metal_surface={d} swapchain={d} swapchain_images={d} acquired={d} submits={d} presents={d} memory(alloc/maps/reuses)={d}/{d}/{d} opaque={d} presenter(stage/attempts/failures/off_ui_calls)={s}/{d}/{d}/{d}\n",
                 .{
                     self.vulkan_logical_devices_created,
                     self.vulkan_queues_acquired,
@@ -1051,6 +1124,7 @@ pub const Forwarder = struct {
                     self.vulkan_presents,
                     self.vulkan_memory_allocations,
                     self.vulkan_memory_maps,
+                    self.vulkan_memory_map_reuses,
                     self.guest_opaque_calls,
                     @tagName(self.vulkan_presenter_stage),
                     self.vulkan_presenter_bind_attempts,
@@ -1065,6 +1139,20 @@ pub const Forwarder = struct {
             machoCapturePrint(
                 "macho-processor: Vulkan forwarding contract: native=instance+Metal_surface synthetic=physical_device+logical_device+swapchain+commands+submit+present capability_queries={d} device_void_calls={d} modeled_commands={d}; rendered pixels are not authoritative until native device/command forwarding is installed\n",
                 .{ self.vulkan_surface_capability_queries, self.vulkan_device_void_calls, self.vulkan_modeled_command_calls },
+            );
+            machoCapturePrint(
+                "macho-processor: graphics visibility: blank_window_expected={} reason={s}\n",
+                .{
+                    self.vulkan_images_acquired == 0 or self.vulkan_queue_submits == 0 or self.vulkan_presents == 0,
+                    if (self.vulkan_images_acquired == 0)
+                        "no swapchain image was acquired"
+                    else if (self.vulkan_queue_submits == 0)
+                        "no Vulkan command submission reached the queue"
+                    else if (self.vulkan_presents == 0)
+                        "no image reached vkQueuePresentKHR"
+                    else
+                        "presentation calls occurred; native pixel authority is still unproven",
+                },
             );
             machoCapturePrint("macho-processor: Vulkan proc inventory:\n", .{});
             for (&self.guest_symbols) |*entry| {
@@ -1850,7 +1938,7 @@ fn nulTerminate(buffer: []u8, value: []const u8) ?[*:0]const u8 {
 }
 
 const TestState = struct {
-    mem: [256]u8 = [_]u8{0} ** 256,
+    mem: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024),
     regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, r8: u64 = 0, r9: u64 = 0, rsp: u64 = 0, rax: u64 = 0 } = .{},
     executed_steps: u64 = 10,
     active_guest_thread: u64 = 0x7FFF_2020,
@@ -1858,6 +1946,7 @@ const TestState = struct {
     monotonic_nanoseconds: u64 = 0,
     last_opaque_handle: u64 = 0,
     last_opaque_owner: []const u8 = "",
+    heap_next: u64 = 1024,
 
     pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
         if (address + length > self.mem.len) return null;
@@ -1883,6 +1972,16 @@ const TestState = struct {
 
     fn write64(self: *@This(), address: u64, value: u64) void {
         std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+    }
+
+    pub fn guestAlloc(self: *@This(), requested_size: u64, alignment: u64) ?u64 {
+        if (alignment == 0 or alignment & (alignment - 1) != 0) return null;
+        const start = std.mem.alignForward(u64, self.heap_next, alignment);
+        const end = std.math.add(u64, start, @max(requested_size, 1)) catch return null;
+        if (end > self.mem.len) return null;
+        @memset(self.mem[@intCast(start)..@intCast(end)], 0);
+        self.heap_next = end;
+        return start;
     }
 
     fn validateNativeMetalLayerToken(_: *@This(), token: u64) bool {
@@ -1927,6 +2026,50 @@ test "modeled Vulkan objects register opaque pointer provenance" {
     try std.testing.expectEqual(@as(u64, 0), forwarder.createVulkanObject(&state, 8, "vkCreateBuffer"));
     try std.testing.expectEqual(state.read64(8), state.last_opaque_handle);
     try std.testing.expectEqualStrings("vkCreateBuffer", state.last_opaque_owner);
+}
+
+test "modeled Vulkan memory uses allocationSize and reuses one mapping" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    const allocate_info: u64 = 16;
+    const allocate_output: u64 = 64;
+    state.write64(allocate_info + 8, 0x7FFF_FFFF); // pNext, never a size.
+    state.write64(allocate_info + 16, 4096);
+
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        forwarder.allocateVulkanMemory(&state, allocate_info, allocate_output),
+    );
+    const memory_handle = state.read64(allocate_output);
+    try std.testing.expect(memory_handle != 0);
+    try std.testing.expectEqual(
+        @as(u64, 4096),
+        forwarder.findVulkanMemoryRecord(memory_handle).?.requested_size,
+    );
+
+    const first_output: u64 = 72;
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        forwarder.mapVulkanMemory(
+            &state,
+            memory_handle,
+            0,
+            std.math.maxInt(u64),
+            first_output,
+        ),
+    );
+    const first_mapping = state.read64(first_output);
+    const heap_after_first_map = state.heap_next;
+    try std.testing.expect(first_mapping != 0);
+
+    const second_output: u64 = 80;
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        forwarder.mapVulkanMemory(&state, memory_handle, 256, 512, second_output),
+    );
+    try std.testing.expectEqual(first_mapping + 256, state.read64(second_output));
+    try std.testing.expectEqual(heap_after_first_map, state.heap_next);
+    try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_memory_map_reuses);
 }
 
 test "Vulkan presenter lifecycle requires UI surface before swapchain" {
