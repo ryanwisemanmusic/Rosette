@@ -61,6 +61,37 @@ pub const UiHandoffTracker = struct {
         };
     }
 
+    /// Record a newly queued callback only when no handoff is already in
+    /// flight. A second GTK idle source may be queued while the first callback
+    /// is still executing; replacing the active generation here would make
+    /// the scheduler lose ownership of the running callback and stop donating
+    /// quanta to runnable workers.
+    pub fn queueIfIdle(self: *UiHandoffTracker, source_id: u64, callback: u64, scheduling_thread: u64, scheduling_rip: u64, step: u64) bool {
+        if (self.isActive()) return false;
+        self.queued(source_id, callback, scheduling_thread, scheduling_rip, step);
+        return true;
+    }
+
+    /// Start the generation belonging to the callback actually selected for
+    /// dispatch. If it was queued behind another active callback, its queue
+    /// metadata intentionally wasn't installed until this point.
+    pub fn beginDispatch(
+        self: *UiHandoffTracker,
+        source_id: u64,
+        callback: u64,
+        scheduling_thread: u64,
+        scheduling_rip: u64,
+        queued_step: u64,
+        callback_handle: u64,
+        callback_rip: u64,
+        step: u64,
+    ) void {
+        if (self.phase != .queued or self.source_id != source_id or self.callback != callback) {
+            self.queued(source_id, callback, scheduling_thread, scheduling_rip, queued_step);
+        }
+        self.callbackStarted(callback_handle, callback_rip, step);
+    }
+
     pub fn callbackStarted(self: *UiHandoffTracker, handle: u64, rip: u64, step: u64) void {
         if (self.phase != .queued) {
             if (self.diagnostic_count < 32 or (self.diagnostic_count & (self.diagnostic_count - 1) == 0)) {
@@ -314,4 +345,22 @@ test "running UI callback yields a quantum only when a producer is eligible" {
     try std.testing.expectEqual(CallbackQuantumAction.rendezvous_worker, tracker.callbackQuantumAction(0, 1));
     tracker.callbackSuspended(30);
     try std.testing.expectEqual(CallbackQuantumAction.retain, tracker.callbackQuantumAction(1, 1));
+}
+
+test "queued callback does not replace active handoff generation" {
+    var tracker = UiHandoffTracker{};
+    try std.testing.expect(tracker.queueIfIdle(4, 0x4000, 0x7FFF_2000, 0x1111, 10));
+    tracker.beginDispatch(4, 0x4000, 0x7FFF_2000, 0x1111, 10, 0xFFFF_F900_0000_0004, 0x4000, 20);
+
+    try std.testing.expect(!tracker.queueIfIdle(5, 0x5000, 0x7FFF_2010, 0x2222, 30));
+    try std.testing.expectEqual(@as(u64, 4), tracker.source_id);
+    try std.testing.expectEqual(Phase.callback_running, tracker.phase);
+    try std.testing.expectEqual(CallbackQuantumAction.rendezvous_worker, tracker.callbackQuantumAction(0, 1));
+
+    tracker.completed(40);
+    tracker.beginDispatch(5, 0x5000, 0x7FFF_2010, 0x2222, 30, 0xFFFF_F900_0000_0005, 0x5000, 50);
+    try std.testing.expectEqual(@as(u64, 2), tracker.generation);
+    try std.testing.expectEqual(@as(u64, 5), tracker.source_id);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2010), tracker.scheduling_thread);
+    try std.testing.expectEqual(Phase.callback_running, tracker.phase);
 }
