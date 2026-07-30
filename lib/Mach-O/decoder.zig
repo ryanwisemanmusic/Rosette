@@ -256,7 +256,7 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
             return decodeMovMemImm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
         },
 
-        0xD8, 0xD9, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF => {
+        0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF => {
             if (pos + 2 > bytes.len) return .{};
             var x87 = DecodedInsn{};
             var modrm_pos = pos + 1;
@@ -276,7 +276,7 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
             if (x87.is_reg_form) {
                 x87.imm = rm.addr & 7;
                 x87.len = @intCast(modrm_pos);
-                if (opcode == 0xD9 and group == 0) x87.op = .fld_st else if (opcode == 0xD9 and group == 1) x87.op = .fxch_st else if (opcode == 0xDB and bytes[pos + 1] == 0xE3) x87.op = .fninit else if (opcode == 0xDD and group == 0) x87.op = .ffree_st else if (opcode == 0xDD and group == 3) x87.op = .fstp_st else if (opcode == 0xDF and bytes[pos + 1] == 0xE0) x87.op = .fnstsw_ax else if (opcode == 0xDF and bytes[pos + 1] >= 0xE8 and bytes[pos + 1] <= 0xEF) x87.op = .fucomip_st else return .{};
+                if (opcode == 0xD9 and group == 0) x87.op = .fld_st else if (opcode == 0xD9 and group == 1) x87.op = .fxch_st else if (opcode == 0xDB and bytes[pos + 1] == 0xE3) x87.op = .fninit else if (opcode == 0xDD and group == 0) x87.op = .ffree_st else if (opcode == 0xDD and group == 3) x87.op = .fstp_st else if (opcode == 0xDA and group <= 3) x87.op = .nop else if (opcode == 0xDF and bytes[pos + 1] == 0xE0) x87.op = .fnstsw_ax else if (opcode == 0xDF and bytes[pos + 1] >= 0xE8 and bytes[pos + 1] <= 0xEF) x87.op = .fucomip_st else return .{};
                 return x87;
             }
             x87.addr = rm.addr;
@@ -300,6 +300,7 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
                     3 => x87.op = .fstp_mem64,
                     else => return .{},
                 },
+                0xDA => x87.op = .nop,
                 0xDF => switch (group) {
                     0 => x87.op = .fild_mem16,
                     5 => x87.op = .fild_mem64,
@@ -535,7 +536,11 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
             d.len = @as(u8, @intCast(pos + 1));
         },
         0x9E => {
-            d.op = .nop;
+            d.op = .sahf;
+            d.len = @as(u8, @intCast(pos + 1));
+        },
+        0x9F => {
+            d.op = .lahf;
             d.len = @as(u8, @intCast(pos + 1));
         },
 
@@ -1644,6 +1649,84 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VEX.0F arithmetic: VADD (58), VMUL (59), VSUB (5C), VDIV (5E)
+    // Prefix: 0=PS, 1=PD, 2=SS, 3=SD
+    if (opcode_map == 1 and
+        (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or opcode == 0x5E))
+    {
+        if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
+
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x58 => switch (prefix) {
+                0 => .vaddps,
+                1 => .vaddpd,
+                2 => .vaddss,
+                3 => .vaddsd,
+                else => unreachable,
+            },
+            0x59 => switch (prefix) {
+                0 => .vmulps,
+                1 => .vmulpd,
+                2 => .vmulss,
+                3 => .vmulsd,
+                else => unreachable,
+            },
+            0x5C => switch (prefix) {
+                0 => .vsubps,
+                1 => .vsubpd,
+                2 => .vsubss,
+                3 => .vsubsd,
+                else => unreachable,
+            },
+            0x5E => switch (prefix) {
+                0 => .vdivps,
+                1 => .vdivpd,
+                2 => .vdivss,
+                3 => .vdivsd,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VEX.0F bitwise ops: VAND (54/55), VOR (56), VXOR (57)
+    // Prefix: 0=PS, 1=PD only
+    if (opcode_map == 1 and opcode >= 0x54 and opcode <= 0x57 and (prefix == 0 or prefix == 1)) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x54 => if (prefix == 0) .vandps else .vandpd,
+            0x55 => if (prefix == 0) .vandnps else .vandnpd,
+            0x56 => if (prefix == 0) .vorps else .vorpd,
+            0x57 => if (prefix == 0) .vxorps else .vxorpd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode_map == 1 and
         (opcode == 0x12 or opcode == 0x13 or opcode == 0x16 or opcode == 0x17) and
         !vector_256 and (prefix == 0 or prefix == 1))
@@ -2378,16 +2461,65 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
         return decodeCmpxchg(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
     }
 
-    if (opcode2 == 0xB3) {
+    if (opcode2 == 0xA3 or opcode2 == 0xAB or opcode2 == 0xB3 or opcode2 == 0xBB) {
         if (pos.* >= bytes.len) return .{};
+        const is_mem = bytes[pos.*] < 0xC0;
         const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, d.size);
         d.src_reg = rm.reg;
-        if (d.is_reg_form) {
-            d.dst_reg = @enumFromInt(rm.addr);
-            d.op = .btr_reg_reg;
-        } else {
+        if (is_mem) {
             d.addr = rm.addr;
-            d.op = .btr_mem_reg;
+            d.op = switch (opcode2) {
+                0xA3 => .bt_mem_reg,
+                0xAB => .bts_mem_reg,
+                0xB3 => .btr_mem_reg,
+                0xBB => .btc_mem_reg,
+                else => unreachable,
+            };
+        } else {
+            d.dst_reg = @enumFromInt(rm.addr);
+            d.op = switch (opcode2) {
+                0xA3 => .bt_reg_reg,
+                0xAB => .bts_reg_reg,
+                0xB3 => .btr_reg_reg,
+                0xBB => .btc_reg_reg,
+                else => unreachable,
+            };
+        }
+        d.len = @intCast(pos.*);
+        return d;
+    }
+
+    if (opcode2 == 0xBA) {
+        // Group 8: BT/BTS/BTR/BTC with imm8 (0F BA /4-7 ib).
+        if (pos.* >= bytes.len) return .{};
+        const group_modrm = bytes[pos.*];
+        const group_op = (group_modrm >> 3) & 0x07;
+        if (group_op < 4) return .{}; // groups 0-3 are reserved
+        const is_mem = group_modrm < 0xC0;
+        // REX.R does not extend the opcode field of a ModRM opcode group.
+        const rm = readModRM(&d, bytes, pos, false, rex_x, rex_b, d.size);
+        if (pos.* >= bytes.len) return .{};
+        d.imm = bytes[pos.*];
+        pos.* += 1;
+        d.uses_imm = true;
+        if (is_mem) {
+            d.addr = rm.addr;
+            d.op = switch (group_op) {
+                4 => .bt_mem_imm,
+                5 => .bts_mem_imm,
+                6 => .btr_mem_imm,
+                7 => .btc_mem_imm,
+                else => unreachable,
+            };
+        } else {
+            d.dst_reg = @enumFromInt(rm.addr);
+            d.op = switch (group_op) {
+                4 => .bt_reg_imm,
+                5 => .bts_reg_imm,
+                6 => .btr_reg_imm,
+                7 => .btc_reg_imm,
+                else => unreachable,
+            };
         }
         d.len = @intCast(pos.*);
         return d;

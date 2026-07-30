@@ -27,6 +27,17 @@ pub const SyntheticThunk = enum(u8) {
     locale_destroy,
     xmodule_get_name,
     streambuf_imbue,
+    streambuf_setbuf,
+    streambuf_seekoff,
+    streambuf_seekpos,
+    streambuf_sync,
+    streambuf_showmanyc,
+    streambuf_xsgetn,
+    streambuf_underflow,
+    streambuf_uflow,
+    streambuf_pbackfail,
+    streambuf_xsputn,
+    streambuf_overflow,
 };
 
 const NamedHandle = struct {
@@ -308,6 +319,17 @@ pub fn syntheticThunk(address: u64) ?SyntheticThunk {
         11 => .locale_destroy,
         12 => .xmodule_get_name,
         13 => .streambuf_imbue,
+        14 => .streambuf_setbuf,
+        15 => .streambuf_seekoff,
+        16 => .streambuf_seekpos,
+        17 => .streambuf_sync,
+        18 => .streambuf_showmanyc,
+        19 => .streambuf_xsgetn,
+        20 => .streambuf_underflow,
+        21 => .streambuf_uflow,
+        22 => .streambuf_pbackfail,
+        23 => .streambuf_xsputn,
+        24 => .streambuf_overflow,
         else => null,
     };
 }

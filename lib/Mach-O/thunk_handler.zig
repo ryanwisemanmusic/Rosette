@@ -75,6 +75,30 @@ pub fn handleSyntheticRuntimeThunk(self: anytype) bool {
             // replacement locale in basic_ios is sufficient.
             self.regs.rax = 0;
         },
+        .streambuf_setbuf,
+        .streambuf_seekoff,
+        .streambuf_seekpos,
+        .streambuf_sync,
+        .streambuf_showmanyc,
+        .streambuf_xsgetn,
+        .streambuf_underflow,
+        .streambuf_uflow,
+        .streambuf_pbackfail,
+        .streambuf_xsputn,
+        .streambuf_overflow,
+        => {
+            // These are typed Itanium virtual calls from locally linked
+            // libc++ bodies. Keep them in the stream bridge so object
+            // ownership, file position and string-buffer contents share one
+            // authoritative model.
+            self.regs.rax = self.libcxx_streams.dispatchStreambufVirtual(
+                self,
+                thunk,
+                self.regs.rdi,
+                self.regs.rsi,
+                self.regs.rdx,
+            );
+        },
     }
 
     const return_address = self.pop();

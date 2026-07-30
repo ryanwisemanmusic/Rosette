@@ -1080,6 +1080,16 @@ test "decode carry flag control instructions" {
     try std.testing.expectEqual(Op.stc, decodeInsn(&[_]u8{0xF9}).op);
 }
 
+test "decode status-byte flag transfer instructions" {
+    const sahf = decodeInsn(&[_]u8{0x9E});
+    try std.testing.expectEqual(Op.sahf, sahf.op);
+    try std.testing.expectEqual(@as(u8, 1), sahf.len);
+
+    const lahf = decodeInsn(&[_]u8{0x9F});
+    try std.testing.expectEqual(Op.lahf, lahf.op);
+    try std.testing.expectEqual(@as(u8, 1), lahf.len);
+}
+
 test "decode bit scan and count instructions without losing ModRM" {
     const fmt_bsr = decodeInsn(&[_]u8{ 0x48, 0x0F, 0xBD, 0xC0 });
     try std.testing.expectEqual(Op.bsr_reg_reg, fmt_bsr.op);
@@ -1152,6 +1162,93 @@ test "decode BTR register forms without consuming following instructions" {
     try std.testing.expectEqual(Size.bits64, rex_w.size);
     try std.testing.expectEqual(RegId.r8b_r8w_r8d_r8, rex_w.dst_reg);
     try std.testing.expectEqual(RegId.r9b_r9w_r9d_r9, rex_w.src_reg);
+}
+
+test "decode BT family register-index forms" {
+    const cases = [_]struct {
+        bytes: [3]u8,
+        op: Op,
+    }{
+        .{ .bytes = .{ 0x0F, 0xA3, 0xC8 }, .op = .bt_reg_reg },
+        .{ .bytes = .{ 0x0F, 0xAB, 0xC8 }, .op = .bts_reg_reg },
+        .{ .bytes = .{ 0x0F, 0xB3, 0xC8 }, .op = .btr_reg_reg },
+        .{ .bytes = .{ 0x0F, 0xBB, 0xC8 }, .op = .btc_reg_reg },
+    };
+    for (cases) |case| {
+        const decoded = decodeInsn(&case.bytes);
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(Size.bits32, decoded.size);
+        try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.dst_reg);
+        try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.src_reg);
+        try std.testing.expectEqual(@as(u8, 3), decoded.len);
+    }
+}
+
+test "decode Group 8 BT family immediate register and memory forms" {
+    const register_cases = [_]struct {
+        modrm: u8,
+        op: Op,
+    }{
+        .{ .modrm = 0xE1, .op = .bt_reg_imm },
+        .{ .modrm = 0xE9, .op = .bts_reg_imm },
+        .{ .modrm = 0xF1, .op = .btr_reg_imm },
+        .{ .modrm = 0xF9, .op = .btc_reg_imm },
+    };
+    for (register_cases) |case| {
+        const decoded = decodeInsn(&.{ 0x0F, 0xBA, case.modrm, 0x01 });
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(Size.bits32, decoded.size);
+        try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.dst_reg);
+        try std.testing.expectEqual(@as(u64, 1), decoded.imm);
+        try std.testing.expect(decoded.uses_imm);
+        try std.testing.expectEqual(@as(u8, 4), decoded.len);
+    }
+
+    const memory_cases = [_]struct {
+        modrm: u8,
+        op: Op,
+    }{
+        .{ .modrm = 0x20, .op = .bt_mem_imm },
+        .{ .modrm = 0x28, .op = .bts_mem_imm },
+        .{ .modrm = 0x30, .op = .btr_mem_imm },
+        .{ .modrm = 0x38, .op = .btc_mem_imm },
+    };
+    for (memory_cases) |case| {
+        const decoded = decodeInsn(&.{ 0x0F, 0xBA, case.modrm, 0x1F });
+        try std.testing.expectEqual(case.op, decoded.op);
+        try std.testing.expectEqual(Size.bits32, decoded.size);
+        try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.sib_base_reg);
+        try std.testing.expectEqual(@as(u64, 0x1F), decoded.imm);
+        try std.testing.expectEqual(@as(u8, 4), decoded.len);
+    }
+
+    try std.testing.expectEqual(
+        Op.invalid,
+        decodeInsn(&.{ 0x0F, 0xBA, 0xC1, 0x01 }).op,
+    );
+}
+
+test "decode observed PPC Format AA bit extraction sequence" {
+    const bytes = [_]u8{
+        0x0F, 0xBA, 0xE1, 0x01, // bt ecx, 1
+        0x19, 0xC0, // sbb eax, eax
+        0x24, 0x01, // and al, 1
+        0x0F, 0xB6, 0xC0, // movzx eax, al
+    };
+    const bit_test = decodeInsn(&bytes);
+    try std.testing.expectEqual(Op.bt_reg_imm, bit_test.op);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, bit_test.dst_reg);
+    try std.testing.expectEqual(@as(u64, 1), bit_test.imm);
+    try std.testing.expectEqual(@as(u8, 4), bit_test.len);
+
+    const sbb = decodeInsn(bytes[bit_test.len..]);
+    try std.testing.expectEqual(Op.sbb_reg32_reg32, sbb.op);
+    try std.testing.expectEqual(@as(u8, 2), sbb.len);
+
+    const bit_and = decodeInsn(bytes[bit_test.len + sbb.len ..]);
+    try std.testing.expectEqual(Op.and_accum_imm, bit_and.op);
+    try std.testing.expectEqual(Size.bits8, bit_and.size);
+    try std.testing.expectEqual(@as(u64, 1), bit_and.imm);
 }
 
 test "decode BSWAP register family" {

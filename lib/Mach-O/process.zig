@@ -975,7 +975,13 @@ pub const MachOState = struct {
             const destination = self.guestMemory(binding.address, @sizeOf(u64)) orelse continue;
             const existing = std.mem.readInt(u64, destination[0..8], .little);
             if (std.mem.eql(u8, binding.dylib, "weak-lookup") and existing != 0) continue;
-            const force_bound_thunk = bindingRequiresBoundThunk(section);
+            const capstone_callback_slot = self.capstoneCallbackSlotName(binding.address);
+            // Function pointers stored in writable runtime data don't pass
+            // through a normal call-site lazy-binding sequence. Route them
+            // through Rosette's direct bound thunks so callbacks such as
+            // Capstone's allocator hooks deterministically enter the import
+            // dispatcher with the original ABI arguments intact.
+            const force_bound_thunk = bindingRequiresBoundThunk(section, capstone_callback_slot != null);
             var target = if (!force_bound_thunk) stubs.get(binding.name) orelse 0 else 0;
             if (target == 0) target = blk: {
                 if (thunk_addresses.get(binding.name)) |existing_thunk| break :blk existing_thunk;
@@ -1002,10 +1008,10 @@ pub const MachOState = struct {
             applied += 1;
             if (std.mem.eql(u8, section.name, "__got")) callable_got_bindings += 1;
             if (isWritableDataSection(section)) writable_callable_bindings += 1;
-            if (self.capstoneCallbackSlotName(binding.address)) |slot_name| {
+            if (capstone_callback_slot) |slot_name| {
                 capstone_callback_bindings += 1;
                 machoCapturePrint(
-                    "macho-processor: Capstone runtime callback binding: slot={s} address=0x{x} import={s} target=0x{x} section={s} repaired_null={}\n",
+                    "macho-processor: Capstone runtime callback binding: slot={s} address=0x{x} import={s} target=0x{x} section={s} route=direct_bound_thunk repaired_null={}\n",
                     .{ slot_name, binding.address, binding.name, target, section.name, existing == 0 },
                 );
             }
@@ -1232,12 +1238,12 @@ pub const MachOState = struct {
             std.mem.indexOf(u8, symbol_name, "ios_base") != null;
     }
 
-    fn bindingRequiresBoundThunk(section: macho_metadata.Section) bool {
-        return std.mem.eql(u8, section.name, "__got");
+    fn bindingRequiresBoundThunk(section: macho_metadata.Section, is_runtime_callback: bool) bool {
+        return is_runtime_callback or std.mem.eql(u8, section.name, "__got");
     }
 
     pub const addrToOffset = memory_access.addrToOffset;
-    const setPagePermissions = memory_access.setPagePermissions;
+    pub const setPagePermissions = memory_access.setPagePermissions;
     const translateGuest = memory_access.translateGuest;
     const describeGuestAccess = memory_access.describeGuestAccess;
     pub const isExecutableAddress = memory_access.isExecutableAddress;
@@ -1300,6 +1306,7 @@ pub const MachOState = struct {
     pub const guestReserveAddressSpaceWithBacking = memory_access.guestReserveAddressSpaceWithBacking;
     pub const guestUnmapFile = memory_access.guestUnmapFile;
     pub const guestProtectSparseMemory = memory_access.guestProtectSparseMemory;
+    pub const guestProtectMappedMemory = memory_access.guestProtectMappedMemory;
     pub const renderProcSelfMaps = memory_access.renderProcSelfMaps;
     pub const guestCString = memory_access.guestCString;
     pub const cxxExceptionTypeName = memory_access.cxxExceptionTypeName;
@@ -1743,6 +1750,23 @@ pub const MachOState = struct {
                                 return inner_st.guestCString(address, 4096);
                             }
                         }.read,
+                        .moveGuestFn = struct {
+                            fn move(ptr: *anyopaque, destination_address: u64, source_address: u64, count: usize) bool {
+                                const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
+                                if (count == 0 or destination_address == source_address) return true;
+                                const count_u64: u64 = @intCast(count);
+                                const source = inner_st.guestMemoryConst(source_address, count_u64) orelse return false;
+                                const destination = inner_st.guestMemory(destination_address, count_u64) orelse return false;
+                                const mutation = inner_st.captureMemoryMutation(destination_address, count_u64);
+                                if (destination_address > source_address and destination_address - source_address < count_u64) {
+                                    std.mem.copyBackwards(u8, destination, source);
+                                } else {
+                                    std.mem.copyForwards(u8, destination, source);
+                                }
+                                inner_st.commitMemoryMutation(mutation, .bulk_copy);
+                                return true;
+                            }
+                        }.move,
                         .callGuestFn = struct {
                             fn call(ptr: *anyopaque, fn_address: u64, args: [6]u64) u64 {
                                 const st: *MachOState = @ptrCast(@alignCast(ptr));
@@ -1803,6 +1827,32 @@ pub const MachOState = struct {
                                 return result;
                             }
                         }.call,
+                        .pthreadMachThreadIdFn = struct {
+                            fn lookup(ptr: *anyopaque, handle: u64) u64 {
+                                const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
+                                return inner_st.pthreads.numericThreadId(handle);
+                            }
+                        }.lookup,
+                        .dladdrResolveFn = struct {
+                            fn resolve(ptr: *anyopaque, address: u64) primitive.types.DladdrInfo {
+                                const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
+                                const match = inner_st.metadata.nearestSymbol(address) orelse return .{};
+                                const file_offset = @as(u64, @intFromPtr(match.name.ptr)) - @as(u64, @intFromPtr(inner_st.data.ptr));
+                                var name_vaddr: u64 = 0;
+                                for (inner_st.segments) |seg| {
+                                    if (file_offset >= seg.fileoff and file_offset < seg.fileoff + seg.filesize) {
+                                        name_vaddr = seg.vmaddr + (file_offset - seg.fileoff);
+                                        break;
+                                    }
+                                }
+                                return .{
+                                    .found = true,
+                                    .dli_fbase = inner_st.mem_base,
+                                    .dli_sname = name_vaddr,
+                                    .dli_saddr = match.address,
+                                };
+                            }
+                        }.resolve,
                     };
                     const result = typed_handler(slot, &prim_ctx);
                     return @intFromEnum(result);
@@ -1885,8 +1935,10 @@ pub const MachOState = struct {
         instruction_len: u8,
         fault_address: u64,
         fault_access: ?GuestAccess,
+        fault_width: u8,
+        fault_instruction: []const u8,
     ) bool {
-        return signal_handling.deliverGuestSignal(self, signal, fault_rip, instruction_len, fault_address, fault_access);
+        return signal_handling.deliverGuestSignal(self, signal, fault_rip, instruction_len, fault_address, fault_access, fault_width, fault_instruction);
     }
 
     pub fn signalIsActive(self: *const MachOState, signal: u8) bool {
@@ -2213,23 +2265,38 @@ pub const MachOState = struct {
         }
     }
 
-    pub fn executeBtrRegister(self: *MachOState, d: DecodedInsn) void {
+    pub fn executeBitTestRegister(
+        self: *MachOState,
+        d: DecodedInsn,
+        operation: x64_decoder.BitTestOperation,
+        immediate_index: bool,
+    ) void {
         const value = self.regVal(d.dst_reg, d.size);
-        const result = x64_decoder.bitTestAndResetRegister(d.size, value, self.regVal(d.src_reg, d.size));
+        const raw_index = if (immediate_index) d.imm else self.regVal(d.src_reg, d.size);
+        const result = x64_decoder.bitTestRegister(d.size, value, raw_index, operation);
         self.setFlag(RFL_CF, result.carry);
-        self.setReg(d.dst_reg, d.size, result.value);
+        if (operation != .probe) self.setReg(d.dst_reg, d.size, result.value);
     }
 
-    pub fn executeBtrMemory(self: *MachOState, d: DecodedInsn) void {
-        const operand = x64_decoder.bitTestMemoryOperand(d.size, d.addr, self.regVal(d.src_reg, d.size)) orelse {
+    pub fn executeBitTestMemory(
+        self: *MachOState,
+        d: DecodedInsn,
+        operation: x64_decoder.BitTestOperation,
+        immediate_index: bool,
+    ) void {
+        const operand = if (immediate_index)
+            x64_decoder.bitTestMemoryOperandImmediate(d.size, d.addr, d.imm)
+        else
+            x64_decoder.bitTestMemoryOperand(d.size, d.addr, self.regVal(d.src_reg, d.size));
+        const resolved = operand orelse {
             self.faulted = true;
             self.terminated = true;
             return;
         };
-        const mask = @as(u64, 1) << operand.bit_index;
-        const value = self.readMemVal(operand.address, d.size);
-        self.setFlag(RFL_CF, value & mask != 0);
-        self.writeMemVal(operand.address, d.size, value & ~mask);
+        const value = self.readMemVal(resolved.address, d.size);
+        const result = x64_decoder.bitTestRegister(d.size, value, resolved.bit_index, operation);
+        self.setFlag(RFL_CF, result.carry);
+        if (operation != .probe) self.writeMemVal(resolved.address, d.size, result.value);
     }
 
     fn terminateForMemoryAccess(self: *MachOState, check: x64_decoder.highway.MemoryCheck, instruction: []const u8) void {
@@ -2484,12 +2551,28 @@ pub const MachOState = struct {
         return if (hash == 0) 1 else hash;
     }
 
+    fn executableInstructionBytesAt(self: *const MachOState, address: u64) ?[]const u8 {
+        // Dynamically generated x64 code (Xenia's code cache begins at
+        // 0xA0000000) lives in sparse mappings rather than self.mem. Fetch
+        // from the executable sparse view first so mprotect metadata remains
+        // authoritative and reservation-backed JIT pages are decodable.
+        if (self.sparse_memory.isExecutable(address, 1)) {
+            var count: u64 = 16;
+            while (count != 0) : (count -= 1) {
+                if (self.sparse_memory.executableBytesConst(address, count)) |bytes| return bytes;
+            }
+            return null;
+        }
+
+        const offset = self.addrToOffset(address) orelse return null;
+        if (offset >= self.mem.len) return null;
+        const remaining = self.mem.len - @as(usize, @intCast(offset));
+        return self.mem[@intCast(offset)..][0..@min(@as(usize, 16), remaining)];
+    }
+
     fn decodeAt(self: *const MachOState) ?DecodedInsn {
         const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
-        const offset = self.addrToOffset(fetch_address) orelse return null;
-        if (offset >= self.mem.len) return null;
-
-        const bytes = self.mem[offset..];
+        const bytes = self.executableInstructionBytesAt(fetch_address) orelse return null;
         var decoded = decodeInsn(bytes);
         const prefixes = x64_decoder.decodeLegacyPrefixes(bytes);
         decoded.has_0x67 = prefixes.address_size_override;
@@ -2554,22 +2637,40 @@ pub const MachOState = struct {
             if (self.terminated) return false;
             const rip = self.regs.rip;
             machoCapturePrint("macho-processor: decode failed at rip=0x{x}\n", .{rip});
-            if (self.fileOffsetForVaddr(rip)) |file_off| {
+            if (self.sparse_memory.containsMapped(rip, 1)) {
+                const bytes = self.executableInstructionBytesAt(rip) orelse
+                    self.sparse_memory.bytesConst(rip, 1) orelse &.{};
+                machoCapturePrint(
+                    "macho-processor: decode failed in sparse generated-code mapping: mapped=true executable={} readable={} bytes={any}; this is not an unmapped Mach-O address\n",
+                    .{
+                        self.sparse_memory.isExecutable(rip, 1),
+                        self.sparse_memory.bytesConst(rip, 1) != null,
+                        bytes,
+                    },
+                );
+            } else if (self.fileOffsetForVaddr(rip)) |file_off| {
                 const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
                 const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
                 machoCapturePrint("macho-processor: decode failed file_offset=0x{x} bytes={any}\n", .{ file_off, file_bytes });
             } else {
                 machoCapturePrint("macho-processor: decode failed at unmapped address\n", .{});
             }
+            self.faulted = true;
+            self.exit_code = 127;
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.decode_failed);
             self.terminated = true;
             return false;
         };
         if (decoded.op == .invalid) {
-            const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
-            const mem_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
+            const mem_bytes = self.executableInstructionBytesAt(self.regs.rip) orelse &.{};
             const rip = self.regs.rip;
-            machoCapturePrint("macho-processor: invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}\n", .{ rip, mem_off, mem_bytes });
+            if (self.addrToOffset(rip)) |mem_off| {
+                machoCapturePrint("macho-processor: invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}\n", .{ rip, mem_off, mem_bytes });
+            } else if (self.sparse_memory.containsMapped(rip, 1)) {
+                machoCapturePrint("macho-processor: invalid instruction in sparse generated code at rip=0x{x}, bytes: {any}\n", .{ rip, mem_bytes });
+            } else {
+                machoCapturePrint("macho-processor: invalid instruction at unmapped rip=0x{x}, bytes: {any}\n", .{ rip, mem_bytes });
+            }
             if (x64_decoder.capabilities.classifyRequirement(mem_bytes)) |requirement| {
                 machoCapturePrint(
                     "macho-processor: ISA requirement: {s} encoding requires {s}; virtual profile={s}, advertised={}\n",
@@ -2594,6 +2695,9 @@ pub const MachOState = struct {
             self.dumpCoopHeartbeatTrace();
             self.dumpUiHandoffTrace();
             self.dumpRecentTrace();
+            if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, 1, self.regs.rip, null, 0, mem_bytes)) {
+                return true;
+            }
             self.faulted = true;
             self.exit_code = 127;
             self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
@@ -4106,8 +4210,9 @@ test "dyld data bindings materialize callable constant and GOT slots" {
     try std.testing.expect(MachOState.isAbiDataSymbol("__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE"));
     try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE"));
     try std.testing.expect(!MachOState.isBridgedLibcppDataSymbol("__ZTVN10__cxxabiv117__class_type_infoE"));
-    try std.testing.expect(MachOState.bindingRequiresBoundThunk(got_section));
-    try std.testing.expect(!MachOState.bindingRequiresBoundThunk(constant_section));
+    try std.testing.expect(MachOState.bindingRequiresBoundThunk(got_section, false));
+    try std.testing.expect(!MachOState.bindingRequiresBoundThunk(constant_section, false));
+    try std.testing.expect(MachOState.bindingRequiresBoundThunk(constant_section, true));
 }
 
 test "near-null XModule recovery guard is limited to Matches" {
