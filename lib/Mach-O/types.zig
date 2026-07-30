@@ -225,6 +225,12 @@ pub const DecodeCacheEntry = struct {
     rip: u64 = std.math.maxInt(u64),
     code_generation: u64 = 0,
     decoded: DecodedInsn = .{},
+    /// Raw displacement from `decodeInsn`, before base/index/rip-relative
+    /// resolution.  Used on cache hit to re-resolve the operand address
+    /// from current register state without double-counting the base
+    /// register (which happens when the already-resolved `decoded.addr`
+    /// is fed back through `resolveMemoryAddress` as `displacement`).
+    displacement: u64 = 0,
 };
 
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;

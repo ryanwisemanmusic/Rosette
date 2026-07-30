@@ -142,7 +142,6 @@ const IDLE_STARVATION_STEPS = constants.IDLE_STARVATION_STEPS;
 const INITIALIZER_STEP_LIMIT = constants.INITIALIZER_STEP_LIMIT;
 const GUEST_LOG_BUFFER_SIZE = constants.GUEST_LOG_BUFFER_SIZE;
 const DECODE_CACHE_ENTRY_COUNT = constants.DECODE_CACHE_ENTRY_COUNT;
-const DECODE_CACHE_HASH_SHIFT = constants.DECODE_CACHE_HASH_SHIFT;
 const IMPORT_ROUTE_CACHE_SIZE = constants.IMPORT_ROUTE_CACHE_SIZE;
 const PAGE_READ = constants.PAGE_READ;
 const PAGE_WRITE = constants.PAGE_WRITE;
@@ -2571,17 +2570,45 @@ pub const MachOState = struct {
         return self.mem[@intCast(offset)..][0..@min(@as(usize, 16), remaining)];
     }
 
-    fn decodeAt(self: *const MachOState) ?DecodedInsn {
+    fn decodeAt(self: *MachOState) ?DecodedInsn {
         const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
+        const cache_index = @as(usize, @intCast((fetch_address >> 4) & (DECODE_CACHE_ENTRY_COUNT - 1)));
+        const entry = &self.decode_cache[cache_index];
+        // Executable writes invalidate overlapping entries at the shared
+        // memory-write boundary. Do not globally discard unrelated decoded
+        // host/Xenia instructions whenever the JIT emits a new block.
+        if (entry.rip == fetch_address) {
+            self.decode_cache_hits +|= 1;
+            var decoded = entry.decoded;
+            if (!decoded.rip_relative) {
+                const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
+                decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+                    .displacement = entry.displacement,
+                    .has_index = decoded.sib_has_index,
+                    .index_reg = decoded.sib_index_reg,
+                    .scale = decoded.sib_scale,
+                    .has_base = decoded.sib_has_base,
+                    .base_reg = decoded.sib_base_reg,
+                    .rip_relative = decoded.rip_relative,
+                    .segment = decoded.segment,
+                }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+            }
+            return decoded;
+        }
+        self.decode_cache_misses +|= 1;
         const bytes = self.executableInstructionBytesAt(fetch_address) orelse return null;
         var decoded = decodeInsn(bytes);
+        if (decoded.op == .invalid and self.sparse_memory.containsMapped(fetch_address, 1)) {
+            decoded = decodeInsnCompat(bytes);
+        }
         const prefixes = x64_decoder.decodeLegacyPrefixes(bytes);
         decoded.has_0x67 = prefixes.address_size_override;
         const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
         const base_register: ?RegId = if (decoded.sib_has_base) decoded.sib_base_reg else null;
         decoded.segment = x64_decoder.selectSegment(.explicit_data, base_register, prefixes.segment_override);
+        const raw_displacement = decoded.addr;
         decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
-            .displacement = decoded.addr,
+            .displacement = raw_displacement,
             .has_index = decoded.sib_has_index,
             .index_reg = decoded.sib_index_reg,
             .scale = decoded.sib_scale,
@@ -2590,6 +2617,12 @@ pub const MachOState = struct {
             .rip_relative = decoded.rip_relative,
             .segment = decoded.segment,
         }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+        entry.* = .{
+            .rip = fetch_address,
+            .code_generation = self.code_generation,
+            .decoded = decoded,
+            .displacement = raw_displacement,
+        };
         return decoded;
     }
 
@@ -4175,6 +4208,7 @@ fn extractX8664Slice(allocator: std.mem.Allocator, data: []const u8) ![]const u8
 }
 
 const decodeInsn = macho_core.decoder.decodeInsn;
+const decodeInsnCompat = macho_core.decoder.decodeInsnCompat;
 
 test {
     _ = @import("decoder_tests.zig");

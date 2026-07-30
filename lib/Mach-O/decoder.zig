@@ -17,7 +17,7 @@ const RFL_ZF = x64_decoder.RFL_ZF;
 const RFL_SF = x64_decoder.RFL_SF;
 const RFL_OF = x64_decoder.RFL_OF;
 
-pub fn decodeInsn(bytes: []const u8) DecodedInsn {
+fn decodeInsnWithMode(bytes: []const u8, mode: x64_decoder.ExecutionMode) DecodedInsn {
     if (bytes.len == 0) return .{};
     var pos: usize = 0;
     var d = DecodedInsn{};
@@ -55,8 +55,12 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
                 pos += 1;
             },
             0x40...0x4F => {
-                rex = bytes[pos];
-                pos += 1;
+                if (mode == .long64) {
+                    rex = bytes[pos];
+                    pos += 1;
+                } else {
+                    break;
+                }
             },
             else => break,
         }
@@ -506,15 +510,54 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
             d.len = @intCast(pos + 2);
         },
 
-        0x40...0x47 => {
-            if (opcode == 0x40) {
-                d.op = .nop;
+        0x06, 0x0E, 0x16, 0x1E => {
+            if (mode != .compatibility) {
+                d.op = .invalid;
             } else {
-                d.op = .inc_reg64;
+                d.op = .push_reg;
+                d.dst_reg = .al_ax_eax_rax;
+                d.len = @as(u8, @intCast(pos + 1));
+            }
+        },
+        0x07, 0x17, 0x1F => {
+            if (mode != .compatibility) {
+                d.op = .invalid;
+            } else {
+                d.op = .pop_reg;
+                d.dst_reg = .al_ax_eax_rax;
+                d.len = @as(u8, @intCast(pos + 1));
+            }
+        },
+        0x27, 0x2F, 0x37, 0x3F => {
+            if (mode != .compatibility) {
+                d.op = .invalid;
+            } else {
+                d.op = .nop;
+                d.len = @as(u8, @intCast(pos + 1));
+            }
+        },
+
+        0x40...0x47 => {
+            if (mode == .compatibility) {
+                d.op = .inc_reg32;
                 const reg_num: u8 = opcode - 0x40;
                 d.dst_reg = mapReg(reg_num, false);
+                d.len = @as(u8, @intCast(pos + 1));
+            } else {
+                d.op = .invalid;
+                d.len = @as(u8, @intCast(pos + 1));
             }
-            d.len = @as(u8, @intCast(pos + 1));
+        },
+        0x48...0x4F => {
+            if (mode == .compatibility) {
+                d.op = .dec_reg32;
+                const reg_num: u8 = opcode - 0x48;
+                d.dst_reg = mapReg(reg_num, false);
+                d.len = @as(u8, @intCast(pos + 1));
+            } else {
+                d.op = .invalid;
+                d.len = @as(u8, @intCast(pos + 1));
+            }
         },
 
         0xC9 => {
@@ -552,6 +595,14 @@ pub fn decodeInsn(bytes: []const u8) DecodedInsn {
 
     d.lock = has_f0;
     return d;
+}
+
+pub fn decodeInsn(bytes: []const u8) DecodedInsn {
+    return decodeInsnWithMode(bytes, .long64);
+}
+
+pub fn decodeInsnCompat(bytes: []const u8) DecodedInsn {
+    return decodeInsnWithMode(bytes, .compatibility);
 }
 
 // The D8 family targets ST(0); DC and DE target ST(i).  Their reversed
