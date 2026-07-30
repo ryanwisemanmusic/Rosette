@@ -1276,8 +1276,10 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     }
 
     if (std.mem.endsWith(u8, name, "_memcmp")) {
-        const lhs = self.guestMemoryConst(self.regs.rdi, self.regs.rdx) orelse return .{ .unsupported = 0 };
-        const rhs = self.guestMemoryConst(self.regs.rsi, self.regs.rdx) orelse return .{ .unsupported = 0 };
+        const n = self.regs.rdx;
+        if (n == 0) return .{ .handled = 0 };
+        const lhs = self.guestMemoryConst(self.regs.rdi, n) orelse return .{ .handled = 0 };
+        const rhs = self.guestMemoryConst(self.regs.rsi, n) orelse return .{ .handled = 0 };
         const cmp = std.mem.order(u8, lhs, rhs);
         return .{ .handled = switch (cmp) {
             .lt => @bitCast(@as(i64, -1)),
