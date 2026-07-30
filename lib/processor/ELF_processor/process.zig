@@ -1169,32 +1169,39 @@ pub const ElfState = struct {
         }
     }
 
-    fn executeBtrRegister(self: *ElfState, d: DecodedInsn) void {
-        const width = @as(u64, @intFromEnum(d.size));
-        const bit_index = self.regVal(d.src_reg, d.size) & (width - 1);
-        const mask = @as(u64, 1) << @as(u6, @intCast(bit_index));
+    fn executeBitTestRegister(
+        self: *ElfState,
+        d: DecodedInsn,
+        operation: x64_decoder.BitTestOperation,
+        immediate_index: bool,
+    ) void {
         const value = self.regVal(d.dst_reg, d.size);
-        self.setFlag(RFL_CF, value & mask != 0);
-        self.setReg(d.dst_reg, d.size, value & ~mask);
+        const raw_index = if (immediate_index) d.imm else self.regVal(d.src_reg, d.size);
+        const result = x64_decoder.bitTestRegister(d.size, value, raw_index, operation);
+        self.setFlag(RFL_CF, result.carry);
+        if (operation != .probe) self.setReg(d.dst_reg, d.size, result.value);
     }
 
-    fn executeBtrMemory(self: *ElfState, d: DecodedInsn) void {
-        const width = @as(i64, @intFromEnum(d.size));
-        const byte_width = @divExact(width, 8);
-        const raw_index = self.regVal(d.src_reg, d.size);
-        const bit_index: i64 = switch (d.size) {
-            .bits16 => @as(i16, @bitCast(@as(u16, @truncate(raw_index)))),
-            .bits32 => @as(i32, @bitCast(@as(u32, @truncate(raw_index)))),
-            .bits64 => @bitCast(raw_index),
-            .bits8 => unreachable,
+    fn executeBitTestMemory(
+        self: *ElfState,
+        d: DecodedInsn,
+        operation: x64_decoder.BitTestOperation,
+        immediate_index: bool,
+    ) void {
+        const operand = if (immediate_index)
+            x64_decoder.bitTestMemoryOperandImmediate(d.size, d.addr, d.imm)
+        else
+            x64_decoder.bitTestMemoryOperand(d.size, d.addr, self.regVal(d.src_reg, d.size));
+        const resolved = operand orelse {
+            self.faulted = true;
+            self.terminated = true;
+            self.exit_code = 127;
+            return;
         };
-        const element_offset = @divFloor(bit_index, width);
-        const element_address = d.addr +% @as(u64, @bitCast(element_offset * byte_width));
-        const bit_in_element: u6 = @intCast(@mod(bit_index, width));
-        const mask = @as(u64, 1) << bit_in_element;
-        const value = self.readMemVal(element_address, d.size);
-        self.setFlag(RFL_CF, value & mask != 0);
-        self.writeMemVal(element_address, d.size, value & ~mask);
+        const value = self.readMemVal(resolved.address, d.size);
+        const result = x64_decoder.bitTestRegister(d.size, value, resolved.bit_index, operation);
+        self.setFlag(RFL_CF, result.carry);
+        if (operation != .probe) self.writeMemVal(resolved.address, d.size, result.value);
     }
 
     fn bitWidth(size: Size) u7 {
@@ -1457,6 +1464,11 @@ pub const ElfState = struct {
             .cmc => self.regs.rflags ^= RFL_CF,
             .clc => self.regs.rflags &= ~RFL_CF,
             .stc => self.regs.rflags |= RFL_CF,
+            .lahf => {
+                const ah = @as(u64, x64_decoder.statusByteForLahf(self.regs.rflags));
+                self.regs.rax = (self.regs.rax & 0xFFFF_FFFF_FFFF_00FF) | (ah << 8);
+            },
+            .sahf => x64_decoder.applySahf(&self.regs.rflags, @truncate(self.regs.rax >> 8)),
 
             .fild_mem16, .fld_mem32, .fld_mem64, .fld_mem80, .fstp_mem32, .fstp_mem64, .fld_st, .fstp_st, .fxch_st, .ffree_st, .fninit, .fnstsw_ax, .fnstcw_mem16, .fldcw_mem16, .x87_binary, .fucomip_st => {},
 
@@ -1797,8 +1809,22 @@ pub const ElfState = struct {
                 self.writeMemVal(d.addr, d.size, ~self.readMemVal(d.addr, d.size));
             },
 
-            .btr_reg_reg => self.executeBtrRegister(d),
-            .btr_mem_reg => self.executeBtrMemory(d),
+            .bt_reg_reg => self.executeBitTestRegister(d, .probe, false),
+            .bt_mem_reg => self.executeBitTestMemory(d, .probe, false),
+            .bts_reg_reg => self.executeBitTestRegister(d, .set, false),
+            .bts_mem_reg => self.executeBitTestMemory(d, .set, false),
+            .btr_reg_reg => self.executeBitTestRegister(d, .reset, false),
+            .btr_mem_reg => self.executeBitTestMemory(d, .reset, false),
+            .btc_reg_reg => self.executeBitTestRegister(d, .complement, false),
+            .btc_mem_reg => self.executeBitTestMemory(d, .complement, false),
+            .bt_reg_imm => self.executeBitTestRegister(d, .probe, true),
+            .bt_mem_imm => self.executeBitTestMemory(d, .probe, true),
+            .bts_reg_imm => self.executeBitTestRegister(d, .set, true),
+            .bts_mem_imm => self.executeBitTestMemory(d, .set, true),
+            .btr_reg_imm => self.executeBitTestRegister(d, .reset, true),
+            .btr_mem_imm => self.executeBitTestMemory(d, .reset, true),
+            .btc_reg_imm => self.executeBitTestRegister(d, .complement, true),
+            .btc_mem_imm => self.executeBitTestMemory(d, .complement, true),
 
             // ── cmp r/m, reg (opcode 0x39) ──
             .cmp_mem8_reg8, .cmp_mem16_reg16, .cmp_mem32_reg32, .cmp_mem64_reg64 => self.executeHighwayMemoryBinary(d, .cmp, .register_to_memory),
@@ -3341,6 +3367,8 @@ fn decodeInsn(bytes: []const u8) DecodedInsn {
         0xF5 => return DecodedInsn{ .op = .cmc, .len = @intCast(pos) },
         0xF8 => return DecodedInsn{ .op = .clc, .len = @intCast(pos) },
         0xF9 => return DecodedInsn{ .op = .stc, .len = @intCast(pos) },
+        0x9E => return DecodedInsn{ .op = .sahf, .len = @intCast(pos) },
+        0x9F => return DecodedInsn{ .op = .lahf, .len = @intCast(pos) },
         0x00...0x03 => {
             // ADD r/m, r or ADD r, r/m
             if (pos >= bytes.len) return .{};
@@ -5093,6 +5121,28 @@ test "decode and execute shlq cl r14" {
     try testing.expectEqual(@as(u64, 128), state.regs.r14);
     try testing.expect((state.regs.rflags & RFL_ZF) == 0);
     try testing.expect((state.regs.rflags & RFL_SF) == 0);
+}
+
+test "decode and execute LAHF and SAHF" {
+    const lahf = decodeInsn(&[_]u8{0x9F});
+    try testing.expectEqual(Op.lahf, lahf.op);
+
+    var state = ElfState.init(testing.allocator);
+    defer state.deinit();
+    state.regs.rax = 0xAABB_CCDD_EEFF_0011;
+    state.regs.rflags = RFL_CF | RFL_AF | RFL_SF | RFL_OF | (1 << 10) | 0x02;
+    state.execute(lahf);
+    try testing.expectEqual(@as(u8, 0x93), @as(u8, @truncate(state.regs.rax >> 8)));
+    try testing.expectEqual(@as(u64, 0xAABB_CCDD_EEFF_9311), state.regs.rax);
+
+    const sahf = decodeInsn(&[_]u8{0x9E});
+    try testing.expectEqual(Op.sahf, sahf.op);
+    state.regs.rax = (state.regs.rax & 0xFFFF_FFFF_FFFF_00FF) | (@as(u64, 0x44) << 8);
+    state.execute(sahf);
+    try testing.expectEqual(
+        RFL_ZF | RFL_PF | RFL_OF | (1 << 10) | 0x02,
+        state.regs.rflags,
+    );
 }
 
 test "decode and execute shlq imm r9" {
