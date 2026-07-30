@@ -2,8 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 pub const AVX = @import("AVX/root.zig");
 pub const AVX2 = @import("AVX2/root.zig");
-pub const GATHER = @import("GATHER/root.zig");
-pub const SCATTER = @import("SCATTER/root.zig");
+// GATHER and SCATTER now live in AVX512F/root.zig
 pub const AVX512F = @import("AVX512F/root.zig");
 pub const AVX512DQ = @import("AVX512DQ/root.zig");
 pub const AVX512BW = @import("AVX512BW/root.zig");
@@ -449,24 +448,24 @@ pub const metas = [_]types.InstructionMeta{
     AVX512F.VCVTPH2PS.meta,
     AVX512F.VCVTPS2PH.meta,
     AVX512F.VCVTNEPS2BF16.meta,
-    // GATHER — indexed memory load
-    GATHER.VGATHERDPD.meta,
-    GATHER.VGATHERDPS.meta,
-    GATHER.VGATHERQPD.meta,
-    GATHER.VGATHERQPS.meta,
-    GATHER.VPGATHERDD.meta,
-    GATHER.VPGATHERDQ.meta,
-    GATHER.VPGATHERQD.meta,
-    GATHER.VPGATHERQQ.meta,
-    // SCATTER — indexed memory store
-    SCATTER.VSCATTERDPD.meta,
-    SCATTER.VSCATTERDPS.meta,
-    SCATTER.VSCATTERQPD.meta,
-    SCATTER.VSCATTERQPS.meta,
-    SCATTER.VPSCATTERDD.meta,
-    SCATTER.VPSCATTERDQ.meta,
-    SCATTER.VPSCATTERQD.meta,
-    SCATTER.VPSCATTERQQ.meta,
+    // GATHER — indexed memory load (AVX512F)
+    AVX512F.VGATHERDPD.meta,
+    AVX512F.VGATHERDPS.meta,
+    AVX512F.VGATHERQPD.meta,
+    AVX512F.VGATHERQPS.meta,
+    AVX512F.VPGATHERDD.meta,
+    AVX512F.VPGATHERDQ.meta,
+    AVX512F.VPGATHERQD.meta,
+    AVX512F.VPGATHERQQ.meta,
+    // SCATTER — indexed memory store (AVX512F)
+    AVX512F.VSCATTERDPD.meta,
+    AVX512F.VSCATTERDPS.meta,
+    AVX512F.VSCATTERQPD.meta,
+    AVX512F.VSCATTERQPS.meta,
+    AVX512F.VPSCATTERDD.meta,
+    AVX512F.VPSCATTERDQ.meta,
+    AVX512F.VPSCATTERQD.meta,
+    AVX512F.VPSCATTERQQ.meta,
 };
 
 pub fn tableCount() usize {

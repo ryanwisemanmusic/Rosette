@@ -158,6 +158,24 @@ pub const VBROADCASTI32X4 = @import("VBROADCASTI32X4.zig");
 pub const VBROADCASTI32X8 = @import("VBROADCASTI32X8.zig");
 pub const VBROADCASTI64X2 = @import("VBROADCASTI64X2.zig");
 pub const VBROADCASTI64X4 = @import("VBROADCASTI64X4.zig");
+// GATHER — indexed memory load (AVX512F)
+pub const VGATHERDPD = @import("VGATHERDPD.zig");
+pub const VGATHERDPS = @import("VGATHERDPS.zig");
+pub const VGATHERQPD = @import("VGATHERQPD.zig");
+pub const VGATHERQPS = @import("VGATHERQPS.zig");
+pub const VPGATHERDD = @import("VPGATHERDD.zig");
+pub const VPGATHERDQ = @import("VPGATHERDQ.zig");
+pub const VPGATHERQD = @import("VPGATHERQD.zig");
+pub const VPGATHERQQ = @import("VPGATHERQQ.zig");
+// SCATTER — indexed memory store (AVX512F)
+pub const VSCATTERDPD = @import("VSCATTERDPD.zig");
+pub const VSCATTERDPS = @import("VSCATTERDPS.zig");
+pub const VSCATTERQPD = @import("VSCATTERQPD.zig");
+pub const VSCATTERQPS = @import("VSCATTERQPS.zig");
+pub const VPSCATTERDD = @import("VPSCATTERDD.zig");
+pub const VPSCATTERDQ = @import("VPSCATTERDQ.zig");
+pub const VPSCATTERQD = @import("VPSCATTERQD.zig");
+pub const VPSCATTERQQ = @import("VPSCATTERQQ.zig");
 
 const types = @import("../types.zig");
 
@@ -322,6 +340,24 @@ pub const metas = [_]types.InstructionMeta{
     VBROADCASTI32X8.meta,
     VBROADCASTI64X2.meta,
     VBROADCASTI64X4.meta,
+    // GATHER — indexed memory load (AVX512F)
+    VGATHERDPD.meta,
+    VGATHERDPS.meta,
+    VGATHERQPD.meta,
+    VGATHERQPS.meta,
+    VPGATHERDD.meta,
+    VPGATHERDQ.meta,
+    VPGATHERQD.meta,
+    VPGATHERQQ.meta,
+    // SCATTER — indexed memory store (AVX512F)
+    VSCATTERDPD.meta,
+    VSCATTERDPS.meta,
+    VSCATTERQPD.meta,
+    VSCATTERQPS.meta,
+    VPSCATTERDD.meta,
+    VPSCATTERDQ.meta,
+    VPSCATTERQD.meta,
+    VPSCATTERQQ.meta,
 };
 
 pub fn validateAll() types.SafetyError!void {
