@@ -81,9 +81,9 @@ pub const specs = [_]StageSpec{
     .{ .stage = .guest_main_ready, .subsystem = .guest_thread, .description = "LaunchModule returned a running guest main thread" },
     .{ .stage = .complete_launch_ready, .subsystem = .xex_loader, .description = "CompleteLaunch returned success" },
     .{ .stage = .ring_buffer_ready, .subsystem = .ring_buffer, .description = "guest command ring buffer initialized" },
-    .{ .stage = .surface_ready, .subsystem = .window_surface, .description = "presenter connected to a drawable surface and swapchain" },
+    .{ .stage = .surface_ready, .subsystem = .window_surface, .description = "presenter obtained a surface and swapchain (not proof of native image backing)" },
     .{ .stage = .guest_output_ready, .subsystem = .guest_output, .description = "first guest output image reached the presenter" },
-    .{ .stage = .first_present, .subsystem = .presentation, .description = "first swapchain presentation succeeded" },
+    .{ .stage = .first_present, .subsystem = .presentation, .description = "first presentation API call returned success (not proof of visible drawable pixels)" },
 };
 
 pub fn spec(stage: Stage) *const StageSpec {

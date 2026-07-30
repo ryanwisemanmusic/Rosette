@@ -31,8 +31,32 @@ pub const Engine = struct {
     out_of_order_events: u64 = 0,
     last_event_step: u64 = 0,
     frontier: ?Stage = null,
+    title_launch_failed: bool = false,
+    title_path_empty: bool = false,
+    gpu_callback_import_ready: bool = false,
+    gpu_callback_registration_pending: bool = false,
+    gpu_callback_registered: bool = false,
+    gpu_callback_pending_events: u64 = 0,
+    gpu_callback_first_pending_step: u64 = 0,
+    gpu_callback_registered_step: u64 = 0,
 
     pub fn observeLine(self: *Engine, line: []const u8, step: u64) ?Observation {
+        self.observeGpuCallbackContract(line, step);
+        if (contains(line, "Failed to launch title path is empty") or
+            contains(line, "DEBUG: TARGET PATH: ''"))
+        {
+            self.title_launch_failed = true;
+            self.title_path_empty = true;
+        } else if ((contains(line, "RunTitle returned:") or
+            contains(line, "RunTitle returned result:")) and
+            contains(line, "not X_STATUS_SUCCESS"))
+        {
+            self.title_launch_failed = true;
+        } else if (contains(line, "CompleteLaunch SUCCEEDED")) {
+            self.title_launch_failed = false;
+            self.title_path_empty = false;
+        }
+
         const stage = classifyLine(line) orelse return null;
         self.observations +|= 1;
         self.last_event_step = step;
@@ -87,8 +111,25 @@ pub const Engine = struct {
     }
 
     pub fn verdict(self: *const Engine) []const u8 {
-        if (self.hasReached(.first_present)) return "first frame presented";
+        if (self.hasReached(.first_present)) {
+            return "presentation API returned success; visible drawable pixels are not independently proven";
+        }
+        if (self.title_path_empty and !self.hasReached(.user_module_ready)) {
+            return "title launch failed because the target path became empty; prelaunch graphics readiness cannot produce a frame";
+        }
+        if (self.title_launch_failed and !self.hasReached(.user_module_ready)) {
+            return "title launch failed; no guest frame can be produced";
+        }
         if (self.hasReached(.guest_output_ready)) return "guest output reached presenter; first present not yet proven";
+        if (self.hasReached(.guest_main_ready) and
+            self.gpu_callback_registration_pending and
+            !self.gpu_callback_registered)
+        {
+            return if (self.gpu_callback_import_ready)
+                "guest main thread running; GPU callback import is ready and guest callback registration is pending"
+            else
+                "guest main thread running; guest GPU callback registration is pending and import readiness is unproven";
+        }
         if (self.hasReached(.guest_main_ready)) return "guest main thread running; GPU ring/output milestones remain";
         if (self.hasReached(.user_module_ready)) return "title image ready; guest main thread not yet proven";
         if (self.hasReached(.emulator_setup_ready)) return "emulator setup ready; title launch not yet proven";
@@ -103,7 +144,7 @@ pub const Engine = struct {
         if (self.observations == 0) return;
         const next = self.nextRequired();
         machoCapturePrint(
-            "macho-processor: Xenia pipeline summary: frontier={s} reached={d}/{d} observations={d} duplicates={d} out_of_order={d} last_progress_step={d} idle_steps={d} next={s} next_subsystem={s} verdict={s}\n",
+            "macho-processor: Xenia pipeline summary: frontier={s} reached={d}/{d} observations={d} duplicates={d} out_of_order={d} title_launch_failed={} title_path_empty={} last_progress_step={d} idle_steps={d} next={s} next_subsystem={s} verdict={s}\n",
             .{
                 if (self.frontier) |stage| @tagName(stage) else "none",
                 self.unique_stages,
@@ -111,6 +152,8 @@ pub const Engine = struct {
                 self.observations,
                 self.duplicate_events,
                 self.out_of_order_events,
+                self.title_launch_failed,
+                self.title_path_empty,
                 self.lastEventForFrontier(),
                 self.stepsSinceProgress(current_step),
                 if (next) |stage| @tagName(stage) else "none",
@@ -123,6 +166,59 @@ pub const Engine = struct {
                 "macho-processor: Xenia pipeline next contract: stage={s} subsystem={s} evidence={s}\n",
                 .{ @tagName(stage), @tagName(contracts.spec(stage).subsystem), contracts.spec(stage).description },
             );
+        }
+        machoCapturePrint(
+            "macho-processor: Xenia GPU callback contract: import_ready={} registration_pending={} registered={} pending_events={d} first_pending_step={d} registered_step={d}\n",
+            .{
+                self.gpu_callback_import_ready,
+                self.gpu_callback_registration_pending,
+                self.gpu_callback_registered,
+                self.gpu_callback_pending_events,
+                self.gpu_callback_first_pending_step,
+                self.gpu_callback_registered_step,
+            },
+        );
+    }
+
+    fn observeGpuCallbackContract(self: *Engine, line: []const u8, step: u64) void {
+        const import_probe_ready =
+            contains(line, "callback-missing import probe ordinal=0x1D5") and
+            contains(line, "thunk_sc2_stub=YES");
+        const import_gate_ready =
+            contains(line, "critical GPU static import probes are valid") and
+            contains(line, "probe_01D5=READY");
+        const export_implementation_ready =
+            contains(line, "export verify critical ordinal=0x1D5") and
+            contains(line, "VdSetGraphicsInterruptCallback") and
+            contains(line, "implemented=YES");
+        const preinitialized_import_ready =
+            contains(line, "VdSetGraphicsInterruptCallback import is preinitialized");
+        if (import_probe_ready or import_gate_ready or
+            export_implementation_ready or preinitialized_import_ready)
+        {
+            self.gpu_callback_import_ready = true;
+        }
+
+        const registration_pending =
+            contains(line, "GPU interrupt callback not set") or
+            contains(line, "GPU interrupt callback registration pending");
+        if (registration_pending and !self.gpu_callback_registered) {
+            self.gpu_callback_registration_pending = true;
+            self.gpu_callback_pending_events +|= 1;
+            if (self.gpu_callback_first_pending_step == 0) {
+                self.gpu_callback_first_pending_step = step;
+            }
+        }
+
+        const registration_executed =
+            contains(line, "VdSetGraphicsInterruptCallback EXECUTED:") or
+            contains(line, "GPU interrupt callback set #");
+        if (registration_executed) {
+            self.gpu_callback_registered = true;
+            self.gpu_callback_registration_pending = false;
+            if (self.gpu_callback_registered_step == 0) {
+                self.gpu_callback_registered_step = step;
+            }
         }
     }
 
@@ -168,7 +264,8 @@ pub fn classifyLine(line: []const u8) ?Stage {
     if (contains(line, "Guest main thread ready")) return .guest_main_ready;
     if (contains(line, "CompleteLaunch SUCCEEDED")) return .complete_launch_ready;
     if (contains(line, "RING BUFFER INITIALIZED") or
-        contains(line, "InitializeRingBuffer completed"))
+        contains(line, "InitializeRingBuffer completed") or
+        contains(line, "InitializeRingBuffer COMPLETE"))
         return .ring_buffer_ready;
     if (contains(line, "Created") and contains(line, "swapchain") or
         contains(line, "surface binding validated"))
@@ -217,7 +314,103 @@ test "pipeline records the setup launch and first-frame frontier" {
     }
     try std.testing.expectEqual(Stage.first_present, engine.frontier.?);
     try std.testing.expect(engine.nextRequired() == null);
-    try std.testing.expectEqualStrings("first frame presented", engine.verdict());
+    try std.testing.expectEqualStrings(
+        "presentation API returned success; visible drawable pixels are not independently proven",
+        engine.verdict(),
+    );
+}
+
+test "pipeline recognizes the Xenia ring-buffer completion breadcrumb" {
+    try std.testing.expectEqual(
+        Stage.ring_buffer_ready,
+        classifyLine(
+            "RING BUFFER: InitializeRingBuffer COMPLETE rb_base=FFAA9000 rb_size=00200000 read_ptr=00000000 write_ptr=00000000 init=YES",
+        ).?,
+    );
+}
+
+test "pipeline distinguishes callback import readiness from guest registration" {
+    var engine = Engine{};
+    const setup_lines = [_][]const u8{
+        "Setup: Initializing Memory...",
+        "Setup: Initializing Exports...",
+        "Setup: Processor setup completed successfully",
+        "Setup: Creating patcher...",
+        "PIPELINE: Kernel guest globals begin",
+        "PIPELINE: Kernel guest globals ready",
+        "Setup: Kernel initialization completed successfully",
+        "Setup: Setting up graphics system...",
+        "DEBUG: CommandProcessor::Initialize() SUCCEEDED!",
+        "Setup: Graphics system setup completed successfully",
+        "Setup: DEBUG: Emulator setup completed successfully!",
+        "DEBUG: Emulator::LaunchPath ENTRY",
+        "LaunchPath: Detected XISO",
+        "DEBUG: Emulator::CompleteLaunch ENTRY",
+        "DEBUG: Module loaded successfully",
+        "DEBUG: User module finished loading successfully",
+        "DEBUG: Shader storage init request completed",
+        "DEBUG: Guest main thread ready",
+    };
+    for (setup_lines, 0..) |line, index| {
+        _ = engine.observeLine(line, index + 1).?;
+    }
+    try std.testing.expect(engine.observeLine(
+        "RING BUFFER: callback-missing import probe ordinal=0x1D5 name=VdSetGraphicsInterruptCallback thunk_sc2_stub=YES",
+        30,
+    ) == null);
+    try std.testing.expect(engine.observeLine(
+        "RING BUFFER: GPU interrupt callback registration pending during guest bootstrap grace",
+        31,
+    ) == null);
+    try std.testing.expect(engine.gpu_callback_import_ready);
+    try std.testing.expect(engine.gpu_callback_registration_pending);
+    try std.testing.expect(!engine.gpu_callback_registered);
+    try std.testing.expectEqual(@as(u64, 31), engine.gpu_callback_first_pending_step);
+    try std.testing.expectEqualStrings(
+        "guest main thread running; GPU callback import is ready and guest callback registration is pending",
+        engine.verdict(),
+    );
+
+    try std.testing.expect(engine.observeLine(
+        "VdSetGraphicsInterruptCallback EXECUTED: cb=82590000 arg=00000000",
+        40,
+    ) == null);
+    try std.testing.expect(engine.gpu_callback_registered);
+    try std.testing.expect(!engine.gpu_callback_registration_pending);
+    try std.testing.expectEqual(@as(u64, 40), engine.gpu_callback_registered_step);
+}
+
+test "pipeline recognizes implemented callback export before registration" {
+    var engine = Engine{};
+    try std.testing.expect(engine.observeLine(
+        "RING BUFFER: export verify critical ordinal=0x1D5 required_name=VdSetGraphicsInterruptCallback export_name=VdSetGraphicsInterruptCallback state=ordinal-match type=function implemented=YES",
+        10,
+    ) == null);
+    try std.testing.expect(engine.gpu_callback_import_ready);
+
+    try std.testing.expect(engine.observeLine(
+        "RING BUFFER: GPU interrupt callback registration pending during guest bootstrap grace (vblank_id=1 age=0ms grace=500ms); VdSetGraphicsInterruptCallback import is preinitialized",
+        20,
+    ) == null);
+    try std.testing.expect(engine.gpu_callback_registration_pending);
+    try std.testing.expect(engine.gpu_callback_import_ready);
+}
+
+test "pipeline reports an empty RunTitle path as the frame blocker" {
+    var engine = Engine{};
+    _ = engine.observeLine("Setup: Initializing Memory...", 10).?;
+    _ = engine.observeLine("Setup: Initializing Exports...", 20).?;
+    _ = engine.observeLine("Setup: Processor setup completed successfully", 30).?;
+    try std.testing.expect(engine.observeLine(
+        "Failed to launch title path is empty.",
+        40,
+    ) == null);
+    try std.testing.expect(engine.title_launch_failed);
+    try std.testing.expect(engine.title_path_empty);
+    try std.testing.expectEqualStrings(
+        "title launch failed because the target path became empty; prelaunch graphics readiness cannot produce a frame",
+        engine.verdict(),
+    );
 }
 
 test "pipeline keeps a missing kernel-global completion visible" {

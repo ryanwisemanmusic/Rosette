@@ -112,8 +112,16 @@ pub const Engine = struct {
     pub fn classifyAssertion(file: []const u8, line: u64, function: []const u8) AssertionBinding {
         const backend_file = std.mem.indexOf(u8, file, "x64_backend") != null;
         const backend_function = std.mem.indexOf(u8, function, "X64Backend") != null;
-        if (!backend_file and !backend_function) return .none;
+        const assembler_file = std.mem.endsWith(u8, file, "x64_assembler.cc");
+        const assembler_function = std.mem.indexOf(u8, function, "X64Assembler") != null;
+        if (!backend_file and !backend_function and !assembler_file and !assembler_function) return .none;
         if (std.mem.endsWith(u8, file, "x64_backend_mac.cc") and line == 139) {
+            return .x64_backend_capstone;
+        }
+        // Older macOS-port builds asserted directly on cs_open in the
+        // assembler constructor. Keep a small line window because local
+        // diagnostic edits shift this site without changing its meaning.
+        if (assembler_file and assembler_function and line >= 38 and line <= 55) {
             return .x64_backend_capstone;
         }
         if (std.mem.endsWith(u8, file, "x64_backend_mac.cc") and line == 438) {
@@ -321,6 +329,17 @@ test "mac backend line 139 binds to capstone initialization" {
     try std.testing.expect(engine.signalReturnCorrelates(0xDA80DF));
     engine.noteSignalReturn();
     try std.testing.expect(!engine.signalReturnCorrelates(0xDA80DF));
+}
+
+test "x64 assembler constructor assertion binds to capstone initialization" {
+    try std.testing.expectEqual(
+        AssertionBinding.x64_backend_capstone,
+        Engine.classifyAssertion("x64_assembler.cc", 42, "X64Assembler"),
+    );
+    try std.testing.expectEqual(
+        AssertionBinding.x64_backend_capstone,
+        Engine.classifyAssertion("/src/xenia/cpu/backend/x64/x64_assembler.cc", 48, "X64Assembler"),
+    );
 }
 
 test "mac backend line 438 binds to low 32-bit thunk placement" {
