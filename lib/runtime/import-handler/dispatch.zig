@@ -101,7 +101,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .terminated = exit_code };
     }
     if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove") or
-        std.mem.eql(u8, name, "___memcpy_chk"))
+        std.mem.eql(u8, name, "___memcpy_chk") or std.mem.eql(u8, name, "___memmove_chk"))
     {
         self.resolving_import_route = .guest_memory_copy;
         return handleGuestMemoryCopy(self, name);
@@ -417,8 +417,8 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 );
                 if (backend_binding == .x64_backend_capstone) {
                     machoCapturePrint(
-                        "  x64 backend assertion cause: source line 139 is the failure branch of cs_open(CS_ARCH_X86, CS_MODE_64, &capstone_handle_); this indicates Capstone initialization failure inside an existing X64Backend constructor, not absence of the backend object\n",
-                        .{},
+                        "  x64 backend assertion cause: {s}:{d} is a cs_open(CS_ARCH_X86, CS_MODE_64, ...) failure branch in the x64 backend/assembler; this indicates optional Capstone initialization failure, not absence of the backend, compiler, or code cache\n",
+                        .{ file_name, self.regs.rdx },
                     );
                     machoCapturePrint(
                         "  x64 backend assertion impact: Capstone-backed disassembly/introspection is unreliable until proven otherwise; subsequent backend/code-cache/processor success events will be logged as independent readiness evidence\n",
@@ -764,9 +764,33 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     {
         const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
         if (!ok) {
+            const source_view = compat_runtime.libcppStringView(self, self.regs.rsi);
+            const source_data_mapped = if (source_view) |view|
+                self.guestMemoryConst(view.address, view.length) != null
+            else
+                false;
+            const State = @typeInfo(@TypeOf(self)).pointer.child;
+            const heap_next = if (comptime @hasField(State, "heap_next"))
+                self.heap_next
+            else
+                0;
             machoCapturePrint(
-                "macho-processor: libc++ string copy rejected: destination=0x{x} source=0x{x} destination_mapped={} source_mapped={}\n",
-                .{ self.regs.rdi, self.regs.rsi, self.guestMemoryConst(self.regs.rdi, 24) != null, self.guestMemoryConst(self.regs.rsi, 24) != null },
+                "macho-processor: libc++ string copy rejected: destination=0x{x} source=0x{x} destination_mapped={} source_mapped={} source_data=0x{x} source_length={d} source_data_mapped={} heap_next=0x{x} likely_stage={s}\n",
+                .{
+                    self.regs.rdi,
+                    self.regs.rsi,
+                    self.guestMemoryConst(self.regs.rdi, 24) != null,
+                    self.guestMemoryConst(self.regs.rsi, 24) != null,
+                    if (source_view) |view| view.address else 0,
+                    if (source_view) |view| view.length else 0,
+                    source_data_mapped,
+                    heap_next,
+                    if (source_data_mapped and
+                        (if (source_view) |view| view.length >= 23 else false))
+                        "long_string_destination_allocation"
+                    else
+                        "source_validation",
+                },
             );
         }
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
@@ -1905,10 +1929,12 @@ pub fn handleGuestMemoryCopy(self: anytype, name: []const u8) ImportHandlerResul
     const destination_address = self.regs.rdi;
     const source_address = self.regs.rsi;
     const count = self.regs.rdx;
-    if (std.mem.eql(u8, name, "___memcpy_chk") and count > self.regs.rcx) {
+    if ((std.mem.eql(u8, name, "___memcpy_chk") or std.mem.eql(u8, name, "___memmove_chk")) and
+        count > self.regs.rcx)
+    {
         machoCapturePrint(
-            "macho-processor: fortified memcpy rejected: destination=0x{x} source=0x{x} bytes={d} destination_size={d}\n",
-            .{ destination_address, source_address, count, self.regs.rcx },
+            "macho-processor: fortified memory move rejected: import={s} destination=0x{x} source=0x{x} bytes={d} destination_size={d}\n",
+            .{ name, destination_address, source_address, count, self.regs.rcx },
         );
         return .{ .terminated = 134 };
     }
