@@ -56,6 +56,7 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "llabs", .handler = @import("handlers.zig").llabs },
     .{ .name_pattern = "strlen", .handler = @import("handlers.zig").strlen },
     .{ .name_pattern = "memcmp", .handler = @import("handlers.zig").memcmp },
+    .{ .name_pattern = "memcpy", .handler = @import("handlers.zig").memcpy },
     .{ .name_pattern = "strcmp", .handler = @import("handlers.zig").strcmp },
     .{ .name_pattern = "strncmp", .handler = @import("handlers.zig").strncmp },
     .{ .name_pattern = "__cxa_guard_acquire", .handler = @import("handlers.zig").cxaGuardAcquire },

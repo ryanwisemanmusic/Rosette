@@ -38,10 +38,29 @@ pub fn cxaGuardAbort(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled_void;
 }
 
+pub fn memcpy(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const dst = ctx.readArg(0);
+    const src = ctx.readArg(1);
+    const n = ctx.readArg(2);
+    if (n == 0) {
+        ctx.setResult(dst);
+        return .handled;
+    }
+    const source_data = ctx.readGuest(src, @intCast(n)) orelse return .unsupported;
+    ctx.writeGuest(dst, source_data) orelse return .unsupported;
+    ctx.setResult(dst);
+    return .handled;
+}
+
 pub fn memcmp(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     const s1 = ctx.readArg(0);
     const s2 = ctx.readArg(1);
     const n = ctx.readArg(2);
+    // memcmp with zero length always returns 0 regardless of pointer validity.
+    if (n == 0) {
+        ctx.setResult(0);
+        return .handled;
+    }
     var i: u64 = 0;
     while (i < n) : (i += 1) {
         const b1 = ctx.readGuest(s1 + i, 1) orelse return .unsupported;
