@@ -1020,7 +1020,7 @@ pub const Runtime = struct {
         return result;
     }
 
-    fn numericThreadId(self: *Runtime, handle: u64) u64 {
+    pub fn numericThreadId(self: *Runtime, handle: u64) u64 {
         if (handle == 0 or handle == CURRENT_THREAD_HANDLE) return 1;
         for (&self.threads) |*thread| {
             if (thread.active and thread.handle == handle) {
