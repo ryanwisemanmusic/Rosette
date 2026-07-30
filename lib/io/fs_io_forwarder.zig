@@ -3,6 +3,17 @@ const path_translation = @import("path_translation.zig");
 const fd_management = @import("fd_management.zig");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 
+/// mmap owns complete Darwin VM pages even when the caller requests only a
+/// few bytes. The primary-memory fallback must preserve that ownership just
+/// like the sparse mmap backend does; otherwise a later heap allocation may
+/// share a page that mprotect has made read-only.
+fn pageOwnedMmapLength(requested_length: u64) ?u64 {
+    if (requested_length == 0) return null;
+    const page_size: u64 = std.heap.page_size_min;
+    const padded = std.math.add(u64, requested_length, page_size - 1) catch return null;
+    return padded & ~(page_size - 1);
+}
+
 extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
 extern "c" fn shm_unlink(name: [*:0]const u8) c_int;
 extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
@@ -929,36 +940,67 @@ pub const Forwarder = struct {
                 return mapped;
             }
         }
-        const mapped = state.guestHeapAllocate(length, 4096) orelse {
-            if (backend_trace) {
-                machoCapturePrint(
-                    "macho-processor: x64 backend mmap FAILED: route=import stage=guest_heap_allocate address=0x{x} length={d} heap allocation could not satisfy backend request\n",
-                    .{ state.regs.rdi, length },
-                );
-            }
-            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "guest_heap_allocate");
+        // Small non-fixed mappings still need true mmap page ownership. Keep
+        // them in the low primary guest window for Xenia/Xbyak reachability,
+        // but reserve and align the full Darwin page span so ordinary C++
+        // allocations cannot occupy the tail of an mprotected mapping.
+        const effective_length = pageOwnedMmapLength(length) orelse {
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "page_owned_length");
             return @bitCast(@as(i64, -1));
         };
-        const destination = state.guestMemory(mapped, length) orelse {
+        const mapped = state.guestHeapAllocate(effective_length, std.heap.page_size_min) orelse {
+            if (backend_trace) {
+                machoCapturePrint(
+                    "macho-processor: x64 backend mmap FAILED: route=import stage=guest_heap_page_owned address=0x{x} requested_length={d} effective_length={d} page_size={d} heap allocation could not satisfy backend request\n",
+                    .{ state.regs.rdi, length, effective_length, std.heap.page_size_min },
+                );
+            }
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "guest_heap_page_owned");
+            return @bitCast(@as(i64, -1));
+        };
+        const destination = state.guestMemory(mapped, effective_length) orelse {
             state.guestHeapRelease(mapped);
             if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "guest_heap_backing");
             return @bitCast(@as(i64, -1));
         };
         @memset(destination, 0);
+        const requested_length_usize = std.math.cast(usize, length) orelse {
+            state.guestHeapRelease(mapped);
+            if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "requested_length_cast");
+            return @bitCast(@as(i64, -1));
+        };
         if (!map_flags.ANONYMOUS and state.regs.r8 != std.math.maxInt(u64)) {
             const host_fd = self.fd_manager.hostFd(state.regs.r8) orelse {
                 state.guestHeapRelease(mapped);
                 if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "file_fd_translation");
                 return @bitCast(@as(i64, -1));
             };
-            const rc = std.c.pread(host_fd, destination.ptr, destination.len, offset);
+            // The rounded tail is zero-fill VM ownership, not additional file
+            // data. Read only the byte count the guest requested.
+            const rc = std.c.pread(host_fd, destination.ptr, requested_length_usize, offset);
             if (rc < 0) {
                 state.guestHeapRelease(mapped);
                 if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "file_pread");
                 return @bitCast(@as(i64, -1));
             }
         }
-        if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, mapped, "guest_heap_allocate");
+        // Apply the requested mmap permissions only after Rosette has
+        // initialized the backing. This also makes small PROT_NONE/read-only
+        // mappings truthful instead of silently leaving them writable.
+        if (comptime @hasDecl(@TypeOf(state.*), "guestProtectMappedMemory")) {
+            if (!state.guestProtectMappedMemory(mapped, effective_length, @truncate(state.regs.rdx))) {
+                state.guestHeapRelease(mapped);
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(false, 0, "guest_heap_initial_protection");
+                return @bitCast(@as(i64, -1));
+            }
+        }
+        if (backend_trace or effective_length != length) {
+            machoCapturePrint(
+                "macho-processor: mmap page ownership established: guest_base=0x{x} requested_length={d} effective_length={d} page_tail={d} alignment={d} route=primary_page_owned_heap\n",
+                .{ mapped, length, effective_length, effective_length - length, std.heap.page_size_min },
+            );
+        }
+        if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, mapped, "guest_heap_page_owned");
         return mapped;
     }
 
@@ -966,6 +1008,13 @@ pub const Forwarder = struct {
         _ = self;
         if (state.guestUnmapFile(state.regs.rdi, state.regs.rsi)) return 0;
         if (!state.guestHeapContains(state.regs.rdi)) return @bitCast(@as(i64, -1));
+        // Heap-backed mmap pages may have been made read-only. The allocation
+        // manager can reuse this range after release, so restore allocator
+        // permissions for the complete page-owned span first.
+        if (comptime @hasDecl(@TypeOf(state.*), "guestProtectMappedMemory")) {
+            const effective_length = pageOwnedMmapLength(state.regs.rsi) orelse return @bitCast(@as(i64, -1));
+            if (!state.guestProtectMappedMemory(state.regs.rdi, effective_length, 0x3)) return @bitCast(@as(i64, -1));
+        }
         state.guestHeapRelease(state.regs.rdi);
         return 0;
     }
@@ -975,7 +1024,7 @@ pub const Forwarder = struct {
         const sparse_succeeded = state.guestProtectSparseMemory(state.regs.rdi, state.regs.rsi, @truncate(state.regs.rdx));
         const result: u64 = if (sparse_succeeded)
             0
-        else if (state.guestMemory(state.regs.rdi, state.regs.rsi) != null)
+        else if (state.guestProtectMappedMemory(state.regs.rdi, state.regs.rsi, @truncate(state.regs.rdx)))
             0
         else
             @bitCast(@as(i64, -1));
@@ -1064,6 +1113,15 @@ pub const Forwarder = struct {
         state.setGuestErrno(value);
     }
 };
+
+test "small mmap fallback owns a complete Darwin VM page" {
+    const page_size: u64 = std.heap.page_size_min;
+    try std.testing.expectEqual(@as(?u64, page_size), pageOwnedMmapLength(1648));
+    try std.testing.expectEqual(@as(?u64, page_size), pageOwnedMmapLength(page_size));
+    try std.testing.expectEqual(@as(?u64, page_size * 2), pageOwnedMmapLength(page_size + 1));
+    try std.testing.expectEqual(@as(?u64, null), pageOwnedMmapLength(0));
+    try std.testing.expectEqual(@as(?u64, null), pageOwnedMmapLength(std.math.maxInt(u64)));
+}
 
 fn isMacOSMetadataEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, ".DS_Store") or

@@ -55,6 +55,8 @@ pub const Bridge = struct {
     capacity_calls: u64 = 0,
     copy_calls: u64 = 0,
     errors_written: u64 = 0,
+    absolute_path_clones: u64 = 0,
+    path_write_failures: u64 = 0,
 
     pub fn dispatch(self: *Bridge, state: anytype, fs: anytype, name: []const u8) ?Outcome {
         if (std.mem.eql(u8, name, "__ZNSt3__14__fs10filesystem8__statusERKNS1_4pathEPNS_10error_codeE")) {
@@ -123,8 +125,8 @@ pub const Bridge = struct {
     pub fn logSummary(self: *const Bridge) void {
         if (self.status_calls == 0 and self.path_calls == 0 and self.mutation_calls == 0 and self.capacity_calls == 0 and self.copy_calls == 0) return;
         machoCapturePrint(
-            "macho-processor: libc++ filesystem: status={d} paths={d} capacity={d} mutations={d} copies={d} errors={d}\n",
-            .{ self.status_calls, self.path_calls, self.capacity_calls, self.mutation_calls, self.copy_calls, self.errors_written },
+            "macho-processor: libc++ filesystem: status={d} paths={d} capacity={d} mutations={d} copies={d} errors={d} absolute_clones={d} path_write_failures={d}\n",
+            .{ self.status_calls, self.path_calls, self.capacity_calls, self.mutation_calls, self.copy_calls, self.errors_written, self.absolute_path_clones, self.path_write_failures },
         );
     }
 
@@ -164,20 +166,55 @@ pub const Bridge = struct {
     fn absolute(self: *Bridge, state: anytype, fs: anytype) u64 {
         self.path_calls +|= 1;
         const output = state.regs.rdi;
-        const path = pathView(state, state.regs.rsi) orelse return output;
-        var translated_buffer: [4096]u8 = undefined;
-        const translated = fs.resolveHostPath(path, &translated_buffer) orelse return output;
-        if (std.fs.path.isAbsolute(translated)) {
-            _ = compat_runtime.initLibcppStringFromSlice(state, output, translated);
-            self.writeErrorCode(state, state.regs.rdx, 0, false);
+        const input = state.regs.rsi;
+        const path = pathView(state, input) orelse return output;
+
+        // `filesystem::absolute` is an identity operation for an already
+        // absolute path. Preserve the complete libc++ path object directly.
+        // This also avoids requiring a compatibility-heap allocation merely
+        // to duplicate a long pathname during early startup. Rosette's
+        // modeled libc++ string destructor uses arena lifetime, so sharing the
+        // immutable long-string backing store is intentional and safe here.
+        if (std.fs.path.isAbsolute(path)) {
+            if (clonePathObject(state, output, input)) {
+                self.absolute_path_clones +|= 1;
+                self.writeErrorCode(state, state.regs.rdx, 0, false);
+                if (shouldTrace(self.path_calls) or isDiagnosticPath(path)) {
+                    machoCapturePrint(
+                        "macho-processor: libc++ filesystem absolute #{d}: preserved absolute guest_path={s} input=0x{x} output=0x{x}\n",
+                        .{ self.path_calls, path, input, output },
+                    );
+                }
+            } else {
+                self.path_write_failures +|= 1;
+                self.writeErrorCode(state, state.regs.rdx, @intFromEnum(std.c.E.IO), false);
+                machoCapturePrint(
+                    "macho-processor: libc++ filesystem absolute FAILED: unable to clone absolute guest_path={s} input=0x{x} output=0x{x}\n",
+                    .{ path, input, output },
+                );
+            }
             return output;
         }
+
+        var translated_buffer: [4096]u8 = undefined;
+        const translated = fs.resolveHostPath(path, &translated_buffer) orelse return output;
         var cwd_buffer: [4096]u8 = undefined;
         const cwd_ptr = std.c.getcwd(&cwd_buffer, cwd_buffer.len) orelse return output;
         const cwd = std.mem.sliceTo(cwd_ptr, 0);
         var result: [4096]u8 = undefined;
-        const joined = joinPath(&result, cwd, translated) orelse return output;
-        _ = compat_runtime.initLibcppStringFromSlice(state, output, joined);
+        const absolute_path = if (std.fs.path.isAbsolute(translated))
+            translated
+        else
+            joinPath(&result, cwd, translated) orelse return output;
+        if (!writePathObject(state, output, absolute_path)) {
+            self.path_write_failures +|= 1;
+            self.writeErrorCode(state, state.regs.rdx, @intFromEnum(std.c.E.IO), false);
+            machoCapturePrint(
+                "macho-processor: libc++ filesystem absolute FAILED: unable to materialize relative guest_path={s} host_path={s} output=0x{x}\n",
+                .{ path, absolute_path, output },
+            );
+            return output;
+        }
         self.writeErrorCode(state, state.regs.rdx, 0, false);
         return output;
     }
@@ -427,6 +464,22 @@ const CopyResult = struct {
 fn pathView(state: anytype, object: u64) ?[]const u8 {
     const view = compat_runtime.libcppStringView(state, object) orelse return null;
     return state.guestMemoryConst(view.address, view.length);
+}
+
+fn clonePathObject(state: anytype, output: u64, input: u64) bool {
+    if (output == input) return true;
+    const source = state.guestMemoryConst(input, 24) orelse return false;
+    var snapshot: [24]u8 = undefined;
+    @memcpy(&snapshot, source);
+    const destination = state.guestMemory(output, 24) orelse return false;
+    @memcpy(destination, &snapshot);
+    return true;
+}
+
+fn writePathObject(state: anytype, output: u64, value: []const u8) bool {
+    if (!compat_runtime.initLibcppStringFromSlice(state, output, value)) return false;
+    const written = pathView(state, output) orelse return false;
+    return std.mem.eql(u8, written, value);
 }
 
 fn writeFileStatus(state: anytype, output: u64, file_type: i8, permissions: u32) void {
@@ -748,6 +801,66 @@ test "extension replacement preserves path and hidden-file rules" {
     try std.testing.expectEqual(@as(?usize, 8), extensionStart("dir/name.txt"));
     try std.testing.expectEqual(@as(?usize, null), extensionStart("dir/.config"));
     try std.testing.expectEqual(@as(?usize, null), extensionStart("dir/.."));
+}
+
+test "absolute preserves a long absolute path without a compatibility allocation" {
+    const TestState = struct {
+        const Registers = struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0 };
+
+        mem: [512]u8 = [_]u8{0} ** 512,
+        regs: Registers = .{},
+
+        pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+            if (address > self.mem.len or length > self.mem.len - address) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        pub fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            if (address > self.mem.len or length > self.mem.len - address) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        pub fn guestAlloc(_: *@This(), _: u64, _: u64) ?u64 {
+            return null;
+        }
+
+        pub fn read64(self: *const @This(), address: u64) u64 {
+            return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
+        }
+
+        pub fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.mem[@intCast(address)..][0..4], value, .little);
+        }
+
+        pub fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+        }
+    };
+    const TestFs = struct {
+        pub fn resolveHostPath(_: *@This(), path: []const u8, _: []u8) ?[]const u8 {
+            return path;
+        }
+    };
+
+    const input_object: u64 = 32;
+    const output_object: u64 = 80;
+    const backing: u64 = 256;
+    const path = "/Users/ryanwiseman/Desktop/8CEB1ABA7AC20BDAF62EEA16699E0227.iso";
+    var state = TestState{};
+    @memcpy(state.mem[@intCast(backing)..][0..path.len], path);
+    state.write64(input_object, 80 | 1);
+    state.write64(input_object + 8, path.len);
+    state.write64(input_object + 16, backing);
+    state.regs.rdi = output_object;
+    state.regs.rsi = input_object;
+    var fs = TestFs{};
+    var bridge = Bridge{};
+
+    try std.testing.expectEqual(output_object, bridge.absolute(&state, &fs));
+    try std.testing.expectEqual(@as(u64, 1), bridge.absolute_path_clones);
+    const output_path = pathView(&state, output_object).?;
+    try std.testing.expectEqualStrings(path, output_path);
+    try std.testing.expectEqual(backing, state.read64(output_object + 16));
 }
 
 test "path extension bridge returns the libc++ string_view register pair" {

@@ -71,6 +71,8 @@ const Stream = struct {
     string_length: usize = 0,
     string_truncated: bool = false,
     string_storage: [STRINGSTREAM_TEXT_CAPACITY]u8 = [_]u8{0} ** STRINGSTREAM_TEXT_CAPACITY,
+    string_backed: bool = false,
+    numeric_base: u8 = 10,
     synthetic_proc_maps: bool = false,
 };
 
@@ -257,6 +259,9 @@ pub const Bridge = struct {
     thread_id_insertions: u64 = 0,
     rdbuf_alias_resolutions: u64 = 0,
     modeled_streambuf_imbues: u64 = 0,
+    modeled_streambuf_virtual_calls: u64 = 0,
+    modeled_streambuf_writes: u64 = 0,
+    modeled_streambuf_short_writes: u64 = 0,
     rejected: u64 = 0,
     next_generation: u64 = 1,
     io_sequence: u64 = 0,
@@ -303,10 +308,17 @@ pub const Bridge = struct {
                 null;
         }
         if (isStringStreamConstructor(name)) {
-            return if (self.constructStringStream(state, state.regs.rdi))
-                .{ .handled = state.regs.rdi }
-            else
-                null;
+            var initial_storage: [STRINGSTREAM_TEXT_CAPACITY]u8 = undefined;
+            const initial_text = if (isStringStreamTextConstructor(name)) blk: {
+                const view = compat_runtime.libcppStringView(state, state.regs.rsi) orelse return null;
+                const source = state.guestMemoryConst(view.address, view.length) orelse return null;
+                const length = @min(source.len, initial_storage.len);
+                @memcpy(initial_storage[0..length], source[0..length]);
+                break :blk initial_storage[0..length];
+            } else null;
+            if (!self.constructStringStream(state, state.regs.rdi)) return null;
+            if (initial_text) |text| self.seedStringStream(state.regs.rdi, text);
+            return .{ .handled = state.regs.rdi };
         }
         if (isBasicFilebufConstructor(name) or isBasicStreambufConstructor(name)) {
             return if (self.constructFilebuf(state, state.regs.rdi))
@@ -358,6 +370,11 @@ pub const Bridge = struct {
         if (isBasicIosFail(name)) return .{ .handled = @intFromBool(self.object_model.fail(state, state.regs.rdi)) };
         if (isBasicIosEof(name)) return .{ .handled = @intFromBool(self.object_model.eof(state, state.regs.rdi)) };
         if (isBasicIosBool(name)) return .{ .handled = @intFromBool(!self.object_model.fail(state, state.regs.rdi)) };
+        if (numericBaseForManipulator(name)) |base| {
+            const stream = self.findOwned(state.regs.rdi) orelse return null;
+            stream.numeric_base = base;
+            return .{ .handled = state.regs.rdi };
+        }
         if (isThreadIdInsertion(name)) return .{ .handled = self.insertThreadId(state, state.regs.rdi, state.regs.rsi) };
         if (isPointerInsertion(name)) return .{ .handled = self.insertPointer(state, state.regs.rdi, state.regs.rsi) };
         if (isCStringInsertion(name)) return .{ .handled = self.insertCString(state, state.regs.rdi, state.regs.rsi) };
@@ -451,6 +468,9 @@ pub const Bridge = struct {
             // to translate that result into failbit.
             return .{ .handled = @bitCast(self.readInto(state, state.regs.rdi, state.regs.rsi, state.regs.rdx, false)) };
         }
+        if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsputnEPKcl")) {
+            return .{ .handled = @bitCast(self.writeFromGuest(state, state.regs.rdi, state.regs.rsi, state.regs.rdx)) };
+        }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5tellgEv")) {
             return .{ .handled = @bitCast(self.seek(state.regs.rdi, 0, std.c.SEEK.CUR)) };
         }
@@ -482,6 +502,10 @@ pub const Bridge = struct {
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5uflowEv")) {
             return .{ .handled = @bitCast(@as(i64, self.readByte(state.regs.rdi))) };
         }
+        if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9pbackfailEi")) {
+            const value: i32 = @bitCast(@as(u32, @truncate(state.regs.rsi)));
+            return .{ .handled = @bitCast(@as(i64, self.putBack(state.regs.rdi, value))) };
+        }
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7snextcEv")) {
             const byte = self.readByte(state.regs.rdi);
             if (byte < 0) return .{ .handled = @bitCast(@as(i64, -1)) };
@@ -496,8 +520,18 @@ pub const Bridge = struct {
         if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6setbufEPcl")) {
             return .{ .handled = self.setBuffer(state.regs.rdi, state.regs.rsi, state.regs.rdx) };
         }
+        if (std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE8overflowEi")) {
+            const value: i32 = @bitCast(@as(u32, @truncate(state.regs.rsi)));
+            return .{ .handled = @bitCast(@as(i64, self.writeOne(state, state.regs.rdi, value))) };
+        }
         if (std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERm")) {
             return .{ .handled = self.extractUnsignedLong(state) };
+        }
+        if (isCharacterReferenceExtraction(name)) {
+            return .{ .handled = self.extractCharacter(state) };
+        }
+        if (characterArrayCapacity(name)) |capacity| {
+            return .{ .handled = self.extractCharacterArray(state, capacity) };
         }
         return null;
     }
@@ -524,6 +558,7 @@ pub const Bridge = struct {
             isBasicIosFail(name) or
             isBasicIosEof(name) or
             isBasicIosBool(name) or
+            numericBaseForManipulator(name) != null or
             isThreadIdInsertion(name) or
             isPointerInsertion(name) or
             isCStringInsertion(name) or
@@ -543,6 +578,7 @@ pub const Bridge = struct {
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE4readEPcl") or
             std.mem.eql(u8, name, "_ZNKSt3__113basic_istreamIcNS_11char_traitsIcEEE6gcountEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsgetnEPcl") or
+            std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsputnEPKcl") or
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5tellgEv") or
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgENS_4fposI11__mbstate_tEE") or
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE5seekgExNS_8ios_base7seekdirE") or
@@ -551,15 +587,61 @@ pub const Bridge = struct {
             std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE4peekEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9underflowEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5uflowEv") or
+            std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9pbackfailEi") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE7snextcEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9showmanycEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE4syncEv") or
             std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6setbufEPcl") or
-            std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERm");
+            std.mem.eql(u8, name, "_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE8overflowEi") or
+            std.mem.eql(u8, name, "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERm") or
+            isCharacterReferenceExtraction(name) or
+            characterArrayCapacity(name) != null;
     }
 
     pub fn handlePubsetbuf(self: *Bridge, object: u64, buffer: u64, size: u64) u64 {
         return self.setBuffer(object, buffer, size);
+    }
+
+    /// Executes a typed virtual from Rosette's synthetic basic_streambuf
+    /// vtable. The vtable owns only addresses; all stream state and I/O remain
+    /// centralized here so direct imports and virtual calls cannot diverge.
+    pub fn dispatchStreambufVirtual(
+        self: *Bridge,
+        state: anytype,
+        thunk: compat_runtime.SyntheticThunk,
+        object: u64,
+        argument_1: u64,
+        argument_2: u64,
+    ) u64 {
+        self.modeled_streambuf_virtual_calls +|= 1;
+        return switch (thunk) {
+            .streambuf_setbuf => self.setBuffer(object, argument_1, argument_2),
+            .streambuf_seekoff => blk: {
+                const result = self.seek(object, @bitCast(argument_1), seekDirection(argument_2));
+                self.clearEofBitAfterSeek(state, object, result);
+                break :blk @bitCast(result);
+            },
+            .streambuf_seekpos => blk: {
+                const result = self.seek(object, @bitCast(argument_1), std.c.SEEK.SET);
+                self.clearEofBitAfterSeek(state, object, result);
+                break :blk @bitCast(result);
+            },
+            .streambuf_sync => 0,
+            .streambuf_showmanyc => @bitCast(self.available(object)),
+            .streambuf_xsgetn => @bitCast(self.readInto(state, object, argument_1, argument_2, false)),
+            .streambuf_underflow => @bitCast(@as(i64, self.peek(object))),
+            .streambuf_uflow => @bitCast(@as(i64, self.readByte(object))),
+            .streambuf_pbackfail => blk: {
+                const value: i32 = @bitCast(@as(u32, @truncate(argument_1)));
+                break :blk @bitCast(@as(i64, self.putBack(object, value)));
+            },
+            .streambuf_xsputn => @bitCast(self.writeFromGuest(state, object, argument_1, argument_2)),
+            .streambuf_overflow => blk: {
+                const value: i32 = @bitCast(@as(u32, @truncate(argument_1)));
+                break :blk @bitCast(@as(i64, self.writeOne(state, object, value)));
+            },
+            else => 0,
+        };
     }
 
     pub fn constructIfstream(self: *Bridge, state: anytype, object: u64) bool {
@@ -622,6 +704,8 @@ pub const Bridge = struct {
         stream.last_read_count = 0;
         stream.eof = false;
         stream.failed = false;
+        stream.string_backed = false;
+        stream.numeric_base = 10;
         stream.patch_toml_trace_next = 0;
         stream.patch_toml_trace_full = false;
         self.resetStringBuffer(stream);
@@ -683,42 +767,22 @@ pub const Bridge = struct {
         const dest_ptr = state.regs.rsi;
         const stream = self.findFlexible(istream) orelse return istream;
 
-        // Read a line from the stream to parse the number
         var buffer: [64]u8 = undefined;
         var length: usize = 0;
-
-        if (self.syntheticContent(stream)) |content| {
-            while (length < buffer.len and stream.tracked_pos < content.len) {
-                const byte = content[@intCast(stream.tracked_pos)];
-                stream.tracked_pos += 1;
-                if (byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r') break;
-                buffer[length] = byte;
-                length += 1;
-            }
-            if (stream.tracked_pos >= content.len) {
-                stream.eof = true;
-                self.noteState(state, stream, cxx_object_model.EOFBIT);
-            }
-        } else if (stream.fd >= 0) {
-            while (length < buffer.len) {
-                var byte: [1]u8 = undefined;
-                const result = std.c.pread(stream.fd, &byte, 1, @intCast(stream.tracked_pos));
-                if (result <= 0) break;
-                if (byte[0] == ' ' or byte[0] == '\n' or byte[0] == '\t' or byte[0] == '\r') {
-                    stream.tracked_pos += 1;
-                    break;
-                }
-                buffer[length] = byte[0];
-                length += 1;
-                stream.tracked_pos += 1;
-            }
+        self.skipFormattedWhitespace(stream);
+        while (length < buffer.len) {
+            const byte = self.peek(stream.object);
+            if (byte < 0 or !isDigitForBase(@intCast(byte), stream.numeric_base)) break;
+            buffer[length] = @intCast(self.readByte(stream.object));
+            length += 1;
         }
-
-        // Parse the number
         const text = buffer[0..length];
-        const value = std.fmt.parseUnsigned(u64, text, 10) catch 0;
+        const value = std.fmt.parseUnsigned(u64, text, stream.numeric_base) catch {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.FAILBIT);
+            return istream;
+        };
 
-        // Write to destination
         if (state.guestMemory(dest_ptr, 8) != null) {
             state.write64(dest_ptr, value);
         }
@@ -726,16 +790,143 @@ pub const Bridge = struct {
         return istream;
     }
 
+    fn extractCharacter(self: *Bridge, state: anytype) u64 {
+        const istream = state.regs.rdi;
+        const stream = self.findFlexible(istream) orelse return istream;
+        self.skipFormattedWhitespace(stream);
+        const byte = self.readByte(stream.object);
+        if (byte < 0 or state.guestMemory(state.regs.rsi, 1) == null) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.EOFBIT | cxx_object_model.FAILBIT);
+            return istream;
+        }
+        state.write8(state.regs.rsi, @intCast(byte));
+        return istream;
+    }
+
+    fn extractCharacterArray(self: *Bridge, state: anytype, capacity: usize) u64 {
+        const istream = state.regs.rdi;
+        const stream = self.findFlexible(istream) orelse return istream;
+        if (capacity < 2 or capacity > 4096) return istream;
+        const destination = state.guestMemory(state.regs.rsi, @intCast(capacity)) orelse return istream;
+        self.skipFormattedWhitespace(stream);
+
+        var length: usize = 0;
+        while (length + 1 < capacity) {
+            const byte = self.peek(stream.object);
+            if (byte < 0 or isFormattedWhitespace(@intCast(byte))) break;
+            destination[length] = @intCast(self.readByte(stream.object));
+            length += 1;
+        }
+        destination[length] = 0;
+        if (length == 0) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.FAILBIT);
+        }
+        return istream;
+    }
+
+    fn skipFormattedWhitespace(self: *Bridge, stream: *Stream) void {
+        while (true) {
+            const byte = self.peek(stream.object);
+            if (byte < 0 or !isFormattedWhitespace(@intCast(byte))) return;
+            _ = self.readByte(stream.object);
+        }
+    }
+
     fn appendToOstream(self: *Bridge, state: anytype, ostream: u64, text: []const u8) bool {
         const stream = self.streamForOstream(state, ostream) orelse return false;
+        return self.writeBytes(state, stream, text) == text.len;
+    }
+
+    fn writeFromGuest(self: *Bridge, state: anytype, object: u64, source: u64, count: u64) i64 {
+        if (count == 0) return 0;
+        if (count > MAX_REASONABLE_READ_SIZE) {
+            self.rejected +|= 1;
+            return 0;
+        }
+        const bytes = state.guestMemoryConst(source, count) orelse {
+            self.rejected +|= 1;
+            return 0;
+        };
+        const stream = self.findFlexible(object) orelse {
+            self.rejected +|= 1;
+            return 0;
+        };
+        return @intCast(self.writeBytes(state, stream, bytes));
+    }
+
+    fn writeBytes(self: *Bridge, state: anytype, stream: *Stream, bytes: []const u8) usize {
+        self.modeled_streambuf_writes +|= 1;
+        if (stream.fd >= 0) {
+            const result = std.c.pwrite(stream.fd, bytes.ptr, bytes.len, @intCast(stream.tracked_pos));
+            if (result < 0) {
+                stream.failed = true;
+                self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
+                self.modeled_streambuf_short_writes +|= 1;
+                return 0;
+            }
+            const written: usize = @intCast(result);
+            stream.tracked_pos +|= @as(u64, @intCast(written));
+            if (written < bytes.len) self.modeled_streambuf_short_writes +|= 1;
+            return written;
+        }
+
+        if (stream.buffer != 0 and stream.tracked_pos < stream.buffer_size) {
+            const available_capacity: usize = @intCast(stream.buffer_size - stream.tracked_pos);
+            const written = @min(available_capacity, bytes.len);
+            const destination = state.guestMemory(
+                stream.buffer + stream.tracked_pos,
+                @as(u64, @intCast(written)),
+            ) orelse {
+                stream.failed = true;
+                self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
+                self.modeled_streambuf_short_writes +|= 1;
+                return 0;
+            };
+            @memcpy(destination, bytes[0..written]);
+            stream.tracked_pos +|= @as(u64, @intCast(written));
+            if (written < bytes.len) self.modeled_streambuf_short_writes +|= 1;
+            return written;
+        }
+
+        // A modeled stringstream has a distinct ostream subobject. Filebufs
+        // do not, so an unopened filebuf must fail rather than silently
+        // becoming an in-memory stream.
+        if (stream.stream_object == 0) {
+            stream.failed = true;
+            self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
+            self.modeled_streambuf_short_writes +|= 1;
+            return 0;
+        }
         const remaining_capacity = STRINGSTREAM_TEXT_CAPACITY - stream.string_length;
-        const written = @min(remaining_capacity, text.len);
+        const written = @min(remaining_capacity, bytes.len);
         if (written != 0) {
-            @memcpy(stream.string_storage[stream.string_length..][0..written], text[0..written]);
+            @memcpy(stream.string_storage[stream.string_length..][0..written], bytes[0..written]);
             stream.string_length += written;
         }
-        if (written < text.len) stream.string_truncated = true;
-        return true;
+        if (written < bytes.len) {
+            stream.string_truncated = true;
+            self.modeled_streambuf_short_writes +|= 1;
+        }
+        return written;
+    }
+
+    fn writeOne(self: *Bridge, state: anytype, object: u64, value: i32) i32 {
+        // char_traits<char>::eof() is accepted as a successful no-op by
+        // overflow; return not_eof(eof), which is zero for this model.
+        if (value < 0) return 0;
+        const stream = self.findFlexible(object) orelse return -1;
+        const byte = [_]u8{@intCast(value & 0xFF)};
+        return if (self.writeBytes(state, stream, &byte) == 1) value & 0xFF else -1;
+    }
+
+    fn putBack(self: *Bridge, object: u64, value: i32) i32 {
+        const stream = self.findFlexible(object) orelse return -1;
+        if (stream.tracked_pos == 0) return -1;
+        stream.tracked_pos -= 1;
+        stream.eof = false;
+        return if (value < 0) 0 else value & 0xFF;
     }
 
     fn streamForOstream(self: *Bridge, state: anytype, object: u64) ?*Stream {
@@ -805,6 +996,9 @@ pub const Bridge = struct {
             object + STRINGSTREAM_IOS_OFFSET,
         );
         self.resetStringBuffer(stream);
+        stream.string_backed = true;
+        stream.numeric_base = 10;
+        stream.tracked_pos = 0;
         registerStackVtable(state, streambuf);
         if (object != self.last_logged_stringstream_object) {
             self.last_logged_stringstream_object = object;
@@ -817,16 +1011,51 @@ pub const Bridge = struct {
         return true;
     }
 
+    fn seedStringStream(self: *Bridge, object: u64, text: []const u8) void {
+        const stream = self.find(object + STRINGSTREAM_BUFFER_OFFSET) orelse return;
+        self.resetStringBuffer(stream);
+        stream.string_backed = true;
+        const copy_length = @min(text.len, stream.string_storage.len);
+        @memcpy(stream.string_storage[0..copy_length], text[0..copy_length]);
+        stream.string_length = copy_length;
+        stream.string_truncated = text.len > copy_length;
+        stream.tracked_pos = 0;
+        stream.eof = false;
+        stream.failed = false;
+    }
+
     fn installStreambufVirtuals(self: *Bridge, state: anytype, kind: cxx_object_model.Kind) bool {
-        // Itanium slot 2 is basic_streambuf::imbue, called by the locally
-        // linked pubimbue body. It must be a real callable target even though
-        // direct imports of imbue are also modeled by this bridge.
-        return self.object_model.setVirtualSlot(
-            state,
-            kind,
-            2,
-            compat_runtime.thunkAddress(.streambuf_imbue),
-        );
+        // libc++ v160006 basic_streambuf virtual surface. Slots 0 and 1 are
+        // destructor variants, which remain on the bridge's typed direct
+        // destructor path. Every operational slot is populated up front so a
+        // locally linked wrapper (sputn, pubseekoff, sgetc, and friends)
+        // cannot branch through a null synthetic vtable entry.
+        const slots = [_]struct {
+            index: usize,
+            thunk: compat_runtime.SyntheticThunk,
+        }{
+            .{ .index = 2, .thunk = .streambuf_imbue },
+            .{ .index = 3, .thunk = .streambuf_setbuf },
+            .{ .index = 4, .thunk = .streambuf_seekoff },
+            .{ .index = 5, .thunk = .streambuf_seekpos },
+            .{ .index = 6, .thunk = .streambuf_sync },
+            .{ .index = 7, .thunk = .streambuf_showmanyc },
+            .{ .index = 8, .thunk = .streambuf_xsgetn },
+            .{ .index = 9, .thunk = .streambuf_underflow },
+            .{ .index = 10, .thunk = .streambuf_uflow },
+            .{ .index = 11, .thunk = .streambuf_pbackfail },
+            .{ .index = 12, .thunk = .streambuf_xsputn },
+            .{ .index = 13, .thunk = .streambuf_overflow },
+        };
+        for (slots) |slot| {
+            if (!self.object_model.setVirtualSlot(
+                state,
+                kind,
+                slot.index,
+                compat_runtime.thunkAddress(slot.thunk),
+            )) return false;
+        }
+        return true;
     }
 
     pub fn destroyIfstream(self: *Bridge, state: anytype, object: u64) void {
@@ -942,8 +1171,8 @@ pub const Bridge = struct {
             if (stream.active and (stream.fd >= 0 or stream.synthetic_proc_maps)) live += 1;
         }
         machoCapturePrint(
-            "macho-processor: libc++ stream bridge: constructors={d} open={d} open_failed={d} close={d} read={d} seek={d} peek={d} buffers={d} base_dtors={d} ofstream_dtors={d} rdbuf_aliases={d} modeled_imbues={d} live={d} rejected={d}\n",
-            .{ self.constructors, self.opens, self.open_failures, self.closes, self.reads, self.seeks, self.peeks, self.buffer_changes, self.base_destructors, self.ofstream_destructors, self.rdbuf_alias_resolutions, self.modeled_streambuf_imbues, live, self.rejected },
+            "macho-processor: libc++ stream bridge: constructors={d} open={d} open_failed={d} close={d} read={d} seek={d} peek={d} buffers={d} base_dtors={d} ofstream_dtors={d} rdbuf_aliases={d} modeled_imbues={d} virtual_calls={d} writes={d} short_writes={d} live={d} rejected={d}\n",
+            .{ self.constructors, self.opens, self.open_failures, self.closes, self.reads, self.seeks, self.peeks, self.buffer_changes, self.base_destructors, self.ofstream_destructors, self.rdbuf_alias_resolutions, self.modeled_streambuf_imbues, self.modeled_streambuf_virtual_calls, self.modeled_streambuf_writes, self.modeled_streambuf_short_writes, live, self.rejected },
         );
     }
 
@@ -1773,8 +2002,14 @@ pub const Bridge = struct {
     }
 
     fn syntheticContent(self: *const Bridge, stream: *const Stream) ?[]const u8 {
-        if (!stream.synthetic_proc_maps) return null;
-        return self.proc_maps_storage[0..self.proc_maps_length];
+        if (stream.synthetic_proc_maps) return self.proc_maps_storage[0..self.proc_maps_length];
+        if (stream.string_backed) return stream.string_storage[0..stream.string_length];
+        return null;
+    }
+
+    pub fn modeledStreamObjectForAddress(self: *Bridge, address: u64) ?u64 {
+        const stream = self.findOwned(address) orelse return null;
+        return stream.object;
     }
 
     fn ensure(self: *Bridge, object: u64) ?*Stream {
@@ -1922,6 +2157,56 @@ fn isStringStreamConstructor(name: []const u8) bool {
         std.mem.indexOf(u8, name, "basic_istringstream") != null or
         std.mem.indexOf(u8, name, "basic_stringstream") != null;
     return family and (std.mem.indexOf(u8, name, "C1") != null or std.mem.indexOf(u8, name, "C2") != null);
+}
+
+fn isStringStreamTextConstructor(name: []const u8) bool {
+    return isStringStreamConstructor(name) and
+        std.mem.indexOf(u8, name, "ERKNS_12basic_string") != null;
+}
+
+fn numericBaseForManipulator(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "_ZNSt3__13decB7v160006ERNS_8ios_baseE")) return 10;
+    if (std.mem.eql(u8, name, "_ZNSt3__13hexB7v160006ERNS_8ios_baseE")) return 16;
+    if (std.mem.eql(u8, name, "_ZNSt3__13octB7v160006ERNS_8ios_baseE")) return 8;
+    return null;
+}
+
+fn isCharacterReferenceExtraction(name: []const u8) bool {
+    return std.mem.eql(
+        u8,
+        name,
+        "_ZNSt3__1rsB7v160006IcNS_11char_traitsIcEEEERNS_13basic_istreamIT_T0_EES7_RS4_",
+    );
+}
+
+fn characterArrayCapacity(name: []const u8) ?usize {
+    const marker = "_ZNSt3__1rsB7v160006IcNS_11char_traitsIcEELm";
+    if (!std.mem.startsWith(u8, name, marker) or
+        std.mem.indexOf(u8, name, "RNS_13basic_istream") == null or
+        std.mem.indexOf(u8, name, "RAT1__S4_") == null)
+    {
+        return null;
+    }
+    const suffix = name[marker.len..];
+    const end = std.mem.indexOfScalar(u8, suffix, 'E') orelse return null;
+    const capacity = std.fmt.parseUnsigned(usize, suffix[0..end], 10) catch return null;
+    return if (capacity >= 2 and capacity <= 4096) capacity else null;
+}
+
+fn isFormattedWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r' or byte == '\x0b' or byte == '\x0c';
+}
+
+fn isDigitForBase(byte: u8, base: u8) bool {
+    const digit: u8 = if (byte >= '0' and byte <= '9')
+        byte - '0'
+    else if (byte >= 'a' and byte <= 'f')
+        byte - 'a' + 10
+    else if (byte >= 'A' and byte <= 'F')
+        byte - 'A' + 10
+    else
+        return false;
+    return digit < base;
 }
 
 fn isBasicFilebufConstructor(name: []const u8) bool {
@@ -2397,6 +2682,41 @@ test "stream bridge forwards guest file operations through typed host calls" {
         compat_runtime.thunkAddress(.streambuf_imbue),
         state.read64(streambuf_vptr + 2 * @sizeOf(u64)),
     );
+    const expected_streambuf_thunks = [_]compat_runtime.SyntheticThunk{
+        .streambuf_imbue,
+        .streambuf_setbuf,
+        .streambuf_seekoff,
+        .streambuf_seekpos,
+        .streambuf_sync,
+        .streambuf_showmanyc,
+        .streambuf_xsgetn,
+        .streambuf_underflow,
+        .streambuf_uflow,
+        .streambuf_pbackfail,
+        .streambuf_xsputn,
+        .streambuf_overflow,
+    };
+    for (expected_streambuf_thunks, 2..) |thunk, slot| {
+        const target = state.read64(streambuf_vptr + slot * @sizeOf(u64));
+        try std.testing.expectEqual(compat_runtime.thunkAddress(thunk), target);
+        try std.testing.expectEqual(thunk, compat_runtime.syntheticThunk(target).?);
+    }
+    const virtual_text_address: u64 = 1792;
+    const virtual_text = "GPU-ready ";
+    @memcpy(
+        state.mem[virtual_text_address .. virtual_text_address + virtual_text.len],
+        virtual_text,
+    );
+    try std.testing.expectEqual(
+        @as(u64, virtual_text.len),
+        stringstream_bridge.dispatchStreambufVirtual(
+            &state,
+            .streambuf_xsputn,
+            streambuf_for_stringstream,
+            virtual_text_address,
+            virtual_text.len,
+        ),
+    );
     for ([_]u64{
         stringstream,
         stringstream + STRINGSTREAM_OSTREAM_OFFSET,
@@ -2428,7 +2748,9 @@ test "stream bridge forwards guest file operations through typed host calls" {
     try std.testing.expect(stringstream_bridge.dispatch(&state, &fs, "__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv") != null);
     const thread_id_text = compat_runtime.libcppStringView(&state, output_string).?;
     const thread_id_bytes = state.guestMemoryConst(thread_id_text.address, thread_id_text.length).?;
-    try std.testing.expectEqualStrings("3", thread_id_bytes);
+    try std.testing.expectEqualStrings("GPU-ready 3", thread_id_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stringstream_bridge.modeled_streambuf_virtual_calls);
+    try std.testing.expectEqual(@as(u64, 2), stringstream_bridge.modeled_streambuf_writes);
     try std.testing.expect(state.vtable_stack_registry.contains(streambuf_for_stringstream));
     state.regs = .{ .rdi = stringstream };
     const stringstream_destructor = stringstream_bridge.dispatch(
@@ -2442,6 +2764,60 @@ test "stream bridge forwards guest file operations through typed host calls" {
     }
     try std.testing.expect(!state.vtable_stack_registry.contains(streambuf_for_stringstream));
     try std.testing.expect(stringstream_bridge.find(streambuf_for_stringstream) == null);
+
+    // Xenia's POSIX QueryProtect parses Rosette's virtual /proc/self/maps with
+    // `stringstream(line) >> std::hex >> begin >> '-' >> end >> protection`.
+    // All of these locally-linked libc++ helpers must stay on the modeled
+    // stream path; allowing even the char extractor to enter native sbumpc()
+    // reads zero get-area pointers from the synthetic streambuf layout.
+    const maps_line_object: u64 = 1400;
+    const maps_stream: u64 = 1536;
+    const maps_begin: u64 = 1800;
+    const maps_separator: u64 = 1816;
+    const maps_end: u64 = 1824;
+    const maps_protection: u64 = 1840;
+    const maps_line = "3cd450000-3cd460000 rw-p 00000000 00:00 0 [rosette-mapping]";
+    try std.testing.expect(compat_runtime.initLibcppStringFromSlice(&state, maps_line_object, maps_line));
+    state.regs = .{ .rdi = maps_stream, .rsi = maps_line_object, .rdx = OPENMODE_IN };
+    try std.testing.expect(stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__118basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEC1B7v160006ERKNS_12basic_stringIcS2_S4_EEj",
+    ) != null);
+    state.regs = .{ .rdi = maps_stream + STRINGSTREAM_IOS_OFFSET };
+    try std.testing.expect(stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__13hexB7v160006ERNS_8ios_baseE",
+    ) != null);
+    state.regs = .{ .rdi = maps_stream, .rsi = maps_begin };
+    try std.testing.expect(stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERm",
+    ) != null);
+    state.regs = .{ .rdi = maps_stream, .rsi = maps_separator };
+    try std.testing.expect(stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__1rsB7v160006IcNS_11char_traitsIcEEEERNS_13basic_istreamIT_T0_EES7_RS4_",
+    ) != null);
+    state.regs = .{ .rdi = maps_stream, .rsi = maps_end };
+    try std.testing.expect(stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERm",
+    ) != null);
+    state.regs = .{ .rdi = maps_stream, .rsi = maps_protection };
+    try std.testing.expect(stringstream_bridge.dispatch(
+        &state,
+        &fs,
+        "__ZNSt3__1rsB7v160006IcNS_11char_traitsIcEELm4EEERNS_13basic_istreamIT_T0_EES7_RAT1__S4_",
+    ) != null);
+    try std.testing.expectEqual(@as(u64, 0x3cd450000), state.read64(maps_begin));
+    try std.testing.expectEqual(@as(u8, '-'), state.mem[maps_separator]);
+    try std.testing.expectEqual(@as(u64, 0x3cd460000), state.read64(maps_end));
+    try std.testing.expectEqualStrings("rw-", state.mem[maps_protection .. maps_protection + 3]);
 
     var ostringstream_bridge = Bridge{};
     defer ostringstream_bridge.deinit();
