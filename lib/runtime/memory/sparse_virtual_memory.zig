@@ -41,6 +41,22 @@ pub fn pageRoundedLength(length: u64) ?u64 {
     return with_padding & ~(page_size - 1);
 }
 
+/// Returns the effective interval covered by a guest mprotect request.
+///
+/// Darwin rounds the end of an mprotect interval up to a VM page. Rosette
+/// must mirror that behavior in its permission metadata as well as in the
+/// host syscall. The metadata is deliberately rounded to the x86 guest page
+/// (4 KiB), not the Apple Silicon host page (16 KiB), so a legitimate tail
+/// access is admitted without consuming an adjacent guest guard page.
+pub fn guestProtectionRoundedLength(guest_base: u64, length: u64) ?u64 {
+    if (length == 0) return null;
+    const end = std.math.add(u64, guest_base, length) catch return null;
+    const padded_end = std.math.add(u64, end, PAGE_4K - 1) catch return null;
+    const rounded_end = padded_end & ~(PAGE_4K - 1);
+    if (rounded_end <= guest_base) return null;
+    return rounded_end - guest_base;
+}
+
 const HostPageSpan = struct {
     offset: usize,
     length: usize,
@@ -76,6 +92,7 @@ const Activation = struct {
     readable: bool,
     writable: bool,
     executable: bool,
+    sequence: u64,
 };
 
 pub const Manager = struct {
@@ -83,6 +100,7 @@ pub const Manager = struct {
     mappings: std.ArrayList(Mapping) = .empty,
     activations: std.ArrayList(Activation) = .empty,
     total_reserved: u64 = 0,
+    protection_sequence: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{ .allocator = allocator };
@@ -483,46 +501,52 @@ pub const Manager = struct {
     }
 
     pub fn protect(self: *Manager, guest_base: u64, length: u64, prot_raw: u32) bool {
-        const end = std.math.add(u64, guest_base, length) catch return false;
+        const effective_length = guestProtectionRoundedLength(guest_base, length) orelse return false;
+        const end = std.math.add(u64, guest_base, effective_length) catch return false;
         for (self.mappings.items) |*mapping| {
             const mapping_end = mapping.guest_base + mapping.memory.len;
             if (guest_base >= mapping.guest_base and end <= mapping_end) {
                 const offset = @as(usize, @intCast(guest_base - mapping.guest_base));
-                const requested_length = std.math.cast(usize, length) orelse return false;
-                const host_span = hostPageSpan(offset, requested_length, mapping.memory.len) orelse return false;
+                const effective_length_usize = std.math.cast(usize, effective_length) orelse return false;
+                const host_span = hostPageSpan(offset, effective_length_usize, mapping.memory.len) orelse return false;
                 const page_aligned = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(mapping.memory.ptr + host_span.offset)));
+                // The host permission is only the backing permission. Exact
+                // guest permissions are enforced by the activation records
+                // below. Preserve access required by neighboring guest ranges
+                // sharing the same host page, including the mapping's original
+                // permissions and earlier partial mprotect calls.
                 var effective_guest_prot = prot_raw;
-                if (mapping.is_reservation) {
-                    const host_guest_start = mapping.guest_base + host_span.offset;
-                    const host_guest_end = host_guest_start + host_span.length;
-                    for (self.activations.items) |active| {
-                        const active_end = active.guest_base +| active.memory.len;
-                        if (active.guest_base >= host_guest_end or active_end <= host_guest_start) continue;
-                        if (active.readable) effective_guest_prot |= PROT_READ;
-                        if (active.writable) effective_guest_prot |= PROT_WRITE;
-                        if (active.executable) effective_guest_prot |= PROT_EXEC;
-                    }
+                if (mapping.readable) effective_guest_prot |= PROT_READ;
+                if (mapping.writable) effective_guest_prot |= PROT_WRITE;
+                if (mapping.executable) effective_guest_prot |= PROT_EXEC;
+                const host_guest_start = mapping.guest_base + host_span.offset;
+                const host_guest_end = host_guest_start + host_span.length;
+                for (self.activations.items) |active| {
+                    const active_end = active.guest_base +| active.memory.len;
+                    if (active.guest_base >= host_guest_end or active_end <= host_guest_start) continue;
+                    if (active.readable) effective_guest_prot |= PROT_READ;
+                    if (active.writable) effective_guest_prot |= PROT_WRITE;
+                    if (active.executable) effective_guest_prot |= PROT_EXEC;
                 }
                 const host_prot_raw = hostBackingProtection(effective_guest_prot);
                 if (mprotect(page_aligned, host_span.length, @as(c_int, @intCast(host_prot_raw))) != 0) return false;
-                if (host_span.offset != offset or host_span.length != requested_length) {
+                if (effective_length != length or host_span.offset != offset or host_span.length != effective_length_usize) {
                     machoCapturePrint(
-                        "macho-processor: sparse guest protection normalized: guest_base=0x{x} guest_length={d} guest_page={d} host_offset=0x{x} host_length={d} host_page={d} prot=0x{x}; exact guest permissions retained in metadata\n",
-                        .{ guest_base, length, PAGE_4K, host_span.offset, host_span.length, std.heap.page_size_min, prot_raw },
+                        "macho-processor: sparse guest protection normalized: guest_base=0x{x} requested_guest_length={d} effective_guest_length={d} guest_page_tail={d} guest_page={d} host_offset=0x{x} host_length={d} host_page={d} prot=0x{x}; guest-page-granular permissions retained in metadata\n",
+                        .{ guest_base, length, effective_length, effective_length - length, PAGE_4K, host_span.offset, host_span.length, std.heap.page_size_min, prot_raw },
                     );
                 }
-                if (mapping.is_reservation) {
-                    const active_memory = mapping.memory[offset..][0..requested_length];
-                    self.appendActivation(guest_base, active_memory, prot_raw) catch return false;
-                } else {
-                    mapping.readable = prot_raw & 1 != 0;
-                    mapping.writable = prot_raw & 2 != 0;
-                    mapping.executable = prot_raw & 4 != 0;
-                }
+                // A protection request may cover only a stack guard or a JIT
+                // subrange. Recording it against the entire non-reservation
+                // mapping made an adjacent PROT_NONE guard revoke the usable
+                // stack. Use the same ordered interval overlay for every
+                // mapping kind.
+                const active_memory = mapping.memory[offset..][0..effective_length_usize];
+                self.appendActivation(guest_base, active_memory, prot_raw) catch return false;
                 if (prot_raw & PROT_EXEC != 0) {
                     machoCapturePrint(
-                        "macho-processor: sparse guest execute protection emulated: guest_base=0x{x} length={d} guest_prot=0x{x} host_prot=0x{x} host_execute=false\n",
-                        .{ guest_base, length, prot_raw, host_prot_raw },
+                        "macho-processor: sparse guest execute protection emulated: guest_base=0x{x} requested_length={d} effective_length={d} guest_prot=0x{x} host_prot=0x{x} host_execute=false\n",
+                        .{ guest_base, length, effective_length, prot_raw, host_prot_raw },
                     );
                 }
                 return true;
@@ -558,7 +582,22 @@ pub const Manager = struct {
     }
 
     pub fn bytes(self: *Manager, address: u64, length: u64, write: bool) ?[]u8 {
-        if (self.activeBytes(address, length, write)) |active| return active;
+        const end = std.math.add(u64, address, length) catch return null;
+        var activation_index = self.activations.items.len;
+        while (activation_index != 0) {
+            activation_index -= 1;
+            const active = &self.activations.items[activation_index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (address >= active_end or end <= active.guest_base) continue;
+            // The newest overlapping interval is authoritative. A denied
+            // activation must not fall through to the mapping's older base
+            // permission.
+            if (address < active.guest_base or end > active_end) return null;
+            if (write and !active.writable) return null;
+            if (!write and !active.readable) return null;
+            const offset: usize = @intCast(address - active.guest_base);
+            return active.memory[offset..][0..@intCast(length)];
+        }
         const found = self.find(address, length) orelse return null;
         if (write and !found.mapping.writable) return null;
         if (!write and !found.mapping.readable) return null;
@@ -566,14 +605,24 @@ pub const Manager = struct {
     }
 
     pub fn bytesConst(self: *const Manager, address: u64, length: u64) ?[]const u8 {
-        if (self.activeBytesConst(address, length)) |active| return active;
+        const end = std.math.add(u64, address, length) catch return null;
+        var activation_index = self.activations.items.len;
+        while (activation_index != 0) {
+            activation_index -= 1;
+            const active = &self.activations.items[activation_index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (address >= active_end or end <= active.guest_base) continue;
+            if (address < active.guest_base or end > active_end or !active.readable) return null;
+            const offset: usize = @intCast(address - active.guest_base);
+            return active.memory[offset..][0..@intCast(length)];
+        }
         const found = self.findConst(address, length) orelse return null;
         if (!found.mapping.readable) return null;
         return found.mapping.memory[found.offset..][0..@intCast(length)];
     }
 
     pub fn contains(self: *const Manager, address: u64, length: u64) bool {
-        return self.activeBytesConst(address, length) != null or self.findConst(address, length) != null;
+        return self.bytesConst(address, length) != null;
     }
 
     pub fn containsMapped(self: *const Manager, address: u64, length: u64) bool {
@@ -590,6 +639,61 @@ pub const Manager = struct {
             if (address >= mapping.guest_base and end <= mapping_end) return true;
         }
         return false;
+    }
+
+    /// Emits the exact sparse permission records involved in a denied access.
+    /// This stays silent on successful accesses so it is safe in the hot path,
+    /// while making an unexpected protection fault actionable in one run.
+    pub fn logAccessFailure(self: *const Manager, address: u64, length: u64, write: bool) void {
+        const end = std.math.add(u64, address, length) catch std.math.maxInt(u64);
+        var containing_mappings: usize = 0;
+        for (self.mappings.items) |mapping| {
+            const mapping_end = mapping.guest_base +| mapping.memory.len;
+            if (address >= mapping.guest_base and end <= mapping_end) containing_mappings += 1;
+        }
+
+        var overlap_count: usize = 0;
+        var newest_overlap_sequence: u64 = 0;
+        var newest_overlap_allows = false;
+        var activation_index = self.activations.items.len;
+        while (activation_index != 0) {
+            activation_index -= 1;
+            const active = self.activations.items[activation_index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (address >= active_end or end <= active.guest_base) continue;
+            overlap_count += 1;
+            if (newest_overlap_sequence == 0) {
+                newest_overlap_sequence = active.sequence;
+                newest_overlap_allows = address >= active.guest_base and end <= active_end and
+                    (if (write) active.writable else active.readable);
+            }
+        }
+
+        machoCapturePrint(
+            "macho-processor: sparse access contract FAILED: address=0x{x} end=0x{x} length={d} access={s} containing_mappings={d} overlapping_activations={d} newest_sequence={d} newest_allows={} total_activations={d}\n",
+            .{ address, end, length, if (write) "write" else "read", containing_mappings, overlap_count, newest_overlap_sequence, newest_overlap_allows, self.activations.items.len },
+        );
+
+        var printed: usize = 0;
+        activation_index = self.activations.items.len;
+        while (activation_index != 0 and printed < 12) {
+            activation_index -= 1;
+            const active = self.activations.items[activation_index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (address >= active_end or end <= active.guest_base) continue;
+            const contains_request = address >= active.guest_base and end <= active_end;
+            machoCapturePrint(
+                "macho-processor:   sparse activation sequence={d} index={d} range=[0x{x},0x{x}) permissions={c}{c}{c} relation={s} requested_access_allowed={}\n",
+                .{ active.sequence, activation_index, active.guest_base, active_end, @as(u8, if (active.readable) 'r' else '-'), @as(u8, if (active.writable) 'w' else '-'), @as(u8, if (active.executable) 'x' else '-'), if (contains_request) "contains" else "partial_overlap", contains_request and (if (write) active.writable else active.readable) },
+            );
+            printed += 1;
+        }
+        if (overlap_count > printed) {
+            machoCapturePrint(
+                "macho-processor:   sparse activation diagnostics truncated: printed={d} omitted={d}\n",
+                .{ printed, overlap_count - printed },
+            );
+        }
     }
 
     pub fn isExecutable(self: *const Manager, address: u64, length: u64) bool {
@@ -747,12 +851,15 @@ pub const Manager = struct {
     fn appendActivation(self: *Manager, guest_base: u64, memory: []u8, prot_raw: u32) !void {
         // Newer mprotect calls supersede older permission records for the same
         // exact span. Reverse lookup below also handles contained updates.
+        self.protection_sequence +%= 1;
+        if (self.protection_sequence == 0) self.protection_sequence = 1;
         try self.activations.append(self.allocator, .{
             .guest_base = guest_base,
             .memory = memory,
             .readable = prot_raw & 1 != 0,
             .writable = prot_raw & 2 != 0,
             .executable = prot_raw & 4 != 0,
+            .sequence = self.protection_sequence,
         });
     }
 
@@ -944,6 +1051,32 @@ test "guest protection range is widened only at the host syscall boundary" {
     try std.testing.expectEqual(host_page, span.length);
 }
 
+test "guest protection rounds a partial final guest page" {
+    try std.testing.expectEqual(@as(?u64, PAGE_64K), guestProtectionRoundedLength(0x9FFF_0000, PAGE_64K - 1));
+    try std.testing.expectEqual(@as(?u64, PAGE_4K), guestProtectionRoundedLength(0x9FFF_0000, PAGE_4K));
+    try std.testing.expectEqual(@as(?u64, null), guestProtectionRoundedLength(0x9FFF_0000, 0));
+    try std.testing.expectEqual(@as(?u64, null), guestProtectionRoundedLength(std.math.maxInt(u64) - PAGE_4K, PAGE_64K));
+}
+
+test "partial final guest page remains accessible after protect" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    const anonymous_private: u32 = 0x1000 | 0x2;
+    const base = manager.mapAnywhereWithBacking(
+        PAGE_64K,
+        0,
+        anonymous_private,
+        -1,
+        0,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(manager.protect(base, PAGE_64K - 1, PROT_READ | PROT_WRITE));
+    const tail = manager.bytes(base + PAGE_64K - 4, 4, true) orelse return error.TestUnexpectedResult;
+    tail[0] = 0xA5;
+    try std.testing.expectEqual(@as(u8, 0xA5), manager.bytesConst(base + PAGE_64K - 4, 1).?[0]);
+    try std.testing.expectEqual(@as(usize, PAGE_64K), manager.activations.items[manager.activations.items.len - 1].memory.len);
+}
+
 test "backend hint mapping enforces a low 32-bit result window" {
     if (comptime builtin.os.tag != .macos) return;
     var manager = Manager.init(std.testing.allocator);
@@ -1037,6 +1170,42 @@ test "new protection overrides an older broad activation" {
     try std.testing.expect(manager.protect(base, std.heap.page_size_min, 0));
     try std.testing.expect(manager.bytes(base, 1, false) == null);
     try std.testing.expect(manager.bytes(base + std.heap.page_size_min, 1, true) != null);
+}
+
+test "writable stack interior survives adjacent guard activations" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    const base = manager.reserveAnywhere(3 * PAGE_64K) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(manager.protect(base, 3 * PAGE_64K, PROT_READ | PROT_WRITE));
+    try std.testing.expect(manager.protect(base, PAGE_64K, 0));
+    try std.testing.expect(manager.protect(base + 2 * PAGE_64K, PAGE_64K, 0));
+    // Reassert the usable interval after both guards, matching Xenia's stack
+    // allocation contract on translated hosts with larger VM pages.
+    try std.testing.expect(manager.protect(base + PAGE_64K, PAGE_64K, PROT_READ | PROT_WRITE));
+
+    try std.testing.expect(manager.bytes(base, 1, true) == null);
+    try std.testing.expect(manager.bytes(base + PAGE_64K + PAGE_64K - 0xD8, 8, true) != null);
+    try std.testing.expect(manager.bytes(base + 2 * PAGE_64K, 1, true) == null);
+}
+
+test "partial guards do not revoke a normal sparse mapping interior" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    const anonymous_private: u32 = 0x1000 | 0x2;
+    const base = manager.mapAnywhereWithBacking(
+        3 * PAGE_64K,
+        PROT_READ | PROT_WRITE,
+        anonymous_private,
+        -1,
+        0,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(manager.protect(base, PAGE_64K, 0));
+    try std.testing.expect(manager.protect(base + 2 * PAGE_64K, PAGE_64K, 0));
+
+    try std.testing.expect(manager.bytes(base, 1, true) == null);
+    try std.testing.expect(manager.bytes(base + 2 * PAGE_64K - 0xD8, 8, true) != null);
+    try std.testing.expect(manager.bytes(base + 2 * PAGE_64K, 1, true) == null);
 }
 
 test "protect changes mapping permissions" {
