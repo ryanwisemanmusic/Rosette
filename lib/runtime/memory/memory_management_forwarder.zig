@@ -78,8 +78,11 @@ pub const Manager = struct {
 
     pub fn allocateZeroed(self: *Manager, state: anytype, count: u64, element_size: u64) ?u64 {
         const size = std.math.mul(u64, count, element_size) catch return null;
-        const alignment = @max(element_size, 16);
-        const address = self.allocate(state, size, alignment) orelse return null;
+        // calloc promises storage suitable for any ordinary object; the
+        // element size is not an alignment request.  Using element_size here
+        // rejects every non-power-of-two-sized struct in allocate(), including
+        // Capstone's cs_struct, and makes cs_open report CS_ERR_MEM.
+        const address = self.allocate(state, size, 16) orelse return null;
         const storage = state.guestMemory(address, @max(size, 1)) orelse return null;
         @memset(storage, 0);
         return address;
@@ -328,6 +331,14 @@ test "calloc rejects overflow and zeroes storage" {
     defer manager.deinit();
     var state = TestState{};
     try std.testing.expect(manager.allocateZeroed(&state, std.math.maxInt(u64), 2) == null);
+
+    // Struct sizes are commonly not powers of two. They must not be treated
+    // as an alignment value (Capstone's allocator callback relies on this).
+    const non_power_of_two = manager.allocateZeroed(&state, 1, 136).?;
+    try std.testing.expectEqual(@as(u64, 0), non_power_of_two % 16);
+    for (state.guestMemoryConst(non_power_of_two, 136).?) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
     const address = manager.allocateZeroed(&state, 4, 8).?;
     for (state.guestMemoryConst(address, 32).?) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
