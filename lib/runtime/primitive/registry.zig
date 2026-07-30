@@ -7,6 +7,12 @@ const Handler = types.Handler;
 pub const PrimitiveDef = struct {
     name_pattern: []const u8,
     handler: Handler,
+    match_kind: MatchKind = .contains,
+};
+
+pub const MatchKind = enum {
+    contains,
+    exact,
 };
 
 pub const PrimitiveRegistry = struct {
@@ -18,7 +24,11 @@ pub const PrimitiveRegistry = struct {
 
     pub fn matchSymbol(self: *const PrimitiveRegistry, symbol_name: []const u8) ?Handler {
         for (self.defs) |def| {
-            if (std.mem.indexOf(u8, symbol_name, def.name_pattern) != null) {
+            const matches = switch (def.match_kind) {
+                .contains => std.mem.indexOf(u8, symbol_name, def.name_pattern) != null,
+                .exact => std.mem.eql(u8, symbol_name, def.name_pattern),
+            };
+            if (matches) {
                 return def.handler;
             }
         }
@@ -40,6 +50,9 @@ pub const PrimitiveRegistry = struct {
 };
 
 const builtin_primitives = [_]PrimitiveDef{
+    .{ .name_pattern = "_vsnprintf", .handler = @import("printf_compat.zig").vsnprintf, .match_kind = .exact },
+    .{ .name_pattern = "___memmove_chk", .handler = @import("memory_compat.zig").memmoveChk, .match_kind = .exact },
+    .{ .name_pattern = "_sysctl", .handler = @import("darwin_compat.zig").sysctl, .match_kind = .exact },
     .{ .name_pattern = "llabs", .handler = @import("handlers.zig").llabs },
     .{ .name_pattern = "strlen", .handler = @import("handlers.zig").strlen },
     .{ .name_pattern = "memcmp", .handler = @import("handlers.zig").memcmp },
@@ -53,6 +66,17 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "3putEc", .handler = @import("handlers.zig").ostreamPut },
     .{ .name_pattern = "terminatev", .handler = @import("handlers.zig").stdTerminate },
     .{ .name_pattern = "qsort", .handler = @import("handlers.zig").qsort },
+    .{ .name_pattern = "pthread_mach_thread_np", .handler = @import("handlers.zig").pthreadMachThreadNp },
+    .{ .name_pattern = "dladdr", .handler = @import("handlers.zig").dladdr },
+    .{ .name_pattern = "thread_get_state", .handler = @import("handlers.zig").threadGetState },
+    .{ .name_pattern = "strncpy", .handler = @import("handlers.zig").strncpy },
+    .{ .name_pattern = "strtol", .handler = @import("handlers.zig").strtol },
+    .{ .name_pattern = "_abs", .handler = @import("handlers.zig").absInt },
+    .{ .name_pattern = "compareEmmPKc", .handler = @import("handlers.zig").stringCompare },
+    .{ .name_pattern = "sentryC1ERS3_", .handler = @import("handlers.zig").sentryC1 },
+    .{ .name_pattern = "random_deviceC1E", .handler = @import("handlers.zig").randomDeviceC1 },
+    .{ .name_pattern = "random_deviceclEv", .handler = @import("handlers.zig").randomDeviceCl },
+    .{ .name_pattern = "random_deviceD1Ev", .handler = @import("handlers.zig").randomDeviceD1 },
 };
 
 pub fn builtin() PrimitiveRegistry {
@@ -63,6 +87,9 @@ test "registry: match symbol by pattern" {
     const reg = builtin();
     try std.testing.expect(reg.matchSymbol("_strlen") != null);
     try std.testing.expect(reg.matchSymbol("__cxa_guard_acquire") != null);
+    try std.testing.expect(reg.matchSymbol("_vsnprintf") != null);
+    try std.testing.expect(reg.matchSymbol("_sysctl") != null);
+    try std.testing.expect(reg.matchSymbol("_sysctlbyname") == null);
     try std.testing.expect(reg.matchSymbol("_unknown_function") == null);
 }
 

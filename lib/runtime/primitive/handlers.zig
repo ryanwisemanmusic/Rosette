@@ -243,6 +243,391 @@ pub fn qsort(_: SlotIndex, ctx: *const PrimitiveContext) Result {
 /// Implements `std::terminate()` — called by `__clang_call_terminate` when a
 /// `noexcept` violation occurs during C++ exception stack unwinding.
 /// ABI: no arguments. This function never returns — it calls host `abort()`.
+pub fn pthreadMachThreadNp(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const handle = ctx.readArg(0);
+    const result = ctx.pthreadMachThreadId(handle);
+    ctx.setResult(result);
+    return .handled;
+}
+
+/// Implements `dladdr` — resolves an address to a symbol name and location.
+/// Writes a Dl_info struct (28 bytes on x86_64 macOS) at the pointer in rsi.
+/// Dl_info layout (4 fields, each 8 bytes):
+///   +0: dli_fname (const char*)
+///   +8: dli_fbase  (void*)
+///   +16: dli_sname (const char*)
+///   +24: dli_saddr (void*)
+/// ABI: rdi = address, rsi = Dl_info* output. Returns 1 on success, 0 on failure.
+pub fn dladdr(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const address = ctx.readArg(0);
+    const info_ptr = ctx.readArg(1);
+    if (info_ptr == 0) {
+        ctx.setResult(0);
+        return .handled;
+    }
+    const info = ctx.dladdrResolve(address);
+    if (!info.found) {
+        ctx.setResult(0);
+        return .handled;
+    }
+    var buf: [32]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], info.dli_fname, .little);
+    std.mem.writeInt(u64, buf[8..16], info.dli_fbase, .little);
+    std.mem.writeInt(u64, buf[16..24], info.dli_sname, .little);
+    std.mem.writeInt(u64, buf[24..32], info.dli_saddr, .little);
+    ctx.writeGuest(info_ptr, &buf) orelse {
+        ctx.setResult(0);
+        return .handled;
+    };
+    ctx.setResult(1);
+    return .handled;
+}
+
+/// Implements `strncpy` — copies up to n characters from src to dst,
+/// null-padding the remainder of dst. Returns dst.
+/// ABI: rdi = dst, rsi = src, rdx = n.
+pub fn strncpy(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const dst = ctx.readArg(0);
+    const src = ctx.readArg(1);
+    const n = ctx.readArg(2);
+    if (n == 0) {
+        ctx.setResult(dst);
+        return .handled;
+    }
+    const max_copy: usize = @intCast(n);
+    // Copy at most n bytes from src to dst; stop at a null byte.
+    var i: usize = 0;
+    while (i < max_copy) : (i += 1) {
+        const byte = ctx.readGuest(src + i, 1) orelse {
+            ctx.setResult(dst);
+            return .handled;
+        };
+        ctx.writeGuest(dst + i, byte) orelse {
+            ctx.setResult(dst);
+            return .handled;
+        };
+        if (byte[0] == 0) {
+            // Null-pad the remainder of dst.
+            const pad_byte: [1]u8 = .{0};
+            var j: usize = i + 1;
+            while (j < max_copy) : (j += 1) {
+                ctx.writeGuest(dst + j, &pad_byte) orelse break;
+            }
+            ctx.setResult(dst);
+            return .handled;
+        }
+    }
+    ctx.setResult(dst);
+    return .handled;
+}
+
+/// Implements `thread_get_state` — Mach kernel API to get thread register state.
+/// We cannot provide real Mach thread state for emulated threads, so return
+/// KERN_FAILURE (1). The caller (PosixStackWalker) handles this gracefully.
+/// ABI: rdi = thread_act (ignored), rsi = flavor, rdx = state buffer,
+///      rcx = state count pointer. Returns KERN_SUCCESS (0) or KERN_FAILURE (1).
+pub fn threadGetState(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    // We can't provide real Mach thread state for emulated threads.
+    // Return KERN_FAILURE so the caller falls back gracefully.
+    ctx.setResult(1);
+    return .handled;
+}
+
+/// Implements `strtol` — parses a long integer from a C string.
+/// Handles leading whitespace, optional sign, and base detection (0 or 2-36).
+/// ABI: rdi = str, rsi = endptr (char**), rdx = base (0 or 2-36).
+/// Returns the parsed long value, or 0 on error (without setting errno).
+pub fn strtol(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const str = ctx.readArg(0);
+    const endptr = ctx.readArg(1);
+    const base = ctx.readArg(2);
+
+    if (base > 36) {
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    const cstr = ctx.readCString(str) orelse return .unsupported;
+    if (cstr.len == 0) {
+        if (endptr != 0) {
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, str, .little);
+            ctx.writeGuest(endptr, &buf) orelse return .unsupported;
+        }
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    // Skip whitespace
+    var idx: usize = 0;
+    while (idx < cstr.len and (cstr[idx] == ' ' or cstr[idx] == '\t' or cstr[idx] == '\n' or cstr[idx] == '\r' or cstr[idx] == '\x0c' or cstr[idx] == '\x0b')) : (idx += 1) {}
+
+    if (idx >= cstr.len) {
+        if (endptr != 0) {
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, str, .little);
+            ctx.writeGuest(endptr, &buf) orelse return .unsupported;
+        }
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    // Check sign
+    var negative = false;
+    if (cstr[idx] == '-') {
+        negative = true;
+        idx += 1;
+    } else if (cstr[idx] == '+') {
+        idx += 1;
+    }
+
+    // Detect base if 0 or 16
+    var effective_base = base;
+    if (effective_base == 0) {
+        if (idx < cstr.len and cstr[idx] == '0') {
+            if (idx + 1 < cstr.len and (cstr[idx + 1] == 'x' or cstr[idx + 1] == 'X')) {
+                effective_base = 16;
+                idx += 2;
+            } else {
+                effective_base = 8;
+                idx += 1;
+            }
+        } else {
+            effective_base = 10;
+        }
+    } else if (effective_base == 16) {
+        if (idx + 1 < cstr.len and cstr[idx] == '0' and (cstr[idx + 1] == 'x' or cstr[idx + 1] == 'X')) {
+            idx += 2;
+        }
+    }
+
+    if (idx >= cstr.len) {
+        if (endptr != 0) {
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, str, .little);
+            ctx.writeGuest(endptr, &buf) orelse return .unsupported;
+        }
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    // Parse digits
+    var result: i64 = 0;
+    const start_idx = idx;
+    while (idx < cstr.len) : (idx += 1) {
+        const ch = cstr[idx];
+        var digit: u8 = 0;
+        if (ch >= '0' and ch <= '9') {
+            digit = ch - '0';
+        } else if (ch >= 'a' and ch <= 'z') {
+            digit = ch - 'a' + 10;
+        } else if (ch >= 'A' and ch <= 'Z') {
+            digit = ch - 'A' + 10;
+        } else {
+            break;
+        }
+        if (digit >= effective_base) break;
+
+        const r: i64 = result;
+        result = r *% @as(i64, @intCast(effective_base));
+        result +%= @as(i64, @intCast(digit));
+    }
+
+    if (idx == start_idx) {
+        if (endptr != 0) {
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, str, .little);
+            ctx.writeGuest(endptr, &buf) orelse return .unsupported;
+        }
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    // Write endptr if requested
+    if (endptr != 0) {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, str + idx, .little);
+        ctx.writeGuest(endptr, &buf) orelse return .unsupported;
+    }
+
+    if (negative) {
+        ctx.setResult(@as(u64, @bitCast(-result)));
+    } else {
+        ctx.setResult(@as(u64, @bitCast(result)));
+    }
+    return .handled;
+}
+
+/// Implements `abs` — returns the absolute value of an int.
+/// ABI: rdi = signed 32-bit int value (sign-extended to 64 in rdi).
+/// Returns the absolute value (non-negative int).
+pub fn absInt(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const raw = ctx.readArg(0);
+    const value: i32 = @bitCast(@as(u32, @truncate(raw)));
+    ctx.setResult(@as(u64, @bitCast(@as(i64, @abs(value)))));
+    return .handled;
+}
+
+/// Implements `std::string::compare(size_t pos, size_t n, const char* s)` —
+/// compares a substring of this string with a C string.
+/// ABI: rdi = this (string*), rsi = pos, rdx = n, rcx = s.
+/// Returns 0 if equal, <0 if this substring < s, >0 if this substring > s.
+pub fn stringCompare(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const this_ptr = ctx.readArg(0);
+    const pos = ctx.readArg(1);
+    const n = ctx.readArg(2);
+    const s_ptr = ctx.readArg(3);
+
+    if (this_ptr == 0) return .unsupported;
+    const s_cstr = ctx.readCString(s_ptr) orelse return .unsupported;
+
+    // Read the libc++ string object header (24 bytes)
+    const header = ctx.readGuest(this_ptr, 24) orelse return .unsupported;
+
+    // libc++ basic_string<char> on x86_64:
+    // 24-byte object. __long/short union.
+    // __long: [0..7=ptr, 8..15=size, 16..23=cap]
+    // __short: [0..23=inline data], size tracked via __short.__size_
+    //
+    // __is_long() checks capacity's LSB at bytes 16-23.
+    // For long mode: (bytes[23..24].0 & 1) == 1 → capacity has bit 0 set
+    // For short mode: byte 0 = (size << 1), data starts at byte 1
+    //                 OR size stored in __data_[22] (last inline byte)
+    //                 and data starts at byte 0
+    //
+    // We check both possible layouts.
+
+    const data_ptr: u64 = blk: {
+        const size_field: u64 = blk2: {
+            // Try long mode: check if byte 22 or 23 has LSB = 1 (capacity marker)
+            if ((header[22] & 1) == 1 or (header[23] & 1) == 1) {
+                // Long mode: data pointer at bytes 0-7
+                break :blk std.mem.readInt(u64, header[0..8], .little);
+            }
+            break :blk2 header[0];
+        };
+        _ = size_field;
+        // Short mode: inline data starts at offset 0 or 1
+        // If byte 0 is even and <= 46 (max SSO = 22 chars, byte 0 = 44), it's the size marker
+        // and data starts at byte 1
+        if ((header[0] & 1) == 0 and header[0] <= 44) {
+            break :blk this_ptr + 1;
+        }
+        // Otherwise data starts at byte 0
+        break :blk this_ptr;
+    };
+
+    const string_len: u64 = blk: {
+        if ((header[22] & 1) == 1 or (header[23] & 1) == 1) {
+            // Long mode: size at bytes 8-15
+            break :blk std.mem.readInt(u64, header[8..16], .little);
+        }
+        // Short mode: size from byte 22 >> 1 (two layout possibilities)
+        const sz22 = header[22] >> 1;
+        const sz0 = header[0] >> 1;
+        if (header[0] <= 44 and (header[0] & 1) == 0) {
+            break :blk sz0;
+        }
+        if (sz22 > 0 and sz22 <= 22) {
+            break :blk sz22;
+        }
+        // Fallback: size from byte 0 >> 1
+        break :blk sz0;
+    };
+
+    if (pos >= string_len) {
+        // Compare empty substring with s
+        if (s_cstr.len == 0) {
+            ctx.setResult(0);
+        } else {
+            ctx.setResult(@as(u64, @bitCast(@as(i64, @as(i32, -1)))));
+        }
+        return .handled;
+    }
+
+    // Read the actual string data starting at pos, up to n chars
+    const available = string_len - pos;
+    const compare_len = @min(n, available);
+    if (compare_len == 0 and s_cstr.len == 0) {
+        ctx.setResult(0);
+        return .handled;
+    }
+
+    const compare_data = ctx.readGuest(data_ptr + pos, @intCast(compare_len)) orelse return .unsupported;
+
+    // Compare byte by byte
+    const limit = @min(compare_len, s_cstr.len);
+    var i: usize = 0;
+    while (i < limit) : (i += 1) {
+        if (compare_data[i] != s_cstr[i]) {
+            const diff = @as(i32, @intCast(compare_data[i])) - @as(i32, @intCast(s_cstr[i]));
+            ctx.setResult(@as(u64, @bitCast(@as(i64, diff))));
+            return .handled;
+        }
+    }
+
+    // All characters matched up to the shorter length
+    if (compare_len < s_cstr.len) {
+        ctx.setResult(@as(u64, @bitCast(@as(i64, @as(i32, -1)))));
+    } else if (compare_len > s_cstr.len) {
+        ctx.setResult(@as(u64, @bitCast(@as(i64, @as(i32, 1)))));
+    } else {
+        ctx.setResult(0);
+    }
+    return .handled;
+}
+
+/// Implements `std::basic_ostream::sentry::sentry(basic_ostream&)` —
+/// constructs a sentry object that checks the stream state and flushes
+/// tied streams. For emulation, we just mark the sentry as OK.
+/// ABI: rdi = this (sentry*), rsi = os (ostream&).
+/// The sentry is typically a small object with a bool at offset 0.
+pub fn sentryC1(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const sentry_ptr = ctx.readArg(0);
+    if (sentry_ptr == 0) return .unsupported;
+    // Write ok_ = true at the sentry's first byte.
+    // The sentry typically has a bool `ok_` at offset 0.
+    var ok_byte: [1]u8 = .{1};
+    ctx.writeGuest(sentry_ptr, &ok_byte) orelse return .unsupported;
+    return .handled_void;
+}
+
+/// Implements `std::random_device::random_device(const std::string&)` —
+/// constructs a random_device with a token string (e.g. "/dev/urandom").
+/// For emulation, we write a marker at the object to show it's initialized.
+/// ABI: rdi = this (random_device*), rsi = token (const string&).
+pub fn randomDeviceC1(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const this_ptr = ctx.readArg(0);
+    if (this_ptr == 0) return .unsupported;
+    // Write a marker showing the random_device is initialized.
+    // The object is typically a small wrapper; we just need it to be
+    // non-zero so operator() and destructor recognize it as active.
+    var marker: [8]u8 = undefined;
+    std.mem.writeInt(u64, &marker, 1, .little);
+    ctx.writeGuest(this_ptr, &marker) orelse return .unsupported;
+    return .handled_void;
+}
+
+extern fn arc4random() u32;
+
+/// Implements `std::random_device::operator()()` — returns a random
+/// unsigned int. Uses host arc4random() for cryptographically secure
+/// random numbers.
+/// ABI: rdi = this (random_device*). Returns unsigned int (32-bit).
+pub fn randomDeviceCl(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const result = arc4random();
+    ctx.setResult(@as(u64, result));
+    return .handled;
+}
+
+/// Implements `std::random_device::~random_device()` — destructor.
+/// For our stubbed implementation, this is a no-op.
+/// ABI: rdi = this (random_device*). No return value.
+pub fn randomDeviceD1(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    _ = ctx;
+    return .handled_void;
+}
+
 pub fn stdTerminate(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     _ = ctx;
     const msg = "std::terminate() called from guest code; aborting\n";
