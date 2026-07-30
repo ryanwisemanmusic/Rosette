@@ -220,12 +220,15 @@ pub fn runOneInitializer(self: anytype, launch_regs: Regs, index: usize, is_retr
     }
     if (self.terminated) {
         const final_abi = self.initializerAbi();
+        const crash_symbol = self.metadata.nearestSymbol(self.regs.rip);
         machoCapturePrint(
-            "macho-processor: initializer [{d}/{d}] terminated at rip=0x{x} reason={s} exit_code=0x{x} vtable(protections={d} recoveries={d} detections={d})\n",
+            "macho-processor: initializer [{d}/{d}] terminated at rip=0x{x} symbol={s}+0x{x} reason={s} exit_code=0x{x} vtable(protections={d} recoveries={d} detections={d})\n",
             .{
                 index + 1,
                 self.metadata.initializer_addresses.len,
                 self.regs.rip,
+                if (crash_symbol) |s| s.name else "<unknown>",
+                if (crash_symbol) |s| s.offset else @as(i64, 0),
                 @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)),
                 self.exit_code,
                 self.vtable_tracker.live_vtable_write_protections,

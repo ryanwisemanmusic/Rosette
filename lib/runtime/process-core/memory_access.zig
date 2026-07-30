@@ -148,6 +148,7 @@ pub fn read64(self: anytype, vaddr: u64) u64 {
 pub fn write8(self: anytype, vaddr: u64, val: u8) void {
     if (self.sparse_memory.bytes(vaddr, 1, true)) |bytes| {
         const mutation = captureMemoryMutation(self, vaddr, 1);
+        noteGuestWrite(self, vaddr, 1);
         bytes[0] = val;
         commitMemoryMutation(self, mutation, .partial_scalar);
         return;
@@ -165,6 +166,7 @@ pub fn write8(self: anytype, vaddr: u64, val: u8) void {
 pub fn write16(self: anytype, vaddr: u64, val: u16) void {
     if (self.sparse_memory.bytes(vaddr, 2, true)) |bytes| {
         const mutation = captureMemoryMutation(self, vaddr, 2);
+        noteGuestWrite(self, vaddr, 2);
         std.mem.writeInt(u16, bytes[0..2], val, .little);
         commitMemoryMutation(self, mutation, .partial_scalar);
         return;
@@ -182,6 +184,7 @@ pub fn write16(self: anytype, vaddr: u64, val: u16) void {
 pub fn write32(self: anytype, vaddr: u64, val: u32) void {
     if (self.sparse_memory.bytes(vaddr, 4, true)) |bytes| {
         const mutation = captureMemoryMutation(self, vaddr, 4);
+        noteGuestWrite(self, vaddr, 4);
         std.mem.writeInt(u32, bytes[0..4], val, .little);
         commitMemoryMutation(self, mutation, .partial_scalar);
         return;
@@ -226,6 +229,7 @@ pub fn write64(self: anytype, vaddr: u64, val: u64) void {
     if (self.sparse_memory.bytes(vaddr, 8, true)) |bytes| {
         const prev = std.mem.readInt(u64, bytes[0..8], .little);
         self.memory_writes.record(self.allocator, vaddr, prev, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+        noteGuestWrite(self, vaddr, 8);
         std.mem.writeInt(u64, bytes[0..8], val, .little);
         // Observe only after the guest write commits.  Failed translations
         // must not manufacture vptr history.
@@ -469,18 +473,22 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
         (transition_count <= 8 or std.math.isPowerOfTwo(transition_count)))
     {
         const previous_symbol = self.metadata.nearestSymbol(result.previous_vptr);
+        const previous_origin = vt.ownership.classifyOrigin(result.previous_vptr, self.metadata);
         const current_symbol = self.metadata.nearestSymbol(result.trusted_vptr);
+        const current_origin = vt.ownership.classifyOrigin(result.trusted_vptr, self.metadata);
         machoCapturePrint(
-            "macho-processor: vtable lifecycle transition: object=0x{x} generation={d} previous=0x{x}({s}+0x{x}) current=0x{x}({s}+0x{x}) writer=0x{x} step={d} thread=0x{x}\n",
+            "macho-processor: vtable lifecycle transition: object=0x{x} generation={d} previous=0x{x}({s}+0x{x}) origin={s} current=0x{x}({s}+0x{x}) origin={s} writer=0x{x} step={d} thread=0x{x}\n",
             .{
                 addr,
                 result.generation,
                 result.previous_vptr,
                 if (previous_symbol) |s| s.name else "<unknown>",
                 if (previous_symbol) |s| s.offset else 0,
+                @tagName(previous_origin),
                 result.trusted_vptr,
                 if (current_symbol) |s| s.name else "<unknown>",
                 if (current_symbol) |s| s.offset else 0,
+                @tagName(current_origin),
                 self.regs.rip,
                 self.executed_steps,
                 self.active_guest_thread,
@@ -668,6 +676,7 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
     const bytes = bytesForSize(size);
     if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
         recordMemoryAccess(self, addr, size, "write", val);
+        noteGuestWrite(self, addr, bytes);
         if (size == .bits64 and (addr & 7) == 0) {
             const previous = std.mem.readInt(u64, storage[0..8], .little);
             std.mem.writeInt(u64, storage[0..8], val, .little);
@@ -1275,6 +1284,7 @@ pub fn readMem128(self: anytype, addr: u64) [16]u8 {
 
 pub fn writeMem128(self: anytype, addr: u64, value: [16]u8) void {
     if (self.sparse_memory.bytes(addr, 16, true)) |storage| {
+        noteGuestWrite(self, addr, 16);
         @memcpy(storage[0..16], value[0..]);
         return;
     }
@@ -1288,7 +1298,10 @@ pub fn writeMem128(self: anytype, addr: u64, value: [16]u8) void {
 }
 
 pub fn guestMemory(self: anytype, addr: u64, count: u64) ?[]u8 {
-    if (self.sparse_memory.bytes(addr, count, true)) |bytes| return bytes;
+    if (self.sparse_memory.bytes(addr, count, true)) |bytes| {
+        noteGuestWrite(self, addr, count);
+        return bytes;
+    }
     if (count > std.math.maxInt(usize)) return null;
     const off = translateGuest(self, addr, count, .write) orelse return null;
     const off_usize: usize = @intCast(off);
@@ -1300,11 +1313,42 @@ pub fn guestMemory(self: anytype, addr: u64, count: u64) ?[]u8 {
 }
 
 pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
-    if (count == 0 or self.executable_min == std.math.maxInt(u64)) return;
+    if (count == 0) return;
     const end = address +| count;
-    if (address < self.executable_max and end > self.executable_min) {
-        self.code_generation +%= 1;
-        if (self.code_generation == 0) self.code_generation = 1;
+    const touches_image_code =
+        self.executable_min != std.math.maxInt(u64) and
+        address < self.executable_max and end > self.executable_min;
+    const touches_sparse_code = self.sparse_memory.isExecutable(address, count);
+    if (!touches_image_code and !touches_sparse_code) return;
+
+    self.code_generation +%= 1;
+    if (self.code_generation == 0) self.code_generation = 1;
+
+    // Xenia emits and patches translated x64 in a sparse RWX code cache
+    // (normally 0xA0000000..0xAFFFFFFF). Invalidate only cached instructions
+    // whose bytes overlap the write. A global generation flush on every JIT
+    // byte store is correct but makes concurrent compilation prohibitively
+    // expensive.
+    const maximum_instruction_length: u64 = 15;
+    const first_block = (address -| (maximum_instruction_length - 1)) >> 4;
+    const last_block = (end - 1) >> 4;
+    const block_count = last_block - first_block + 1;
+    if (block_count >= @as(u64, @intCast(self.decode_cache.len))) {
+        @memset(self.decode_cache, .{});
+        return;
+    }
+    var block = first_block;
+    while (block <= last_block) : (block += 1) {
+        const cache_mask: u64 = @intCast(self.decode_cache.len - 1);
+        const cache_index =
+            @as(usize, @intCast(block & cache_mask));
+        const entry = &self.decode_cache[cache_index];
+        if (entry.rip == std.math.maxInt(u64)) continue;
+        const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+        const instruction_end = entry.rip +| instruction_length;
+        if (entry.rip < end and instruction_end > address) {
+            entry.* = .{};
+        }
     }
 }
 

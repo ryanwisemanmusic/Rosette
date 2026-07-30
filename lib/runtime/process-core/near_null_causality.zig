@@ -8,6 +8,7 @@
 const std = @import("std");
 const x64_decoder = @import("x64_decoder");
 const macho_core = @import("macho_core");
+const vtable_ownership = @import("vtable").ownership;
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 
 const RegId = x64_decoder.RegId;
@@ -58,8 +59,15 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     const scaled_index = index_value << @as(u6, decoded.sib_scale);
     const rip_component = if (decoded.rip_relative) self.regs.rip + decoded.len else 0;
 
+    const src_value = switch (decoded.op) {
+        .mov_mem64_reg64, .mov_mem32_reg32, .mov_mem16_reg16, .mov_mem8_reg8,
+        => x64_decoder.regVal(&self.regs, decoded.src_reg, address_size),
+        else => 0,
+    };
+    const term_symbol = self.metadata.nearestSymbol(self.regs.rip);
+
     machoCapturePrint(
-        "macho-processor: near-null causality: terminal rip=0x{x} op={s} effective=0x{x} displacement=0x{x} base({s})=0x{x} index({s},scale={d})=0x{x} rip_component=0x{x}\n",
+        "macho-processor: near-null causality: terminal rip=0x{x} op={s} effective=0x{x} displacement=0x{x} base({s})=0x{x} index({s},scale={d})=0x{x} rip_component=0x{x} src({s})=0x{x} symbol={s}\n",
         .{
             self.regs.rip,
             @tagName(decoded.op),
@@ -71,8 +79,46 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
             @as(u8, 1) << decoded.sib_scale,
             scaled_index,
             rip_component,
+            @tagName(decoded.src_reg),
+            src_value,
+            if (term_symbol) |s| s.name else "<unknown>",
         },
     );
+
+    // Vtable ownership diagnostics: if the crash involves a write of a
+    // non-zero value through a null pointer, check whether that value
+    // is a vtable and classify its origin (host-resolved vs guest-written).
+    // This separates host-side issues (corrupted dyld binding) from
+    // guest-side issues (null `this` in Xenia's constructors).
+    if (src_value >= 0x1000 and (decoded.op == .mov_mem64_reg64 or
+        decoded.op == .mov_mem32_reg32 or
+        decoded.op == .mov_mem16_reg16))
+    {
+        const origin = vtable_ownership.classifyOrigin(src_value, self.metadata);
+        if (origin != .unknown) {
+            const origin_str = @tagName(origin);
+            const symbol = self.metadata.nearestSymbol(src_value);
+            machoCapturePrint(
+                "macho-processor: vtable ownership: value=0x{x} origin={s} symbol={s}+0x{x}\n",
+                .{
+                    src_value,
+                    origin_str,
+                    if (symbol) |s| s.name else "<unknown>",
+                    if (symbol) |s| s.offset else @as(i64, 0),
+                },
+            );
+            if (effective_address == 0) {
+                const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
+                machoCapturePrint(
+                    "macho-processor: vtable consistency: null this (this=0x0) — guest-side bug: constructor called on null object at {s}+0x{x}\n",
+                    .{
+                        if (writer_symbol) |s| s.name else "<unknown>",
+                        if (writer_symbol) |s| s.offset else 0,
+                    },
+                );
+            }
+        }
+    }
 
     // A zero C++ `this` argument is the strongest causal landmark in the
     // retained trace. Resolve it before following the terminal arithmetic,
