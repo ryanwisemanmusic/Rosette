@@ -1,5 +1,5 @@
 // Mirror: PAND/VPAND.inc
-source_isa = "arm64_neon"
+source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "PAND/VPAND.inc"
 x86_handler = "x86_vpand"
@@ -13,4 +13,11 @@ encodings = [
   { opcode = "VEX.128.66.0F.WIG DB /r", form = "VPAND xmm1, xmm2, xmm3/m128", op_en = "B", vector_length = 128 },
   { opcode = "VEX.256.66.0F.WIG DB /r", form = "VPAND ymm1, ymm2, ymm3/m256", op_en = "B", vector_length = 256 }
 ]
+
+neon_register_model = "VPAND is an x86 packed integer logical AND. NEON lowering via bitwise AND."
+neon_flag_model = "None."
+neon_assembly = "// NEON lowering: VPAND -> AND (bitwise AND)"
+semantic_general = "Bitwise AND of packed integer operands. 128-bit (AVX) and 256-bit (AVX2) VEX forms."
+flags_written = []
+
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape"]

@@ -62,5 +62,7 @@ DEST (SRC1) unchanged;
 
 other_exceptions = ["#UD if CR4.OSFXSR = 0", "#UD if LOCK prefix used", "#UD if VEX.L > 0 on 128-bit-only implementations"]
 
+flags_written = ["CF", "ZF"]
+
 handler = "x86_ptest"
 jit_lowering = "arm64_neon_cmeq_and"

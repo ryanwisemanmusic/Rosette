@@ -17,6 +17,9 @@ element_type = "i64"
 element_size = 64
 
 encodings = [
+  { opcode = "EVEX.128.66.0F38.W1 A0 /vsib", form = "VPSCATTERDQ vm32x {k1}, xmm1", op_en = "A", feature = "avx512f", vector_length = 0, encoding = "legacy" }
+  { opcode = "EVEX.256.66.0F38.W1 A0 /vsib", form = "VPSCATTERDQ vm32x {k1}, ymm1", op_en = "A", feature = "avx512f", vector_length = 0, encoding = "legacy" }
+  { opcode = "EVEX.512.66.0F38.W1 A0 /vsib", form = "VPSCATTERDQ vm32y {k1}, zmm1", op_en = "A", feature = "avx512f", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encoding = {

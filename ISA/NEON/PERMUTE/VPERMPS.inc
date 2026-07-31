@@ -16,7 +16,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "PERMUTE/VPERMPS.inc"
 x86_handler = "x86_vpermps"
-neon_lowering = "arm64_neon_tbl1"
+neon_lowering = "arm64_neon_tbl"
 lowering_kind = "neon_vector"
 
 
@@ -31,7 +31,9 @@ lanes_512 = 16
 mxcsr_used = true
 
 encodings = [
-  { opcode = "0E 30 80 30 TBL Vd.16B, {Vn.16B}, Vm.16B", form = "VPERMPS Vd.4S, Vn.4S, Vm.4S", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_neon_tbl1" }
+  { opcode = "VEX.256.66.0F38.W0 16 /r", form = "VPERMPS ymm1, ymm2, ymm3/m256", op_en = "A", feature = "AVX2", mode = "V/V", handler = "x86_vpermps_ymm_ymm_ymmm256" },
+  { opcode = "EVEX.256.66.0F38.W0 16 /r", form = "VPERMPS ymm1 {k1}{z}, ymm2, ymm3/m256/m32bcst", op_en = "B", feature = "AVX512VL AVX512F", mode = "V/V", tuple = "Full", handler = "x86_vpermps_evex256" },
+  { opcode = "EVEX.512.66.0F38.W0 16 /r", form = "VPERMPS zmm1 {k1}{z}, zmm2, zmm3/m512/m32bcst{er}", op_en = "B", feature = "AVX512F", mode = "V/V", tuple = "Full", handler = "x86_vpermps_evex512" },
 ]
 
 operand_encodings = [

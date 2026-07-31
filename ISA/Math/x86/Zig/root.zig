@@ -1160,6 +1160,28 @@ const store_vpcompressd = @import("STORE/VPCOMPRESSD.zig");
 const store_vpcompressq = @import("STORE/VPCOMPRESSQ.zig");
 const store_vpcompressw = @import("STORE/VPCOMPRESSW.zig");
 
+const arithmetic_vpaddb = @import("ARITHMETIC/vpaddb.zig");
+const arithmetic_vpaddd = @import("ARITHMETIC/vpaddd.zig");
+const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
+const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
+const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
+const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
+const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
+const horizontal_vphaddd = @import("HORIZONTAL/vphaddd.zig");
+const horizontal_vphaddsw = @import("HORIZONTAL/vphaddsw.zig");
+const horizontal_vphaddw = @import("HORIZONTAL/vphaddw.zig");
+const insert_extract_vpextrb = @import("INSERT_EXTRACT/vpextrb.zig");
+const insert_extract_vpextrd = @import("INSERT_EXTRACT/vpextrd.zig");
+const insert_extract_vpextrq = @import("INSERT_EXTRACT/vpextrq.zig");
+const insert_extract_vpextrw = @import("INSERT_EXTRACT/vpextrw.zig");
+const insert_extract_vextractf128 = @import("INSERT_EXTRACT/vextractf128.zig");
+const round_vroundpd = @import("ROUND/vroundpd.zig");
+const round_vroundps = @import("ROUND/vroundps.zig");
+const round_vroundsd = @import("ROUND/vroundsd.zig");
+const round_vroundss = @import("ROUND/vroundss.zig");
+const shuffle_vpshufd = @import("SHUFFLE/vpshufd.zig");
+const unordered_vucomiss = @import("UNORDERED/vucomiss.zig");
+
 pub const specs = blk: {
     @setEvalBranchQuota(5000);
     break :blk [_]core.InstructionMathSpec{
@@ -2320,6 +2342,27 @@ pub const specs = blk: {
         spec(store_vpcompressd.meta),
         spec(store_vpcompressq.meta),
         spec(store_vpcompressw.meta),
+        spec(arithmetic_vpaddb.meta),
+        spec(arithmetic_vpaddd.meta),
+        spec(arithmetic_vpaddq.meta),
+        spec(arithmetic_vpaddw.meta),
+        spec(atomic_cmpxchg.meta),
+        spec(atomic_cmpxchg8b.meta),
+        spec(atomic_cmpxchg16b.meta),
+        spec(horizontal_vphaddd.meta),
+        spec(horizontal_vphaddsw.meta),
+        spec(horizontal_vphaddw.meta),
+        spec(insert_extract_vpextrb.meta),
+        spec(insert_extract_vpextrd.meta),
+        spec(insert_extract_vpextrq.meta),
+        spec(insert_extract_vpextrw.meta),
+        spec(insert_extract_vextractf128.meta),
+        spec(round_vroundpd.meta),
+        spec(round_vroundps.meta),
+        spec(round_vroundsd.meta),
+        spec(round_vroundss.meta),
+        spec(shuffle_vpshufd.meta),
+        spec(unordered_vucomiss.meta),
     };
 };
 
@@ -3481,6 +3524,27 @@ pub const proof_reports = [_]proofs.ProofReport{
     store_vpcompressd.proof_report,
     store_vpcompressq.proof_report,
     store_vpcompressw.proof_report,
+    arithmetic_vpaddb.proof_report,
+    arithmetic_vpaddd.proof_report,
+    arithmetic_vpaddq.proof_report,
+    arithmetic_vpaddw.proof_report,
+    atomic_cmpxchg.proof_report,
+    atomic_cmpxchg8b.proof_report,
+    atomic_cmpxchg16b.proof_report,
+    horizontal_vphaddd.proof_report,
+    horizontal_vphaddsw.proof_report,
+    horizontal_vphaddw.proof_report,
+    insert_extract_vpextrb.proof_report,
+    insert_extract_vpextrd.proof_report,
+    insert_extract_vpextrq.proof_report,
+    insert_extract_vpextrw.proof_report,
+    insert_extract_vextractf128.proof_report,
+    round_vroundpd.proof_report,
+    round_vroundps.proof_report,
+    round_vroundsd.proof_report,
+    round_vroundss.proof_report,
+    shuffle_vpshufd.proof_report,
+    unordered_vucomiss.proof_report,
 };
 
 pub fn tableCount() usize {

@@ -1,7 +1,7 @@
 // Mirror: GET/XGETBV.inc
 // Lowering contract mirrors x86 table under arm64_neon ABI.
 
-source_isa = "arm64_neon"
+source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "GET/XGETBV.inc"
 x86_handler = "x86_xgetbv"
@@ -16,5 +16,20 @@ feature = "xsave"
 encodings = [
   { opcode = "NP 0F 01 D0", form = "XGETBV", op_en = "ZO", vector_length = 0 }
 ]
+
+
+neon_register_model = """
+XGETBV is an x86 XCR read instruction. No ARM64 NEON equivalent; handled via documented contract.
+"""
+neon_flag_model = """
+None.
+"""
+neon_assembly = """
+// NEON lowering: XGETBV stub (XCR read)
+"""
+semantic_general = """
+Reads the contents of the extended control register (XCR) specified in ECX into EDX:EAX.
+"""
+flags_written = []
 
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape"]

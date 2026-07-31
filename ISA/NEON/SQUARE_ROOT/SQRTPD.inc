@@ -17,6 +17,9 @@ element_type = "f64"
 element_size = 64
 
 encodings = [
+  { opcode = "66 0F 51 /r", form = "SQRTPD xmm1, xmm2/m128", op_en = "A", feature = "sse2", vector_length = 0, encoding = "legacy" }
+  { opcode = "VEX.128.66.0F.WIG 51 /r", form = "VSQRTPD xmm1, xmm2/m128", op_en = "A", feature = "avx", vector_length = 0, encoding = "legacy" }
+  { opcode = "VEX.256.66.0F.WIG 51 /r", form = "VSQRTPD ymm1, ymm2/m256", op_en = "A", feature = "avx", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encoding = {

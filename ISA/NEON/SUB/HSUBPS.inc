@@ -16,7 +16,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "SUB/HSUBPS.inc"
 x86_handler = "x86_hsubps"
-neon_lowering = "arm64_neon_fhsub_ps"
+neon_lowering = "arm64_neon_hsub_ps"
 lowering_kind = "neon_vector"
 
 
@@ -30,7 +30,9 @@ lanes_256 = 8
 mxcsr_used = true
 
 encodings = [
-  { opcode = "7E 30 D0 30", form = "FHSUB Vd.4S, Vn.4S, Vm.4S", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_fhsub_vd4s_vn4s_vm4s" }
+  { opcode = "F2 0F 7D /r", form = "HSUBPS xmm1, xmm2/m128", op_en = "RM", feature = "SSE3", mode = "V/V", handler = "x86_hsubps_xmm_xmmm128" },
+  { opcode = "VEX.128.F2.0F.WIG 7D /r", form = "VHSUBPS xmm1, xmm2, xmm3/m128", op_en = "RVM", feature = "AVX", mode = "V/V", handler = "x86_vhsubps_xmm_xmm_xmmm128" },
+  { opcode = "VEX.256.F2.0F.WIG 7D /r", form = "VHSUBPS ymm1, ymm2, ymm3/m256", op_en = "RVM", feature = "AVX", mode = "V/V", handler = "x86_vhsubps_ymm_ymm_ymmm256" }
 ]
 
 operand_encodings = [

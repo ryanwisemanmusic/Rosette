@@ -14,7 +14,8 @@ element_type = "float"
 legacy_width = 0
 
 encodings = [
-  { opcode = "ARM64 FPU store", form = "FSTCW", op_en = "DOC", feature = "NEON", mode = "V/V", handler = "arm64_fstcw" }
+  { opcode = "9B D9 /7", form = "FSTCW m2byte", op_en = "DOC", feature = "NEON", mode = "V/V", handler = "arm64_fstcw" },
+  { opcode = "D9 /7", form = "FNSTCW m2byte", op_en = "DOC", feature = "NEON", mode = "V/V", handler = "arm64_fstcw" }
 ]
 
 operand_encodings = [

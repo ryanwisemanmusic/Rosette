@@ -1,7 +1,7 @@
 // Mirror: BITWISE/VPTERNLOGD.inc
 // Lowering contract mirrors x86 table under arm64_neon ABI.
 
-source_isa = "arm64_neon"
+source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "BITWISE/VPTERNLOGD.inc"
 x86_handler = "x86_vpternlogd"
@@ -18,5 +18,20 @@ encodings = [
   { opcode = "EVEX.256.66.0F3A.W0 25 /r ib", form = "VPTERNLOGD ymm1 {k1}{z}, ymm2, ymm3/m256/m32bcst, imm8", op_en = "A", vector_length = 0 },
   { opcode = "EVEX.512.66.0F3A.W0 25 /r ib", form = "VPTERNLOGD zmm1 {k1}{z}, zmm2, zmm3/m512/m32bcst, imm8", op_en = "A", vector_length = 0 }
 ]
+
+
+neon_register_model = """
+VPTERNLOGD is an AVX512 bitwise ternary operation.
+"""
+neon_flag_model = """
+VPTERNLOGD does not modify flags.
+"""
+neon_assembly = """
+// NEON lowering: VPTERNLOGD stub (AVX512 bitwise ternary dword)
+"""
+semantic_general = """
+Performs bitwise ternary logic on three dword vectors using imm8 as a lookup table for each bit position.
+"""
+flags_written = []
 
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape"]

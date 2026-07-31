@@ -15,6 +15,8 @@ PUSH: preserve the operation and form-specific semantic blocks.
 See operation, semantic_* blocks, source_contract, or preserved X86_INST rows below for the full instruction behavior.
 """
 
+flags_written = []
+
 source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "PUSH/PUSH.inc"

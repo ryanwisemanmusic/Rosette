@@ -1,3 +1,4 @@
+jit_lowering = "arm64_documented_contract_cmppd"
 // CMPPD.inc
 // Compare packed double-precision floating-point values.
 

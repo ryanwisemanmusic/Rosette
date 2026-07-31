@@ -1,3 +1,4 @@
+jit_lowering = "arm64_documented_contract_pcmpgtb"
 // CMP/PCMPGTB.inc
 // Compare Packed Signed Bytes for Greater Than.
 

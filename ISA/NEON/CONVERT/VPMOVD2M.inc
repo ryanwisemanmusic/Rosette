@@ -11,7 +11,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "CONVERT/VPMOVD2M.inc"
 x86_handler = "x86_vpmovd2m"
-neon_lowering = "arm64_vpmovd2m"
+neon_lowering = "arm64_neon_vpmovd2m"
 lowering_kind = "arm64_documented_contract"
 
 name = "VPMOVD2M"

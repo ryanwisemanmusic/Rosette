@@ -14,9 +14,9 @@ Category: simd_arithmetic.
 
 source_isa = "x86"
 target_isa = "arm64_neon"
-x86_table = "MIN-MAX/MAXSS.inc"
+x86_table = "RET/MAXSS.inc"
 x86_handler = "x86_maxss"
-neon_lowering = "arm64_neon_fmax_ss"
+neon_lowering = "arm64_neon_fmax_scalar"
 lowering_kind = "neon_vector"
 
 name = "MAXSS"
@@ -30,7 +30,9 @@ lanes_512 = 1
 mxcsr_used = true
 
 encodings = [
-  { opcode = "7E 34 80 30 FMAX Vd.4S, Vn.4S, Vm.4S", form = "MAXSS Vd.4S, Vn.4S, Vm.4S", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_neon_fmax_ss" }
+  { opcode = "F3 0F 5F /r", form = "MAXSS xmm1, xmm2/m32", op_en = "A", feature = "SSE" },
+  { opcode = "VEX.LIG.F3.0F.WIG 5F /r", form = "VMAXSS xmm1, xmm2, xmm3/m32", op_en = "B", feature = "AVX" },
+  { opcode = "EVEX.LLIG.F3.0F.W0 5F /r", form = "VMAXSS xmm1{k1}{z}, xmm2, xmm3/m32{er}", op_en = "C", feature = "AVX512F" }
 ]
 
 operand_encodings = [

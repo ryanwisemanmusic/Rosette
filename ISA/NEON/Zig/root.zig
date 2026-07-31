@@ -1234,6 +1234,28 @@ pub const LoweringPlan = struct {
     can_lower: bool = true,
 };
 
+const arithmetic_vpaddb = @import("ARITHMETIC/vpaddb.zig");
+const arithmetic_vpaddd = @import("ARITHMETIC/vpaddd.zig");
+const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
+const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
+const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
+const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
+const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
+const horizontal_vphaddd = @import("HORIZONTAL/vphaddd.zig");
+const horizontal_vphaddsw = @import("HORIZONTAL/vphaddsw.zig");
+const horizontal_vphaddw = @import("HORIZONTAL/vphaddw.zig");
+const insert_extract_vpextrb = @import("INSERT_EXTRACT/vpextrb.zig");
+const insert_extract_vpextrd = @import("INSERT_EXTRACT/vpextrd.zig");
+const insert_extract_vpextrq = @import("INSERT_EXTRACT/vpextrq.zig");
+const insert_extract_vpextrw = @import("INSERT_EXTRACT/vpextrw.zig");
+const insert_extract_vextractf128 = @import("INSERT_EXTRACT/vextractf128.zig");
+const round_vroundpd = @import("ROUND/vroundpd.zig");
+const round_vroundps = @import("ROUND/vroundps.zig");
+const round_vroundsd = @import("ROUND/vroundsd.zig");
+const round_vroundss = @import("ROUND/vroundss.zig");
+const shuffle_vpshufd = @import("SHUFFLE/vpshufd.zig");
+const unordered_vucomiss = @import("UNORDERED/vucomiss.zig");
+
 pub const mirror_tables = blk: {
     @setEvalBranchQuota(5000);
     break :blk [_]MirrorTable{
@@ -2396,6 +2418,27 @@ pub const mirror_tables = blk: {
         mirror(store_vpcompressd.family, store_vpcompressd.path, store_vpcompressd.source),
         mirror(store_vpcompressq.family, store_vpcompressq.path, store_vpcompressq.source),
         mirror(store_vpcompressw.family, store_vpcompressw.path, store_vpcompressw.source),
+        mirror(arithmetic_vpaddb.family, arithmetic_vpaddb.path, arithmetic_vpaddb.source),
+        mirror(arithmetic_vpaddd.family, arithmetic_vpaddd.path, arithmetic_vpaddd.source),
+        mirror(arithmetic_vpaddq.family, arithmetic_vpaddq.path, arithmetic_vpaddq.source),
+        mirror(arithmetic_vpaddw.family, arithmetic_vpaddw.path, arithmetic_vpaddw.source),
+        mirror(atomic_cmpxchg.family, atomic_cmpxchg.path, atomic_cmpxchg.source),
+        mirror(atomic_cmpxchg8b.family, atomic_cmpxchg8b.path, atomic_cmpxchg8b.source),
+        mirror(atomic_cmpxchg16b.family, atomic_cmpxchg16b.path, atomic_cmpxchg16b.source),
+        mirror(horizontal_vphaddd.family, horizontal_vphaddd.path, horizontal_vphaddd.source),
+        mirror(horizontal_vphaddsw.family, horizontal_vphaddsw.path, horizontal_vphaddsw.source),
+        mirror(horizontal_vphaddw.family, horizontal_vphaddw.path, horizontal_vphaddw.source),
+        mirror(insert_extract_vpextrb.family, insert_extract_vpextrb.path, insert_extract_vpextrb.source),
+        mirror(insert_extract_vpextrd.family, insert_extract_vpextrd.path, insert_extract_vpextrd.source),
+        mirror(insert_extract_vpextrq.family, insert_extract_vpextrq.path, insert_extract_vpextrq.source),
+        mirror(insert_extract_vpextrw.family, insert_extract_vpextrw.path, insert_extract_vpextrw.source),
+        mirror(insert_extract_vextractf128.family, insert_extract_vextractf128.path, insert_extract_vextractf128.source),
+        mirror(round_vroundpd.family, round_vroundpd.path, round_vroundpd.source),
+        mirror(round_vroundps.family, round_vroundps.path, round_vroundps.source),
+        mirror(round_vroundsd.family, round_vroundsd.path, round_vroundsd.source),
+        mirror(round_vroundss.family, round_vroundss.path, round_vroundss.source),
+        mirror(shuffle_vpshufd.family, shuffle_vpshufd.path, shuffle_vpshufd.source),
+        mirror(unordered_vucomiss.family, unordered_vucomiss.path, unordered_vucomiss.source),
     };
 };
 
@@ -2561,19 +2604,40 @@ fn countToken(source: []const u8, needle: []const u8) usize {
 }
 
 fn countStructuredEncodingRows(source: []const u8, opener: u8) ?usize {
-    const block_start = std.mem.indexOf(u8, source, "encodings") orelse return null;
-    const open_rel = std.mem.indexOfScalar(u8, source[block_start..], opener) orelse return null;
     const closer: u8 = if (opener == '[') ']' else '}';
-    const body_start = block_start + open_rel + 1;
-    const body_end_rel = std.mem.indexOfScalar(u8, source[body_start..], closer) orelse return null;
-    const body = source[body_start .. body_start + body_end_rel];
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var in_block = false;
     var count: usize = 0;
-    var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, stripLineComment(raw_line), " \t\r");
-        if (std.mem.startsWith(u8, line, "{")) count += 1;
+        if (!in_block) {
+            // Only the assignment named exactly "encodings" opens the block;
+            // the opener must be on the same line ("encodings = [" or "encodings = {").
+            const name = assignmentName(line) orelse continue;
+            if (!std.mem.eql(u8, name, "encodings")) continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const rhs = std.mem.trim(u8, line[eq + 1 ..], " \t");
+            if (rhs.len == 0 or rhs[0] != opener) continue;
+            in_block = true;
+            // Single-line block: encodings = [{ ... }]
+            if (std.mem.indexOfScalar(u8, rhs, closer) != null) {
+                var i: usize = 0;
+                while (i < rhs.len) : (i += 1) {
+                    if (rhs[i] == '{') count += 1;
+                }
+                return count;
+            }
+            continue;
+        }
+        // Inside the block: a line starting with '{' is one encoding row.
+        if (std.mem.startsWith(u8, line, "{")) {
+            count += 1;
+            continue;
+        }
+        // The block ends at the closer line (e.g. "]" or "}" on its own line).
+        if (line.len >= 1 and line[0] == closer) break;
     }
-    return count;
+    return if (in_block) count else null;
 }
 
 fn countSourceContractOpcodeRows(source: []const u8) ?usize {

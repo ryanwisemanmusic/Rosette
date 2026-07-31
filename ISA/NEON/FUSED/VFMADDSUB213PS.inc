@@ -13,7 +13,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "FUSED/VFMADDSUB213PS.inc"
 x86_handler = "x86_vfmaddsub213ps"
-neon_lowering = "arm64_neon_fmaddsub_ps"
+neon_lowering = "arm64_vfmaddsub213ps"
 lowering_kind = "neon_vector"
 
 name = "VFMADDSUB213PS"

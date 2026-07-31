@@ -30,7 +30,10 @@ lanes_256 = 16
 mxcsr_used = false
 
 encodings = [
-  { opcode = "0E 20 34 60", form = "SHSUB Vd.8B, Vn.8B, Vm.8B", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_shsub_vd8b_vn8b_vm8b" }
+  { opcode = "NP 0F 38 05 /r", form = "PHSUBW mm1, mm2/m64", op_en = "RM", feature = "SSSE3", mode = "V/V", handler = "x86_phsubw_mm_mmm64" },
+  { opcode = "66 0F 38 05 /r", form = "PHSUBW xmm1, xmm2/m128", op_en = "RM", feature = "SSSE3", mode = "V/V", handler = "x86_phsubw_xmm_xmmm128" },
+  { opcode = "VEX.128.66.0F38.WIG 05 /r", form = "VPHSUBW xmm1, xmm2, xmm3/m128", op_en = "RVM", feature = "AVX", mode = "V/V", handler = "x86_vphsubw_xmm_xmm_xmmm128" },
+  { opcode = "VEX.256.66.0F38.WIG 05 /r", form = "VPHSUBW ymm1, ymm2, ymm3/m256", op_en = "RVM", feature = "AVX2", mode = "V/V", handler = "x86_vphsubw_ymm_ymm_ymmm256" }
 ]
 
 operand_encodings = [

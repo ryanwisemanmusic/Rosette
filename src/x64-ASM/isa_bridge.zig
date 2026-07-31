@@ -1,4 +1,4 @@
-const decoder = @import("decoder.zig");
+const decoder = @import("../../ISA/decoding/root.zig");
 
 pub const BridgeStatus = enum {
     unsupported,

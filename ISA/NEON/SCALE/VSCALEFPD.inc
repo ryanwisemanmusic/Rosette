@@ -14,7 +14,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "SCALE/VSCALEFPD.inc"
 x86_handler = "x86_vscalefpd"
-neon_lowering = "arm64_documented_contract_vscalefpd"
+neon_lowering = "arm64_vscalefpd"
 lowering_kind = "arm64_documented_contract"
 
 name = "VSCALEFPD"

@@ -31,7 +31,13 @@ lanes_512 = 64
 mxcsr_used = false
 
 encodings = [
-  { opcode = "0E 30 80 20 ZIP1 Vd.16B, Vn.16B, Vm.16B", form = "PUNPCKLBW Vd.16B, Vn.16B, Vm.16B", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_neon_zip_low_b" }
+  { opcode = "NP 0F 60 /r", form = "PUNPCKLBW mm1, mm2/m64", op_en = "A", feature = "MMX", mode = "V/V", handler = "x86_punpcklbw_mm_mmm64" },
+  { opcode = "66 0F 60 /r", form = "PUNPCKLBW xmm1, xmm2/m128", op_en = "A", feature = "SSE2", mode = "V/V", handler = "x86_punpcklbw_xmm_xmmm128" },
+  { opcode = "VEX.128.66.0F.WIG 60 /r", form = "VPUNPCKLBW xmm1, xmm2, xmm3/m128", op_en = "B", feature = "AVX", mode = "V/V", handler = "x86_vpunpcklbw_xmm_xmm_xmmm128" },
+  { opcode = "VEX.256.66.0F.WIG 60 /r", form = "VPUNPCKLBW ymm1, ymm2, ymm3/m256", op_en = "B", feature = "AVX2", mode = "V/V", handler = "x86_vpunpcklbw_ymm_ymm_ymmm256" },
+  { opcode = "EVEX.128.66.0F.WIG 60 /r", form = "VPUNPCKLBW xmm1 {k1}{z}, xmm2, xmm3/m128", op_en = "C", feature = "AVX512BW AVX512VL", tuple = "Full", handler = "x86_vpunpcklbw_evex128" },
+  { opcode = "EVEX.256.66.0F.WIG 60 /r", form = "VPUNPCKLBW ymm1 {k1}{z}, ymm2, ymm3/m256", op_en = "C", feature = "AVX512BW AVX512VL", tuple = "Full", handler = "x86_vpunpcklbw_evex256" },
+  { opcode = "EVEX.512.66.0F.WIG 60 /r", form = "VPUNPCKLBW zmm1 {k1}{z}, zmm2, zmm3/m512", op_en = "C", feature = "AVX512BW", tuple = "Full", handler = "x86_vpunpcklbw_evex512" }
 ]
 
 operand_encodings = [

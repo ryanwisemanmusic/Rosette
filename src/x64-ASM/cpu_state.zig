@@ -1,4 +1,4 @@
-const flags = @import("flags.zig");
+const flags = @import("flags");
 
 pub const OperandSize = flags.OperandSize;
 

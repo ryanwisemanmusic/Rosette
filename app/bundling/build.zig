@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const x64_decoder_module = b.createModule(.{
-        .root_source_file = b.path("../../src/x64-ASM/decoder.zig"),
+        .root_source_file = b.path("../../ISA/decoding/root.zig"),
         .target = target,
         .optimize = optimize,
     });

@@ -64,6 +64,8 @@ for j in 0..KL:
 DEST[MAXVL-1:VL] = 0;
 """
 
+flags_written = []
+
 handler = "x86_pabsb"
 jit_lowering = "arm64_abs_simd"
 

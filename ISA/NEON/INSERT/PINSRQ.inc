@@ -13,7 +13,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "INSERT/PINSRQ.inc"
 x86_handler = "x86_pinsrq"
-neon_lowering = "arm64_neon_insert_qword"
+neon_lowering = "arm64_insert_element"
 lowering_kind = "arm64_documented_contract"
 
 // INSERT/PINSRQ.inc

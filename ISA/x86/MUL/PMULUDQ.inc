@@ -74,3 +74,7 @@ DEST[MAXVL-1:VL] = 0
 handler = "x86_pmuludq"
 jit_lowering = "arm64_neon_umull_v2i32"
 fallback = "zig_lane_loop"
+
+semantic_general = """
+PMULUDQ: preserve the x86 operation contract; see the x86 source table for the full semantic blocks.
+"""

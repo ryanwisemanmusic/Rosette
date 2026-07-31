@@ -1,3 +1,4 @@
+jit_lowering = "arm64_documented_contract_pcmpeqw"
 // CMP/PCMPEQW.inc
 // Compare Packed Words for Equal.
 

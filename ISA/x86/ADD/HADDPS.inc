@@ -63,6 +63,8 @@ DEST[223:192] = SRC2[31:0] + SRC2[63:32];
 DEST[255:224] = SRC2[127:96] + SRC2[95:64];
 """
 
+flags_written = []
+
 handler = "x86_haddps"
 jit_lowering = "arm64_haddps_simd"
 

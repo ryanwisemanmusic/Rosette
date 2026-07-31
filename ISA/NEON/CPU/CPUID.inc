@@ -1,3 +1,4 @@
+neon_lowering = "arm64_cpuid"
 // NEON/CPU/CPUID.inc
 // ARM64/NEON translation mirror generated from ISA/x86/CPU/CPUID.inc.
 // Source contract: CPUID — CPU Identification.
@@ -6,8 +7,8 @@ semantic = """
 Returns processor identification and feature information.
 """
 
-source_isa = "arm64_neon"
-target_isa = "x86"
+source_isa = "x86"
+target_isa = "arm64_neon"
 
 name = "CPUID"
 aliases = []

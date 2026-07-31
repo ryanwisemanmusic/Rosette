@@ -7,9 +7,10 @@ PABSD: compute absolute value of each signed dword element, storing unsigned res
 Category: simd_integer_absolute.
 """
 
-source_isa = "arm64_neon"
-target_isa = "x86"
+source_isa = "x86"
+target_isa = "arm64_neon"
 x86_table = "ABSOLUTE/PABSD.inc"
+neon_lowering = "arm64_abs_simd"
 
 name = "PABSD"
 category = "simd_integer_absolute"
@@ -64,3 +65,20 @@ for j in 0..KL:
         DEST.u32[j*32+31:j*32] = 0;
 DEST[MAXVL-1:VL] = 0;
 """
+
+neon_register_model = """
+x86 XMM/YMM/ZMM registers mapped to ARM64 Vn registers. PABSD/VPABSD is a lane-wise SIMD absolute value.
+"""
+
+neon_flag_model = """
+No x86 flags modified by PABSD.
+"""
+
+neon_assembly = """
+abs Vd.4S, Vn.4S
+// 128-bit: abs Vd.4S, Vn.4S
+// 256-bit: abs Vd.4S, Vn.4S (low) + abs Vd2.4S, Vn2.4S (high)
+// 512-bit: abs Vd.4S, Vn.4S (4 lanes)
+"""
+
+flags_written = []

@@ -14,7 +14,9 @@ element_type = "f64"
 legacy_width = 128
 
 encodings = [
-  { opcode = "NEON compress store", form = "VCOMPRESSPD", op_en = "DOC", feature = "NEON", mode = "V/V", handler = "arm64_vcompresspd" }
+  { opcode = "EVEX.128.66.0F38.W1 8A /r", form = "VCOMPRESSPD xmm1/m128{k1}{z}, xmm2", op_en = "A", feature = "AVX512VL AVX512F", vector_length = 128, encoding = "evex" },
+  { opcode = "EVEX.256.66.0F38.W1 8A /r", form = "VCOMPRESSPD ymm1/m256{k1}{z}, ymm2", op_en = "A", feature = "AVX512VL AVX512F", vector_length = 256, encoding = "evex" },
+  { opcode = "EVEX.512.66.0F38.W1 8A /r", form = "VCOMPRESSPD zmm1/m512{k1}{z}, zmm2", op_en = "A", feature = "AVX512F", vector_length = 512, encoding = "evex" }
 ]
 
 operand_encodings = [

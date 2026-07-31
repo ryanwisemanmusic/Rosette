@@ -16,7 +16,11 @@ feature = "AVX512BW"
 element_type = "i16"
 element_size = 16
 
-encodings = []
+encodings = [
+  { opcode = "EVEX.128.66.0F38.W1 12 /r", form = "VPSLLVW xmm1 {k1}{z}, xmm2, xmm3/m128", op_en = "B", feature = "AVX512VL AVX512BW", vector_length = 128, encoding = "evex" },
+  { opcode = "EVEX.256.66.0F38.W1 12 /r", form = "VPSLLVW ymm1 {k1}{z}, ymm2, ymm3/m256", op_en = "B", feature = "AVX512VL AVX512BW", vector_length = 256, encoding = "evex" },
+  { opcode = "EVEX.512.66.0F38.W1 12 /r", form = "VPSLLVW zmm1 {k1}{z}, zmm2, zmm3/m512", op_en = "B", feature = "AVX512BW", vector_length = 512, encoding = "evex" }
+]
 
 operand_encoding = { B = { operand1 = "ModRM:reg (w)", operand2 = "EVEX.vvvv (r)", operand3 = "ModRM:r/m (r)" } }
 

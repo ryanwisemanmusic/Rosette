@@ -1893,6 +1893,28 @@ pub const InstructionTable = struct {
     }
 };
 
+const arithmetic_vpaddb = @import("ARITHMETIC/vpaddb.zig");
+const arithmetic_vpaddd = @import("ARITHMETIC/vpaddd.zig");
+const arithmetic_vpaddq = @import("ARITHMETIC/vpaddq.zig");
+const arithmetic_vpaddw = @import("ARITHMETIC/vpaddw.zig");
+const atomic_cmpxchg = @import("ATOMIC/cmpxchg.zig");
+const atomic_cmpxchg8b = @import("ATOMIC/cmpxchg8b.zig");
+const atomic_cmpxchg16b = @import("ATOMIC/cmpxchg16b.zig");
+const horizontal_vphaddd = @import("HORIZONTAL/vphaddd.zig");
+const horizontal_vphaddsw = @import("HORIZONTAL/vphaddsw.zig");
+const horizontal_vphaddw = @import("HORIZONTAL/vphaddw.zig");
+const insert_extract_vpextrb = @import("INSERT_EXTRACT/vpextrb.zig");
+const insert_extract_vpextrd = @import("INSERT_EXTRACT/vpextrd.zig");
+const insert_extract_vpextrq = @import("INSERT_EXTRACT/vpextrq.zig");
+const insert_extract_vpextrw = @import("INSERT_EXTRACT/vpextrw.zig");
+const insert_extract_vextractf128 = @import("INSERT_EXTRACT/vextractf128.zig");
+const round_vroundpd = @import("ROUND/vroundpd.zig");
+const round_vroundps = @import("ROUND/vroundps.zig");
+const round_vroundsd = @import("ROUND/vroundsd.zig");
+const round_vroundss = @import("ROUND/vroundss.zig");
+const shuffle_vpshufd = @import("SHUFFLE/vpshufd.zig");
+const unordered_vucomiss = @import("UNORDERED/vucomiss.zig");
+
 pub const tables = blk: {
     @setEvalBranchQuota(5000);
     break :blk [_]InstructionTable{
@@ -3055,6 +3077,27 @@ pub const tables = blk: {
         entry(zero_tilezero.family, zero_tilezero.path, zero_tilezero.source),
         entry(zero_vzeroall.family, zero_vzeroall.path, zero_vzeroall.source),
         entry(zero_vzeroupper.family, zero_vzeroupper.path, zero_vzeroupper.source),
+        entry(arithmetic_vpaddb.family, arithmetic_vpaddb.path, arithmetic_vpaddb.source),
+        entry(arithmetic_vpaddd.family, arithmetic_vpaddd.path, arithmetic_vpaddd.source),
+        entry(arithmetic_vpaddq.family, arithmetic_vpaddq.path, arithmetic_vpaddq.source),
+        entry(arithmetic_vpaddw.family, arithmetic_vpaddw.path, arithmetic_vpaddw.source),
+        entry(atomic_cmpxchg.family, atomic_cmpxchg.path, atomic_cmpxchg.source),
+        entry(atomic_cmpxchg8b.family, atomic_cmpxchg8b.path, atomic_cmpxchg8b.source),
+        entry(atomic_cmpxchg16b.family, atomic_cmpxchg16b.path, atomic_cmpxchg16b.source),
+        entry(horizontal_vphaddd.family, horizontal_vphaddd.path, horizontal_vphaddd.source),
+        entry(horizontal_vphaddsw.family, horizontal_vphaddsw.path, horizontal_vphaddsw.source),
+        entry(horizontal_vphaddw.family, horizontal_vphaddw.path, horizontal_vphaddw.source),
+        entry(insert_extract_vpextrb.family, insert_extract_vpextrb.path, insert_extract_vpextrb.source),
+        entry(insert_extract_vpextrd.family, insert_extract_vpextrd.path, insert_extract_vpextrd.source),
+        entry(insert_extract_vpextrq.family, insert_extract_vpextrq.path, insert_extract_vpextrq.source),
+        entry(insert_extract_vpextrw.family, insert_extract_vpextrw.path, insert_extract_vpextrw.source),
+        entry(insert_extract_vextractf128.family, insert_extract_vextractf128.path, insert_extract_vextractf128.source),
+        entry(round_vroundpd.family, round_vroundpd.path, round_vroundpd.source),
+        entry(round_vroundps.family, round_vroundps.path, round_vroundps.source),
+        entry(round_vroundsd.family, round_vroundsd.path, round_vroundsd.source),
+        entry(round_vroundss.family, round_vroundss.path, round_vroundss.source),
+        entry(shuffle_vpshufd.family, shuffle_vpshufd.path, shuffle_vpshufd.source),
+        entry(unordered_vucomiss.family, unordered_vucomiss.path, unordered_vucomiss.source),
     };
 };
 
@@ -3063,11 +3106,44 @@ pub fn tableCount() usize {
 }
 
 pub fn findByName(name: []const u8) ?InstructionTable {
+    if (findExact(name)) |table| return table;
+    // The registry documents VEX-encoded forms under their non-V names
+    // (ADDPS covers VEX.128/256/512 VADDPS); normalize before a second pass.
+    if (name.len > 1 and (name[0] == 'V' or name[0] == 'v')) {
+        if (findExact(name[1..])) |table| return table;
+    }
+    return null;
+}
+
+fn findExact(name: []const u8) ?InstructionTable {
     for (tables) |table| {
         const meta = table.metadata();
         if (std.ascii.eqlIgnoreCase(meta.name, name)) return table;
+        // Alias lookups: several specs declare canonical aliases (e.g. FSTSW
+        // declares FNSTSW) that consumers (ISA ABI contract, CLEO routing)
+        // resolve by mnemonic.
+        if (tableHasAlias(table.source, name)) return table;
     }
     return null;
+}
+
+/// True when the spec declares `name` in its `aliases = [...]` list.
+fn tableHasAlias(source: []const u8, name: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, stripLineComment(raw_line), " \t\r");
+        const key = assignmentName(line) orelse continue;
+        if (!std.mem.eql(u8, key, "aliases")) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |raw_item| {
+            const item = std.mem.trim(u8, raw_item, " \t\"[]");
+            if (item.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(item, name)) return true;
+        }
+    }
+    return false;
 }
 
 pub fn validateAll() void {
@@ -3162,19 +3238,40 @@ fn countToken(source: []const u8, needle: []const u8) usize {
 }
 
 fn countStructuredEncodingRows(source: []const u8, opener: u8) ?usize {
-    const block_start = std.mem.indexOf(u8, source, "encodings") orelse return null;
-    const open_rel = std.mem.indexOfScalar(u8, source[block_start..], opener) orelse return null;
     const closer: u8 = if (opener == '[') ']' else '}';
-    const body_start = block_start + open_rel + 1;
-    const body_end_rel = std.mem.indexOfScalar(u8, source[body_start..], closer) orelse return null;
-    const body = source[body_start .. body_start + body_end_rel];
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var in_block = false;
     var count: usize = 0;
-    var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, stripLineComment(raw_line), " \t\r");
-        if (std.mem.startsWith(u8, line, "{")) count += 1;
+        if (!in_block) {
+            // Only the assignment named exactly "encodings" opens the block;
+            // the opener must be on the same line ("encodings = [" or "encodings = {").
+            const name = assignmentName(line) orelse continue;
+            if (!std.mem.eql(u8, name, "encodings")) continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const rhs = std.mem.trim(u8, line[eq + 1 ..], " \t");
+            if (rhs.len == 0 or rhs[0] != opener) continue;
+            in_block = true;
+            // Single-line block: encodings = [{ ... }]
+            if (std.mem.indexOfScalar(u8, rhs, closer) != null) {
+                var i: usize = 0;
+                while (i < rhs.len) : (i += 1) {
+                    if (rhs[i] == '{') count += 1;
+                }
+                return count;
+            }
+            continue;
+        }
+        // Inside the block: a line starting with '{' is one encoding row.
+        if (std.mem.startsWith(u8, line, "{")) {
+            count += 1;
+            continue;
+        }
+        // The block ends at the closer line (e.g. "]" or "}" on its own line).
+        if (line.len >= 1 and line[0] == closer) break;
     }
-    return count;
+    return if (in_block) count else null;
 }
 
 fn countSourceContractOpcodeRows(source: []const u8) ?usize {

@@ -58,3 +58,17 @@ DEST[127:64] = SRC2[127:64] + SRC2[63:0];
 DEST[191:128] = SRC1[255:192] + SRC1[191:128];
 DEST[255:192] = SRC2[255:192] + SRC2[191:128];
 """
+
+neon_register_model = """
+x86 XMM/YMM registers mapped to ARM64 Vn registers.
+"""
+
+neon_flag_model = """
+No x86 flags modified by HADDPD.
+"""
+
+neon_assembly = """
+// NEON lowering: use ext + fadd for horizontal pair addition
+"""
+
+flags_written = []

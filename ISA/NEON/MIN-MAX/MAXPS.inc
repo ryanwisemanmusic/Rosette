@@ -13,7 +13,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "MIN-MAX/MAXPS.inc"
 x86_handler = "x86_maxps"
-neon_lowering = "arm64_fmaxps"
+neon_lowering = "arm64_neon_fmax_ps"
 lowering_kind = "arm64_documented_contract"
 
 // MIN-MAX/MAXPS.inc

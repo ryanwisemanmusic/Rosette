@@ -27,7 +27,9 @@ element_type = "i128"
 legacy_width = 128
 
 encodings = [
-  { opcode = "0E 30 80 20", form = "CMEQ Vd.16B, Vn.16B, Vm.16B", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_cmeq_v16b_v16b_v16b" }
+  { opcode = "66 0F 38 17 /r", form = "PTEST xmm1, xmm2/m128", op_en = "RM", feature = "SSE4_1", mode = "V/V", handler = "x86_ptest_xmm_xmmm128" },
+  { opcode = "VEX.128.66.0F38.W0 17 /r", form = "VPTEST xmm1, xmm2, xmm3/m128", op_en = "RVM", feature = "AVX", mode = "V/V", handler = "x86_vptest_xmm_xmm_xmmm128" },
+  { opcode = "VEX.256.66.0F38.W0 17 /r", form = "VPTEST ymm1, ymm2, ymm3/m256", op_en = "RVM", feature = "AVX", mode = "V/V", handler = "x86_vptest_ymm_ymm_ymmm256" }
 ]
 
 operand_encodings = [

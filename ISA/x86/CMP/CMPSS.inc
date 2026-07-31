@@ -1,3 +1,4 @@
+jit_lowering = "arm64_documented_contract_cmpss"
 // CMPSS.inc
 // Compare scalar single-precision floating-point value.
 

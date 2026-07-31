@@ -17,6 +17,11 @@ element_type = "i32"
 element_size = 32
 
 encodings = [
+  { opcode = "F2 0F 38 F0 /r", form = "CRC32 r32, r/m8", op_en = "RM", feature = "sse4_2", vector_length = 0, encoding = "legacy" }
+  { opcode = "F2 0F 38 F1 /r", form = "CRC32 r32, r/m16", op_en = "RM", feature = "sse4_2", vector_length = 0, encoding = "legacy" }
+  { opcode = "F2 0F 38 F1 /r", form = "CRC32 r32, r/m32", op_en = "RM", feature = "sse4_2", vector_length = 0, encoding = "legacy" }
+  { opcode = "F2 REX.W 0F 38 F0 /r", form = "CRC32 r64, r/m8", op_en = "RM", feature = "sse4_2", vector_length = 0, encoding = "legacy" }
+  { opcode = "F2 REX.W 0F 38 F1 /r", form = "CRC32 r64, r/m64", op_en = "RM", feature = "sse4_2", vector_length = 0, encoding = "legacy" }
 ]
 
 operand_encoding = {

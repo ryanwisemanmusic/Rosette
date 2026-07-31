@@ -50,3 +50,11 @@ neon_assembly = """
 // 3. Merge results using writemask if k1 is active
 // Broadcast support: replicate f64 scalar from memory across all lanes
 """
+
+encodings = [
+  { opcode = "EVEX.128.66.0F3A.W1 54 /r ib", form = "VFIXUPIMMPD xmm1 {k1}{z}, xmm2, xmm3/m128/m64bcst, imm8", op_en = "A", feature = "AVX512VL AVX512F", vector_length = 128, encoding = "evex" },
+  { opcode = "EVEX.256.66.0F3A.W1 54 /r ib", form = "VFIXUPIMMPD ymm1 {k1}{z}, ymm2, ymm3/m256/m64bcst, imm8", op_en = "A", feature = "AVX512VL AVX512F", vector_length = 256, encoding = "evex" },
+  { opcode = "EVEX.512.66.0F3A.W1 54 /r ib", form = "VFIXUPIMMPD zmm1 {k1}{z}, zmm2, zmm3/m512/m64bcst, imm8", op_en = "A", feature = "AVX512F", vector_length = 512, encoding = "evex" }
+]
+
+flags_written = []

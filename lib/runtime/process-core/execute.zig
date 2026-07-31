@@ -601,7 +601,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .btc_mem_imm => self.executeBitTestMemory(d, .complement, true),
 
         .push_reg => {
-            self.push(self.regVal(d.dst_reg, .bits64));
+            // src_reg is the canonical field for push (the register is read).
+            self.push(self.regVal(d.src_reg, .bits64));
         },
         .push_mem64 => {
             self.push(self.readMemVal(d.addr, .bits64));

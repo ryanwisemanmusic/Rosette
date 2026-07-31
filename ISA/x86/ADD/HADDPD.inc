@@ -55,6 +55,8 @@ DEST[191:128] = SRC1[255:192] + SRC1[191:128];
 DEST[255:192] = SRC2[255:192] + SRC2[191:128];
 """
 
+flags_written = []
+
 handler = "x86_haddpd"
 jit_lowering = "arm64_hadd_simd"
 

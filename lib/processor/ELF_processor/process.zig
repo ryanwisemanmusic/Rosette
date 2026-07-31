@@ -3341,6 +3341,8 @@ fn parseModRmMemory(bytes: []const u8, pos: *usize, mod: u3, rm: u8, rex: u8) ?M
 }
 
 fn decodeInsn(bytes: []const u8) DecodedInsn {
+    const use_shared = true;
+    if (use_shared) return x64_decoder.decodeLegacyInstruction(bytes, .long64);
     if (bytes.len == 0) return .{};
 
     // Check for VEX prefix first (C5 for 2-byte, C4 for 3-byte)
@@ -5410,7 +5412,7 @@ test "decode and execute xorps zero then movaps store" {
     try testing.expectEqual(@as(u8, 0), zero.xmm_src);
 
     const load_unaligned = decodeInsn(&[_]u8{ 0x0F, 0x10, 0x06 });
-    try testing.expectEqual(Op.movaps_xmm_mem, load_unaligned.op);
+    try testing.expectEqual(Op.movups_xmm_mem, load_unaligned.op);
     try testing.expect(load_unaligned.sib_has_base);
     try testing.expectEqual(RegId.dh_si_esi_rsi, load_unaligned.sib_base_reg);
 

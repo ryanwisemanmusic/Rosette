@@ -31,7 +31,12 @@ lanes_512 = 16
 mxcsr_used = true
 
 encodings = [
-  { opcode = "7E 30 80 30 ZIP2 Vd.4S, Vn.4S, Vm.4S", form = "UNPCKHPS Vd.4S, Vn.4S, Vm.4S", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_neon_zip_high_s" }
+  { opcode = "NP 0F 15 /r", form = "UNPCKHPS xmm1, xmm2/m128", op_en = "A", feature = "SSE", mode = "V/V", handler = "x86_unpckhps_xmm_xmmm128" },
+  { opcode = "VEX.128.0F.WIG 15 /r", form = "VUNPCKHPS xmm1, xmm2, xmm3/m128", op_en = "B", feature = "AVX", mode = "V/V", handler = "x86_vunpckhps_xmm_xmm_xmmm128" },
+  { opcode = "VEX.256.0F.WIG 15 /r", form = "VUNPCKHPS ymm1, ymm2, ymm3/m256", op_en = "B", feature = "AVX", mode = "V/V", handler = "x86_vunpckhps_ymm_ymm_ymmm256" },
+  { opcode = "EVEX.128.0F.W0 15 /r", form = "VUNPCKHPS xmm1 {k1}{z}, xmm2, xmm3/m128/m32bcst", op_en = "C", feature = "AVX512VL AVX512F", tuple = "Full", handler = "x86_vunpckhps_evex128" },
+  { opcode = "EVEX.256.0F.W0 15 /r", form = "VUNPCKHPS ymm1 {k1}{z}, ymm2, ymm3/m256/m32bcst", op_en = "C", feature = "AVX512VL AVX512F", tuple = "Full", handler = "x86_vunpckhps_evex256" },
+  { opcode = "EVEX.512.0F.W0 15 /r", form = "VUNPCKHPS zmm1 {k1}{z}, zmm2, zmm3/m512/m32bcst{er}", op_en = "C", feature = "AVX512F", tuple = "Full", handler = "x86_vunpckhps_evex512" }
 ]
 
 operand_encodings = [

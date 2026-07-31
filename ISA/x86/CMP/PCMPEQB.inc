@@ -1,3 +1,4 @@
+jit_lowering = "arm64_documented_contract_pcmpeqb"
 // CMP/PCMPEQB.inc
 // Compare Packed Bytes for Equal.
 

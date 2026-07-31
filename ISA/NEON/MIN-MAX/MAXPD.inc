@@ -13,7 +13,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "MIN-MAX/MAXPD.inc"
 x86_handler = "x86_maxpd"
-neon_lowering = "arm64_fmaxpd"
+neon_lowering = "arm64_neon_fmax_pd"
 lowering_kind = "arm64_documented_contract"
 
 // MIN-MAX/MAXPD.inc

@@ -7,9 +7,10 @@ PABSW: compute absolute value of each signed word element, storing unsigned resu
 Category: simd_integer_absolute.
 """
 
-source_isa = "arm64_neon"
-target_isa = "x86"
+source_isa = "x86"
+target_isa = "arm64_neon"
 x86_table = "ABSOLUTE/PABSW.inc"
+neon_lowering = "arm64_abs_simd"
 
 name = "PABSW"
 category = "simd_integer_absolute"
@@ -64,3 +65,20 @@ for j in 0..KL:
         DEST.u16[j*16+15:j*16] = 0;
 DEST[MAXVL-1:VL] = 0;
 """
+
+neon_register_model = """
+x86 XMM/YMM/ZMM registers mapped to ARM64 Vn registers. PABSW/VPABSW is a lane-wise SIMD absolute value.
+"""
+
+neon_flag_model = """
+No x86 flags modified by PABSW.
+"""
+
+neon_assembly = """
+abs Vd.8H, Vn.8H
+// 128-bit: abs Vd.8H, Vn.8H
+// 256-bit: abs Vd.8H, Vn.8H (low) + abs Vd2.8H, Vn2.8H (high)
+// 512-bit: abs Vd.8H, Vn.8H (4 lanes)
+"""
+
+flags_written = []

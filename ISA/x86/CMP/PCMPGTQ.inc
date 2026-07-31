@@ -1,3 +1,4 @@
+jit_lowering = "arm64_documented_contract_pcmpgtq"
 // CMP/PCMPGTQ.inc
 // Compare Packed Signed Qwords for Greater Than.
 

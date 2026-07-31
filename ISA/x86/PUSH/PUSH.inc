@@ -16,6 +16,10 @@ PUSH: preserve the operation and form-specific semantic blocks.
 See operation, semantic_* blocks, source_contract, or preserved X86_INST rows below for the full instruction behavior.
 """
 
+flags_written = []
+
+jit_lowering = "arm64_documented_contract_from_x86_push"
+
 #ifndef X86_PUSH_INC
 #define X86_PUSH_INC
 

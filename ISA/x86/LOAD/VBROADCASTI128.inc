@@ -63,4 +63,8 @@ neon_notes = [
   "Runtime ABI validation checks both the x86 table shape and this NEON lowering shape."
 ]
 
+semantic_general = """
+VBROADCASTI128: preserve the x86 operation contract; see the x86 source table for the full semantic blocks.
+"""
+
 abi_contract = ["x86_table_shape", "neon_mirror_shape", "arm64_lowering_shape", "full_scope_preserved"]

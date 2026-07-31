@@ -31,7 +31,13 @@ lanes_512 = 8
 mxcsr_used = false
 
 encodings = [
-  { opcode = "0E 30 80 80", form = "SUB Vd.2D, Vn.2D, Vm.2D", op_en = "A", feature = "NEON", mode = "V/V", handler = "arm64_sub_vd2d_vn2d_vm2d" }
+  { opcode = "NP 0F FB /r", form = "PSUBQ mm1, mm2/m64", op_en = "A", feature = "SSE2", mode = "V/V", handler = "x86_psubq_mm_mmm64" },
+  { opcode = "66 0F FB /r", form = "PSUBQ xmm1, xmm2/m128", op_en = "A", feature = "SSE2", mode = "V/V", handler = "x86_psubq_xmm_xmmm128" },
+  { opcode = "VEX.128.66.0F.WIG FB /r", form = "VPSUBQ xmm1, xmm2, xmm3/m128", op_en = "B", feature = "AVX", mode = "V/V", handler = "x86_vpsubq_xmm_xmm_xmmm128" },
+  { opcode = "VEX.256.66.0F.WIG FB /r", form = "VPSUBQ ymm1, ymm2, ymm3/m256", op_en = "B", feature = "AVX2", mode = "V/V", handler = "x86_vpsubq_ymm_ymm_ymmm256" },
+  { opcode = "EVEX.128.66.0F.W1 FB /r", form = "VPSUBQ xmm1 {k1}{z}, xmm2, xmm3/m128/m64bcst", op_en = "C", feature = "AVX512F AVX512VL", tuple = "Full", handler = "x86_vpsubq_evex128" },
+  { opcode = "EVEX.256.66.0F.W1 FB /r", form = "VPSUBQ ymm1 {k1}{z}, ymm2, ymm3/m256/m64bcst", op_en = "C", feature = "AVX512F AVX512VL", tuple = "Full", handler = "x86_vpsubq_evex256" },
+  { opcode = "EVEX.512.66.0F.W1 FB /r", form = "VPSUBQ zmm1 {k1}{z}, zmm2, zmm3/m512/m64bcst", op_en = "C", feature = "AVX512F", tuple = "Full", handler = "x86_vpsubq_evex512" }
 ]
 
 operand_encodings = [

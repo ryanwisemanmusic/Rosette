@@ -13,7 +13,7 @@ source_isa = "x86"
 target_isa = "arm64_neon"
 x86_table = "INSERT/PINSRW.inc"
 x86_handler = "x86_pinsrw"
-neon_lowering = "arm64_neon_insert_word"
+neon_lowering = "arm64_insert_element"
 lowering_kind = "arm64_documented_contract"
 
 // INSERT/PINSRW.inc
@@ -28,9 +28,10 @@ element_type = "u16"
 element_size = 16
 
 encodings = [
-  { opcode = "0F C4 /r ib", form = "PINSRW mm1, r32/m16, imm8", op_en = "A", feature = "SSE", vector_length = 64, encoding = "legacy_mmx" },
-  { opcode = "66 0F C4 /r ib", form = "PINSRW xmm1, r32/m16, imm8", op_en = "A", feature = "SSE2", vector_length = 128, encoding = "legacy_sse" },
-  { opcode = "VEX.128.66.0F.W1 C4 /r ib", form = "VPINSRW xmm1, xmm2, r32/m16, imm8", op_en = "B", feature = "AVX", vector_length = 128, encoding = "vex" }
+  { opcode = "NP 0F C4 /r ib", form = "PINSRW mm1, r32/m16, imm8", op_en = "RMI", feature = "SSE", vector_length = 64, encoding = "legacy_mmx" },
+  { opcode = "66 0F C4 /r ib", form = "PINSRW xmm1, r32/m16, imm8", op_en = "RMI", feature = "SSE2", vector_length = 128, encoding = "legacy_sse" },
+  { opcode = "VEX.128.66.0F.W0 C4 /r ib", form = "VPINSRW xmm1, xmm2, r32/m16, imm8", op_en = "RVMI", feature = "AVX", vector_length = 128, encoding = "vex" },
+  { opcode = "EVEX.128.66.0F.WIG C4 /r ib", form = "VPINSRW xmm1 {k1}{z}, xmm2, r32/m16, imm8", op_en = "C", feature = "AVX512BW", vector_length = 128, encoding = "evex" }
 ]
 
 operand_encoding = {
