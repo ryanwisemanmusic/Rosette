@@ -16,7 +16,7 @@ encodings = [
   { opcode = "80 /2 ib", form = "ADC r/m8, imm8", op_en = "MI" },
   { opcode = "81 /2 iw", form = "ADC r/m16, imm16", op_en = "MI" },
   { opcode = "81 /2 id", form = "ADC r/m32, imm32", op_en = "MI" },
-  { opcode = "83 /2 ib", form = "ADC r/m16|r/m32, imm8", op_en = "MI", imm = "sign_extend" },
+  { opcode = "83 /2 ib", form = "ADC r/m16|r/m32|r/m64, imm8", op_en = "MI", imm = "sign_extend" },
   { opcode = "10 /r", form = "ADC r/m8, r8", op_en = "MR" },
   { opcode = "11 /r", form = "ADC r/m16|r/m32, r16|r32", op_en = "MR" },
   { opcode = "12 /r", form = "ADC r8, r/m8", op_en = "RM" },

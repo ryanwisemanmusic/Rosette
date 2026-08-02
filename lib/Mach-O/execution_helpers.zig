@@ -54,6 +54,20 @@ pub fn signBitForSize(size: Size) u64 {
     };
 }
 
+/// Sign-extends a value from `source_size` to `destination_size` while
+/// preserving the architectural destination width. In particular, REX.W
+/// MOVSX must extend through all 64 bits rather than first producing a u32
+/// that is subsequently zero-extended by the register write.
+pub fn signExtend(value: u64, source_size: Size, destination_size: Size) u64 {
+    const source_mask = maskForSize(source_size);
+    const truncated = value & source_mask;
+    const extended = if (truncated & signBitForSize(source_size) != 0)
+        truncated | ~source_mask
+    else
+        truncated;
+    return extended & maskForSize(destination_size);
+}
+
 pub fn executeFucomip(self: anytype, source: u3) void {
     const lhs = self.x87.get(0) orelse return;
     const rhs = self.x87.get(source) orelse return;
@@ -66,6 +80,14 @@ pub fn executeFucomip(self: anytype, source: u3) void {
         self.regs.rflags |= RFL_ZF;
     }
     _ = self.x87.pop();
+}
+
+test "sign extension honors the full architectural destination width" {
+    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FF80), signExtend(0x80, .bits8, .bits64));
+    try std.testing.expectEqual(@as(u64, 0x0000_0000_FFFF_FF80), signExtend(0x80, .bits8, .bits32));
+    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_8000), signExtend(0x8000, .bits16, .bits64));
+    try std.testing.expectEqual(@as(u64, 0xFFFF_FFFF_8000_0000), signExtend(0x8000_0000, .bits32, .bits64));
+    try std.testing.expectEqual(@as(u64, 0x7F), signExtend(0x7F, .bits8, .bits64));
 }
 
 pub fn executeBitScan(self: anytype, d: DecodedInsn) void {

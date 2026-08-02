@@ -287,6 +287,27 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
 
     // Original 0x0F map (vex.m == 1)
     switch (opcode) {
+        0xAE => {
+            // VLDMXCSR/VSTMXCSR: VEX.128.0F.WIG AE /2 and /3. Unlike most
+            // VEX instructions these use the ModR/M reg field as an opcode
+            // extension, not as a vector destination. Keep them in the
+            // unified ISA decoder so generated Xenia code doesn't depend on
+            // an external VEX-to-NEON diagnostic shim.
+            const group = modrm_decoded.dst_xmm & 7;
+            if (vex.l or vex.vvvv != 0 or vex.has_66_prefix or vex.has_f2_prefix or
+                vex.has_f3_prefix or modrm_decoded.is_reg_form or
+                (group != 2 and group != 3))
+            {
+                return null;
+            }
+            return .{
+                .op = if (group == 2) .ldmxcsr_mem32 else .stmxcsr_mem32,
+                .size = .bits32,
+                .len = @intCast(pos),
+                .addr = modrm_decoded.addr,
+                .is_reg_form = false,
+            };
+        },
         0x10 => {
             // VMOVUPS (VEX.0F 10), VMOVUPD (VEX.66.0F 10)
             // VMOVSS (VEX.F3.0F 10), VMOVSD (VEX.F2.0F 10) — load forms
@@ -830,6 +851,23 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return .{ .op = .vzeroupper, .len = @intCast(start_pos + 3) };
     }
     if (start_pos + 3 >= bytes.len) return .{};
+
+    // VLDMXCSR/VSTMXCSR: VEX.128.0F.WIG AE /2 and /3. Xenia emits the
+    // load form before entering generated floating-point code. This belongs
+    // to Rosette's ISA state model; no Xenia-side VEX-to-NEON helper is
+    // involved.
+    if (opcode == 0xAE and (vex & 0x78) == 0x78 and !vector_256 and prefix == 0) {
+        var decoded = DecodedInsn{ .size = .bits32 };
+        var pos = start_pos + 3;
+        const modrm = bytes[pos];
+        const group = (modrm >> 3) & 7;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits32);
+        if (decoded.is_reg_form or (group != 2 and group != 3)) return .{};
+        decoded.op = if (group == 2) .ldmxcsr_mem32 else .stmxcsr_mem32;
+        decoded.addr = rm.addr;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
 
     if (opcode == 0x6E and (vex & 0x78) == 0x78 and !vector_256 and prefix == 1) {
         var decoded = DecodedInsn{ .size = .bits32 };
@@ -2174,52 +2212,127 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     // Three-byte VEX is required when X/B extension bits address r8-r15 even
-    // for ordinary 0F-map moves. Xbyak emits this form for VMOVDQU [r9],xmm0.
-    if (opcode_map == 1 and (opcode == 0x6F or opcode == 0x7F) and
-        (prefix == 1 or prefix == 2) and (vex_control & 0x78) == 0x78)
+    // for ordinary 0F-map moves. Clang and Xbyak use these forms throughout
+    // Xenia, including VMOVUPS xmm0,[r12] in pre-main libc++ constructors.
+    // Keep the full aligned/unaligned integer and floating-point move families
+    // on the same ModR/M + SIB path so VEX.B and VEX.X reach readModRM.
+    if (opcode_map == 1 and
+        (opcode == 0x6F or opcode == 0x7F or
+            opcode == 0x10 or opcode == 0x11 or
+            opcode == 0x28 or opcode == 0x29) and
+        (vex_control & 0x78) == 0x78)
     {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 4;
         const is_memory = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
-        const unaligned = prefix == 2;
-        if (opcode == 0x6F) {
+        const Family = enum { dqu, dqa, ups, aps, upd, apd, ss, sd };
+        const family: Family = switch (opcode) {
+            0x6F, 0x7F => switch (prefix) {
+                1 => .dqa,
+                2 => .dqu,
+                else => return .{},
+            },
+            0x10, 0x11 => switch (prefix) {
+                0 => .ups,
+                1 => .upd,
+                2 => .ss,
+                3 => .sd,
+                else => unreachable,
+            },
+            0x28, 0x29 => switch (prefix) {
+                0 => .aps,
+                1 => .apd,
+                else => return .{},
+            },
+            else => unreachable,
+        };
+        if ((family == .ss or family == .sd) and (!is_memory or vector_256)) return .{};
+
+        const is_load = opcode == 0x6F or opcode == 0x10 or opcode == 0x28;
+        if (is_load) {
             decoded.xmm_dst = @intFromEnum(rm.reg);
             if (is_memory) {
                 decoded.addr = rm.addr;
-                decoded.op = if (vector_256)
-                    if (unaligned) .vmovdqu_ymm_mem else .vmovdqa_ymm_mem
-                else if (unaligned)
-                    .vmovdqu_xmm_mem
-                else
-                    .vmovdqa_xmm_mem;
+                decoded.op = if (vector_256) switch (family) {
+                    .dqu => .vmovdqu_ymm_mem,
+                    .dqa => .vmovdqa_ymm_mem,
+                    .ups => .vmovups_ymm_mem,
+                    .aps => .vmovaps_ymm_mem,
+                    .upd => .vmovupd_ymm_mem,
+                    .apd => .vmovapd_ymm_mem,
+                    .ss, .sd => unreachable,
+                } else switch (family) {
+                    .dqu => .vmovdqu_xmm_mem,
+                    .dqa => .vmovdqa_xmm_mem,
+                    .ups => .vmovups_xmm_mem,
+                    .aps => .vmovaps_xmm_mem,
+                    .upd => .vmovupd_xmm_mem,
+                    .apd => .vmovapd_xmm_mem,
+                    .ss => .vmovss_xmm_mem,
+                    .sd => .vmovsd_xmm_mem,
+                };
             } else {
                 decoded.xmm_src = @intCast(rm.addr);
-                decoded.op = if (vector_256)
-                    if (unaligned) .vmovdqu_ymm_ymm else .vmovdqa_ymm_ymm
-                else if (unaligned)
-                    .vmovdqu_xmm_xmm
-                else
-                    .vmovdqa_xmm_xmm;
+                decoded.op = if (vector_256) switch (family) {
+                    .dqu => .vmovdqu_ymm_ymm,
+                    .dqa => .vmovdqa_ymm_ymm,
+                    .ups => .vmovups_ymm_ymm,
+                    .aps => .vmovaps_ymm_ymm,
+                    .upd => .vmovupd_ymm_ymm,
+                    .apd => .vmovapd_ymm_ymm,
+                    .ss, .sd => unreachable,
+                } else switch (family) {
+                    .dqu => .vmovdqu_xmm_xmm,
+                    .dqa => .vmovdqa_xmm_xmm,
+                    .ups => .vmovups_xmm_xmm,
+                    .aps => .vmovaps_xmm_xmm,
+                    .upd => .vmovupd_xmm_xmm,
+                    .apd => .vmovapd_xmm_xmm,
+                    .ss, .sd => unreachable,
+                };
             }
         } else {
             decoded.xmm_src = @intFromEnum(rm.reg);
             if (is_memory) {
                 decoded.addr = rm.addr;
-                decoded.op = if (vector_256)
-                    if (unaligned) .vmovdqu_mem_ymm else .vmovdqa_mem_ymm
-                else if (unaligned)
-                    .vmovdqu_mem_xmm
-                else
-                    .vmovdqa_mem_xmm;
+                decoded.op = if (vector_256) switch (family) {
+                    .dqu => .vmovdqu_mem_ymm,
+                    .dqa => .vmovdqa_mem_ymm,
+                    .ups => .vmovups_mem_ymm,
+                    .aps => .vmovaps_mem_ymm,
+                    .upd => .vmovupd_mem_ymm,
+                    .apd => .vmovapd_mem_ymm,
+                    .ss, .sd => unreachable,
+                } else switch (family) {
+                    .dqu => .vmovdqu_mem_xmm,
+                    .dqa => .vmovdqa_mem_xmm,
+                    .ups => .vmovups_mem_xmm,
+                    .aps => .vmovaps_mem_xmm,
+                    .upd => .vmovupd_mem_xmm,
+                    .apd => .vmovapd_mem_xmm,
+                    .ss => .vmovss_mem_xmm,
+                    .sd => .vmovsd_mem_xmm,
+                };
             } else {
                 decoded.xmm_dst = @intCast(rm.addr);
-                decoded.op = if (vector_256)
-                    if (unaligned) .vmovdqu_ymm_ymm else .vmovdqa_ymm_ymm
-                else if (unaligned)
-                    .vmovdqu_xmm_xmm
-                else
-                    .vmovdqa_xmm_xmm;
+                decoded.op = if (vector_256) switch (family) {
+                    .dqu => .vmovdqu_ymm_ymm,
+                    .dqa => .vmovdqa_ymm_ymm,
+                    .ups => .vmovups_ymm_ymm,
+                    .aps => .vmovaps_ymm_ymm,
+                    .upd => .vmovupd_ymm_ymm,
+                    .apd => .vmovapd_ymm_ymm,
+                    .ss, .sd => unreachable,
+                } else switch (family) {
+                    .dqu => .vmovdqu_xmm_xmm,
+                    .dqa => .vmovdqa_xmm_xmm,
+                    .ups => .vmovups_xmm_xmm,
+                    .aps => .vmovaps_xmm_xmm,
+                    .upd => .vmovupd_xmm_xmm,
+                    .apd => .vmovapd_xmm_xmm,
+                    .ss, .sd => unreachable,
+                };
             }
         }
         decoded.len = @intCast(pos);

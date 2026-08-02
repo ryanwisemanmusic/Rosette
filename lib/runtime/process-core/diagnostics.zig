@@ -22,8 +22,8 @@ pub fn logDecodeCacheSummary(self: anytype) void {
     const total = self.decode_cache_hits + self.decode_cache_misses;
     const hit_percent = if (total == 0) 0 else self.decode_cache_hits * 100 / total;
     machoCapturePrint(
-        "macho-processor: decode cache: entries={d} hits={d} misses={d} hit_rate={d}% code_generation={d}\n",
-        .{ self.decode_cache.len, self.decode_cache_hits, self.decode_cache_misses, hit_percent, self.code_generation },
+        "macho-processor: decode cache: entries={d} hits={d} misses={d} hit_rate={d}% stale_byte_rejections={d} code_generation={d}\n",
+        .{ self.decode_cache.len, self.decode_cache_hits, self.decode_cache_misses, hit_percent, self.decode_cache_stale_rejections, self.code_generation },
     );
 }
 
@@ -49,6 +49,14 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             "macho-processor: PatchDB empty-patch compatibility: recoveries={d}\n",
             .{self.patch_db_empty_array_recoveries},
         );
+    }
+    if (comptime @hasField(@TypeOf(self.*), "generated_endian_contract_recoveries")) {
+        if (self.generated_endian_contract_recoveries != 0) {
+            machoCapturePrint(
+                "macho-processor: generated endian contract: witnessed_repairs={d}\n",
+                .{self.generated_endian_contract_recoveries},
+            );
+        }
     }
     if (self.libcxx_string_substr_fast_paths != 0 or self.profile_host_preflight_checks != 0) {
         machoCapturePrint(
@@ -176,7 +184,8 @@ pub fn logExitDiagnostics(self: anytype) void {
         },
     };
 
-    if (self.isExecutableAddress(self.regs.rip)) {
+    const terminal_in_generated_code = self.sparse_memory.isExecutable(self.regs.rip, 1);
+    if (self.isExecutableAddress(self.regs.rip) and !terminal_in_generated_code) {
         if (self.metadata.nearestSymbol(self.regs.rip)) |symbol| {
             report.terminal_symbol = .{
                 .address = symbol.address,
@@ -187,7 +196,11 @@ pub fn logExitDiagnostics(self: anytype) void {
     }
 
     if (self.terminal_memory_failure) |failure| {
-        const terminal_symbol = self.metadata.nearestSymbol(failure.instruction_address);
+        const instruction_in_generated_code = self.sparse_memory.isExecutable(failure.instruction_address, 1);
+        const terminal_symbol = if (instruction_in_generated_code)
+            null
+        else
+            self.metadata.nearestSymbol(failure.instruction_address);
         const symbol_name = if (terminal_symbol) |symbol| symbol.name else "";
         const fault_policy = self.pointer_firewall.policyAt(failure.address);
         var vtable_header_mapped = true;
@@ -220,6 +233,7 @@ pub fn logExitDiagnostics(self: anytype) void {
             .vtable_header_mapped = vtable_header_mapped,
             .typeinfo_mapped = typeinfo_mapped,
             .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
+            .instruction_in_generated_code = instruction_in_generated_code,
         });
         report.semantic_fault = .{
             .class = @tagName(classification.class),
@@ -230,8 +244,19 @@ pub fn logExitDiagnostics(self: anytype) void {
             .effective_address = failure.address,
         };
         var provenance = self.memory_regions.find(failure.address, @as(u64, failure.bytes));
-        if (provenance == null) provenance = self.memory_regions.find(self.regs.rdi, 1);
-        if (provenance == null) provenance = self.memory_regions.find(self.regs.rsi, 1);
+        const pointer_attribution = switch (classification.class) {
+            .bad_this_pointer,
+            .bad_vtable_header,
+            .bad_streambuf_pointer,
+            .bad_typeinfo_pointer,
+            .cxx_invalid_vtt,
+            .cxx_object_model_null_vtable,
+            .cxx_shared_control_block_null_vtable,
+            => true,
+            else => false,
+        };
+        if (pointer_attribution and provenance == null) provenance = self.memory_regions.find(self.regs.rdi, 1);
+        if (pointer_attribution and provenance == null) provenance = self.memory_regions.find(self.regs.rsi, 1);
         if (provenance) |region| {
             report.semantic_fault.?.region_kind = @tagName(region.kind);
             report.semantic_fault.?.region_owner = region.owner;
@@ -243,8 +268,8 @@ pub fn logExitDiagnostics(self: anytype) void {
             report.semantic_fault.?.region_synthetic = region.isSynthetic();
         }
         var diagnostic_policy = fault_policy;
-        if (diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rdi);
-        if (diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rsi);
+        if (pointer_attribution and diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rdi);
+        if (pointer_attribution and diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rsi);
         if (diagnostic_policy) |policy| {
             report.semantic_fault.?.pointer_kind = @tagName(policy.kind);
             report.semantic_fault.?.pointer_owner = policy.owner;
@@ -359,6 +384,16 @@ pub fn logExitDiagnostics(self: anytype) void {
         report.terminal_instruction = terminal;
         if (report.semantic_fault) |*semantic| {
             if (semantic.instruction.len == 0) semantic.instruction = terminal.op;
+        }
+    } else if (self.terminal_memory_failure) |failure| {
+        if (failure.instruction_byte_count != 0) {
+            report.terminal_instruction = .{
+                .address = failure.instruction_address,
+                .op = if (failure.decoded_instruction.len != 0) failure.decoded_instruction else failure.instruction,
+                .length = failure.instruction_length,
+                .bytes = failure.instruction_bytes,
+                .byte_count = failure.instruction_byte_count,
+            };
         }
     }
 

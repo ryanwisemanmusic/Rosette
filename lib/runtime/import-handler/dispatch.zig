@@ -994,21 +994,29 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = object_address };
     }
     if (std.mem.eql(u8, name, "___cxa_end_catch")) {
-        const object_address = self.cxx_exceptions.endCatch();
-        if (object_address) |object| {
+        const catch_result = self.cxx_exceptions.endCatch();
+        if (catch_result) |ended| {
+            const object = ended.object_address;
             machoCapturePrint("macho-processor: __cxa_end_catch object=0x{x}\n", .{object});
-            if (self.unwinder.completeCatch()) {
+            if (ended.rethrow_in_progress) {
                 machoCapturePrint(
-                    "macho-processor: Itanium catch transaction completed: object=0x{x}; phase-two checkpoint retired\n",
+                    "macho-processor: Itanium rethrow handler ended: object=0x{x}; phase-two checkpoint retained for _Unwind_Resume\n",
                     .{object},
                 );
-            }
-            const spirv_resolution = self.spirv_cross.noteCatch(object);
-            if (spirv_resolution == .expected_dummy_probe_caught) {
-                machoCapturePrint(
-                    "macho-processor: SPIRV-Cross dummy-module probe resolved: object=0x{x} entry_point_expected=false handler_completed=true; this exception is verified startup history, not a hang cause\n",
-                    .{object},
-                );
+            } else {
+                if (self.unwinder.completeCatch()) {
+                    machoCapturePrint(
+                        "macho-processor: Itanium catch transaction completed: object=0x{x}; phase-two checkpoint retired\n",
+                        .{object},
+                    );
+                }
+                const spirv_resolution = self.spirv_cross.noteCatch(object);
+                if (spirv_resolution == .expected_dummy_probe_caught) {
+                    machoCapturePrint(
+                        "macho-processor: SPIRV-Cross dummy-module probe resolved: object=0x{x} entry_point_expected=false handler_completed=true; this exception is verified startup history, not a hang cause\n",
+                        .{object},
+                    );
+                }
             }
         }
         return .handled_void;
@@ -1043,6 +1051,27 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         if (self.cxxExceptionTypeName(thrown.type_info_address)) |type_name| {
             exception_type_name = type_name;
             machoCapturePrint("macho-processor: C++ exception ABI type name: {s}\n", .{type_name});
+            if (std.mem.eql(u8, type_name, "N5Xbyak5ErrorE")) {
+                // Xbyak::Error is a 16-byte std::exception-derived object in
+                // this build: vptr at +0, integer error code at +8. Reading
+                // the field directly avoids requiring a synthetic virtual
+                // `what()` call while the object is actively unwinding.
+                const error_code: i32 = @bitCast(self.read32(thrown.object_address + 8));
+                const error_name: []const u8 = switch (error_code) {
+                    5 => "bad combination",
+                    6 => "bad register size",
+                    7 => "immediate is too big",
+                    13 => "bad parameter",
+                    17 => "memory size is not specified",
+                    18 => "bad memory size",
+                    21 => "cannot allocate",
+                    else => "unclassified Xbyak error",
+                };
+                machoCapturePrint(
+                    "macho-processor: Xbyak exception detail: code={d} reason='{s}' object=0x{x}\n",
+                    .{ error_code, error_name, thrown.object_address },
+                );
+            }
             if (std.mem.indexOf(u8, type_name, "toml") != null and
                 std.mem.indexOf(u8, type_name, "parse_error") != null)
             {

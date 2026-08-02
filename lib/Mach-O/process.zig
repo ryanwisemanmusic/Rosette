@@ -458,6 +458,7 @@ pub const MachOState = struct {
     sparse_memory: sparse_virtual_memory.Manager,
     memory_regions: memory_provenance.Registry,
     memory_writes: memory_write_provenance.Tracker = .{},
+    generated_endian_contract_recoveries: u64 = 0,
     vtable_tracker: vt.VtableTracker,
     /// Tracks vtable writes for non-heap (stack-local / modeled) objects.
     /// Registered by the stream bridge during stringstream construction
@@ -523,6 +524,7 @@ pub const MachOState = struct {
     decode_cache: []DecodeCacheEntry,
     decode_cache_hits: u64 = 0,
     decode_cache_misses: u64 = 0,
+    decode_cache_stale_rejections: u64 = 0,
     code_generation: u64 = 1,
     mapped_min: u64,
     executable_min: u64,
@@ -1350,6 +1352,15 @@ pub const MachOState = struct {
     }
     pub fn noteNativeVulkanSurfaceBound(self: *MachOState, layer_token: u64, guest_surface: u64, host_surface: u64) void {
         return native_window.noteNativeVulkanSurfaceBound(self, layer_token, guest_surface, host_surface);
+    }
+    pub fn presentNativeSyntheticVulkanFrame(
+        self: *MachOState,
+        serial: u64,
+        width: u32,
+        height: u32,
+        stage: u32,
+    ) bool {
+        return native_window.presentNativeSyntheticVulkanFrame(self, serial, width, height, stage);
     }
     pub fn pumpNativeWindowEvents(self: *MachOState) void {
         return native_window.pumpNativeWindowEvents(self);
@@ -2188,6 +2199,14 @@ pub const MachOState = struct {
         x64_decoder.setReg(&self.regs, id, size, val);
     }
 
+    pub fn regOperandVal(self: *const MachOState, id: RegId, size: Size, high8: bool) u64 {
+        return x64_decoder.registerOperandValue(&self.regs, .{ .id = id, .high8 = high8 }, size);
+    }
+
+    pub fn setRegOperand(self: *MachOState, id: RegId, size: Size, high8: bool, val: u64) void {
+        x64_decoder.setRegisterOperand(&self.regs, .{ .id = id, .high8 = high8 }, size, val);
+    }
+
     pub fn setFlagsSub(self: *MachOState, a: u64, b: u64, result: u64, size: Size) void {
         x64_decoder.applySub(&self.regs.rflags, a, b, result, size);
     }
@@ -2211,9 +2230,15 @@ pub const MachOState = struct {
             .bits32 => .bits32,
             .bits64 => .bits64,
         };
-        const evaluated = x64_decoder.highway.evaluate(op, width, self.regVal(d.dst_reg, size), self.regVal(d.src_reg, size), self.regs.rflags);
+        const evaluated = x64_decoder.highway.evaluate(
+            op,
+            width,
+            self.regOperandVal(d.dst_reg, size, d.dst_high8),
+            self.regOperandVal(d.src_reg, size, d.src_high8),
+            self.regs.rflags,
+        );
         self.regs.rflags = evaluated.rflags;
-        if (evaluated.writeback) self.setReg(d.dst_reg, size, evaluated.value);
+        if (evaluated.writeback) self.setRegOperand(d.dst_reg, size, d.dst_high8, evaluated.value);
     }
 
     pub fn executeHighwayMemoryBinary(
@@ -2232,9 +2257,10 @@ pub const MachOState = struct {
         const access: GuestAccess = if (direction == .register_to_memory and op != .cmp and op != .test_bits) .write else .read;
         if (!self.ensureGuestAccess(d.addr, bytesForSize(size), access, @tagName(op))) return;
         const reg = if (direction == .memory_to_register) d.dst_reg else d.src_reg;
-        const evaluated = x64_decoder.highway.evaluateMemory(op, width, self.regVal(reg, size), self.readMemVal(d.addr, size), direction, self.regs.rflags);
+        const reg_high8 = if (direction == .memory_to_register) d.dst_high8 else d.src_high8;
+        const evaluated = x64_decoder.highway.evaluateMemory(op, width, self.regOperandVal(reg, size, reg_high8), self.readMemVal(d.addr, size), direction, self.regs.rflags);
         self.regs.rflags = evaluated.rflags;
-        if (evaluated.write_register) self.setReg(reg, size, evaluated.value);
+        if (evaluated.write_register) self.setRegOperand(reg, size, reg_high8, evaluated.value);
         if (evaluated.write_memory) self.writeMemVal(d.addr, size, evaluated.value);
     }
 
@@ -2249,11 +2275,11 @@ pub const MachOState = struct {
             const access: GuestAccess = if (op == .cmp or op == .test_bits) .read else .write;
             if (!self.ensureGuestAccess(d.addr, bytesForSize(size), access, @tagName(op))) return;
         }
-        const lhs = if (memory) self.readMemVal(d.addr, size) else self.regVal(d.dst_reg, size);
+        const lhs = if (memory) self.readMemVal(d.addr, size) else self.regOperandVal(d.dst_reg, size, d.dst_high8);
         const evaluated = x64_decoder.highway.evaluate(op, width, lhs, d.imm, self.regs.rflags);
         self.regs.rflags = evaluated.rflags;
         if (evaluated.writeback) {
-            if (memory) self.writeMemVal(d.addr, size, evaluated.value) else self.setReg(d.dst_reg, size, evaluated.value);
+            if (memory) self.writeMemVal(d.addr, size, evaluated.value) else self.setRegOperand(d.dst_reg, size, d.dst_high8, evaluated.value);
         }
     }
 
@@ -2572,12 +2598,26 @@ pub const MachOState = struct {
 
     fn decodeAt(self: *MachOState) ?DecodedInsn {
         const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
-        const cache_index = @as(usize, @intCast((fetch_address >> 4) & (DECODE_CACHE_ENTRY_COUNT - 1)));
+        const cache_index = constants.decodeCacheIndex(fetch_address);
         const entry = &self.decode_cache[cache_index];
         // Executable writes invalidate overlapping entries at the shared
         // memory-write boundary. Do not globally discard unrelated decoded
         // host/Xenia instructions whenever the JIT emits a new block.
-        if (entry.rip == fetch_address) {
+        const fetched_bytes = if (entry.rip == fetch_address)
+            self.executableInstructionBytesAt(fetch_address)
+        else
+            null;
+        const cached_bytes_match = if (fetched_bytes) |current_bytes|
+            entry.instruction_byte_count != 0 and
+                current_bytes.len >= entry.instruction_byte_count and
+                std.mem.eql(
+                    u8,
+                    entry.instruction_bytes[0..entry.instruction_byte_count],
+                    current_bytes[0..entry.instruction_byte_count],
+                )
+        else
+            false;
+        if (entry.rip == fetch_address and cached_bytes_match) {
             self.decode_cache_hits +|= 1;
             var decoded = entry.decoded;
             if (!decoded.rip_relative) {
@@ -2595,8 +2635,15 @@ pub const MachOState = struct {
             }
             return decoded;
         }
+        if (entry.rip == fetch_address) {
+            // Never execute a cached decode whose source bytes changed. This
+            // catches JIT publication paths that did not pass through the
+            // normal guest write boundary without flushing unrelated code.
+            self.decode_cache_stale_rejections +|= 1;
+            entry.* = .{};
+        }
         self.decode_cache_misses +|= 1;
-        const bytes = self.executableInstructionBytesAt(fetch_address) orelse return null;
+        const bytes = fetched_bytes orelse self.executableInstructionBytesAt(fetch_address) orelse return null;
         var decoded = decodeInsn(bytes);
         if (decoded.op == .invalid and self.sparse_memory.containsMapped(fetch_address, 1)) {
             decoded = decodeInsnCompat(bytes);
@@ -2617,12 +2664,21 @@ pub const MachOState = struct {
             .rip_relative = decoded.rip_relative,
             .segment = decoded.segment,
         }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+        const instruction_byte_count: u8 = @intCast(@min(
+            @as(usize, @max(decoded.len, 1)),
+            @min(bytes.len, @as(usize, 15)),
+        ));
         entry.* = .{
             .rip = fetch_address,
             .code_generation = self.code_generation,
             .decoded = decoded,
             .displacement = raw_displacement,
+            .instruction_byte_count = instruction_byte_count,
         };
+        @memcpy(
+            entry.instruction_bytes[0..instruction_byte_count],
+            bytes[0..instruction_byte_count],
+        );
         return decoded;
     }
 

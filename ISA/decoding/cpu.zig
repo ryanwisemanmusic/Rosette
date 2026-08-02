@@ -109,9 +109,10 @@ pub fn bitScan(size: OperandSize, kind: BitScanKind, raw_source: u64) BitScanRes
 
 pub fn byteSwap(size: OperandSize, value: u64) u64 {
     return switch (size) {
+        .bits8 => @as(u8, @truncate(value)),
+        .bits16 => @byteSwap(@as(u16, @truncate(value))),
         .bits32 => @byteSwap(@as(u32, @truncate(value))),
         .bits64 => @byteSwap(value),
-        .bits8, .bits16 => unreachable,
     };
 }
 
@@ -160,6 +161,8 @@ test "emulated CPUID exposes a coherent AVX baseline" {
 }
 
 test "shared byte swap preserves operand width" {
+    try std.testing.expectEqual(@as(u64, 0x12), byteSwap(.bits8, 0x12));
+    try std.testing.expectEqual(@as(u64, 0x3412), byteSwap(.bits16, 0x1234));
     try std.testing.expectEqual(@as(u64, 0x7856_3412), byteSwap(.bits32, 0x1234_5678));
     try std.testing.expectEqual(@as(u64, 0xEFCD_AB89_6745_2301), byteSwap(.bits64, 0x0123_4567_89AB_CDEF));
 }

@@ -225,6 +225,11 @@ pub const DecodeCacheEntry = struct {
     rip: u64 = std.math.maxInt(u64),
     code_generation: u64 = 0,
     decoded: DecodedInsn = .{},
+    /// Exact bytes used to produce `decoded`. Executable-write notifications
+    /// remain the fast invalidation path, while this snapshot is the final
+    /// guard against a missed JIT publication or an alternate write route.
+    instruction_bytes: [15]u8 = [_]u8{0} ** 15,
+    instruction_byte_count: u8 = 0,
     /// Raw displacement from `decodeInsn`, before base/index/rip-relative
     /// resolution.  Used on cache hit to re-resolve the operand address
     /// from current register state without double-counting the base

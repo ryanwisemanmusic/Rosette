@@ -65,6 +65,7 @@ const shiftPackedBytes = packed_ops.shiftPackedBytes;
 const shiftPackedElements = packed_ops.shiftPackedElements;
 const threeOperandImulResult = utils.threeOperandImulResult;
 const maskForSize = execution_helpers.maskForSize;
+const signExtend = execution_helpers.signExtend;
 
 const log = std.log.scoped(.macho);
 
@@ -114,79 +115,86 @@ fn isCooperativeYieldImport(name: []const u8) bool {
     return std.mem.eql(u8, name, "_pthread_yield_np") or std.mem.eql(u8, name, "_sched_yield");
 }
 
+const cleo_runtime_features = cleo_routing.types.FeatureSet.cleoEmulated();
+const cleo_meta_by_op = blk: {
+    @setEvalBranchQuota(1_000_000);
+    const fields = @typeInfo(Op).@"enum".fields;
+    var result: [fields.len]?cleo_routing.types.InstructionMeta = .{null} ** fields.len;
+    for (fields) |field| {
+        result[field.value] = cleo_routing.CleoRouter.findInstruction(field.name);
+    }
+    break :blk result;
+};
+
 pub fn execute(self: anytype, initial_d: DecodedInsn) void {
-    // Check if CLEO can route this instruction for wide execution
-    {
-        const result = cleo_routing.CleoRouter.route(
-            @tagName(initial_d.op),
-            cleo_routing.types.FeatureSet.cleoEmulated(),
-            0, // skip width check; decoder determines width
-        );
-        if (result.can_route) {
+    // CLEO supports a small subset of DecodedInsn operations. The former path
+    // linearly scanned all 424 CLEO metadata records for every scalar guest
+    // instruction. Resolve names once at compile time, then make the common
+    // scalar path a single indexed null check.
+    if (cleo_meta_by_op[@intFromEnum(initial_d.op)]) |meta| {
+        if (cleo_routing.CleoRouter.isInstructionSupported(meta, cleo_runtime_features)) {
             self.cleo_dispatch_hits +|= 1;
-            if (result.meta) |meta| {
-                const result_wide: ?cleo_routing.wide.Wide(128) = ternary: {
-                    const is_fma = switch (meta.operation) {
-                        .fma_ps, .fma_pd, .fms_ps, .fms_pd, .fnma_ps, .fnma_pd, .fnms_ps, .fnms_pd, .fma_addsub_ps, .fma_addsub_pd, .fma_subadd_ps => true,
-                        else => false,
-                    };
-                    const mask_active = initial_d.opmask != 0;
-                    const mask_val: u64 = if (mask_active) self.k[initial_d.opmask] else 0xFFFF_FFFF_FFFF_FFFF;
-                    const mask_mode: cleo_routing.wide.MaskMode = if (initial_d.zero_mask) .zero else .merge;
-                    if (!is_fma) {
-                        _ = initial_d.evex_broadcast; // Reserved for EVEX broadcast semantics
-                        if (mask_active) {
-                            break :ternary cleo_routing.ops.executeBinaryMasked(
-                                128,
-                                meta,
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
-                                cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_src]),
-                                mask_val,
-                                mask_mode,
-                                result.features,
-                            ) catch null;
-                        }
-                        break :ternary cleo_routing.ops.executeBinary(
+            const result_wide: ?cleo_routing.wide.Wide(128) = ternary: {
+                const is_fma = switch (meta.operation) {
+                    .fma_ps, .fma_pd, .fms_ps, .fms_pd, .fnma_ps, .fnma_pd, .fnms_ps, .fnms_pd, .fma_addsub_ps, .fma_addsub_pd, .fma_subadd_ps => true,
+                    else => false,
+                };
+                const mask_active = initial_d.opmask != 0;
+                const mask_val: u64 = if (mask_active) self.k[initial_d.opmask] else 0xFFFF_FFFF_FFFF_FFFF;
+                const mask_mode: cleo_routing.wide.MaskMode = if (initial_d.zero_mask) .zero else .merge;
+                if (!is_fma) {
+                    _ = initial_d.evex_broadcast; // Reserved for EVEX broadcast semantics
+                    if (mask_active) {
+                        break :ternary cleo_routing.ops.executeBinaryMasked(
                             128,
                             meta,
+                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
                             cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
                             cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_src]),
-                            result.features,
-                        ) catch null;
-                    }
-                    const op_name = @tagName(initial_d.op);
-                    const has_132 = std.mem.indexOf(u8, op_name, "132") != null;
-                    const has_213 = std.mem.indexOf(u8, op_name, "213") != null;
-                    const accum = if (has_132) initial_d.xmm_src2 else if (has_213) initial_d.xmm_src else initial_d.xmm_dst;
-                    const lhs = if (has_132) initial_d.xmm_dst else if (has_213) initial_d.xmm_src2 else initial_d.xmm_src2;
-                    const rhs = if (has_132) initial_d.xmm_src else if (has_213) initial_d.xmm_dst else initial_d.xmm_src;
-                    if (mask_active) {
-                        break :ternary cleo_routing.ops.executeAccumulateMasked(
-                            128,
-                            meta,
-                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
-                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
-                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
-                            cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
                             mask_val,
                             mask_mode,
-                            result.features,
+                            cleo_runtime_features,
                         ) catch null;
                     }
-                    break :ternary cleo_routing.ops.executeAccumulate(
+                    break :ternary cleo_routing.ops.executeBinary(
                         128,
                         meta,
+                        cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
+                        cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_src]),
+                        cleo_runtime_features,
+                    ) catch null;
+                }
+                const op_name = @tagName(initial_d.op);
+                const has_132 = std.mem.indexOf(u8, op_name, "132") != null;
+                const has_213 = std.mem.indexOf(u8, op_name, "213") != null;
+                const accum = if (has_132) initial_d.xmm_src2 else if (has_213) initial_d.xmm_src else initial_d.xmm_dst;
+                const lhs = if (has_132) initial_d.xmm_dst else if (has_213) initial_d.xmm_src2 else initial_d.xmm_src2;
+                const rhs = if (has_132) initial_d.xmm_src else if (has_213) initial_d.xmm_dst else initial_d.xmm_src;
+                if (mask_active) {
+                    break :ternary cleo_routing.ops.executeAccumulateMasked(
+                        128,
+                        meta,
+                        cleo_routing.wide.Wide(128).fromBytes(self.xmm[initial_d.xmm_dst]),
                         cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
                         cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
                         cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
-                        result.features,
+                        mask_val,
+                        mask_mode,
+                        cleo_runtime_features,
                     ) catch null;
-                };
-                if (result_wide) |rw| {
-                    self.xmm[initial_d.xmm_dst] = rw.bytes;
-                    return;
                 }
+                break :ternary cleo_routing.ops.executeAccumulate(
+                    128,
+                    meta,
+                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[accum]),
+                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[lhs]),
+                    cleo_routing.wide.Wide(128).fromBytes(self.xmm[rhs]),
+                    cleo_runtime_features,
+                ) catch null;
+            };
+            if (result_wide) |rw| {
+                self.xmm[initial_d.xmm_dst] = rw.bytes;
+                return;
             }
             // Fall through to interpreter for unsupported operations
         }
@@ -271,7 +279,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .fucomip_st => self.executeFucomip(@truncate(d.imm)),
 
         .mov_reg8_mem8 => {
-            self.setReg(d.dst_reg, .bits8, self.readMemVal(d.addr, .bits8));
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, self.readMemVal(d.addr, .bits8));
         },
         .mov_reg16_mem16 => {
             self.setReg(d.dst_reg, .bits16, self.readMemVal(d.addr, .bits16));
@@ -285,7 +293,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
 
         .mov_mem8_reg8 => {
-            self.writeMemVal(d.addr, .bits8, self.regVal(d.src_reg, .bits8));
+            self.writeMemVal(d.addr, .bits8, self.regOperandVal(d.src_reg, .bits8, d.src_high8));
         },
         .mov_mem16_reg16 => {
             self.writeMemVal(d.addr, .bits16, self.regVal(d.src_reg, .bits16));
@@ -298,7 +306,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
 
         .mov_reg_imm => {
-            self.setReg(d.dst_reg, d.size, d.imm);
+            self.setRegOperand(d.dst_reg, d.size, d.dst_high8, d.imm);
         },
 
         .mov_mem8_imm8 => {
@@ -315,7 +323,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
 
         .mov_reg8_reg8 => {
-            self.setReg(d.dst_reg, .bits8, self.regVal(d.src_reg, .bits8));
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, self.regOperandVal(d.src_reg, .bits8, d.src_high8));
         },
         .mov_reg16_reg16 => {
             self.setReg(d.dst_reg, .bits16, self.regVal(d.src_reg, .bits16));
@@ -410,35 +418,48 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.executeSubRegImm(d, sz);
         },
         .sbb_reg8_imm8 => {
-            const a = self.regVal(d.dst_reg, .bits8);
+            const a = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const b = d.imm;
             const cf = (self.regs.rflags & RFL_CF) != 0;
             const r = a -% b -% @as(u8, @intFromBool(cf));
-            self.setReg(d.dst_reg, .bits8, r);
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, r);
             self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
         },
         .adc_reg8_imm8 => {
-            const a = self.regVal(d.dst_reg, .bits8);
+            const a = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const b = d.imm;
             const cf = (self.regs.rflags & RFL_CF) != 0;
             const r = a +% b +% @as(u8, @intFromBool(cf));
-            self.setReg(d.dst_reg, .bits8, r);
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, r);
             self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
         },
+        .adc_reg16_imm8, .adc_reg32_imm8, .adc_reg64_imm8 => self.executeHighwayImmediate(d, .adc, d.size, false),
         .adc_reg8_mem8 => {
-            const a = self.regVal(d.dst_reg, .bits8);
+            const a = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const b = self.readMemVal(d.addr, .bits8);
             const cf = (self.regs.rflags & RFL_CF) != 0;
             const r = a +% b +% @as(u8, @intFromBool(cf));
-            self.setReg(d.dst_reg, .bits8, r);
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, r);
             self.setFlagsAdd(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
         },
+        .adc_reg8_reg8, .adc_reg16_reg16, .adc_reg32_reg32, .adc_reg64_reg64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.adc_reg8_reg8) + @intFromEnum(Size.bits8));
+            self.executeHighwayRegisterBinary(d, .adc, sz);
+        },
+        .adc_reg16_mem16, .adc_reg32_mem32, .adc_reg64_mem64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.adc_reg16_mem16) + @intFromEnum(Size.bits16));
+            self.executeHighwayMemoryBinary(d, .adc, sz, .memory_to_register);
+        },
+        .adc_mem8_reg8, .adc_mem16_reg16, .adc_mem32_reg32, .adc_mem64_reg64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.adc_mem8_reg8) + @intFromEnum(Size.bits8));
+            self.executeHighwayMemoryBinary(d, .adc, sz, .register_to_memory);
+        },
         .sbb_reg8_mem8 => {
-            const a = self.regVal(d.dst_reg, .bits8);
+            const a = self.regOperandVal(d.dst_reg, .bits8, d.dst_high8);
             const b = self.readMemVal(d.addr, .bits8);
             const cf = (self.regs.rflags & RFL_CF) != 0;
             const r = a -% b -% @as(u8, @intFromBool(cf));
-            self.setReg(d.dst_reg, .bits8, r);
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, r);
             self.setFlagsSub(a, b + @as(u8, @intFromBool(cf)), r, .bits8);
         },
 
@@ -768,10 +789,14 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             }
         },
         .ret => {
+            // RET imm16 pops the return address first, then releases the
+            // callee-cleanup bytes. Applying imm16 before pop reads the return
+            // target from an argument slot and can manufacture a zero-return
+            // termination even when the call stack is intact.
+            const ret_addr = self.pop();
             if (d.imm > 0) {
                 self.regs.rsp +|= d.imm;
             }
-            const ret_addr = self.pop();
             if (ret_addr == 0) {
                 self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.ret_stack_empty);
                 self.terminated = true;
@@ -896,6 +921,22 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
 
         .bswap_reg => self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, self.regVal(d.dst_reg, d.size))),
+
+        .movbe_reg_mem => {
+            const value = self.readMemVal(d.addr, d.size);
+            self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, value));
+        },
+        .movbe_mem_reg => {
+            const value = x64_decoder.byteSwap(d.size, self.regVal(d.src_reg, d.size));
+            self.writeMemVal(d.addr, d.size, value);
+        },
+
+        .ldmxcsr_mem32 => {
+            self.regs.mxcsr = @truncate(self.readMemVal(d.addr, .bits32));
+        },
+        .stmxcsr_mem32 => {
+            self.writeMemVal(d.addr, .bits32, self.regs.mxcsr);
+        },
 
         .crc32_reg_reg, .crc32_reg_mem => {
             const source = if (d.op == .crc32_reg_mem)
@@ -1117,26 +1158,22 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 self.regVal(d.src_reg, .bits8)
             else
                 self.readMemVal(d.addr, .bits8);
-            const signed_val = @as(u32, @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(val)))))));
-            self.setReg(d.dst_reg, d.size, signed_val);
+            self.setReg(d.dst_reg, d.size, signExtend(val, .bits8, d.size));
         },
         .movsx_reg32_mem16 => {
             const val = if (d.is_reg_form)
                 self.regVal(d.src_reg, .bits16)
             else
                 self.readMemVal(d.addr, .bits16);
-            const signed_val = @as(u32, @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(val)))))));
-            self.setReg(d.dst_reg, d.size, signed_val);
+            self.setReg(d.dst_reg, d.size, signExtend(val, .bits16, d.size));
         },
         .movsxd_reg64_reg32 => {
             const val = self.regVal(d.src_reg, .bits32);
-            const signed_val = @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(val)))))));
-            self.setReg(d.dst_reg, .bits64, signed_val);
+            self.setReg(d.dst_reg, .bits64, signExtend(val, .bits32, .bits64));
         },
         .movsxd_reg64_mem32 => {
             const val = self.readMemVal(d.addr, .bits32);
-            const signed_val = @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(val)))))));
-            self.setReg(d.dst_reg, .bits64, signed_val);
+            self.setReg(d.dst_reg, .bits64, signExtend(val, .bits32, .bits64));
         },
 
         .cbw => {
@@ -1177,9 +1214,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
 
         .setcc_reg8 => {
             if (x64_decoder.evalCond(self.regs.rflags, d.cond)) {
-                self.setReg(d.dst_reg, .bits8, 1);
+                self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, 1);
             } else {
-                self.setReg(d.dst_reg, .bits8, 0);
+                self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, 0);
             }
         },
         .setcc_mem8 => {

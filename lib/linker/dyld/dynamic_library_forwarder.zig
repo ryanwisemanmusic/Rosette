@@ -153,7 +153,14 @@ const VulkanPresenterStage = enum {
     metal_surface_requested,
     metal_surface_created,
     swapchain_requested,
-    ready,
+    // The guest-visible swapchain and its images exist only as Rosette model
+    // handles. This is sufficient for Vulkan initialization discovery, but it
+    // cannot put pixels in the CAMetalLayer.
+    synthetic_swapchain_ready,
+    // Reserved for the native device + native swapchain + command submission
+    // bridge. Nothing may report this state until vkQueuePresentKHR targets a
+    // real host swapchain backed by the window's CAMetalLayer.
+    native_drawable_ready,
     failed,
 };
 
@@ -397,7 +404,7 @@ pub const Forwarder = struct {
                 .get_swapchain_images => state.regs.rax = self.enumerateSwapchainImages(state),
                 .acquire_next_image => state.regs.rax = self.acquireNextImage(state, state.regs.r9),
                 .queue_submit => state.regs.rax = self.queueSubmit(),
-                .queue_present => state.regs.rax = self.queuePresent(),
+                .queue_present => state.regs.rax = self.queuePresent(state),
                 .create_device_object => state.regs.rax = self.createVulkanObject(state, state.regs.rcx, entry.name[0..entry.name_length]),
                 .allocate_command_buffers => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 28, entry.name[0..entry.name_length]),
                 .allocate_descriptor_sets => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 24, entry.name[0..entry.name_length]),
@@ -456,6 +463,9 @@ pub const Forwarder = struct {
         state.write64(output, handle);
         registerOpaqueHandle(state, handle, name);
         machoCapturePrint("macho-processor: Vulkan object created: {s} handle=0x{x} output=0x{x}\n", .{ name, handle, output });
+        if (std.mem.eql(u8, name, "vkCreateImage")) {
+            _ = presentNativeSyntheticVulkanFrame(state, handle, 0, 0, 2);
+        }
         return 0;
     }
 
@@ -738,11 +748,18 @@ pub const Forwarder = struct {
                 .{ handle, output, self.vulkan_swapchain_image_count, image_width, image_height, image_usage },
             );
         }
-        self.vulkan_presenter_stage = .ready;
+        self.vulkan_presenter_stage = .synthetic_swapchain_ready;
         machoCapturePrint(
-            "macho-processor: Vulkan presenter bind complete: stage=ready attempt={d} surface=0x{x} swapchain=0x{x} gtk_idle_source={d}\n",
+            "macho-processor: Vulkan presenter bind complete: stage=synthetic_swapchain_ready attempt={d} surface=0x{x} swapchain=0x{x} gtk_idle_source={d} native_drawable=false\n",
             .{ self.vulkan_presenter_bind_attempts, surface, handle, state.active_idle_source },
         );
+        if (self.vulkan_swapchains_created == 1) {
+            machoCapturePrint(
+                "macho-processor: GRAPHICS FORWARDING BOUNDARY: Cocoa window, CAMetalLayer, and native VkSurfaceKHR are ready; physical device, logical device, swapchain images, commands, queue submission, and presentation are synthetic. Diagnostic Metal frames are forced to the window, but authoritative guest pixels still require native Vulkan handle and structure translation.\n",
+                .{},
+            );
+        }
+        _ = presentNativeSyntheticVulkanFrame(state, handle, image_width, image_height, 1);
         return 0;
     }
 
@@ -801,12 +818,19 @@ pub const Forwarder = struct {
         return 0;
     }
 
-    fn queuePresent(self: *Forwarder) u64 {
+    fn queuePresent(self: *Forwarder, state: anytype) u64 {
         self.vulkan_presents +|= 1;
+        const presented = presentNativeSyntheticVulkanFrame(
+            state,
+            self.vulkan_presents,
+            0,
+            0,
+            3,
+        );
         if (self.vulkan_presents == 1) {
             machoCapturePrint(
-                "macho-processor: Vulkan modeled milestone: first_queue_present (synthetic success; no native drawable presentation)\n",
-                .{},
+                "macho-processor: Vulkan modeled milestone: first_queue_present (synthetic command stream, forced_native_drawable={})\n",
+                .{presented},
             );
         }
         return 0;
@@ -938,7 +962,7 @@ pub const Forwarder = struct {
                 @memcpy(entry.path[0..path_length], path[0..path_length]);
                 self.guest_open_count +|= 1;
                 machoCapturePrint(
-                    "macho-processor: Vulkan guest loader virtualized: path={s} mode=0x{x} token=0x{x}; native dyld load deferred until Metal surface bind\n",
+                    "macho-processor: Vulkan guest loader virtualized: path={s} mode=0x{x} token=0x{x}; native dyld load deferred until Metal surface bind and is currently limited to the shadow instance + surface bridge\n",
                     .{ path, mode, token },
                 );
                 return token;
@@ -1133,18 +1157,21 @@ pub const Forwarder = struct {
                 },
             );
             machoCapturePrint(
-                "macho-processor: native Vulkan presenter backing: loader(attempts/failures)={d}/{d} instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
+                "macho-processor: native Vulkan surface backing: loader(attempts/failures)={d}/{d} instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
                 .{ self.native_vulkan_loader_attempts, self.native_vulkan_loader_failures, self.native_vulkan_instance_attempts, self.native_vulkan_surface_attempts, self.native_vulkan_failures, if (self.native_vulkan_instance) |instance| @intFromPtr(instance) else 0, self.native_vulkan_surface, self.native_vulkan_library_token },
             );
             machoCapturePrint(
                 "macho-processor: Vulkan forwarding contract: native=instance+Metal_surface synthetic=physical_device+logical_device+swapchain+commands+submit+present capability_queries={d} device_void_calls={d} modeled_commands={d}; rendered pixels are not authoritative until native device/command forwarding is installed\n",
                 .{ self.vulkan_surface_capability_queries, self.vulkan_device_void_calls, self.vulkan_modeled_command_calls },
             );
+            const native_drawable = self.vulkan_presenter_stage == .native_drawable_ready;
             machoCapturePrint(
                 "macho-processor: graphics visibility: blank_window_expected={} reason={s}\n",
                 .{
-                    self.vulkan_images_acquired == 0 or self.vulkan_queue_submits == 0 or self.vulkan_presents == 0,
-                    if (self.vulkan_images_acquired == 0)
+                    !native_drawable or self.vulkan_images_acquired == 0 or self.vulkan_queue_submits == 0 or self.vulkan_presents == 0,
+                    if (!native_drawable)
+                        "native drawable authority is unavailable; the Vulkan swapchain/submit/present path is synthetic"
+                    else if (self.vulkan_images_acquired == 0)
                         "no swapchain image was acquired"
                     else if (self.vulkan_queue_submits == 0)
                         "no Vulkan command submission reached the queue"
@@ -1864,6 +1891,35 @@ fn registerOpaqueHandle(state: anytype, handle: u64, owner: []const u8) void {
     }
 }
 
+fn presentNativeSyntheticVulkanFrame(
+    state: anytype,
+    serial: u64,
+    requested_width: u32,
+    requested_height: u32,
+    stage: u32,
+) bool {
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    if (!@hasDecl(State, "presentNativeSyntheticVulkanFrame")) return false;
+    const width = if (requested_width != 0)
+        requested_width
+    else if (@hasDecl(State, "nativeWindowWidth"))
+        state.nativeWindowWidth()
+    else
+        1280;
+    const height = if (requested_height != 0)
+        requested_height
+    else if (@hasDecl(State, "nativeWindowHeight"))
+        state.nativeWindowHeight()
+    else
+        720;
+    return state.presentNativeSyntheticVulkanFrame(
+        serial,
+        @max(width, 1),
+        @max(height, 1),
+        stage,
+    );
+}
+
 fn vkErrorInitializationFailed() u64 {
     return @as(u32, @bitCast(@as(i32, -3)));
 }
@@ -2087,7 +2143,7 @@ test "Vulkan presenter lifecycle requires UI surface before swapchain" {
     state.write64(80 + 24, VK_SYNTHETIC_SURFACE);
     try std.testing.expectEqual(@as(u64, 0), forwarder.createSwapchain(&state, VK_SYNTHETIC_DEVICE, 80, 200));
     try std.testing.expect(state.read64(200) != 0);
-    try std.testing.expectEqual(VulkanPresenterStage.ready, forwarder.vulkan_presenter_stage);
+    try std.testing.expectEqual(VulkanPresenterStage.synthetic_swapchain_ready, forwarder.vulkan_presenter_stage);
     try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_presenter_bind_attempts);
     try std.testing.expectEqual(@as(u64, 0), forwarder.vulkan_presenter_bind_failures);
     try std.testing.expectEqual(@as(u64, 0), forwarder.vulkan_presenter_off_ui_calls);

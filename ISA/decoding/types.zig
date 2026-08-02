@@ -843,6 +843,26 @@ pub const Op = enum(u16) {
     // values remain stable for trace and cache consumers.
     lahf,
     sahf,
+    // Three-byte endian-aware moves. Appended to preserve all existing Op
+    // numeric values used by decode caches and trace consumers.
+    movbe_reg_mem,
+    movbe_mem_reg,
+    // ADC ModRM forms. Appended to preserve the numeric values of all earlier
+    // operations used by trace and decode-cache consumers.
+    adc_reg8_reg8,
+    adc_reg16_reg16,
+    adc_reg32_reg32,
+    adc_reg64_reg64,
+    adc_reg16_mem16,
+    adc_reg32_mem32,
+    adc_reg64_mem64,
+    adc_mem8_reg8,
+    adc_mem16_reg16,
+    adc_mem32_reg32,
+    adc_mem64_reg64,
+    // SSE/AVX control-state transfers share one architectural MXCSR state.
+    ldmxcsr_mem32,
+    stmxcsr_mem32,
 };
 
 fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {

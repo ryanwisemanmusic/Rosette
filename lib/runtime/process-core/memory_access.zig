@@ -24,6 +24,7 @@ const opaque_lifetime_recovery = @import("diagnostics").opaque_lifetime_recovery
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const vt = @import("vtable");
 const guest_log = @import("guest_log.zig");
+const generated_endian_contract = @import("generated_endian_contract.zig");
 const near_null_causality = @import("near_null_causality.zig");
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 
@@ -46,6 +47,33 @@ const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
 const GUEST_SIGSEGV = constants.GUEST_SIGSEGV;
 
 const mappedOffset = macho_core.utils.mappedOffset;
+
+const InstructionSnapshot = struct {
+    operation: []const u8 = "",
+    length: u8 = 0,
+    bytes: [16]u8 = [_]u8{0} ** 16,
+    byte_count: u8 = 0,
+};
+
+fn currentInstructionSnapshot(self: anytype) InstructionSnapshot {
+    const rip = self.regs.rip;
+    const source: []const u8 = if (self.sparse_memory.executableBytesConst(rip, 16)) |sparse_code|
+        sparse_code
+    else blk: {
+        const offset = translateGuest(self, rip, 1, .execute) orelse return .{};
+        if (offset >= self.mem.len) return .{};
+        break :blk self.mem[@intCast(offset)..][0..@min(@as(usize, 16), self.mem.len - @as(usize, @intCast(offset)))];
+    };
+    if (source.len == 0) return .{};
+    const decoded = decodeInsn(source);
+    var snapshot = InstructionSnapshot{
+        .operation = @tagName(decoded.op),
+        .length = decoded.len,
+        .byte_count = @intCast(@min(source.len, @as(usize, 16))),
+    };
+    @memcpy(snapshot.bytes[0..snapshot.byte_count], source[0..snapshot.byte_count]);
+    return snapshot;
+}
 
 pub fn addrToOffset(self: anytype, vaddr: u64) ?u64 {
     if (!self.pointer_firewall.mayDereference(vaddr)) return null;
@@ -260,6 +288,198 @@ pub fn pop(self: anytype) u64 {
     return val;
 }
 
+fn decodedInstructionAt(self: anytype, rip: u64) ?DecodedInsn {
+    const source: []const u8 = if (self.sparse_memory.executableBytesConst(rip, 16)) |sparse_code|
+        sparse_code
+    else blk: {
+        const offset = translateGuest(self, rip, 1, .execute) orelse return null;
+        if (offset >= self.mem.len) return null;
+        break :blk self.mem[@intCast(offset)..][0..@min(@as(usize, 16), self.mem.len - @as(usize, @intCast(offset)))];
+    };
+    if (source.len == 0) return null;
+    const decoded = decodeInsn(source);
+    return if (decoded.op == .invalid) null else decoded;
+}
+
+fn decodedMemoryEvent(event: exit_diagnostics.MemoryAccessEvent) ?DecodedInsn {
+    if (event.instruction_byte_count == 0) return null;
+    const count: usize = @min(event.instruction_byte_count, event.instruction_bytes.len);
+    const decoded = decodeInsn(event.instruction_bytes[0..count]);
+    return if (decoded.op == .invalid) null else decoded;
+}
+
+fn tryRecoverGeneratedEndianAddress(self: anytype, fault_address: u64, bytes: u8) ?u64 {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "has_xenia_compat") or
+        !@hasField(State, "generated_endian_contract_recoveries"))
+    {
+        return null;
+    }
+    if (!self.has_xenia_compat or bytes != 4 or
+        !self.sparse_memory.isExecutable(self.regs.rip, 1))
+    {
+        return null;
+    }
+
+    const fault = decodedInstructionAt(self, self.regs.rip) orelse return null;
+    if (fault.op != .mov_reg32_mem32 or !fault.has_0x67 or
+        !fault.sib_has_base or fault.sib_has_index or fault.rip_relative or
+        fault.addr != 0 or self.regVal(fault.sib_base_reg, .bits32) != fault_address)
+    {
+        return null;
+    }
+
+    const count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
+    var load: ?generated_endian_contract.MovbeLoad = null;
+    var witness: ?generated_endian_contract.ComparisonWitness = null;
+    var examined: usize = 0;
+    while (examined < count and examined < 8 and (load == null or witness == null)) : (examined += 1) {
+        const distance: u8 = @intCast(examined + 1);
+        const index = (self.memory_trace_index + MEMORY_TRACE_BUFFER_LEN - 1 - examined) % MEMORY_TRACE_BUFFER_LEN;
+        const event = self.memory_trace_entries[index];
+        const decoded = decodedMemoryEvent(event) orelse continue;
+        if (witness == null and decoded.op == .cmp_reg32_mem32 and
+            decoded.dst_reg == fault.sib_base_reg and event.bytes == 4 and
+            std.mem.eql(u8, event.access, "read"))
+        {
+            witness = .{
+                .execution = .{
+                    .present = event.provenance_present,
+                    .thread_handle = event.thread_handle,
+                    .scheduler_epoch = event.scheduler_epoch,
+                    .step = event.step,
+                },
+                .instruction_address = event.instruction_address,
+                .width_bytes = event.bytes,
+                .compared_register = @intCast(@intFromEnum(decoded.dst_reg)),
+                .memory_value = @as(u32, @truncate(event.value)),
+                .distance = distance,
+            };
+        }
+        if (load == null and decoded.op == .movbe_reg_mem and decoded.size == .bits32 and
+            decoded.dst_reg == fault.sib_base_reg and event.bytes == 4 and
+            std.mem.eql(u8, event.access, "read"))
+        {
+            const raw_value: u32 = @truncate(event.value);
+            load = .{
+                .execution = .{
+                    .present = event.provenance_present,
+                    .thread_handle = event.thread_handle,
+                    .scheduler_epoch = event.scheduler_epoch,
+                    .step = event.step,
+                },
+                .instruction_address = event.instruction_address,
+                .source_address = event.address,
+                .width_bytes = event.bytes,
+                .destination_register = @intCast(@intFromEnum(decoded.dst_reg)),
+                .raw_value = raw_value,
+                .swapped_value = generated_endian_contract.swapped(raw_value, .dword),
+                .distance = distance,
+            };
+        }
+    }
+    const unswapped_candidate: u32 = @truncate(generated_endian_contract.swapped(fault_address, .dword));
+    const candidate_readable = self.sparse_memory.bytesConst(unswapped_candidate, bytes) != null or
+        translateGuest(self, unswapped_candidate, bytes, .read) != null;
+    const observed_load = load orelse {
+        if (candidate_readable) {
+            machoCapturePrint(
+                "macho-processor: generated endian contract rejected: reason=movbe_evidence_missing fault_rip=0x{x} invalid=0x{x} candidate=0x{x} witness_seen={}\n",
+                .{ self.regs.rip, fault_address, unswapped_candidate, witness != null },
+            );
+        }
+        return null;
+    };
+    const observed_witness = witness orelse {
+        machoCapturePrint(
+            "macho-processor: generated endian contract rejected: reason=comparison_witness_missing fault_rip=0x{x} invalid=0x{x} candidate=0x{x} movbe=0x{x}\n",
+            .{ self.regs.rip, fault_address, unswapped_candidate, observed_load.instruction_address },
+        );
+        return null;
+    };
+    const assessment = generated_endian_contract.assess(observed_load, observed_witness, .{
+        .execution = .{
+            .present = true,
+            .thread_handle = self.active_guest_thread,
+            .scheduler_epoch = self.cooperative_thread_switches,
+            .step = self.executed_steps,
+        },
+        .address = fault_address,
+        .width_bytes = bytes,
+        .base_register = @intCast(@intFromEnum(fault.sib_base_reg)),
+        .address_size_override = fault.has_0x67,
+        .base_only = fault.sib_has_base and !fault.sib_has_index and !fault.rip_relative,
+        .displacement = fault.addr,
+        .generated_code = true,
+        .original_value_readable = candidate_readable,
+    });
+    const recovery = switch (assessment) {
+        .recovery => |recovery| recovery,
+        .rejected => |reason| {
+            machoCapturePrint(
+                "macho-processor: generated endian contract rejected: reason={s} fault_rip=0x{x} invalid=0x{x} candidate=0x{x} base={s} movbe=0x{x}/0x{x} witness=0x{x}/0x{x} distances={d}/{d} provenance(load/witness/fault)={}/{}:{}@{d}/{}/{}:{}@{d}/{}/{}:{}@{d} candidate_readable={}\n",
+                .{
+                    @tagName(reason),
+                    self.regs.rip,
+                    fault_address,
+                    unswapped_candidate,
+                    @tagName(fault.sib_base_reg),
+                    observed_load.raw_value,
+                    observed_load.swapped_value,
+                    observed_witness.memory_value,
+                    observed_witness.instruction_address,
+                    observed_load.distance,
+                    observed_witness.distance,
+                    observed_load.execution.present,
+                    observed_load.execution.thread_handle,
+                    observed_load.execution.scheduler_epoch,
+                    observed_load.execution.step,
+                    observed_witness.execution.present,
+                    observed_witness.execution.thread_handle,
+                    observed_witness.execution.scheduler_epoch,
+                    observed_witness.execution.step,
+                    true,
+                    self.active_guest_thread,
+                    self.cooperative_thread_switches,
+                    self.executed_steps,
+                    candidate_readable,
+                },
+            );
+            return null;
+        },
+    };
+
+    const previous_writer = self.memory_writes.lookup(recovery.source_address);
+    const source_writable = self.sparse_memory.bytes(recovery.source_address, 4, true) != null or
+        translateGuest(self, recovery.source_address, 4, .write) != null;
+    self.setReg(fault.sib_base_reg, .bits32, recovery.address);
+    if (source_writable) {
+        // Persist the proven guest-big-endian representation. The raw memory
+        // word becomes the swapped value, so the next architectural MOVBE
+        // produces the witnessed guest code address without recovery.
+        self.writeMemVal(recovery.source_address, .bits32, fault_address);
+    }
+    self.generated_endian_contract_recoveries +|= 1;
+    machoCapturePrint(
+        "macho-processor: generated endian contract repair #{d}: fault_rip=0x{x} base={s} invalid=0x{x} restored=0x{x} movbe=0x{x} source=0x{x} witness=0x{x} source_rewritten={} writer=0x{x}@{d} writer_thread=0x{x}; classification=xenia_guest_return_address_host_endian\n",
+        .{
+            self.generated_endian_contract_recoveries,
+            self.regs.rip,
+            @tagName(fault.sib_base_reg),
+            fault_address,
+            recovery.address,
+            recovery.producer_instruction,
+            recovery.source_address,
+            recovery.witness_instruction,
+            source_writable,
+            if (previous_writer) |writer| writer.instruction_address else 0,
+            if (previous_writer) |writer| writer.step else 0,
+            if (previous_writer) |writer| writer.thread else 0,
+        },
+    );
+    return recovery.address;
+}
+
 pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     const State = @TypeOf(self.*);
     const bytes = bytesForSize(size);
@@ -268,14 +488,24 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     // main-image offset before dispatching the read.  Writes have always
     // followed this ordering; keeping reads symmetric prevents valid mprotect
     // activations from being reported as permission faults.
-    const sparse_readable = self.sparse_memory.bytesConst(addr, bytes) != null;
-    const off = if (sparse_readable) null else translateGuest(self, addr, bytes, .read);
+    var effective_address = addr;
+    var sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
+    var off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
     if (!sparse_readable and off == null) {
-        terminateForGuestAccess(self, addr, bytes, .read, @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op));
-        return 0;
+        if (tryRecoverGeneratedEndianAddress(self, effective_address, bytes)) |recovered_address| {
+            effective_address = recovered_address;
+            sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
+            off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
+        }
+        if (!sparse_readable and off == null) {
+            const snapshot = currentInstructionSnapshot(self);
+            const instruction = if (snapshot.operation.len != 0) snapshot.operation else @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op);
+            terminateForGuestAccess(self, effective_address, bytes, .read, instruction);
+            return 0;
+        }
     }
     const ctx: *anyopaque = @ptrCast(self);
-    return memReadMemVal(&ms(self), addr, size, off, .{
+    return memReadMemVal(&ms(self), effective_address, size, off, .{
         .ctx = ctx,
         .recoverVtable = struct {
             fn recover(c: *anyopaque, a: u64, suspect: u64) ?u64 {
@@ -723,7 +953,9 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
     }
     const off = translateGuest(self, addr, bytes, .write) orelse {
         if (deferInitializerRuntimeDependency(self, addr, size)) return;
-        terminateForGuestAccess(self, addr, bytes, .write, @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op));
+        const snapshot = currentInstructionSnapshot(self);
+        const instruction = if (snapshot.operation.len != 0) snapshot.operation else @tagName(self.trace_entries[if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1].op);
+        terminateForGuestAccess(self, addr, bytes, .write, instruction);
         return;
     };
     recordMemoryAccess(self, addr, size, "write", val);
@@ -1023,9 +1255,14 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
         ) catch "";
         _ = guest_log.hostWriteFdAll(self.summary_output_fd, summary_line);
     }
+    const instruction_snapshot = currentInstructionSnapshot(self);
     self.terminal_memory_failure = .{
         .instruction_address = self.regs.rip,
         .instruction = instruction,
+        .decoded_instruction = instruction_snapshot.operation,
+        .instruction_length = instruction_snapshot.length,
+        .instruction_bytes = instruction_snapshot.bytes,
+        .instruction_byte_count = instruction_snapshot.byte_count,
         .address = address,
         .bytes = bytes,
         .access = @tagName(access),
@@ -1246,7 +1483,13 @@ pub fn recordMemoryAccess(self: anytype, address: u64, size: Size, access: []con
     const offset = translateGuest(self, address, bytes, if (std.mem.eql(u8, access, "write")) .write else .read);
     const backed = if (offset) |off| off + bytes <= self.mem.len else false;
     const trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
-    const instruction = if (trace_count == 0)
+    const instruction_snapshot = if (self.sparse_memory.isExecutable(self.regs.rip, 1))
+        currentInstructionSnapshot(self)
+    else
+        InstructionSnapshot{};
+    const instruction = if (instruction_snapshot.operation.len != 0)
+        instruction_snapshot.operation
+    else if (trace_count == 0)
         "<runtime>"
     else blk: {
         const latest_index = if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1;
@@ -1255,8 +1498,15 @@ pub fn recordMemoryAccess(self: anytype, address: u64, size: Size, access: []con
     // Check for near-null or negative addresses (high bit set in 64-bit, or very small positive addresses)
     const near_null = (address & 0x8000_0000_0000_0000) != 0 or address < 0x1000;
     self.memory_trace_entries[self.memory_trace_index] = .{
+        .provenance_present = true,
+        .thread_handle = self.active_guest_thread,
+        .scheduler_epoch = self.cooperative_thread_switches,
+        .step = self.executed_steps,
         .instruction_address = self.regs.rip,
         .instruction = instruction,
+        .instruction_length = instruction_snapshot.length,
+        .instruction_bytes = instruction_snapshot.bytes,
+        .instruction_byte_count = instruction_snapshot.byte_count,
         .address = address,
         .bytes = bytes,
         .access = access,
@@ -1330,18 +1580,20 @@ pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
     // byte store is correct but makes concurrent compilation prohibitively
     // expensive.
     const maximum_instruction_length: u64 = 15;
-    const first_block = (address -| (maximum_instruction_length - 1)) >> 4;
-    const last_block = (end - 1) >> 4;
-    const block_count = last_block - first_block + 1;
-    if (block_count >= @as(u64, @intCast(self.decode_cache.len))) {
+    const first_candidate = address -| (maximum_instruction_length - 1);
+    const last_candidate = end - 1;
+    const candidate_count = last_candidate - first_candidate + 1;
+    if (candidate_count >= @as(u64, @intCast(self.decode_cache.len))) {
         @memset(self.decode_cache, .{});
         return;
     }
-    var block = first_block;
-    while (block <= last_block) : (block += 1) {
-        const cache_mask: u64 = @intCast(self.decode_cache.len - 1);
-        const cache_index =
-            @as(usize, @intCast(block & cache_mask));
+    // Any x86 instruction overlapping this write must begin between
+    // address-14 and end-1. Probe exact candidate starts with the same hash as
+    // decodeAt; this preserves precise invalidation without reverting to a
+    // global cache flush for each small Xenia JIT patch.
+    var candidate = first_candidate;
+    while (candidate <= last_candidate) : (candidate += 1) {
+        const cache_index = constants.decodeCacheIndex(candidate);
         const entry = &self.decode_cache[cache_index];
         if (entry.rip == std.math.maxInt(u64)) continue;
         const instruction_length = @max(@as(u64, entry.decoded.len), 1);
@@ -1547,6 +1799,10 @@ pub fn guestProtectSparseMemory(self: anytype, address: u64, length: u64, prot: 
         .may_execute = prot & 4 != 0,
         .owner = "sparse guest mprotect",
     });
+    // Publishing pages as executable is a code-cache boundary even when the
+    // bytes were written while the mapping was non-executable. Invalidate the
+    // affected decoded range before any generated code may enter it.
+    if (prot & 4 != 0) noteGuestWrite(self, address, effective_length);
     return true;
 }
 
@@ -1571,6 +1827,7 @@ pub fn guestProtectMappedMemory(self: anytype, address: u64, length: u64, prot: 
         .may_execute = prot & 4 != 0,
         .owner = "primary guest mprotect",
     });
+    if (prot & 4 != 0) noteGuestWrite(self, address, length);
     return true;
 }
 

@@ -259,6 +259,46 @@ pub fn qsort(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled_void;
 }
 
+/// Implements `bsearch` over guest memory.
+/// ABI: rdi = key, rsi = base, rdx = nmemb, rcx = size, r8 = compar.
+pub fn bsearch(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const key = ctx.readArg(0);
+    const base = ctx.readArg(1);
+    const nmemb = ctx.readArg(2);
+    const size = ctx.readArg(3);
+    const compar = ctx.readArg(4);
+
+    if (nmemb == 0) {
+        ctx.setResult(0);
+        return .handled;
+    }
+    if (key == 0 or base == 0 or size == 0 or compar == 0) return .unsupported;
+
+    const byte_count = std.math.mul(u64, nmemb, size) catch return .unsupported;
+    _ = std.math.add(u64, base, byte_count) catch return .unsupported;
+    _ = ctx.readGuest(base, @intCast(byte_count)) orelse return .unsupported;
+
+    var low: u64 = 0;
+    var high = nmemb;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const element = base + middle * size;
+        const raw_comparison = ctx.callGuest(compar, .{ key, element, 0, 0, 0, 0 });
+        const comparison: i32 = @bitCast(@as(u32, @truncate(raw_comparison)));
+        if (comparison < 0) {
+            high = middle;
+        } else if (comparison > 0) {
+            low = middle + 1;
+        } else {
+            ctx.setResult(element);
+            return .handled;
+        }
+    }
+
+    ctx.setResult(0);
+    return .handled;
+}
+
 /// Implements `std::terminate()` — called by `__clang_call_terminate` when a
 /// `noexcept` violation occurs during C++ exception stack unwinding.
 /// ABI: no arguments. This function never returns — it calls host `abort()`.
@@ -821,4 +861,68 @@ test "handlers: qsort honors signed 32-bit comparator and preserves elements" {
         const actual = std.mem.readInt(u32, state.memory[8 + index * 4 ..][0..4], .little);
         try std.testing.expectEqual(value, actual);
     }
+}
+
+test "handlers: bsearch returns the matching guest element or null" {
+    const TestState = struct {
+        args: [6]u64 = .{0} ** 6,
+        result: u64 = 0,
+        memory: [64]u8 = [_]u8{0} ** 64,
+
+        fn readArg(ptr: *anyopaque, index: u8) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (index < 6) self.args[index] else 0;
+        }
+        fn setResult(ptr: *anyopaque, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = value;
+        }
+        fn readGuest(ptr: *const anyopaque, address: u64, size_bytes: usize) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            const end = std.math.add(usize, start, size_bytes) catch return null;
+            if (end > self.memory.len) return null;
+            return self.memory[start..end];
+        }
+        fn writeGuest(_: *anyopaque, _: u64, _: []const u8) ?void {
+            return null;
+        }
+        fn readCString(_: *const anyopaque, _: u64) ?[]const u8 {
+            return null;
+        }
+        fn callGuest(ptr: *anyopaque, _: u64, call_args: [6]u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const key_offset: usize = @intCast(call_args[0]);
+            const element_offset: usize = @intCast(call_args[1]);
+            const key = std.mem.readInt(u32, self.memory[key_offset..][0..4], .little);
+            const element = std.mem.readInt(u32, self.memory[element_offset..][0..4], .little);
+            const comparison: i32 = if (key < element) -1 else if (key > element) 1 else 0;
+            return @as(u32, @bitCast(comparison));
+        }
+    };
+
+    var state = TestState{};
+    const input = [_]u32{ 2, 4, 6, 8, 10 };
+    for (input, 0..) |value, index| {
+        std.mem.writeInt(u32, state.memory[16 + index * 4 ..][0..4], value, .little);
+    }
+    std.mem.writeInt(u32, state.memory[4..8], 8, .little);
+    state.args = .{ 4, 16, input.len, @sizeOf(u32), 0x1234, 0 };
+
+    const ctx = PrimitiveContext{
+        .ptr = &state,
+        .readArgFn = TestState.readArg,
+        .setResultFn = TestState.setResult,
+        .readGuestFn = TestState.readGuest,
+        .writeGuestFn = TestState.writeGuest,
+        .readCStringFn = TestState.readCString,
+        .callGuestFn = TestState.callGuest,
+    };
+
+    try std.testing.expectEqual(Result.handled, bsearch(0, &ctx));
+    try std.testing.expectEqual(@as(u64, 28), state.result);
+
+    std.mem.writeInt(u32, state.memory[4..8], 7, .little);
+    try std.testing.expectEqual(Result.handled, bsearch(0, &ctx));
+    try std.testing.expectEqual(@as(u64, 0), state.result);
 }

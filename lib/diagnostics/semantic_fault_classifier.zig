@@ -12,6 +12,7 @@ pub const FaultClass = enum {
     bad_return_address,
     bad_import_thunk,
     bad_guest_stack,
+    generated_code_memory,
     generic_memory,
 };
 
@@ -33,6 +34,7 @@ pub const Context = struct {
     vtable_header_mapped: bool = true,
     typeinfo_mapped: bool = true,
     live_allocation_vtable_history: bool = false,
+    instruction_in_generated_code: bool = false,
 };
 
 pub const Classification = struct {
@@ -127,6 +129,13 @@ pub fn classify(context: Context) Classification {
     if (!context.stack_mapped) {
         return .{ .class = .bad_guest_stack, .reason = "RSP/RBP escaped the registered guest stack", .next_subsystem = "guest scheduler / stack allocator" };
     }
+    if (context.instruction_in_generated_code) {
+        return .{
+            .class = .generated_code_memory,
+            .reason = "Xenia-generated x64 reached an invalid effective address; inspect the decoded byte boundary, JIT publication, and preceding control flow",
+            .next_subsystem = "ISA decoder / generated-code cache / control-flow execution",
+        };
+    }
     // A stack_push that lands in a mapped-but-not-writable page signals a stack
     // overflow: the thread's stack has grown into a read-only region immediately
     // below its writable allocation (e.g. __LINKEDIT or a guard page).
@@ -137,6 +146,23 @@ pub fn classify(context: Context) Classification {
         return .{ .class = .bad_this_pointer, .reason = "pointer-like argument is outside all guest mappings", .next_subsystem = "pointer_firewall / calling convention bridge" };
     }
     return .{ .class = .generic_memory, .reason = "memory access is outside the active guest mapping", .next_subsystem = "memory provenance / decoder" };
+}
+
+test "generated x64 memory faults are not mislabeled as C++ this-pointer failures" {
+    const result = classify(.{
+        .instruction = "add_mem8_imm8",
+        .symbol = "",
+        .address = 0x3_0520_FD5B,
+        .rdi = 0x3_4D7D_0000,
+        .rsi = 0x40_E000_0068,
+        .rsp = 0x1_A2DE_EE68,
+        .rbp = 0x1_A2DF_0130,
+        .rdi_mapped = false,
+        .rsi_mapped = false,
+        .stack_mapped = true,
+        .instruction_in_generated_code = true,
+    });
+    try std.testing.expectEqual(FaultClass.generated_code_memory, result.class);
 }
 
 test "plain C++ namespace functions do not imply a typeinfo fault" {

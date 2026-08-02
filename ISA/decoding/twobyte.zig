@@ -81,7 +81,7 @@ const decodeSetcc = groups.decodeSetcc;
 const decodeMovupsMovss = groups.decodeMovupsMovss;
 const decodeMovaps = groups.decodeMovaps;
 
-pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_f2: bool, has_f3: bool, _: u8) DecodedInsn {
+pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_f2: bool, has_f3: bool, rex: u8) DecodedInsn {
     var d = DecodedInsn{};
     d.size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
 
@@ -146,7 +146,7 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 >= 0x90 and opcode2 <= 0x9F) {
-        return decodeSetcc(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, opcode2);
+        return decodeSetcc(bytes, pos.* - 1, rex_r, rex_x, rex_b, rex_w, has_66, rex != 0, opcode2);
     }
 
     if (opcode2 == 0xA2) {
@@ -404,17 +404,22 @@ pub fn decodeTwoByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, r
     }
 
     if (opcode2 == 0xAE) {
-        if (pos.* < bytes.len) {
-            const modrm = bytes[pos.*];
-            const reg = (modrm >> 3) & 7;
-            if (reg == 5 or reg == 6 or reg == 7) {
-                d.op = .nop;
-                d.len = @as(u8, @intCast(pos.* + 1));
-                return d;
-            }
-        }
-        d.op = .nop;
-        d.len = @as(u8, @intCast(pos.* + 1));
+        if (pos.* >= bytes.len) return .{};
+        const modrm = bytes[pos.*];
+        const group = (modrm >> 3) & 7;
+        const rm = readModRM(&d, bytes, pos, rex_r, rex_x, rex_b, .bits32);
+        // LDMXCSR/STMXCSR require a memory operand. The remaining 0F AE
+        // groups (FXSAVE/FXRSTOR and fences) are retained as boundary-safe
+        // NOPs until their state contracts are needed.
+        d.op = if (!d.is_reg_form and group == 2)
+            .ldmxcsr_mem32
+        else if (!d.is_reg_form and group == 3)
+            .stmxcsr_mem32
+        else
+            .nop;
+        d.size = .bits32;
+        d.addr = rm.addr;
+        d.len = @intCast(pos.*);
         return d;
     }
 
@@ -467,16 +472,56 @@ pub fn decodeThreeByte(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool,
         }
     }
 
+    // MOVBE is deliberately handled separately from F2-prefixed CRC32 even
+    // though both use 0F 38 F0/F1. Leaving an unprefixed MOVBE to the generic
+    // fallback used to consume only `0F 38 F0`, after which the ModRM and
+    // displacement bytes were executed as standalone instructions. Besides
+    // producing a wrong value, that silently corrupts memory and permanently
+    // loses the generated-code instruction boundary.
+    if (opcode == 0x38 and !has_f2 and !has_f3 and pos.* < bytes.len) {
+        const opcode3 = bytes[pos.*];
+        if (opcode3 == 0xF0 or opcode3 == 0xF1) {
+            pos.* += 1;
+            if (pos.* >= bytes.len) return .{};
+
+            var decoded = DecodedInsn{};
+            const operand_size: Size = if (rex_w)
+                .bits64
+            else if (has_66)
+                .bits16
+            else
+                .bits32;
+            const rm = readModRM(&decoded, bytes, pos, rex_r, rex_x, rex_b, operand_size);
+            // Intel defines MOVBE only between a GPR and memory. Treat the
+            // reserved register-to-register encoding as invalid rather than
+            // manufacturing semantics for it.
+            if (decoded.is_reg_form) return .{};
+
+            decoded.size = operand_size;
+            decoded.addr = rm.addr;
+            if (opcode3 == 0xF0) {
+                decoded.op = .movbe_reg_mem;
+                decoded.dst_reg = rm.reg;
+            } else {
+                decoded.op = .movbe_mem_reg;
+                decoded.src_reg = rm.reg;
+            }
+            decoded.len = @intCast(pos.*);
+            return decoded;
+        }
+    }
+
     if (pos.* >= bytes.len) return .{};
     const opcode3 = bytes[pos.*];
     if (opcode3 == 0xF5 or opcode3 == 0xF7 or opcode3 == 0xFA or opcode3 == 0xFB or opcode3 == 0xFC) {
         pos.* += 1;
         return decodeSseBytes(bytes, &pos.*, rex_r, rex_x, rex_b, rex_w, false, opcode3, .nop);
     }
-    var d = DecodedInsn{};
-    d.op = .nop;
-    d.len = @as(u8, @intCast(pos.* + 1));
-    return d;
+    // Never consume just the opcode bytes of an unsupported three-byte
+    // instruction. Its ModRM/SIB/displacement/immediate length is unknown,
+    // so a partial NOP would resume in operand data and convert a clean
+    // unsupported-instruction report into arbitrary memory corruption.
+    return .{};
 }
 
 pub fn decodeSseBytes(bytes: []const u8, pos: *usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8, sse_op: anytype) DecodedInsn {

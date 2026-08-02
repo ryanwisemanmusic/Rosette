@@ -76,6 +76,16 @@ pub fn noteNativeVulkanSurfaceBound(self: anytype, layer_token: u64, guest_surfa
     self.native_window.noteSurfaceBound(layer_token, guest_surface, host_surface);
 }
 
+pub fn presentNativeSyntheticVulkanFrame(
+    self: anytype,
+    serial: u64,
+    width: u32,
+    height: u32,
+    stage: u32,
+) bool {
+    return self.native_window.presentSyntheticVulkanFrame(serial, width, height, stage);
+}
+
 pub fn pumpNativeWindowEvents(self: anytype) void {
     if (self.native_window.application_ensure_attempts == 0) return;
     _ = self.native_window.pumpEvents();

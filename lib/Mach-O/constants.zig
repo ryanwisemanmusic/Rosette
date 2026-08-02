@@ -32,6 +32,27 @@ pub const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 pub const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 pub const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 16;
 pub const DECODE_CACHE_HASH_SHIFT: u6 = 48;
+pub const DECODE_CACHE_HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Hash an exact instruction address into the direct-mapped decode cache.
+///
+/// The old `(address >> 4) & mask` mapping gave every instruction in the same
+/// 16-byte block one cache slot. A normal basic block therefore evicted itself
+/// continuously (the Xenia trace showed a 3% hit rate). Multiplicative hashing
+/// keeps neighboring instruction starts in independent slots while still
+/// mixing high JIT addresses such as 0xA0000000 into the index.
+pub inline fn decodeCacheIndex(address: u64) usize {
+    return @intCast((address *% DECODE_CACHE_HASH_MULTIPLIER) >> DECODE_CACHE_HASH_SHIFT);
+}
+
+test "decode cache hashes neighboring instruction starts independently" {
+    var seen = [_]bool{false} ** DECODE_CACHE_ENTRY_COUNT;
+    for (0..16) |offset| {
+        const index = decodeCacheIndex(0xA000_5AF8 + offset);
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+    }
+}
 pub const IMPORT_ROUTE_CACHE_SIZE: usize = 1024;
 pub const PAGE_READ: u8 = 1 << 0;
 pub const PAGE_WRITE: u8 = 1 << 1;

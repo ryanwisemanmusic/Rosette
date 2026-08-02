@@ -67,6 +67,7 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "3putEc", .handler = @import("handlers.zig").ostreamPut },
     .{ .name_pattern = "terminatev", .handler = @import("handlers.zig").stdTerminate },
     .{ .name_pattern = "qsort", .handler = @import("handlers.zig").qsort },
+    .{ .name_pattern = "_bsearch", .handler = @import("handlers.zig").bsearch, .match_kind = .exact },
     .{ .name_pattern = "pthread_mach_thread_np", .handler = @import("handlers.zig").pthreadMachThreadNp },
     .{ .name_pattern = "dladdr", .handler = @import("handlers.zig").dladdr },
     .{ .name_pattern = "thread_get_state", .handler = @import("handlers.zig").threadGetState },

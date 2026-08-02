@@ -392,6 +392,25 @@ test "shared VEX decoder handles both VMOVD transfer directions" {
     try std.testing.expect(!to_memory.is_reg_form);
 }
 
+test "shared VEX decoder owns MXCSR transfer encodings" {
+    const load = decodeVexInstruction(&[_]u8{ 0xC5, 0xF8, 0xAE, 0x56, 0xF0 }) orelse
+        return error.ExpectedVldmxcsr;
+    try std.testing.expectEqual(Op.ldmxcsr_mem32, load.op);
+    try std.testing.expectEqual(OperandSize.bits32, load.size);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -16))), load.addr);
+    try std.testing.expectEqual(@as(u8, 5), load.len);
+
+    const store = decodeVexInstruction(&[_]u8{ 0xC5, 0xF8, 0xAE, 0x5F, 0x20 }) orelse
+        return error.ExpectedVstmxcsr;
+    try std.testing.expectEqual(Op.stmxcsr_mem32, store.op);
+    try std.testing.expectEqual(@as(u64, 0x20), store.addr);
+    try std.testing.expectEqual(@as(u8, 5), store.len);
+
+    // The VEX register form is reserved and must remain invalid rather than
+    // aliasing a fence or silently becoming a NOP.
+    try std.testing.expect(decodeVexInstruction(&[_]u8{ 0xC5, 0xF8, 0xAE, 0xD0 }) == null);
+}
+
 test "shared MOV decoder preserves high-byte versus REX low-byte registers" {
     const legacy = decodeMovForTest(&[_]u8{ 0x88, 0xE0 }) orelse return error.ExpectedMov; // mov al, ah
     try std.testing.expectEqual(Op.mov_reg8_reg8, legacy.op);
@@ -411,6 +430,114 @@ test "shared MOV decoder preserves high-byte versus REX low-byte registers" {
     try std.testing.expect(!rex_imm.dst_high8);
 }
 
+test "SETcc uses the ModRM r/m field for AH versus SPL" {
+    const setb_ah = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x92, 0xC4 }, .long64);
+    try std.testing.expectEqual(Op.setcc_reg8, setb_ah.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, setb_ah.dst_reg);
+    try std.testing.expect(setb_ah.dst_high8);
+
+    const setb_spl = decodeLegacyInstruction(&[_]u8{ 0x40, 0x0F, 0x92, 0xC4 }, .long64);
+    try std.testing.expectEqual(Op.setcc_reg8, setb_spl.op);
+    try std.testing.expectEqual(RegId.ah_sp_esp_rsp, setb_spl.dst_reg);
+    try std.testing.expect(!setb_spl.dst_high8);
+
+    var regs = Regs{ .rax = 1, .rsp = 0x1a2d_f000 };
+    setRegisterOperand(&regs, .{ .id = setb_ah.dst_reg, .high8 = setb_ah.dst_high8 }, .bits8, 1);
+    try std.testing.expectEqual(@as(u64, 0x101), regs.rax);
+    try std.testing.expectEqual(@as(u64, 0x1a2d_f000), regs.rsp);
+}
+
+test "top-level arithmetic decoder preserves legacy high-byte registers" {
+    const add_al_ah = decodeLegacyInstruction(&[_]u8{ 0x00, 0xE0 }, .long64);
+    try std.testing.expectEqual(Op.add_reg8_reg8, add_al_ah.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, add_al_ah.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, add_al_ah.src_reg);
+    try std.testing.expect(!add_al_ah.dst_high8);
+    try std.testing.expect(add_al_ah.src_high8);
+    try std.testing.expectEqual(@as(u8, 2), add_al_ah.len);
+
+    const add_al_spl = decodeLegacyInstruction(&[_]u8{ 0x40, 0x00, 0xE0 }, .long64);
+    try std.testing.expectEqual(Op.add_reg8_reg8, add_al_spl.op);
+    try std.testing.expectEqual(RegId.ah_sp_esp_rsp, add_al_spl.src_reg);
+    try std.testing.expect(!add_al_spl.src_high8);
+    try std.testing.expectEqual(@as(u8, 3), add_al_spl.len);
+
+    const add_ah_al = decodeLegacyInstruction(&[_]u8{ 0x02, 0xE0 }, .long64);
+    try std.testing.expect(add_ah_al.dst_high8);
+    try std.testing.expect(!add_ah_al.src_high8);
+}
+
+test "top-level ADC decoder covers generated register and memory forms" {
+    const generated_immediate = decodeLegacyInstruction(&[_]u8{ 0x49, 0x83, 0xD6, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.adc_reg64_imm8, generated_immediate.op);
+    try std.testing.expectEqual(Size.bits64, generated_immediate.size);
+    try std.testing.expectEqual(RegId.r14b_r14w_r14d_r14, generated_immediate.dst_reg);
+    try std.testing.expectEqual(@as(u64, 0), generated_immediate.imm);
+    try std.testing.expectEqual(@as(u8, 4), generated_immediate.len);
+
+    const generated = decodeLegacyInstruction(&[_]u8{ 0x11, 0xF3, 0x4C, 0x89 }, .long64);
+    try std.testing.expectEqual(Op.adc_reg32_reg32, generated.op);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, generated.dst_reg);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, generated.src_reg);
+    try std.testing.expectEqual(Size.bits32, generated.size);
+    try std.testing.expectEqual(@as(u8, 2), generated.len);
+
+    const load64 = decodeLegacyInstruction(&[_]u8{ 0x48, 0x13, 0x48, 0x08 }, .long64);
+    try std.testing.expectEqual(Op.adc_reg64_mem64, load64.op);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, load64.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, load64.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 8), load64.addr);
+
+    const store8 = decodeLegacyInstruction(&[_]u8{ 0x10, 0x20 }, .long64);
+    try std.testing.expectEqual(Op.adc_mem8_reg8, store8.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, store8.src_reg);
+    try std.testing.expect(store8.src_high8);
+}
+
+test "top-level MOV dispatch uses the shared high-byte decoder" {
+    const decoded = decodeLegacyInstruction(&[_]u8{ 0x88, 0xE0 }, .long64); // mov al, ah
+    try std.testing.expectEqual(Op.mov_reg8_reg8, decoded.op);
+    try std.testing.expect(!decoded.dst_high8);
+    try std.testing.expect(decoded.src_high8);
+}
+
+test "top-level three-byte dispatch preserves MOVBE boundaries" {
+    // Exact Xenia-generated sequence observed at the failure boundary. MOVBE
+    // occupies eight bytes; the following CMP begins at byte eight.
+    const dword_load = decodeLegacyInstruction(&[_]u8{
+        0x0F, 0x38, 0xF0, 0x9F, 0x00, 0x00, 0x00, 0x00,
+        0x83, 0xFB, 0x00,
+    }, .long64);
+    try std.testing.expectEqual(Op.movbe_reg_mem, dword_load.op);
+    try std.testing.expectEqual(Size.bits32, dword_load.size);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, dword_load.dst_reg);
+    try std.testing.expectEqual(RegId.bh_di_edi_rdi, dword_load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0), dword_load.addr);
+    try std.testing.expectEqual(@as(u8, 8), dword_load.len);
+
+    const qword_load = decodeLegacyInstruction(&[_]u8{ 0x48, 0x0F, 0x38, 0xF0, 0x48, 0x08 }, .long64);
+    try std.testing.expectEqual(Op.movbe_reg_mem, qword_load.op);
+    try std.testing.expectEqual(Size.bits64, qword_load.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, qword_load.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, qword_load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 8), qword_load.addr);
+    try std.testing.expectEqual(@as(u8, 6), qword_load.len);
+
+    const word_store = decodeLegacyInstruction(&[_]u8{ 0x66, 0x0F, 0x38, 0xF1, 0x4A, 0x10 }, .long64);
+    try std.testing.expectEqual(Op.movbe_mem_reg, word_store.op);
+    try std.testing.expectEqual(Size.bits16, word_store.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, word_store.src_reg);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, word_store.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x10), word_store.addr);
+    try std.testing.expectEqual(@as(u8, 6), word_store.len);
+}
+
+test "unsupported three-byte opcode never becomes a partial nop" {
+    const unsupported = decodeLegacyInstruction(&[_]u8{ 0x0F, 0x38, 0x42, 0x80, 0x00, 0x00, 0x00, 0x00 }, .long64);
+    try std.testing.expectEqual(Op.invalid, unsupported.op);
+    try std.testing.expectEqual(@as(u8, 0), unsupported.len);
+}
+
 test "shared legacy prefix decoder normalizes prefix classes" {
     const prefixes = decodeLegacyPrefixes(&[_]u8{ 0xF0, 0x2E, 0x66, 0x67, 0xF3, 0x4D, 0x89, 0xC8 });
     try std.testing.expectEqual(@as(usize, 6), prefixes.len);
@@ -425,6 +552,16 @@ test "shared legacy prefix decoder normalizes prefix classes" {
     // Verify LOCK prefix propagates to DecodedInsn
     const mov = decodeMovForTest(&[_]u8{ 0xF0, 0x89, 0xC8 }).?;
     try std.testing.expect(mov.lock);
+}
+
+test "shared legacy decoder preserves address-size override for MOV EAX,[EBX]" {
+    const decoded = decodeLegacyInstruction(&[_]u8{ 0x67, 0x8B, 0x03 }, .long64);
+    try std.testing.expectEqual(Op.mov_reg32_mem32, decoded.op);
+    try std.testing.expectEqual(Size.bits32, decoded.size);
+    try std.testing.expect(decoded.has_0x67);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, decoded.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0), decoded.addr);
+    try std.testing.expectEqual(@as(u8, 3), decoded.len);
 }
 
 pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedInsn {
@@ -482,6 +619,7 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
     const rex_r = (rex & 0x04) != 0;
     const rex_x = (rex & 0x02) != 0;
     const rex_b = (rex & 0x01) != 0;
+    const prefixes = decodeLegacyPrefixes(bytes);
 
     const op_size: Size = if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
     _ = op_size;
@@ -601,7 +739,8 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0x88, 0x89, 0x8A, 0x8B => {
-            return decodeMovRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            var operand_pos = pos + 1;
+            return decodeLegacyMov(bytes, &operand_pos, prefixes, opcode) orelse .{};
         },
 
         0x8D => {
@@ -613,25 +752,28 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0x00...0x03 => {
-            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .add);
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .add);
         },
         0x08...0x0B => {
-            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .@"or");
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .@"or");
+        },
+        0x10...0x13 => {
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .adc);
         },
         0x18...0x1B => {
-            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .sbb);
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .sbb);
         },
         0x20...0x23 => {
-            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .@"and");
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .@"and");
         },
         0x28...0x2B => {
-            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .sub);
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .sub);
         },
         0x30...0x33 => {
-            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .xor);
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .xor);
         },
         0x38...0x3B => {
-            return decodeArithRmReg(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode, .cmp);
+            return decodeArithRmReg(bytes, pos, prefixes, opcode, .cmp);
         },
 
         0x80...0x83 => {
@@ -675,7 +817,8 @@ pub fn decodeLegacyInstruction(bytes: []const u8, mode: ExecutionMode) DecodedIn
         },
 
         0xC6, 0xC7 => {
-            return decodeMovMemImm(bytes, pos, rex_r, rex_x, rex_b, rex_w, has_66, opcode);
+            var operand_pos = pos + 1;
+            return decodeLegacyMov(bytes, &operand_pos, prefixes, opcode) orelse .{};
         },
 
         0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF => {

@@ -476,6 +476,7 @@ pub fn auditVexDecoder() VexDecoderAudit {
         .{ .bytes = &.{ 0xC5, 0xFA, 0x7E, 0x40, 0x48 }, .op = .vmovq_xmm_mem64 }, // vmovq xmm0, [rax+0x48]
         .{ .bytes = &.{ 0xC5, 0xFA, 0x6F, 0x00 }, .op = .vmovdqu_xmm_mem }, // vmovdqu xmm0, [rax]
         .{ .bytes = &.{ 0xC4, 0xC1, 0x7A, 0x7F, 0x01 }, .op = .vmovdqu_mem_xmm }, // vmovdqu [r9], xmm0
+        .{ .bytes = &.{ 0xC4, 0xC1, 0x78, 0x10, 0x04, 0x24 }, .op = .vmovups_xmm_mem }, // vmovups xmm0, [r12]
         .{ .bytes = &.{ 0xC5, 0xFC, 0x10, 0x00 }, .op = .vmovups_ymm_mem, .vector_256 = true }, // vmovups ymm0, [rax]
         .{ .bytes = &.{ 0xC5, 0xFC, 0x11, 0x00 }, .op = .vmovups_mem_ymm, .vector_256 = true }, // vmovups [rax], ymm0
         .{ .bytes = &.{ 0xC5, 0xF8, 0x58, 0xC1 }, .op = .vaddps }, // vaddps xmm0, xmm0, xmm1
@@ -488,6 +489,7 @@ pub fn auditVexDecoder() VexDecoderAudit {
         .{ .bytes = &.{ 0xC5, 0xF9, 0xF3, 0xC2 }, .op = .vpsllq }, // vpsllq xmm0, xmm0, xmm2
         .{ .bytes = &.{ 0xC4, 0xE3, 0x79, 0x0E, 0xDA, 0xCC }, .op = .vpblendw }, // vpblendw xmm3, xmm0, xmm2, 0xcc
         .{ .bytes = &.{ 0xC5, 0xF9, 0x6C, 0xC1 }, .op = .vpunpcklqdq }, // vpunpcklqdq xmm0, xmm0, xmm1
+        .{ .bytes = &.{ 0xC5, 0xF8, 0xAE, 0x56, 0xF0 }, .op = .ldmxcsr_mem32 }, // vldmxcsr [rsi-0x10]
         .{ .bytes = &.{ 0xC5, 0xF8, 0x77 }, .op = .vzeroupper }, // vzeroupper
     };
     var passed: usize = 0;

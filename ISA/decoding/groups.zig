@@ -4,6 +4,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const addressing = @import("addressing.zig");
+const LegacyPrefixes = @import("prefix.zig").LegacyPrefixes;
 const highway = types.highway;
 const isa_decode = types.isa_decode;
 const capabilities = types.capabilities;
@@ -60,15 +61,16 @@ const mapJccCond8 = addressing.mapJccCond8;
 const mapJccCond32 = addressing.mapJccCond32;
 const readModRM = addressing.readModRM;
 
-pub fn decodeArithRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode: u8, arith_type: enum { add, @"or", adc, sbb, @"and", sub, xor, cmp }) DecodedInsn {
-    var d = DecodedInsn{};
+pub fn decodeArithRmReg(bytes: []const u8, start_pos: usize, prefixes: LegacyPrefixes, opcode: u8, arith_type: enum { add, @"or", adc, sbb, @"and", sub, xor, cmp }) DecodedInsn {
     var pos = start_pos + 1;
 
     const is_byte = (opcode & 0x01) == 0;
-    const sz: Size = if (is_byte) .bits8 else if (rex_w) .bits64 else if (has_66) .bits16 else .bits32;
-
-    const rm = readModRM(&d, bytes, &pos, rex_r, rex_x, rex_b, sz);
-    const is_reg_reg = bytes[start_pos + 1] >= 0xC0;
+    const sz: Size = if (is_byte) .bits8 else if (prefixes.rexW()) .bits64 else if (prefixes.operand_size_override) .bits16 else .bits32;
+    const operands = decodeModRm(bytes, &pos, prefixes, is_byte) orelse return .{};
+    const is_reg_reg = switch (operands.rm) {
+        .register => true,
+        .memory => false,
+    };
     const is_mem_to_reg = (opcode & 0x02) != 0;
 
     const reg_mem_ops: [8]Op = .{
@@ -84,7 +86,34 @@ pub fn decodeArithRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x:
         .and_reg8_reg8, .sub_reg8_reg8, .xor_reg8_reg8, .cmp_reg8_reg8,
     };
 
-    const base_op = if (arith_type == .sbb and !is_reg_reg and (!is_mem_to_reg or sz != .bits8))
+    const base_op = if (arith_type == .adc)
+        switch (sz) {
+            .bits8 => if (is_reg_reg)
+                Op.adc_reg8_reg8
+            else if (is_mem_to_reg)
+                Op.adc_reg8_mem8
+            else
+                Op.adc_mem8_reg8,
+            .bits16 => if (is_reg_reg)
+                Op.adc_reg16_reg16
+            else if (is_mem_to_reg)
+                Op.adc_reg16_mem16
+            else
+                Op.adc_mem16_reg16,
+            .bits32 => if (is_reg_reg)
+                Op.adc_reg32_reg32
+            else if (is_mem_to_reg)
+                Op.adc_reg32_mem32
+            else
+                Op.adc_mem32_reg32,
+            .bits64 => if (is_reg_reg)
+                Op.adc_reg64_reg64
+            else if (is_mem_to_reg)
+                Op.adc_reg64_mem64
+            else
+                Op.adc_mem64_reg64,
+        }
+    else if (arith_type == .sbb and !is_reg_reg and (!is_mem_to_reg or sz != .bits8))
         .invalid
     else if (is_reg_reg)
         reg_reg_ops[@intFromEnum(arith_type)]
@@ -93,30 +122,46 @@ pub fn decodeArithRmReg(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x:
     else
         mem_reg_ops[@intFromEnum(arith_type)];
     const off = @intFromEnum(sz) - @intFromEnum(Size.bits8);
-    d.op = if (base_op == .invalid)
-        .invalid
-    else
-        @enumFromInt(@intFromEnum(base_op) + off);
-
-    if (is_reg_reg) {
-        if (is_mem_to_reg) {
-            d.dst_reg = rm.reg;
-            d.src_reg = @enumFromInt(rm.addr);
-        } else {
-            d.dst_reg = @enumFromInt(rm.addr);
-            d.src_reg = rm.reg;
-        }
-        d.is_reg_form = true;
-    } else if (is_mem_to_reg) {
-        d.dst_reg = rm.reg;
-        d.addr = rm.addr;
-    } else {
-        d.src_reg = rm.reg;
-        d.addr = rm.addr;
+    var d = DecodedInsn{
+        .op = if (base_op == .invalid)
+            .invalid
+        else if (arith_type == .adc)
+            base_op
+        else
+            @enumFromInt(@intFromEnum(base_op) + off),
+        .size = sz,
+        .len = @intCast(pos),
+        .has_0x67 = prefixes.address_size_override,
+        .lock = prefixes.lock,
+    };
+    switch (operands.rm) {
+        .register => |rm_register| {
+            const dst = if (is_mem_to_reg) operands.reg else rm_register;
+            const src = if (is_mem_to_reg) rm_register else operands.reg;
+            d.dst_reg = dst.id;
+            d.dst_high8 = dst.high8;
+            d.src_reg = src.id;
+            d.src_high8 = src.high8;
+            d.is_reg_form = true;
+        },
+        .memory => |memory| {
+            if (is_mem_to_reg) {
+                d.dst_reg = operands.reg.id;
+                d.dst_high8 = operands.reg.high8;
+            } else {
+                d.src_reg = operands.reg.id;
+                d.src_high8 = operands.reg.high8;
+            }
+            d.addr = memory.displacement;
+            d.sib_has_index = memory.has_index;
+            d.sib_index_reg = memory.index_reg;
+            d.sib_scale = memory.scale;
+            d.sib_has_base = memory.has_base;
+            d.sib_base_reg = memory.base_reg;
+            d.rip_relative = memory.rip_relative;
+            d.segment = memory.segment;
+        },
     }
-    d.size = sz;
-    d.len = @as(u8, @intCast(pos));
-
     return d;
 }
 
@@ -933,7 +978,7 @@ pub fn decodeXadd(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool,
     return d;
 }
 
-pub fn decodeSetcc(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, opcode2: u8) DecodedInsn {
+pub fn decodeSetcc(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool, rex_b: bool, rex_w: bool, has_66: bool, has_rex: bool, opcode2: u8) DecodedInsn {
     _ = rex_w;
     _ = has_66;
     var d = DecodedInsn{};
@@ -951,8 +996,18 @@ pub fn decodeSetcc(bytes: []const u8, start_pos: usize, rex_r: bool, rex_x: bool
         d.op = .setcc_mem8;
         d.addr = rm.addr;
     } else {
+        // Without any REX prefix, ModRM r/m values 4...7 name the legacy
+        // high-byte registers AH...BH. With even a neutral 0x40 REX prefix,
+        // the same encodings name SPL...DIL. Treating 0F 92 C4 as SETB SPL
+        // corrupted the low byte of RSP in Xenia-generated code and made the
+        // eventual RET appear to pop zero from an unaligned stack.
+        // decodeRegister expects the three-bit r/m field, not the complete
+        // ModR/M byte. Passing 0xC4 made the AH range check (4...7)
+        // unreachable even though registerId later truncated it to SPL.
+        const register = decodeRegister(modrm & 7, rex_b, true, has_rex);
         d.op = .setcc_reg8;
-        d.dst_reg = @enumFromInt(rm.addr);
+        d.dst_reg = register.id;
+        d.dst_high8 = register.high8;
     }
 
     d.cond = setcc_conditions[opcode2 & 0x0F];

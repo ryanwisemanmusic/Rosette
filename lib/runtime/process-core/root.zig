@@ -8,6 +8,7 @@ pub const near_null_causality = @import("near_null_causality.zig");
 pub const crash_diag = @import("crash_diag.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const execute = @import("execute.zig");
+pub const generated_endian_contract = @import("generated_endian_contract.zig");
 pub const guest_log = @import("guest_log.zig");
 pub const initializers = @import("initializers.zig");
 pub const native_window = @import("native_window.zig");

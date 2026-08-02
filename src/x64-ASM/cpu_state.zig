@@ -90,6 +90,9 @@ pub const Regs = struct {
     r15: u64 = 0,
     rip: u64 = 0,
     rflags: u32 = 0x0002,
+    // Architectural reset value. Rosette keeps MXCSR in the shared CPU state
+    // so legacy LDMXCSR and VEX VLDMXCSR have one runtime-owned contract.
+    mxcsr: u32 = 0x0000_1F80,
     segments: SegmentState = .{},
 
     pub fn get(self: *const Regs, comptime reg: []const u8) u64 {

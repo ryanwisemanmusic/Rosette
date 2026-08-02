@@ -104,6 +104,10 @@ pub const StackEntry = struct {
 pub const MemoryAccessFailure = struct {
     instruction_address: u64 = 0,
     instruction: []const u8 = "",
+    decoded_instruction: []const u8 = "",
+    instruction_length: u8 = 0,
+    instruction_bytes: [16]u8 = [_]u8{0} ** 16,
+    instruction_byte_count: u8 = 0,
     address: u64 = 0,
     bytes: u8 = 0,
     access: []const u8 = "",
@@ -133,8 +137,15 @@ pub const SemanticFault = struct {
 };
 
 pub const MemoryAccessEvent = struct {
+    provenance_present: bool = false,
+    thread_handle: u64 = 0,
+    scheduler_epoch: u64 = 0,
+    step: u64 = 0,
     instruction_address: u64 = 0,
     instruction: []const u8 = "",
+    instruction_length: u8 = 0,
+    instruction_bytes: [16]u8 = [_]u8{0} ** 16,
+    instruction_byte_count: u8 = 0,
     address: u64 = 0,
     bytes: u8 = 0,
     access: []const u8 = "",
@@ -302,6 +313,12 @@ pub fn logExitReport(report: ExitReport) void {
             .{ failure.instruction, failure.instruction_address, failure.access, failure.address, failure.bytes },
         );
         std.debug.print("    fault={s} mapped={}\n", .{ failure.fault, failure.mapped });
+        if (failure.instruction_byte_count != 0) {
+            std.debug.print(
+                "    decoded={s} len={d} raw_bytes={any}\n",
+                .{ failure.decoded_instruction, failure.instruction_length, failure.instruction_bytes[0..failure.instruction_byte_count] },
+            );
+        }
     }
 
     if (report.semantic_fault) |semantic| {
@@ -337,9 +354,15 @@ pub fn logExitReport(report: ExitReport) void {
         std.debug.print("  \x1b[33mrecent scalar memory accesses (oldest first):\x1b[0m\n", .{});
         for (report.recent_memory_accesses, 0..) |event, i| {
             std.debug.print(
-                "    [{d:>2}] rip=0x{x} op={s} {s} addr=0x{x} bytes={d} value=0x{x} backed={} near_null={}\n",
-                .{ i, event.instruction_address, event.instruction, event.access, event.address, event.bytes, event.value, event.backed, event.near_null },
+                "    [{d:>2}] thread=0x{x} epoch={d} step={d} rip=0x{x} op={s} {s} addr=0x{x} bytes={d} value=0x{x} backed={} near_null={}\n",
+                .{ i, event.thread_handle, event.scheduler_epoch, event.step, event.instruction_address, event.instruction, event.access, event.address, event.bytes, event.value, event.backed, event.near_null },
             );
+            if (event.instruction_byte_count != 0) {
+                std.debug.print(
+                    "         generated_instruction len={d} raw_bytes={any}\n",
+                    .{ event.instruction_length, event.instruction_bytes[0..event.instruction_byte_count] },
+                );
+            }
         }
     }
 

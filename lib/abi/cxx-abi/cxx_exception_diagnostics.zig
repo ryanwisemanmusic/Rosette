@@ -18,6 +18,14 @@ pub const ThrowRecord = struct {
     allocation: ?AllocationRecord = null,
 };
 
+pub const EndCatchResult = struct {
+    object_address: u64,
+    /// `__cxa_rethrow` ends the current handler without completing the
+    /// exception. The phase-two checkpoint must survive this end-catch so
+    /// the following `_Unwind_Resume` can continue the same transaction.
+    rethrow_in_progress: bool,
+};
+
 pub const Summary = struct {
     allocations: u64,
     throws: u64,
@@ -47,6 +55,7 @@ pub const Tracker = struct {
     rethrow_count: u64 = 0,
     last_throw: ?ThrowRecord = null,
     last_throw_caught: bool = false,
+    pending_rethrow_object: u64 = 0,
 
     pub fn recordAllocation(self: *Tracker, storage_address: u64, object_address: u64, object_size: u64, caller_address: u64) void {
         self.allocations[self.allocation_index] = .{
@@ -79,6 +88,7 @@ pub const Tracker = struct {
         if (allocation != null) self.matched_throw_count +|= 1;
         self.last_throw = record;
         self.last_throw_caught = false;
+        self.pending_rethrow_object = 0;
         return record;
     }
 
@@ -92,19 +102,31 @@ pub const Tracker = struct {
         return object_address;
     }
 
-    pub fn endCatch(self: *Tracker) ?u64 {
+    pub fn endCatch(self: *Tracker) ?EndCatchResult {
         if (self.active_catch_count == 0) return null;
         self.active_catch_count -= 1;
         const object_address = self.active_catches[self.active_catch_count];
         self.active_catches[self.active_catch_count] = 0;
         self.end_catch_count +|= 1;
-        if (self.last_throw) |thrown| {
-            if (thrown.object_address == object_address and !self.last_throw_caught) {
-                self.last_throw_caught = true;
-                self.caught_throw_count +|= 1;
+
+        const rethrow_in_progress = self.pending_rethrow_object == object_address;
+        if (rethrow_in_progress) {
+            // The handler has ended, but the exception has not. Clearing the
+            // marker here leaves `last_throw_caught` false until an outer
+            // handler genuinely completes the exception.
+            self.pending_rethrow_object = 0;
+        } else {
+            if (self.last_throw) |thrown| {
+                if (thrown.object_address == object_address and !self.last_throw_caught) {
+                    self.last_throw_caught = true;
+                    self.caught_throw_count +|= 1;
+                }
             }
         }
-        return object_address;
+        return .{
+            .object_address = object_address,
+            .rethrow_in_progress = rethrow_in_progress,
+        };
     }
 
     pub fn exceptionPointer(self: *const Tracker, exception_address: u64) u64 {
@@ -134,9 +156,11 @@ pub const Tracker = struct {
 
     pub fn recordRethrow(self: *Tracker) ?u64 {
         self.rethrow_count +|= 1;
-        self.last_throw_caught = false;
         if (self.active_catch_count == 0) return null;
-        return self.active_catches[self.active_catch_count - 1];
+        const object_address = self.active_catches[self.active_catch_count - 1];
+        self.last_throw_caught = false;
+        self.pending_rethrow_object = object_address;
+        return object_address;
     }
 
     /// Returns only an exception that is still eligible to drive unwinding.
@@ -211,12 +235,28 @@ test "catch lifecycle normalizes ABI header pointers and frees storage" {
     tracker.recordAllocation(0x3fc0, 0x4000, 32, 0x1000);
     _ = tracker.recordThrow(0x4000, 0x5000, 0x6000, 0x2000);
     try std.testing.expectEqual(@as(u64, 0x4000), tracker.beginCatch(0x3fe0));
-    try std.testing.expectEqual(@as(u64, 0x4000), tracker.recordRethrow().?);
-    try std.testing.expectEqual(@as(u64, 0x4000), tracker.endCatch().?);
+    const ended = tracker.endCatch().?;
+    try std.testing.expectEqual(@as(u64, 0x4000), ended.object_address);
+    try std.testing.expect(!ended.rethrow_in_progress);
     try std.testing.expect(tracker.last_throw_caught);
     const allocation = tracker.freeException(0x3ff0).?;
     try std.testing.expectEqual(@as(u64, 0x3fc0), allocation.storage_address);
     try std.testing.expectEqual(@as(usize, 0), tracker.summary().active_catches);
+}
+
+test "rethrow end-catch preserves the exception as an active unwind source" {
+    var tracker = Tracker{};
+    tracker.recordAllocation(0x3fc0, 0x4000, 16, 0x1000);
+    _ = tracker.recordThrow(0x4000, 0x5000, 0, 0x2000);
+    _ = tracker.beginCatch(0x3fc0);
+
+    try std.testing.expectEqual(@as(u64, 0x4000), tracker.recordRethrow().?);
+    const ended = tracker.endCatch().?;
+    try std.testing.expectEqual(@as(u64, 0x4000), ended.object_address);
+    try std.testing.expect(ended.rethrow_in_progress);
+    try std.testing.expect(!tracker.last_throw_caught);
+    try std.testing.expect(tracker.activeThrow() != null);
+    try std.testing.expectEqual(@as(u64, 0), tracker.summary().caught_throws);
 }
 
 test "unmatched throw remains explicit" {

@@ -32,6 +32,8 @@ int rosette_macho_native_window_set_size(uint32_t width, uint32_t height);
 int rosette_macho_native_window_show(void);
 int rosette_macho_native_window_set_fullscreen(int fullscreen);
 int rosette_macho_native_window_attach_metal_layer(void);
+uint64_t rosette_macho_native_window_present_synthetic_vulkan_frame(
+    uint64_t serial, uint32_t width, uint32_t height, uint32_t stage);
 uint32_t rosette_macho_native_window_pump_events(void);
 RosetteMachONativeWindowStatus rosette_macho_native_window_status(void);
 void rosette_macho_native_window_shutdown(void);

@@ -239,6 +239,43 @@ test "decode CRC32 forms without consuming the following instruction" {
     try std.testing.expectEqual(@as(u8, 7), qword_memory.len);
 }
 
+test "decode MOVBE forms without entering ModRM or displacement bytes" {
+    // Exact generated-code shape from the Xenia bootstrap failure. The four
+    // zero displacement bytes must remain part of MOVBE, not become ADDs.
+    const dword_load = decodeInsn(&[_]u8{
+        0x0F, 0x38, 0xF0, 0x9F, 0x00, 0x00, 0x00, 0x00,
+        0x83, 0xFB, 0x00,
+    });
+    try std.testing.expectEqual(Op.movbe_reg_mem, dword_load.op);
+    try std.testing.expectEqual(Size.bits32, dword_load.size);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, dword_load.dst_reg);
+    try std.testing.expectEqual(RegId.bh_di_edi_rdi, dword_load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0), dword_load.addr);
+    try std.testing.expectEqual(@as(u8, 8), dword_load.len);
+
+    const qword_load = decodeInsn(&[_]u8{ 0x48, 0x0F, 0x38, 0xF0, 0x48, 0x08 });
+    try std.testing.expectEqual(Op.movbe_reg_mem, qword_load.op);
+    try std.testing.expectEqual(Size.bits64, qword_load.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, qword_load.dst_reg);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, qword_load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 8), qword_load.addr);
+    try std.testing.expectEqual(@as(u8, 6), qword_load.len);
+
+    const word_store = decodeInsn(&[_]u8{ 0x66, 0x0F, 0x38, 0xF1, 0x4A, 0x10 });
+    try std.testing.expectEqual(Op.movbe_mem_reg, word_store.op);
+    try std.testing.expectEqual(Size.bits16, word_store.size);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, word_store.src_reg);
+    try std.testing.expectEqual(RegId.dl_dx_edx_rdx, word_store.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x10), word_store.addr);
+    try std.testing.expectEqual(@as(u8, 6), word_store.len);
+}
+
+test "unsupported three-byte opcode fails at its real boundary" {
+    const unsupported = decodeInsn(&[_]u8{ 0x0F, 0x38, 0x42, 0x80, 0x00, 0x00, 0x00, 0x00 });
+    try std.testing.expectEqual(Op.invalid, unsupported.op);
+    try std.testing.expectEqual(@as(u8, 0), unsupported.len);
+}
+
 test "decode register MOVZX without consuming the following instruction" {
     const decoded = decodeInsn(&[_]u8{ 0x0F, 0xB6, 0xC0, 0x48, 0x83, 0xC4, 0x30 });
     try std.testing.expectEqual(Op.movzx_reg32_mem8, decoded.op);
@@ -247,6 +284,43 @@ test "decode register MOVZX without consuming the following instruction" {
     try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.dst_reg);
     try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.src_reg);
     try std.testing.expectEqual(@as(u8, 3), decoded.len);
+}
+
+test "SETcc distinguishes legacy high-byte registers from REX byte registers" {
+    // Exact generated-code instruction from the Xenia failure. Without REX,
+    // r/m=4 is AH, not SPL.
+    const legacy = decodeInsn(&[_]u8{ 0x0F, 0x92, 0xC4 });
+    try std.testing.expectEqual(Op.setcc_reg8, legacy.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, legacy.dst_reg);
+    try std.testing.expect(legacy.dst_high8);
+    try std.testing.expectEqual(@as(u8, 3), legacy.len);
+
+    const rex = decodeInsn(&[_]u8{ 0x40, 0x0F, 0x92, 0xC4 });
+    try std.testing.expectEqual(Op.setcc_reg8, rex.op);
+    try std.testing.expectEqual(RegId.ah_sp_esp_rsp, rex.dst_reg);
+    try std.testing.expect(!rex.dst_high8);
+    try std.testing.expectEqual(@as(u8, 4), rex.len);
+}
+
+test "decode legacy and VEX MXCSR memory transfers at the full boundary" {
+    const legacy_load = decodeInsn(&[_]u8{ 0x0F, 0xAE, 0x56, 0xF0 });
+    try std.testing.expectEqual(Op.ldmxcsr_mem32, legacy_load.op);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, legacy_load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -16))), legacy_load.addr);
+    try std.testing.expectEqual(@as(u8, 4), legacy_load.len);
+
+    // Exact instruction shape reported by Xenia: vldmxcsr [rsi-0x10].
+    const vex_load = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0xAE, 0x56, 0xF0 });
+    try std.testing.expectEqual(Op.ldmxcsr_mem32, vex_load.op);
+    try std.testing.expectEqual(RegId.dh_si_esi_rsi, vex_load.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -16))), vex_load.addr);
+    try std.testing.expectEqual(@as(u8, 5), vex_load.len);
+
+    const vex_store = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0xAE, 0x5F, 0x20 });
+    try std.testing.expectEqual(Op.stmxcsr_mem32, vex_store.op);
+    try std.testing.expectEqual(RegId.bh_di_edi_rdi, vex_store.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x20), vex_store.addr);
+    try std.testing.expectEqual(@as(u8, 5), vex_store.len);
 }
 
 test "decode UD2 undefined instruction" {
@@ -405,6 +479,16 @@ test "decode Xbyak unaligned feature-mask copy" {
 }
 
 test "decode 128-bit VEX move families" {
+    // Exact Clang/libc++ initializer sequence previously rejected by Rosette:
+    // C4.C1.78.10 /r with SIB base r12 is VMOVUPS xmm0, [r12].
+    const initializer_extended_base_load = decodeInsn(&[_]u8{ 0xC4, 0xC1, 0x78, 0x10, 0x04, 0x24 });
+    try std.testing.expectEqual(Op.vmovups_xmm_mem, initializer_extended_base_load.op);
+    try std.testing.expectEqual(@as(u8, 0), initializer_extended_base_load.xmm_dst);
+    try std.testing.expect(initializer_extended_base_load.sib_has_base);
+    try std.testing.expectEqual(RegId.r12b_r12w_r12d_r12, initializer_extended_base_load.sib_base_reg);
+    try std.testing.expect(!initializer_extended_base_load.sib_has_index);
+    try std.testing.expectEqual(@as(u8, 6), initializer_extended_base_load.len);
+
     const extended_base_store = decodeInsn(&[_]u8{ 0xC4, 0xC1, 0x7A, 0x7F, 0x01 });
     try std.testing.expectEqual(Op.vmovdqu_mem_xmm, extended_base_store.op);
     try std.testing.expectEqual(@as(u8, 0), extended_base_store.xmm_src);
@@ -508,6 +592,21 @@ test "decode VEX qword moves between XMM general registers and memory" {
     try std.testing.expectEqual(RegId.al_ax_eax_rax, failing_signbit_move.dst_reg);
     try std.testing.expectEqual(@as(u8, 0), failing_signbit_move.xmm_src);
     try std.testing.expectEqual(@as(u8, 5), failing_signbit_move.len);
+
+    // Xenia's CONVERT_I64_F64 sequence must preserve all 64 source bits for
+    // its overflow-sign test. Keep the exact macOS emitter boundary covered:
+    // vmovq rcx, xmm4; vcvtsd2si rbx, xmm4.
+    const xenia_signbit_move = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x7E, 0xE1 });
+    try std.testing.expectEqual(Op.vmovq_reg64_xmm, xenia_signbit_move.op);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, xenia_signbit_move.dst_reg);
+    try std.testing.expectEqual(@as(u8, 4), xenia_signbit_move.xmm_src);
+    try std.testing.expectEqual(@as(u8, 5), xenia_signbit_move.len);
+
+    const xenia_conversion = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xFB, 0x2D, 0xDC });
+    try std.testing.expectEqual(Op.vcvtsd2si, xenia_conversion.op);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, xenia_conversion.dst_reg);
+    try std.testing.expectEqual(@as(u8, 4), xenia_conversion.xmm_src);
+    try std.testing.expectEqual(@as(u8, 5), xenia_conversion.len);
 
     const load_register = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0xF9, 0x6E, 0xC8 });
     try std.testing.expectEqual(Op.vmovq_xmm_reg64, load_register.op);
@@ -1324,6 +1423,16 @@ test "decode 64-bit OR register immediate without aliasing memory opcodes" {
     try std.testing.expectEqual(@as(u64, 8), memory.addr);
     try std.testing.expectEqual(@as(u64, 1), memory.imm);
     try std.testing.expectEqual(@as(u8, 5), memory.len);
+}
+
+test "decode the reported ADCQ register immediate" {
+    // Exact bytes at the reported Xenia failure RIP: adc r14, 0.
+    const decoded = decodeInsn(&[_]u8{ 0x49, 0x83, 0xD6, 0x00 });
+    try std.testing.expectEqual(Op.adc_reg64_imm8, decoded.op);
+    try std.testing.expectEqual(Size.bits64, decoded.size);
+    try std.testing.expectEqual(RegId.r14b_r14w_r14d_r14, decoded.dst_reg);
+    try std.testing.expectEqual(@as(u64, 0), decoded.imm);
+    try std.testing.expectEqual(@as(u8, 4), decoded.len);
 }
 
 test "decode XCHG ModRM register and memory forms without aliasing" {

@@ -22,11 +22,13 @@ static NSWindow *g_window;
 static RosetteMachOMetalView *g_view;
 static CAMetalLayer *g_metal_layer;
 static id<MTLDevice> g_metal_device;
+static id<MTLCommandQueue> g_metal_command_queue;
 static uint32_t g_width = 1280;
 static uint32_t g_height = 720;
 static uint32_t g_events_pumped;
 static BOOL g_fullscreen;
 static BOOL g_reported_off_main_thread;
+static uint64_t g_synthetic_vulkan_frames_presented;
 
 static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
   if (![NSThread isMainThread]) {
@@ -130,6 +132,14 @@ static BOOL RosetteMachOEnsureWindowOnMainThread(uint32_t width,
   }
 
   g_metal_layer.device = g_metal_device;
+  g_metal_command_queue = [g_metal_device newCommandQueue];
+  if (!g_metal_command_queue) {
+    g_metal_layer = nil;
+    g_metal_device = nil;
+    g_view = nil;
+    g_window = nil;
+    return NO;
+  }
   g_metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
   g_metal_layer.framebufferOnly = NO;
   g_metal_layer.opaque = YES;
@@ -248,6 +258,52 @@ int rosette_macho_native_window_attach_metal_layer(void) {
   return result ? 1 : 0;
 }
 
+uint64_t rosette_macho_native_window_present_synthetic_vulkan_frame(
+    uint64_t serial, uint32_t width, uint32_t height, uint32_t stage) {
+  __block uint64_t presented = 0;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      if (!RosetteMachOEnsureWindowOnMainThread(
+              width ? width : g_width, height ? height : g_height, nil)) {
+        return;
+      }
+      RosetteMachOUpdateMetalDrawable();
+      id<CAMetalDrawable> drawable = [g_metal_layer nextDrawable];
+      id<MTLCommandBuffer> command_buffer =
+          [g_metal_command_queue commandBuffer];
+      if (!drawable || !command_buffer) {
+        return;
+      }
+
+      // The translated Vulkan device and command stream are still modeled,
+      // so no authoritative guest pixels exist here yet. Put an unmistakable
+      // frame on the real CAMetalLayer anyway: this proves the final Cocoa /
+      // Metal forwarding boundary is live and prevents a permanently blank
+      // window while the native Vulkan object bridge is being completed.
+      const double phase = (double)((serial >> 4) % 7u) / 6.0;
+      const double stage_bias = (double)(stage % 4u) * 0.08;
+      MTLRenderPassDescriptor *pass =
+          [MTLRenderPassDescriptor renderPassDescriptor];
+      pass.colorAttachments[0].texture = drawable.texture;
+      pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+      pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+      pass.colorAttachments[0].clearColor =
+          MTLClearColorMake(0.05 + stage_bias, 0.08 + phase * 0.35,
+                            0.16 + (1.0 - phase) * 0.45, 1.0);
+      id<MTLRenderCommandEncoder> encoder =
+          [command_buffer renderCommandEncoderWithDescriptor:pass];
+      if (!encoder) {
+        return;
+      }
+      [encoder endEncoding];
+      [command_buffer presentDrawable:drawable];
+      [command_buffer commit];
+      presented = ++g_synthetic_vulkan_frames_presented;
+    });
+  }
+  return presented;
+}
+
 uint32_t rosette_macho_native_window_pump_events(void) {
   __block uint32_t count = 0;
   @autoreleasepool {
@@ -308,11 +364,13 @@ void rosette_macho_native_window_shutdown(void) {
       [g_window orderOut:nil];
       g_metal_layer.device = nil;
       g_window.contentView = nil;
+      g_metal_command_queue = nil;
       g_metal_layer = nil;
       g_metal_device = nil;
       g_view = nil;
       g_window = nil;
       g_fullscreen = NO;
+      g_synthetic_vulkan_frames_presented = 0;
     });
   }
 }
