@@ -52,6 +52,39 @@ pub fn blendPackedWords(lhs: [16]u8, rhs: [16]u8, control: u8) [16]u8 {
     return result;
 }
 
+/// Variable-blend (VBLENDVPS/VBLENDVPD/VPBLENDVB): selects each lane from
+/// `lhs` (SRC1) or `rhs` (SRC2) based on the most-significant bit of the
+/// corresponding lane of the `mask` vector. A mask lane MSB of 1 selects the
+/// rhs lane, 0 selects the lhs lane.
+pub fn blendPackedElements(lhs: [16]u8, rhs: [16]u8, mask: [16]u8, lane_bits: u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    switch (lane_bits) {
+        8 => for (0..16) |lane| {
+            result[lane] = if (mask[lane] & 0x80 != 0) rhs[lane] else lhs[lane];
+        },
+        16 => for (0..8) |lane| {
+            const offset = lane * 2;
+            const select_rhs = std.mem.readInt(u16, mask[offset..][0..2], .little) & 0x8000 != 0;
+            const source = if (select_rhs) rhs else lhs;
+            @memcpy(result[offset..][0..2], source[offset..][0..2]);
+        },
+        32 => for (0..4) |lane| {
+            const offset = lane * 4;
+            const select_rhs = std.mem.readInt(u32, mask[offset..][0..4], .little) & 0x80000000 != 0;
+            const source = if (select_rhs) rhs else lhs;
+            @memcpy(result[offset..][0..4], source[offset..][0..4]);
+        },
+        64 => for (0..2) |lane| {
+            const offset = lane * 8;
+            const select_rhs = std.mem.readInt(u64, mask[offset..][0..8], .little) & 0x8000000000000000 != 0;
+            const source = if (select_rhs) rhs else lhs;
+            @memcpy(result[offset..][0..8], source[offset..][0..8]);
+        },
+        else => unreachable,
+    }
+    return result;
+}
+
 /// Performs a packed integer binary operation (add, sub, or mul_low) across
 /// all lanes of the specified bit width.
 pub fn packedIntegerBinary(lhs: [16]u8, rhs: [16]u8, lane_bits: u8, operation: PackedIntegerOperation) [16]u8 {

@@ -82,6 +82,7 @@ const thunk_handler = @import("macho_core").thunk_handler;
 const execution_helpers = @import("macho_core").execution_helpers;
 const execute_impl = @import("process_core").execute;
 const memory_access = @import("process_core").memory_access;
+const generated_endian_contract = @import("process_core").generated_endian_contract;
 const packed_ops = @import("macho_core").packed_ops;
 const signal_handling = @import("process_core").signal_handling;
 const initializers = @import("process_core").initializers;
@@ -125,6 +126,7 @@ const PAGE_SIZE = constants.PAGE_SIZE;
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
 const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;
 const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
+const ENDIAN_EVIDENCE_BUFFER_LEN = constants.ENDIAN_EVIDENCE_BUFFER_LEN;
 const UNSUPPORTED_RUNTIME_EXIT_CODE = constants.UNSUPPORTED_RUNTIME_EXIT_CODE;
 const GUEST_FILE_BASE = constants.GUEST_FILE_BASE;
 const GUEST_FILE_MAX = constants.GUEST_FILE_MAX;
@@ -544,6 +546,14 @@ pub const MachOState = struct {
     // so the fast path is a direct slice read; enable with
     // ROSETTE_MACHO_MEMORY_TRACE=1 when diagnosing faults/near-null causality.
     memory_trace_enabled: bool = false,
+    // Always-on endian-contract evidence ring. Populated at the execute site
+    // (no re-decode: the interpreter already has the decoded instruction) for
+    // the narrow set of ops the generated-endian contract consumes. Unlike the
+    // diagnostic-gated memory trace above, this ring is written unconditionally
+    // so the contract can substantiate repairs in production runs.
+    endian_evidence_entries: [ENDIAN_EVIDENCE_BUFFER_LEN]generated_endian_contract.EvidenceEntry = [_]generated_endian_contract.EvidenceEntry{.{}} ** ENDIAN_EVIDENCE_BUFFER_LEN,
+    endian_evidence_index: usize = 0,
+    endian_evidence_filled: bool = false,
     guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
     bound_import_thunks: []BoundImportThunk = &.{},
     decode_cache: []DecodeCacheEntry,
@@ -1305,6 +1315,7 @@ pub const MachOState = struct {
     const dumpHeapCorruptionDiagnostics = memory_access.dumpHeapCorruptionDiagnostics;
     const timerQueueWatchWrite = memory_access.timerQueueWatchWrite;
     pub const writeMemVal = memory_access.writeMemVal;
+    pub const recordEndianEvidence = memory_access.recordEndianEvidence;
     pub const captureMemoryMutation = memory_access.captureMemoryMutation;
     pub const commitMemoryMutation = memory_access.commitMemoryMutation;
     const deferInitializerRuntimeDependency = memory_access.deferInitializerRuntimeDependency;
@@ -2290,7 +2301,15 @@ pub const MachOState = struct {
         if (!self.ensureGuestAccess(d.addr, bytesForSize(size), access, @tagName(op))) return;
         const reg = if (direction == .memory_to_register) d.dst_reg else d.src_reg;
         const reg_high8 = if (direction == .memory_to_register) d.dst_high8 else d.src_high8;
-        const evaluated = x64_decoder.highway.evaluateMemory(op, width, self.regOperandVal(reg, size, reg_high8), self.readMemVal(d.addr, size), direction, self.regs.rflags);
+        const memory_value = self.readMemVal(d.addr, size);
+        // Endian-contract witness: a 32-bit register/memory comparison retains
+        // the original (unswapped) value. Recorded at the execute site, always
+        // on, so the generated-endian contract can substantiate repairs without
+        // the diagnostic-gated memory trace.
+        if (op == .cmp and size == .bits32 and direction == .memory_to_register) {
+            self.recordEndianEvidence(.cmp_witness, reg, d.addr, size, memory_value);
+        }
+        const evaluated = x64_decoder.highway.evaluateMemory(op, width, self.regOperandVal(reg, size, reg_high8), memory_value, direction, self.regs.rflags);
         self.regs.rflags = evaluated.rflags;
         if (evaluated.write_register) self.setRegOperand(reg, size, reg_high8, evaluated.value);
         if (evaluated.write_memory) self.writeMemVal(d.addr, size, evaluated.value);

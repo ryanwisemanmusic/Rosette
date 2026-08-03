@@ -1042,6 +1042,114 @@ test "decode VEX scalar and packed rounding" {
     try std.testing.expectEqual(@as(u64, 3), packed_round.imm);
 }
 
+test "decode VPEXTRB/W/D/Q (VEX.128.66.0F3A 14-17)" {
+    // Exact bytes from the Xenia JIT-generated-code fault at 0xa004b4dd:
+    // VPEXTRB r32, xmm4, 3 — ModRM.reg is the source XMM, ModRM.r/m the
+    // destination GPR.
+    const extract_b = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x14, 0xE3, 0x03 });
+    try std.testing.expectEqual(Op.vpextrb, extract_b.op);
+    try std.testing.expectEqual(@as(u64, 3), extract_b.imm);
+    try std.testing.expectEqual(@as(u8, 6), extract_b.len);
+    try std.testing.expectEqual(@as(u8, 4), extract_b.xmm_src);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, extract_b.dst_reg);
+    try std.testing.expect(extract_b.is_reg_form);
+
+    const extract_w = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x15, 0xC3, 0x02 });
+    try std.testing.expectEqual(Op.vpextrw, extract_w.op);
+    try std.testing.expectEqual(@as(u64, 2), extract_w.imm);
+
+    const extract_d = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x16, 0xC3, 0x01 });
+    try std.testing.expectEqual(Op.vpextrd, extract_d.op);
+    try std.testing.expectEqual(@as(u64, 1), extract_d.imm);
+
+    // VPEXTRQ is the W1 encoding (byte3 bit 7 set): C4 E3 F9 17 ...
+    const extract_q = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0xF9, 0x17, 0xC3, 0x00 });
+    try std.testing.expectEqual(Op.vpextrq, extract_q.op);
+    try std.testing.expectEqual(@as(u8, 6), extract_q.len);
+    try std.testing.expectEqual(@as(u8, 0), extract_q.xmm_src);
+
+    // Memory form: VPEXTRD [rax], xmm1, 1
+    const extract_mem = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x79, 0x16, 0x08, 0x01 });
+    try std.testing.expectEqual(Op.vpextrd, extract_mem.op);
+    try std.testing.expect(!extract_mem.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 1), extract_mem.xmm_src);
+    try std.testing.expectEqual(@as(u64, 1), extract_mem.imm);
+}
+
+test "decode VPSUB/VPADD/VPUNPCK 3-operand VEX2 with real vvvv source" {
+    // Exact bytes from the Xenia JIT-generated-code fault at 0xa004b554:
+    // VPSUBB xmm0, xmm1, xmm3 — VEX2 vvvv=1110 selects a real source register.
+    const sub_b = decodeInsn(&[_]u8{ 0xC5, 0xF1, 0xF8, 0xC3 });
+    try std.testing.expectEqual(Op.vpsubb, sub_b.op);
+    try std.testing.expectEqual(@as(u8, 0), sub_b.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), sub_b.xmm_src);
+    try std.testing.expectEqual(@as(u8, 3), sub_b.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 4), sub_b.len);
+    try std.testing.expect(sub_b.is_reg_form);
+
+    // VPXOR xmm1, xmm0, [rip+0x06778350] — memory form with RIP-relative addressing
+    const xor_mem = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xEF, 0x0C, 0x25, 0x50, 0x83, 0x77, 0x06 });
+    try std.testing.expectEqual(Op.vpxor, xor_mem.op);
+    try std.testing.expectEqual(@as(u8, 1), xor_mem.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), xor_mem.xmm_src);
+    try std.testing.expect(!xor_mem.is_reg_form);
+    try std.testing.expect(xor_mem.rip_relative);
+
+    // 256-bit VPADDD ymm0, ymm1, ymm3 — L=1 (0xF5) with a real vvvv source
+    const add_d = decodeInsn(&[_]u8{ 0xC5, 0xF5, 0xFE, 0xC3 });
+    try std.testing.expectEqual(Op.vpaddd, add_d.op);
+    try std.testing.expect(add_d.vector_256);
+    try std.testing.expectEqual(@as(u8, 1), add_d.xmm_src);
+    try std.testing.expectEqual(@as(u8, 3), add_d.xmm_src2);
+
+    // VPUNPCKLBW xmm0, xmm1, xmm3 — same-class guard fix (vvvv=1110 source)
+    const unpack = decodeInsn(&[_]u8{ 0xC5, 0xF1, 0x60, 0xC3 });
+    try std.testing.expectEqual(Op.vpunpcklbw, unpack.op);
+    try std.testing.expectEqual(@as(u8, 1), unpack.xmm_src);
+    try std.testing.expectEqual(@as(u8, 3), unpack.xmm_src2);
+}
+
+test "decode VBLENDVPS/VBLENDVPD/VPBLENDVB variable-blend (0F3A 4A/4B/4C)" {
+    // Exact bytes from the Xenia JIT-generated-code fault at 0xa004b566:
+    // VPBLENDVB xmm3, xmm2, [rax], xmm1 — the mask register is encoded in
+    // imm8[7:4] (0x10 -> xmm1); imm8[3:0] is ignored.
+    const blend = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x69, 0x4C, 0x18, 0x10 });
+    try std.testing.expectEqual(Op.vpblendvb, blend.op);
+    try std.testing.expectEqual(@as(u8, 3), blend.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), blend.xmm_src);
+    try std.testing.expect(!blend.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 1), blend.xmm_mask);
+    try std.testing.expectEqual(@as(u64, 0x10), blend.imm);
+    try std.testing.expectEqual(@as(u8, 6), blend.len);
+
+    // Register form: VPBLENDVB xmm0, xmm2, xmm3, xmm1
+    const blend_reg = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x69, 0x4C, 0xC3, 0x10 });
+    try std.testing.expectEqual(Op.vpblendvb, blend_reg.op);
+    try std.testing.expect(blend_reg.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 0), blend_reg.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 3), blend_reg.xmm_src2);
+    try std.testing.expectEqual(@as(u8, 1), blend_reg.xmm_mask);
+
+    // 256-bit form (VEX.L=1): VPBLENDVB ymm0, ymm2, ymm3, ymm1
+    const blend_256 = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x6D, 0x4C, 0xC3, 0x10 });
+    try std.testing.expectEqual(Op.vpblendvb, blend_256.op);
+    try std.testing.expect(blend_256.vector_256);
+
+    // VBLENDVPS (4A) and VBLENDVPD (4B) share the same RVMR encoding
+    const blend_ps = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x69, 0x4A, 0xC3, 0x10 });
+    try std.testing.expectEqual(Op.vblendvps, blend_ps.op);
+    try std.testing.expectEqual(@as(u8, 2), blend_ps.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), blend_ps.xmm_mask);
+    const blend_pd = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0x69, 0x4B, 0xC3, 0x10 });
+    try std.testing.expectEqual(Op.vblendvpd, blend_pd.op);
+    try std.testing.expectEqual(@as(u8, 2), blend_pd.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), blend_pd.xmm_mask);
+
+    // VEX.W=1 is #UD for the variable-blend family
+    const bad_w = decodeInsn(&[_]u8{ 0xC4, 0xE3, 0xF9, 0x4C, 0xC3, 0x10 });
+    try std.testing.expectEqual(Op.invalid, bad_w.op);
+}
+
 test "VEX rounding modes include ties-to-even" {
     try std.testing.expectEqual(@as(f32, 2.0), roundVexFloat(f32, 2.5, 0));
     try std.testing.expectEqual(@as(f32, 4.0), roundVexFloat(f32, 3.5, 0));

@@ -14,6 +14,12 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const TRACE_BUFFER_LEN: usize = 256;
 pub const IMPORT_TRACE_BUFFER_LEN: usize = 64;
 pub const MEMORY_TRACE_BUFFER_LEN: usize = 64;
+/// Endian-contract evidence ring: always-on, recorded at the execute site for
+/// the narrow set of instructions the generated-endian contract consumes
+/// (movbe loads + 32-bit register/memory comparisons). Kept separate from the
+/// diagnostic-gated memory trace so the contract can substantiate repairs in
+/// production runs where ROSETTE_MACHO_MEMORY_TRACE is not set.
+pub const ENDIAN_EVIDENCE_BUFFER_LEN: usize = 16;
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
 pub const HEARTBEAT_INTERVAL: u64 = 25_000_000;
 pub const UNSUPPORTED_RUNTIME_EXIT_CODE: u64 = 125;
