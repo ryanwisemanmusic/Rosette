@@ -771,6 +771,7 @@ fn decodeVexMap38(vex: VexPrefix, pos: usize, opcode: u8, modrm: anytype) ?Decod
         0x2A => decodeVexReturn(vex, pos, .vpmovzxbd, modrm), // VMOVNTDQA with 66
         0x2B => decodeVexReturn(vex, pos, .vpackusdw, modrm),
         0x36 => decodeVexReturn(vex, pos, .vpermd, modrm),
+        0x16 => decodeVexReturn(vex, pos, .vpermps, modrm), // VPERMPS (VEX.256.66.0F38.W0 16)
         0x37 => decodeVexReturn(vex, pos, .vpcmpgtq, modrm),
         0x38 => decodeVexReturn(vex, pos, .vpminsb, modrm),
         0x39 => decodeVexReturn(vex, pos, .vpminsd, modrm),
@@ -812,16 +813,16 @@ fn decodeVexMap3A(vex: VexPrefix, pos: usize, opcode: u8, modrm: anytype, imm: u
     // by the caller). The immediate controls operation selection, element
     // insertion/sign extension, or broadcast behavior.
     return switch (opcode) {
-        0x0A => decodeVexReturnImm(vex, pos, .vpextrb, modrm, imm), // VPEXTRB
-        0x0B => decodeVexReturnImm(vex, pos, .vpextrw, modrm, imm), // VPEXTRW
-        0x0C => decodeVexReturnImm(vex, pos, .vpextrd, modrm, imm), // VPEXTRD / VEXTRACTPS
-        0x0D => decodeVexReturnImm(vex, pos, .vpextrq, modrm, imm), // VPEXTRQ
+        0x0A => decodeVexReturnImm(vex, pos, .vroundss, modrm, imm), // VROUNDSS (VEX.128.66.0F3A.W0 0A)
+        0x0B => decodeVexReturnImm(vex, pos, .vroundsd, modrm, imm), // VROUNDSD (VEX.128.66.0F3A.W0 0B)
         0x0E => decodeVexReturnImm(vex, pos, .vpblendw, modrm, imm), // VPBLENDW
         0x0F => decodeVexReturnImm(vex, pos, .vpalignr, modrm, imm), // VPALIGNR
-        0x16 => decodeVexReturnImm(vex, pos, .vpermps, modrm, imm), // VPERMPS
-        0x17 => decodeVexReturnImm(vex, pos, .vextractf128, modrm, imm), // VEXTRACTF128 (VEX.L=1)
+        0x14 => decodeVexReturnImm(vex, pos, .vpextrb, modrm, imm), // VPEXTRB
+        0x15 => decodeVexReturnImm(vex, pos, .vpextrw, modrm, imm), // VPEXTRW
+        0x16 => decodeVexReturnImm(vex, pos, .vpextrd, modrm, imm), // VPEXTRD
+        0x17 => decodeVexReturnImm(vex, pos, .vpextrq, modrm, imm), // VPEXTRQ
         0x18 => decodeVexReturnImm(vex, pos, .vbroadcastss, modrm, imm), // VBROADCASTSS
-        0x19 => decodeVexReturnImm(vex, pos, .vbroadcastsd, modrm, imm), // VBROADCASTSD (YMM only)
+        0x19 => decodeVexReturnImm(vex, pos, .vextractf128, modrm, imm), // VEXTRACTF128 (VEX.L=1)
         0x1A => decodeVexReturnImm(vex, pos, .vbroadcastf128, modrm, imm), // VBROADCASTF128
         0x1B => decodeVexReturnImm(vex, pos, .vbroadcasti128, modrm, imm), // VBROADCASTI128
         0x20 => decodeVexReturnImm(vex, pos, .vpinsrb_xmm_xmm_reg32, modrm, imm), // VPINSRB
@@ -1311,7 +1312,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     // VPUNPCKHBW/HDQ/HWD: VEX.NDS.128.66.0F.WIG 68/69/6A /r
-    if ((opcode == 0x68 or opcode == 0x69 or opcode == 0x6A) and prefix == 1 and (vex & 0x78) == 0x78) {
+    if ((opcode == 0x68 or opcode == 0x69 or opcode == 0x6A) and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
         const is_mem = bytes[pos] < 0xC0;
@@ -1335,7 +1336,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     // VPUNPCKLBW/LWD/LQD: VEX.NDS.128.66.0F.WIG 60/61/62 /r
-    if ((opcode == 0x60 or opcode == 0x61) and prefix == 1 and (vex & 0x78) == 0x78) {
+    if ((opcode == 0x60 or opcode == 0x61) and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
         const is_mem = bytes[pos] < 0xC0;
@@ -1358,7 +1359,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     // VPSHUFB: VEX.NDS.128.66.0F.WIG 00 /r ib
-    if (opcode == 0x00 and prefix == 1 and (vex & 0x78) == 0x78) {
+    if (opcode == 0x00 and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
         const is_mem = bytes[pos] < 0xC0;
@@ -1419,7 +1420,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     // VPSUBB/PSUBD/PSUBQ/PSUBW: VEX.NDS.128.66.0F.WIG F8/FA/FB/F9 /r
-    if ((opcode == 0xF8 or opcode == 0xFA or opcode == 0xFB or opcode == 0xF9) and prefix == 1 and (vex & 0x78) == 0x78) {
+    if ((opcode == 0xF8 or opcode == 0xFA or opcode == 0xFB or opcode == 0xF9) and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
         const is_mem = bytes[pos] < 0xC0;
@@ -1469,7 +1470,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     }
 
     // VPMULLW: VEX.NDS.128.66.0F.WIG D5 /r
-    if (opcode == 0xD5 and prefix == 1 and (vex & 0x78) == 0x78) {
+    if (opcode == 0xD5 and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
         const is_mem = bytes[pos] < 0xC0;
@@ -2083,6 +2084,48 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VPEXTRB/W/D/Q: VEX.NDD.LIG.66.0F3A.W0 14/15/16, W1 17 /r ib
+    // ModRM.reg is the source XMM (VEX.R extends); ModRM.r/m is the
+    // destination GPR or memory (VEX.B extends). VEX.L must be 0 and
+    // VEX.vvvv reserved (1111b). VPEXTRQ is the W1 form; B/W/D are W0.
+    // Xbyak emits these for byte/word/dword/qword lane extraction in
+    // JIT-generated code.
+    if (opcode_map == 3 and (opcode == 0x14 or opcode == 0x15 or opcode == 0x16 or opcode == 0x17) and prefix == 1) {
+        if (vector_256 or (vex_control & 0x78) != 0x78) return .{};
+        const w_ok = if (opcode == 0x17) rex_w else !rex_w;
+        if (!w_ok) return .{};
+        const extract_size: Size = switch (opcode) {
+            0x14 => .bits8,
+            0x15 => .bits16,
+            0x16 => .bits32,
+            0x17 => .bits64,
+            else => unreachable,
+        };
+        var decoded = DecodedInsn{ .size = extract_size };
+        var pos = start_pos + 4;
+        if (pos >= bytes.len) return .{};
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.dst_reg = @enumFromInt(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.op = switch (opcode) {
+            0x14 => .vpextrb,
+            0x15 => .vpextrw,
+            0x16 => .vpextrd,
+            0x17 => .vpextrq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode_map == 3 and opcode >= 0x08 and opcode <= 0x0B and prefix == 1) {
         const is_scalar = opcode == 0x0A or opcode == 0x0B;
         if (is_scalar and vector_256) return .{};
@@ -2107,6 +2150,41 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x09 => .vroundpd,
             0x0A => .vroundss,
             0x0B => .vroundsd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VBLENDVPS/VBLENDVPD/VPBLENDVB: VEX.NDS.128/256.66.0F3A.W0 4A/4B/4C /r ib
+    // RVMR encoding: ModRM.reg = DEST, VEX.vvvv = SRC1, ModRM.r/m = SRC2,
+    // and the MASK register is encoded in bits[7:4] of the imm8 (imm8[3:0]
+    // ignored). VEX.W must be 0 (otherwise #UD). Xbyak emits these for
+    // HIR select/blend operations in JIT-generated code.
+    if (opcode_map == 3 and (opcode == 0x4A or opcode == 0x4B or opcode == 0x4C) and prefix == 1) {
+        if (rex_w) return .{};
+
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        if (pos >= bytes.len) return .{};
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        decoded.xmm_mask = @intCast((bytes[pos] >> 4) & 0x0F);
+        pos += 1;
+        decoded.op = switch (opcode) {
+            0x4A => .vblendvps,
+            0x4B => .vblendvpd,
+            0x4C => .vpblendvb,
             else => unreachable,
         };
         decoded.len = @intCast(pos);

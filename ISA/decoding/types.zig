@@ -863,6 +863,11 @@ pub const Op = enum(u16) {
     // SSE/AVX control-state transfers share one architectural MXCSR state.
     ldmxcsr_mem32,
     stmxcsr_mem32,
+    // AVX variable-blend (VEX.0F3A 4A/4B/4C: VBLENDVPS/VBLENDVPD/VPBLENDVB).
+    // Appended to preserve the numeric values of all earlier operations used
+    // by trace and decode-cache consumers.
+    vblendvps,
+    vblendvpd,
 };
 
 fn canonicalMnemonic(op: Op, buffer: *[32]u8) ?[]const u8 {
@@ -935,6 +940,10 @@ pub const DecodedInsn = struct {
     xmm_dst: u8 = 0,
     xmm_src: u8 = 0,
     xmm_src2: u8 = 0,
+    // Fourth XMM operand (register index). Used by AVX variable-blend
+    // instructions (VBLENDVPS/VBLENDVPD/VPBLENDVB) whose mask register is
+    // encoded in imm8[7:4].
+    xmm_mask: u8 = 0,
     vector_256: bool = false,
     uses_imm: bool = false,
     lock: bool = false,
