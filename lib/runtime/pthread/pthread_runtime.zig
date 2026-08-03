@@ -145,6 +145,12 @@ pub const Runtime = struct {
     deferred_threads: u64 = 0,
     joined_threads: u64 = 0,
     cancelled_threads: u64 = 0,
+    // P0-1 (event-driven scheduler): bumped on every transition that can
+    // change whether a suspended guest context is runnable. The cooperative
+    // scheduler caches its runnable-count scan keyed on this version so the
+    // per-interval suspended-FIFO + thread-table scans can be skipped while
+    // no thread state changed.
+    state_version: u64 = 0,
     mutex_locks: u64 = 0,
     mutex_unlocks: u64 = 0,
     mutex_contentions: u64 = 0,
@@ -426,22 +432,37 @@ pub const Runtime = struct {
         return null;
     }
 
+    /// P0-1 (event-driven scheduler): invalidates the cooperative scheduler's
+    /// cached suspended-runnable count. Called only where a thread state
+    /// transition (or condvar notification) can change whether a suspended
+    /// context would be accepted by `resumeCooperativeContext`.
+    fn bumpStateVersion(self: *Runtime) void {
+        self.state_version +|= 1;
+    }
+
     pub fn markCompleted(self: *Runtime, handle: u64) void {
         const thread = self.threadForHandle(handle) orelse return;
         if (thread.state == .terminated) return;
         thread.state = .terminated;
+        self.bumpStateVersion();
         self.completed_threads +|= 1;
         self.emit(.{ .kind = .thread_terminated, .thread = handle, .reason = "guest_thread_returned" });
     }
 
     pub fn markRunning(self: *Runtime, handle: u64) void {
         const thread = self.threadForHandle(handle) orelse return;
-        if (thread.state == .runnable or thread.state == .created) thread.state = .running;
+        if (thread.state == .runnable or thread.state == .created) {
+            thread.state = .running;
+            self.bumpStateVersion();
+        }
     }
 
     pub fn markContextSuspended(self: *Runtime, handle: u64) void {
         const thread = self.threadForHandle(handle) orelse return;
-        if (thread.state == .running) thread.state = .runnable;
+        if (thread.state == .running) {
+            thread.state = .runnable;
+            self.bumpStateVersion();
+        }
     }
 
     pub fn currentThreadHandle(self: *const Runtime, state: anytype) u64 {
@@ -523,6 +544,7 @@ pub const Runtime = struct {
             waiting_thread.wait_address = cond_addr;
             waiting_thread.wait_result = .pending;
             waiting_thread.spurious_wake_pending = false;
+            self.bumpStateVersion();
         }
         const State = @TypeOf(state.*);
         if (deadline_nanoseconds != 0) {
@@ -603,6 +625,7 @@ pub const Runtime = struct {
             thread.wait_deadline_nanoseconds = 0;
             thread.deadline_sequence = 0;
             thread.wait_result = .signaled;
+            self.bumpStateVersion();
             self.blocked_threads -|= 1;
             self.timed_sleeps_completed +|= 1;
             self.emit(.{ .kind = .thread_resumed, .thread = handle, .reason = "virtual_sleep_deadline" });
@@ -637,6 +660,7 @@ pub const Runtime = struct {
         thread.wait_result = if (result == ETIMEDOUT) .timed_out else .signaled;
         const spurious = thread.spurious_wake_pending;
         thread.spurious_wake_pending = false;
+        self.bumpStateVersion();
         self.blocked_threads -|= 1;
         if (was_timed) {
             if (result == ETIMEDOUT) {
@@ -672,6 +696,7 @@ pub const Runtime = struct {
         thread.wait_deadline_nanoseconds = deadline_nanoseconds orelse 0;
         thread.deadline_sequence = deadline_sequence;
         thread.wait_result = .pending;
+        self.bumpStateVersion();
         self.blocked_threads +|= 1;
         if (deadline_nanoseconds != null) {
             self.timed_sleeps_started +|= 1;
@@ -696,6 +721,7 @@ pub const Runtime = struct {
         thread.wait_deadline_nanoseconds = 0;
         thread.deadline_sequence = 0;
         thread.wait_result = .signaled;
+        self.bumpStateVersion();
         self.blocked_threads -|= 1;
         self.emit(.{ .kind = .thread_resumed, .thread = handle, .reason = reason });
         return true;
@@ -723,6 +749,7 @@ pub const Runtime = struct {
         thread.spurious_wake_pending = true;
         thread.last_spurious_condvar = thread.waiting_condvar;
         thread.last_spurious_generation = thread.wait_generation;
+        self.bumpStateVersion();
         self.quiescence_spurious_wakes +|= 1;
         self.emit(.{
             .kind = .quiescence_recovery,
@@ -943,6 +970,7 @@ pub const Runtime = struct {
         if (self.condvarForAddress(address)) |cv| {
             cv.generation +|= 1;
             cv.notifications +|= 1;
+            self.bumpStateVersion();
             var selected: ?*Thread = null;
             for (&self.threads) |*thread| {
                 if (!thread.active or thread.state != .waiting_condvar or thread.waiting_condvar != address) continue;
@@ -965,6 +993,7 @@ pub const Runtime = struct {
     fn condvarBroadcast(self: *Runtime, address: u64) void {
         if (self.condvarForAddress(address)) |cv| {
             cv.generation +|= 1;
+            self.bumpStateVersion();
             var woke: u32 = 0;
             for (&self.threads) |*thread| {
                 if (!thread.active or thread.state != .waiting_condvar or thread.waiting_condvar != address) continue;

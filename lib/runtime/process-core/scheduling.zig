@@ -355,7 +355,7 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
     }
     if (scan_due) {
         self.cached_pending_idle = self.pendingIdleCallbackCount();
-        self.cached_suspended_runnable = self.runnableSuspendedSnapshot().runnable;
+        self.cached_suspended_runnable = self.refreshSuspendedRunnableCache();
     }
     const pending_idle = self.cached_pending_idle;
     const suspended_runnable = self.cached_suspended_runnable;
@@ -370,8 +370,10 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
             // Refresh the cached suspended count at the quantum boundary and
             // use it directly here, so the rendezvous decision reads a count
             // no more than one scan interval old exactly where it matters
-            // (runs at most once per 10k steps).
-            self.cached_suspended_runnable = self.runnableSuspendedSnapshot().runnable;
+            // (runs at most once per 10k steps). The refresh itself is
+            // version/deadline-keyed, so it is a no-op unless pthread state
+            // or virtual time moved since the last computation.
+            self.cached_suspended_runnable = self.refreshSuspendedRunnableCache();
             const boundary_suspended_runnable = self.cached_suspended_runnable;
             const tracker_owns_callback = self.ui_handoff.ownsCallbackHandle(self.active_guest_thread);
             if (tracker_owns_callback) {
@@ -706,6 +708,34 @@ pub fn runnableSuspendedSnapshot(self: anytype) RunnableSuspendedSnapshot {
         result.oldest_reason = context.reason;
     }
     return result;
+}
+
+/// P0-1 (event-driven scheduler): returns an authoritative count of runnable
+/// suspended contexts without paying for the full scan unless runnability
+/// could actually have changed since the last computation.
+///
+/// The full scan (`runnableSuspendedSnapshot`) is O(suspended × threads)
+/// because every context is resolved back through the pthread thread table.
+/// It is only required after (a) a pthread state transition that can alter
+/// whether a suspended context is accepted by `resumeCooperativeContext`, or
+/// (b) virtual time reaching the earliest finite deadline (an O(1) heap-top
+/// read) — the one way runnability changes without an explicit transition.
+///
+/// Callers must still attempt the authoritative `resumeCooperativeContext`
+/// before resuming anything; this only decides whether the attempt is worth
+/// scanning for.
+pub fn refreshSuspendedRunnableCache(self: anytype) usize {
+    const version = self.pthreads.state_version;
+    const cached_next = self.cached_suspended_next_deadline;
+    if (version == self.cached_suspended_version and
+        (cached_next == null or self.guest_time.now() < cached_next.?))
+    {
+        return self.cached_suspended_runnable;
+    }
+    self.cached_suspended_runnable = self.runnableSuspendedSnapshot().runnable;
+    self.cached_suspended_version = version;
+    self.cached_suspended_next_deadline = self.guest_time.nextDeadline();
+    return self.cached_suspended_runnable;
 }
 
 pub fn logThreadTable(self: anytype, reason: []const u8) void {

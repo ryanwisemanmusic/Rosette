@@ -386,6 +386,13 @@ pub const MachOState = struct {
     cooperative_scheduler_scan_steps: u64 = 0,
     cached_pending_idle: usize = 0,
     cached_suspended_runnable: usize = 0,
+    // P0-1 (event-driven): the suspended-runnable cache is additionally keyed
+    // on the pthread runtime state_version so the O(suspended x threads) scan
+    // only reruns when runnability could actually have changed, plus the
+    // earliest guest-time deadline so virtual time reaching a sleep expiry
+    // (which changes runnability with no explicit transition) also refreshes.
+    cached_suspended_version: u64 = std.math.maxInt(u64),
+    cached_suspended_next_deadline: ?u64 = null,
     coop_bootstrap_active: bool = false,
     coop_bootstrap_index: u8 = 0,
     coop_bootstrap_entries: [24]GtkBootstrapEntry = [_]GtkBootstrapEntry{.{}} ** 24,
@@ -531,6 +538,12 @@ pub const MachOState = struct {
     memory_trace_entries: [MEMORY_TRACE_BUFFER_LEN]exit_diagnostics.MemoryAccessEvent = [_]exit_diagnostics.MemoryAccessEvent{.{}} ** MEMORY_TRACE_BUFFER_LEN,
     memory_trace_index: usize = 0,
     memory_trace_filled: bool = false,
+    // P1-2 (perf audit): the per-access memory trace (translateGuest +
+    // isExecutable probe + current-instruction re-decode + ring write) runs on
+    // every guest load/store but is only consumed post-fault. Off by default
+    // so the fast path is a direct slice read; enable with
+    // ROSETTE_MACHO_MEMORY_TRACE=1 when diagnosing faults/near-null causality.
+    memory_trace_enabled: bool = false,
     guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
     bound_import_thunks: []BoundImportThunk = &.{},
     decode_cache: []DecodeCacheEntry,
@@ -2619,6 +2632,33 @@ pub const MachOState = struct {
         const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
         const cache_index = constants.decodeCacheIndex(fetch_address);
         const entry = &self.decode_cache[cache_index];
+        // P0-2 (perf audit): generation-keyed fast path. Every executable
+        // write bumps self.code_generation (noteGuestWrite) and precisely
+        // clears overlapping entries, so a matching generation proves no
+        // executable write touched this address since the entry was
+        // populated — the cached decode is valid without re-fetching and
+        // byte-comparing the source. Only when the generation moved (e.g. a
+        // non-overlapping JIT write elsewhere) fall back to the byte check,
+        // and re-arm the generation on a confirmed match so the next hit
+        // takes the fast path again.
+        if (entry.rip == fetch_address and entry.code_generation == self.code_generation) {
+            self.decode_cache_hits +|= 1;
+            var decoded = entry.decoded;
+            if (!decoded.rip_relative) {
+                const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
+                decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+                    .displacement = entry.displacement,
+                    .has_index = decoded.sib_has_index,
+                    .index_reg = decoded.sib_index_reg,
+                    .scale = decoded.sib_scale,
+                    .has_base = decoded.sib_has_base,
+                    .base_reg = decoded.sib_base_reg,
+                    .rip_relative = decoded.rip_relative,
+                    .segment = decoded.segment,
+                }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+            }
+            return decoded;
+        }
         // Executable writes invalidate overlapping entries at the shared
         // memory-write boundary. Do not globally discard unrelated decoded
         // host/Xenia instructions whenever the JIT emits a new block.
@@ -2638,6 +2678,7 @@ pub const MachOState = struct {
             false;
         if (entry.rip == fetch_address and cached_bytes_match) {
             self.decode_cache_hits +|= 1;
+            entry.code_generation = self.code_generation;
             var decoded = entry.decoded;
             if (!decoded.rip_relative) {
                 const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
@@ -2932,6 +2973,10 @@ pub const MachOState = struct {
     // a bounded execution slice so one spinner cannot starve their producers.
     pub fn maybeYieldActiveGuestThreadForQuantum(self: *MachOState) void {
         scheduling.maybeYieldActiveGuestThreadForQuantum(self);
+    }
+
+    pub fn refreshSuspendedRunnableCache(self: *MachOState) usize {
+        return scheduling.refreshSuspendedRunnableCache(self);
     }
 
     pub fn finishActiveGuestThread(self: *MachOState) void {
@@ -4020,6 +4065,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.unwinder.verbose = state.verbose_trace or environmentFlag("ROSETTE_MACHO_UNWIND_VERBOSE");
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
+    state.memory_trace_enabled = environmentFlag("ROSETTE_MACHO_MEMORY_TRACE");
     state.strict_initializers = environmentFlag("ROSETTE_MACHO_STRICT_INITIALIZERS");
     state.strict_imports = environmentFlag("ROSETTE_MACHO_STRICT_IMPORTS");
     state.max_steps = environmentUnsigned("ROSETTE_MACHO_MAX_STEPS", state.max_steps);

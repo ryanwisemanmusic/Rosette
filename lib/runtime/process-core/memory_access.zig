@@ -1479,6 +1479,12 @@ pub fn traceRegisterValue(entry: TraceEntry, register: RegId) u64 {
 }
 
 pub fn recordMemoryAccess(self: anytype, address: u64, size: Size, access: []const u8, value: u64) void {
+    // P1-2 (perf audit): this runs on every guest load/store, and its
+    // currentInstructionSnapshot() re-decodes the current instruction purely
+    // for the ring buffer. The ring is only consumed post-fault, so gate the
+    // whole path behind the diagnostic flag; the default fast path is a direct
+    // slice read.
+    if (!self.memory_trace_enabled) return;
     const bytes = bytesForSize(size);
     const offset = translateGuest(self, address, bytes, if (std.mem.eql(u8, access, "write")) .write else .read);
     const backed = if (offset) |off| off + bytes <= self.mem.len else false;
