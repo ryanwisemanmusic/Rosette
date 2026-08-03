@@ -390,6 +390,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const isa_decode_module = b.createModule(.{
+        .root_source_file = b.path("../ISA/decode/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const svx_module = b.createModule(.{
         .root_source_file = b.path("../lib/SVX/root.zig"),
         .target = target,
@@ -999,14 +1004,46 @@ pub fn build(b: *std.Build) void {
     }
 
     // Shared x86-64 decoder/interpreter modules
+    //
+    // Register state, flags, bit-test helpers and the emulated CPUID model are
+    // wired as modules so the decoder families under ISA/decoding/ can reach
+    // them by name (they live outside the decoder's module directory).
+    const decoder_flags_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/flags.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const decoder_cpu_state_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/cpu_state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    decoder_cpu_state_mod.addImport("flags", decoder_flags_mod);
+    const decoder_bit_test_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/bit_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    decoder_bit_test_mod.addImport("flags", decoder_flags_mod);
+    const decoder_capabilities_mod = b.createModule(.{
+        .root_source_file = b.path("../src/x64-ASM/capabilities.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const x64_decoder_mod = b.createModule(.{
-        .root_source_file = b.path("../src/x64-ASM/decoder.zig"),
+        .root_source_file = b.path("../ISA/decoding/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     x64_decoder_mod.addImport("isa_highway", isa_highway_module);
+    x64_decoder_mod.addImport("isa_decode", isa_decode_module);
     x64_decoder_mod.addImport("isa_registry", isa_module);
     x64_decoder_mod.addImport("runtime_abi_handshake", runtime_abi_module);
+    x64_decoder_mod.addImport("flags", decoder_flags_mod);
+    x64_decoder_mod.addImport("cpu_state", decoder_cpu_state_mod);
+    x64_decoder_mod.addImport("bit_test", decoder_bit_test_mod);
+    x64_decoder_mod.addImport("capabilities", decoder_capabilities_mod);
     const x64_decoder_test_mod = b.createModule(.{
         .root_source_file = b.path("../src/x64-ASM/decoder_test_root.zig"),
         .target = target,
@@ -1016,8 +1053,41 @@ pub fn build(b: *std.Build) void {
     const x64_decoder_test = b.addTest(.{ .root_module = x64_decoder_test_mod });
     const run_x64_decoder_test = b.addRunArtifact(x64_decoder_test);
     check_step.dependOn(&run_x64_decoder_test.step);
+
+    // The decoder families under ISA/decoding/ carry their own test blocks;
+    // dependency modules' tests do not run under `zig test`, so aggregate them
+    // behind a test root that imports every family file.
+    const decoder_family_tests_mod = b.createModule(.{
+        .root_source_file = b.path("../ISA/decoding/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    decoder_family_tests_mod.addImport("isa_highway", isa_highway_module);
+    decoder_family_tests_mod.addImport("isa_decode", isa_decode_module);
+    decoder_family_tests_mod.addImport("isa_registry", isa_module);
+    decoder_family_tests_mod.addImport("runtime_abi_handshake", runtime_abi_module);
+    decoder_family_tests_mod.addImport("flags", decoder_flags_mod);
+    decoder_family_tests_mod.addImport("cpu_state", decoder_cpu_state_mod);
+    decoder_family_tests_mod.addImport("bit_test", decoder_bit_test_mod);
+    decoder_family_tests_mod.addImport("capabilities", decoder_capabilities_mod);
+    const decoder_family_tests = b.addTest(.{ .root_module = decoder_family_tests_mod });
+    const run_decoder_family_tests = b.addRunArtifact(decoder_family_tests);
+    check_step.dependOn(&run_decoder_family_tests.step);
+    const setcc_stack_regression_test = b.addTest(.{
+        .root_module = decoder_family_tests_mod,
+        .filters = &.{"SETcc uses the ModRM r/m field for AH versus SPL"},
+    });
+    const run_setcc_stack_regression_test = b.addRunArtifact(setcc_stack_regression_test);
+    const decoder_family_check_step = b.step(
+        "decoder-family-check",
+        "Run the focused SETcc stack-corruption decoder regression",
+    );
+    decoder_family_check_step.dependOn(&run_setcc_stack_regression_test.step);
     const isa_highway_test = b.addTest(.{ .root_module = isa_highway_module });
     check_step.dependOn(&isa_highway_test.step);
+    const isa_decode_test = b.addTest(.{ .root_module = isa_decode_module });
+    const run_isa_decode_test = b.addRunArtifact(isa_decode_test);
+    check_step.dependOn(&run_isa_decode_test.step);
     const x64_interpreter_mod = b.createModule(.{
         .root_source_file = b.path("../src/x64-ASM/interpreter.zig"),
         .target = target,
@@ -1107,6 +1177,29 @@ pub fn build(b: *std.Build) void {
             .root_module = toml_exe_mod,
         });
         b.installArtifact(toml_exe);
+    }
+
+    // PS1 processor (PowerShell .ps1 → POSIX shell/Makefile translator)
+    {
+        const ps1_processor_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/processor/ps1_processor/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const ps1_processor_test = b.addTest(.{ .root_module = ps1_processor_mod });
+        check_step.dependOn(&ps1_processor_test.step);
+
+        const ps1_exe_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/processor/ps1_processor/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        ps1_exe_mod.addImport("root.zig", ps1_processor_mod);
+        const ps1_exe = b.addExecutable(.{
+            .name = "ps1_processor",
+            .root_module = ps1_exe_mod,
+        });
+        b.installArtifact(ps1_exe);
     }
 
     // Mach-O processor (x86_64 macOS binary loader/diagnostic backend)
