@@ -341,114 +341,121 @@ pub const Forwarder = struct {
     }
 
     pub fn dispatchGuestSymbol(self: *Forwarder, state: anytype, token: u64) bool {
-        for (&self.guest_symbols) |*entry| {
-            if (entry.token != token) continue;
-            if (self.guestLibraryEntry(entry.library_token) == null) return false;
-            self.guest_thunk_calls +|= 1;
-            entry.calls +|= 1;
-            switch (entry.kind) {
-                .get_instance_proc_addr, .get_device_proc_addr => {
-                    const symbol = state.guestCString(state.regs.rsi, 512) orelse {
-                        state.regs.rax = 0;
-                        return true;
-                    };
-                    const result = self.lookupVulkanProcGuest(entry.library_token, symbol);
-                    if (result != 0) state.registerSyntheticThunk(result, 1, symbol);
-                    state.regs.rax = result;
-                },
-                .enumerate_instance_extensions => state.regs.rax = enumerateInstanceExtensions(state),
-                .enumerate_instance_layers => state.regs.rax = enumerateEmpty(state, state.regs.rdi),
-                .enumerate_instance_version => state.regs.rax = writeApiVersion(state, state.regs.rdi),
-                .create_instance => state.regs.rax = createHandle(state, state.regs.rdx, 0xFFFF_F600_0000_0001, "Vulkan instance"),
-                .enumerate_physical_devices => state.regs.rax = enumerateHandle(state, state.regs.rsi, state.regs.rdx, 0xFFFF_F600_0000_0011, "Vulkan physical device"),
-                .enumerate_device_extensions => state.regs.rax = enumerateDeviceExtensions(state),
-                .get_physical_device_features => writePhysicalDeviceFeatures(state, state.regs.rsi),
-                .get_physical_device_format_properties => writeFormatProperties(state, state.regs.rdx),
-                .get_physical_device_memory_properties => writeMemoryProperties(state, state.regs.rsi),
-                .get_physical_device_properties => writePhysicalDeviceProperties(state, state.regs.rsi),
-                .get_physical_device_queue_families => writeQueueFamilies(state),
-                .get_physical_device_features2 => writePhysicalDeviceFeatures2(state, state.regs.rsi),
-                .get_physical_device_memory_properties2 => writeMemoryProperties2(state, state.regs.rsi),
-                .get_physical_device_properties2 => writePhysicalDeviceProperties2(state, state.regs.rsi),
-                .create_device => state.regs.rax = self.createLogicalDevice(state, state.regs.rcx),
-                .get_device_queue => state.regs.rax = self.writeDeviceQueue(state, state.regs.rcx, "vkGetDeviceQueue"),
-                .get_device_queue2 => state.regs.rax = self.writeDeviceQueue(state, state.regs.rdx, "vkGetDeviceQueue2"),
-                .create_metal_surface => state.regs.rax = self.createMetalSurface(state, entry.library_token, state.regs.rdi, state.regs.rsi, state.regs.rcx),
-                .get_surface_capabilities => {
-                    self.vulkan_surface_capability_queries +|= 1;
-                    state.regs.rax = writeSurfaceCapabilities(state, state.regs.rdx);
-                    if (self.vulkan_surface_capability_queries == 1 and state.regs.rax == 0) {
-                        const State = @typeInfo(@TypeOf(state)).pointer.child;
-                        const width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 0;
-                        const height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 0;
+        // Guest symbol tokens are laid out contiguously as
+        // GUEST_SYMBOL_THUNK_BASE + index*16 + 1 (see allocateGuestSymbol), so
+        // the owning slot is determined arithmetically instead of scanning all
+        // MAX_GUEST_SYMBOLS entries on every interpreted instruction.
+        if (token < GUEST_SYMBOL_THUNK_BASE) return false;
+        const offset = token - GUEST_SYMBOL_THUNK_BASE;
+        if (offset == 0 or offset % 16 != 1) return false;
+        const index: usize = @intCast((offset - 1) / 16);
+        if (index >= MAX_GUEST_SYMBOLS) return false;
+        const entry = &self.guest_symbols[index];
+        if (entry.token != token) return false;
+        if (self.guestLibraryEntry(entry.library_token) == null) return false;
+        self.guest_thunk_calls +|= 1;
+        entry.calls +|= 1;
+        switch (entry.kind) {
+            .get_instance_proc_addr, .get_device_proc_addr => {
+                const symbol = state.guestCString(state.regs.rsi, 512) orelse {
+                    state.regs.rax = 0;
+                    return true;
+                };
+                const result = self.lookupVulkanProcGuest(entry.library_token, symbol);
+                if (result != 0) state.registerSyntheticThunk(result, 1, symbol);
+                state.regs.rax = result;
+            },
+            .enumerate_instance_extensions => state.regs.rax = enumerateInstanceExtensions(state),
+            .enumerate_instance_layers => state.regs.rax = enumerateEmpty(state, state.regs.rdi),
+            .enumerate_instance_version => state.regs.rax = writeApiVersion(state, state.regs.rdi),
+            .create_instance => state.regs.rax = createHandle(state, state.regs.rdx, 0xFFFF_F600_0000_0001, "Vulkan instance"),
+            .enumerate_physical_devices => state.regs.rax = enumerateHandle(state, state.regs.rsi, state.regs.rdx, 0xFFFF_F600_0000_0011, "Vulkan physical device"),
+            .enumerate_device_extensions => state.regs.rax = enumerateDeviceExtensions(state),
+            .get_physical_device_features => writePhysicalDeviceFeatures(state, state.regs.rsi),
+            .get_physical_device_format_properties => writeFormatProperties(state, state.regs.rdx),
+            .get_physical_device_memory_properties => writeMemoryProperties(state, state.regs.rsi),
+            .get_physical_device_properties => writePhysicalDeviceProperties(state, state.regs.rsi),
+            .get_physical_device_queue_families => writeQueueFamilies(state),
+            .get_physical_device_features2 => writePhysicalDeviceFeatures2(state, state.regs.rsi),
+            .get_physical_device_memory_properties2 => writeMemoryProperties2(state, state.regs.rsi),
+            .get_physical_device_properties2 => writePhysicalDeviceProperties2(state, state.regs.rsi),
+            .create_device => state.regs.rax = self.createLogicalDevice(state, state.regs.rcx),
+            .get_device_queue => state.regs.rax = self.writeDeviceQueue(state, state.regs.rcx, "vkGetDeviceQueue"),
+            .get_device_queue2 => state.regs.rax = self.writeDeviceQueue(state, state.regs.rdx, "vkGetDeviceQueue2"),
+            .create_metal_surface => state.regs.rax = self.createMetalSurface(state, entry.library_token, state.regs.rdi, state.regs.rsi, state.regs.rcx),
+            .get_surface_capabilities => {
+                self.vulkan_surface_capability_queries +|= 1;
+                state.regs.rax = writeSurfaceCapabilities(state, state.regs.rdx);
+                if (self.vulkan_surface_capability_queries == 1 and state.regs.rax == 0) {
+                    const State = @typeInfo(@TypeOf(state)).pointer.child;
+                    const width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 0;
+                    const height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 0;
+                    machoCapturePrint(
+                        "macho-processor: Vulkan surface capabilities: native_extent={d}x{d} min_extent=1x1 max_extent=16384x16384 image_count=2..3 usage=0x13\n",
+                        .{ width, height },
+                    );
+                }
+            },
+            .get_surface_formats => state.regs.rax = enumerateSurfaceFormats(state),
+            .get_surface_present_modes => state.regs.rax = enumerateSurfacePresentModes(state),
+            .get_surface_support => state.regs.rax = writeBoolResult(state, state.regs.rcx, true),
+            .destroy_surface => {
+                self.destroyNativeSurface();
+                state.regs.rax = 0;
+            },
+            .destroy_instance => {
+                self.destroyNativeVulkanObjects();
+                state.regs.rax = 0;
+            },
+            .destroy_device => state.regs.rax = 0,
+            .create_swapchain => state.regs.rax = self.createSwapchain(state, state.regs.rdi, state.regs.rsi, state.regs.rcx),
+            .destroy_swapchain => state.regs.rax = 0,
+            .get_swapchain_images => state.regs.rax = self.enumerateSwapchainImages(state),
+            .acquire_next_image => state.regs.rax = self.acquireNextImage(state, state.regs.r9),
+            .queue_submit => state.regs.rax = self.queueSubmit(),
+            .queue_present => state.regs.rax = self.queuePresent(state),
+            .create_device_object => state.regs.rax = self.createVulkanObject(state, state.regs.rcx, entry.name[0..entry.name_length]),
+            .allocate_command_buffers => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 28, entry.name[0..entry.name_length]),
+            .allocate_descriptor_sets => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 24, entry.name[0..entry.name_length]),
+            .allocate_memory => state.regs.rax = self.allocateVulkanMemory(state, state.regs.rsi, state.regs.rcx),
+            .map_memory => state.regs.rax = self.mapVulkanMemory(
+                state,
+                state.regs.rsi,
+                state.regs.rdx,
+                state.regs.rcx,
+                state.regs.r9,
+            ),
+            .get_memory_requirements => state.regs.rax = writeMemoryRequirements(state, state.regs.rdx),
+            .create_graphics_pipelines => state.regs.rax = self.createMultipleVulkanObjects(state, state.regs.rdx, state.regs.r9, entry.name[0..entry.name_length]),
+            .destroy_device_object => state.regs.rax = 0,
+            .device_success => state.regs.rax = 0,
+            .device_void => {
+                self.vulkan_device_void_calls +|= 1;
+                if (std.mem.startsWith(u8, entry.name[0..entry.name_length], "vkCmd")) {
+                    self.vulkan_modeled_command_calls +|= 1;
+                    if (self.vulkan_modeled_command_calls == 1) {
                         machoCapturePrint(
-                            "macho-processor: Vulkan surface capabilities: native_extent={d}x{d} min_extent=1x1 max_extent=16384x16384 image_count=2..3 usage=0x13\n",
-                            .{ width, height },
+                            "macho-processor: Vulkan forwarding boundary: first modeled command={s}; Metal surface is native, but device/command/swapchain submission remains synthetic\n",
+                            .{entry.name[0..entry.name_length]},
                         );
                     }
-                },
-                .get_surface_formats => state.regs.rax = enumerateSurfaceFormats(state),
-                .get_surface_present_modes => state.regs.rax = enumerateSurfacePresentModes(state),
-                .get_surface_support => state.regs.rax = writeBoolResult(state, state.regs.rcx, true),
-                .destroy_surface => {
-                    self.destroyNativeSurface();
-                    state.regs.rax = 0;
-                },
-                .destroy_instance => {
-                    self.destroyNativeVulkanObjects();
-                    state.regs.rax = 0;
-                },
-                .destroy_device => state.regs.rax = 0,
-                .create_swapchain => state.regs.rax = self.createSwapchain(state, state.regs.rdi, state.regs.rsi, state.regs.rcx),
-                .destroy_swapchain => state.regs.rax = 0,
-                .get_swapchain_images => state.regs.rax = self.enumerateSwapchainImages(state),
-                .acquire_next_image => state.regs.rax = self.acquireNextImage(state, state.regs.r9),
-                .queue_submit => state.regs.rax = self.queueSubmit(),
-                .queue_present => state.regs.rax = self.queuePresent(state),
-                .create_device_object => state.regs.rax = self.createVulkanObject(state, state.regs.rcx, entry.name[0..entry.name_length]),
-                .allocate_command_buffers => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 28, entry.name[0..entry.name_length]),
-                .allocate_descriptor_sets => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 24, entry.name[0..entry.name_length]),
-                .allocate_memory => state.regs.rax = self.allocateVulkanMemory(state, state.regs.rsi, state.regs.rcx),
-                .map_memory => state.regs.rax = self.mapVulkanMemory(
-                    state,
-                    state.regs.rsi,
-                    state.regs.rdx,
-                    state.regs.rcx,
-                    state.regs.r9,
-                ),
-                .get_memory_requirements => state.regs.rax = writeMemoryRequirements(state, state.regs.rdx),
-                .create_graphics_pipelines => state.regs.rax = self.createMultipleVulkanObjects(state, state.regs.rdx, state.regs.r9, entry.name[0..entry.name_length]),
-                .destroy_device_object => state.regs.rax = 0,
-                .device_success => state.regs.rax = 0,
-                .device_void => {
-                    self.vulkan_device_void_calls +|= 1;
-                    if (std.mem.startsWith(u8, entry.name[0..entry.name_length], "vkCmd")) {
-                        self.vulkan_modeled_command_calls +|= 1;
-                        if (self.vulkan_modeled_command_calls == 1) {
-                            machoCapturePrint(
-                                "macho-processor: Vulkan forwarding boundary: first modeled command={s}; Metal surface is native, but device/command/swapchain submission remains synthetic\n",
-                                .{entry.name[0..entry.name_length]},
-                            );
-                        }
-                    }
-                    state.regs.rax = 0;
-                },
-                // A non-null lookup remains useful for capability discovery,
-                // but calling an untyped ARM64 function through x86 registers
-                // is unsafe. Keep it contained until its Vulkan ABI signature
-                // has an explicit bridge.
-                .@"opaque" => {
-                    self.guest_opaque_calls +|= 1;
-                    machoCapturePrint(
-                        "macho-processor: Vulkan ABI gap: called unmodeled proc {s} (token=0x{x}, call={d}); returning zero\n",
-                        .{ entry.name[0..entry.name_length], entry.token, entry.calls },
-                    );
-                    state.regs.rax = 0;
-                },
-            }
-            return true;
+                }
+                state.regs.rax = 0;
+            },
+            // A non-null lookup remains useful for capability discovery,
+            // but calling an untyped ARM64 function through x86 registers
+            // is unsafe. Keep it contained until its Vulkan ABI signature
+            // has an explicit bridge.
+            .@"opaque" => {
+                self.guest_opaque_calls +|= 1;
+                machoCapturePrint(
+                    "macho-processor: Vulkan ABI gap: called unmodeled proc {s} (token=0x{x}, call={d}); returning zero\n",
+                    .{ entry.name[0..entry.name_length], entry.token, entry.calls },
+                );
+                state.regs.rax = 0;
+            },
         }
-        return false;
+        return true;
     }
 
     fn nextVulkanObject(self: *Forwarder) u64 {

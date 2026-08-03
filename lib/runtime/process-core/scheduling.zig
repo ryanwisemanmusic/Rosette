@@ -20,6 +20,7 @@ const idleQueueSnapshotFor = @import("macho_core").types.idleQueueSnapshotFor;
 // Constants used in function bodies
 const DEFAULT_GUEST_THREAD_STACK_SIZE = @import("macho_core").constants.DEFAULT_GUEST_THREAD_STACK_SIZE;
 const COOPERATIVE_THREAD_QUANTUM_STEPS = @import("macho_core").constants.COOPERATIVE_THREAD_QUANTUM_STEPS;
+const COOPERATIVE_SCHEDULER_SCAN_INTERVAL = @import("macho_core").constants.COOPERATIVE_SCHEDULER_SCAN_INTERVAL;
 const IDLE_STARVATION_STEPS = @import("macho_core").constants.IDLE_STARVATION_STEPS;
 const GUEST_THREAD_RETURN_SENTINEL = @import("macho_core").constants.GUEST_THREAD_RETURN_SENTINEL;
 const MAX_IDLE_CALLBACKS = @import("macho_core").types.MAX_IDLE_CALLBACKS;
@@ -340,24 +341,46 @@ pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
 // a bounded execution slice so one spinner cannot starve their producers.
 pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
     if (self.cooperative_ui_context == null or self.active_guest_thread == 0) return;
-    const pending_idle = self.pendingIdleCallbackCount();
+
+    // P0-1 (perf audit): the idle-callback table scan and the
+    // every-suspended-thread scan previously ran on EVERY interpreted
+    // instruction. They now run once per COOPERATIVE_SCHEDULER_SCAN_INTERVAL
+    // steps; in between, cached counts from the last scan are reused, so
+    // quantum-expiry timing and yield cadence are unchanged. Staleness of up
+    // to one scan interval is immaterial against the 10k-step quantum.
+    const scan_due = self.cooperative_scheduler_scan_steps == 0;
+    self.cooperative_scheduler_scan_steps +|= 1;
+    if (self.cooperative_scheduler_scan_steps >= COOPERATIVE_SCHEDULER_SCAN_INTERVAL) {
+        self.cooperative_scheduler_scan_steps = 0;
+    }
+    if (scan_due) {
+        self.cached_pending_idle = self.pendingIdleCallbackCount();
+        self.cached_suspended_runnable = self.runnableSuspendedSnapshot().runnable;
+    }
+    const pending_idle = self.cached_pending_idle;
+    const suspended_runnable = self.cached_suspended_runnable;
     const idle_callback_inflight = self.active_idle_source != 0;
     const idle_callback_running = idle_callback_inflight and
         self.isSyntheticCallbackHandle(self.active_guest_thread);
-    const suspended = self.runnableSuspendedSnapshot();
 
     if (idle_callback_running) {
         self.cooperative_quantum_steps +|= 1;
         if (self.cooperative_quantum_steps >= COOPERATIVE_THREAD_QUANTUM_STEPS) {
             self.cooperative_quantum_steps = 0;
+            // Refresh the cached suspended count at the quantum boundary and
+            // use it directly here, so the rendezvous decision reads a count
+            // no more than one scan interval old exactly where it matters
+            // (runs at most once per 10k steps).
+            self.cached_suspended_runnable = self.runnableSuspendedSnapshot().runnable;
+            const boundary_suspended_runnable = self.cached_suspended_runnable;
             const tracker_owns_callback = self.ui_handoff.ownsCallbackHandle(self.active_guest_thread);
             if (tracker_owns_callback) {
                 self.ui_handoff.registerProgress(self.executed_steps);
             }
 
-            const producer_eligible = self.pthreads.deferred_threads != 0 or suspended.runnable != 0;
+            const producer_eligible = self.pthreads.deferred_threads != 0 or boundary_suspended_runnable != 0;
             const should_rendezvous = if (tracker_owns_callback)
-                self.ui_handoff.callbackQuantumAction(self.pthreads.deferred_threads, suspended.runnable) == .rendezvous_worker
+                self.ui_handoff.callbackQuantumAction(self.pthreads.deferred_threads, boundary_suspended_runnable) == .rendezvous_worker
             else
                 producer_eligible;
             if (should_rendezvous) {
@@ -368,13 +391,13 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
                     if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
                         machoCapturePrint(
                             "scheduler: UI callback rendezvous: quantum={d} callback=0x{x} -> worker=0x{x} deferred={d} runnable_suspended={d}; callback ownership retained\n",
-                            .{ self.ui_callback_retained_quanta, callback, self.active_guest_thread, self.pthreads.deferred_threads, suspended.runnable },
+                            .{ self.ui_callback_retained_quanta, callback, self.active_guest_thread, self.pthreads.deferred_threads, boundary_suspended_runnable },
                         );
                     }
                 } else if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
                     machoCapturePrint(
                         "scheduler: retained active UI callback: quantum={d} callback_handle=0x{x} rip=0x{x} deferred_workers={d} runnable_suspended={d}; no eligible rendezvous target\n",
-                        .{ self.ui_callback_retained_quanta, self.active_guest_thread, self.regs.rip, self.pthreads.deferred_threads, suspended.runnable },
+                        .{ self.ui_callback_retained_quanta, self.active_guest_thread, self.regs.rip, self.pthreads.deferred_threads, boundary_suspended_runnable },
                     );
                 }
             }
@@ -387,7 +410,7 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
         .callback_inflight = idle_callback_inflight,
         .idle_callback_running = idle_callback_running,
         .deferred_threads = self.pthreads.deferred_threads,
-        .suspended_threads = suspended.runnable,
+        .suspended_threads = suspended_runnable,
     });
     if (work == .gtk_idle) {
         const scheduling_thread = self.active_guest_thread;

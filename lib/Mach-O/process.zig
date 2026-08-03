@@ -379,6 +379,13 @@ pub const MachOState = struct {
     last_cooperative_starvation_step: u64 = 0,
     ui_callback_retained_quanta: u64 = 0,
     cooperative_quantum_steps: u64 = 0,
+    // P0-1: throttled cooperative-scheduler queue scans (see
+    // COOPERATIVE_SCHEDULER_SCAN_INTERVAL). The full idle-callback table and
+    // suspended-thread scans used to run on every interpreted instruction;
+    // they now run once per interval with cached counts used in between.
+    cooperative_scheduler_scan_steps: u64 = 0,
+    cached_pending_idle: usize = 0,
+    cached_suspended_runnable: usize = 0,
     coop_bootstrap_active: bool = false,
     coop_bootstrap_index: u8 = 0,
     coop_bootstrap_entries: [24]GtkBootstrapEntry = [_]GtkBootstrapEntry{.{}} ** 24,
@@ -445,6 +452,11 @@ pub const MachOState = struct {
     native_window: native_window_runtime.Runtime = .{},
     native_window_handles_registered: bool = false,
     local_libcpp_stream_targets: std.AutoHashMap(u64, []const u8),
+    /// Fast-reject span for the libcpp stream target map. Populated once at
+    /// load; the per-instruction handler skips its hash probe whenever rip is
+    /// outside this range.
+    libcpp_stream_target_min: u64 = 0,
+    libcpp_stream_target_max: u64 = 0,
     logging: logging_runtime.Engine = .{},
     backend_diagnostics: x64_backend_diagnostics.Engine = .{},
     xenia_pipeline: xenia_pipeline.Engine = .{},
@@ -798,7 +810,14 @@ pub const MachOState = struct {
         var defined_symbols = result.metadata.definedSymbolIterator();
         while (defined_symbols.next()) |entry| {
             if (!libcpp_stream_bridge.Bridge.recognizesSymbol(entry.key_ptr.*)) continue;
-            try result.local_libcpp_stream_targets.put(entry.value_ptr.*, entry.key_ptr.*);
+            const target: u64 = entry.value_ptr.*;
+            try result.local_libcpp_stream_targets.put(target, entry.key_ptr.*);
+            if (result.libcpp_stream_target_min == 0 or target < result.libcpp_stream_target_min) {
+                result.libcpp_stream_target_min = target;
+            }
+            if (target > result.libcpp_stream_target_max) {
+                result.libcpp_stream_target_max = target;
+            }
         }
         result.logging.configure(
             result.internal_targets.guest_log_get_thread_buffer != 0,

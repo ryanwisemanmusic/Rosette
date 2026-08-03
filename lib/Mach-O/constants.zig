@@ -27,6 +27,13 @@ pub const GUEST_SIGNAL_RETURN_SENTINEL: u64 = 0xFFFF_F900_0000_0000;
 pub const GUEST_ATEXIT_RETURN_SENTINEL: u64 = 0xFFFF_F800_0000_0000;
 pub const DEFAULT_GUEST_THREAD_STACK_SIZE: u64 = 2 * 1024 * 1024;
 pub const COOPERATIVE_THREAD_QUANTUM_STEPS: u64 = 10_000;
+/// P0-1 (perf audit): cadence for the cooperative scheduler's full queue
+/// scans (idle-callback table + every suspended thread). These used to run
+/// on every interpreted instruction; the scheduler only acts on their
+/// results at quantum boundaries or on idle dispatch, so scanning at this
+/// interval (256 steps, ~40 scans per 10k-step quantum) is ample while
+/// removing the per-instruction scan from the interpreter hot loop.
+pub const COOPERATIVE_SCHEDULER_SCAN_INTERVAL: u64 = 256;
 pub const IDLE_STARVATION_STEPS: u64 = 100_000;
 pub const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 pub const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;

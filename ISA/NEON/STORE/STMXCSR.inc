@@ -14,7 +14,8 @@ element_type = "integer"
 legacy_width = 32
 
 encodings = [
-  { opcode = "ARM64 mrs_fpcr_fpsr", form = "STMXCSR", op_en = "DOC", feature = "NEON", mode = "V/V", handler = "arm64_stmxcsr" }
+  { opcode = "NP 0F AE /3", form = "STMXCSR m32", op_en = "M", feature = "SSE", vector_length = 0, encoding = "legacy" },
+  { opcode = "VEX.LZ.0F.WIG AE /3", form = "VSTMXCSR m32", op_en = "M", feature = "AVX", vector_length = 0, encoding = "vex" }
 ]
 
 operand_encodings = [

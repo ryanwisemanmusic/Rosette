@@ -292,6 +292,11 @@ pub fn handlePageEntryBulkInitialization(self: anytype) bool {
 }
 
 pub fn handleLocalLibcppStreamCompatibility(self: anytype) bool {
+    // Fast-reject outside the populated target span so the hash probe does
+    // not run on every interpreted instruction.
+    if (self.libcpp_stream_target_max == 0 or
+        self.regs.rip < self.libcpp_stream_target_min or
+        self.regs.rip > self.libcpp_stream_target_max) return false;
     const symbol = self.local_libcpp_stream_targets.get(self.regs.rip) orelse return false;
     const resolution = self.libcxx_streams.dispatch(self, &self.fs_forwarder, symbol) orelse return false;
     switch (resolution) {
