@@ -105,6 +105,31 @@ pub const ComparisonWitness = struct {
     distance: u8,
 };
 
+/// Ops recorded into the always-on evidence ring at the execute site. These
+/// mirror the two evidence kinds the contract consumes (a MOVBE load that
+/// produced the byte-swapped register value, and a 32-bit register/memory
+/// comparison that retained the original value). The ring is written without
+/// any re-decode because the interpreter already decoded the instruction, so it
+/// stays cheap even though the diagnostic memory trace is gated behind
+/// ROSETTE_MACHO_MEMORY_TRACE.
+pub const EvidenceKind = enum(u8) {
+    movbe_load,
+    cmp_witness,
+};
+
+/// A single recorded endian-contract evidence event. All fields are populated
+/// at record time from the already-decoded instruction plus execution
+/// provenance; `distance` is derived from ring position during the scan.
+pub const EvidenceEntry = struct {
+    kind: EvidenceKind = .movbe_load,
+    execution: ExecutionStamp = .{},
+    instruction_address: u64 = 0,
+    source_address: u64 = 0,
+    width_bytes: u8 = 0,
+    register: u8 = 0,
+    raw_value: u64 = 0,
+};
+
 pub const Fault = struct {
     execution: ExecutionStamp = .{},
     address: u64,

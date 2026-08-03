@@ -61,6 +61,7 @@ const multiplyUnsignedEvenDwords = packed_ops.multiplyUnsignedEvenDwords;
 const shufflePackedDwords = packed_ops.shufflePackedDwords;
 const unpackLowQwords = packed_ops.unpackLowQwords;
 const blendPackedWords = packed_ops.blendPackedWords;
+const blendPackedElements = packed_ops.blendPackedElements;
 const shiftPackedBytes = packed_ops.shiftPackedBytes;
 const shiftPackedElements = packed_ops.shiftPackedElements;
 const threeOperandImulResult = utils.threeOperandImulResult;
@@ -924,6 +925,17 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
 
         .movbe_reg_mem => {
             const value = self.readMemVal(d.addr, d.size);
+            // Endian-contract load evidence: recorded at the execute site,
+            // always on, so the generated-endian contract can substantiate
+            // repairs without the diagnostic-gated memory trace. The raw memory
+            // value (pre-swap) is the contract's original-value witness. Only
+            // 32-bit MOVBE participates in the contract; wider forms are not
+            // candidates and would only waste ring slots.
+            if (d.size == .bits32) {
+                if (comptime @hasDecl(@TypeOf(self.*), "recordEndianEvidence")) {
+                    self.recordEndianEvidence(.movbe_load, d.dst_reg, d.addr, d.size, value);
+                }
+            }
             self.setReg(d.dst_reg, d.size, x64_decoder.byteSwap(d.size, value));
         },
         .movbe_mem_reg => {
@@ -1405,6 +1417,26 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.xmm[d.xmm_dst][@intCast(d.imm & 0x0F)] = value;
             @memset(&self.ymm_hi[d.xmm_dst], 0);
         },
+        .vpextrb, .vpextrw, .vpextrd, .vpextrq => {
+            // Extract a byte/word/dword/qword lane from the source XMM
+            // (selected by the immediate) into a GPR (zero-extended for the
+            // 8/16/32-bit forms) or memory. VPEXTR* are 128-bit only, so the
+            // low 16 bytes of the vector are the only live lanes.
+            const value: u64 = switch (d.op) {
+                .vpextrb => self.xmm[d.xmm_src][@intCast(d.imm & 0x0F)],
+                .vpextrw => std.mem.readInt(u16, self.xmm[d.xmm_src][@intCast((d.imm & 0x07) * 2)..][0..2], .little),
+                .vpextrd => std.mem.readInt(u32, self.xmm[d.xmm_src][@intCast((d.imm & 0x03) * 4)..][0..4], .little),
+                .vpextrq => std.mem.readInt(u64, self.xmm[d.xmm_src][@intCast((d.imm & 0x01) * 8)..][0..8], .little),
+                else => unreachable,
+            };
+            if (d.is_reg_form) {
+                // VPEXTRB/W/D zero-extend into the 32-bit destination GPR;
+                // VPEXTRQ writes the full 64-bit register.
+                self.setReg(d.dst_reg, if (d.op == .vpextrq) .bits64 else .bits32, value);
+            } else {
+                self.writeMemVal(d.addr, d.size, value);
+            }
+        },
         .vpshufb => {
             const source_low = self.xmm[d.xmm_src];
             const mask_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
@@ -1725,6 +1757,29 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             if (d.vector_256) {
                 const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = blendPackedWords(self.ymm_hi[d.xmm_src], rhs_high, @truncate(d.imm));
+            } else {
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            }
+        },
+        .vblendvps, .vblendvpd, .vpblendvb => {
+            // RVMR encoding: DEST = ModRM.reg (xmm_dst), SRC1 = VEX.vvvv
+            // (xmm_src), SRC2 = ModRM.r/m (xmm_src2/addr), and the MASK
+            // register is encoded in imm8[7:4] (xmm_mask). Each lane is
+            // selected by the MSB of the corresponding mask lane.
+            const lane_bits: u8 = switch (d.op) {
+                .vblendvps => 32,
+                .vblendvpd => 64,
+                else => 8,
+            };
+            const src1_low = self.xmm[d.xmm_src];
+            const src2_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+            const mask_low = self.xmm[d.xmm_mask];
+            self.xmm[d.xmm_dst] = blendPackedElements(src1_low, src2_low, mask_low, lane_bits);
+            if (d.vector_256) {
+                const src1_high = self.ymm_hi[d.xmm_src];
+                const src2_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                const mask_high = self.ymm_hi[d.xmm_mask];
+                self.ymm_hi[d.xmm_dst] = blendPackedElements(src1_high, src2_high, mask_high, lane_bits);
             } else {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }

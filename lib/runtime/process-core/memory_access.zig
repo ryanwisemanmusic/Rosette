@@ -44,6 +44,7 @@ const PAGE_WRITE = constants.PAGE_WRITE;
 const PAGE_EXECUTE = constants.PAGE_EXECUTE;
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
 const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
+const ENDIAN_EVIDENCE_BUFFER_LEN = constants.ENDIAN_EVIDENCE_BUFFER_LEN;
 const GUEST_SIGSEGV = constants.GUEST_SIGSEGV;
 
 const mappedOffset = macho_core.utils.mappedOffset;
@@ -329,53 +330,99 @@ fn tryRecoverGeneratedEndianAddress(self: anytype, fault_address: u64, bytes: u8
         return null;
     }
 
-    const count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
     var load: ?generated_endian_contract.MovbeLoad = null;
     var witness: ?generated_endian_contract.ComparisonWitness = null;
-    var examined: usize = 0;
-    while (examined < count and examined < 8 and (load == null or witness == null)) : (examined += 1) {
-        const distance: u8 = @intCast(examined + 1);
-        const index = (self.memory_trace_index + MEMORY_TRACE_BUFFER_LEN - 1 - examined) % MEMORY_TRACE_BUFFER_LEN;
-        const event = self.memory_trace_entries[index];
-        const decoded = decodedMemoryEvent(event) orelse continue;
-        if (witness == null and decoded.op == .cmp_reg32_mem32 and
-            decoded.dst_reg == fault.sib_base_reg and event.bytes == 4 and
-            std.mem.eql(u8, event.access, "read"))
-        {
-            witness = .{
-                .execution = .{
-                    .present = event.provenance_present,
-                    .thread_handle = event.thread_handle,
-                    .scheduler_epoch = event.scheduler_epoch,
-                    .step = event.step,
-                },
-                .instruction_address = event.instruction_address,
-                .width_bytes = event.bytes,
-                .compared_register = @intCast(@intFromEnum(decoded.dst_reg)),
-                .memory_value = @as(u32, @truncate(event.value)),
-                .distance = distance,
-            };
+    // Production evidence path: the always-on endian evidence ring, written at
+    // the execute site without re-decode. The diagnostic memory trace below is
+    // gated behind ROSETTE_MACHO_MEMORY_TRACE (off by default) so it cannot be
+    // the sole evidence source for the contract.
+    if (comptime @hasField(@TypeOf(self.*), "endian_evidence_entries")) {
+        const evidence_count: usize = if (self.endian_evidence_filled) ENDIAN_EVIDENCE_BUFFER_LEN else self.endian_evidence_index;
+        var examined: usize = 0;
+        while (examined < evidence_count and examined < 8 and (load == null or witness == null)) : (examined += 1) {
+            const distance: u8 = @intCast(examined + 1);
+            const index = (self.endian_evidence_index + ENDIAN_EVIDENCE_BUFFER_LEN - 1 - examined) % ENDIAN_EVIDENCE_BUFFER_LEN;
+            const entry = self.endian_evidence_entries[index];
+            if (entry.width_bytes != 4) continue;
+            if (witness == null and entry.kind == .cmp_witness and
+                entry.register == @as(u8, @intCast(@intFromEnum(fault.sib_base_reg))))
+            {
+                witness = .{
+                    .execution = entry.execution,
+                    .instruction_address = entry.instruction_address,
+                    .width_bytes = entry.width_bytes,
+                    .compared_register = entry.register,
+                    .memory_value = entry.raw_value,
+                    .distance = distance,
+                };
+            }
+            if (load == null and entry.kind == .movbe_load and
+                entry.register == @as(u8, @intCast(@intFromEnum(fault.sib_base_reg))))
+            {
+                const raw_value: u32 = @truncate(entry.raw_value);
+                load = .{
+                    .execution = entry.execution,
+                    .instruction_address = entry.instruction_address,
+                    .source_address = entry.source_address,
+                    .width_bytes = entry.width_bytes,
+                    .destination_register = entry.register,
+                    .raw_value = raw_value,
+                    .swapped_value = generated_endian_contract.swapped(raw_value, .dword),
+                    .distance = distance,
+                };
+            }
         }
-        if (load == null and decoded.op == .movbe_reg_mem and decoded.size == .bits32 and
-            decoded.dst_reg == fault.sib_base_reg and event.bytes == 4 and
-            std.mem.eql(u8, event.access, "read"))
-        {
-            const raw_value: u32 = @truncate(event.value);
-            load = .{
-                .execution = .{
-                    .present = event.provenance_present,
-                    .thread_handle = event.thread_handle,
-                    .scheduler_epoch = event.scheduler_epoch,
-                    .step = event.step,
-                },
-                .instruction_address = event.instruction_address,
-                .source_address = event.address,
-                .width_bytes = event.bytes,
-                .destination_register = @intCast(@intFromEnum(decoded.dst_reg)),
-                .raw_value = raw_value,
-                .swapped_value = generated_endian_contract.swapped(raw_value, .dword),
-                .distance = distance,
-            };
+    }
+    // Fallback: the diagnostic memory trace (ROSETTE_MACHO_MEMORY_TRACE=1)
+    // records every access with instruction bytes; use it when the always-on
+    // ring did not yield both pieces of evidence.
+    if (load == null or witness == null) {
+        const count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
+        var examined: usize = 0;
+        while (examined < count and examined < 8 and (load == null or witness == null)) : (examined += 1) {
+            const distance: u8 = @intCast(examined + 1);
+            const index = (self.memory_trace_index + MEMORY_TRACE_BUFFER_LEN - 1 - examined) % MEMORY_TRACE_BUFFER_LEN;
+            const event = self.memory_trace_entries[index];
+            const decoded = decodedMemoryEvent(event) orelse continue;
+            if (witness == null and decoded.op == .cmp_reg32_mem32 and
+                decoded.dst_reg == fault.sib_base_reg and event.bytes == 4 and
+                std.mem.eql(u8, event.access, "read"))
+            {
+                witness = .{
+                    .execution = .{
+                        .present = event.provenance_present,
+                        .thread_handle = event.thread_handle,
+                        .scheduler_epoch = event.scheduler_epoch,
+                        .step = event.step,
+                    },
+                    .instruction_address = event.instruction_address,
+                    .width_bytes = event.bytes,
+                    .compared_register = @intCast(@intFromEnum(decoded.dst_reg)),
+                    .memory_value = @as(u32, @truncate(event.value)),
+                    .distance = distance,
+                };
+            }
+            if (load == null and decoded.op == .movbe_reg_mem and decoded.size == .bits32 and
+                decoded.dst_reg == fault.sib_base_reg and event.bytes == 4 and
+                std.mem.eql(u8, event.access, "read"))
+            {
+                const raw_value: u32 = @truncate(event.value);
+                load = .{
+                    .execution = .{
+                        .present = event.provenance_present,
+                        .thread_handle = event.thread_handle,
+                        .scheduler_epoch = event.scheduler_epoch,
+                        .step = event.step,
+                    },
+                    .instruction_address = event.instruction_address,
+                    .source_address = event.address,
+                    .width_bytes = event.bytes,
+                    .destination_register = @intCast(@intFromEnum(decoded.dst_reg)),
+                    .raw_value = raw_value,
+                    .swapped_value = generated_endian_contract.swapped(raw_value, .dword),
+                    .distance = distance,
+                };
+            }
         }
     }
     const unswapped_candidate: u32 = @truncate(generated_endian_contract.swapped(fault_address, .dword));
@@ -1522,6 +1569,47 @@ pub fn recordMemoryAccess(self: anytype, address: u64, size: Size, access: []con
     };
     self.memory_trace_index = (self.memory_trace_index + 1) % MEMORY_TRACE_BUFFER_LEN;
     if (self.memory_trace_index == 0) self.memory_trace_filled = true;
+}
+
+/// Always-on endian-contract evidence recorder. The generated-endian contract
+/// substantiates a repair from a MOVBE load plus a 32-bit register/memory
+/// comparison. The diagnostic memory trace above is gated behind
+/// ROSETTE_MACHO_MEMORY_TRACE (off by default), so in production runs the
+/// contract would otherwise see an empty ring and reject every legitimate
+/// repair as `movbe_evidence_missing`. This recorder runs at the execute site
+/// where the instruction is already decoded, so it costs only a small ring
+/// write (no re-decode), and is written unconditionally.
+pub fn recordEndianEvidence(
+    self: anytype,
+    kind: generated_endian_contract.EvidenceKind,
+    register: RegId,
+    source_address: u64,
+    size: Size,
+    raw_value: u64,
+) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "endian_evidence_entries")) return;
+    // The contract is Xenia-specific; skip the ring write for non-Xenia guests
+    // so the always-on recorder stays effectively free outside the compat path.
+    if (comptime @hasField(State, "has_xenia_compat")) {
+        if (!self.has_xenia_compat) return;
+    }
+    self.endian_evidence_entries[self.endian_evidence_index] = .{
+        .kind = kind,
+        .execution = .{
+            .present = true,
+            .thread_handle = self.active_guest_thread,
+            .scheduler_epoch = self.cooperative_thread_switches,
+            .step = self.executed_steps,
+        },
+        .instruction_address = self.regs.rip,
+        .source_address = source_address,
+        .width_bytes = bytesForSize(size),
+        .register = @intCast(@intFromEnum(register)),
+        .raw_value = raw_value,
+    };
+    self.endian_evidence_index = (self.endian_evidence_index + 1) % ENDIAN_EVIDENCE_BUFFER_LEN;
+    if (self.endian_evidence_index == 0) self.endian_evidence_filled = true;
 }
 
 pub fn readMem128(self: anytype, addr: u64) [16]u8 {
