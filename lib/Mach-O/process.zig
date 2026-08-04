@@ -87,6 +87,7 @@ const packed_ops = @import("macho_core").packed_ops;
 const signal_handling = @import("process_core").signal_handling;
 const initializers = @import("process_core").initializers;
 const compat_handlers = @import("process_core").compat_handlers;
+const bounded_dispatch_fst = @import("process_core").bounded_dispatch_fst;
 const crash_diag = @import("process_core").crash_diag;
 
 test {
@@ -480,6 +481,31 @@ pub const MachOState = struct {
     memory_regions: memory_provenance.Registry,
     memory_writes: memory_write_provenance.Tracker = .{},
     generated_endian_contract_recoveries: u64 = 0,
+    generated_null_scalar_read_recoveries: u64 = 0,
+    generated_null_indirect_skips: u64 = 0,
+    // Skips of indirect transfers from JIT-generated code to unpatched Xenia
+    // indirection-table sentinels (guest-module addresses such as 0x82582cc8):
+    // the same code-cache-miss family as generated_null_indirect_skips, but
+    // the target is the guest function address itself rather than 0.
+    generated_guest_dispatch_skips: u64 = 0,
+    // Zero-allocation, fail-closed recognizer for Xenia's generated
+    // CALL_POSSIBLE_RETURN path. It may redirect only when the 0x67 null-base
+    // load, matching guest return, tail-jump shape, and host frame all agree.
+    bounded_dispatch: bounded_dispatch_fst.Machine = .{},
+    // RIP of the most recent generated null scalar read satisfied as
+    // zero-fill; the null indirect transfer recovery reports the linkage when
+    // a null function pointer dispatch follows within a short window.
+    last_generated_null_read_rip: u64 = 0,
+    // Frame-return recoveries for generated-code tail dispatches (null pointer
+    // or guest sentinel): the bytes after the dispatch are Xenia's dead
+    // function-exit epilogue, so we return to the host caller via [rbp+8]
+    // instead of falling through (which double-deallocates the frame).
+    generated_dispatch_frame_returns: u64 = 0,
+    // Loop guard: RIP of the last generated dispatch recovery site and the
+    // consecutive count, so a non-progressing guest terminates with diagnostics
+    // instead of spinning on the same miss forever.
+    last_dispatch_recovery_rip: u64 = 0,
+    consecutive_dispatch_recoveries: u32 = 0,
     vtable_tracker: vt.VtableTracker,
     /// Tracks vtable writes for non-heap (stack-local / modeled) objects.
     /// Registered by the stream bridge during stringstream construction
@@ -2786,10 +2812,26 @@ pub const MachOState = struct {
         if (self.handlePatchDbEmptyPatchArray()) return !self.terminated;
         if (!self.isExecutableAddress(self.regs.rip)) {
             if (self.pending_control_transfer) |context| {
+                // Generated code dispatching to an unpatched Xenia indirection
+                // sentinel (a guest-module address) is the same recoverable
+                // code-cache miss as a null function pointer: skip the
+                // transfer and keep the run alive. The target poll below runs
+                // only at this terminal raise site, never on the hot path.
+                // Only recover when the failed RIP is exactly the transfer
+                // target: a stale pending context (from an earlier transfer
+                // that was never consulted) must not hijack an unrelated
+                // non-executable RIP.
+                if (context.target_address == self.regs.rip and
+                    memory_access.tryRecoverGeneratedGuestDispatchMiss(self, context, context.return_address != 0))
+                {
+                    return true;
+                }
+                memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
                 self.terminateForInvalidControlTransfer(context);
                 self.dumpRecentTrace();
                 return false;
             }
+            memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
             machoCapturePrint(
                 "macho-processor: invalid control-flow target rip=0x{x}; address is outside executable Mach-O segments\n",
                 .{self.regs.rip},
@@ -4396,6 +4438,121 @@ test "near-null XModule recovery guard is limited to Matches" {
     ));
     try std.testing.expect(!MachOState.isXModuleMatchesSymbol("__ZN2xe6kernel7XModuleC1Ev"));
     try std.testing.expect(!MachOState.isXModuleMatchesSymbol("__ZNSt3__16locale9use_facetEv"));
+}
+
+test "generated null scalar read gate is limited to small loads" {
+    try std.testing.expect(memory_access.isGeneratedNullScalarLoadOp(x64_decoder.Op.mov_reg8_mem8));
+    try std.testing.expect(memory_access.isGeneratedNullScalarLoadOp(x64_decoder.Op.mov_reg16_mem16));
+    try std.testing.expect(memory_access.isGeneratedNullScalarLoadOp(x64_decoder.Op.mov_reg32_mem32));
+    // 64-bit loads are owned by the vtable/XModule recovery paths and must not
+    // be zero-filled by the generated-code scalar read recovery.
+    try std.testing.expect(!memory_access.isGeneratedNullScalarLoadOp(x64_decoder.Op.mov_reg64_mem64));
+    try std.testing.expect(!memory_access.isGeneratedNullScalarLoadOp(x64_decoder.Op.movbe_reg_mem));
+    try std.testing.expect(!memory_access.isGeneratedNullScalarLoadOp(x64_decoder.Op.mov_mem32_reg32));
+}
+
+test "generated null transfer gate is limited to indirect jmp/call ops" {
+    try std.testing.expect(memory_access.isGeneratedNullTransferOp(x64_decoder.Op.jmp_reg64));
+    try std.testing.expect(memory_access.isGeneratedNullTransferOp(x64_decoder.Op.call_reg64));
+    try std.testing.expect(memory_access.isGeneratedNullTransferOp(x64_decoder.Op.jmp_mem64));
+    try std.testing.expect(memory_access.isGeneratedNullTransferOp(x64_decoder.Op.call_mem64));
+    // Direct transfers and non-transfer ops stay owned by their own paths;
+    // the generated null transfer recovery must never claim them.
+    try std.testing.expect(!memory_access.isGeneratedNullTransferOp(x64_decoder.Op.jmp_rel8));
+    try std.testing.expect(!memory_access.isGeneratedNullTransferOp(x64_decoder.Op.ret));
+    try std.testing.expect(!memory_access.isGeneratedNullTransferOp(x64_decoder.Op.mov_reg32_mem32));
+}
+
+test "generated guest dispatch gate includes ret; null transfer gate stays jmp/call" {
+    // The guest-dispatch recovery also covers `ret` (a corrupt-frame return
+    // that pops a guest sentinel), while the null transfer gate stays
+    // jmp/call-only.
+    try std.testing.expect(memory_access.isGeneratedDispatchMissOp(x64_decoder.Op.ret));
+    try std.testing.expect(memory_access.isGeneratedDispatchMissOp(x64_decoder.Op.jmp_reg64));
+    try std.testing.expect(memory_access.isGeneratedDispatchMissOp(x64_decoder.Op.call_mem64));
+    try std.testing.expect(!memory_access.isGeneratedDispatchMissOp(x64_decoder.Op.jmp_rel8));
+    try std.testing.expect(!memory_access.isGeneratedDispatchMissOp(x64_decoder.Op.mov_reg32_mem32));
+    try std.testing.expect(!memory_access.isGeneratedNullTransferOp(x64_decoder.Op.ret));
+}
+
+test "function-exit epilogue bytes detect Xenia dead tail-dispatch epilogue" {
+    // `add rsp, 0x68; dec [rsi-0x14]; ret` — exactly the bytes observed after
+    // the null `jmp rax` at 0xa0059876 (the CALL_POSSIBLE_RETURN path).
+    const epilogue: []const u8 = &.{ 0x48, 0x83, 0xC4, 0x68, 0xFF, 0x4E, 0xEC, 0xC3 };
+    try std.testing.expect(memory_access.isFunctionExitEpilogueBytes(epilogue));
+    // imm32 teardown with no profiler decrement: 48 81 C4 + imm32 is 8 bytes,
+    // so the ret byte must follow at index 8.
+    try std.testing.expect(memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x81, 0xC4, 0x68, 0x01, 0x00, 0x00, 0x00, 0xC3 }));
+    // Truncated buffers (length guards before byte reads) must not panic.
+    try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x83, 0xC4, 0x68, 0xFF }));
+    try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x81, 0xC4 }));
+    // A `jmp` is not an epilogue.
+    try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0xFF, 0xE0, 0x48, 0x83, 0xC4, 0x68 }));
+    // `sub rsp` is a prologue, not a teardown.
+    try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x83, 0xEC, 0x68, 0xC3 }));
+    // add rsp without a terminating ret is not a function exit.
+    try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x83, 0xC4, 0x68 }));
+}
+
+test "generated guest dispatch gate recognizes Xenia module sentinel addresses" {
+    // Unpatched indirection sentinels are guest-module addresses in either the
+    // zero-extended (0x82582cc8) or sign-extended (0xffffffff8313e528) form of
+    // the guest PPC function address.
+    try std.testing.expect(memory_access.isGuestModuleAddress(0x82582cc8));
+    try std.testing.expect(memory_access.isGuestModuleAddress(0xffffffff8313e528));
+    try std.testing.expect(memory_access.isGuestModuleAddress(0x80000000)); // xboxkrnl.exe base
+    try std.testing.expect(memory_access.isGuestModuleAddress(0x801c0000)); // xam.xex base
+    try std.testing.expect(memory_access.isGuestModuleAddress(0x9fffffff)); // guest RAM end
+    // Mach-O text, host JIT mappings, and null are not guest module addresses.
+    try std.testing.expect(!memory_access.isGuestModuleAddress(0x13fa70));
+    try std.testing.expect(!memory_access.isGuestModuleAddress(0x6778000));
+    try std.testing.expect(!memory_access.isGuestModuleAddress(0));
+    try std.testing.expect(!memory_access.isGuestModuleAddress(0x7fff2000));
+    try std.testing.expect(!memory_access.isGuestModuleAddress(0xa0000000));
+    // A genuine 64-bit host pointer whose low 32 bits fall in the guest window
+    // is NOT a guest sentinel and must not be skipped by the recovery.
+    try std.testing.expect(!memory_access.isGuestModuleAddress(0x1082582cc8));
+}
+
+test "generated null scalar read address form gate accepts zero-base 0x67 forms" {
+    // `67 8B 03` = mov eax, dword ptr [ebx] with a 0x67 address-size override
+    // and EBX=0 is the exact Xenia perf_monitor_detailed_metrics fault shape:
+    // the structural gate must recognize the address form. Live recovery then
+    // gives this exact EAX-from-EBX layout exclusively to the bounded dispatch
+    // transducer; it is never handled by the generic zero-fill fallback.
+    const fault = x64_decoder.DecodedInsn{
+        .op = x64_decoder.Op.mov_reg32_mem32,
+        .addr = 0,
+        .sib_has_base = true,
+        .sib_base_reg = .bl_bx_ebx_rbx,
+        .has_0x67 = true,
+    };
+    try std.testing.expect(memory_access.isGeneratedNullScalarAddressForm(fault));
+
+    // A 64-bit load keeps its vtable/XModule ownership.
+    var wide = fault;
+    wide.op = x64_decoder.Op.mov_reg64_mem64;
+    try std.testing.expect(!memory_access.isGeneratedNullScalarAddressForm(wide));
+
+    // Indexed or RIP-relative forms are not base-only zero expressions.
+    var indexed = fault;
+    indexed.sib_has_index = true;
+    indexed.sib_index_reg = .r12b_r12w_r12d_r12;
+    try std.testing.expect(!memory_access.isGeneratedNullScalarAddressForm(indexed));
+    var rip_rel = fault;
+    rip_rel.rip_relative = true;
+    try std.testing.expect(!memory_access.isGeneratedNullScalarAddressForm(rip_rel));
+
+    // Non-zero displacement disqualifies (the endian contract or termination
+    // owns non-zero effective addresses).
+    var displaced = fault;
+    displaced.addr = 0x40;
+    try std.testing.expect(!memory_access.isGeneratedNullScalarAddressForm(displaced));
+
+    // A non-0x67 zero-base form still qualifies.
+    var plain = fault;
+    plain.has_0x67 = false;
+    try std.testing.expect(memory_access.isGeneratedNullScalarAddressForm(plain));
 }
 
 test "Mach-O PAGEZERO is excluded from guest memory" {
