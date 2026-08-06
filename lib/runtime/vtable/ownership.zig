@@ -151,7 +151,7 @@ pub fn checkConsistency(
             .vtable_value = vtable_value,
             .origin = origin,
             .writer_rip = writer_rip,
-        }};
+        } };
     }
 
     // Check 2: validate vtable identity
@@ -160,7 +160,7 @@ pub fn checkConsistency(
         return .{ .invalid_vtable = .{
             .value = vtable_value,
             .writer_rip = writer_rip,
-        }};
+        } };
     }
 
     return .valid;
