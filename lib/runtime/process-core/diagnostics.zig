@@ -13,6 +13,7 @@ const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const primitiveCapturePrint = macho_log.primitiveCapturePrint;
 const constants = @import("macho_core").constants;
+const TraceEntry = @import("macho_core").types.TraceEntry;
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
 const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
 const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;
@@ -50,11 +51,67 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             .{self.patch_db_empty_array_recoveries},
         );
     }
-    if (comptime @hasField(@TypeOf(self.*), "generated_endian_contract_recoveries")) {
-        if (self.generated_endian_contract_recoveries != 0) {
+    if (comptime @hasField(@TypeOf(self.*), "generated_endian_contract")) {
+        if (self.generated_endian_contract.recoveries != 0) {
             machoCapturePrint(
                 "macho-processor: generated endian contract: witnessed_repairs={d}\n",
-                .{self.generated_endian_contract_recoveries},
+                .{self.generated_endian_contract.recoveries},
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "generated_null_scalar_read")) {
+        if (self.generated_null_scalar_read.recoveries != 0) {
+            machoCapturePrint(
+                "macho-processor: generated null scalar reads: zero_fill_recoveries={d} (JIT cvar/global reads satisfied as zero)\n",
+                .{self.generated_null_scalar_read.recoveries},
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "generated_null_indirect")) {
+        if (self.generated_null_indirect.recoveries != 0) {
+            machoCapturePrint(
+                "macho-processor: generated null indirect transfers: skipped_tail_calls={d} (JIT indirection misses; tail dispatches returned to host caller)\n",
+                .{self.generated_null_indirect.recoveries},
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "generated_guest_dispatch")) {
+        if (self.generated_guest_dispatch.recoveries != 0) {
+            machoCapturePrint(
+                "macho-processor: generated guest dispatches: skipped={d} (unpatched Xenia indirection sentinels returned to host caller)\n",
+                .{self.generated_guest_dispatch.recoveries},
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "generated_dispatch_frame_return")) {
+        if (self.generated_dispatch_frame_return.recoveries != 0) {
+            machoCapturePrint(
+                "macho-processor: generated dispatch frame returns: {d} (tail-dispatch misses returned to host caller via rbp frame, leave;ret semantics)\n",
+                .{self.generated_dispatch_frame_return.recoveries},
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "imgui_text_ex_noops")) {
+        if (self.imgui_text_ex_noops != 0) {
+            machoCapturePrint(
+                "macho-processor: ImGui TextEx compatibility: no-op_calls={d} (Xenia headless renderer boundary; exact symbol interception)\n",
+                .{self.imgui_text_ex_noops},
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "bounded_dispatch")) {
+        if (self.bounded_dispatch.observations != 0) {
+            machoCapturePrint(
+                "macho-processor: bounded dispatch FST: observations={d} redirects={d} rejections={d} (a redirect needs either a surviving comparison operand that equals the guest return slot, or — when the comparison read the null base itself — a recovered pre-clear value that does; rejected cases remain terminal)\n",
+                .{ self.bounded_dispatch.observations, self.bounded_dispatch.redirects, self.bounded_dispatch.rejections },
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "consecutive_dispatch_recoveries")) {
+        if (self.consecutive_dispatch_recoveries > 16) {
+            machoCapturePrint(
+                "macho-processor: generated dispatch recovery loop: stopped after {d} consecutive recoveries at one site (guest not progressing)\n",
+                .{self.consecutive_dispatch_recoveries},
             );
         }
     }
@@ -368,10 +425,9 @@ pub fn logExitDiagnostics(self: anytype) void {
         };
     }
 
-    const terminal_trace_count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+    const terminal_trace_count: usize = self.execution_history.countFor(self.active_guest_thread);
     if (terminal_trace_count > 0) {
-        const latest_index = if (self.trace_index == 0) TRACE_BUFFER_LEN - 1 else self.trace_index - 1;
-        const latest = self.trace_entries[latest_index];
+        const latest = self.execution_history.latestFor(self.active_guest_thread) orelse TraceEntry{};
         var terminal = exit_diagnostics.TerminalInstruction{
             .address = latest.rip,
             .op = @tagName(latest.op),
@@ -500,11 +556,7 @@ pub fn logExitDiagnostics(self: anytype) void {
     if (trace_count > 0) {
         var trace_buf: [TRACE_BUFFER_LEN]exit_diagnostics.TraceEntry = undefined;
         for (0..trace_count) |i| {
-            const idx = if (self.trace_filled)
-                (self.trace_index + i) % TRACE_BUFFER_LEN
-            else
-                i;
-            const entry = self.trace_entries[idx];
+            const entry = self.execution_history.chronological(self.active_guest_thread, i) orelse continue;
             trace_buf[i] = .{
                 .thread_handle = entry.thread_handle,
                 .rip = entry.rip,
@@ -545,7 +597,6 @@ pub fn releaseBarrier() void {
 pub fn logAtomicDiagnostic(self: anytype, matched: bool, size: Size, addr: u64, expected: u64, actual: u64, replacement: u64, is_locked: bool, rax_before: u64, rflags_before: u32) void {
     const op_num = self.atomic_cmpxchg.operations;
     if (op_num <= 16 or (!matched and self.atomic_cmpxchg.mismatches <= 16)) {
-        const symbol = self.metadata.nearestSymbol(self.regs.rip);
         const subtract_expected_vs_actual = (expected -% actual) & maskForSize(size);
         const cf: u8 = @intFromBool((expected & maskForSize(size)) < (actual & maskForSize(size)));
         const of: u8 = @intFromBool(((expected ^ actual) & (expected ^ subtract_expected_vs_actual) & signBitForSize(size)) != 0);
@@ -574,7 +625,7 @@ pub fn logAtomicDiagnostic(self: anytype, matched: bool, size: Size, addr: u64, 
                 @as(u8, @intFromBool(matched)),
                 self.executed_steps,
                 self.active_guest_thread,
-                if (symbol) |s| s.name else "<unknown>",
+                self.metadata.symbolLabel(self.regs.rip),
             },
         );
     }

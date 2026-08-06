@@ -122,23 +122,24 @@ pub fn runOneInitializer(self: anytype, launch_regs: Regs, index: usize, is_retr
 
     // Log vtable state at start of each attempt so we can correlate
     // write-protection recoveries across retries of the same initializer.
-    machoCapturePrint(
-        "macho-processor: running initializer [{d}/{d}] {s}+0x{x} vtable(write_protections={d} recoveries={d} detections={d} guards={d})\n",
-        .{
-            index + 1,
-            self.metadata.initializer_addresses.len,
-            symbol_name,
-            if (nearest_symbol) |item| item.offset else address,
-            self.vtable_tracker.live_vtable_write_protections,
-            self.vtable_tracker.live_vtable_guard_recoveries,
-            self.vtable_tracker.heap_corruption_detections,
-            self.guard_rollback.count(),
-        },
-    );
-
-    // Flush log before executing the initializer so diagnostics from a
-    // crash are captured even without explicit fsync calls between lines.
-    macho_log.checkPointSync();
+    // N7 (perf audit): gated behind initializer_detail_logging — the 722
+    // per-initializer lines flooded the run log (~700K chars) for a detail
+    // that is only useful when diagnosing write-protection recoveries.
+    if (self.initializer_detail_logging) {
+        machoCapturePrint(
+            "macho-processor: running initializer [{d}/{d}] {s}+0x{x} vtable(write_protections={d} recoveries={d} detections={d} guards={d})\n",
+            .{
+                index + 1,
+                self.metadata.initializer_addresses.len,
+                symbol_name,
+                if (nearest_symbol) |item| item.offset else address,
+                self.vtable_tracker.live_vtable_write_protections,
+                self.vtable_tracker.live_vtable_guard_recoveries,
+                self.vtable_tracker.heap_corruption_detections,
+                self.guard_rollback.count(),
+            },
+        );
+    }
 
     self.push(INITIALIZER_RETURN_SENTINEL);
     self.regs.rip = address;
@@ -358,6 +359,10 @@ pub fn runInitializers(self: anytype) bool {
             .failed => return false,
         }
         if ((index + 1) % 50 == 0 or index + 1 == self.metadata.initializer_addresses.len) {
+            // N7 (perf audit): the progress line stays (one write per 50
+            // initializers) but the 3× fsync per checkpoint is dropped — the
+            // log is buffered by the OS and failure/deferral paths below still
+            // checkpoint explicitly before returning.
             machoCapturePrint(
                 "macho-processor: processed initializer {d}/{d}\n",
                 .{ index + 1, self.metadata.initializer_addresses.len },

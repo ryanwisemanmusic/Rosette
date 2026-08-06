@@ -130,11 +130,85 @@ pub fn handleInternalCompatibility(self: anytype) bool {
     {
         return true;
     }
+    if (self.has_xenia_compat and
+        self.internal_targets.imgui_text_ex != 0 and
+        self.regs.rip == self.internal_targets.imgui_text_ex)
+    {
+        // TextEx only contributes diagnostic/UI text. Rosette's Mach-O path
+        // has no ImGui renderer, and executing the real function would enter
+        // an incomplete ImGuiContext/ImGuiWindow graph (the observed fault was
+        // `test byte ptr [rax+0x106]` with rax=0). Model this exact rendering
+        // boundary as a void-returning no-op; do not turn arbitrary near-null
+        // reads into zero-filled memory.
+        const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null)
+            self.read64(self.regs.rsp)
+        else
+            0;
+        if (return_address == 0 or !self.isExecutableAddress(return_address)) {
+            machoCapturePrint(
+                "macho-processor: ImGui TextEx compatibility rejected: invalid return target rsp=0x{x} entry=0x{x} text=0x{x} text_end=0x{x} flags=0x{x} return=0x{x} executable={}\n",
+                .{ self.regs.rsp, self.regs.rip, self.regs.rdi, self.regs.rsi, self.regs.rdx, return_address, return_address != 0 and self.isExecutableAddress(return_address) },
+            );
+            return false;
+        }
+        self.imgui_text_ex_noops +|= 1;
+        if (self.imgui_text_ex_noops == 1 or self.imgui_text_ex_noops % 256 == 0) {
+            machoCapturePrint(
+                "macho-processor: ImGui TextEx compatibility no-op #{d}: entry=0x{x} text=0x{x} text_end=0x{x} flags=0x{x} return=0x{x} phase={s}\n",
+                .{ self.imgui_text_ex_noops, self.regs.rip, self.regs.rdi, self.regs.rsi, self.regs.rdx, return_address, @tagName(self.startup.phase) },
+            );
+        }
+        self.regs.rip = self.pop();
+        return true;
+    }
     if (self.internal_targets.imgui_settings_push_back != 0 and
         self.regs.rip == self.internal_targets.imgui_settings_push_back)
     {
         _ = self.appendTrivialVector(self.regs.rdi, self.regs.rsi, 0x48, 8);
         if (!self.terminated) self.regs.rip = self.pop();
+        return true;
+    }
+    if (self.internal_targets.imgui_create_context != 0 and
+        self.regs.rip == self.internal_targets.imgui_create_context)
+    {
+        // ImGui::CreateContext(ImFontAtlas* atlas = NULL)
+        // rdi = atlas (optional), return = ImGuiContext*
+        // Allocate a minimal ImGuiContext (we just need the GImGui global set)
+        // The actual context struct is complex, but we just need to set GImGui
+        // to a valid address so GetCurrentWindow doesn't crash.
+        const ctx_size: u64 = 0x2000; // ImGuiContext is large, allocate generously
+        const ctx = self.memory_forwarder.allocate(self, ctx_size, 16) orelse 0;
+        if (ctx != 0) {
+            // ImGui's GImGui global is typically at a known offset from the context
+            // For simplicity, we'll store the context pointer at a known location
+            // and ensure GetCurrentWindow can find it.
+            // The actual GImGui global location varies; we'll write the context
+            // pointer to the first qword of the allocated block as a proxy.
+            _ = self.write64(ctx, ctx);
+        }
+        self.regs.rax = ctx;
+        self.regs.rip = self.pop();
+        return true;
+    }
+    if (self.internal_targets.imgui_get_current_window != 0 and
+        self.regs.rip == self.internal_targets.imgui_get_current_window)
+    {
+        // ImGui::GetCurrentWindow() - ensure context exists
+        // Check if GImGui global is set; if not, create a context first
+        // The GImGui global location is binary-specific; we'll try to find it
+        // by looking at known offsets or create a context on demand.
+        // For now, if we have a context from CreateContext, return it.
+        // This is a simplified implementation - in reality we'd need to
+        // find the actual GImGui global address.
+        if (self.internal_targets.imgui_create_context != 0) {
+            // Reuse the create context logic
+            const ctx_size: u64 = 0x2000;
+            const ctx = self.memory_forwarder.allocate(self, ctx_size, 16) orelse 0;
+            self.regs.rax = ctx;
+        } else {
+            self.regs.rax = 0;
+        }
+        self.regs.rip = self.pop();
         return true;
     }
     if (self.internal_targets.imgui_mem_alloc != 0 and

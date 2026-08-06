@@ -133,7 +133,7 @@ pub fn recoverLibcppSharedControlBlockCall(
 }
 
 pub fn findNearNullBaseTransition(self: anytype, register: RegId, terminal_value: u64) ?NearNullBaseTransition {
-    const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+    const count: usize = self.execution_history.countFor(self.active_guest_thread);
     if (count < 2) return null;
 
     var skipped_current = false;
@@ -142,11 +142,7 @@ pub fn findNearNullBaseTransition(self: anytype, register: RegId, terminal_value
     var reverse_index = count;
     while (reverse_index != 0) {
         reverse_index -= 1;
-        const index = if (self.trace_filled)
-            (self.trace_index + reverse_index) % TRACE_BUFFER_LEN
-        else
-            reverse_index;
-        const entry = self.trace_entries[index];
+        const entry = self.execution_history.chronological(self.active_guest_thread, reverse_index) orelse continue;
         if (entry.thread_handle != self.active_guest_thread) continue;
 
         if (!skipped_current) {

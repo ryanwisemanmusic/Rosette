@@ -344,17 +344,16 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
 
     // P0-1 (perf audit): the idle-callback table scan and the
     // every-suspended-thread scan previously ran on EVERY interpreted
-    // instruction. They now run once per COOPERATIVE_SCHEDULER_SCAN_INTERVAL
-    // steps; in between, cached counts from the last scan are reused, so
-    // quantum-expiry timing and yield cadence are unchanged. Staleness of up
-    // to one scan interval is immaterial against the 10k-step quantum.
+    // instruction. They now run once per COOPERATIVE_THREAD_QUANTUM_STEPS
+    // (10k) steps — quantum granularity. In between, cached counts from
+    // incremental maintenance (idle) and version/deadline-keyed refresh
+    // (suspended) are reused. Staleness is bounded to one quantum.
     const scan_due = self.cooperative_scheduler_scan_steps == 0;
     self.cooperative_scheduler_scan_steps +|= 1;
-    if (self.cooperative_scheduler_scan_steps >= COOPERATIVE_SCHEDULER_SCAN_INTERVAL) {
+    if (self.cooperative_scheduler_scan_steps >= COOPERATIVE_THREAD_QUANTUM_STEPS) {
         self.cooperative_scheduler_scan_steps = 0;
     }
     if (scan_due) {
-        self.cached_pending_idle = self.pendingIdleCallbackCount();
         self.cached_suspended_runnable = self.refreshSuspendedRunnableCache();
     }
     const pending_idle = self.cached_pending_idle;
@@ -539,10 +538,11 @@ pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []cons
             .scheduling_rip = self.regs.rip,
         };
         self.idle_scheduled +|= 1;
+        updateCachedPendingIdle(self, 1);
         _ = self.ui_handoff.queueIfIdle(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
         machoCapturePrint(
             "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
-            .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.pendingIdleCallbackCount() },
+            .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.cached_pending_idle },
         );
         self.logThreadTable("GTK idle scheduled");
         return source;
@@ -552,6 +552,18 @@ pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []cons
         .{ function, data, tag },
     );
     return 0;
+}
+
+/// Incrementally maintain the cached idle callback count.
+/// Call with +1 when a callback is scheduled, -1 when removed/completed.
+pub fn updateCachedPendingIdle(self: anytype, delta: i32) void {
+    if (delta > 0) {
+        self.cached_pending_idle += 1;
+    } else {
+        if (self.cached_pending_idle > 0) {
+            self.cached_pending_idle -= 1;
+        }
+    }
 }
 
 pub fn pendingIdleCallbackCount(self: anytype) usize {
@@ -579,7 +591,8 @@ pub fn removeIdleSource(self: anytype, source: u64) bool {
         if (!entry.active or entry.source_id != source) continue;
         entry.* = .{};
         self.idle_removed +|= 1;
-        machoCapturePrint("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.pendingIdleCallbackCount() });
+        updateCachedPendingIdle(self, -1);
+        machoCapturePrint("macho-processor: GTK idle removed: source={d} pending={d}\n", .{ source, self.cached_pending_idle });
         return true;
     }
     return false;
@@ -596,6 +609,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
                 .{ entry.source_id, entry.function, entry.tag },
             );
             entry.* = .{};
+            updateCachedPendingIdle(self, -1);
             continue;
         }
         if (!active_already_saved and self.active_guest_thread != 0 and !self.saveActiveGuestThread("GTK idle dispatch")) return false;
@@ -607,6 +621,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         const scheduling_thread = entry.scheduling_thread;
         const scheduling_rip = entry.scheduling_rip;
         entry.* = .{};
+        updateCachedPendingIdle(self, -1);
         self.regs = context.regs;
         self.xmm = context.xmm;
         self.ymm_hi = context.ymm_hi;

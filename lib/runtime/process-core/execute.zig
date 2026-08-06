@@ -6,6 +6,7 @@ const macho_log = @import("dyld").event_log;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
 const memory_mod = @import("memory");
 const proc_diag = @import("diagnostics.zig");
+const memory_access = @import("memory_access.zig");
 const execution_helpers = @import("macho_core").execution_helpers;
 const packed_ops = @import("macho_core").packed_ops;
 const decoder = @import("macho_core").decoder;
@@ -210,6 +211,169 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         // LOCK-prefixed RMW executes (x86 LOCK# acquire semantic).
         releaseBarrier();
     }
+    // N6 (perf audit): fast-path dispatch for the hottest scalar operations
+    // before the general switch. These arms are verbatim copies of the
+    // corresponding general-switch arms below — keep the two in sync. The hot
+    // ops (mov/lea/cmp/test/jcc/add/sub/push/pop, plus the byte/word/dword/
+    // qword store forms that dominate Xenia's JIT-emission loops) bypass the
+    // ~700-arm jump table with a small, branch-predictable comparison tree.
+    // Only ops whose general arms have no extra side effects are fast-pathed:
+    // loads are excluded because mov_reg32_mem32/mov_reg64_mem64 carry
+    // bounded-dispatch / near-null recovery, and all fault-recovery and
+    // tracing logic stays in the general switch. writeMemVal (R3: gated write
+    // bookkeeping) and the highway helpers are the exact same calls the
+    // general arms make.
+    switch (d.op) {
+        .nop => {
+            return;
+        },
+        .mov_reg8_reg8 => {
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, self.regOperandVal(d.src_reg, .bits8, d.src_high8));
+            return;
+        },
+        .mov_reg16_reg16 => {
+            self.setReg(d.dst_reg, .bits16, self.regVal(d.src_reg, .bits16));
+            return;
+        },
+        .mov_reg32_reg32 => {
+            self.setReg(d.dst_reg, .bits32, self.regVal(d.src_reg, .bits32));
+            return;
+        },
+        .mov_reg64_reg64 => {
+            self.setReg(d.dst_reg, .bits64, self.regVal(d.src_reg, .bits64));
+            return;
+        },
+        .mov_reg_imm => {
+            self.setRegOperand(d.dst_reg, d.size, d.dst_high8, d.imm);
+            return;
+        },
+        .mov_mem8_reg8 => {
+            self.writeMemVal(d.addr, .bits8, self.regOperandVal(d.src_reg, .bits8, d.src_high8));
+            return;
+        },
+        .mov_mem16_reg16 => {
+            self.writeMemVal(d.addr, .bits16, self.regVal(d.src_reg, .bits16));
+            return;
+        },
+        .mov_mem32_reg32 => {
+            self.writeMemVal(d.addr, .bits32, self.regVal(d.src_reg, .bits32));
+            return;
+        },
+        .mov_mem64_reg64 => {
+            self.writeMemVal(d.addr, .bits64, self.regVal(d.src_reg, .bits64));
+            return;
+        },
+        .mov_mem8_imm8 => {
+            self.writeMemVal(d.addr, .bits8, d.imm);
+            return;
+        },
+        .mov_mem16_imm16 => {
+            self.writeMemVal(d.addr, .bits16, d.imm);
+            return;
+        },
+        .mov_mem32_imm32 => {
+            self.writeMemVal(d.addr, .bits32, d.imm);
+            return;
+        },
+        .mov_mem64_imm32 => {
+            self.writeMemVal(d.addr, .bits64, d.imm);
+            return;
+        },
+        .lea_reg_mem => {
+            self.setReg(d.dst_reg, d.size, d.addr);
+            return;
+        },
+        .push_reg => {
+            self.push(self.regVal(d.src_reg, .bits64));
+            return;
+        },
+        .pop_reg => {
+            self.setReg(d.dst_reg, .bits64, self.pop());
+            return;
+        },
+        .jcc_rel8, .jcc_rel32 => {
+            const condMet = x64_decoder.evalCond(self.regs.rflags, d.cond);
+            // DecodedInsn.addr contains the signed branch displacement for
+            // relative JCCs, not an absolute target. Using directControl here
+            // treated the displacement as an address and could miss Xenia's
+            // CALL_POSSIBLE_RETURN `je`, allowing execution to reach 67 8B 03.
+            const transfer = x64_decoder.highway.relativeControl(
+                .conditional_jump,
+                self.regs.rip,
+                d.len,
+                @bitCast(d.addr),
+                condMet,
+            );
+            if (condMet) {
+                self.logControlFlow("jcc_taken", self.regs.rip, transfer.target, d.len, null);
+                self.regs.rip = transfer.target;
+            }
+            return;
+        },
+        .add_reg8_reg8, .add_reg16_reg16, .add_reg32_reg32, .add_reg64_reg64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.add_reg8_reg8) + @intFromEnum(Size.bits8));
+            self.executeHighwayRegisterBinary(d, .add, sz);
+            return;
+        },
+        .add_reg8_imm8 => {
+            self.executeAddRegImm(d, .bits8);
+            return;
+        },
+        .add_reg16_imm8 => {
+            self.executeAddRegImm(d, .bits16);
+            return;
+        },
+        .add_reg32_imm8 => {
+            self.executeAddRegImm(d, .bits32);
+            return;
+        },
+        .add_reg64_imm8 => {
+            self.executeAddRegImm(d, .bits64);
+            return;
+        },
+        .add_reg16_imm32 => {
+            self.executeAddRegImm(d, .bits16);
+            return;
+        },
+        .add_reg32_imm32 => {
+            self.executeAddRegImm(d, .bits32);
+            return;
+        },
+        .add_reg64_imm32 => {
+            self.executeAddRegImm(d, .bits64);
+            return;
+        },
+        .sub_reg8_reg8, .sub_reg16_reg16, .sub_reg32_reg32, .sub_reg64_reg64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_reg8) + @intFromEnum(Size.bits8));
+            self.executeHighwayRegisterBinary(d, .sub, sz);
+            return;
+        },
+        .sub_reg8_imm8, .sub_reg16_imm8, .sub_reg32_imm8, .sub_reg64_imm8 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.sub_reg8_imm8) + @intFromEnum(Size.bits8));
+            self.executeSubRegImm(d, sz);
+            return;
+        },
+        .cmp_reg8_reg8, .cmp_reg16_reg16, .cmp_reg32_reg32, .cmp_reg64_reg64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_reg8_reg8) + @intFromEnum(Size.bits8));
+            self.executeHighwayRegisterBinary(d, .cmp, sz);
+            return;
+        },
+        .cmp_reg8_imm8, .cmp_reg16_imm8, .cmp_reg32_imm8, .cmp_reg64_imm8 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.cmp_reg8_imm8) + @intFromEnum(Size.bits8));
+            self.executeHighwayImmediate(d, .cmp, sz, false);
+            return;
+        },
+        .test_reg8_reg8, .test_reg16_reg16, .test_reg32_reg32, .test_reg64_reg64 => {
+            const sz: Size = @enumFromInt(@intFromEnum(d.op) - @intFromEnum(Op.test_reg8_reg8) + @intFromEnum(Size.bits8));
+            self.executeHighwayRegisterBinary(d, .test_bits, sz);
+            return;
+        },
+        .test_reg8_imm8, .test_reg16_imm16, .test_reg32_imm32, .test_reg64_imm32 => {
+            self.executeHighwayImmediate(d, .test_bits, d.size, false);
+            return;
+        },
+        else => {},
+    }
     switch (d.op) {
         .invalid => {
             machoCapturePrint("macho-processor: undecoded instruction at rip=0x{x} opcode_prefix=0x{x}\n", .{ self.regs.rip, self.readMemVal(self.regs.rip, .bits8) });
@@ -286,7 +450,15 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.setReg(d.dst_reg, .bits16, self.readMemVal(d.addr, .bits16));
         },
         .mov_reg32_mem32 => {
-            self.setReg(d.dst_reg, .bits32, self.readMemVal(d.addr, .bits32));
+            const load_rip = self.regs.rip;
+            const value = self.readMemVal(d.addr, .bits32);
+            // A bounded dispatch recovery may redirect the entire generated
+            // frame while resolving this load. In that case the load belongs
+            // to the abandoned JIT frame and must not clobber the caller's
+            // destination register after the host continuation is installed.
+            if (!self.terminated and self.regs.rip == load_rip) {
+                self.setReg(d.dst_reg, .bits32, value);
+            }
         },
         .mov_reg64_mem64 => {
             _ = self.recoverNearNullBaseRegister(&d);
@@ -663,7 +835,12 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
 
         .call_rel32 => {
             const from_rip = self.regs.rip;
-            const transfer = x64_decoder.highway.directControl(.call, from_rip, d.len, d.addr, true);
+            // DecodedInsn.addr holds the signed relative displacement for
+            // rel32 calls, not an absolute target. Using directControl here
+            // jumped to the raw displacement value as an address, landing
+            // mid-instruction (e.g. on `FF FF`) in unrelated code whenever the
+            // displacement happened to alias an executable address.
+            const transfer = x64_decoder.highway.relativeControl(.call, from_rip, d.len, @bitCast(d.addr), true);
             const target = transfer.target;
             const return_addr = transfer.return_address.?;
             self.pending_control_transfer = .{
@@ -694,9 +871,35 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             const target = self.regVal(d.dst_reg, .bits64);
             const return_addr = self.regs.rip + d.len;
             if (target == 0) {
-                self.logControlFlow("call_reg64_null", from_rip, target, d.len, return_addr);
+                // JIT-generated code (Xenia indirection dispatch) tail-calling
+                // through a zero function pointer is a recoverable code-cache
+                // miss: fall through to the epilogue instead of terminating.
+                if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "call_reg64_null")) {
+                    self.regs.rip = from_rip + d.len;
+                } else {
+                    self.logControlFlow("call_reg64_null", from_rip, target, d.len, return_addr);
+                    self.terminateForInvalidControlTransfer(.{
+                        .kind = "call_reg64_null",
+                        .instruction_address = from_rip,
+                        .target_address = target,
+                        .return_address = return_addr,
+                    });
+                }
+            } else if (!self.isExecutableAddress(target) and compat_runtime.syntheticThunk(target) == null and !tlv_runtime.Runtime.handles(target)) {
+                // Validate indirect targets before mutating RSP/RIP. A guest
+                // sentinel may take the narrowly verified generated-dispatch
+                // route; every other non-executable value is terminal here.
+                if (memory_access.tryRecoverGeneratedGuestDispatchMiss(self, .{
+                    .kind = "call_reg64",
+                    .instruction_address = from_rip,
+                    .target_address = target,
+                    .return_address = return_addr,
+                }, false)) {
+                    return;
+                }
+                self.logControlFlow("call_reg64", from_rip, target, d.len, return_addr);
                 self.terminateForInvalidControlTransfer(.{
-                    .kind = "call_reg64_null",
+                    .kind = "call_reg64",
                     .instruction_address = from_rip,
                     .target_address = target,
                     .return_address = return_addr,
@@ -746,6 +949,13 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                     self.terminateForGuestAccess(d.addr, @sizeOf(u64), .read, "call_mem64");
                     return;
                 }
+                // JIT-generated code dispatching through a zero indirection
+                // entry is a recoverable code-cache miss: fall through to the
+                // epilogue instead of terminating.
+                if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "call_mem64_null")) {
+                    self.regs.rip = from_rip + d.len;
+                    return;
+                }
                 self.logControlFlow("call_mem64_null", from_rip, target, d.len, return_addr);
                 self.terminateForInvalidControlTransfer(.{
                     .kind = "call_mem64_null",
@@ -755,6 +965,21 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                     .return_address = return_addr,
                 });
             } else if (!self.isExecutableAddress(target) and compat_runtime.syntheticThunk(target) == null and !tlv_runtime.Runtime.handles(target)) {
+                // Generated code calling an unpatched Xenia indirection
+                // sentinel (a guest-module address) is the same recoverable
+                // code-cache miss as the null case: continue after the call
+                // instead of terminating. The return address has not been
+                // pushed yet on this path.
+                if (memory_access.tryRecoverGeneratedGuestDispatchMiss(self, .{
+                    .kind = "call_mem64",
+                    .instruction_address = from_rip,
+                    .operand_address = d.addr,
+                    .target_address = target,
+                    .return_address = return_addr,
+                }, false)) {
+                    self.regs.rip = from_rip + d.len;
+                    return;
+                }
                 self.logControlFlow("call_mem64", from_rip, target, d.len, return_addr);
                 self.terminateForInvalidControlTransfer(.{
                     .kind = "call_mem64",
@@ -805,6 +1030,15 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 return;
             }
             self.logControlFlow("ret", self.regs.rip, ret_addr, d.len, null);
+            // Record the transfer so the step() raise site can attempt the
+            // generated code-cache-miss recovery when the popped address is an
+            // unpatched guest sentinel (or otherwise non-executable). Cleared
+            // on the executable path; the raise site nulls it on recovery.
+            self.pending_control_transfer = .{
+                .kind = "ret",
+                .instruction_address = self.regs.rip,
+                .target_address = ret_addr,
+            };
             self.regs.rip = ret_addr;
             if (self.sha1_tracer.enabled and
                 self.sha1_tracer.isActiveThread(self))
@@ -822,7 +1056,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
 
         .jmp_rel8 => {
-            const transfer = x64_decoder.highway.directControl(.jump, self.regs.rip, d.len, d.addr, true);
+            // Same as call_rel32: d.addr is the signed relative displacement
+            // (rel8 or rel32), not an absolute target.
+            const transfer = x64_decoder.highway.relativeControl(.jump, self.regs.rip, d.len, @bitCast(d.addr), true);
             self.pending_control_transfer = .{
                 .kind = "jmp_rel8",
                 .instruction_address = self.regs.rip,
@@ -834,10 +1070,38 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .jmp_reg64 => {
             const target = self.regVal(d.dst_reg, .bits64);
             if (target == 0) {
-                self.logControlFlow("jmp_reg64_null", self.regs.rip, target, d.len, null);
+                // JIT-generated code (Xenia indirection dispatch) tail-jumping
+                // through a zero function pointer is a recoverable code-cache
+                // miss. The bytes after the `jmp` are Xenia's dead
+                // function-exit epilogue (the CALL_POSSIBLE_RETURN path), so
+                // falling through double-deallocates the frame; return to the
+                // host caller via the rbp frame (leave;ret semantics) instead.
+                if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "jmp_reg64_null")) {
+                    if (!memory_access.applyGeneratedDispatchFrameReturn(self, "jmp_reg64_null")) {
+                        self.regs.rip += d.len;
+                    }
+                } else {
+                    self.logControlFlow("jmp_reg64_null", self.regs.rip, target, d.len, null);
+                    self.terminateForInvalidControlTransfer(.{
+                        .kind = "jmp_reg64_null",
+                        .instruction_address = self.regs.rip,
+                        .target_address = target,
+                    });
+                }
+            } else if (!self.isExecutableAddress(target) and compat_runtime.syntheticThunk(target) == null and !tlv_runtime.Runtime.handles(target)) {
+                const from_rip = self.regs.rip;
+                if (memory_access.tryRecoverGeneratedGuestDispatchMiss(self, .{
+                    .kind = "jmp_reg64",
+                    .instruction_address = from_rip,
+                    .target_address = target,
+                    .return_address = from_rip + d.len,
+                }, false)) {
+                    return;
+                }
+                self.logControlFlow("jmp_reg64", from_rip, target, d.len, null);
                 self.terminateForInvalidControlTransfer(.{
-                    .kind = "jmp_reg64_null",
-                    .instruction_address = self.regs.rip,
+                    .kind = "jmp_reg64",
+                    .instruction_address = from_rip,
                     .target_address = target,
                 });
             } else {
@@ -870,16 +1134,44 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                     self.handleDirectImportCall(import);
                 },
                 .invalid_null_target => {
-                    self.logControlFlow("jmp_mem64_null", stub_rip, target, d.len, null);
-                    self.terminateForInvalidControlTransfer(.{
-                        .kind = "jmp_mem64_null",
-                        .instruction_address = stub_rip,
-                        .operand_address = d.addr,
-                        .target_address = target,
-                    });
+                    // JIT-generated code dispatching through a zero indirection
+                    // entry is a recoverable code-cache miss. The bytes after
+                    // the `jmp` are Xenia's dead function-exit epilogue, so
+                    // return to the host caller via the rbp frame instead of
+                    // falling through (which double-deallocates the frame).
+                    if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "jmp_mem64_null")) {
+                        self.pending_import_stub_rip = null;
+                        if (!memory_access.applyGeneratedDispatchFrameReturn(self, "jmp_mem64_null")) {
+                            self.regs.rip = stub_rip + d.len;
+                        }
+                    } else {
+                        self.logControlFlow("jmp_mem64_null", stub_rip, target, d.len, null);
+                        self.terminateForInvalidControlTransfer(.{
+                            .kind = "jmp_mem64_null",
+                            .instruction_address = stub_rip,
+                            .operand_address = d.addr,
+                            .target_address = target,
+                        });
+                    }
                 },
                 .follow_target => {
                     self.pending_import_stub_rip = null;
+                    // Non-executable guest-module target (e.g. an
+                    // unpatched Xenia indirection sentinel that points
+                    // into a data section / thunk table): same
+                    // recoverable code-cache miss as the null case.
+                    if (!self.isExecutableAddress(target) and compat_runtime.syntheticThunk(target) == null and !tlv_runtime.Runtime.handles(target)) {
+                        if (memory_access.tryRecoverGeneratedGuestDispatchMiss(self, .{
+                            .kind = "jmp_mem64",
+                            .instruction_address = stub_rip,
+                            .operand_address = d.addr,
+                            .target_address = target,
+                            .return_address = stub_rip + d.len,
+                        }, false)) {
+                            self.regs.rip = stub_rip + d.len;
+                            return;
+                        }
+                    }
                     self.pending_control_transfer = .{
                         .kind = "jmp_mem64",
                         .instruction_address = stub_rip,
@@ -894,7 +1186,17 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
 
         .jcc_rel8, .jcc_rel32 => {
             const condMet = x64_decoder.evalCond(self.regs.rflags, d.cond);
-            const transfer = x64_decoder.highway.directControl(.conditional_jump, self.regs.rip, d.len, d.addr, condMet);
+            // DecodedInsn.addr contains the signed branch displacement for
+            // relative JCCs, not an absolute target. Using directControl here
+            // treated the displacement as an address and could miss Xenia's
+            // CALL_POSSIBLE_RETURN `je`, allowing execution to reach 67 8B 03.
+            const transfer = x64_decoder.highway.relativeControl(
+                .conditional_jump,
+                self.regs.rip,
+                d.len,
+                @bitCast(d.addr),
+                condMet,
+            );
             if (condMet) {
                 self.logControlFlow("jcc_taken", self.regs.rip, transfer.target, d.len, null);
                 self.regs.rip = transfer.target;

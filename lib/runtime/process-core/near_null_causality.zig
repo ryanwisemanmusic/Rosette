@@ -9,6 +9,7 @@ const std = @import("std");
 const x64_decoder = @import("x64_decoder");
 const macho_core = @import("macho_core");
 const vtable_ownership = @import("vtable").ownership;
+const memory_write_provenance = @import("memory").memory_write_provenance;
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 
 const RegId = x64_decoder.RegId;
@@ -39,6 +40,54 @@ const CallBoundary = struct {
 pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse return;
     const decoded = decodeInsn(bytes);
+    const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
+
+    // Fault-time instruction bytes and full GPR snapshot. This block runs only
+    // in the confirmed near-null terminal path (never in the hot loop), so the
+    // exact encoding (e.g. a 0x67 address-size override, a REX/MOVBE form, or a
+    // register-materialized address) and the entire register file are recorded
+    // to make the next failure self-explanatory.
+    const raw_len: usize = @min(@as(usize, decoded.len), bytes.len);
+    machoCapturePrint(
+        "macho-processor: near-null causality: terminal bytes={any} len={d} addr_size={s} has_0x67={} generated_rip={} op={s}\n",
+        .{
+            bytes[0..raw_len],
+            decoded.len,
+            @tagName(address_size),
+            decoded.has_0x67,
+            self.sparse_memory.isExecutable(self.regs.rip, 1),
+            @tagName(decoded.op),
+        },
+    );
+    machoCapturePrint(
+        "macho-processor: near-null causality: gpr rax=0x{x} rcx=0x{x} rdx=0x{x} rbx=0x{x} rsp=0x{x} rbp=0x{x} rsi=0x{x} rdi=0x{x}\n",
+        .{
+            self.regs.rax,
+            self.regs.rcx,
+            self.regs.rdx,
+            self.regs.rbx,
+            self.regs.rsp,
+            self.regs.rbp,
+            self.regs.rsi,
+            self.regs.rdi,
+        },
+    );
+    machoCapturePrint(
+        "macho-processor: near-null causality: gpr r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x} r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x} rip=0x{x} rflags=0x{x}\n",
+        .{
+            self.regs.r8,
+            self.regs.r9,
+            self.regs.r10,
+            self.regs.r11,
+            self.regs.r12,
+            self.regs.r13,
+            self.regs.r14,
+            self.regs.r15,
+            self.regs.rip,
+            self.regs.rflags,
+        },
+    );
+
     if (!decoded.sib_has_base and !decoded.sib_has_index and !decoded.rip_relative) {
         machoCapturePrint(
             "macho-processor: near-null causality: terminal rip=0x{x} op={s} effective=0x{x}; decoder exposed no address expression\n",
@@ -47,7 +96,6 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
         return;
     }
 
-    const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
     const base_value = if (decoded.sib_has_base)
         x64_decoder.regVal(&self.regs, decoded.sib_base_reg, address_size)
     else
@@ -60,11 +108,13 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     const rip_component = if (decoded.rip_relative) self.regs.rip + decoded.len else 0;
 
     const src_value = switch (decoded.op) {
-        .mov_mem64_reg64, .mov_mem32_reg32, .mov_mem16_reg16, .mov_mem8_reg8,
+        .mov_mem64_reg64,
+        .mov_mem32_reg32,
+        .mov_mem16_reg16,
+        .mov_mem8_reg8,
         => x64_decoder.regVal(&self.regs, decoded.src_reg, address_size),
         else => 0,
     };
-    const term_symbol = self.metadata.nearestSymbol(self.regs.rip);
 
     machoCapturePrint(
         "macho-processor: near-null causality: terminal rip=0x{x} op={s} effective=0x{x} displacement=0x{x} base({s})=0x{x} index({s},scale={d})=0x{x} rip_component=0x{x} src({s})=0x{x} symbol={s}\n",
@@ -81,10 +131,9 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
             rip_component,
             @tagName(decoded.src_reg),
             src_value,
-            if (term_symbol) |s| s.name else "<unknown>",
+            self.metadata.symbolLabel(self.regs.rip),
         },
     );
-
     // Vtable ownership diagnostics: if the crash involves a write of a
     // non-zero value through a null pointer, check whether that value
     // is a vtable and classify its origin (host-resolved vs guest-written).
@@ -103,7 +152,7 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
                 .{
                     src_value,
                     origin_str,
-                    if (symbol) |s| s.name else "<unknown>",
+                    self.metadata.symbolLabel(src_value),
                     if (symbol) |s| s.offset else @as(i64, 0),
                 },
             );
@@ -112,7 +161,7 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
                 machoCapturePrint(
                     "macho-processor: vtable consistency: null this (this=0x0) — guest-side bug: constructor called on null object at {s}+0x{x}\n",
                     .{
-                        if (writer_symbol) |s| s.name else "<unknown>",
+                        self.metadata.symbolLabel(self.regs.rip),
                         if (writer_symbol) |s| s.offset else 0,
                     },
                 );
@@ -125,11 +174,22 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     // which may otherwise end at a callee's copied zero stack local.
     const invalid_this_explained = dumpZeroThisRoot(self);
 
+    // `base_value`/`index_value` were read at the terminal instruction's
+    // address width. The trace ring stores whole 64-bit registers, so the walk
+    // must compare at the same width. Under a 0x67 override a base register
+    // holding, say, 0x1_0000_0000 reads as 0 in the address expression while
+    // every trace entry reads as 0x1_0000_0000 — an unmasked comparison would
+    // report the most recent entry as a fabricated 0x1_0000_0000 -> 0
+    // transition and attribute the fault to an instruction that never touched
+    // the register. Every 0x67 fault handed here by the bounded dispatch
+    // transducer takes this path.
+    const address_mask: u64 = addressWidthMask(address_size);
     if (decoded.sib_has_base) {
         dumpRegisterChain(
             self,
             decoded.sib_base_reg,
             base_value,
+            address_mask,
             "base",
             !invalid_this_explained,
         );
@@ -139,21 +199,68 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
             self,
             decoded.sib_index_reg,
             index_value,
+            address_mask,
             "index",
             !invalid_this_explained,
         );
     }
 }
 
+/// Comparison mask for register values observed at a given address width.
+/// Widths narrower than the trace ring's storage must be masked on both sides
+/// or the walk compares an architectural truncation against a whole register.
+fn addressWidthMask(size: Size) u64 {
+    return switch (size) {
+        .bits8 => 0xFF,
+        .bits16 => 0xFFFF,
+        .bits32 => 0xFFFF_FFFF,
+        .bits64 => std.math.maxInt(u64),
+    };
+}
+
 fn dumpRegisterChain(
     self: anytype,
     register: RegId,
     terminal_value: u64,
+    value_mask: u64,
     role: []const u8,
     allow_direct_producer: bool,
 ) void {
-    const count: usize = if (self.trace_filled) self.trace_entries.len else self.trace_index;
+    const count: usize = self.execution_history.countFor(self.active_guest_thread);
+    // Report the tape before walking it. A bounded machine that cannot reach
+    // the evidence must say so; the previous behaviour was to print nothing at
+    // all, which reads as "no cause found" when it means "not looked far
+    // enough". The ring is process-wide and filtered per thread, so the useful
+    // depth is the same-thread count, not the ring size.
+    const window = retainedWindow(self);
+    machoCapturePrint(
+        "macho-processor: near-null causality: {s}_window register={s} terminal=0x{x} mask=0x{x} thread=0x{x} thread_entries={d}/{d} saturated={} live_threads={d} evicted_threads={d} memory_trace_entries={d}{s}\n",
+        .{
+            role,
+            @tagName(register),
+            terminal_value,
+            value_mask,
+            self.active_guest_thread,
+            window.same_thread,
+            window.capacity,
+            window.saturated,
+            window.live_threads,
+            window.evictions,
+            window.memory_entries,
+            if (window.memory_entries == 0)
+                "; memory trace ring empty (set ROSETTE_MACHO_MEMORY_TRACE=1 to retain it) — exact-producer attribution unavailable, falling back to historical re-decode"
+            else
+                "",
+        },
+    );
     if (count == 0) return;
+    if (window.same_thread == 0) {
+        machoCapturePrint(
+            "macho-processor: near-null causality: {s}_chain UNDECIDABLE register={s}; the retained instruction ring holds no entries for the faulting thread, so no transition can be recovered. This is a tape limit, not an absence of cause\n",
+            .{ role, @tagName(register) },
+        );
+        return;
+    }
 
     var cursor = count;
     var after = terminal_value;
@@ -167,7 +274,19 @@ fn dumpRegisterChain(
     // to reach the backing-slot load rather than stopping at values such as
     // 0x40 that were merely added to a null block pointer.
     while (cursor != 0 and chain_depth < 12) {
-        const transition = findPreviousTransition(self, register, after, &cursor) orelse break;
+        const transition = findPreviousTransition(self, register, after, value_mask, &cursor) orelse {
+            // No transition anywhere in the retained window means the register
+            // held this value for the whole tape. That is a decidable and very
+            // specific finding — the value was not produced within reach — and
+            // it must not be reported as silence.
+            if (chain_depth == 0) {
+                machoCapturePrint(
+                    "macho-processor: near-null causality: {s}_chain UNDECIDABLE register={s} value=0x{x}; the register held this value across all {d} retained same-thread entries, so its producer predates the tape. Look upstream of the retained window: the defining instruction is outside it, not missing\n",
+                    .{ role, @tagName(register), terminal_value, window.same_thread },
+                );
+            }
+            break;
+        };
         const symbol = self.metadata.nearestSymbol(transition.instruction_address);
         machoCapturePrint(
             "macho-processor: near-null causality: {s}_chain[{d}] register={s} before=0x{x} after=0x{x} instruction=0x{x} {s}+0x{x} retained_distance={d}\n",
@@ -178,7 +297,7 @@ fn dumpRegisterChain(
                 transition.before,
                 transition.after,
                 transition.instruction_address,
-                if (symbol) |resolved| resolved.name else "<unknown>",
+                self.metadata.symbolLabel(transition.instruction_address),
                 if (symbol) |resolved| resolved.offset else 0,
                 transition.retained_distance,
             },
@@ -229,10 +348,10 @@ fn dumpZeroThisRoot(self: anytype) bool {
         "macho-processor: near-null causality: invalid_this_boundary call=0x{x} {s}+0x{x} this=0x0 callee=0x{x} {s}+0x{x}\n",
         .{
             boundary.call_address,
-            if (caller) |resolved| resolved.name else "<unknown>",
+            self.metadata.symbolLabel(boundary.call_address),
             if (caller) |resolved| resolved.offset else 0,
             boundary.callee_address,
-            if (callee) |resolved| resolved.name else "<unknown>",
+            self.metadata.symbolLabel(boundary.callee_address),
             if (callee) |resolved| resolved.offset else 0,
         },
     );
@@ -245,6 +364,7 @@ fn dumpZeroThisRoot(self: anytype) bool {
         self,
         .bh_di_edi_rdi,
         0,
+        std.math.maxInt(u64),
         &cursor,
     ) orelse {
         machoCapturePrint(
@@ -267,26 +387,26 @@ fn dumpZeroThisRoot(self: anytype) bool {
 }
 
 fn findZeroThisBoundary(self: anytype) ?CallBoundary {
-    const count: usize = if (self.trace_filled) self.trace_entries.len else self.trace_index;
+    const count: usize = self.execution_history.countFor(self.active_guest_thread);
     if (count < 2) return null;
 
     const fault_thread = self.active_guest_thread;
     var best: ?CallBoundary = null;
     var ordinal: usize = 0;
     while (ordinal + 1 < count) : (ordinal += 1) {
-        const entry = self.trace_entries[chronologicalTraceIndex(self, count, ordinal)];
+        const entry = traceEntry(self, ordinal) orelse continue;
         if (entry.thread_handle != fault_thread or entry.rdi != 0 or !isCall(entry)) continue;
 
         const callee_address =
             nextSameThreadRip(self, count, ordinal + 1, fault_thread) orelse continue;
-        const callee = self.metadata.nearestSymbol(callee_address) orelse continue;
-        // Zero is a valid scalar first argument for many C functions. Limit
-        // the inference to Xenia C++ instance methods, where RDI is `this`.
-        if (!std.mem.startsWith(u8, callee.name, "__ZN2xe") and
-            !std.mem.startsWith(u8, callee.name, "_ZN2xe"))
-        {
-            continue;
-        }
+        // Zero is a valid scalar first argument for many C functions, so a
+        // zero RDI at a call is only a `this` fault when the callee actually
+        // dereferences it. Decide that from the callee's own instructions
+        // rather than from its name: a symbol-prefix test only recognises the
+        // one program whose namespace was hardcoded, and silently stops
+        // classifying anything else — including the same program built with a
+        // different mangling, and every statically linked dependency.
+        if (!calleeDereferencesFirstArgument(self, callee_address)) continue;
         best = .{
             .ordinal = ordinal,
             .call_address = entry.rip,
@@ -296,23 +416,150 @@ fn findZeroThisBoundary(self: anytype) ?CallBoundary {
     return best;
 }
 
+/// How much tape the causality walk actually has. The instruction ring is
+/// process-wide, so a run with many live guest threads leaves each one only a
+/// fraction of it — the number that matters is the same-thread count.
+pub const RetainedWindow = struct {
+    same_thread: usize,
+    capacity: usize,
+    /// The thread has filled its window, so "not found" may mean "overwritten".
+    saturated: bool,
+    live_threads: usize,
+    evictions: u64,
+    memory_entries: usize,
+};
+
+pub fn retainedWindow(self: anytype) RetainedWindow {
+    const window = self.execution_history.windowFor(self.active_guest_thread);
+    const memory_entries: usize = if (self.memory_trace_filled)
+        self.memory_trace_entries.len
+    else
+        self.memory_trace_index;
+    return .{
+        .same_thread = window.thread_entries,
+        .capacity = window.thread_capacity,
+        .saturated = window.saturated(),
+        .live_threads = window.live_threads,
+        .evictions = window.evictions,
+        .memory_entries = memory_entries,
+    };
+}
+
+/// The value a register held on the faulting thread at the most recent
+/// retained point where it was not zero, together with how many same-thread
+/// trace entries back that was.
+pub const ClearedValue = struct {
+    value: u64,
+    retained_distance: usize,
+};
+
+/// Recover the value a register held before it was most recently cleared to
+/// zero, from the retained instruction trace of the faulting thread.
+///
+/// This exists because a fault whose defining condition is "this register is
+/// zero" destroys the only snapshot a fault-time read could return. Any
+/// question about what the register was *supposed* to hold has to be answered
+/// from history, not from the register file. The walk is bounded by the trace
+/// ring itself, filters to the faulting thread, and reports the distance so a
+/// caller can require recency or record it for audit.
+///
+/// Returns null when the register is zero throughout retained history — which
+/// is the honest answer, not a licence to guess.
+pub fn lastNonZeroBeforeClear(self: anytype, register: RegId, value_mask: u64) ?ClearedValue {
+    const count: usize = self.execution_history.countFor(self.active_guest_thread);
+    if (count == 0) return null;
+
+    var cursor = count;
+    var retained_distance: usize = 0;
+    while (cursor != 0) {
+        cursor -= 1;
+        const entry = traceEntry(self, cursor) orelse continue;
+        retained_distance += 1;
+        const observed = traceRegisterValue(entry, register) & value_mask;
+        if (observed != 0) {
+            return .{ .value = observed, .retained_distance = retained_distance };
+        }
+    }
+    return null;
+}
+
+/// Decide whether a callee treats its first integer argument (RDI under the
+/// System V ABI) as a pointer it dereferences, by reading a bounded prologue
+/// window of the callee itself. This is the behavioural replacement for asking
+/// whether the callee's symbol belongs to a particular program's namespace.
+///
+/// The window is a finite tape: at most 12 instructions or 48 bytes, no
+/// branches followed, no speculative execution. It answers yes on the first
+/// memory operand based or indexed on RDI, and no as soon as RDI is redefined
+/// before any such use (the callee took a scalar, or reloaded the register),
+/// or when control flow leaves the straight-line prologue without an answer.
+/// Undecided is reported as no, so a missing answer never manufactures a
+/// `this` boundary.
+fn calleeDereferencesFirstArgument(self: anytype, callee_address: u64) bool {
+    const arg0: RegId = .bh_di_edi_rdi;
+    var cursor = callee_address;
+    var examined: u8 = 0;
+    while (examined < 12 and cursor >= callee_address and cursor - callee_address <= 48) : (examined += 1) {
+        const bytes = self.guestMemoryConst(cursor, 16) orelse return false;
+        const decoded = decodeInsn(bytes);
+        if (decoded.op == .invalid or decoded.len == 0) return false;
+
+        if (!decoded.rip_relative and
+            ((decoded.sib_has_base and decoded.sib_base_reg == arg0) or
+                (decoded.sib_has_index and decoded.sib_index_reg == arg0)))
+        {
+            return true;
+        }
+
+        switch (decoded.op) {
+            // Leaving straight-line code ends the proof. Following the edge
+            // would turn a bounded reader into a search.
+            .jmp_rel8,
+            .jmp_reg64,
+            .jmp_mem64,
+            .jcc_rel8,
+            .jcc_rel32,
+            .call_rel32,
+            .call_reg64,
+            .call_mem64,
+            .ret,
+            => return false,
+            // Redefinitions of the argument register itself. Conservative on
+            // purpose: an op missing from this list only costs a few more
+            // instructions of window, never a wrong `true`.
+            .mov_reg32_reg32,
+            .mov_reg64_reg64,
+            .mov_reg_imm,
+            .mov_reg32_mem32,
+            .mov_reg64_mem64,
+            .lea_reg_mem,
+            .pop_reg,
+            .xor_reg32_reg32,
+            .xor_reg64_reg64,
+            => if (decoded.dst_reg == arg0) return false,
+            else => {},
+        }
+        cursor +|= decoded.len;
+    }
+    return false;
+}
+
 fn findPreviousTransition(
     self: anytype,
     register: RegId,
     expected_after: u64,
+    value_mask: u64,
     cursor: *usize,
 ) ?Transition {
-    const count: usize = if (self.trace_filled) self.trace_entries.len else self.trace_index;
-    const fault_thread = self.active_guest_thread;
-    var after = expected_after;
+    // Entries are already partitioned per thread, so no filtering is needed:
+    // every retained entry here belongs to the faulting thread by construction.
+    var after = expected_after & value_mask;
     var retained_distance: usize = 0;
     while (cursor.* != 0) {
         cursor.* -= 1;
-        const index = chronologicalTraceIndex(self, count, cursor.*);
-        const entry = self.trace_entries[index];
-        if (entry.thread_handle != fault_thread) continue;
+        const entry = traceEntry(self, cursor.*) orelse continue;
         retained_distance += 1;
-        const before = traceRegisterValue(entry, register);
+        const before = traceRegisterValue(entry, register) & value_mask;
         if (before != after) {
             return .{
                 .instruction_address = entry.rip,
@@ -360,18 +607,9 @@ fn findExactProducer(self: anytype, transition: Transition) ?Producer {
     // ring. Reconstruct the effective address from the exact historical
     // instruction snapshot when a helper-heavy libc++ path has already pushed
     // the read out of the memory ring.
-    const trace_count: usize = if (self.trace_filled)
-        self.trace_entries.len
-    else
-        self.trace_index;
+    const trace_count: usize = self.execution_history.countFor(self.active_guest_thread);
     if (transition.trace_ordinal >= trace_count) return null;
-    const entry = self.trace_entries[
-        chronologicalTraceIndex(
-            self,
-            trace_count,
-            transition.trace_ordinal,
-        )
-    ];
+    const entry = traceEntry(self, transition.trace_ordinal) orelse return null;
     const decoded = self.decodeTraceInstruction(entry) orelse return null;
     if (decoded.op != .mov_reg64_mem64 or
         decoded.dst_reg != transition.register)
@@ -392,7 +630,7 @@ fn dumpProducer(self: anytype, producer: Producer) void {
             .{
                 producer.slot,
                 producer.instruction_address,
-                if (reader) |symbol| symbol.name else "<unknown>",
+                self.metadata.symbolLabel(producer.instruction_address),
                 if (reader) |symbol| symbol.offset else 0,
                 allocation.base,
                 allocation.offset,
@@ -405,7 +643,7 @@ fn dumpProducer(self: anytype, producer: Producer) void {
             .{
                 producer.slot,
                 producer.instruction_address,
-                if (reader) |symbol| symbol.name else "<unknown>",
+                self.metadata.symbolLabel(producer.instruction_address),
                 if (reader) |symbol| symbol.offset else 0,
             },
         );
@@ -413,6 +651,16 @@ fn dumpProducer(self: anytype, producer: Producer) void {
 
     if (self.memory_writes.lookup(producer.slot)) |writer| {
         const writer_symbol = self.metadata.nearestSymbol(writer.instruction_address);
+        // A host-authored repair records the faulting guest RIP as its writer.
+        // Say so before the symbol is printed, or the next reader concludes that
+        // a guest function wrote a value Rosette wrote.
+        if (memory_write_provenance.isHostAuthored(writer.kind)) {
+            machoCapturePrint(
+                "macho-processor: near-null causality: producer_last_writer slot=0x{x} value=0x{x} kind=host_repair; this slot was last written by a Rosette fault repair, not by the guest. The recorded writer 0x{x} is the guest instruction that was faulting at the time and did not perform this store — do not attribute guest behaviour to it. Investigate the repair that wrote here\n",
+                .{ writer.address, writer.value, writer.instruction_address },
+            );
+            return;
+        }
         machoCapturePrint(
             "macho-processor: near-null causality: producer_last_writer slot=0x{x} previous=0x{x} value=0x{x} kind={s} writer=0x{x} {s}+0x{x} step={d} age_steps={d} thread=0x{x}\n",
             .{
@@ -421,7 +669,7 @@ fn dumpProducer(self: anytype, producer: Producer) void {
                 writer.value,
                 @tagName(writer.kind),
                 writer.instruction_address,
-                if (writer_symbol) |resolved| resolved.name else "<unknown>",
+                self.metadata.symbolLabel(writer.instruction_address),
                 if (writer_symbol) |resolved| resolved.offset else 0,
                 writer.step,
                 self.executed_steps -| writer.step,
@@ -507,9 +755,11 @@ fn dumpRootClassification(
     );
 }
 
-fn chronologicalTraceIndex(self: anytype, count: usize, ordinal: usize) usize {
-    const start: usize = if (self.trace_filled) self.trace_index else 0;
-    return (start + ordinal) % count;
+/// Chronological entry for the faulting thread. All ring arithmetic lives in
+/// the execution-history library now; this is the one accessor this module
+/// needs, and it can no longer disagree with any other consumer's copy.
+fn traceEntry(self: anytype, ordinal: usize) ?TraceEntry {
+    return self.execution_history.chronological(self.active_guest_thread, ordinal);
 }
 
 fn chronologicalMemoryIndex(self: anytype, count: usize, ordinal: usize) usize {
@@ -520,7 +770,7 @@ fn chronologicalMemoryIndex(self: anytype, count: usize, ordinal: usize) usize {
 fn nextSameThreadRip(self: anytype, count: usize, start_ordinal: usize, thread: u64) ?u64 {
     var ordinal = start_ordinal;
     while (ordinal < count) : (ordinal += 1) {
-        const entry = self.trace_entries[chronologicalTraceIndex(self, count, ordinal)];
+        const entry = traceEntry(self, ordinal) orelse continue;
         if (entry.thread_handle == thread) return entry.rip;
     }
     return null;
