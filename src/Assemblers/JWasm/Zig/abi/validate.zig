@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_abi = @import("runtime_abi_handshake.zig");
+const runtime_abi = @import("runtime_abi_handshake");
 
 pub const AssemblerValidator = struct {
     allocator: std.mem.Allocator,

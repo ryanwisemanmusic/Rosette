@@ -98,6 +98,14 @@ test "YASM assembler strict ABI suite" {
     try std.testing.expectEqual(@as(u32, 0), handshake.validator.error_count);
 }
 
+// The suite must not write to stderr. `zig build`'s runner prints a step's
+// captured stderr "no matter the result", and that printer also emits the
+// pre-armed `result_failed_command` string — which `Step.Run` sets before
+// spawning and never clears on success. A passing run that writes one byte to
+// stderr therefore reports `failed command: …/test --listen=-` while the build
+// still succeeds. Assert the handshake state instead of announcing it.
 test "Assembler ABI Validation checks all passed" {
-    std.debug.print("Assembler ABI Validation checks: ALL Passed\n", .{});
+    runtime_abi.common.acquire();
+    defer runtime_abi.common.release();
+    try std.testing.expectEqual(@as(usize, 0), runtime_abi.common.violationCount());
 }

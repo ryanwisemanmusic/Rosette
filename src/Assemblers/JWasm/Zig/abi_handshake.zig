@@ -1,7 +1,7 @@
 const std = @import("std");
 const model = @import("abi/model.zig");
 const validate = @import("abi/validate.zig");
-const runtime_abi = @import("runtime_abi_handshake.zig");
+const runtime_abi = @import("runtime_abi_handshake");
 
 pub const JwasmAbiHandshake = struct {
     allocator: std.mem.Allocator,
