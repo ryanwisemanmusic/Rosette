@@ -1297,6 +1297,14 @@ pub fn build(b: *std.Build) void {
         macho_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_core_mod.addImport("guest_abi", guest_abi_mod);
+        // Retained execution history: bounded-ring arithmetic and thread
+        // partitioning, extracted from six owners.
+        const execution_history_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/execution-history/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
         const process_core_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/process-core/root.zig"),
             .target = target,
@@ -1318,6 +1326,49 @@ pub fn build(b: *std.Build) void {
         process_core_mod.addImport("pthread", pthread_mod);
         process_core_mod.addImport("guest_abi", guest_abi_mod);
         process_core_mod.addImport("vtable", vtable_mod);
+        process_core_mod.addImport("execution_history", execution_history_mod);
+
+        // The bounded dispatch transducer is a self-contained decision
+        // procedure over supplied invariants, and its test blocks are the only
+        // executable specification of which null-base dispatches may redirect.
+        // As a dependency of process_core those blocks neither compile nor run
+        // under `zig test`, so it is rooted directly and actually executed —
+        // an unreachable redirect branch previously passed review because the
+        // suite asserting it was never built.
+        const bounded_dispatch_fst_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/process-core/bounded_dispatch_fst.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const bounded_dispatch_fst_test = b.addTest(.{ .root_module = bounded_dispatch_fst_mod });
+        const run_bounded_dispatch_fst_test = b.addRunArtifact(bounded_dispatch_fst_test);
+        const bounded_dispatch_check = b.step(
+            "bounded-dispatch-check",
+            "Run the bounded null-base dispatch transducer decision tests",
+        );
+        bounded_dispatch_check.dependOn(&run_bounded_dispatch_fst_test.step);
+        check_step.dependOn(&run_bounded_dispatch_fst_test.step);
+
+        // Its tests are the executable statement of what "the oldest retained
+        // entry" and "this thread's window" mean, so they are rooted and run
+        // rather than compiled.
+        const execution_history_test = b.addTest(.{ .root_module = execution_history_mod });
+        const run_execution_history_test = b.addRunArtifact(execution_history_test);
+        check_step.dependOn(&run_execution_history_test.step);
+
+        // Per-family recovery bookkeeping: counts, log throttles and loop
+        // guards. Self-contained for the same reason, and rooted here so the
+        // guarantees it makes about family isolation are actually executed.
+        const recovery_ledger_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/process-core/recovery_ledger.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const recovery_ledger_test = b.addTest(.{ .root_module = recovery_ledger_mod });
+        const run_recovery_ledger_test = b.addRunArtifact(recovery_ledger_test);
+        bounded_dispatch_check.dependOn(&run_recovery_ledger_test.step);
+        check_step.dependOn(&run_recovery_ledger_test.step);
+
         const import_handler_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/import-handler/root.zig"),
             .target = target,
