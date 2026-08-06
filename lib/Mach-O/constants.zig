@@ -11,6 +11,19 @@ pub fn envMemSizeMb() ?u64 {
 }
 pub const MEM_BASE: u64 = 0x0;
 pub const PAGE_SIZE: u64 = 4096;
+// Retained instruction history is partitioned per guest thread rather than
+// shared. The old single 256-entry ring was divided among every live thread, so
+// a faulting thread's reach depended on how noisy its neighbours were — the
+// direct cause of history-based recognizers being unable to decide anything
+// about a long-running thread. Each thread now gets its own window.
+//
+// Sizing: 24 slots x 512 entries x ~160 bytes/entry is ~2 MB, heap-allocated
+// once per process. Xenia runs ~13 live guest threads, so the slot count leaves
+// headroom before eviction begins (and evictions are counted and reported).
+pub const TRACE_THREAD_SLOTS: usize = 24;
+pub const TRACE_PER_THREAD_LEN: usize = 512;
+// Retained for the fixed-size diagnostic rings that are still process-wide
+// (memory, import). Instruction history no longer uses it.
 pub const TRACE_BUFFER_LEN: usize = 256;
 pub const IMPORT_TRACE_BUFFER_LEN: usize = 64;
 pub const MEMORY_TRACE_BUFFER_LEN: usize = 64;

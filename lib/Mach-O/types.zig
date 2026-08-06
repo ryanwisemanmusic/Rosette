@@ -363,6 +363,12 @@ pub const InternalCompatibilityTargets = struct {
     imgui_mem_alloc: u64 = 0,
     imgui_mem_free: u64 = 0,
     imgui_settings_push_back: u64 = 0,
+    imgui_create_context: u64 = 0,
+    imgui_get_current_window: u64 = 0,
+    /// ImGui::TextEx entry. Rosette has no native renderer, so this GUI-only
+    /// call is modeled as a no-op rather than entering an incomplete ImGui
+    /// object graph during Xenia startup.
+    imgui_text_ex: u64 = 0,
     page_entry_construct_at_end: u64 = 0,
     libcpp_atomic_bool_control_block_vtable: u64 = 0,
     /// sha1::SHA1::processBytes — resolved at init for entry-tracking

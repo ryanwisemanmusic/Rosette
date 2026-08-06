@@ -86,6 +86,10 @@ pub const Metadata = struct {
     allocator: std.mem.Allocator,
     data: []const u8,
     sections: []Section,
+    /// Indices into `sections`, sorted by ascending section address. Built
+    /// once at load so `sectionAtAddress` is a binary search instead of a
+    /// linear scan on the instruction hot path.
+    section_lookup: []u32,
     segment_addresses: []u64,
     dylibs: [][]const u8,
     imports: []ImportedSymbol,
@@ -198,10 +202,28 @@ pub const Metadata = struct {
             command_offset += command_size;
         }
 
+        // Build an address-sorted section index so sectionAtAddress (called
+        // on every interpreted instruction via isExecutableAddress) is a
+        // binary search rather than a linear walk. Mach-O sections are
+        // non-overlapping; the index tie-break preserves file order for the
+        // (unusual) same-address case, matching the old first-match scan.
+        var section_lookup: std.ArrayList(u32) = .empty;
+        errdefer section_lookup.deinit(allocator);
+        for (0..sections.items.len) |section_index| {
+            try section_lookup.append(allocator, @intCast(section_index));
+        }
+        std.mem.sort(u32, section_lookup.items, sections.items, struct {
+            fn lessThan(ordered: []const Section, lhs: u32, rhs: u32) bool {
+                if (ordered[lhs].address != ordered[rhs].address) return ordered[lhs].address < ordered[rhs].address;
+                return lhs < rhs;
+            }
+        }.lessThan);
+
         var metadata = Metadata{
             .allocator = allocator,
             .data = data,
             .sections = try sections.toOwnedSlice(allocator),
+            .section_lookup = try section_lookup.toOwnedSlice(allocator),
             .segment_addresses = try segment_addresses.toOwnedSlice(allocator),
             .dylibs = try dylibs.toOwnedSlice(allocator),
             .imports = &.{},
@@ -224,6 +246,7 @@ pub const Metadata = struct {
 
     pub fn deinit(self: *Metadata) void {
         self.allocator.free(self.sections);
+        self.allocator.free(self.section_lookup);
         self.allocator.free(self.segment_addresses);
         self.allocator.free(self.dylibs);
         if (self.imports.len != 0) self.allocator.free(self.imports);
@@ -252,15 +275,51 @@ pub const Metadata = struct {
     }
 
     pub fn sectionAtAddress(self: *const Metadata, address: u64) ?Section {
-        for (self.sections) |section| {
-            if (address >= section.address and address - section.address < section.size) {
-                return section;
+        // Binary search over the address-sorted section index. Sections are
+        // non-overlapping, so the last section at or below `address` either
+        // contains it or nothing does. Same-address sections (if any) keep
+        // original file order via the index tie-break; walking back to the
+        // first entry of the group reproduces the old linear first-match.
+        var low: usize = 0;
+        var high: usize = self.section_lookup.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.sections[self.section_lookup[middle]].address <= address) {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
         }
+        if (low == 0) return null;
+        var best_index = low - 1;
+        const best_address = self.sections[self.section_lookup[best_index]].address;
+        while (best_index != 0 and self.sections[self.section_lookup[best_index - 1]].address == best_address) {
+            best_index -= 1;
+        }
+        const section = self.sections[self.section_lookup[best_index]];
+        if (address - section.address < section.size) return section;
         return null;
     }
 
+    /// Nearest defined symbol at or below `address`, **bounded** to addresses
+    /// the symbol can plausibly cover.
+    ///
+    /// The bound is not cosmetic. Without it, "last symbol at or below" answers
+    /// every address above the last symbol in the image — which is every
+    /// JIT-generated address, since generated code lives in sparse memory
+    /// outside the Mach-O image entirely. A run then reports things like
+    /// `0xa0059867 → …cvars::perf_monitor_detailed_metrics+0x9dfaf0f9`: a
+    /// confident, precise, and completely false attribution, printed by every
+    /// diagnostic that resolves a symbol. An unattributable address must read as
+    /// unattributable.
+    ///
+    /// Two independent bounds, both required:
+    ///   1. `address` lies inside a mapped image section, and
+    ///   2. `address` lies before the next defined symbol, and within the
+    ///      containing section — the best extent available without DWARF.
     pub fn nearestSymbol(self: *const Metadata, address: u64) ?SymbolMatch {
+        const section = self.sectionAtAddress(address) orelse return null;
+
         var low: usize = 0;
         var high: usize = self.addressed_symbols.len;
         while (low < high) {
@@ -279,12 +338,62 @@ pub const Metadata = struct {
         while (best_index != 0 and self.addressed_symbols[best_index - 1].address == best_address) {
             best_index -= 1;
         }
+
+        // The symbol must live in the same section as the queried address; a
+        // symbol from an earlier section says nothing about this one.
+        if (best_address < section.address or best_address >= section.address +| section.size) {
+            return null;
+        }
+        // `low` is the first symbol strictly above `address`; it bounds the
+        // best symbol's extent. Fall back to the section end when there is none.
+        const next_bound: u64 = if (low < self.addressed_symbols.len)
+            @min(self.addressed_symbols[low].address, section.address +| section.size)
+        else
+            section.address +| section.size;
+        if (address >= next_bound) return null;
+
         const best = self.addressed_symbols[best_index];
         return .{
             .name = best.name,
             .address = best.address,
             .offset = address - best.address,
         };
+    }
+
+    /// What kind of address this is, for diagnostics that must say something
+    /// when `nearestSymbol` honestly returns null.
+    pub const AddressKind = enum {
+        image_symbol,
+        /// Inside the image but with no symbol covering it (padding, data
+        /// without a symbol, a stripped region).
+        image_unsymbolized,
+        /// Outside every image section. For this runtime that is overwhelmingly
+        /// JIT-generated code in sparse memory, plus heap and stack.
+        outside_image,
+
+        pub fn label(self: AddressKind) []const u8 {
+            return switch (self) {
+                .image_symbol => "<symbol>",
+                .image_unsymbolized => "<image:unsymbolized>",
+                .outside_image => "<outside-image:generated-or-heap>",
+            };
+        }
+    };
+
+    pub fn addressKind(self: *const Metadata, address: u64) AddressKind {
+        if (self.sectionAtAddress(address) == null) return .outside_image;
+        if (self.nearestSymbol(address) != null) return .image_symbol;
+        return .image_unsymbolized;
+    }
+
+    /// Symbol name when one genuinely covers `address`, otherwise a label that
+    /// says why there is none. Use this wherever a log previously wrote
+    /// `if (symbol) |s| s.name else "<unknown>"` — "<unknown>" hid the
+    /// difference between "no symbol here" and "not part of the image at all",
+    /// which is the single most useful fact about a generated-code fault.
+    pub fn symbolLabel(self: *const Metadata, address: u64) []const u8 {
+        if (self.nearestSymbol(address)) |symbol| return symbol.name;
+        return self.addressKind(address).label();
     }
 
     pub fn symbolAddressWithPrefix(self: *const Metadata, prefix: []const u8) ?u64 {
@@ -781,4 +890,49 @@ test "metadata collects mod init function addresses" {
     defer metadata.deinit();
     try std.testing.expectEqual(@as(usize, 1), metadata.initializer_count);
     try std.testing.expectEqualSlices(u64, &.{0x1234_5678}, metadata.initializer_addresses);
+}
+
+test "sectionAtAddress binary search finds the containing section" {
+    const allocator = std.testing.allocator;
+    const sections = try allocator.alloc(Section, 3);
+    defer allocator.free(sections);
+    const lookup = try allocator.alloc(u32, 3);
+    defer allocator.free(lookup);
+
+    sections[0] = .{ .name = "b", .segment_name = "__TEXT", .address = 0x2000, .size = 0x100, .file_offset = 0, .flags = 0, .indirect_symbol_start = 0, .stub_size = 0 };
+    sections[1] = .{ .name = "c", .segment_name = "__TEXT", .address = 0x4000, .size = 0x100, .file_offset = 0, .flags = 0, .indirect_symbol_start = 0, .stub_size = 0 };
+    sections[2] = .{ .name = "a", .segment_name = "__TEXT", .address = 0x1000, .size = 0x100, .file_offset = 0, .flags = 0, .indirect_symbol_start = 0, .stub_size = 0 };
+    // Address-sorted: 0x1000 (a), 0x2000 (b), 0x4000 (c) — deliberately not
+    // file order, exercising the sorted lookup built at load.
+    lookup[0] = 2;
+    lookup[1] = 0;
+    lookup[2] = 1;
+
+    var metadata = Metadata{
+        .allocator = allocator,
+        .data = &.{},
+        .sections = sections,
+        .section_lookup = lookup,
+        .segment_addresses = &.{},
+        .dylibs = &.{},
+        .imports = &.{},
+        .bindings = &.{},
+        .initializer_count = 0,
+        .initializer_addresses = &.{},
+        .addressed_symbols = &.{},
+        .symtab = null,
+        .dysymtab = null,
+        .dyld_info = null,
+        .defined_symbols = std.StringHashMap(u64).init(allocator),
+    };
+    defer metadata.defined_symbols.deinit();
+
+    try std.testing.expectEqualStrings("a", metadata.sectionAtAddress(0x1000).?.name);
+    try std.testing.expectEqualStrings("a", metadata.sectionAtAddress(0x10ff).?.name);
+    try std.testing.expectEqualStrings("b", metadata.sectionAtAddress(0x2000).?.name);
+    try std.testing.expectEqualStrings("c", metadata.sectionAtAddress(0x40ff).?.name);
+    try std.testing.expect(metadata.sectionAtAddress(0x0fff) == null);
+    try std.testing.expect(metadata.sectionAtAddress(0x2100) == null);
+    try std.testing.expect(metadata.sectionAtAddress(0x3fff) == null);
+    try std.testing.expect(metadata.sectionAtAddress(0x5000) == null);
 }

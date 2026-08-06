@@ -88,6 +88,9 @@ const signal_handling = @import("process_core").signal_handling;
 const initializers = @import("process_core").initializers;
 const compat_handlers = @import("process_core").compat_handlers;
 const bounded_dispatch_fst = @import("process_core").bounded_dispatch_fst;
+const recovery_ledger = @import("process_core").recovery_ledger;
+const execution_history = @import("execution_history");
+const ExecutionHistory = execution_history.History(TraceEntry);
 const crash_diag = @import("process_core").crash_diag;
 
 test {
@@ -103,6 +106,54 @@ const RegId = x64_decoder.RegId;
 const Cond = x64_decoder.Condition;
 const Op = x64_decoder.Op;
 const DecodedInsn = x64_decoder.DecodedInsn;
+
+/// Relative control-flow operands are signed displacements, not memory
+/// addresses. `rip_relative` is also used for RIP-relative ModRM operands, so
+/// the opcode must disambiguate the two before address materialization.
+fn hasRelativeControlDisplacement(op: Op) bool {
+    return switch (op) {
+        .call_rel32, .jmp_rel8, .jcc_rel8, .jcc_rel32 => true,
+        else => false,
+    };
+}
+
+test "relative control displacements are not materialized as memory addresses" {
+    try std.testing.expect(hasRelativeControlDisplacement(.call_rel32));
+    try std.testing.expect(hasRelativeControlDisplacement(.jmp_rel8));
+    try std.testing.expect(hasRelativeControlDisplacement(.jcc_rel32));
+    try std.testing.expect(!hasRelativeControlDisplacement(.jmp_mem64));
+    try std.testing.expect(!hasRelativeControlDisplacement(.mov_reg64_mem64));
+}
+
+test "special-RIP table binary search finds only registered addresses" {
+    // Sorted, deduplicated view matching buildSpecialRipTable output.
+    const table = [_]u64{ 0x1000, 0x2000, 0x4000, 0x8000 };
+    try std.testing.expect(specialRipTableContains(&table, 0x1000));
+    try std.testing.expect(specialRipTableContains(&table, 0x8000));
+    try std.testing.expect(!specialRipTableContains(&table, 0x0000));
+    try std.testing.expect(!specialRipTableContains(&table, 0x0fff));
+    try std.testing.expect(!specialRipTableContains(&table, 0x3000));
+    try std.testing.expect(!specialRipTableContains(&table, 0x9000));
+    try std.testing.expect(!specialRipTableContains(&[_]u64{}, 0x1000));
+}
+/// R2 (N3): binary search over the address-sorted special-RIP table. The
+/// table is a load-time-resolved index of every fixed target the
+/// per-instruction handler chain probes, so a miss here (combined with the
+/// O(1) range probes in specialRipPossible) proves the chain is inert.
+fn specialRipTableContains(table: []const u64, rip: u64) bool {
+    var low: usize = 0;
+    var high: usize = table.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (table[middle] < rip) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low < table.len and table[low] == rip;
+}
+
 const VexArithmetic = macho_core.decoder.VexArithmetic;
 const VexBitwise = macho_core.decoder.VexBitwise;
 const BitScanKind = x64_decoder.BitScanKind;
@@ -125,6 +176,8 @@ const envMemSizeMb = constants.envMemSizeMb;
 const MEM_BASE = constants.MEM_BASE;
 const PAGE_SIZE = constants.PAGE_SIZE;
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
+const TRACE_THREAD_SLOTS = constants.TRACE_THREAD_SLOTS;
+const TRACE_PER_THREAD_LEN = constants.TRACE_PER_THREAD_LEN;
 const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;
 const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
 const ENDIAN_EVIDENCE_BUFFER_LEN = constants.ENDIAN_EVIDENCE_BUFFER_LEN;
@@ -347,10 +400,34 @@ pub const MachOState = struct {
     toml_ascii_block: ?TomlAsciiBlock = null,
     toml_fault_diagnostics_dumped: bool = false,
     patch_db_empty_array_recoveries: u64 = 0,
+    // R2 (perf audit, N3): load-time-resolved, address-sorted table of every
+    // fixed special-RIP target probed by the per-instruction handler chain
+    // (internal compatibility targets, cvar launch-option vector, toml fast
+    // path entries). step() consults it with one binary search inside
+    // specialRipPossible() instead of 9 handler calls + ~65 compares per
+    // instruction; on a hit the full chain still runs with identical
+    // short-circuit semantics.
+    special_rip_table: []u64 = &.{},
+    // R2 (N3 phase-arm): the toml/patch-db probes only fire while config
+    // parsing may still run. Cleared once runInitializers succeeds so the
+    // special-RIP gate drops the non-address patch-db state probe from the
+    // per-instruction cost stack.
+    config_parsing_active: bool = true,
+    // R2 (N7): gates the per-initializer and vtable-lifecycle detail log
+    // lines that flooded the run log (722 `running initializer` lines + per
+    // object vtable transitions during static init). Progress lines and
+    // failure/deferral diagnostics stay unconditionally. Enable with
+    // ROSETTE_MACHO_INITIALIZER_DETAIL=1.
+    initializer_detail_logging: bool = false,
+    // R2 (N3): if building the special-RIP table fails (startup OOM), fall
+    // back to probing every instruction (the pre-R2 behavior) rather than
+    // silently skipping the handler chain.
+    special_rip_table_failed: bool = false,
     stalled_instruction_reports: u64 = 0,
     initializer_abort_requested: bool = false,
     initializer_abort_reason: initialization_resolution.DeferralReason = .none,
     cxxopts_split_accelerations: u64 = 0,
+    imgui_text_ex_noops: u64 = 0,
     positional_options_captured: bool = false,
     executed_steps: u64 = 0,
     internal_targets: InternalCompatibilityTargets = .{},
@@ -480,18 +557,25 @@ pub const MachOState = struct {
     sparse_memory: sparse_virtual_memory.Manager,
     memory_regions: memory_provenance.Registry,
     memory_writes: memory_write_provenance.Tracker = .{},
-    generated_endian_contract_recoveries: u64 = 0,
-    generated_null_scalar_read_recoveries: u64 = 0,
-    generated_null_indirect_skips: u64 = 0,
+    // One ledger per recovery family: its own count, its own log throttle, and
+    // its own loop guard. These were five bare counters and one shared guard,
+    // which made every one of them ambiguous — see recovery_ledger.zig.
+    generated_endian_contract: recovery_ledger.Ledger = .{},
+    generated_null_scalar_read: recovery_ledger.Ledger = .{},
+    generated_null_indirect: recovery_ledger.Ledger = .{},
     // Skips of indirect transfers from JIT-generated code to unpatched Xenia
     // indirection-table sentinels (guest-module addresses such as 0x82582cc8):
-    // the same code-cache-miss family as generated_null_indirect_skips, but
-    // the target is the guest function address itself rather than 0.
-    generated_guest_dispatch_skips: u64 = 0,
+    // the same code-cache-miss family as generated_null_indirect, but the
+    // target is the guest function address itself rather than 0.
+    generated_guest_dispatch: recovery_ledger.Ledger = .{},
     // Zero-allocation, fail-closed recognizer for Xenia's generated
     // CALL_POSSIBLE_RETURN path. It may redirect only when the 0x67 null-base
     // load, matching guest return, tail-jump shape, and host frame all agree.
     bounded_dispatch: bounded_dispatch_fst.Machine = .{},
+    // The transducer's own recoveries. Previously its redirects were counted
+    // against the null-scalar-read and frame-return families, so neither of
+    // those counters meant what it said and the transducer had no loop guard.
+    bounded_dispatch_recoveries: recovery_ledger.Ledger = .{},
     // RIP of the most recent generated null scalar read satisfied as
     // zero-fill; the null indirect transfer recovery reports the linkage when
     // a null function pointer dispatch follows within a short window.
@@ -500,12 +584,7 @@ pub const MachOState = struct {
     // or guest sentinel): the bytes after the dispatch are Xenia's dead
     // function-exit epilogue, so we return to the host caller via [rbp+8]
     // instead of falling through (which double-deallocates the frame).
-    generated_dispatch_frame_returns: u64 = 0,
-    // Loop guard: RIP of the last generated dispatch recovery site and the
-    // consecutive count, so a non-progressing guest terminates with diagnostics
-    // instead of spinning on the same miss forever.
-    last_dispatch_recovery_rip: u64 = 0,
-    consecutive_dispatch_recoveries: u32 = 0,
+    generated_dispatch_frame_return: recovery_ledger.Ledger = .{},
     vtable_tracker: vt.VtableTracker,
     /// Tracks vtable writes for non-heap (stack-local / modeled) objects.
     /// Registered by the stream bridge during stringstream construction
@@ -539,9 +618,13 @@ pub const MachOState = struct {
     page_entry_bulk_bytes: u64 = 0,
     initializer_memory: memory_transaction.Journal,
     initializer_checkpoint: ?InitializerCheckpoint = null,
-    trace_entries: [TRACE_BUFFER_LEN]TraceEntry = [_]TraceEntry{TraceEntry{}} ** TRACE_BUFFER_LEN,
-    trace_index: usize = 0,
-    trace_filled: bool = false,
+    // Thread-partitioned retained instruction history. This replaces a single
+    // TRACE_BUFFER_LEN ring shared by every guest thread: with thirteen live
+    // threads a faulting thread's usable window was a couple of dozen entries,
+    // which is why history-based recognizers reported "always zero" for a
+    // register set a billion steps earlier. Heap-backed, because per-thread
+    // capacity times slot count is far too large to carry by value.
+    execution_history: ExecutionHistory,
     trace_range_start: ?u64 = null,
     trace_range_end: ?u64 = null,
     last_trace_rip: u64 = 0,
@@ -572,6 +655,20 @@ pub const MachOState = struct {
     // so the fast path is a direct slice read; enable with
     // ROSETTE_MACHO_MEMORY_TRACE=1 when diagnosing faults/near-null causality.
     memory_trace_enabled: bool = false,
+    // R3 (perf audit, N4): write bookkeeping — capture/commit mutation
+    // before-images, memory_writes provenance records, recordAllocationWrite
+    // (vtable tracking + write-protection), and the suspicious-write detector
+    // — serves fault-time diagnostics but used to run on every guest store.
+    // Off by default so stores pay ~2 ops (translate + write + generation
+    // note); arm with ROSETTE_MACHO_WRITE_DIAGNOSTICS=1 for full diagnosis.
+    // noteGuestWrite (decode-cache invalidation, correctness-critical) stays
+    // always-on regardless of this flag.
+    write_diagnostics_armed: bool = false,
+    /// Set while a Rosette fault repair is writing guest memory, so
+    /// write-provenance records the store as `host_repair` instead of
+    /// attributing it to the faulting guest instruction. Always set through
+    /// `writeMemValAsHostRepair`, never assigned directly.
+    host_repair_in_flight: bool = false,
     // Always-on endian-contract evidence ring. Populated at the execute site
     // (no re-decode: the interpreter already has the decoded instruction) for
     // the narrow set of ops the generated-endian contract consumes. Unlike the
@@ -680,6 +777,7 @@ pub const MachOState = struct {
             .initializer_resolver = initialization_resolution.Engine.init(allocator, initializer_count),
             .vtt_resolver = vtt_resolution.VttBindingResolver.init(allocator),
             .initializer_memory = memory_transaction.Journal.init(allocator, PAGE_SIZE),
+            .execution_history = try ExecutionHistory.init(allocator, TRACE_THREAD_SLOTS, TRACE_PER_THREAD_LEN),
             .fs_forwarder = fs_io_forwarder.Forwarder.init(allocator),
             .memory_forwarder = memory_management_forwarder.Manager.init(allocator),
             .sparse_memory = sparse_virtual_memory.Manager.init(allocator),
@@ -802,6 +900,21 @@ pub const MachOState = struct {
         result.internal_targets.imgui_settings_push_back = result.metadata.symbolAddressWithPrefix(
             "__ZN8ImVectorI20ImGuiSettingsHandlerE9push_backERKS0_",
         ) orelse 0;
+        result.internal_targets.imgui_create_context = result.metadata.symbolAddressWithPrefix(
+            "__ZN5ImGui12CreateContextEPNS_9ImFontAtlasE",
+        ) orelse 0;
+        result.internal_targets.imgui_get_current_window = result.metadata.symbolAddressWithPrefix(
+            "__ZN5ImGui16GetCurrentWindowEv",
+        ) orelse 0;
+        result.internal_targets.imgui_text_ex = result.metadata.symbolAddressWithPrefix(
+            "__ZN5ImGui6TextExEPKcS1_i",
+        ) orelse 0;
+        if (result.internal_targets.imgui_text_ex != 0) {
+            machoCapturePrint(
+                "macho-processor: ImGui TextEx compatibility target resolved: address=0x{x} renderer_policy=noop\n",
+                .{result.internal_targets.imgui_text_ex},
+            );
+        }
         result.internal_targets.page_entry_construct_at_end = result.metadata.symbolAddressWithPrefix(
             "__ZNSt3__114__split_bufferIN2xe9PageEntryERNS_9allocatorIS2_EEE18__construct_at_endEm",
         ) orelse 0;
@@ -856,6 +969,11 @@ pub const MachOState = struct {
         result.toml_read_next_entry = result.metadata.symbolAddressWithPrefix(
             "__ZN4toml2v34impl11utf8_readerINSt3__113basic_istreamIcNS3_11char_traitsIcEEEEE9read_nextEv",
         );
+        // P1-3 (perf audit): arm the SHA1 tracer here (not in loadAndRun) so
+        // the init log below reflects the effective state. Default off;
+        // ROSETTE_MACHO_SHA1_TRACE=1 enables it when a SHA1 hot-loop stall is
+        // being diagnosed.
+        result.sha1_tracer.enabled = environmentFlag("ROSETTE_MACHO_SHA1_TRACE");
         var defined_symbols = result.metadata.definedSymbolIterator();
         while (defined_symbols.next()) |entry| {
             if (!libcpp_stream_bridge.Bridge.recognizesSymbol(entry.key_ptr.*)) continue;
@@ -882,6 +1000,15 @@ pub const MachOState = struct {
             result.registerSyntheticThunk(tlv_runtime.bootstrap_thunk, 16, "_tlv_bootstrap");
         }
 
+        // R2 (N3): build the address-sorted special-RIP table now that every
+        // load-time target (internal compatibility, toml fast path, cvar
+        // launch-option vector) is resolved. A table is a pure index over the
+        // same addresses the chain probes; failure falls back to probing every
+        // instruction (pre-R2 behavior).
+        result.buildSpecialRipTable() catch {
+            result.special_rip_table_failed = true;
+        };
+
         // Initialize the thread scheduler
         // result.thread_scheduler.init();
 
@@ -901,6 +1028,7 @@ pub const MachOState = struct {
     }
 
     pub fn deinit(self: *MachOState) void {
+        self.execution_history.deinit(self.allocator);
         self.scheduler_log.close();
         self.jit_log.close();
         self.macho_log.close();
@@ -929,6 +1057,7 @@ pub const MachOState = struct {
         self.allocator.free(self.page_permissions);
         self.initializer_memory.deinit();
         self.allocator.free(self.decode_cache);
+        if (self.special_rip_table.len != 0) self.allocator.free(self.special_rip_table);
         if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
         self.metadata.deinit();
         self.allocator.free(self.mem);
@@ -2201,7 +2330,7 @@ pub const MachOState = struct {
     }
 
     fn recordTrace(self: *MachOState, decoded: DecodedInsn) void {
-        self.trace_entries[self.trace_index] = .{
+        self.execution_history.record(self.active_guest_thread, .{
             .thread_handle = self.active_guest_thread,
             .rip = self.regs.rip,
             .op = decoded.op,
@@ -2222,9 +2351,7 @@ pub const MachOState = struct {
             .r13 = self.regs.r13,
             .r14 = self.regs.r14,
             .r15 = self.regs.r15,
-        };
-        self.trace_index = (self.trace_index + 1) % TRACE_BUFFER_LEN;
-        if (self.trace_index == 0) self.trace_filled = true;
+        });
     }
 
     fn shouldTraceRIP(self: *const MachOState, rip: u64) bool {
@@ -2236,16 +2363,12 @@ pub const MachOState = struct {
     }
 
     pub fn dumpRecentTrace(self: *const MachOState) void {
-        const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        const count: usize = self.execution_history.countFor(self.active_guest_thread);
         if (count == 0) return;
         log.err("recent trace dump (most recent last, count={d})", .{count});
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            const idx = if (self.trace_filled)
-                (self.trace_index + i) % TRACE_BUFFER_LEN
-            else
-                i;
-            const entry = self.trace_entries[idx];
+            const entry = self.execution_history.chronological(self.active_guest_thread, i) orelse continue;
             log.err("trace[{d}]: thread=0x{x} rip=0x{x} op={s} len={d} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
                 i,
                 entry.thread_handle,
@@ -2673,6 +2796,130 @@ pub const MachOState = struct {
         return self.mem[@intCast(offset)..][0..@min(@as(usize, 16), remaining)];
     }
 
+    /// R2 (N3): single special-RIP probe replacing the 9 per-instruction
+    /// handler calls (which paid ~65 compares + 1 function call on every
+    /// instruction even when all inert). True only when `rip` could possibly
+    /// match one of the load-time-resolved fixed targets (one binary search
+    /// over special_rip_table) or one of the O(1) range/state probes. The
+    /// chain in step() is provably inert when this returns false, so it is
+    /// skipped wholesale. Over-permissive hits are safe (the chain re-verifies
+    /// every condition); a miss must imply no handler can fire.
+    ///
+    /// Note (deviation from the audit's "any_special_rips bool"): the gate
+    /// always runs (~10 compares) rather than being short-circuited by a bool
+    /// computed at load, because the dynamic-library thunk region can be
+    /// populated at runtime (guest symbols are allocated as dylibs load), so a
+    /// static bool could incorrectly suppress its probe. ~10 compares is still
+    /// ~4x cheaper than the pre-R2 9 calls + ~65 compares.
+    fn specialRipPossible(self: *const MachOState) bool {
+        if (self.special_rip_table_failed) return true; // fallback: run the chain always
+        const rip = self.regs.rip;
+        // All synthetic/thunk bases live at or above the TLV bootstrap thunk
+        // (0xFFFF_F700_0000_0000). One watermark compare replaces the five
+        // per-region probes for the overwhelmingly common main-image rip.
+        if (rip >= tlv_runtime.bootstrap_thunk) {
+            if (rip >= BOUND_IMPORT_THUNK_BASE) return true;
+            if (compat_runtime.syntheticThunk(rip) != null) return true;
+            if (tlv_runtime.Runtime.handles(rip)) return true;
+            if (rip >= dynamic_library_forwarder.GUEST_SYMBOL_THUNK_BASE) {
+                const offset = rip - dynamic_library_forwarder.GUEST_SYMBOL_THUNK_BASE;
+                if (offset != 0 and offset % 16 == 1 and
+                    (offset - 1) / 16 < dynamic_library_forwarder.MAX_GUEST_SYMBOLS)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (self.special_rip_table.len != 0 and specialRipTableContains(self.special_rip_table, rip)) return true;
+        if (rip >= self.stub_helper_start and rip < self.stub_helper_end) return true;
+        if (self.libcpp_stream_target_max != 0 and
+            rip >= self.libcpp_stream_target_min and
+            rip <= self.libcpp_stream_target_max) return true;
+        if (self.config_parsing_active and self.regs.rdi == 0 and
+            self.libcxx_streams.latestPatchSchemaHasEmptyPatchSet())
+        {
+            return true;
+        }
+        return false;
+    }
+
+    /// R2 (N3): collect every fixed special-RIP address the per-instruction
+    /// handler chain probes, sort and deduplicate, and publish the table. The
+    /// array is bounded (26 internal targets + 32 cvar vector slots + 2 toml
+    /// entries), so a fixed stack buffer avoids intermediate allocation.
+    fn buildSpecialRipTable(self: *MachOState) !void {
+        var entries: [64]u64 = undefined;
+        var count: usize = 0;
+        const targets = &self.internal_targets;
+        const fixed = [_]u64{
+            targets.cxxopts_split_option_names,
+            targets.xenia_cpu_feature_detector_initialize_cpu_info,
+            targets.xenia_vulkan_provider_vulkan_device,
+            targets.parse_launch_arguments,
+            targets.initialize_logging,
+            targets.shutdown_logging,
+            targets.guest_log_get_thread_buffer,
+            targets.guest_log_append_formatted,
+            targets.guest_log_append_view,
+            targets.libcxx_basic_streambuf_pubsetbuf,
+            targets.libcxx_basic_ifstream_default_constructor,
+            targets.libcxx_basic_ifstream_destructor_1,
+            targets.libcxx_basic_ifstream_destructor_2,
+            targets.libcxx_getline,
+            targets.libcxx_getline_delimiter,
+            targets.libcxx_basic_string_substr,
+            targets.print_config_to_log,
+            targets.imgui_default_malloc,
+            targets.imgui_default_free,
+            targets.imgui_mem_alloc,
+            targets.imgui_mem_free,
+            targets.imgui_settings_push_back,
+            targets.imgui_create_context,
+            targets.imgui_get_current_window,
+            targets.imgui_text_ex,
+            targets.page_entry_construct_at_end,
+        };
+        for (fixed) |address| {
+            if (address != 0) {
+                entries[count] = address;
+                count += 1;
+            }
+        }
+        for (targets.cvar_add_to_launch_options[0..targets.cvar_add_to_launch_options_count]) |address| {
+            if (address != 0) {
+                entries[count] = address;
+                count += 1;
+            }
+        }
+        if (self.toml_ascii_entry) |address| {
+            entries[count] = address;
+            count += 1;
+        }
+        if (self.toml_read_next_entry) |address| {
+            entries[count] = address;
+            count += 1;
+        }
+        // The fixed targets (26) + cvar vector (32) + toml entries (2) bound
+        // at 60 < 64. Assert rather than silently truncate: a truncated table
+        // would make the gate miss entries and skip handler dispatch with no
+        // diagnostic — the exact failure mode a completeness gate must not have.
+        std.debug.assert(count <= entries.len);
+        std.mem.sort(u64, entries[0..count], {}, std.sort.asc(u64));
+        // Deduplicate adjacent equal addresses (multiple conditions may match).
+        var write: usize = 0;
+        for (entries[0..count]) |address| {
+            if (write != 0 and entries[write - 1] == address) continue;
+            entries[write] = address;
+            write += 1;
+        }
+        self.special_rip_table = try self.allocator.dupe(u64, entries[0..write]);
+        machoCapturePrint(
+            "macho-processor: special-RIP table built: entries={d} (R2/N3 single-probe dispatch)\n",
+            .{self.special_rip_table.len},
+        );
+    }
+
     fn decodeAt(self: *MachOState) ?DecodedInsn {
         const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
         const cache_index = constants.decodeCacheIndex(fetch_address);
@@ -2759,16 +3006,18 @@ pub const MachOState = struct {
         const base_register: ?RegId = if (decoded.sib_has_base) decoded.sib_base_reg else null;
         decoded.segment = x64_decoder.selectSegment(.explicit_data, base_register, prefixes.segment_override);
         const raw_displacement = decoded.addr;
-        decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
-            .displacement = raw_displacement,
-            .has_index = decoded.sib_has_index,
-            .index_reg = decoded.sib_index_reg,
-            .scale = decoded.sib_scale,
-            .has_base = decoded.sib_has_base,
-            .base_reg = decoded.sib_base_reg,
-            .rip_relative = decoded.rip_relative,
-            .segment = decoded.segment,
-        }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+        if (!hasRelativeControlDisplacement(decoded.op)) {
+            decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+                .displacement = raw_displacement,
+                .has_index = decoded.sib_has_index,
+                .index_reg = decoded.sib_index_reg,
+                .scale = decoded.sib_scale,
+                .has_base = decoded.sib_has_base,
+                .base_reg = decoded.sib_base_reg,
+                .rip_relative = decoded.rip_relative,
+                .segment = decoded.segment,
+            }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+        }
         const instruction_byte_count: u8 = @intCast(@min(
             @as(usize, @max(decoded.len, 1)),
             @min(bytes.len, @as(usize, 15)),
@@ -2799,17 +3048,25 @@ pub const MachOState = struct {
             self.finishActiveGuestThread();
             return !self.terminated;
         }
-        if (self.handleInternalCompatibility()) return !self.terminated;
-        if (self.handleTlvBootstrap()) return !self.terminated;
-        if (self.handleBoundImportThunk()) return !self.terminated;
-        if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
-        if (self.handleDynamicLibraryThunk()) return !self.terminated;
-        if (self.handleStubHelperTransition()) {
-            return !self.terminated;
+        // R2 (N3): the 9 special-RIP handlers below used to run (and pay
+        // ~65 compares + a function call) on every instruction even when all
+        // inert. specialRipPossible is one binary search over the
+        // load-time-resolved table plus O(1) range/state probes; the chain
+        // runs only when rip could actually match a target, with identical
+        // short-circuit semantics.
+        if (self.specialRipPossible()) {
+            if (self.handleInternalCompatibility()) return !self.terminated;
+            if (self.handleTlvBootstrap()) return !self.terminated;
+            if (self.handleBoundImportThunk()) return !self.terminated;
+            if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
+            if (self.handleDynamicLibraryThunk()) return !self.terminated;
+            if (self.handleStubHelperTransition()) {
+                return !self.terminated;
+            }
+            self.handleTomlReadNextIntegrity();
+            if (self.handleTomlAsciiFastPath()) return !self.terminated;
+            if (self.handlePatchDbEmptyPatchArray()) return !self.terminated;
         }
-        self.handleTomlReadNextIntegrity();
-        if (self.handleTomlAsciiFastPath()) return !self.terminated;
-        if (self.handlePatchDbEmptyPatchArray()) return !self.terminated;
         if (!self.isExecutableAddress(self.regs.rip)) {
             if (self.pending_control_transfer) |context| {
                 // Generated code dispatching to an unpatched Xenia indirection
@@ -2827,13 +3084,15 @@ pub const MachOState = struct {
                     return true;
                 }
                 memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
+                memory_access.logNonExecutableTarget(self, self.regs.rip, context);
                 self.terminateForInvalidControlTransfer(context);
                 self.dumpRecentTrace();
                 return false;
             }
             memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
+            memory_access.logNonExecutableTarget(self, self.regs.rip, null);
             machoCapturePrint(
-                "macho-processor: invalid control-flow target rip=0x{x}; address is outside executable Mach-O segments\n",
+                "macho-processor: invalid control-flow target rip=0x{x}; address is not an executable instruction target\n",
                 .{self.regs.rip},
             );
             self.dumpRecentTrace();
@@ -3145,6 +3404,19 @@ pub const MachOState = struct {
 
     pub fn run(self: *MachOState) void {
         var steps: u64 = 0;
+        // N5 (perf audit): replace the four per-instruction `steps % X`
+        // modulo operations below with down-counters. Each counter decrements
+        // once per iteration and fires (then resets) at exactly the step the
+        // old modulo would have matched — including the step-0 heartbeat
+        // (`0 % HEARTBEAT_INTERVAL == 0` fires on the first iteration) and
+        // excluding 0 for the `steps != 0`-guarded reports. The concise 100M
+        // progress report instead uses a boundary comparison (steps >= next
+        // boundary) so checkpoints land on exact multiples of 100,000,000 — a
+        // decrement-then-fire counter would fire at steps == N*100M - 1.
+        var next_progress_report: u64 = PROGRESS_REPORT_INTERVAL;
+        var next_heartbeat: u64 = 0;
+        var next_concise_report: u64 = 100_000_000;
+        var next_memory_init_report: u64 = 1_000_000;
         machoCapturePrint(
             "macho-processor: CMPXCHG contract active — 0F B0 executes at byte width, flags use ACC-DEST, and assertion-triggered CAS repair paths are absent.\n",
             .{},
@@ -3189,7 +3461,9 @@ pub const MachOState = struct {
             // self.thread_scheduler.setUIContext(self.cooperative_ui_context != null);
             // self.thread_scheduler.updatePendingIdle(self.pendingIdleCallbackCount());
             // self.thread_scheduler.updateDeferredThreads(self.pthreads.deferred_threads);
-            if (steps != 0 and steps % PROGRESS_REPORT_INTERVAL == 0) {
+            next_progress_report -|= 1;
+            if (next_progress_report == 0) {
+                next_progress_report = PROGRESS_REPORT_INTERVAL;
                 const symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const heap_summary = self.memory_forwarder.summary();
                 const snapshot: startup_observer.Snapshot = .{
@@ -3228,7 +3502,9 @@ pub const MachOState = struct {
                     }
                 }
             }
-            if (steps % HEARTBEAT_INTERVAL == 0) {
+            next_heartbeat -|= 1;
+            if (next_heartbeat == 0) {
+                next_heartbeat = HEARTBEAT_INTERVAL;
                 const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const heartbeat_snapshot: startup_observer.Snapshot = .{
                     .step = steps,
@@ -3323,7 +3599,8 @@ pub const MachOState = struct {
                     .symbol = if (hb_symbol) |resolved| resolved.name else "",
                 });
             }
-            if (self.concise_output and steps != 0 and steps % 100_000_000 == 0) {
+            if (self.concise_output and steps >= next_concise_report) {
+                next_concise_report +%= 100_000_000;
                 var progress_buffer: [256]u8 = undefined;
                 const progress = std.fmt.bufPrint(
                     &progress_buffer,
@@ -3348,7 +3625,9 @@ pub const MachOState = struct {
             }
             if (!self.step()) break;
             self.maybeYieldActiveGuestThreadForQuantum();
-            if (self.page_entry_bulk_initializations != 0 and steps != 0 and steps % 1_000_000 == 0) {
+            next_memory_init_report -|= 1;
+            if (self.page_entry_bulk_initializations != 0 and next_memory_init_report == 0) {
+                next_memory_init_report = 1_000_000;
                 self.logMemoryInitializationProgress(steps);
             }
         }
@@ -3441,8 +3720,13 @@ pub const MachOState = struct {
     /// we detect it heuristically when a function exceeds 1M guest instructions,
     /// and additionally by intercepting calls targeting the resolved symbol.
     pub const Sha1Tracer = struct {
-        /// Master enable — always on, negligible overhead.
-        enabled: bool = true,
+        /// P1-3 (perf audit): master enable. Defaults to OFF so the two
+        /// per-instruction probe sites (processBytes entry + post-exec
+        /// accounting) collapse to a single compare on the hot path; the
+        /// tracer is a diagnostic that only substantiates a SHA1 hot-loop
+        /// stall, and it is only meaningful when a stall is being
+        /// investigated. Arm with ROSETTE_MACHO_SHA1_TRACE=1.
+        enabled: bool = false,
         /// True only while the resolved SHA1::processBytes invocation is on
         /// the active guest thread's stack. Keeping this explicit prevents
         /// unrelated long-running functions from being diagnosed as SHA1.
@@ -4127,9 +4411,17 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.memory_trace_enabled = environmentFlag("ROSETTE_MACHO_MEMORY_TRACE");
+    // R3 (perf audit): write diagnostics (mutation provenance, vtable
+    // tracking, suspicious-write detector) default off so the store path is
+    // ~2 ops; arm with ROSETTE_MACHO_WRITE_DIAGNOSTICS=1 when a fault needs
+    // write-order diagnosis.
+    state.write_diagnostics_armed = environmentFlag("ROSETTE_MACHO_WRITE_DIAGNOSTICS");
     state.strict_initializers = environmentFlag("ROSETTE_MACHO_STRICT_INITIALIZERS");
     state.strict_imports = environmentFlag("ROSETTE_MACHO_STRICT_IMPORTS");
     state.max_steps = environmentUnsigned("ROSETTE_MACHO_MAX_STEPS", state.max_steps);
+    // N7 (perf audit): per-initializer + vtable-lifecycle detail logs default
+    // to off; the run log flooded with ~700K chars of initializer detail.
+    state.initializer_detail_logging = environmentFlag("ROSETTE_MACHO_INITIALIZER_DETAIL");
 
     var temp_state = try macho.load(allocator, slice);
     defer temp_state.deinit();
@@ -4278,6 +4570,20 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     }
 
     state.startup.enter(.main_enter, state.executed_steps);
+    // R2 (N3 phase-arm): config parsing (cvar, toml patch files) completes
+    // with the initializer phase. Deactivate the non-address patch-db probe so
+    // the special-RIP gate drops its per-instruction state check; the fixed
+    // toml table entries become unreachable once is_ascii/read_next stop
+    // being called.
+    //
+    // Trade-off (accepted, per audit): a title that opened a patch file with
+    // an empty patch set *after* the initializer phase would no longer get the
+    // PatchDB empty-patch-array recovery. Xenia loads patch files pre-main
+    // (the audit's run log shows patches completing in the initializer phase),
+    // so the probe's trigger condition cannot occur after this point for the
+    // audited target; the schema state check alone (without the phase flag)
+    // is the fallback if a title ever violates that assumption.
+    state.config_parsing_active = false;
     output.human("Loading guest program...\n", .{});
     machoCapturePrint("macho-processor: starting execution at 0x{x}, rsp=0x{x}\n", .{ state.regs.rip, state.regs.rsp });
 
