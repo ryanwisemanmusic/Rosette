@@ -1470,6 +1470,11 @@ pub const ElfState = struct {
             },
             .sahf => x64_decoder.applySahf(&self.regs.rflags, @truncate(self.regs.rax >> 8)),
 
+            // The D8-DF x87 arithmetic family (fadd/fmul/fsub/fsubr/fdiv/fdivr
+            // with m32/m64, plus the fi* integer forms) is decoded by the shared
+            // decoder into a single .x87_binary op with the operation packed in
+            // x87.imm; the per-size members below are the only x87 ops the
+            // shared Op enum exposes.
             .fild_mem16, .fld_mem32, .fld_mem64, .fld_mem80, .fstp_mem32, .fstp_mem64, .fld_st, .fstp_st, .fxch_st, .ffree_st, .fninit, .fnstsw_ax, .fnstcw_mem16, .fldcw_mem16, .x87_binary, .fucomip_st => {},
 
             .fild_mem32 => {
