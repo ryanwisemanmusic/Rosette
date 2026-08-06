@@ -8,9 +8,9 @@ const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
 const MAX_LIBRARIES = 16;
 const MAX_GUEST_LIBRARIES = 32;
-const MAX_GUEST_SYMBOLS = 256;
+pub const MAX_GUEST_SYMBOLS = 256;
 const GUEST_LIBRARY_HANDLE_BASE: u64 = 0xFFFF_FC00_0000_0000;
-const GUEST_SYMBOL_THUNK_BASE: u64 = 0xFFFF_FB00_0000_0000;
+pub const GUEST_SYMBOL_THUNK_BASE: u64 = 0xFFFF_FB00_0000_0000;
 
 extern fn dlopen(path: ?[*:0]const u8, mode: c_int) ?*anyopaque;
 extern fn dlsym(handle: *anyopaque, symbol: [*:0]const u8) ?*anyopaque;

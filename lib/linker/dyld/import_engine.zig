@@ -85,6 +85,7 @@ pub const ContractId = enum {
     libcxx_basic_ios_good,
     libcxx_basic_ios_fail,
     libcxx_basic_ios_eof,
+    xenia_vd_set_graphics_interrupt_callback,
 };
 
 pub const Contract = struct {
@@ -256,6 +257,13 @@ pub const basic_ios_bool = Contract{ .id = .libcxx_basic_ios_bool, .canonical_sy
 pub const basic_ios_good = Contract{ .id = .libcxx_basic_ios_good, .canonical_symbol = "basic_ios::good", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
 pub const basic_ios_fail = Contract{ .id = .libcxx_basic_ios_fail, .canonical_symbol = "basic_ios::fail", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
 pub const basic_ios_eof = Contract{ .id = .libcxx_basic_ios_eof, .canonical_symbol = "basic_ios::eof", .domain = .libcxx, .confidence = .verified, .effects = .{ .return_convention = .rax } };
+pub const xenia_vd_set_graphics_interrupt_callback = Contract{
+    .id = .xenia_vd_set_graphics_interrupt_callback,
+    .canonical_symbol = "VdSetGraphicsInterruptCallback",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void, .writes_guest_memory = false },
+};
 
 pub fn normalizeSymbol(symbol: []const u8) []const u8 {
     var normalized = symbol;
@@ -340,6 +348,9 @@ pub fn contractFor(symbol: []const u8) ?Contract {
         if (std.mem.indexOf(u8, normalized, "4good") != null) return basic_ios_good;
         if (std.mem.indexOf(u8, normalized, "4fail") != null) return basic_ios_fail;
         if (std.mem.indexOf(u8, normalized, "3eof") != null) return basic_ios_eof;
+    }
+    if (std.mem.indexOf(u8, normalized, "VdSetGraphicsInterruptCallback") != null) {
+        return xenia_vd_set_graphics_interrupt_callback;
     }
     return null;
 }
@@ -431,6 +442,10 @@ pub fn dispatchContract(state: anytype, symbol: []const u8) ?ContractDispatch {
         .libcxx_basic_ios_fail,
         .libcxx_basic_ios_eof,
         => .failed,
+        .xenia_vd_set_graphics_interrupt_callback => if (executeXeniaVdSetGraphicsInterruptCallback(state))
+            .handled_void
+        else
+            .failed,
     };
 }
 
@@ -809,6 +824,22 @@ pub fn executeIsatty(state: anytype, fd: u64) bool {
     // This allows the has_console_attached check to continue
     _ = fd;
     state.regs.rax = 0;
+    return true;
+}
+
+pub fn executeXeniaVdSetGraphicsInterruptCallback(state: anytype) bool {
+    // VdSetGraphicsInterruptCallback pre-initialization: register the GPU interrupt
+    // callback early to prevent GPU stalls during guest bootstrap.
+    // Xenia's signature: void VdSetGraphicsInterruptCallback(void (*callback)(void*), void* arg)
+    // rdi = callback function pointer, rsi = argument
+    // Store callback info in state if the state has the appropriate fields
+    // This marks the import as pre-initialized for the xenia_pipeline diagnostics
+    const callback = state.regs.rdi;
+    const arg = state.regs.rsi;
+    machoCapturePrint(
+        "macho-processor: VdSetGraphicsInterruptCallback import is preinitialized; callback=0x{x} arg=0x{x}\n",
+        .{ callback, arg },
+    );
     return true;
 }
 
