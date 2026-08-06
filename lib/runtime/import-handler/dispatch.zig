@@ -2284,15 +2284,11 @@ pub fn analyzeUnknownSymbol(
 }
 
 pub fn traceCallSite(self: anytype, return_address: u64) ?u64 {
-    const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+    const count: usize = self.execution_history.countFor(self.active_guest_thread);
     var ordinal = count;
     while (ordinal != 0) {
         ordinal -= 1;
-        const index = if (self.trace_filled)
-            (self.trace_index + ordinal) % TRACE_BUFFER_LEN
-        else
-            ordinal;
-        const entry = self.trace_entries[index];
+        const entry = self.execution_history.chronological(self.active_guest_thread, ordinal) orelse continue;
         if (entry.rip +% entry.len != return_address) continue;
         switch (entry.op) {
             .call_rel32, .call_reg64, .call_mem64 => return entry.rip,
@@ -2308,15 +2304,12 @@ pub fn logDynamicUnknownSymbolContext(
     use_site: u64,
     symbol_hits: u64,
 ) void {
-    const count: usize = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+    const count: usize = self.execution_history.countFor(self.active_guest_thread);
     if (count == 0) return;
     var selected_ordinal: ?usize = null;
     for (0..count) |ordinal| {
-        const index = if (self.trace_filled)
-            (self.trace_index + ordinal) % TRACE_BUFFER_LEN
-        else
-            ordinal;
-        if (self.trace_entries[index].rip == use_site) selected_ordinal = ordinal;
+        const entry = self.execution_history.chronological(self.active_guest_thread, ordinal) orelse continue;
+        if (entry.rip == use_site) selected_ordinal = ordinal;
     }
     const selected = selected_ordinal orelse return;
     const start = selected -| symbol_assembly_context.CONTEXT_BEFORE;
@@ -2348,11 +2341,7 @@ pub fn logDynamicUnknownSymbolContext(
     }
 
     for (start..end) |ordinal| {
-        const index = if (self.trace_filled)
-            (self.trace_index + ordinal) % TRACE_BUFFER_LEN
-        else
-            ordinal;
-        const entry = self.trace_entries[index];
+        const entry = self.execution_history.chronological(self.active_guest_thread, ordinal) orelse continue;
         const offset = self.addrToOffset(entry.rip) orelse continue;
         if (offset >= self.mem.len) continue;
         const available = @min(@as(usize, entry.len), self.mem.len - offset);
