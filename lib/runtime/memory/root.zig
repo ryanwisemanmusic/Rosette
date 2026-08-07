@@ -29,7 +29,14 @@ test {
     _ = memory_write_provenance;
     _ = sparse_virtual_memory;
     _ = atomic_compare_exchange;
-    _ = bytesForSize(.bits32);
+    // Instantiated with a real enum rather than a bare `.bits32`. `bytesForSize`
+    // takes `anytype` and switches exhaustively, and an enum *literal* has type
+    // `@EnumLiteral()`, which has no exhaustive set — so the previous line
+    // (`bytesForSize(.bits32)`) could never compile. It survived because this
+    // module was only ever built as a dependency: its tests were analysed for
+    // nothing and executed never.
+    const Size = enum { bits8, bits16, bits32, bits64 };
+    try @import("std").testing.expectEqual(@as(u8, 4), bytesForSize(Size.bits32));
     _ = MemoryState;
     _ = read8;
     _ = read16;

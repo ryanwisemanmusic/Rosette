@@ -8,7 +8,23 @@ pub const WriteKind = enum {
     partial_scalar,
     bulk_fill,
     bulk_copy,
+    /// Written by Rosette itself while repairing a fault, not by the guest.
+    ///
+    /// Provenance records the *faulting guest RIP* as the writer, because that
+    /// is what `regs.rip` holds when a recovery runs. Without this kind the
+    /// ledger cannot distinguish a repair from guest behaviour, and every
+    /// consumer — most visibly the near-null causality chain's
+    /// `producer_last_writer` line — attributes Rosette's own write to a guest
+    /// symbol. Any conclusion drawn from such an entry is about the emulator,
+    /// not the program.
+    host_repair,
 };
+
+/// True when the entry describes a write Rosette performed, so callers can
+/// refuse to draw guest-side conclusions from it.
+pub fn isHostAuthored(kind: WriteKind) bool {
+    return kind == .host_repair;
+}
 
 pub const Entry = struct {
     address: u64,

@@ -27,6 +27,42 @@ pub const Summary = struct {
     live_allocations: usize,
 };
 
+/// What a free that matched no live allocation actually was.
+///
+/// The count alone was unactionable: ten invalid frees in a run could be ten
+/// double-frees in Rosette's own modelling, ten guest interior-pointer frees, or
+/// ten frees of memory some other subsystem owns — three different bugs with
+/// three different fixes, and no way to tell them apart from a number. The
+/// forwarder already holds everything needed to separate them.
+pub const InvalidFreeKind = enum {
+    /// Inside a live allocation but not its base. The guest freed an interior
+    /// or member pointer, or Rosette handed out a base the guest then adjusted.
+    interior_of_live_allocation,
+    /// Already on the free list. A double free, or two owners releasing the
+    /// same block.
+    already_freed,
+    /// Neither live nor freed. The address was never handed out by this
+    /// forwarder — it belongs to some other allocator, or it is not an
+    /// allocation at all.
+    never_forwarded,
+};
+
+pub const InvalidFree = struct {
+    address: u64,
+    /// Guest instruction that requested the free, when the caller supplied it.
+    instruction_address: u64,
+    kind: InvalidFreeKind,
+    /// The live allocation containing the address, for the interior case.
+    container_base: u64 = 0,
+    container_size: u64 = 0,
+    container_offset: u64 = 0,
+};
+
+/// Bounded, because an unbounded record of a pathological run is just the run.
+/// Eight is enough to see whether the kinds are mixed or uniform, which is the
+/// question the count could not answer.
+pub const max_recorded_invalid_frees: usize = 8;
+
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     allocations: std.AutoHashMap(u64, Allocation),
@@ -37,6 +73,18 @@ pub const Manager = struct {
     reused_block_count: u64 = 0,
     overlap_rejection_count: u64 = 0,
     invalid_free_count: u64 = 0,
+    invalid_free_interior_count: u64 = 0,
+    invalid_free_double_count: u64 = 0,
+    invalid_free_unknown_count: u64 = 0,
+    invalid_free_shared_arena_count: u64 = 0,
+    invalid_free_records: [max_recorded_invalid_frees]InvalidFree = undefined,
+    invalid_free_recorded: usize = 0,
+    /// Span of every address this forwarder has ever handed out. A free of an
+    /// address inside the span that the forwarder does not know about means
+    /// some *other* allocator is handing out memory from the same arena — a
+    /// different and more serious finding than a free of a foreign pointer.
+    lowest_allocated: u64 = std.math.maxInt(u64),
+    highest_allocated: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{
@@ -73,6 +121,8 @@ pub const Manager = struct {
         }
         result.value_ptr.* = .{ .size = size, .alignment = alignment };
         self.allocation_count +|= 1;
+        if (address < self.lowest_allocated) self.lowest_allocated = address;
+        if (address +| size > self.highest_allocated) self.highest_allocated = address +| size;
         return address;
     }
 
@@ -114,13 +164,79 @@ pub const Manager = struct {
     }
 
     pub fn release(self: *Manager, address: u64) void {
+        self.releaseFrom(address, 0);
+    }
+
+    /// Release, recording the guest instruction that asked for it.
+    ///
+    /// Callers that know the requesting RIP should pass it: without it an
+    /// invalid free is a fact with no location, and the whole difficulty with
+    /// invalid frees is finding who performed them.
+    pub fn releaseFrom(self: *Manager, address: u64, instruction_address: u64) void {
         if (address == 0) return;
         const removed = self.allocations.fetchRemove(address) orelse {
-            self.invalid_free_count +|= 1;
+            self.noteInvalidFree(address, instruction_address);
             return;
         };
         self.addFreeBlock(.{ .address = address, .size = removed.value.size });
         self.free_count +|= 1;
+    }
+
+    fn noteInvalidFree(self: *Manager, address: u64, instruction_address: u64) void {
+        self.invalid_free_count +|= 1;
+        var record = InvalidFree{
+            .address = address,
+            .instruction_address = instruction_address,
+            .kind = .never_forwarded,
+        };
+        if (self.containingAllocation(address)) |container| {
+            record.kind = .interior_of_live_allocation;
+            record.container_base = container.base;
+            record.container_size = container.size;
+            record.container_offset = container.offset;
+            self.invalid_free_interior_count +|= 1;
+        } else if (self.freeBlockCovering(address) != null) {
+            record.kind = .already_freed;
+            self.invalid_free_double_count +|= 1;
+        } else {
+            self.invalid_free_unknown_count +|= 1;
+            if (self.withinArena(address)) self.invalid_free_shared_arena_count +|= 1;
+        }
+        if (self.invalid_free_recorded < self.invalid_free_records.len) {
+            self.invalid_free_records[self.invalid_free_recorded] = record;
+            self.invalid_free_recorded += 1;
+            machoCapturePrint(
+                "macho-processor: memory forwarding invalid free #{d}: address=0x{x} rip=0x{x} kind={s}{s}\n",
+                .{
+                    self.invalid_free_count,
+                    address,
+                    instruction_address,
+                    @tagName(record.kind),
+                    switch (record.kind) {
+                        .interior_of_live_allocation => " — freeing an interior pointer; the containing allocation stays live and its base is reported in the summary",
+                        .already_freed => " — this block is already on the free list: a double free, or two owners releasing the same allocation",
+                        .never_forwarded => if (self.withinArena(address))
+                            " — INSIDE this forwarder's arena but never handed out by it: another allocator is issuing memory from the same range, so the two disagree about what is live"
+                        else
+                            " — outside this forwarder's arena entirely, so the pointer belongs to a different allocator or is not an allocation",
+                    },
+                },
+            );
+        }
+    }
+
+    /// Whether an address falls inside the range this forwarder allocates from.
+    fn withinArena(self: *const Manager, address: u64) bool {
+        return self.highest_allocated != 0 and
+            address >= self.lowest_allocated and address < self.highest_allocated;
+    }
+
+    fn freeBlockCovering(self: *const Manager, address: u64) ?FreeBlock {
+        for (self.free_blocks.items) |block| {
+            const end = std.math.add(u64, block.address, block.size) catch continue;
+            if (address >= block.address and address < end) return block;
+        }
+        return null;
     }
 
     pub fn allocationSize(self: *const Manager, address: u64) ?u64 {
@@ -174,6 +290,34 @@ pub const Manager = struct {
                 totals.invalid_frees,
             },
         );
+        if (totals.invalid_frees == 0) return;
+        machoCapturePrint(
+            "macho-processor: memory forwarding invalid frees: total={d} interior_of_live_allocation={d} already_freed={d} never_forwarded={d} (of which inside_this_arena={d}) recorded={d}/{d}; interior frees are a guest or shim passing an adjusted pointer, already_freed is a double free or two owners. A never_forwarded free INSIDE this arena means a second allocator is issuing from the same range and the two disagree about liveness — that is an ownership split, not a guest bug\n",
+            .{
+                totals.invalid_frees,
+                self.invalid_free_interior_count,
+                self.invalid_free_double_count,
+                self.invalid_free_unknown_count,
+                self.invalid_free_shared_arena_count,
+                self.invalid_free_recorded,
+                self.invalid_free_records.len,
+            },
+        );
+        var index: usize = 0;
+        while (index < self.invalid_free_recorded) : (index += 1) {
+            const record = self.invalid_free_records[index];
+            machoCapturePrint(
+                "  invalid free: address=0x{x} rip=0x{x} kind={s} container_base=0x{x} container_size={d} container_offset=0x{x}\n",
+                .{
+                    record.address,
+                    record.instruction_address,
+                    @tagName(record.kind),
+                    record.container_base,
+                    record.container_size,
+                    record.container_offset,
+                },
+            );
+        }
     }
 
     fn reuseBlock(self: *Manager, size: u64, alignment: u64) ?u64 {
@@ -374,4 +518,47 @@ test "adjacent free blocks coalesce and invalid frees are counted" {
 
     manager.release(first);
     try std.testing.expectEqual(@as(u64, 1), manager.summary().invalid_frees);
+}
+
+// The count on its own could not separate three different bugs. Each kind has
+// a different fix, and a run that mixes them needs to say so.
+test "invalid frees are classified rather than counted" {
+    var state = TestState{};
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const base = manager.allocate(&state, 128, 16) orelse return error.TestUnexpectedResult;
+
+    // Interior pointer: the allocation stays live.
+    manager.releaseFrom(base + 32, 0xAAAA);
+    try std.testing.expectEqual(@as(u64, 1), manager.invalid_free_interior_count);
+    try std.testing.expect(manager.allocationSize(base) != null);
+
+    // Double free: the first release succeeds, the second finds a free block.
+    manager.releaseFrom(base, 0xBBBB);
+    try std.testing.expectEqual(@as(u64, 1), manager.summary().frees);
+    manager.releaseFrom(base, 0xCCCC);
+    try std.testing.expectEqual(@as(u64, 1), manager.invalid_free_double_count);
+
+    // Never handed out by this forwarder.
+    manager.releaseFrom(0xDEAD_0000, 0xDDDD);
+    try std.testing.expectEqual(@as(u64, 1), manager.invalid_free_unknown_count);
+
+    try std.testing.expectEqual(@as(u64, 3), manager.summary().invalid_frees);
+    try std.testing.expectEqual(@as(usize, 3), manager.invalid_free_recorded);
+    try std.testing.expectEqual(InvalidFreeKind.interior_of_live_allocation, manager.invalid_free_records[0].kind);
+    try std.testing.expectEqual(@as(u64, base), manager.invalid_free_records[0].container_base);
+    try std.testing.expectEqual(@as(u64, 32), manager.invalid_free_records[0].container_offset);
+    try std.testing.expectEqual(@as(u64, 0xAAAA), manager.invalid_free_records[0].instruction_address);
+    try std.testing.expectEqual(InvalidFreeKind.already_freed, manager.invalid_free_records[1].kind);
+    try std.testing.expectEqual(InvalidFreeKind.never_forwarded, manager.invalid_free_records[2].kind);
+}
+
+// A free of address zero is a no-op in C and must not be reported as a defect.
+test "freeing null is not an invalid free" {
+    var manager = Manager.init(std.testing.allocator);
+    defer manager.deinit();
+    manager.releaseFrom(0, 0x1234);
+    try std.testing.expectEqual(@as(u64, 0), manager.summary().invalid_frees);
+    try std.testing.expectEqual(@as(usize, 0), manager.invalid_free_recorded);
 }
