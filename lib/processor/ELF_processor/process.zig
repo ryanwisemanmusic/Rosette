@@ -11,6 +11,7 @@ const x64_linux_runtime = @import("x64_linux_runtime");
 const x64_syscalls = @import("x64_syscalls");
 const exit_diagnostics = @import("exit_diagnostics");
 const cleo_routing = @import("cleo_routing");
+const execution_history = @import("execution_history");
 
 const SYS_read = x64_syscalls.SYS_read; // 0
 const SYS_write = x64_syscalls.SYS_write; // 1
@@ -448,9 +449,11 @@ pub const ElfState = struct {
     faulted: bool = false,
     termination_reason: exit_diagnostics.TerminationReason = .unknown,
     executed_steps: u64 = 0,
-    trace_entries: [TRACE_BUFFER_LEN]ElfTraceEntry = [_]ElfTraceEntry{.{}} ** TRACE_BUFFER_LEN,
-    trace_index: usize = 0,
-    trace_filled: bool = false,
+    // The last hand-written copy of the ring arithmetic in the tree; now the
+    // library's. Storage stays inline because this state is not heap-managed;
+    // `trace_ring` is bound to it in `init`.
+    trace_storage: [TRACE_BUFFER_LEN]ElfTraceEntry = [_]ElfTraceEntry{.{}} ** TRACE_BUFFER_LEN,
+    trace_ring: execution_history.Ring(ElfTraceEntry) = execution_history.Ring(ElfTraceEntry).init(&.{}),
     libc_start_main_trampolined: bool = false,
     dynamic_relocations: []const elf_loader.DynamicRelocation = &.{},
     local_symbols: []const elf_loader.Symbol = &.{},
@@ -472,7 +475,7 @@ pub const ElfState = struct {
     pub fn init(allocator: std.mem.Allocator) ElfState {
         const mem = allocator.alloc(u8, MEM_SIZE) catch unreachable;
         @memset(mem, 0);
-        return .{
+        var state: ElfState = .{
             .allocator = allocator,
             .mem = mem,
             .mem_base = MEM_BASE,
@@ -483,6 +486,12 @@ pub const ElfState = struct {
             .trace_calls = envFlag("ROSETTE_ELF_TRACE_CALLS"),
             .diagnose_abi = envFlag("ROSETTE_ELF_DIAGNOSE_ABI") or envFlag("ROSETTE_ELF_INTERACTIVE_BRIDGE") or envFlag("ROSETTE_ELF_EDU_BRIDGE"),
         };
+        // Bind the ring to its inline storage. The state is returned by value,
+        // so callers must not copy it after this point without rebinding —
+        // `ElfState.init` is the only constructor and it is always assigned to
+        // its final location.
+        state.trace_ring = execution_history.Ring(ElfTraceEntry).init(&state.trace_storage);
+        return state;
     }
 
     pub fn deinit(self: *ElfState) void {
@@ -646,7 +655,7 @@ pub const ElfState = struct {
     }
 
     fn recordTrace(self: *ElfState, decoded: DecodedInsn) void {
-        self.trace_entries[self.trace_index] = .{
+        self.trace_ring.push(.{
             .rip = self.regs.rip,
             .op = decoded.op,
             .len = decoded.len,
@@ -654,9 +663,7 @@ pub const ElfState = struct {
             .rax = self.regs.rax,
             .rcx = self.regs.rcx,
             .rdx = self.regs.rdx,
-        };
-        self.trace_index = (self.trace_index + 1) % TRACE_BUFFER_LEN;
-        if (self.trace_index == 0) self.trace_filled = true;
+        });
     }
 
     pub fn guestAlloc(self: *ElfState, requested_size: u64, requested_alignment: u64) ?u64 {
@@ -825,11 +832,10 @@ pub const ElfState = struct {
             }
         }
 
-        const trace_count = if (self.trace_filled) TRACE_BUFFER_LEN else self.trace_index;
+        const trace_count = self.trace_ring.count();
         var trace: [TRACE_BUFFER_LEN]exit_diagnostics.TraceEntry = undefined;
         for (0..trace_count) |index| {
-            const source_index = if (self.trace_filled) (self.trace_index + index) % TRACE_BUFFER_LEN else index;
-            const entry = self.trace_entries[source_index];
+            const entry = self.trace_ring.chronological(index) orelse continue;
             trace[index] = .{
                 .rip = entry.rip,
                 .op = @tagName(entry.op),
