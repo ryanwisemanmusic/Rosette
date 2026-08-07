@@ -940,6 +940,27 @@ pub const Forwarder = struct {
                 return mapped;
             }
         }
+        // A non-null address without MAP_FIXED is a POSIX *hint*: place it
+        // there when the range is free, elsewhere when it is not, and never
+        // replace anything. Discarding the hint outright is observationally
+        // identical to the address never being available, so a guest that
+        // probes for a free slot by asking for one and comparing the result
+        // runs its scan to exhaustion. Only attempted for anonymous mappings;
+        // file-backed placement stays with the routes above.
+        if (state.regs.rdi != 0 and map_flags.ANONYMOUS and
+            comptime @hasDecl(@TypeOf(state.*), "guestMapHinted"))
+        {
+            if (state.guestMapHinted(state.regs.rdi, length, @truncate(state.regs.rdx), raw_flags, -1, 0)) |placed| {
+                if (trace_mapping) {
+                    machoCapturePrint(
+                        "macho-processor: hinted mmap honoured: route=import hint=0x{x} placed=0x{x} length={d} prot=0x{x} flags=0x{x}\n",
+                        .{ state.regs.rdi, placed, length, state.regs.rdx, raw_flags },
+                    );
+                }
+                if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(true, placed, "hinted_sparse_map");
+                return placed;
+            }
+        }
         // Small non-fixed mappings still need true mmap page ownership. Keep
         // them in the low primary guest window for Xenia/Xbyak reachability,
         // but reserve and align the full Darwin page span so ordinary C++
