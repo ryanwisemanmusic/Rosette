@@ -1,5 +1,6 @@
 const std = @import("std");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
+const ownership_allocation = @import("ownership").allocation;
 
 const Allocation = struct {
     size: u64,
@@ -85,6 +86,11 @@ pub const Manager = struct {
     /// different and more serious finding than a free of a foreign pointer.
     lowest_allocated: u64 = std.math.maxInt(u64),
     highest_allocated: u64 = 0,
+    /// Provenance for addresses this forwarder did not issue. An address is not
+    /// an owner: two allocators sharing a range agree about every address in it
+    /// and disagree about who handed it out, and that disagreement is only ever
+    /// visible at a release. Consulted exactly there.
+    provenance: ownership_allocation.Registry = .{},
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{
@@ -182,8 +188,31 @@ pub const Manager = struct {
         self.free_count +|= 1;
     }
 
+    /// Record who issued an address this forwarder did not.
+    pub fn declareForeign(
+        self: *Manager,
+        base: u64,
+        size: u64,
+        owner: ownership_allocation.Owner,
+        instruction_address: u64,
+    ) void {
+        self.provenance.declare(base, size, owner, instruction_address);
+    }
+
     fn noteInvalidFree(self: *Manager, address: u64, instruction_address: u64) void {
         self.invalid_free_count +|= 1;
+        // Route by owner before classifying by address. A release the forwarder
+        // does not claim is not automatically a defect — it may simply belong to
+        // another allocator, and absorbing it leaves the block live in whoever
+        // does own it while the caller believes it freed.
+        const verdict = self.provenance.route(address, false);
+        if (verdict.disposition == .foreign_owner) {
+            machoCapturePrint(
+                "macho-processor: memory forwarding release routed: address=0x{x} rip=0x{x} owner={s} base=0x{x} size={d}; this forwarder did not issue it and must not release it. Absorbing the free would leave the block live in its real owner while the caller believes it released\n",
+                .{ address, instruction_address, @tagName(verdict.owner), verdict.record.base, verdict.record.size },
+            );
+            return;
+        }
         var record = InvalidFree{
             .address = address,
             .instruction_address = instruction_address,
