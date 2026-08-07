@@ -1269,6 +1269,15 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+
+        // Rooted here rather than beside its creation because it needs
+        // `event_log`, which the unwinder imports directly. That dependency was
+        // invisible while the module was only ever built as someone else's
+        // dependency — which is precisely what rooting a module as a test
+        // surfaces.
+        cxx_abi_mod.addImport("event_log", event_log_mod);
+        const cxx_abi_test = b.addTest(.{ .root_module = cxx_abi_mod });
+        check_step.dependOn(&b.addRunArtifact(cxx_abi_test).step);
         dyld_mod.addImport("event_log", event_log_mod);
         const diagnostics_mod = b.createModule(.{
             .root_source_file = b.path("../lib/diagnostics/root.zig"),
@@ -1276,6 +1285,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         diagnostics_mod.addImport("event_log", event_log_mod);
+        const diagnostics_test = b.addTest(.{ .root_module = diagnostics_mod });
+        check_step.dependOn(&b.addRunArtifact(diagnostics_test).step);
         diagnostics_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         const memory_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/memory/root.zig"),
@@ -1304,6 +1315,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         guest_abi_mod.addImport("event_log", event_log_mod);
+        // Rooted and run: thread-local placement is an ABI contract, and the
+        // previous implementation was wrong in a way that produced no error —
+        // only another thread's data appearing inside yours.
+        const guest_abi_test = b.addTest(.{ .root_module = guest_abi_mod });
+        check_step.dependOn(&b.addRunArtifact(guest_abi_test).step);
 
         const macho_core_mod = b.createModule(.{
             .root_source_file = b.path("../lib/Mach-O/shared_core.zig"),
@@ -1344,6 +1360,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // The forwarder routes a release by owner, which is an ownership
+        // question, so the memory module depends on this rather than
+        // re-deriving provenance from address ranges.
+        memory_mod.addImport("ownership", ownership_mod);
         const ownership_test = b.addTest(.{ .root_module = ownership_mod });
         check_step.dependOn(&b.addRunArtifact(ownership_test).step);
 
@@ -1430,6 +1450,18 @@ pub fn build(b: *std.Build) void {
         const dispatch_recovery_test = b.addTest(.{ .root_module = dispatch_recovery_mod });
         check_step.dependOn(&b.addRunArtifact(dispatch_recovery_test).step);
         process_core_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
+
+        // The guest-driven GPU bootstrap contract. Rooted and run: the whole
+        // value of it is the distinction between "unreachable" and "reachable
+        // and not taken", and the tests are what pin that distinction.
+        const gpu_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/gpu/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const gpu_test = b.addTest(.{ .root_module = gpu_mod });
+        check_step.dependOn(&b.addRunArtifact(gpu_test).step);
+        process_core_mod.addImport("gpu", gpu_mod);
         process_core_mod.addImport("guest_structure", guest_structure_mod);
 
         // The bounded dispatch transducer is a self-contained decision
@@ -1526,6 +1558,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("macho_core", macho_core_mod);
         macho_processor_mod.addImport("process_core", process_core_mod);
         macho_processor_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
+        macho_processor_mod.addImport("gpu", gpu_mod);
         macho_processor_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
@@ -1568,6 +1601,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("macho_core", macho_core_mod);
         macho_processor_test_mod.addImport("process_core", process_core_mod);
         macho_processor_test_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
+        macho_processor_test_mod.addImport("gpu", gpu_mod);
         macho_processor_test_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
