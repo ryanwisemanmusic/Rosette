@@ -662,6 +662,15 @@ pub fn build(b: *std.Build) void {
     zig_module.addImport("dos_platform", dos_platform_module);
     zig_module.addImport("pseudo_kernel_cache", pseudo_kernel_cache_module);
 
+    // Retained execution history: bounded-ring arithmetic and thread
+    // partitioning, extracted from six owners. Declared at top level because
+    // both processors and the process-core consume it.
+    const execution_history_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/runtime/execution-history/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const check_step = b.step("check", "Check Rosette Zig sources");
     const entrypoint_alignment_test = b.addTest(.{ .root_module = entrypoint_alignment_module });
     check_step.dependOn(&entrypoint_alignment_test.step);
@@ -1131,6 +1140,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
         elf_processor_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         elf_processor_mod.addImport("cleo_routing", cleo_routing_mod);
+        elf_processor_mod.addImport("execution_history", execution_history_mod);
         const elf_processor = b.addExecutable(.{
             .name = "elf_processor",
             .root_module = elf_processor_mod,
@@ -1149,6 +1159,7 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("x64_guest_abi", x64_guest_abi_mod);
         elf_processor_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         elf_processor_test_mod.addImport("cleo_routing", cleo_routing_mod);
+        elf_processor_test_mod.addImport("execution_history", execution_history_mod);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
         check_step.dependOn(&elf_processor_test.step);
 
@@ -1273,6 +1284,13 @@ pub fn build(b: *std.Build) void {
         });
         memory_mod.addImport("dyld", dyld_mod);
         memory_mod.addImport("event_log", event_log_mod);
+        // Guest memory placement and lifetime. `root.zig` already pulled every
+        // submodule's tests into its `test` block, but nothing ever ran them:
+        // the module was only ever a dependency, so the rules about which
+        // mapping replaces which — the rules a MAP_FIXED request decides guest
+        // state on — were compiled and never executed.
+        const memory_test = b.addTest(.{ .root_module = memory_mod });
+        check_step.dependOn(&b.addRunArtifact(memory_test).step);
         const pthread_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/pthread/root.zig"),
             .target = target,
@@ -1297,13 +1315,57 @@ pub fn build(b: *std.Build) void {
         macho_core_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
         macho_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_core_mod.addImport("guest_abi", guest_abi_mod);
-        // Retained execution history: bounded-ring arithmetic and thread
-        // partitioning, extracted from six owners.
-        const execution_history_mod = b.createModule(.{
-            .root_source_file = b.path("../lib/runtime/execution-history/root.zig"),
+
+        // `types.zig` owns `TraceEntry`, and `TraceEntry` now owns the mapping
+        // from a decoder register id onto a snapshot field — the input to every
+        // history-based causal walk in the runtime, and previously copied
+        // byte-for-byte into three of them. Rooted and run so that mapping has
+        // an executed test rather than one that merely compiles as part of the
+        // aggregate suite.
+        const macho_types_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/Mach-O/types.zig"),
             .target = target,
             .optimize = optimize,
         });
+        macho_types_mod.addImport("x64_decoder", x64_decoder_mod);
+        macho_types_mod.addImport("dyld", dyld_mod);
+        macho_types_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        macho_types_mod.addImport("exit_diagnostics", exit_diagnostics_module);
+        macho_types_mod.addImport("guest_abi", guest_abi_mod);
+        const macho_types_test = b.addTest(.{ .root_module = macho_types_mod });
+        check_step.dependOn(&b.addRunArtifact(macho_types_test).step);
+
+        // Ownership arbitration: single-owner selection, per-family ledgers,
+        // and data authorship. Extracted because duplicated *authority* — not
+        // duplicated work — is what made fixes in one subsystem surface as
+        // regressions in another.
+        const ownership_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/ownership/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const ownership_test = b.addTest(.{ .root_module = ownership_mod });
+        check_step.dependOn(&b.addRunArtifact(ownership_test).step);
+
+        // Observed guest structure shape: which fields the translation reads
+        // and writes, so a missing store is a measurement rather than a guess.
+        const guest_structure_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/guest-structure/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const guest_structure_test = b.addTest(.{ .root_module = guest_structure_mod });
+        check_step.dependOn(&b.addRunArtifact(guest_structure_test).step);
+
+        // The guest address-space model: derived from observed mappings rather
+        // than asserted from build-time constants.
+        const guest_address_space_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/guest-address-space/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const guest_address_space_test = b.addTest(.{ .root_module = guest_address_space_mod });
+        check_step.dependOn(&b.addRunArtifact(guest_address_space_test).step);
 
         const process_core_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/process-core/root.zig"),
@@ -1327,6 +1389,48 @@ pub fn build(b: *std.Build) void {
         process_core_mod.addImport("guest_abi", guest_abi_mod);
         process_core_mod.addImport("vtable", vtable_mod);
         process_core_mod.addImport("execution_history", execution_history_mod);
+        process_core_mod.addImport("ownership", ownership_mod);
+        process_core_mod.addImport("guest_address_space", guest_address_space_mod);
+
+        // Dispatch tables: what a zero entry means, decided from the entry's
+        // neighbourhood rather than from the entry alone. Rooted and run —
+        // "the target was null" is the same sentence for three different bugs,
+        // and the tests are what pin which is which.
+        const dispatch_table_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/dispatch-table/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const dispatch_table_test = b.addTest(.{ .root_module = dispatch_table_mod });
+        check_step.dependOn(&b.addRunArtifact(dispatch_table_test).step);
+        process_core_mod.addImport("dispatch_table", dispatch_table_mod);
+
+        // Guest byte order. A missed big-endian conversion is the one
+        // corruption that carries its own correction, so it can be counted —
+        // and one reversed value versus several is the difference between a bad
+        // instruction and a bad conversion path.
+        const byte_order_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/byte-order/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const byte_order_test = b.addTest(.{ .root_module = byte_order_mod });
+        check_step.dependOn(&b.addRunArtifact(byte_order_test).step);
+        process_core_mod.addImport("byte_order", byte_order_mod);
+
+        // The population of dispatch sites the bounded machine meets, split by
+        // whether it got through. Rooted and run: "x traversed, y halted, of z
+        // distinct sites" is the number that decides whether a halt is one gap
+        // or the recogniser's coverage, and it has to be right.
+        const dispatch_recovery_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/dispatch-recovery/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const dispatch_recovery_test = b.addTest(.{ .root_module = dispatch_recovery_mod });
+        check_step.dependOn(&b.addRunArtifact(dispatch_recovery_test).step);
+        process_core_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
+        process_core_mod.addImport("guest_structure", guest_structure_mod);
 
         // The bounded dispatch transducer is a self-contained decision
         // procedure over supplied invariants, and its test blocks are the only
@@ -1360,7 +1464,7 @@ pub fn build(b: *std.Build) void {
         // guards. Self-contained for the same reason, and rooted here so the
         // guarantees it makes about family isolation are actually executed.
         const recovery_ledger_mod = b.createModule(.{
-            .root_source_file = b.path("../lib/runtime/process-core/recovery_ledger.zig"),
+            .root_source_file = b.path("../lib/ownership/ledger.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -1368,6 +1472,20 @@ pub fn build(b: *std.Build) void {
         const run_recovery_ledger_test = b.addRunArtifact(recovery_ledger_test);
         bounded_dispatch_check.dependOn(&run_recovery_ledger_test.step);
         check_step.dependOn(&run_recovery_ledger_test.step);
+
+        // Guest-range lifetime. The transducer's "this field was never written"
+        // verdict is only a statement about the guest while the storage behind
+        // the field is still the storage the guest wrote to, so this rides the
+        // same check step as the transducer itself.
+        const guest_lifetime_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/ownership/lifetime.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const guest_lifetime_test = b.addTest(.{ .root_module = guest_lifetime_mod });
+        const run_guest_lifetime_test = b.addRunArtifact(guest_lifetime_test);
+        bounded_dispatch_check.dependOn(&run_guest_lifetime_test.step);
+        check_step.dependOn(&run_guest_lifetime_test.step);
 
         const import_handler_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/import-handler/root.zig"),
@@ -1407,6 +1525,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("jit", jit_mod);
         macho_processor_mod.addImport("macho_core", macho_core_mod);
         macho_processor_mod.addImport("process_core", process_core_mod);
+        macho_processor_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
@@ -1448,6 +1567,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("jit", jit_mod);
         macho_processor_test_mod.addImport("macho_core", macho_core_mod);
         macho_processor_test_mod.addImport("process_core", process_core_mod);
+        macho_processor_test_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_test_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
