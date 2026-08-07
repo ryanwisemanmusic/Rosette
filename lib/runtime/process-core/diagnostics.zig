@@ -134,6 +134,37 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             );
         }
     }
+    if (comptime @hasField(@TypeOf(self.*), "gpu_bootstrap")) {
+        const gpu = @import("gpu");
+        const frontier = self.gpu_bootstrap.frontier();
+        if (frontier.step) |blocked| {
+            machoCapturePrint(
+                "macho-processor: gpu bootstrap frontier: reached={d}/{d} first_missing={s} precondition_met={} blocked_by={s} out_of_order={d}; {s}\n",
+                .{
+                    frontier.reached,
+                    gpu.bootstrap.step_count,
+                    blocked.label(),
+                    frontier.precondition_met,
+                    if (frontier.blocked_by) |required| required.label() else "<none>",
+                    self.gpu_bootstrap.out_of_order,
+                    blocked.guidance(),
+                },
+            );
+            inline for (@typeInfo(gpu.Step).@"enum".fields) |field| {
+                const step: gpu.Step = @enumFromInt(field.value);
+                const entry = self.gpu_bootstrap.observations[field.value];
+                machoCapturePrint(
+                    "  gpu step {s}: observed={} calls={d} first_step={d}\n",
+                    .{ step.label(), entry.seen, entry.count, entry.first_step },
+                );
+            }
+        } else if (self.gpu_bootstrap.observations[0].seen) {
+            machoCapturePrint(
+                "macho-processor: gpu bootstrap frontier: complete ({d}/{d} steps observed, out_of_order={d}); the guest drove the whole bootstrap, so any remaining absence of output is downstream of command submission\n",
+                .{ frontier.reached, gpu.bootstrap.step_count, self.gpu_bootstrap.out_of_order },
+            );
+        }
+    }
     if (comptime @hasField(@TypeOf(self.*), "dispatch_census")) {
         if (self.dispatch_census.observations != 0) {
             const coverage = self.dispatch_census.coverage();

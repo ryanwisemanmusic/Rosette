@@ -1165,6 +1165,180 @@ fn boundedBaseDefinition(
     return result;
 }
 
+/// How far a value can be followed back through register-to-register moves.
+///
+/// Generated code routinely materialises a value in one register and moves it
+/// into the one the instruction needs — Xenia's `CallIndirect` does exactly this
+/// (`mov ebx, reg32; mov eax, [ebx]`). A def-use scan that stops at the move
+/// reports `op=mov_reg32_reg32 from_memory=false` and the search ends one hop
+/// short of every useful answer, which is where naming the writer of a
+/// byte-reversed guest address kept dying.
+///
+/// Bounded because this is a reader, not a search: each hop re-runs the same
+/// block reconstruction, and a chain longer than this is not a copy chain, it is
+/// a computation the reader has no business unwinding.
+pub const max_move_chain: u8 = 6;
+
+pub const ValueOrigin = struct {
+    pub const Hop = struct {
+        instruction_address: u64 = 0,
+        op: x64_decoder.Op = .invalid,
+        from: x64_decoder.RegId = .al_ax_eax_rax,
+        to: x64_decoder.RegId = .al_ax_eax_rax,
+    };
+
+    pub const Terminal = enum {
+        /// Followed to an instruction that read guest memory. `definition`
+        /// carries the address; this is the answer the search wants.
+        memory_load,
+        /// Followed to an immediate. The value was materialised in code, so no
+        /// store is responsible for it.
+        immediate,
+        /// A definition was found but it is neither a load, an immediate, nor a
+        /// move this reader follows — arithmetic, a call result, something else.
+        opaque_definition,
+        /// No definition could be reconstructed at some hop.
+        unresolved,
+        /// The chain was still moving when the bound was reached. Not a
+        /// failure — a stated limit, and the caller is told so rather than
+        /// being handed the last hop as though it were the origin.
+        depth_exhausted,
+    };
+
+    terminal: Terminal = .unresolved,
+    /// Definition at the end of the chain.
+    definition: BoundedDefinition = .{},
+    hops: [max_move_chain]Hop = [_]Hop{.{}} ** max_move_chain,
+    hop_count: u8 = 0,
+};
+
+/// True when `op` copies one register into another without transforming it, so
+/// following it preserves the identity of the value. Deliberately a closed list:
+/// an op absent from it ends the chain as `opaque_definition`, which is a
+/// reported outcome, never a wrong attribution.
+fn isRegisterMove(op: x64_decoder.Op) bool {
+    return switch (op) {
+        .mov_reg8_reg8,
+        .mov_reg16_reg16,
+        .mov_reg32_reg32,
+        .mov_reg64_reg64,
+        => true,
+        else => false,
+    };
+}
+
+/// Follow a register back through moves to whatever actually produced its value.
+pub fn boundedValueOrigin(
+    self: anytype,
+    anchor_rip: u64,
+    register: x64_decoder.RegId,
+) ValueOrigin {
+    var result = ValueOrigin{};
+    var anchor = anchor_rip;
+    var reg = register;
+
+    var step: u8 = 0;
+    while (step < max_move_chain) : (step += 1) {
+        const definition = boundedBaseDefinition(self, anchor, reg);
+        result.definition = definition;
+        if (!definition.found) {
+            result.terminal = .unresolved;
+            return result;
+        }
+        if (definition.from_memory) {
+            result.terminal = .memory_load;
+            return result;
+        }
+        if (definition.from_immediate) {
+            result.terminal = .immediate;
+            return result;
+        }
+        if (!isRegisterMove(definition.op)) {
+            result.terminal = .opaque_definition;
+            return result;
+        }
+        const decoded = decodeStatic(self, definition.instruction_address) orelse {
+            result.terminal = .unresolved;
+            return result;
+        };
+        // A move whose source is its own destination cannot be followed, and
+        // following it would loop.
+        if (decoded.src_reg == reg) {
+            result.terminal = .opaque_definition;
+            return result;
+        }
+        if (result.hop_count < result.hops.len) {
+            result.hops[result.hop_count] = .{
+                .instruction_address = definition.instruction_address,
+                .op = definition.op,
+                .from = decoded.src_reg,
+                .to = reg,
+            };
+            result.hop_count += 1;
+        }
+        anchor = definition.instruction_address;
+        reg = decoded.src_reg;
+    }
+    result.terminal = .depth_exhausted;
+    return result;
+}
+
+/// Report a followed chain and, when it ends at a load, put that slot under
+/// write provenance so the next run names the store.
+fn reportValueOrigin(self: anytype, label: []const u8, origin: ValueOrigin) void {
+    machoCapturePrint(
+        "macho-processor: {s} origin chain: terminal={s} hops={d} instruction=0x{x} op={s} from_memory={} source_address=0x{x} readable={} value=0x{x} from_immediate={} immediate=0x{x}\n",
+        .{
+            label,
+            @tagName(origin.terminal),
+            origin.hop_count,
+            origin.definition.instruction_address,
+            @tagName(origin.definition.op),
+            origin.definition.from_memory,
+            origin.definition.source_address,
+            origin.definition.source_readable,
+            origin.definition.source_value,
+            origin.definition.from_immediate,
+            origin.definition.immediate,
+        },
+    );
+    var index: usize = 0;
+    while (index < origin.hop_count) : (index += 1) {
+        const hop = origin.hops[index];
+        machoCapturePrint(
+            "  {s} hop[{d}]: 0x{x} {s} {s} <- {s}\n",
+            .{ label, index, hop.instruction_address, @tagName(hop.op), @tagName(hop.to), @tagName(hop.from) },
+        );
+    }
+    if (origin.terminal != .memory_load or origin.definition.source_address == 0) return;
+    const seeded = self.provenance_watch.watchPage(origin.definition.source_address, .declared);
+    machoCapturePrint(
+        "macho-processor: {s} origin chain: the value was LOADED from guest memory at 0x{x} (width={d}). Provenance is now watching that page (newly_seeded={} entries={d}/{d}); the next store to it is attributed, which names whoever wrote a guest address in the wrong byte order. That store is the defect — the conversion must happen exactly once, at the guest-memory boundary\n",
+        .{
+            label,
+            origin.definition.source_address,
+            origin.definition.source_bytes,
+            seeded,
+            self.provenance_watch.count,
+            self.provenance_watch.entries.len,
+        },
+    );
+    if (self.memory_writes.lookup(origin.definition.source_address)) |writer| {
+        machoCapturePrint(
+            "macho-processor: {s} origin chain: slot already has a recorded writer rip=0x{x} {s} value=0x{x} kind={s} step={d} thread=0x{x}\n",
+            .{
+                label,
+                writer.instruction_address,
+                self.metadata.symbolLabel(writer.instruction_address),
+                writer.value,
+                @tagName(writer.kind),
+                writer.step,
+                writer.thread,
+            },
+        );
+    }
+}
+
 const GuestReturnCandidate = struct {
     value: u64 = 0,
     register_name: []const u8 = "<none>",
@@ -1553,6 +1727,10 @@ fn tryRepairByteReversedBase(self: anytype, classification: GeneratedFaultClassi
     self.setReg(fault.sib_base_reg, .bits64, finding.corrected);
     noteDispatchSite(self, self.regs.rip, .byte_order_repair, .traversed, 0);
     if (self.generated_byte_order_repair.shouldLog()) {
+        // Follow the reversed value back to whatever produced it. The repair
+        // keeps the run alive; this is what makes the next run able to name the
+        // store that skipped its conversion.
+        reportValueOrigin(self, "byte-reversed base", boundedValueOrigin(self, self.regs.rip, fault.sib_base_reg));
         machoCapturePrint(
             "macho-processor: byte-reversed base repaired #{d}: thread=0x{x} rip=0x{x} base={s} observed=0x{x} corrected=0x{x} readable=true; the register was NOT null — it held a guest address whose eight bytes were never converted from big-endian, which puts zero in the low half and makes every 32-bit addressing form compute a null. The near-null path is not entered for this fault\n",
             .{
@@ -2300,7 +2478,9 @@ fn tryRecoverMissedGuestReturn(self: anytype, fault: DecodedInsn) bool {
         // base register was itself defined somewhere, and if that definition
         // read guest memory, that slot is where a guest code address was stored
         // in the wrong byte order.
-        const producer = boundedBaseDefinition(self, definition.instruction_address, load.sib_base_reg);
+        const origin = boundedValueOrigin(self, definition.instruction_address, load.sib_base_reg);
+        reportValueOrigin(self, "missed guest return", origin);
+        const producer = origin.definition;
         machoCapturePrint(
             "macho-processor: missed guest return producer: register={s} found={} instruction=0x{x} op={s} distance={d} from_memory={} source_address=0x{x} readable={} value=0x{x} from_immediate={} immediate=0x{x} block_origin={s}\n",
             .{
@@ -2464,6 +2644,27 @@ pub fn isGuestAddress(self: anytype, address: u64) bool {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "guest_address_space")) return isGuestModuleAddress(address);
     return isGuestModuleAddressIn(&self.guest_address_space, address);
+}
+
+/// True when `address` is a canonical 32-bit value that lands in *any* mapping
+/// the guest actually made — not only the module window.
+///
+/// `isGuestAddress` answers "is this a guest **module** address", which is the
+/// right question for a dispatch target and the wrong one for byte-order
+/// evidence. A guest stack pointer, a guest heap pointer and a physical-view
+/// pointer are all guest values that can arrive byte-reversed, and none of them
+/// is in the module window: the survey that only knew the window scored
+/// `r10 = byteswap64(r12)` as unrelated, when `r12` was a live guest stack
+/// pointer sitting in the next register.
+///
+/// Canonical form stays a rule — a genuine 64-bit host pointer whose low half
+/// happens to land in a mapping is not a guest value — but membership is
+/// answered from the mappings the run observed rather than from one range.
+pub fn isGuestMappedValue(self: anytype, address: u64) bool {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_address_space")) return isGuestModuleAddress(address);
+    const classified = self.guest_address_space.classify(address);
+    return classified.in_window or classified.region != null;
 }
 
 /// Free-function form, for sites with no state handle and for tests that pin
@@ -4273,7 +4474,42 @@ pub fn renderProcSelfMaps(self: anytype, output: []u8) []const u8 {
 }
 
 pub fn guestCString(self: anytype, addr: u64, max_len: usize) ?[]const u8 {
-    if (addr == 0) return null;
+    if (addr == 0 or max_len == 0) return null;
+    // Sparse-backed strings (guest mmap of files, XISO/XEX image mappings,
+    // JIT data pages, native-bridged memory) live outside the primary image
+    // and are invisible to translateGuest. Every other guest accessor
+    // (guestMemory / guestMemoryConst) consults sparse memory first; C-string
+    // reads must too, otherwise strlen/strcmp/path-style imports against
+    // sparse-backed strings fall through to "unresolved import" (rax=0) even
+    // though the bytes are present and readable.
+    if (self.sparse_memory.bytesConst(addr, 1) != null) {
+        // Grow geometrically until the terminator, max_len, or the readable
+        // span end is reached.
+        var probe: usize = @min(max_len, 256);
+        while (probe <= max_len) {
+            const bytes = self.sparse_memory.bytesConst(addr, probe) orelse break;
+            if (std.mem.indexOfScalar(u8, bytes, 0)) |end| return bytes[0..end];
+            if (probe == max_len) return null;
+            probe = @min(max_len, probe + (probe >> 1));
+        }
+        // The probe outgrew the readable span. Bisect to the exact span
+        // length so a string that ends at a sparse-mapping boundary is still
+        // resolved rather than rejected as "no terminator found".
+        var low: usize = 1;
+        var high: usize = probe;
+        while (low + 1 < high) {
+            const mid = low + (high - low) / 2;
+            if (self.sparse_memory.bytesConst(addr, mid) != null) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        if (self.sparse_memory.bytesConst(addr, low)) |bytes| {
+            if (std.mem.indexOfScalar(u8, bytes, 0)) |end| return bytes[0..end];
+        }
+        return null;
+    }
     const off = translateGuest(self, addr, 1, .read) orelse return null;
     const off_usize: usize = @intCast(off);
     if (off_usize >= self.mem.len) return null;
@@ -4308,4 +4544,106 @@ pub fn guestWriteCString(self: anytype, addr: u64, bytes: []const u8) bool {
         return true;
     }
     return false;
+}
+
+const SparseCStringTestState = struct {
+    sparse_memory: sparse_virtual_memory.Manager,
+    mem: []u8,
+    mem_base: u64,
+    mem_size: u64,
+    mapped_min: u64,
+    pointer_firewall: pointer_firewall.Firewall,
+    page_permissions: []u8,
+};
+
+fn sparseCStringTestState(allocator: std.mem.Allocator) !struct {
+    state: SparseCStringTestState,
+    manager: sparse_virtual_memory.Manager,
+    firewall: pointer_firewall.Firewall,
+} {
+    var manager = sparse_virtual_memory.Manager.init(allocator);
+    errdefer manager.deinit();
+    var firewall = pointer_firewall.Firewall.init(allocator);
+    errdefer firewall.deinit();
+    const image = try allocator.alloc(u8, 4096);
+    errdefer allocator.free(image);
+    @memset(image, 0);
+    const perms = try allocator.alloc(u8, 1);
+    errdefer allocator.free(perms);
+    perms[0] = 0; // primary image intentionally unreadable: only sparse backing is readable
+
+    const base: u64 = 0x8000_0000;
+    const darwin_map_private_anonymous_fixed: u32 = 0x0002 | 0x1000 | 0x0010;
+    if (!manager.mapFile(base, sparse_virtual_memory.PAGE_64K, 3, darwin_map_private_anonymous_fixed, -1, 0)) {
+        return error.TestUnexpectedResult;
+    }
+    return .{
+        .state = .{
+            .sparse_memory = manager,
+            .mem = image,
+            .mem_base = 0,
+            .mem_size = 4096,
+            .mapped_min = 0x1000,
+            .pointer_firewall = firewall,
+            .page_permissions = perms,
+        },
+        .manager = manager,
+        .firewall = firewall,
+    };
+}
+
+test "guestCString reads sparse-backed strings outside the primary image" {
+    const setup = try sparseCStringTestState(std.testing.allocator);
+    defer setup.manager.deinit();
+    defer setup.firewall.deinit();
+    defer std.testing.allocator.free(setup.state.mem);
+    defer std.testing.allocator.free(setup.state.page_permissions);
+    const state = &setup.state;
+
+    const base: u64 = 0x8000_0000;
+    const bytes = setup.manager.bytes(base, 16, true) orelse return error.TestUnexpectedResult;
+    @memcpy(bytes[0..11], "hello world");
+    bytes[11] = 0;
+
+    // A string inside a sparse mapping (guest mmap of a file, XISO/XEX image,
+    // JIT data) resolves even though the primary-image translation cannot see
+    // it; before the sparse path existed this read failed and the caller
+    // reported an unresolved import returning 0.
+    const string = guestCString(state, base, 1 << 20) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello world", string);
+
+    // Zero pointers stay rejected regardless of backing.
+    try std.testing.expect(guestCString(state, 0, 1 << 20) == null);
+
+    // Addresses in neither the sparse mappings nor the primary image reject.
+    try std.testing.expect(guestCString(state, 0xDEAD_BEEF, 1 << 20) == null);
+}
+
+test "guestCString resolves a sparse string that ends at the mapping boundary" {
+    const setup = try sparseCStringTestState(std.testing.allocator);
+    defer setup.manager.deinit();
+    defer setup.firewall.deinit();
+    defer std.testing.allocator.free(setup.state.mem);
+    defer std.testing.allocator.free(setup.state.page_permissions);
+    const state = &setup.state;
+
+    const base: u64 = 0x8000_0000;
+    // 500-byte string whose terminator is the final byte of the 64 KiB
+    // mapping. The geometric probe overshoots the mapping and the bisect must
+    // recover the exact readable span to find the terminator.
+    const tail = base + sparse_virtual_memory.PAGE_64K - 500;
+    const tail_bytes = setup.manager.bytes(tail, 500, true) orelse return error.TestUnexpectedResult;
+    for (0..499) |index| tail_bytes[index] = 'a';
+    tail_bytes[499] = 0;
+
+    const long = guestCString(state, tail, 1 << 20) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 499), long.len);
+    try std.testing.expectEqual(@as(u8, 'a'), long[0]);
+    try std.testing.expectEqual(@as(u8, 'a'), long[498]);
+
+    // A non-terminated read that outgrows max_len rejects like the primary
+    // image path does.
+    const untruncated = setup.manager.bytes(tail, 500, true) orelse return error.TestUnexpectedResult;
+    untruncated[0] = 'b';
+    try std.testing.expect(guestCString(state, tail, 32) == null);
 }

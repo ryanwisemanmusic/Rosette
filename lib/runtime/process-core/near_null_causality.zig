@@ -226,7 +226,11 @@ fn reportByteOrderSurvey(self: anytype) void {
     const Window = struct {
         state: @TypeOf(self),
         fn isGuest(ctx: @This(), address: u64) bool {
-            return memory_access.isGuestAddress(ctx.state, address);
+            // Any observed guest mapping, not just the module window: a guest
+            // stack or heap pointer that arrived byte-reversed is the same
+            // defect as a reversed code address, and scoring it "unrelated"
+            // is how a systematic conversion failure reads as a single site.
+            return memory_access.isGuestMappedValue(ctx.state, address);
         }
     };
     const slots = [_]byte_order.Slot{

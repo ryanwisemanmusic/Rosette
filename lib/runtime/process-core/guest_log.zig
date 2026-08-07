@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const macho_log = @import("dyld").event_log;
+const gpu = @import("gpu");
 const machoCapturePrint = macho_log.machoCapturePrint;
 const startup_observer = @import("diagnostics").startup_observer;
 const constants = @import("macho_core").constants;
@@ -145,6 +146,7 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
     const message = self.guestMemoryConst(address, length) orelse return false;
     observeXeniaPipelineGuestLog(self, message);
+    observeGpuBootstrapGuestLog(self, message);
     self.observeBackendGuestLog(message);
     const raw_char: u8 = @truncate(prefix_char_raw);
     const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
@@ -203,14 +205,81 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     }
 
     if (self.guest_log_mirror_fd >= 0) {
-        _ = hostWriteFdAll(self.guest_log_mirror_fd, prefix);
-        _ = hostWriteFdAll(self.guest_log_mirror_fd, message);
-        if (message.len == 0 or message[message.len - 1] != '\n') {
-            _ = hostWriteFdAll(self.guest_log_mirror_fd, "\n");
+        // The guest's log is the guest's. When it loops, the mirror reproduces
+        // every iteration, and the one line that matters ends up underneath
+        // tens of thousands of copies of one that does not. Collapsing runs
+        // makes the count the finding instead of the volume — and the count is
+        // strictly more informative than the copies.
+        switch (self.guest_log_repetition.observe(message)) {
+            .suppress => {},
+            .emit => writeMirroredLine(self, prefix, message),
+            .emit_after_run => |repeats| {
+                var buffer: [192]u8 = undefined;
+                const summary = std.fmt.bufPrint(
+                    &buffer,
+                    "macho-processor: guest log mirror: previous line repeated {d} more time(s) consecutively and was collapsed\n",
+                    .{repeats},
+                ) catch "macho-processor: guest log mirror: previous line repeated and was collapsed\n";
+                _ = hostWriteFdAll(self.guest_log_mirror_fd, summary);
+                machoCapturePrint("{s}", .{summary});
+                writeMirroredLine(self, prefix, message);
+            },
         }
     }
     self.guest_log_line_count +|= 1;
     return true;
+}
+
+/// Write one mirrored guest line, adding the newline the guest may have omitted.
+fn writeMirroredLine(self: anytype, prefix: []const u8, message: []const u8) void {
+    _ = hostWriteFdAll(self.guest_log_mirror_fd, prefix);
+    _ = hostWriteFdAll(self.guest_log_mirror_fd, message);
+    if (message.len == 0 or message[message.len - 1] != '\n') {
+        _ = hostWriteFdAll(self.guest_log_mirror_fd, "\n");
+    }
+}
+
+/// Observe the guest-driven GPU bootstrap from the mirrored guest log.
+///
+/// The guest's own kernel-export tracing is the only place these calls are
+/// visible to the runtime without instrumenting the host program, and a step the
+/// guest never took leaves no other trace by construction. Matching on the
+/// export name is the observation; the ordering and preconditions live in
+/// `lib/gpu`, which is what turns "callback = 0" into "this step was never
+/// reachable, and here is the one that blocked it".
+pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_bootstrap")) return;
+    const steps = [_]struct { name: []const u8, step: gpu.Step }{
+        .{ .name = "VdInitializeEngines", .step = .initialize_engines },
+        .{ .name = "VdGetSystemCommandBuffer", .step = .system_command_buffer },
+        .{ .name = "VdSetGraphicsInterruptCallback", .step = .graphics_interrupt_callback },
+        .{ .name = "VdInitializeRingBuffer", .step = .ring_buffer },
+        .{ .name = "VdEnableRingBufferRPtrWriteBack", .step = .rptr_writeback },
+        .{ .name = "VdSwap", .step = .swap },
+    };
+    for (steps) |candidate| {
+        // The export-verification lines name these symbols without calling
+        // them, so a bare occurrence is not evidence. Only the call-trace form
+        // `Name(` counts.
+        var buffer: [64]u8 = undefined;
+        const called = std.fmt.bufPrint(&buffer, "{s}(", .{candidate.name}) catch continue;
+        if (std.mem.indexOf(u8, message, called) == null) continue;
+        const before = self.gpu_bootstrap.frontier();
+        self.gpu_bootstrap.observe(candidate.step, self.executed_steps);
+        const after = self.gpu_bootstrap.frontier();
+        if (before.step != after.step) {
+            machoCapturePrint(
+                "macho-processor: gpu bootstrap: {s} observed; frontier moved to {s} (reached={d}/{d})\n",
+                .{
+                    candidate.step.label(),
+                    if (after.step) |next| next.label() else "<complete>",
+                    after.reached,
+                    gpu.bootstrap.step_count,
+                },
+            );
+        }
+    }
 }
 
 pub fn observeXeniaPipelineGuestLog(self: anytype, message: []const u8) void {
