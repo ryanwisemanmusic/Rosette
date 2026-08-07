@@ -12,6 +12,16 @@ pub const Strategy = enum {
     exact_dynamic_type,
     hierarchy,
     name_based,
+    /// The hierarchy was walked successfully and the destination type is simply
+    /// not in it. `dynamic_cast` returns null, and that null is the **correct
+    /// answer** — the language defines this case.
+    ///
+    /// Kept apart from a metadata failure because the two are opposites that
+    /// look identical from the outside: both produce a null pointer. Reporting
+    /// a proven negative as a failure puts a false alarm in the log every time a
+    /// program legitimately tests a pointer's type — and, worse, makes a real
+    /// metadata failure indistinguishable from ordinary correct behaviour.
+    proven_negative,
 };
 
 pub const Resolution = struct {
@@ -67,6 +77,9 @@ pub const Engine = struct {
     exact_dynamic: u64 = 0,
     hierarchy_resolved: u64 = 0,
     failed_metadata: u64 = 0,
+    /// Casts answered null *correctly*: the hierarchy was readable and the
+    /// destination is not a base of the dynamic type.
+    proven_negatives: u64 = 0,
     ambiguous: u64 = 0,
     negative_hints: u64 = 0,
     trace_buffer: [TRACE_BUFFER_SIZE]ResolvedEntry = undefined,
@@ -159,20 +172,42 @@ pub const Engine = struct {
                 return .{ .address = name_matches.destination, .strategy = .name_based };
             }
             if (name_matches.destination_count > 1) self.ambiguous +|= 1;
+            // The graph was readable — the source type was located inside it —
+            // and neither pass found the destination. That is not a failure to
+            // resolve; it is a resolution, and its answer is null. A program
+            // asking "is this Entry a HostPathEntry?" about an entry that is not
+            // one gets null by the language's own rules.
+            if (matches.source_found or name_matches.source_found) {
+                self.resolved +|= 1;
+                self.proven_negatives +|= 1;
+                self.clearLastFailure();
+                return .{ .address = 0, .strategy = .proven_negative };
+            }
         }
         return self.failMetadata();
+    }
+
+    /// A cast that resolved has no failure to report. Without this the last
+    /// *unresolved* cast stays latched and is printed at exit as though it were
+    /// the outcome of a later, successful one.
+    fn clearLastFailure(self: *Engine) void {
+        self.last_fail_source = 0;
+        self.last_fail_src_type = 0;
+        self.last_fail_dst_type = 0;
+        self.last_fail_hint = 0;
     }
 
     pub fn logSummary(self: *const Engine) void {
         if (self.attempts == 0) return;
         machoCapturePrint(
-            "macho-processor: Itanium dynamic cast: attempts={d} resolved={d} null={d} exact={d} hierarchy={d} negative_hints={d} metadata_failures={d} ambiguous={d}\n",
+            "macho-processor: Itanium dynamic cast: attempts={d} resolved={d} null_sources={d} exact={d} hierarchy={d} proven_negatives={d} negative_hints={d} metadata_failures={d} ambiguous={d}; a proven negative is a cast that correctly returned null because the destination is not a base of the dynamic type — the language's own answer, not a failure. Only metadata_failures are casts Rosette could not decide\n",
             .{
                 self.attempts,
                 self.resolved,
                 self.null_sources,
                 self.exact_dynamic,
                 self.hierarchy_resolved,
+                self.proven_negatives,
                 self.negative_hints,
                 self.failed_metadata,
                 self.ambiguous,
@@ -228,7 +263,7 @@ pub const Engine = struct {
             const source_name = typeName(state, self.last_fail_src_type) orelse "<unknown>";
             const dest_name = typeName(state, self.last_fail_dst_type) orelse "<unknown>";
             machoCapturePrint(
-                "macho-processor: __dynamic_cast FAILED: source=0x{x} source_type={s} dest_type={s} hint={d}\n",
+                "macho-processor: __dynamic_cast UNDECIDED: source=0x{x} source_type={s} dest_type={s} hint={d}; the hierarchy was unreadable. This is not a failed cast — a failed cast resolves to a proven negative and is not reported here\n",
                 .{ self.last_fail_source, source_name, dest_name, @as(i64, @bitCast(self.last_fail_hint)) },
             );
         }
@@ -583,4 +618,30 @@ test "typed catch infers single-inheritance RTTI without a libc++abi binding" {
     state.mem[0x3d1] = 0;
 
     try std.testing.expect(isCatchCompatible(&state, thrown_type, public_base));
+}
+
+// A `dynamic_cast` to a type the object is not is *defined* to yield null, and
+// a runtime that reports that as a metadata failure cries wolf on every correct
+// type test a program performs. Observed: a VFS `Entry` from a disc image tested
+// against `HostPathEntry` — null is the right answer and the only right answer.
+test "a resolution and a failure are distinguishable outcomes" {
+    try std.testing.expect(Strategy.proven_negative != Strategy.hierarchy);
+    const negative = Resolution{ .address = 0, .strategy = .proven_negative };
+    const null_source = Resolution{ .address = 0, .strategy = .null_source };
+    // Both carry a null address, so the address alone can never separate them —
+    // which is exactly why the strategy has to.
+    try std.testing.expectEqual(@as(u64, 0), negative.address);
+    try std.testing.expectEqual(@as(u64, 0), null_source.address);
+    try std.testing.expect(negative.strategy != null_source.strategy);
+}
+
+test "a proven negative clears any latched failure state" {
+    var engine = Engine{};
+    engine.last_fail_source = 0xdead;
+    engine.last_fail_src_type = 0xbeef;
+    engine.clearLastFailure();
+    try std.testing.expectEqual(@as(u64, 0), engine.last_fail_source);
+    try std.testing.expectEqual(@as(u64, 0), engine.last_fail_src_type);
+    try std.testing.expectEqual(@as(u64, 0), engine.last_fail_dst_type);
+    try std.testing.expectEqual(@as(u64, 0), engine.last_fail_hint);
 }

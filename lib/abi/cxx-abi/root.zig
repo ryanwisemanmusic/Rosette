@@ -16,3 +16,14 @@ pub const cxx_object_model = @import("cxx_object_model.zig");
 pub const itanium_vtable_builder = @import("itanium_vtable_builder.zig");
 pub const cxx_exception_diagnostics = @import("cxx_exception_diagnostics.zig");
 pub const libcpp_shared_control_block = @import("libcpp_shared_control_block.zig");
+
+// Rooted in build.zig so these run rather than merely compile.
+test {
+    _ = itanium_unwinder;
+    _ = itanium_dynamic_cast;
+    _ = compact_unwind;
+    _ = cxx_object_model;
+    _ = itanium_vtable_builder;
+    _ = cxx_exception_diagnostics;
+    _ = libcpp_shared_control_block;
+}
