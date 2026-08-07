@@ -88,7 +88,11 @@ const signal_handling = @import("process_core").signal_handling;
 const initializers = @import("process_core").initializers;
 const compat_handlers = @import("process_core").compat_handlers;
 const bounded_dispatch_fst = @import("process_core").bounded_dispatch_fst;
-const recovery_ledger = @import("process_core").recovery_ledger;
+const recovery_ledger = @import("ownership").ledger;
+const guest_address_space = @import("guest_address_space");
+const ownership_lib = @import("ownership");
+const dispatch_recovery = @import("dispatch_recovery");
+const guest_structure = @import("guest_structure");
 const execution_history = @import("execution_history");
 const ExecutionHistory = execution_history.History(TraceEntry);
 const crash_diag = @import("process_core").crash_diag;
@@ -555,6 +559,11 @@ pub const MachOState = struct {
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
     memory_forwarder: memory_management_forwarder.Manager,
     sparse_memory: sparse_virtual_memory.Manager,
+    /// Derived model of the guest address window. Replaces the hardcoded
+    /// 0x80000000..0xA0000000 predicate: observations arrive from sparse
+    /// mappings, and every classification reports whether it is derived or
+    /// still running on the bootstrap default.
+    guest_address_space: guest_address_space.Model = .{},
     memory_regions: memory_provenance.Registry,
     memory_writes: memory_write_provenance.Tracker = .{},
     // One ledger per recovery family: its own count, its own log throttle, and
@@ -576,6 +585,15 @@ pub const MachOState = struct {
     // against the null-scalar-read and frame-return families, so neither of
     // those counters meant what it said and the transducer had no loop guard.
     bounded_dispatch_recoveries: recovery_ledger.Ledger = .{},
+    /// Policy: may the dispatch transducer continue past an unresolvable guest
+    /// dispatch on a stated assumption? On by default so a run reaches its next
+    /// distinct failure instead of stopping at a known one; set
+    /// ROSETTE_MACHO_STRICT_DISPATCH=1 to restore strict fail-closed behaviour.
+    allow_assumed_dispatch_continuation: bool = true,
+    /// Single-owner selection for generated-code scalar faults. Evaluates every
+    /// claim so an overlap is reported rather than resolved by ordering.
+    generated_fault_arbiter: memory_access.GeneratedFaultArbiter =
+        memory_access.GeneratedFaultArbiter.init(&memory_access.generated_fault_claims),
     // RIP of the most recent generated null scalar read satisfied as
     // zero-fill; the null indirect transfer recovery reports the linkage when
     // a null function pointer dispatch follows within a short window.
@@ -585,6 +603,23 @@ pub const MachOState = struct {
     // function-exit epilogue, so we return to the host caller via [rbp+8]
     // instead of falling through (which double-deallocates the frame).
     generated_dispatch_frame_return: recovery_ledger.Ledger = .{},
+    /// Returns that were executed as indirect dispatches because the target
+    /// register held the guest return address byte-reversed, so Xenia's
+    /// CALL_POSSIBLE_RETURN compare could not match. Its own family: these are
+    /// not unresolvable dispatches, they are dispatches that should never have
+    /// happened, and folding them into the null-indirect count would hide the
+    /// byte-order defect behind a code-cache-miss statistic.
+    generated_missed_guest_return: recovery_ledger.Ledger = .{},
+    /// Base registers holding a guest address whose bytes were never converted
+    /// from big-endian. The low half is zero, so the fault presents as a null
+    /// pointer — its own family because "the pointer was never set" and "the
+    /// pointer was set and not converted" send an investigation to opposite
+    /// ends of the runtime.
+    generated_byte_order_repair: recovery_ledger.Ledger = .{},
+    /// Population of generated-code dispatch sites the bounded machine has met,
+    /// split by whether it got through. Individual recoveries each report
+    /// themselves; only this says whether a run met one stubborn site or forty.
+    dispatch_census: dispatch_recovery.Census = .{},
     vtable_tracker: vt.VtableTracker,
     /// Tracks vtable writes for non-heap (stack-local / modeled) objects.
     /// Registered by the stream bridge during stringstream construction
@@ -612,6 +647,14 @@ pub const MachOState = struct {
     import_route_cache_misses: u64 = 0,
     import_route_cache_collisions: u64 = 0,
     import_route_cache_fallbacks: u64 = 0,
+    /// Cache hits whose route dispatches straight back into the slow path
+    /// (`.legacy`, `.strtoul`). Counted apart so the reported hit rate measures
+    /// work avoided rather than lookups matched.
+    import_route_cache_slow_hits: u64 = 0,
+    /// Fallbacks attributed to the route that declined the symbol it was cached
+    /// for. A bare total names nothing; this names the route to fix.
+    import_route_fallbacks: [@typeInfo(ImportRoute).@"enum".fields.len]u64 =
+        [_]u64{0} ** @typeInfo(ImportRoute).@"enum".fields.len,
     cleo_dispatch_hits: u64 = 0,
     import_handler: import_handler.ImportHandler,
     page_entry_bulk_initializations: u64 = 0,
@@ -630,7 +673,6 @@ pub const MachOState = struct {
     last_trace_rip: u64 = 0,
     last_trace_op: u64 = 0,
     trace_repeat_count: u64 = 0,
-    trace_ring_enabled: bool = false,
     pending_stub_slot: ?u32 = null,
     pending_stub_entry_rip: ?u64 = null,
     pending_import_stub_rip: ?u64 = null,
@@ -669,6 +711,26 @@ pub const MachOState = struct {
     /// attributing it to the faulting guest instruction. Always set through
     /// `writeMemValAsHostRepair`, never assigned directly.
     host_repair_in_flight: bool = false,
+    /// Guest memory kept under write provenance without the global flag.
+    /// Seeded behaviourally from generated-code structure-field operands, so
+    /// the run does not have to be told in advance which address will matter.
+    provenance_watch: ownership_lib.WatchSet = .{},
+    /// Guest ranges whose backing Rosette discarded — a MAP_FIXED replacement,
+    /// an unmap, or a re-home to a host base the guest never asked for. Every
+    /// observer above keys on the guest address and outlives the bytes, so
+    /// without this an absence of provenance reads as "the guest never wrote
+    /// here" when it means "the storage was replaced under us".
+    guest_lifetime: ownership_lib.LifetimeRegistry = .{},
+    /// Observed field access shape for the structures generated code addresses.
+    /// Distinguishes "this field is never written" (a missing store) from
+    /// "written with the wrong value" — different bugs, and the difference is
+    /// only visible as an absence measured over the whole run.
+    guest_fields: guest_structure.Profile = .{},
+    /// Allowance for the generated-code memory trace, whose per-access
+    /// instruction re-decode is the most expensive observer in the runtime.
+    /// It feeds a *fallback* attribution path (the def-use scan is primary), so
+    /// a bounded prefix is enough; exhaustion is reported rather than hidden.
+    memory_trace_budget: ownership_lib.Budget = ownership_lib.Budget.init(2_000_000),
     // Always-on endian-contract evidence ring. Populated at the execute site
     // (no re-decode: the interpreter already has the decoded instruction) for
     // the narrow set of ops the generated-endian contract consumes. Unlike the
@@ -1474,7 +1536,7 @@ pub const MachOState = struct {
     pub const captureMemoryMutation = memory_access.captureMemoryMutation;
     pub const commitMemoryMutation = memory_access.commitMemoryMutation;
     const deferInitializerRuntimeDependency = memory_access.deferInitializerRuntimeDependency;
-    pub const decodeTraceInstruction = memory_access.decodeTraceInstruction;
+    pub const decodeWithSnapshotOperands = memory_access.decodeWithSnapshotOperands;
     const ensureGuestAccess = memory_access.ensureGuestAccess;
     pub const terminateForGuestAccess = memory_access.terminateForGuestAccess;
     const dumpStepTraceBuffer = memory_access.dumpStepTraceBuffer;
@@ -1500,6 +1562,7 @@ pub const MachOState = struct {
     pub const guestHeapContains = memory_access.guestHeapContains;
     pub const forgetMemoryWriteProvenance = memory_access.forgetMemoryWriteProvenance;
     pub const guestMapFile = memory_access.guestMapFile;
+    pub const guestMapHinted = memory_access.guestMapHinted;
     pub const guestMapAnywhereWithBacking = memory_access.guestMapAnywhereWithBacking;
     pub const guestMapBackendWithBacking = memory_access.guestMapBackendWithBacking;
     pub const guestReserveAddressSpace = memory_access.guestReserveAddressSpace;
@@ -2011,7 +2074,7 @@ pub const MachOState = struct {
                                 while (iter < max_iters) : (iter += 1) {
                                     if (st.terminated or st.faulted) break;
 
-                                    const d = st.decodeAt() orelse break;
+                                    const d = st.decodeWithLiveOperands() orelse break;
                                     if (d.op == .invalid) break;
 
                                     if (d.op == .ret) {
@@ -2327,6 +2390,62 @@ pub const MachOState = struct {
         const addr = stack_arg_addr.*;
         stack_arg_addr.* += 8;
         return self.read64(addr);
+    }
+
+    /// Learn which guest structures generated code treats as state.
+    ///
+    /// A 64-bit load through `base + small displacement` is how compiled code
+    /// reads a structure field, and those fields are what the dispatch
+    /// recognizers end up asking about. Watching their pages puts them under
+    /// write provenance without arming it globally — the difference between
+    /// "who wrote this" being answerable and being a flag the operator had to
+    /// set before knowing which address mattered.
+    ///
+    /// Runs only for generated code (1.8% of executed steps) and stops entirely
+    /// once the bounded set is full, so the cost is a short prefix of the run.
+    /// Record the structure-field access shape for a generated-code operand.
+    /// Separate from the watch seed because it must keep counting after the
+    /// watch fills: the interesting fact is a ratio of reads to writes over the
+    /// whole run, not the first few pages.
+    fn noteGuestFieldAccess(self: *MachOState, decoded: DecodedInsn) void {
+        const is_write = switch (decoded.op) {
+            .mov_mem64_reg64,
+            .mov_mem32_reg32,
+            .mov_mem16_reg16,
+            .mov_mem8_reg8,
+            .mov_mem64_imm32,
+            .mov_mem32_imm32,
+            .mov_mem16_imm16,
+            .mov_mem8_imm8,
+            .movbe_mem_reg,
+            => true,
+            .mov_reg64_mem64,
+            .mov_reg32_mem32,
+            .mov_reg16_mem16,
+            .mov_reg8_mem8,
+            .movbe_reg_mem,
+            => false,
+            else => return,
+        };
+        if (!decoded.sib_has_base or decoded.sib_has_index or decoded.rip_relative) return;
+        const base = self.regVal(decoded.sib_base_reg, .bits64);
+        const effective = decoded.addr;
+        if (base == 0 or effective < base) return;
+        self.guest_fields.note(base, effective - base, is_write);
+    }
+
+    fn seedProvenanceWatch(self: *MachOState, decoded: DecodedInsn) void {
+        if (self.provenance_watch.full()) return;
+        if (decoded.op != .mov_reg64_mem64) return;
+        if (!decoded.sib_has_base or decoded.sib_has_index or decoded.rip_relative) return;
+        // On the execute path `decoded.addr` is the *resolved* effective
+        // address (the decode cache applies live registers), not the raw
+        // displacement. Recover the displacement rather than adding the base a
+        // second time.
+        const base = self.regVal(decoded.sib_base_reg, .bits64);
+        const effective = decoded.addr;
+        if (effective < base) return;
+        _ = self.provenance_watch.seedFromOperand(base, effective - base);
     }
 
     fn recordTrace(self: *MachOState, decoded: DecodedInsn) void {
@@ -2920,7 +3039,10 @@ pub const MachOState = struct {
         );
     }
 
-    fn decodeAt(self: *MachOState) ?DecodedInsn {
+    /// Decode the instruction at the current RIP and resolve its memory operand
+    /// against the **live** register file, via the decode cache. This is the
+    /// execution path's decoder; the other two are readers.
+    fn decodeWithLiveOperands(self: *MachOState) ?DecodedInsn {
         const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
         const cache_index = constants.decodeCacheIndex(fetch_address);
         const entry = &self.decode_cache[cache_index];
@@ -3103,7 +3225,7 @@ pub const MachOState = struct {
             return false;
         }
         self.pending_control_transfer = null;
-        const decoded = self.decodeAt() orelse {
+        const decoded = self.decodeWithLiveOperands() orelse {
             if (self.terminated) return false;
             const rip = self.regs.rip;
             machoCapturePrint("macho-processor: decode failed at rip=0x{x}\n", .{rip});
@@ -3174,7 +3296,33 @@ pub const MachOState = struct {
             self.terminated = true;
             return false;
         }
-        if (self.trace_ring_enabled) self.recordTrace(decoded);
+        // Instruction history, gated behaviourally rather than by a flag.
+        //
+        // The predecessor of this line was `if (self.trace_ring_enabled)`, and
+        // `trace_ring_enabled` was never assigned anywhere in the tree — so the
+        // ring was empty for the entire life of the code and every recognizer
+        // built on it reported "no retained evidence", which reads as a fact
+        // about the guest and was a fact about an unset boolean.
+        //
+        // Generated code is the only region these recognizers ask about, and it
+        // is a small fraction of executed steps (Xenia's own JIT compiler
+        // dominates), so recording exactly there makes the tape both affordable
+        // and deep where it is consulted. Two range compares, no page lookup.
+        switch (self.execution_history.policy) {
+            .disabled => {},
+            .all => self.recordTrace(decoded),
+            .generated_code_only => {
+                const in_host_image = self.regs.rip >= self.executable_min and
+                    self.regs.rip < self.executable_max;
+                if (in_host_image) {
+                    self.execution_history.noteFiltered();
+                } else {
+                    self.recordTrace(decoded);
+                    self.seedProvenanceWatch(decoded);
+                    self.noteGuestFieldAccess(decoded);
+                }
+            },
+        }
         if (self.coop_bootstrap_active and self.coop_bootstrap_index < 24) {
             const idx = self.coop_bootstrap_index;
             self.coop_bootstrap_entries[idx] = .{
@@ -4411,6 +4559,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.memory_trace_enabled = environmentFlag("ROSETTE_MACHO_MEMORY_TRACE");
+    state.allow_assumed_dispatch_continuation = !environmentFlag("ROSETTE_MACHO_STRICT_DISPATCH");
     // R3 (perf audit): write diagnostics (mutation provenance, vtable
     // tracking, suspicious-write detector) default off so the store path is
     // ~2 ops; arm with ROSETTE_MACHO_WRITE_DIAGNOSTICS=1 when a fault needs

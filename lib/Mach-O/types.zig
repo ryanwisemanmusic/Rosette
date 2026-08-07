@@ -10,6 +10,7 @@ const compat_runtime = @import("macho_compat_runtime");
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const Op = x64_decoder.Op;
 const Regs = x64_decoder.Regs;
+const RegId = x64_decoder.RegId;
 const DecodedInsn = x64_decoder.DecodedInsn;
 const TOML_CODEPOINT_CAPACITY = constants.TOML_CODEPOINT_CAPACITY;
 
@@ -65,6 +66,35 @@ pub const TraceEntry = struct {
     r13: u64 = 0,
     r14: u64 = 0,
     r15: u64 = 0,
+
+    /// The snapshot value of one architectural register.
+    ///
+    /// The mapping from a decoder `RegId` onto these fields existed three
+    /// times — in `near_null_causality`, in `memory_access`, and in
+    /// `crash_diag` — byte-identical, which is exactly how a mapping like this
+    /// survives being wrong: nothing forces the copies to move together, and
+    /// the register file is the input to every history-based causal walk in
+    /// the runtime. The type that owns the fields owns the mapping.
+    pub fn registerValue(self: TraceEntry, register: RegId) u64 {
+        return switch (@intFromEnum(register)) {
+            0 => self.rax,
+            1 => self.rcx,
+            2 => self.rdx,
+            3 => self.rbx,
+            4 => self.rsp,
+            5 => self.rbp,
+            6 => self.rsi,
+            7 => self.rdi,
+            8 => self.r8,
+            9 => self.r9,
+            10 => self.r10,
+            11 => self.r11,
+            12 => self.r12,
+            13 => self.r13,
+            14 => self.r14,
+            15 => self.r15,
+        };
+    }
 };
 
 pub const X87Tag = enum(u2) {
@@ -265,7 +295,21 @@ pub const ImportRoute = enum(u8) {
     foreign_object,
     import_contract,
     libcxx_filesystem,
+    /// `pthread_runtime.dispatch` — the POSIX pthread surface.
+    ///
+    /// This tag used to cover three different owners: this one, the C++
+    /// synchronization surface, and the inline `_pthread_once` handler. The
+    /// route cache replays a tag by calling *one* function, so every symbol
+    /// belonging to either of the other two was cached as `.pthread`, declined
+    /// on replay, and fell back through the entire symbol chain — 73,802 times
+    /// in a 1.5-billion-step run, which is essentially every C++ lock and
+    /// unlock the guest performed. One tag, one owner.
     pthread,
+    /// `pthread_runtime.dispatchCppSynchronization` — libc++ mutex/condvar.
+    pthread_cpp_sync,
+    /// The `_pthread_once` handler, which transfers control to the guest's
+    /// initializer rather than returning a value.
+    pthread_once,
     dynamic_library,
     shared_contract,
     allocate,
@@ -545,3 +589,35 @@ pub const ProfileAccountFlow = struct {
     successes: u64 = 0,
     failures: u64 = 0,
 };
+
+// The mapping this replaces was copied into three modules. Each copy was the
+// input to a causal walk that decides where guest execution resumes, so a
+// single transposed ordinal would have produced confident, wrong attribution
+// in whichever consumers happened to hold the bad copy. One owner, one test.
+test "a trace snapshot maps every register id onto its own field" {
+    const entry = TraceEntry{
+        .rax = 0x00,
+        .rcx = 0x11,
+        .rdx = 0x22,
+        .rbx = 0x33,
+        .rsp = 0x44,
+        .rbp = 0x55,
+        .rsi = 0x66,
+        .rdi = 0x77,
+        .r8 = 0x88,
+        .r9 = 0x99,
+        .r10 = 0xAA,
+        .r11 = 0xBB,
+        .r12 = 0xCC,
+        .r13 = 0xDD,
+        .r14 = 0xEE,
+        .r15 = 0xFF,
+    };
+    const expected = [_]u64{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    for (expected, 0..) |value, ordinal| {
+        const register: RegId = @enumFromInt(@as(u4, @intCast(ordinal)));
+        try std.testing.expectEqual(value, entry.registerValue(register));
+    }
+    // The faulting-base register of the dispatch layout these walks exist for.
+    try std.testing.expectEqual(@as(u64, 0x33), entry.registerValue(.bl_bx_ebx_rbx));
+}
