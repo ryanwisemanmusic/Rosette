@@ -26,9 +26,17 @@ const vt = @import("vtable");
 const guest_log = @import("guest_log.zig");
 const generated_endian_contract = @import("generated_endian_contract.zig");
 const near_null_causality = @import("near_null_causality.zig");
-const recovery_ledger = @import("recovery_ledger.zig");
+pub const ownership = @import("ownership");
+const recovery_ledger = ownership.ledger;
 const bounded_dispatch_fst = @import("bounded_dispatch_fst.zig");
 const generated_block = @import("execution_history").generated_block;
+const dispatch_shape = @import("execution_history").dispatch_shape;
+const bounded_scan_mod = @import("execution_history").bounded_scan;
+const scan_limits = bounded_scan_mod.Limits;
+const guest_address_space = @import("guest_address_space");
+const dispatch_table = @import("dispatch_table");
+const byte_order = @import("byte_order");
+const dispatch_recovery = @import("dispatch_recovery");
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 
 const Size = x64_decoder.OperandSize;
@@ -368,7 +376,16 @@ pub fn pop(self: anytype) u64 {
     return val;
 }
 
-fn decodedInstructionAt(self: anytype, rip: u64) ?DecodedInsn {
+/// Decode the instruction at `rip` **without resolving its memory operand**.
+///
+/// `DecodedInsn.addr` is left as the raw displacement. Callers that need an
+/// effective address must resolve it themselves against whichever register
+/// snapshot is correct for their question — see `decodeWithSnapshotOperands`.
+///
+/// Named for what it does not do: three functions here decode an instruction
+/// and they differ precisely in *which register file* resolves the operand, so
+/// a name that only says "decode" hides the one thing a caller must choose.
+fn decodeStatic(self: anytype, rip: u64) ?DecodedInsn {
     const source: []const u8 = if (self.sparse_memory.executableBytesConst(rip, 16)) |sparse_code|
         sparse_code
     else blk: {
@@ -418,10 +435,62 @@ pub const GeneratedFaultClassification = struct {
     address_size: Size = .bits64,
 };
 
-/// Decide the single owner of a generated-code scalar load fault. Pure with
-/// respect to guest state: it reads registers and decodes the faulting
-/// instruction but mutates nothing, so the answer cannot be perturbed by the
-/// repair it selects.
+/// The claim input: everything the owners are allowed to decide on. Assembled
+/// once, from state no repair has touched.
+pub const GeneratedFaultClaim = struct {
+    op: x64_decoder.Op,
+    has_override: bool,
+    base_reg: x64_decoder.RegId,
+    dst_reg: x64_decoder.RegId,
+    base_value: u64,
+    fault_address: u64,
+    width: u8,
+    base_only_zero_displacement: bool,
+    scalar_load_form: bool,
+    indirection_form: bool,
+};
+
+fn claimsEndianSwappedBase(claim: GeneratedFaultClaim) bool {
+    // A zero base is never a byte-swapped address. Omitting this is what let
+    // two owners match the same fault and made declaration order the tie-break.
+    return claim.base_only_zero_displacement and claim.width == 4 and
+        claim.base_value != 0 and claim.fault_address != 0 and
+        claim.op == .mov_reg32_mem32 and claim.has_override and
+        claim.base_value == claim.fault_address;
+}
+
+fn claimsNullBaseDispatch(claim: GeneratedFaultClaim) bool {
+    return claim.base_only_zero_displacement and claim.scalar_load_form and
+        claim.base_value == 0 and claim.fault_address == 0 and
+        (claim.width == 1 or claim.width == 2 or claim.width == 4) and
+        claim.indirection_form;
+}
+
+fn claimsNullBaseScalar(claim: GeneratedFaultClaim) bool {
+    return claim.base_only_zero_displacement and claim.scalar_load_form and
+        claim.base_value == 0 and claim.fault_address == 0 and
+        (claim.width == 1 or claim.width == 2 or claim.width == 4) and
+        !claim.indirection_form;
+}
+
+pub const GeneratedFaultArbiter = ownership.Arbiter(GeneratedFaultOwner, GeneratedFaultClaim);
+
+pub const generated_fault_claims = [_]GeneratedFaultArbiter.Claim{
+    .{ .owner = .endian_swapped_base, .matches = claimsEndianSwappedBase },
+    .{ .owner = .null_base_dispatch, .matches = claimsNullBaseDispatch },
+    .{ .owner = .null_base_scalar, .matches = claimsNullBaseScalar },
+};
+
+/// Decide the single owner of a generated-code scalar load fault.
+///
+/// Pure with respect to guest state: it decodes and reads registers but mutates
+/// nothing, so the answer cannot be perturbed by the repair it selects.
+///
+/// Selection runs through `ownership.Arbiter`, which evaluates **every** claim
+/// rather than short-circuiting. That makes disjointness a continuously checked
+/// property instead of an argued one: if two owners ever match the same fault
+/// again, the run says so instead of quietly handing it to whichever predicate
+/// happens to be listed first.
 pub fn classifyGeneratedScalarFault(
     self: anytype,
     fault_address: u64,
@@ -432,48 +501,55 @@ pub fn classifyGeneratedScalarFault(
     if (!self.has_xenia_compat) return .{};
     if (!self.sparse_memory.isExecutable(self.regs.rip, 1)) return .{};
 
-    const fault = decodedInstructionAt(self, self.regs.rip) orelse return .{};
-    if (!isBaseOnlyZeroDisplacementForm(fault)) return .{};
-    // The 0x67 address-size override makes the address 32-bit; read the base at
-    // that width. A zero EBX with garbage in the upper half of RBX is still an
-    // exactly-zero 32-bit address and must qualify.
+    const fault = decodeStatic(self, self.regs.rip) orelse return .{};
     const address_size: Size = if (fault.has_0x67) .bits32 else .bits64;
-    const base_value = self.regVal(fault.sib_base_reg, address_size);
-    const common: GeneratedFaultClassification = .{
+    const base_value = if (fault.sib_has_base)
+        self.regVal(fault.sib_base_reg, address_size)
+    else
+        0;
+
+    const claim = GeneratedFaultClaim{
+        .op = fault.op,
+        .has_override = fault.has_0x67,
+        .base_reg = fault.sib_base_reg,
+        .dst_reg = fault.dst_reg,
+        .base_value = base_value,
+        .fault_address = fault_address,
+        .width = bytes,
+        .base_only_zero_displacement = isBaseOnlyZeroDisplacementForm(fault),
+        .scalar_load_form = isGeneratedNullScalarAddressForm(fault),
+        .indirection_form = isBoundedDispatchIndirectionForm(fault),
+    };
+
+    const outcome = self.generated_fault_arbiter.decide(claim);
+    if (outcome.ambiguous()) {
+        machoCapturePrint(
+            "macho-processor: generated fault ownership CONFLICT: rip=0x{x} address=0x{x} width={d} owners={s} and {s} both claimed this fault; the selection is ambiguous and whichever ran first would have won silently. This is an ownership defect, not a guest condition\n",
+            .{ self.regs.rip, fault_address, bytes, @tagName(outcome.owner.?), @tagName(outcome.conflict.?) },
+        );
+        return .{};
+    }
+    const owner = outcome.owner orelse return .{};
+
+    // Field-availability gates are about the *state*, not the claim, so they
+    // stay here rather than inside a predicate.
+    switch (owner) {
+        .endian_swapped_base => {
+            if (comptime !@hasField(State, "generated_endian_contract")) return .{};
+        },
+        .null_base_dispatch, .null_base_scalar => {
+            if (comptime !@hasField(State, "generated_null_scalar_read") or
+                !@hasField(State, "last_generated_null_read_rip")) return .{};
+        },
+        .none => return .{},
+    }
+
+    return .{
+        .owner = owner,
         .fault = fault,
         .base_value = base_value,
         .address_size = address_size,
     };
-
-    if (base_value == 0 and fault_address == 0) {
-        if (comptime !@hasField(State, "generated_null_scalar_read") or
-            !@hasField(State, "last_generated_null_read_rip"))
-        {
-            return .{};
-        }
-        // One definition of the eligible address form, shared with the unit
-        // tests that pin it. Re-stating the bits here is how the owners drifted
-        // apart the first time.
-        if (!isGeneratedNullScalarAddressForm(fault)) return .{};
-        if (bytes != 1 and bytes != 2 and bytes != 4) return .{};
-        var owned = common;
-        // Xenia's indirection-table load is not a generic nullable scalar: it
-        // is a control-transfer decision, and satisfying it as a zero-filled
-        // read would feed a null function pointer to the following `jmp rax`.
-        owned.owner = if (isBoundedDispatchIndirectionForm(fault))
-            .null_base_dispatch
-        else
-            .null_base_scalar;
-        return owned;
-    }
-
-    if (comptime !@hasField(State, "generated_endian_contract")) return .{};
-    if (bytes != 4 or base_value == 0 or fault_address == 0) return .{};
-    if (fault.op != .mov_reg32_mem32 or !fault.has_0x67) return .{};
-    if (base_value != fault_address) return .{};
-    var owned = common;
-    owned.owner = .endian_swapped_base;
-    return owned;
 }
 
 /// Base-only, zero-displacement addressing with no index and no RIP-relative
@@ -803,15 +879,15 @@ fn tryRecoverGeneratedNullScalarRead(
                 self.regs.r15,
                 self.regs.rsp,
                 self.regs.rbp,
-                if (isGuestModuleAddress(self.regs.rcx)) " rcx=guest" else "",
-                if (isGuestModuleAddress(self.regs.r8)) " r8=guest" else "",
-                if (isGuestModuleAddress(self.regs.r15)) " r15=guest" else "",
+                if (isGuestAddress(self, self.regs.rcx)) " rcx=guest" else "",
+                if (isGuestAddress(self, self.regs.r8)) " r8=guest" else "",
+                if (isGuestAddress(self, self.regs.r15)) " r15=guest" else "",
             },
         );
         // RCX is intentionally diagnostic-only here. Xenia does not load the
         // authoritative guest return until after the indirection-table load;
         // the bounded witness above uses the fixed [rsp+0x58] slot instead.
-        if (isGuestModuleAddress(self.regs.rcx) and fault.sib_base_reg == .bl_bx_ebx_rbx) {
+        if (isGuestAddress(self, self.regs.rcx) and fault.sib_base_reg == .bl_bx_ebx_rbx) {
             machoCapturePrint(
                 "macho-processor:   null read contextual RCX: rcx=0x{x} ({s}) is a guest-window value, but the authoritative return witness is [rsp+0x58]; the base register was zero so the indirection entry was unread\n",
                 .{
@@ -851,54 +927,21 @@ pub fn isGeneratedDispatchMissOp(op: x64_decoder.Op) bool {
     };
 }
 
-/// Detect Xenia's dead function-exit epilogue emitted after a tail-call
-/// dispatch: `add rsp, imm8/32; [dec mem]; ret` — the CALL_POSSIBLE_RETURN
-/// path in X64Emitter::CallIndirect, reachable only via `je epilogue`. A null
-/// tail dispatch recovery must NEVER fall through into it: the frame teardown
-/// has already run before the dispatch, so executing it again double-
-/// deallocates the frame and the `ret` pops a local (the guest return
-/// address). Pure byte check so it is unit-testable without a state.
+/// The generated dispatch shape has one owner: `execution_history.dispatch_shape`.
+/// These delegate so existing call sites — including the unit tests in
+/// `lib/Mach-O/process.zig` that pin the byte encodings — keep working while the
+/// recognizer and its reasoning live in one place.
 pub fn isFunctionExitEpilogueBytes(bytes: []const u8) bool {
-    if (bytes.len < 4) return false;
-    var off: usize = 0;
-    if (bytes[0] == 0x48 and bytes[1] == 0x83 and bytes[2] == 0xC4) {
-        off = 4; // add rsp, imm8
-    } else if (bytes[0] == 0x48 and bytes[1] == 0x81 and bytes[2] == 0xC4) {
-        off = 8; // add rsp, imm32
-    } else {
-        return false;
-    }
-    if (bytes.len <= off) return false;
-    // Optional profiler decrement before the ret: dec dword [rsi-0x14]
-    // (FF 4E EC) or its REX.W form (48 FF 4E EC). Length guards are checked
-    // BEFORE the byte reads so a truncated mapping slice cannot index OOB.
-    var i = off;
-    while (i + 3 <= bytes.len) {
-        if (i + 4 <= bytes.len and bytes[i] == 0x48 and bytes[i + 1] == 0xFF and bytes[i + 2] == 0x4E) {
-            i += 4;
-            continue;
-        }
-        if (bytes[i] == 0xFF and bytes[i + 1] == 0x4E) {
-            i += 3;
-            continue;
-        }
-        break;
-    }
-    return i < bytes.len and bytes[i] == 0xC3;
+    return dispatch_shape.isFunctionExitEpilogue(bytes);
 }
 
-const BoundedTailShape = struct {
-    transfer_rip: u64 = 0,
-    transfer_len: u8 = 0,
-    transfer_distance: u8 = 0,
-    jmp_rax: bool = false,
-    dead_epilogue: bool = false,
-    /// A `mov r64,[rsp+disp]` was seen between the indirection load and the
-    /// tail transfer: Xenia reloading the guest return address for the callee.
-    /// Independent confirmation of the guest-return stack displacement.
-    return_slot_reload_seen: bool = false,
-    return_slot_reload_offset: u64 = 0,
-};
+pub fn branchTargetsDeadDispatchEpilogue(branch_target: u64, transfer_rip: u64, transfer_len: u8) bool {
+    return dispatch_shape.branchTargetsEpilogue(branch_target, transfer_rip, transfer_len);
+}
+
+/// The recognised dispatch shape. Owned by `execution_history.dispatch_shape`;
+/// this alias keeps the local call sites readable.
+const BoundedTailShape = dispatch_shape.Shape;
 
 /// Walk forward from the null-base load through at most 16 instructions / 64
 /// bytes. This is the bounded "tape" of the dispatch transducer. No allocation,
@@ -908,8 +951,11 @@ fn boundedTailShape(self: anytype, load_rip: u64, load_len: u8) BoundedTailShape
     var instruction_count: u8 = 0;
     var return_slot_seen = false;
     var return_slot_offset: u64 = 0;
-    while (instruction_count < 16 and cursor > load_rip and cursor - load_rip <= 64) : (instruction_count += 1) {
-        const decoded = decodedInstructionAt(self, cursor) orelse return .{};
+    const limits = scan_limits.tail_shape;
+    while (instruction_count < limits.max_instructions and
+        cursor > load_rip and limits.withinBytes(load_rip, cursor)) : (instruction_count += 1)
+    {
+        const decoded = decodeStatic(self, cursor) orelse return .{};
         if (decoded.len == 0) return .{};
         // Xenia reloads the guest return address from the same stack slot the
         // CALL_POSSIBLE_RETURN predicate compared against, to pass it to the
@@ -972,6 +1018,10 @@ const BoundedDefinition = struct {
     /// Three-way outcome from the block reader: unresolved, defined here, or
     /// live-in from a predecessor block.
     origin: generated_block.Origin = .block_unresolved,
+    /// Whether the search range converged or stopped at its ceiling.
+    convergence: bounded_scan_mod.Convergence = .unresolved,
+    /// Window the reconstruction actually needed.
+    window_bytes: u64 = 0,
     block_start: u64 = 0,
     block_length: u8 = 0,
     instruction_address: u64 = 0,
@@ -985,6 +1035,10 @@ const BoundedDefinition = struct {
     source_address: u64 = 0,
     source_readable: bool = false,
     source_value: u64 = 0,
+    /// Width of the load that produced the value. A dispatch-table entry is as
+    /// wide as the instruction that read it, and a neighbourhood probe that
+    /// guesses the stride reads the wrong slots.
+    source_bytes: u8 = 0,
     /// The definition set the register from an immediate.
     from_immediate: bool = false,
     immediate: u64 = 0,
@@ -1048,14 +1102,17 @@ fn boundedBaseDefinition(
         register: x64_decoder.RegId,
 
         fn decode(ctx: @This(), address: u64) ?generated_block.Decoded {
-            const decoded = decodedInstructionAt(ctx.state, address) orelse return null;
+            const decoded = decodeStatic(ctx.state, address) orelse return null;
             return .{
                 .len = decoded.len,
                 .defines_register = definesRegister(decoded, ctx.register),
             };
         }
     };
-    const located = generated_block.findDefinition(
+    // Adaptive: the block boundary is *found* by widening until the answer
+    // stops moving, not asserted by a constant. The window it needed and
+    // whether it converged are both reported.
+    const located = generated_block.findDefinitionAdaptive(
         Ctx,
         .{ .state = self, .register = reg },
         anchor_rip,
@@ -1065,6 +1122,8 @@ fn boundedBaseDefinition(
 
     var result = BoundedDefinition{
         .origin = located.origin,
+        .convergence = located.convergence,
+        .window_bytes = located.window_bytes,
         .block_start = located.block_start,
         .block_length = located.block_length,
         .instruction_address = located.instruction_address,
@@ -1072,10 +1131,11 @@ fn boundedBaseDefinition(
     };
     if (located.origin != .defined_in_block) return result;
 
-    const decoded = decodedInstructionAt(self, located.instruction_address) orelse return result;
+    const decoded = decodeStatic(self, located.instruction_address) orelse return result;
     result.found = true;
     result.op = decoded.op;
     result.from_memory = loadsFromMemory(decoded.op);
+    result.source_bytes = bytesForSize(decoded.size);
     result.from_immediate = decoded.op == .mov_reg_imm;
     result.immediate = decoded.imm;
     if (!result.from_memory) return result;
@@ -1159,7 +1219,7 @@ fn callPossibleReturnWitness(
 ) CallPossibleReturnWitness {
     var witness = CallPossibleReturnWitness{};
 
-    var start = load_rip -| 32;
+    var start = load_rip -| scan_limits.predicate_witness.max_bytes;
     while (start < load_rip) : (start += 1) {
         const bytes = self.guestMemoryConst(start, 16) orelse continue;
         const compare = decodeInsn(bytes);
@@ -1185,7 +1245,7 @@ fn callPossibleReturnWitness(
         if (self.guestMemoryConst(witness.stack_slot, 4)) |slot_bytes| {
             if (slot_bytes.len >= 4) {
                 witness.stack_value = std.mem.readInt(u32, slot_bytes[0..4], .little);
-                witness.stack_value_valid = isGuestModuleAddress(witness.stack_value);
+                witness.stack_value_valid = isGuestAddress(self, witness.stack_value);
                 witness.guest_return = witness.stack_value;
                 witness.guest_return_valid = witness.stack_value_valid;
             }
@@ -1195,7 +1255,7 @@ fn callPossibleReturnWitness(
         witness.target = .{
             .value = target_value,
             .register_name = @tagName(compare.dst_reg),
-            .valid = isGuestModuleAddress(target_value),
+            .valid = isGuestAddress(self, target_value),
             .aliases_null_base = compare.dst_reg == null_base_reg,
         };
         witness.compare_rip = start;
@@ -1215,12 +1275,333 @@ fn callPossibleReturnWitness(
     return witness;
 }
 
-/// Return true only when the observed conditional branch lands at the first
-/// byte after the observed `jmp rax`. This keeps the branch proof finite and
-/// ties it to the same dead epilogue identified by boundedTailShape.
-pub fn branchTargetsDeadDispatchEpilogue(branch_target: u64, transfer_rip: u64, transfer_len: u8) bool {
-    return branch_target != 0 and transfer_rip != 0 and transfer_len != 0 and
-        branch_target == transfer_rip +| transfer_len;
+/// Everything known about where the dispatch target's zero came from.
+///
+/// Runs on both outcomes. It previously ran only on the rejection path, so the
+/// moment the transducer started *continuing* past the fault the evidence that
+/// justified the continuation stopped being printed — the run acted on a
+/// finding it no longer reported.
+fn reportZeroOriginEvidence(
+    self: anytype,
+    candidate: GuestReturnCandidate,
+    definition: BoundedDefinition,
+) void {
+    if (definition.from_memory) {
+        var relative_buffer: [256]u8 = undefined;
+        const relative = describeAddressAgainstRegisters(self, definition.source_address, &relative_buffer);
+        const writer = self.memory_writes.lookup(definition.source_address);
+        machoCapturePrint(
+            "macho-processor: bounded dispatch FST source slot: register={s} address=0x{x} = {s} width_read=64 value=0x{x} readable={}; this is the field the dispatch target was loaded from\n",
+            .{ candidate.register_name, definition.source_address, relative, definition.source_value, definition.source_readable },
+        );
+        if (writer) |entry| {
+            machoCapturePrint(
+                "macho-processor: bounded dispatch FST source slot: last writer rip=0x{x} {s} value=0x{x} kind={s} step={d} thread=0x{x}\n",
+                .{ entry.instruction_address, self.metadata.symbolLabel(entry.instruction_address), entry.value, @tagName(entry.kind), entry.step, entry.thread },
+            );
+        } else {
+            // Provenance is no longer a flag the operator had to set
+            // before knowing which address mattered: the watch set
+            // learns structure pages from generated code as it runs.
+            // Report which of the three states this actually is.
+            const watched = self.provenance_watch.covers(definition.source_address);
+            machoCapturePrint(
+                "macho-processor: bounded dispatch FST source slot: no writer recorded. watched={} globally_armed={} watch(entries={d}/{d} overflows={d} recorded_stores={d} rejected_stores={d})\n",
+                .{
+                    watched,
+                    self.write_diagnostics_armed,
+                    self.provenance_watch.count,
+                    self.provenance_watch.entries.len,
+                    self.provenance_watch.overflows,
+                    self.provenance_watch.recorded,
+                    self.provenance_watch.rejected,
+                },
+            );
+            // An absence of provenance only speaks about the guest when the
+            // storage under the address is still the storage the guest wrote
+            // to. Check that before drawing the conclusion, not after.
+            if (self.guest_lifetime.covers(definition.source_address)) |record| {
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST source slot: this address holds no writer BECAUSE ROSETTE DISCARDED ITS BACKING — range base=0x{x} length={d} reason={s} discards={d} last_discard_step={d}. Provenance for this range was retired at that point, so \"nothing ever stored here\" is a fact about the runtime, not about the guest. The missing evidence is Rosette's, not the program's\n",
+                    .{ record.base, record.size, @tagName(record.reason), record.generation, record.step },
+                );
+            } else if (watched or self.write_diagnostics_armed) {
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST source slot: this address WAS under write provenance, holds no entry, and its backing was never discarded by the runtime — nothing ever stored here. The zero is an UNINITIALISED field, not a cleared one: look for the guest store that should have written it (an unimplemented instruction or an initialisation path Rosette never runs), not for a corrupting writer\n",
+                    .{},
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST source slot: this address was NOT under write provenance, so nothing can be concluded about its writer. The watch seeds from generated-code structure-field loads; if it filled before reaching this page, raise ownership.watch.max_entries or set ROSETTE_MACHO_WRITE_DIAGNOSTICS=1\n",
+                    .{},
+                );
+            }
+        }
+    }
+    // The field-access shape over the whole run. This is what
+    // separates "the store is missing" from "the store ran and
+    // produced the wrong value" — two different bugs that look
+    // identical at the fault site, because the evidence for the
+    // first is an absence measured elsewhere.
+    if (definition.from_memory and definition.source_address != 0) {
+        const base_reg_value = self.regs.rsi;
+        const field_base = if (definition.source_address >= base_reg_value)
+            base_reg_value
+        else
+            0;
+        if (field_base != 0) {
+            const offset = definition.source_address - field_base;
+            if (self.guest_fields.lookup(field_base, offset)) |field| {
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST field shape: base=0x{x} offset=0x{x} reads={d} writes={d} read_only={}; {s}\n",
+                    .{
+                        field_base,                offset, field.reads, field.writes,
+                        field.access().readOnly(),
+                        if (field.access().readOnly())
+                            "generated code READ this field and NEVER WROTE it in the entire run — the store the guest expected is missing. This is an emulation gap, not a corrupted value: look for the instruction or kernel path that should have written it"
+                        else
+                            "generated code both read and wrote this field, so a store did run — the value is wrong rather than absent. Arm write provenance on the page to name the writer",
+                    },
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST field shape: base=0x{x} offset=0x{x} NOT OBSERVED — no generated-code access to this field was profiled, so the load that faulted is the first and only one. Nothing can be concluded about missing stores from this run\n",
+                    .{ field_base, offset },
+                );
+            }
+            var neighbourhood: [12]@import("guest_structure").Field = undefined;
+            const found = self.guest_fields.neighbours(field_base, offset, 0x20, &neighbourhood);
+            var index: usize = 0;
+            while (index < found) : (index += 1) {
+                const field = neighbourhood[index];
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST field neighbour: base=0x{x} offset=0x{x} reads={d} writes={d}\n",
+                    .{ field_base, field.offset, field.reads, field.writes },
+                );
+            }
+        }
+    }
+}
+
+/// Everything the aliasing case decided on, printed on every outcome.
+///
+/// The aliasing rejections are about the *recovered* value, not about the
+/// register file, so a run has to see what each source actually said. Otherwise
+/// it reads "target not proven" for a target that was proven — zero — and the
+/// search goes to the transducer rather than to whoever cleared the register.
+/// The same is true of a continuation: acting on evidence without printing it
+/// leaves a reader the verdict and none of the reasoning.
+fn reportAliasingEvidence(
+    self: anytype,
+    candidate: GuestReturnCandidate,
+    witness: CallPossibleReturnWitness,
+    definition: BoundedDefinition,
+    cleared: ?near_null_causality.ClearedValue,
+    source: bounded_dispatch_fst.Machine.ClearedTargetSource,
+    value: u64,
+) void {
+    if (!candidate.aliases_null_base) return;
+    machoCapturePrint(
+        "macho-processor: bounded dispatch FST evidence: base={s} live=0x0 (the fault's own definition) source={s} value=0x{x} guest_return_slot=[rsp+0x{x}]=0x{x}; a redirect along the guest predicate edge requires the recovered value to equal the return slot\n",
+        .{
+            candidate.register_name,
+            @tagName(source),
+            value,
+            witness.guest_ret_addr_offset,
+            witness.stack_value,
+        },
+    );
+    machoCapturePrint(
+        "macho-processor: bounded dispatch FST evidence: retained_history available={} value=0x{x} distance={d}; definition_reread found={} instruction=0x{x} op={s} distance={d} from_memory={} source_address=0x{x} readable={} value=0x{x} from_immediate={} immediate=0x{x}\n",
+        .{
+            cleared != null,
+            if (cleared) |recovered| recovered.value else 0,
+            if (cleared) |recovered| recovered.retained_distance else 0,
+            definition.found,
+            definition.instruction_address,
+            @tagName(definition.op),
+            definition.distance,
+            definition.from_memory,
+            definition.source_address,
+            definition.source_readable,
+            definition.source_value,
+            definition.from_immediate,
+            definition.immediate,
+        },
+    );
+    // Two independent answers to one question. When they disagree, the run must
+    // say so rather than quietly report only the winner: a history sample that
+    // survived eviction is not a claim about recency, and a reader comparing it
+    // against the re-read is entitled to know they differ.
+    if (cleared != null and definition.found and definition.from_memory and definition.source_readable) {
+        const history32: u32 = @truncate(cleared.?.value);
+        const reread32: u32 = @truncate(definition.source_value);
+        if (history32 != reread32) {
+            machoCapturePrint(
+                "macho-processor: bounded dispatch FST evidence DISAGREEMENT: definition_reread=0x{x} retained_history=0x{x} (distance={d}); the re-read is authoritative — it reads the memory the defining instruction reads, at fault time, and owes nothing to ring retention. The history value is the most recent sample that escaped eviction from a bounded window shared with every guest thread, which is not the same as the most recent value\n",
+                .{ reread32, history32, cleared.?.retained_distance },
+            );
+        }
+    }
+    reportZeroOriginEvidence(self, candidate, definition);
+    machoCapturePrint(
+        "macho-processor: bounded dispatch FST block: origin={s} convergence={s} window_bytes={d} block_start=0x{x} block_length={d} anchor=0x{x} register={s}; {s}\n",
+        .{
+            @tagName(definition.origin),
+            @tagName(definition.convergence),
+            definition.window_bytes,
+            definition.block_start,
+            definition.block_length,
+            witness.compare_rip,
+            candidate.register_name,
+            switch (definition.origin) {
+                .defined_in_block => "the value was produced in this fragment; its source is reported above",
+                .live_in_to_block => "the register is never written in this fragment — it is live-in from a predecessor block, so the producer is upstream of the reconstructed block and neither evidence source can reach it from here",
+                .block_unresolved => "no candidate block start decoded cleanly onto the anchor, so the fragment could not be reconstructed; the bytes before the comparison are not a decodable instruction stream at any offset in the window",
+            },
+        },
+    );
+}
+
+/// How much of this block the bounded machine can get through, at the moment it
+/// could not get through this site.
+///
+/// One line, at a halt only. The individual report says what stopped here; this
+/// says whether that is one gap or the shape of the run — the difference between
+/// investigating this instruction and investigating the recogniser that failed
+/// to claim it.
+fn reportDispatchCoverage(self: anytype, block_start: u64) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "dispatch_census")) return;
+    const overall = self.dispatch_census.coverage();
+    const block = self.dispatch_census.coverageForBlock(block_start);
+    machoCapturePrint(
+        "macho-processor: dispatch coverage: this_block(start=0x{x}) sites={d} traversed={d} mixed={d} halting={d} | run sites={d} traversed={d} mixed={d} halting={d} observations={d} passes={d} halts={d} overflow_sites={d}; {s}\n",
+        .{
+            block_start,
+            block.sites,
+            block.clean,
+            block.mixed,
+            block.halting,
+            overall.sites,
+            overall.clean,
+            overall.mixed,
+            overall.halting,
+            self.dispatch_census.observations,
+            self.dispatch_census.traversals,
+            self.dispatch_census.halts,
+            self.dispatch_census.overflow_sites,
+            if (overall.halting == 0 and overall.mixed == 0)
+                "every site the machine has met was traversed; this is the first gap"
+            else if (overall.mixed != 0)
+                "at least one site is sometimes traversable and sometimes not — the difference between those two register states is the defect, and it is more informative than any always-halting site"
+            else
+                "more than one distinct site halts, so this is the shape recogniser's coverage rather than one stubborn instruction",
+        },
+    );
+}
+
+/// A null base register that is not null: the address is there, byte-reversed.
+///
+/// A 32-bit guest address whose eight bytes were reversed — a 64-bit load from
+/// big-endian guest memory that was never converted — has **zero in its low
+/// 32 bits**. Every 32-bit addressing form then computes an effective address of
+/// zero, and the fault presents as a null pointer, several instructions after
+/// the load that actually went wrong. The whole near-null machinery downstream
+/// answers questions about that zero, correctly, and about the wrong thing.
+///
+/// The register still holds the address. Reversing it produces a guest address,
+/// and reversing an unrelated value essentially never does — which is what makes
+/// this a decision and not a guess. The same standard the endian contract
+/// already applies at one width, applied where the null is manufactured.
+///
+/// The repair corrects the *register*, not memory: the value in the register is
+/// what was mis-converted, and rewriting guest memory to compensate would leave
+/// a second wrong value behind for the next reader. Recorded as a host repair so
+/// no later diagnosis attributes the corrected register to the guest.
+///
+/// Returns the corrected effective address when it acted.
+fn tryRepairByteReversedBase(self: anytype, classification: GeneratedFaultClassification) ?u64 {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "generated_byte_order_repair")) return null;
+    const fault = classification.fault;
+    if (!fault.sib_has_base or fault.sib_has_index or fault.rip_relative) return null;
+    // Only a zero *effective* address is manufactured this way; a non-zero one
+    // is a different question and this must not answer it.
+    if (classification.base_value != 0) return null;
+
+    const whole = self.regVal(fault.sib_base_reg, .bits64);
+    const Window = struct {
+        state: @TypeOf(self),
+        fn isGuest(ctx: @This(), address: u64) bool {
+            return isGuestAddress(ctx.state, address);
+        }
+    };
+    const finding = byte_order.survey.classify(Window, .{ .state = self }, whole, Window.isGuest);
+    if (finding.order != .reversed64 or !finding.low_half_zero) return null;
+    // The corrected address has to be usable, or the repair has proven nothing.
+    if (self.sparse_memory.bytesConst(finding.corrected, 1) == null and
+        translateGuest(self, finding.corrected, 1, .read) == null)
+    {
+        return null;
+    }
+    if (!recoveryLoopAllowed(&self.generated_byte_order_repair, "byte_order_base", self.regs.rip)) {
+        return null;
+    }
+
+    self.generated_byte_order_repair.note();
+    self.setReg(fault.sib_base_reg, .bits64, finding.corrected);
+    noteDispatchSite(self, self.regs.rip, .byte_order_repair, .traversed, 0);
+    if (self.generated_byte_order_repair.shouldLog()) {
+        machoCapturePrint(
+            "macho-processor: byte-reversed base repaired #{d}: thread=0x{x} rip=0x{x} base={s} observed=0x{x} corrected=0x{x} readable=true; the register was NOT null — it held a guest address whose eight bytes were never converted from big-endian, which puts zero in the low half and makes every 32-bit addressing form compute a null. The near-null path is not entered for this fault\n",
+            .{
+                self.generated_byte_order_repair.recoveries,
+                self.active_guest_thread,
+                self.regs.rip,
+                @tagName(fault.sib_base_reg),
+                whole,
+                finding.corrected,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: byte-reversed base: the conversion is the defect, not this repair. A 64-bit load of guest memory produced a value in host byte order; see the BYTE ORDER SURVEY for whether this run has one such site or several\n",
+            .{},
+        );
+    }
+    return finding.corrected +% fault.addr;
+}
+
+/// Record a dispatch-recovery outcome against the site's census.
+///
+/// Individual recoveries each report themselves and every report reads like the
+/// last. The census is what says whether the run met one stubborn site or forty,
+/// and whether the sites it halts on are the ones it always halts on.
+pub fn noteDispatchSite(
+    self: anytype,
+    rip: u64,
+    family: dispatch_recovery.Family,
+    outcome: dispatch_recovery.Outcome,
+    halt_reason: u16,
+) void {
+    noteDispatchSiteInBlock(self, rip, 0, family, outcome, halt_reason);
+}
+
+/// As above, for callers that already reconstructed the containing block.
+/// Block reconstruction is the expensive part of this diagnosis, so it is never
+/// repeated here: a site whose block is unknown is recorded with zero, which the
+/// census reports as its own group rather than silently merging.
+pub fn noteDispatchSiteInBlock(
+    self: anytype,
+    rip: u64,
+    block_start: u64,
+    family: dispatch_recovery.Family,
+    outcome: dispatch_recovery.Outcome,
+    halt_reason: u16,
+) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "dispatch_census")) return;
+    self.dispatch_census.note(rip, block_start, family, outcome, halt_reason);
 }
 
 /// Run the fail-closed bounded dispatch transducer for the exact Xenia
@@ -1264,14 +1645,32 @@ fn tryRedirectBoundedNullDispatch(self: anytype, fault: DecodedInsn) bool {
     else
         BoundedDefinition{};
     // Admissibility is equality with the independently-read guest return slot,
-    // whichever source supplied the value. Retained history is preferred only
-    // because it is an observation of the register rather than a
-    // reconstruction of where it should have come from.
+    // whichever source supplied the value. The *order* of preference is not
+    // arbitrary, and it used to be backwards.
+    //
+    // Retained history won by default on the reasoning that an observation of
+    // the register beats a reconstruction of where it should have come from.
+    // That reasoning does not survive the ring's actual shape:
+    // `lastNonZeroBeforeClear` walks back to the most recent *surviving*
+    // non-zero sample with no recency bound, over a bounded window shared with
+    // every other guest thread. On a thread a billion steps in, the surviving
+    // sample is whatever escaped eviction rather than whatever was recent — in
+    // the run that motivated this it produced 0x182474c0, an unrelated host
+    // pointer, for a register whose defining load was fifteen bytes away.
+    //
+    // The definition re-read asks the direct question instead: find the
+    // instruction that defined the register and read the memory it reads, now.
+    // It is available on a first observation, owes nothing to retention, and is
+    // the value the guest itself would have loaded. History is now the
+    // fallback for when the definition cannot be reconstructed, and a
+    // disagreement between the two is reported rather than silently resolved.
+    const definition_readable = definition.found and definition.from_memory and
+        definition.source_readable;
     const evidence: struct { value: u64, source: bounded_dispatch_fst.Machine.ClearedTargetSource } =
-        if (cleared) |recovered|
-            .{ .value = recovered.value, .source = .retained_history }
-        else if (definition.found and definition.from_memory and definition.source_readable)
+        if (definition_readable)
             .{ .value = @as(u32, @truncate(definition.source_value)), .source = .definition_reread }
+        else if (cleared) |recovered|
+            .{ .value = recovered.value, .source = .retained_history }
         else
             .{ .value = 0, .source = .none };
     const tail = boundedTailShape(self, self.regs.rip, fault.len);
@@ -1296,6 +1695,25 @@ fn tryRedirectBoundedNullDispatch(self: anytype, fault: DecodedInsn) bool {
         tail.transfer_len,
     );
 
+    // The zero is explained when the defining instruction was located and its
+    // memory source re-read. Which explanation it is depends on whether that
+    // memory is still the memory the guest's stores went to: a range whose
+    // backing Rosette replaced or re-homed reads zero for reasons that have
+    // nothing to do with the guest, and reporting that as an uninitialised
+    // field sends the reader after a store that may well have run.
+    const discarded_source = if (definition.found and definition.from_memory)
+        guestRangeDiscarded(self, definition.source_address)
+    else
+        null;
+    const zero_origin: bounded_dispatch_fst.Machine.ZeroOrigin =
+        if (!(definition.found and definition.from_memory and
+            definition.source_readable and definition.source_value == 0))
+            .unidentified
+        else if (discarded_source != null)
+            .discarded_backing
+        else
+            .uninitialised_field;
+
     const output = self.bounded_dispatch.evaluate(.{
         .xenia_compat = self.has_xenia_compat,
         .generated_executable = self.sparse_memory.isExecutable(self.regs.rip, 1),
@@ -1310,6 +1728,8 @@ fn tryRedirectBoundedNullDispatch(self: anytype, fault: DecodedInsn) bool {
         .cleared_target = evidence.value,
         .cleared_target_source = evidence.source,
         .predicate_edge_target = if (branch_targets_dead_epilogue) witness.branch_target else 0,
+        .zero_origin = zero_origin,
+        .allow_assumed_continuation = self.allow_assumed_dispatch_continuation,
         .tail_jmp_rax_found = tail.jmp_rax,
         .dead_epilogue_found = tail.dead_epilogue,
         .branch_targets_dead_epilogue = branch_targets_dead_epilogue,
@@ -1322,62 +1742,26 @@ fn tryRedirectBoundedNullDispatch(self: anytype, fault: DecodedInsn) bool {
     });
 
     const should_log = recovery_ledger.throttled(self.bounded_dispatch.observations);
-    if (!output.redirects()) {
+    // Census before reporting. A halt that cannot say how many other sites in
+    // this block were traversed is a report with no sense of scale, and the
+    // scale is the thing that decides whether to chase this site or the shape
+    // recogniser that failed to claim it.
+    noteDispatchSiteInBlock(
+        self,
+        self.regs.rip,
+        definition.block_start,
+        .bounded_dispatch,
+        if (output.continues()) .traversed else .halted,
+        @intFromEnum(output.reason),
+    );
+    if (!output.continues()) {
         if (should_log) {
             machoCapturePrint(
                 "macho-processor: bounded dispatch FST rejected 0x67 null-base load: thread=0x{x} load_rip=0x{x} state={s} reason={s} candidate={s}:0x{x} candidate_aliases_null_base={} guest_return=0x{x} rcx=0x{x} stack_slot=0x{x} stack_value=0x{x} compare_rip=0x{x} branch_rip=0x{x} branch_target=0x{x} transfer_rip=0x{x} transfer_len={d} distance={d} jmp_rax={} dead_epilogue={} branch_to_epilogue={} host_return_not_guest={} frame_return=0x{x} executable={}; refusing zero-fill\n",
                 .{ self.active_guest_thread, self.regs.rip, @tagName(output.state), @tagName(output.reason), candidate.register_name, candidate.value, candidate.aliases_null_base, witness.guest_return, self.regs.rcx, witness.stack_slot, witness.stack_value, witness.compare_rip, witness.branch_rip, witness.branch_target, tail.transfer_rip, tail.transfer_len, tail.transfer_distance, tail.jmp_rax, tail.dead_epilogue, branch_targets_dead_epilogue, frame_proof.return_not_guest, host_return, frame_proof.return_executable },
             );
-            // The aliasing rejections are about retained history, not about the
-            // register file, so report what history actually said. Otherwise a
-            // run reads "target not proven" for a target that was proven — zero
-            // — and the search goes to the transducer rather than to whoever
-            // cleared the base register.
-            if (candidate.aliases_null_base) {
-                machoCapturePrint(
-                    "macho-processor: bounded dispatch FST evidence: base={s} live=0x0 (the fault's own definition) source={s} value=0x{x} guest_return_slot=[rsp+0x{x}]=0x{x}; a redirect along the guest predicate edge requires the recovered value to equal the return slot\n",
-                    .{
-                        candidate.register_name,
-                        @tagName(evidence.source),
-                        evidence.value,
-                        witness.guest_ret_addr_offset,
-                        witness.stack_value,
-                    },
-                );
-                machoCapturePrint(
-                    "macho-processor: bounded dispatch FST evidence: retained_history available={} value=0x{x} distance={d}; definition_reread found={} instruction=0x{x} op={s} distance={d} from_memory={} source_address=0x{x} readable={} value=0x{x} from_immediate={} immediate=0x{x}\n",
-                    .{
-                        cleared != null,
-                        if (cleared) |recovered| recovered.value else 0,
-                        if (cleared) |recovered| recovered.retained_distance else 0,
-                        definition.found,
-                        definition.instruction_address,
-                        @tagName(definition.op),
-                        definition.distance,
-                        definition.from_memory,
-                        definition.source_address,
-                        definition.source_readable,
-                        definition.source_value,
-                        definition.from_immediate,
-                        definition.immediate,
-                    },
-                );
-                machoCapturePrint(
-                    "macho-processor: bounded dispatch FST block: origin={s} block_start=0x{x} block_length={d} anchor=0x{x} register={s}; {s}\n",
-                    .{
-                        @tagName(definition.origin),
-                        definition.block_start,
-                        definition.block_length,
-                        witness.compare_rip,
-                        candidate.register_name,
-                        switch (definition.origin) {
-                            .defined_in_block => "the value was produced in this fragment; its source is reported above",
-                            .live_in_to_block => "the register is never written in this fragment — it is live-in from a predecessor block, so the producer is upstream of the reconstructed block and neither evidence source can reach it from here",
-                            .block_unresolved => "no candidate block start decoded cleanly onto the anchor, so the fragment could not be reconstructed; the bytes before the comparison are not a decodable instruction stream at any offset in the window",
-                        },
-                    },
-                );
-            }
+            reportDispatchCoverage(self, definition.block_start);
+            reportAliasingEvidence(self, candidate, witness, definition, cleared, evidence.source, evidence.value);
             // The guest-return stack displacement is discovered, then confirmed
             // against the reload in the tail. Report both, and say plainly when
             // they disagree or when the observed layout has moved: that is a
@@ -1400,11 +1784,59 @@ fn tryRedirectBoundedNullDispatch(self: anytype, fault: DecodedInsn) bool {
         return false;
     }
 
-    // A redirect that lands back on the same load is not progress. Both routes
-    // out of this transducer re-enter generated code, so the loop guard has to
-    // cover them; without it a permanently cleared base register would redirect
-    // forever instead of surfacing.
+    // A continuation that lands back on the same load is not progress. All
+    // three routes out of this transducer re-enter guest execution, so the loop
+    // guard has to cover them; without it a permanently uninitialised field
+    // would continue forever instead of surfacing.
     if (!recoveryLoopAllowed(&self.bounded_dispatch_recoveries, "bounded_dispatch", self.regs.rip)) return false;
+
+    // An assumption is not a proof, and the run must say so every time it acts
+    // on one — not only in the summary. This is the line that tells a reader
+    // the guest state after this point is Rosette's construction, not the
+    // program's.
+    if (output.assumed()) {
+        switch (output.zero_origin) {
+            .discarded_backing => {
+                const record = discarded_source.?;
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST CONTINUING ON A STATED ASSUMPTION #{d}: load_rip=0x{x} target=provably zero, origin=field at 0x{x} ({s}) inside a range ROSETTE DISCARDED — base=0x{x} length={d} reason={s} discards={d} last_discard_step={d}. The field reads zero, but the storage behind it was replaced by the runtime, so this is NOT evidence that the guest failed to write it: any store it made went to memory that no longer exists. Do not look for a missing guest store on the strength of this line; look at why the range is being re-mapped. Returning the abandoned frame to its host caller 0x{x} so the NEXT failure becomes observable. Guest state past this point is assumed, not emulated\n",
+                    .{
+                        self.bounded_dispatch.assumed_continuations,
+                        self.regs.rip,
+                        definition.source_address,
+                        self.metadata.symbolLabel(definition.instruction_address),
+                        record.base,
+                        record.size,
+                        @tagName(record.reason),
+                        record.generation,
+                        record.step,
+                        output.host_rip,
+                    },
+                );
+            },
+            else => {
+                machoCapturePrint(
+                    "macho-processor: bounded dispatch FST CONTINUING ON A STATED ASSUMPTION #{d}: load_rip=0x{x} target=provably zero, origin=uninitialised field at 0x{x} ({s}), backing never discarded by the runtime. Everything provable was proven — dispatch shape, epilogue, branch edge, host frame — but what the guest intended cannot be, because the field it would have branched through was never written. Returning the abandoned frame to its host caller 0x{x} so the run continues and the NEXT failure becomes observable. Guest state past this point is assumed, not emulated; treat subsequent diagnostics accordingly\n",
+                    .{
+                        self.bounded_dispatch.assumed_continuations,
+                        self.regs.rip,
+                        definition.source_address,
+                        self.metadata.symbolLabel(definition.instruction_address),
+                        output.host_rip,
+                    },
+                );
+            },
+        }
+        // The evidence this continuation rests on. This reporting documented
+        // itself as running on both outcomes and did not: it was reached only
+        // from the rejection branch, so from the moment the transducer started
+        // continuing past the fault, the run acted on a finding it no longer
+        // printed. A reader of that log could see the verdict and never the
+        // reasoning.
+        if (should_log) {
+            reportAliasingEvidence(self, candidate, witness, definition, cleared, output.cleared_target_source, evidence.value);
+        }
+    }
 
     // Only this family's ledger. The transducer used to bump the null-scalar
     // read counter and the frame-return counter as well, which made both of
@@ -1508,7 +1940,7 @@ pub fn hostFrameProof(self: anytype) HostFrameProof {
         .saved_frame_pointer_valid = saved_frame_pointer == 0 or
             self.guestMemoryConst(saved_frame_pointer, 8) != null,
         .return_executable = return_address != 0 and isExecutableAddress(self, return_address),
-        .return_not_guest = !isGuestModuleAddress(return_address),
+        .return_not_guest = !isGuestAddress(self, return_address),
     };
 }
 
@@ -1612,7 +2044,7 @@ fn dumpGeneratedDispatchStackFrame(self: anytype, instruction_address: u64, tran
         const bytes = self.guestMemoryConst(slot, 8) orelse break;
         if (bytes.len < 8) break;
         const value = std.mem.readInt(u64, bytes[0..8], .little);
-        const guest = isGuestModuleAddress(value);
+        const guest = isGuestAddress(self, value);
         if (guest or idx < 6) {
             machoCapturePrint(
                 "macho-processor:   frame stack[rsp+0x{x}]=0x{x}{s}\n",
@@ -1622,10 +2054,10 @@ fn dumpGeneratedDispatchStackFrame(self: anytype, instruction_address: u64, tran
     }
     // RCX is printed only as contextual state. At the null-base load it is not
     // authoritative; the guest return witness is the fixed [rsp+0x58] slot.
-    if (isGuestModuleAddress(self.regs.rcx)) {
+    if (isGuestAddress(self, self.regs.rcx)) {
         machoCapturePrint(
             "macho-processor: generated dispatch: rcx=0x{x} ({s}) = Xenia GUEST_RET_ADDR candidate; guest resumes at this module address\n",
-            .{ self.regs.rcx, guestModuleName(self.regs.rcx) },
+            .{ self.regs.rcx, describeGuestRegion(self, self.regs.rcx) },
         );
     }
     // Epilogue-shape check on the bytes immediately after the transfer.
@@ -1683,30 +2115,62 @@ fn dumpPrecedingInstructionWindow(self: anytype, from_rip: u64, depth: usize) vo
 /// to generated code only — Mach-O text code that jumps through null is a
 /// real translated-program bug and still terminates. Non-tail calls are never
 /// skipped because inventing a successful callback return would hide behavior.
-pub fn tryRecoverGeneratedNullIndirectTransfer(self: anytype, kind: []const u8) bool {
+/// Who owns the continuation after a recovered null transfer.
+///
+/// This used to be a `bool`, and the caller decided what to do next — frame
+/// return, else advance past the transfer. That gave the continuation *two*
+/// owners, and the caller always won because it ran second. A recovery that had
+/// already proven where execution must resume, installed RIP and RSP, and
+/// returned `true` had both overwritten by a generic frame return that discards
+/// the guest call chain. The run recorded the proof and then threw it away, in
+/// adjacent log lines.
+pub const NullTransferOutcome = enum {
+    /// Nothing was recovered; the caller must terminate.
+    refused,
+    /// Recovery approved, continuation not chosen. The caller installs it, as
+    /// it always did.
+    approved,
+    /// The recovery proved and installed the continuation itself. The caller
+    /// must not touch RIP or RSP: anything it does here replaces a proof with a
+    /// default.
+    continuation_installed,
+
+    pub fn recovered(self: NullTransferOutcome) bool {
+        return self != .refused;
+    }
+
+    pub fn callerMayContinue(self: NullTransferOutcome) bool {
+        return self == .approved;
+    }
+};
+
+pub fn tryRecoverGeneratedNullIndirectTransfer(self: anytype, kind: []const u8) NullTransferOutcome {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "has_xenia_compat") or
         !@hasField(State, "sparse_memory") or
         !@hasField(State, "generated_null_indirect") or
         !@hasField(State, "last_generated_null_read_rip"))
     {
-        return false;
+        return .refused;
     }
-    if (!self.has_xenia_compat) return false;
-    if (!self.sparse_memory.isExecutable(self.regs.rip, 1)) return false;
+    if (!self.has_xenia_compat) return .refused;
+    if (!self.sparse_memory.isExecutable(self.regs.rip, 1)) return .refused;
 
-    const fault = decodedInstructionAt(self, self.regs.rip) orelse return false;
-    if (!isGeneratedNullTransferOp(fault.op)) return false;
-    if (fault.op == .call_reg64 or fault.op == .call_mem64) return false;
-    const after = self.guestMemoryConst(self.regs.rip +| fault.len, 16) orelse return false;
-    if (!isFunctionExitEpilogueBytes(after)) return false;
+    const fault = decodeStatic(self, self.regs.rip) orelse return .refused;
+    if (!isGeneratedNullTransferOp(fault.op)) return .refused;
+    if (fault.op == .call_reg64 or fault.op == .call_mem64) return .refused;
+    const after = self.guestMemoryConst(self.regs.rip +| fault.len, 16) orelse return .refused;
+    if (!isFunctionExitEpilogueBytes(after)) return .refused;
     // Same host-frame proof as the other two consumers. This site previously
     // required only a non-zero executable `[rbp+8]` — no frame alignment, no
     // readable saved frame pointer, no guest-window exclusion — so it accepted
     // frames the transducer rejected and vice versa.
     const frame_proof = hostFrameProof(self);
-    if (!frame_proof.usable()) return false;
-    if (!recoveryLoopAllowed(&self.generated_null_indirect, "null_indirect_transfer", self.regs.rip)) return false;
+    if (!frame_proof.usable()) return .refused;
+    if (!recoveryLoopAllowed(&self.generated_null_indirect, "null_indirect_transfer", self.regs.rip)) return .refused;
+
+    // Before abandoning the frame: this may not be a dispatch at all.
+    if (tryRecoverMissedGuestReturn(self, fault)) return .continuation_installed;
 
     self.generated_null_indirect.note();
     const linked = if (self.last_generated_null_read_rip != 0 and
@@ -1739,40 +2203,289 @@ pub fn tryRecoverGeneratedNullIndirectTransfer(self: anytype, kind: []const u8) 
         );
         dumpGeneratedDispatchStackFrame(self, self.regs.rip, fault.len);
         dumpPrecedingInstructionWindow(self, self.regs.rip, 5);
+        reportNullTransferOrigin(self, fault);
     }
+    return .approved;
+}
+
+/// A tail dispatch that is not a dispatch: the guest was returning.
+///
+/// Xenia guards an indirect transfer with `CALL_POSSIBLE_RETURN` —
+/// `cmp target32, [rsp+GUEST_RET_ADDR]; je epilogue` — so a "call" whose target
+/// is the function's own guest return address is recognised as a return and
+/// takes the epilogue instead. When the target register holds that address with
+/// its bytes reversed, the compare cannot match: the predicate falls through,
+/// the indirection table is consulted with a value that is not a guest address
+/// at all, the slot reads zero, and a *return* becomes a null dispatch.
+///
+/// Everything needed to prove that is available at the transfer, and none of it
+/// is a guess:
+///
+///   1. the transfer register was defined by a load whose base register is the
+///      dispatch target (the bounded def-use scan finds the instruction),
+///   2. that base value is not a guest address, but its byte-reversal is —
+///      only one of the two orders can be, so the reversal is decidable,
+///   3. the reversal equals the guest return address the emitter has already
+///      loaded into RCX two instructions earlier, and
+///   4. the bytes after the transfer are the function-exit epilogue.
+///
+/// The correct continuation is the one the epilogue performs. Its stack
+/// adjustment and stackpoint decrement have *already* run — they precede the
+/// transfer, which is why falling through would undo them twice — so what
+/// remains of the epilogue is its `ret`, and performing that resumes the guest's
+/// caller exactly as the unbroken predicate would have. The saved return address
+/// is verified executable first; anything less falls back to the frame return.
+///
+/// Counted apart from the null-indirect family: those are dispatches that could
+/// not be resolved, this is a dispatch that should never have happened.
+fn tryRecoverMissedGuestReturn(self: anytype, fault: DecodedInsn) bool {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "generated_missed_guest_return")) return false;
+
+    const definition = boundedBaseDefinition(self, self.regs.rip, fault.dst_reg);
+    if (!definition.found or !definition.from_memory) return false;
+    const load = decodeStatic(self, definition.instruction_address) orelse return false;
+    if (!load.sib_has_base or load.sib_has_index or load.rip_relative) return false;
+
+    const address_size: Size = if (load.has_0x67) .bits32 else .bits64;
+    const base_value = self.regVal(load.sib_base_reg, address_size);
+    const Window = struct {
+        state: @TypeOf(self),
+        fn isGuest(ctx: @This(), address: u64) bool {
+            return isGuestAddress(ctx.state, address);
+        }
+    };
+    const inverted = generated_endian_contract.classifyInverted32(
+        Window,
+        .{ .state = self },
+        base_value,
+        Window.isGuest,
+    );
+    if (!inverted.inverted) return false;
+
+    // RCX is the guest return address the emitter loads from GUEST_RET_ADDR
+    // immediately before tearing the frame down. Comparing against a live
+    // register avoids re-reading a stack slot whose RSP has already moved.
+    const guest_return: u32 = @truncate(self.regs.rcx);
+    if (inverted.corrected != guest_return) return false;
+
+    const after = self.regs.rip +| fault.len;
+    const epilogue_bytes = self.guestMemoryConst(after, 16) orelse return false;
+    if (!isFunctionExitEpilogueBytes(epilogue_bytes)) return false;
+
+    const saved_return = read64(self, self.regs.rsp);
+    if (saved_return == 0 or !isExecutableAddress(self, saved_return)) return false;
+    if (!recoveryLoopAllowed(&self.generated_missed_guest_return, "missed_guest_return", self.regs.rip)) {
+        return false;
+    }
+
+    self.generated_missed_guest_return.note();
+    if (self.generated_missed_guest_return.shouldLog()) {
+        machoCapturePrint(
+            "macho-processor: missed guest return recovered #{d}: thread=0x{x} transfer_rip=0x{x} load_rip=0x{x} base={s} observed=0x{x} byte_reversed=0x{x} guest_return(rcx)=0x{x} match=true; the CALL_POSSIBLE_RETURN predicate could not match because the target register held the guest return address with its bytes reversed, so a RETURN was executed as an indirect dispatch and its table slot read zero. Resuming the guest caller at 0x{x} ({s}) — the epilogue's stack adjustment and stackpoint decrement already ran ahead of the transfer, so only its `ret` remained\n",
+            .{
+                self.generated_missed_guest_return.recoveries,
+                self.active_guest_thread,
+                self.regs.rip,
+                definition.instruction_address,
+                @tagName(load.sib_base_reg),
+                base_value,
+                inverted.corrected,
+                guest_return,
+                saved_return,
+                self.metadata.symbolLabel(saved_return),
+            },
+        );
+        // Walk one step further back: what produced the reversed value? The
+        // base register was itself defined somewhere, and if that definition
+        // read guest memory, that slot is where a guest code address was stored
+        // in the wrong byte order.
+        const producer = boundedBaseDefinition(self, definition.instruction_address, load.sib_base_reg);
+        machoCapturePrint(
+            "macho-processor: missed guest return producer: register={s} found={} instruction=0x{x} op={s} distance={d} from_memory={} source_address=0x{x} readable={} value=0x{x} from_immediate={} immediate=0x{x} block_origin={s}\n",
+            .{
+                @tagName(load.sib_base_reg),
+                producer.found,
+                producer.instruction_address,
+                @tagName(producer.op),
+                producer.distance,
+                producer.from_memory,
+                producer.source_address,
+                producer.source_readable,
+                producer.source_value,
+                producer.from_immediate,
+                producer.immediate,
+                @tagName(producer.origin),
+            },
+        );
+        if (producer.found and producer.from_memory and producer.source_address != 0) {
+            // Seed provenance here rather than asking an operator to predict the
+            // address before the run. This is exactly what the watch set exists
+            // for, and the address only becomes knowable at this fault.
+            const seeded = self.provenance_watch.watchPage(producer.source_address, .declared);
+            machoCapturePrint(
+                "macho-processor: missed guest return: provenance now watching the page holding 0x{x} (newly_seeded={} entries={d}/{d}). The next store to it will be attributed, which names whoever wrote a guest code address in host byte order. That writer is the defect; this recovery only keeps the run alive past it\n",
+                .{ producer.source_address, seeded, self.provenance_watch.count, self.provenance_watch.entries.len },
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: missed guest return: the reversed value is the finding, not this recovery. A guest code address reached generated code in host byte order, which means a store of that address into guest memory skipped its big-endian conversion. The producing instruction was not reconstructible from here; arm ROSETTE_MACHO_WRITE_DIAGNOSTICS=1 to name the writer. Every dispatch guarded by CALL_POSSIBLE_RETURN is exposed to the same defect\n",
+                .{},
+            );
+        }
+    }
+    self.pending_control_transfer = null;
+    self.regs.rip = saved_return;
+    self.regs.rsp = self.regs.rsp +| 8;
     return true;
 }
 
-// Xenia's guest physical memory window: Xbox 360 guest RAM mapped at
-// 0x80000000 with the XEX modules inside it — xboxkrnl.exe (0x80000000),
-// xam.xex (0x801C0000), and the game module (0x82000000). JIT-generated code
-// that transfers to an address in this window has dispatched through an
-// *unpatched indirection-table sentinel*: Xenia initializes
-// indirection_table[guest_addr] = guest_addr so a first-execution trap can
-// translate the guest function on demand. We have no trap path, so the
-// transfer is the same recoverable code-cache miss as the null case.
-pub const GUEST_MODULE_BASE: u32 = 0x80000000;
-pub const GUEST_MODULE_END: u32 = 0xA0000000;
+/// Where the null transfer target came from, and whether its zero is anomalous.
+///
+/// This path used to print two decoded predecessors and stop, which is not
+/// enough to distinguish the two things a reader needs to separate: a register
+/// that was clobbered, and a *table slot* that was read correctly and held zero.
+/// The bounded def-use scan the dispatch transducer already owns answers the
+/// first; when the answer is "loaded from memory", the table probe answers the
+/// second by reading the neighbourhood of that slot.
+///
+/// Both are bounded, run only inside the throttled recovery, and neither
+/// assumes anything about which translator produced the code.
+fn reportNullTransferOrigin(self: anytype, fault: DecodedInsn) void {
+    const definition = boundedBaseDefinition(self, self.regs.rip, fault.dst_reg);
+    machoCapturePrint(
+        "macho-processor: null transfer origin: register={s} found={} instruction=0x{x} op={s} distance={d} from_memory={} source_address=0x{x} readable={} value=0x{x} from_immediate={} immediate=0x{x} block_origin={s} convergence={s}\n",
+        .{
+            @tagName(fault.dst_reg),
+            definition.found,
+            definition.instruction_address,
+            @tagName(definition.op),
+            definition.distance,
+            definition.from_memory,
+            definition.source_address,
+            definition.source_readable,
+            definition.source_value,
+            definition.from_immediate,
+            definition.immediate,
+            @tagName(definition.origin),
+            @tagName(definition.convergence),
+        },
+    );
+    if (!definition.found or !definition.from_memory or definition.source_address == 0) {
+        machoCapturePrint(
+            "macho-processor: null transfer origin: no memory source was reconstructed, so the zero cannot be attributed to a dispatch-table slot. The register was either clobbered or defined outside the reconstructed block\n",
+            .{},
+        );
+        return;
+    }
+    const entry_bytes: u64 = if (definition.source_bytes == 0) 4 else definition.source_bytes;
+    const Reader = struct {
+        state: @TypeOf(self),
+        fn read(ctx: @This(), address: u64, bytes: u64) ?u64 {
+            const raw = ctx.state.guestMemoryConst(address, bytes) orelse return null;
+            return switch (bytes) {
+                4 => if (raw.len >= 4) std.mem.readInt(u32, raw[0..4], .little) else null,
+                8 => if (raw.len >= 8) std.mem.readInt(u64, raw[0..8], .little) else null,
+                else => null,
+            };
+        }
+    };
+    const found = dispatch_table.probe.probe(
+        Reader,
+        .{ .state = self },
+        definition.source_address,
+        entry_bytes,
+        16,
+        Reader.read,
+    );
+    machoCapturePrint(
+        "macho-processor: null transfer table probe: slot=0x{x} entry_bytes={d} population={s} sampled={d} readable={d} zero={d} nonzero={d} dominant=0x{x} x{d} distinct={d} range=[0x{x},0x{x}] zero_is_anomalous={}; {s}\n",
+        .{
+            definition.source_address,
+            entry_bytes,
+            @tagName(found.population),
+            found.sampled,
+            found.readable,
+            found.zero,
+            found.nonzero,
+            found.dominant_value,
+            found.dominant_count,
+            found.distinct_values,
+            found.first_slot,
+            found.last_slot,
+            found.population.zeroIsAnomalous(),
+            found.describe(),
+        },
+    );
+    if (found.population == .uniform_default and found.dominant_value != 0) {
+        machoCapturePrint(
+            "macho-processor: null transfer table probe: the host's default entry is 0x{x} ({s}, executable={}). That is where this dispatch would have gone had the slot carried the default, and it is almost certainly the host's not-yet-translated resolver. Skipping the dispatch bypasses that resolver, so the guest function is never translated and never runs\n",
+            .{
+                found.dominant_value,
+                self.metadata.symbolLabel(found.dominant_value),
+                isExecutableAddress(self, found.dominant_value),
+            },
+        );
+    }
+}
 
+// The guest window is *derived*, not asserted. `guest_address_space.Model`
+// accumulates observations from the sparse mappings and reports whether an
+// answer is derived or still running on its bootstrap default. These wrappers
+// exist so the ten call sites read the same as before while the knowledge lives
+// where it belongs.
+//
+// Retained only as the model's bootstrap range; see guest-address-space.
+pub const GUEST_MODULE_BASE: u32 = guest_address_space.window.bootstrap_base;
+pub const GUEST_MODULE_END: u32 = guest_address_space.window.bootstrap_end;
+
+/// True when `address` is a canonical 32-bit value inside the observed guest
+/// window. Canonical form (zero- or sign-extended) is x86-64 semantics and
+/// stays a rule; the window itself comes from the model.
+pub fn isGuestModuleAddressIn(model: *const guest_address_space.Model, address: u64) bool {
+    return model.isGuestAddress(address);
+}
+
+/// The predicate every decision site uses: canonical 32-bit form, against the
+/// window this run actually observed.
+///
+/// This had two owners for a long time. The model-aware form above was
+/// documented as the one to prefer and had *no callers*, so every recovery —
+/// including the dispatch transducer's target/return proofs and its
+/// `host_return_not_guest` gate — ran on the bootstrap constants while the
+/// model was fed on every mapping and then discarded. Two answers to a question
+/// that decides where guest control flow resumes, one of them dead.
+///
+/// Moving the sites here was blocked on the model widening its window over the
+/// executable JIT code cache; `Model.observe` now refuses that, and the model
+/// still falls back to the bootstrap range until an observation arrives, so an
+/// early fault answers exactly as before.
+pub fn isGuestAddress(self: anytype, address: u64) bool {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_address_space")) return isGuestModuleAddress(address);
+    return isGuestModuleAddressIn(&self.guest_address_space, address);
+}
+
+/// Free-function form, for sites with no state handle and for tests that pin
+/// the bootstrap range itself. Everything that makes a decision should use
+/// `isGuestAddress`.
 pub fn isGuestModuleAddress(address: u64) bool {
-    // Guest sentinels are canonical 32-bit addresses: zero-extended
-    // (0x82582cc8) or sign-extended (0xffffffff8313e528). Reject genuine
-    // 64-bit host pointers (heap/JIT, e.g. 0x108313e528) whose low 32 bits
-    // happen to land in the guest window — those must not be skipped.
-    const high: u32 = @truncate(address >> 32);
-    if (high != 0 and high != 0xFFFFFFFF) return false;
-    const low: u32 = @truncate(address);
+    const low = guest_address_space.canonical32(address) orelse return false;
     return low >= GUEST_MODULE_BASE and low < GUEST_MODULE_END;
 }
 
-/// Classify a guest-window address into the known Xenia module it belongs to.
-/// Fault-time only; returns a static label.
-fn guestModuleName(address: u64) []const u8 {
-    const low: u32 = @truncate(address);
-    if (low < 0x801C0000) return "xboxkrnl.exe";
-    if (low < 0x803C0000) return "xam.xex";
-    if (low >= 0x82000000 and low < 0x83000000) return "<game module>";
-    return "guest-ram/other-module";
+/// Describe where a guest-window address lives, from observed mappings rather
+/// than from hardcoded module names. `xboxkrnl.exe` / `xam.xex` / `<game
+/// module>` were split points for one title's layout; an observed region base
+/// and size is factual for any workload.
+fn describeGuestRegion(self: anytype, address: u64) []const u8 {
+    const classified = self.guest_address_space.classify(address);
+    if (!classified.in_window) return "<outside-guest-window>";
+    if (classified.region != null) return "guest-mapped-region";
+    return if (classified.trustworthy())
+        "guest-window (no containing mapping observed)"
+    else
+        "guest-window (bootstrap default; no mapping observed yet)";
 }
 
 /// Poll the target address of an invalid control-flow transfer. Fault-time
@@ -1785,13 +2498,13 @@ pub fn dumpGuestDispatchTargetPoll(self: anytype, target: u64) void {
     const low: u32 = @truncate(target);
     const sign_extended = (target >> 32) == 0xFFFFFFFF;
     const zero_extended = (target >> 32) == 0;
-    const in_window = isGuestModuleAddress(target);
+    const in_window = isGuestAddress(self, target);
     const sparse_bytes = self.sparse_memory.bytesConst(target, 16);
     const raw = if (sparse_bytes) |b| b else (self.guestMemoryConst(target, 16) orelse &[_]u8{});
     const shown = raw[0..@min(@as(usize, 16), raw.len)];
     machoCapturePrint(
         "macho-processor: invalid control-flow target poll: target=0x{x} target32=0x{x} sign_extended={} zero_extended={} guest_module_window={} module={s} readable={} bytes={any}\n",
-        .{ target, low, sign_extended, zero_extended, in_window, if (in_window) guestModuleName(target) else "<none>", raw.len != 0, shown },
+        .{ target, low, sign_extended, zero_extended, in_window, if (in_window) describeGuestRegion(self, target) else "<none>", raw.len != 0, shown },
     );
     machoCapturePrint(
         "macho-processor: invalid control-flow target poll: gpr rax=0x{x} rcx=0x{x} rdx=0x{x} rbx=0x{x} rsp=0x{x} rbp=0x{x} rsi=0x{x} rdi=0x{x}\n",
@@ -1827,9 +2540,9 @@ pub fn tryRecoverGeneratedGuestDispatchMiss(self: anytype, context: anytype, ret
     if (!self.has_xenia_compat) return false;
     if (!self.sparse_memory.isExecutable(context.instruction_address, 1)) return false;
 
-    const fault = decodedInstructionAt(self, context.instruction_address) orelse return false;
+    const fault = decodeStatic(self, context.instruction_address) orelse return false;
     if (!isGeneratedDispatchMissOp(fault.op)) return false;
-    if (!isGuestModuleAddress(context.target_address)) return false;
+    if (!isGuestAddress(self, context.target_address)) return false;
     if (!recoveryLoopAllowed(&self.generated_guest_dispatch, "guest_dispatch_miss", context.instruction_address)) return false;
 
     self.generated_guest_dispatch.note();
@@ -1850,7 +2563,7 @@ pub fn tryRecoverGeneratedGuestDispatchMiss(self: anytype, context: anytype, ret
                 context.instruction_address,
                 context.target_address,
                 @as(u32, @truncate(context.target_address)),
-                guestModuleName(context.target_address),
+                describeGuestRegion(self, context.target_address),
                 linked,
                 self.metadata.symbolLabel(context.instruction_address),
             },
@@ -1914,10 +2627,30 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
                 }
             },
             .null_base_dispatch => {
-                if (tryRedirectBoundedNullDispatch(self, classification.fault)) return 0;
+                // A base register is only null if it is *actually* null. A
+                // 32-bit guest address that arrived byte-reversed as 64 bits
+                // has zero in its low half, so it reads as null through every
+                // 32-bit addressing form while the address it should have
+                // carried is still sitting in the register. Ask that question
+                // before treating the zero as an absence — it is the difference
+                // between a pointer that was never set and a pointer that was
+                // set and not converted.
+                if (tryRepairByteReversedBase(self, classification)) |repaired| {
+                    effective_address = repaired;
+                    sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
+                    off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
+                } else if (tryRedirectBoundedNullDispatch(self, classification.fault)) {
+                    return 0;
+                }
             },
             .null_base_scalar => {
-                if (tryRecoverGeneratedNullScalarRead(self, classification, bytes)) return 0;
+                if (tryRepairByteReversedBase(self, classification)) |repaired| {
+                    effective_address = repaired;
+                    sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
+                    off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
+                } else if (tryRecoverGeneratedNullScalarRead(self, classification, bytes)) {
+                    return 0;
+                }
             },
         }
         if (!sparse_readable and off == null) {
@@ -2441,6 +3174,18 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
     timerQueueWatchWrite(self, addr, size, val);
 }
 
+/// Should this store be recorded in write provenance?
+///
+/// Either the global flag is on, or the address falls in a watched region.
+/// The watch set is what replaces "re-run with ROSETTE_MACHO_WRITE_DIAGNOSTICS
+///=1" as the answer to "who wrote this field" — a flag asks the operator to
+/// predict, before the run, which address will matter.
+pub fn provenanceWanted(self: anytype, address: u64) bool {
+    if (self.write_diagnostics_armed) return true;
+    if (comptime !@hasField(@TypeOf(self.*), "provenance_watch")) return false;
+    return self.provenance_watch.contains(address);
+}
+
 pub fn captureMemoryMutation(
     self: anytype,
     address: u64,
@@ -2451,7 +3196,7 @@ pub fn captureMemoryMutation(
     // write diagnostics are unarmed (the default fast path) return an empty
     // capture so stores pay nothing for it. commitMemoryMutation applies the
     // matching gate.
-    if (!self.write_diagnostics_armed) return .{ .address = address, .length = length };
+    if (!provenanceWanted(self, address)) return .{ .address = address, .length = length };
     return self.memory_writes.captureMutation(self, address, length);
 }
 
@@ -2462,7 +3207,7 @@ pub fn commitMemoryMutation(
 ) void {
     // R3 (N4): matching gate to captureMemoryMutation. When unarmed the
     // capture is empty and the re-read/compare/record work is skipped.
-    if (!self.write_diagnostics_armed) return;
+    if (!provenanceWanted(self, capture.address)) return;
     // The writer recorded below is `regs.rip` — the *faulting guest*
     // instruction — even when the write came from a Rosette repair rather than
     // from the guest. Reclassify while a repair is in flight so consumers can
@@ -2509,7 +3254,7 @@ pub fn deferInitializerRuntimeDependency(self: anytype, address: u64, size: Size
     if (trace_count == 0) return false;
     const fault_entry = self.execution_history.latestFor(self.active_guest_thread) orelse return false;
     if (fault_entry.rip != self.regs.rip or fault_entry.thread_handle != self.active_guest_thread) return false;
-    const fault = decodeTraceInstruction(self, fault_entry) orelse return false;
+    const fault = decodeWithSnapshotOperands(self, fault_entry) orelse return false;
     if (fault.op != .mov_mem64_reg64 or !fault.sib_has_base) return false;
     const base_register = fault.sib_base_reg;
     if (traceRegisterValue(fault_entry, base_register) != address) return false;
@@ -2527,7 +3272,7 @@ pub fn deferInitializerRuntimeDependency(self: anytype, address: u64, size: Size
             continue;
         }
 
-        const producer = decodeTraceInstruction(self, entry) orelse return false;
+        const producer = decodeWithSnapshotOperands(self, entry) orelse return false;
         const producer_is_pointer_load = producer.op == .mov_reg64_mem64;
         const source_address = producer.addr;
         const source_offset = translateGuest(self, source_address, @sizeOf(u64), .read) orelse return false;
@@ -2588,7 +3333,13 @@ pub fn deferInitializerRuntimeDependency(self: anytype, address: u64, size: Size
     return false;
 }
 
-pub fn decodeTraceInstruction(self: anytype, entry: TraceEntry) ?DecodedInsn {
+/// Decode the instruction recorded in a trace entry and resolve its memory
+/// operand against **that entry's register snapshot** — the values as they were
+/// when the instruction executed, not as they are now.
+///
+/// Using live registers here would compute an address the instruction never
+/// touched, which is how a historical load gets attributed to the wrong slot.
+pub fn decodeWithSnapshotOperands(self: anytype, entry: TraceEntry) ?DecodedInsn {
     const instruction_bytes: []const u8 = if (self.sparse_memory.executableBytesConst(entry.rip, 16)) |sparse_code|
         sparse_code
     else blk: {
@@ -2916,34 +3667,36 @@ pub fn dumpRegisterTransition(self: anytype, register: RegId, terminal_value: u6
     );
 }
 
+/// Delegates to the one owner of the RegId-to-snapshot-field mapping:
+/// `TraceEntry` itself. Retained as a name because `process.zig` re-exports
+/// it; the mapping no longer lives here.
 pub fn traceRegisterValue(entry: TraceEntry, register: RegId) u64 {
-    return switch (@intFromEnum(register)) {
-        0 => entry.rax,
-        1 => entry.rcx,
-        2 => entry.rdx,
-        3 => entry.rbx,
-        4 => entry.rsp,
-        5 => entry.rbp,
-        6 => entry.rsi,
-        7 => entry.rdi,
-        8 => entry.r8,
-        9 => entry.r9,
-        10 => entry.r10,
-        11 => entry.r11,
-        12 => entry.r12,
-        13 => entry.r13,
-        14 => entry.r14,
-        15 => entry.r15,
-    };
+    return entry.registerValue(register);
 }
 
 pub fn recordMemoryAccess(self: anytype, address: u64, size: Size, access: []const u8, value: u64) void {
     // P1-2 (perf audit): this runs on every guest load/store, and its
     // currentInstructionSnapshot() re-decodes the current instruction purely
-    // for the ring buffer. The ring is only consumed post-fault, so gate the
-    // whole path behind the diagnostic flag; the default fast path is a direct
-    // slice read.
-    if (!self.memory_trace_enabled) return;
+    // for the ring buffer. The ring is only consumed post-fault.
+    //
+    // Gated behaviourally rather than by a flag, for the same reason the
+    // instruction history is: the only consumer is the near-null causality
+    // chain's exact-producer attribution, and it only ever asks about
+    // generated code. Recording exactly there is ~2% of executed steps, so the
+    // ring exists when it is needed instead of requiring the operator to have
+    // predicted, before the run, that this fault would happen.
+    //
+    // The flag still forces it on everywhere, for host-code investigations.
+    if (!self.memory_trace_enabled) {
+        const generated = self.regs.rip < self.executable_min or self.regs.rip >= self.executable_max;
+        if (!generated) return;
+        // Budgeted: the snapshot below re-decodes the current instruction on
+        // every access, which is the single most expensive observer here. A
+        // bounded prefix keeps the path hot for the rest of the run, and the
+        // exhaustion is reported so a later empty ring is not misread as "this
+        // never happened".
+        if (!self.memory_trace_budget.take()) return;
+    }
     const bytes = bytesForSize(size);
     const offset = translateGuest(self, address, bytes, if (std.mem.eql(u8, access, "write")) .write else .read);
     const backed = if (offset) |off| off + bytes <= self.mem.len else false;
@@ -3093,7 +3846,7 @@ pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
     }
     // Any x86 instruction overlapping this write must begin between
     // address-14 and end-1. Probe exact candidate starts with the same hash as
-    // decodeAt; this preserves precise invalidation without reverting to a
+    // decodeWithLiveOperands; this preserves precise invalidation without reverting to a
     // global cache flush for each small Xenia JIT patch.
     var candidate = first_candidate;
     while (candidate <= last_candidate) : (candidate += 1) {
@@ -3167,7 +3920,7 @@ pub fn guestHeapAllocate(self: anytype, size: u64, alignment: u64) ?u64 {
 }
 
 pub fn guestHeapRelease(self: anytype, address: u64) void {
-    self.memory_forwarder.release(address);
+    self.memory_forwarder.releaseFrom(address, self.regs.rip);
     self.vtable_tracker.forgetAddress(address);
 }
 
@@ -3183,13 +3936,134 @@ pub fn forgetMemoryWriteProvenance(self: anytype, address: u64, length: u64) voi
     self.vtable_tracker.forgetAddress(address);
 }
 
+/// Describe a fault-time address in terms of the live register file.
+///
+/// The def-use scan resolves a source address like `0x40e0000130`, which is
+/// opaque on its own. Expressing it as `rsi+0x130` identifies it as a field of
+/// whatever structure that register points at — a guest context, a heap object,
+/// a stack frame — without knowing any layout, and it is the difference between
+/// "a load returned zero" and "the field at context+0x130 is zero".
+///
+/// Purely behavioural: it reports which live registers the address is near,
+/// with no table of expected structures.
+fn describeAddressAgainstRegisters(self: anytype, address: u64, out: []u8) []const u8 {
+    const Candidate = struct { name: []const u8, value: u64 };
+    const candidates = [_]Candidate{
+        .{ .name = "rax", .value = self.regs.rax },
+        .{ .name = "rbx", .value = self.regs.rbx },
+        .{ .name = "rcx", .value = self.regs.rcx },
+        .{ .name = "rdx", .value = self.regs.rdx },
+        .{ .name = "rsi", .value = self.regs.rsi },
+        .{ .name = "rdi", .value = self.regs.rdi },
+        .{ .name = "rbp", .value = self.regs.rbp },
+        .{ .name = "rsp", .value = self.regs.rsp },
+        .{ .name = "r8", .value = self.regs.r8 },
+        .{ .name = "r13", .value = self.regs.r13 },
+        .{ .name = "r14", .value = self.regs.r14 },
+        .{ .name = "r15", .value = self.regs.r15 },
+    };
+    // A structure field is a small positive displacement from a base pointer.
+    // Anything larger is a coincidence, not a relationship.
+    const field_window: u64 = 0x1000;
+    var written: usize = 0;
+    for (candidates) |candidate| {
+        if (candidate.value == 0 or address < candidate.value) continue;
+        const delta = address - candidate.value;
+        if (delta > field_window) continue;
+        const chunk = std.fmt.bufPrint(
+            out[written..],
+            "{s}{s}+0x{x}",
+            .{ if (written == 0) "" else ", ", candidate.name, delta },
+        ) catch break;
+        written += chunk.len;
+    }
+    if (written == 0) return "<no live register within 0x1000 below this address>";
+    return out[0..written];
+}
+
+/// Record a guest mapping with the address-space model. Only mappings large
+/// enough to be a guest RAM reservation may define the window; the model
+/// enforces that, and retains everything else for containment reporting.
+fn noteGuestMapping(self: anytype, address: u64, length: u64, prot: u32) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_address_space")) return;
+    self.guest_address_space.observe(.{
+        .base = address,
+        .size = length,
+        .executable = prot & 4 != 0,
+        .writable = prot & 2 != 0,
+    });
+}
+
+/// A guest range whose backing Rosette has just thrown away.
+///
+/// Four observers key on the guest address and outlive the bytes behind it:
+/// write provenance, the vtable tracker, the decoded-instruction cache, and —
+/// through the lifetime registry — anything that later asks whether an absence
+/// of provenance means the guest never wrote. Retiring them here is what keeps
+/// "nobody stored to this field" a statement about the guest instead of a
+/// statement about Rosette's memory management.
+///
+/// Deliberately one function: the previous arrangement had the sparse manager
+/// own placement, `guestMapFile` own registration, and nobody own invalidation,
+/// so each new observer inherited the gap by default.
+pub fn noteGuestRangeDiscarded(
+    self: anytype,
+    address: u64,
+    length: u64,
+    reason: ownership.lifetime.Reason,
+) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_lifetime")) return;
+    if (length == 0) return;
+    self.guest_lifetime.note(address, length, reason, self.executed_steps);
+    // Provenance and vtable identity describe bytes that no longer exist.
+    forgetMemoryWriteProvenance(self, address, length);
+    // Executable bytes at these addresses are new bytes. `noteGuestWrite`
+    // returns immediately for non-executable ranges, so this costs nothing on
+    // the ordinary data mapping.
+    noteGuestWrite(self, address, length);
+    if (recovery_ledger.throttled(self.guest_lifetime.events)) {
+        machoCapturePrint(
+            "macho-processor: guest range backing discarded #{d}: base=0x{x} length={d} reason={s} generation={d} step={d}; write provenance, vtable identity and decoded bytes for this range are retired. Any later \"nothing was ever stored here\" about this range is a statement about Rosette's memory management, not about the guest\n",
+            .{
+                self.guest_lifetime.events,
+                address,
+                length,
+                @tagName(reason),
+                if (self.guest_lifetime.covers(address)) |record| record.generation else 1,
+                self.executed_steps,
+            },
+        );
+    }
+}
+
+/// True when `address` lies in a range whose backing Rosette discarded, so an
+/// absence of recorded writes there is not evidence about the guest.
+pub fn guestRangeDiscarded(self: anytype, address: u64) ?ownership.lifetime.Record {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_lifetime")) return null;
+    return self.guest_lifetime.lookup(address);
+}
+
 pub fn guestMapFile(self: anytype, address: u64, length: u64, prot: u32, flags: u32, host_fd: std.posix.fd_t, offset: u64) bool {
     const map_fixed: u32 = 0x0010;
-    const mapped = if (flags & map_fixed != 0)
+    const fixed = flags & map_fixed != 0;
+    // Asked *before* the map, because afterwards the previous mapping is gone
+    // and there is nothing left to detect. MAP_FIXED over an exact match is
+    // ordinary POSIX and the manager is right to honour it; what was missing is
+    // that the discard was invisible to everyone keyed by guest address.
+    const replaces = fixed and self.sparse_memory.replacesExisting(address, length);
+    const mapped = if (fixed)
         self.sparse_memory.mapFixed(address, length, prot, flags, host_fd, offset)
     else
         self.sparse_memory.mapFile(address, length, prot, flags, host_fd, offset);
     if (!mapped) return false;
+    if (replaces) noteGuestRangeDiscarded(self, address, length, .fixed_map_replaced);
+    // Feed the guest address-space model. This is the observation that lets the
+    // window be derived instead of asserted; without it every classification
+    // would silently run on the bootstrap default forever.
+    noteGuestMapping(self, address, length, prot);
     _ = self.memory_regions.register(address, length, .{
         .read = prot & 1 != 0,
         .write = prot & 2 != 0,
@@ -3199,9 +4073,55 @@ pub fn guestMapFile(self: anytype, address: u64, length: u64, prot: u32, flags: 
     return true;
 }
 
+/// Place a non-MAP_FIXED mapping at the address the guest hinted, when that
+/// range is free.
+///
+/// POSIX: a non-null `addr` without MAP_FIXED is a *hint*. The kernel honours it
+/// when the range is available and picks its own address otherwise, and it
+/// never replaces an existing mapping. Rosette discarded every hint that was
+/// not the x64 code-cache window and always answered from the guest heap, which
+/// is indistinguishable to the guest from the hint never being available — so a
+/// guest that finds a free slot by asking for one and checking what it got can
+/// never find one. That is not hypothetical: it is how a process allocates
+/// per-thread state at a fixed low-32-bit pattern, and answering every probe
+/// with "somewhere else" makes the scan run to exhaustion.
+///
+/// Returns the guest base when the mapping was placed at the hint, or null when
+/// the caller should fall through to ordinary placement. Never replaces
+/// anything — that is the entire difference between a hint and MAP_FIXED.
+pub fn guestMapHinted(
+    self: anytype,
+    address: u64,
+    length: u64,
+    prot: u32,
+    flags: u32,
+    host_fd: std.posix.fd_t,
+    offset: u64,
+) ?u64 {
+    if (address == 0 or length == 0) return null;
+    if (address % std.heap.page_size_min != 0) return null;
+    const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return null;
+    if (!self.sparse_memory.rangeIsFree(address, effective_length)) return null;
+    if (!self.sparse_memory.mapFixed(address, length, prot, flags, host_fd, offset)) return null;
+    noteGuestMapping(self, address, effective_length, prot);
+    _ = self.memory_regions.register(address, effective_length, .{
+        .read = prot & 1 != 0,
+        .write = prot & 2 != 0,
+        .execute = prot & 4 != 0,
+    }, .guest_mmap, "hinted sparse guest mmap", self.regs.rip);
+    _ = self.pointer_firewall.register(address, effective_length, .{
+        .kind = .guest_backed,
+        .may_dereference = true,
+        .may_execute = prot & 4 != 0,
+        .owner = "hinted sparse guest mmap",
+    });
+    return address;
+}
+
 pub fn guestMapAnywhereWithBacking(self: anytype, length: u64, prot: u32, flags: u32, host_fd: std.posix.fd_t, offset: u64) ?u64 {
     const address = self.sparse_memory.mapAnywhereWithBacking(length, prot, flags, host_fd, offset) orelse return null;
     const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return null;
+    noteGuestMapping(self, address, effective_length, prot);
     _ = self.memory_regions.register(address, effective_length, .{
         .read = prot & 1 != 0,
         .write = prot & 2 != 0,
@@ -3237,6 +4157,15 @@ pub fn guestMapBackendWithBacking(self: anytype, length: u64, prot: u32, flags: 
         maximum_end,
     ) orelse return null;
     const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return null;
+    // This route places the two mappings that actually define the guest layout
+    // — the 32-bit-reachable guest RAM window and the JIT code cache — and was
+    // the only mapping path that never told the address-space model. With it
+    // silent, every observation the model did receive was a host-side view
+    // above 4 GB, all of which it correctly ignores, so it spent whole runs on
+    // its bootstrap default while reporting `observed_regions=17
+    // ignored_observations=17`. The model distinguishes the two by the
+    // `executable` flag; only guest RAM may define the window.
+    noteGuestMapping(self, address, effective_length, prot);
     _ = self.memory_regions.register(address, effective_length, .{
         .read = prot & 1 != 0,
         .write = prot & 2 != 0,
@@ -3270,6 +4199,10 @@ pub fn guestReserveAddressSpaceWithBacking(self: anytype, length: u64, flags: u3
 pub fn guestUnmapFile(self: anytype, address: u64, length: u64) bool {
     if (!self.sparse_memory.unmap(address, length)) return false;
     const effective_length = sparse_virtual_memory.pageRoundedLength(length) orelse return false;
+    // A later mapping at the same guest address is a different lifetime that
+    // happens to share a name. Retire the address-keyed records now, while the
+    // boundary is still observable.
+    noteGuestRangeDiscarded(self, address, effective_length, .unmapped);
     _ = self.memory_regions.register(
         address,
         effective_length,

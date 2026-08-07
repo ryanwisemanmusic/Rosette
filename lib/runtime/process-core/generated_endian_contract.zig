@@ -56,6 +56,74 @@ pub fn swapped(value: u64, width: ByteWidth) u64 {
     return convert(value, .little, .big, width);
 }
 
+/// Whether a 32-bit value is a guest address whose bytes are the wrong way
+/// round, and what it should have been.
+///
+/// A guest code address that arrives byte-reversed is not a corrupted value in
+/// the ordinary sense: it carries its own correction, and the correction is
+/// checkable. `0xa0a45882` is not a guest address; `0x8258a4a0` is; and only one
+/// of the two orders can be. Requiring the *reversed* form to be a guest address
+/// while the observed form is not is what makes this a decision rather than a
+/// guess — a value that qualifies under both orders is ambiguous and refused.
+///
+/// `is_guest` is supplied by the caller because what counts as a guest address
+/// is the address-space model's business, not this module's.
+pub const InvertedAddress = struct {
+    /// The observed value is byte-reversed and the reversal is a guest address.
+    inverted: bool = false,
+    /// The value the guest would have seen. Meaningless unless `inverted`.
+    corrected: u32 = 0,
+};
+
+pub fn classifyInverted32(
+    comptime Context: type,
+    context: Context,
+    observed: u64,
+    is_guest: *const fn (Context, u64) bool,
+) InvertedAddress {
+    const low: u32 = @truncate(observed);
+    if (low == 0) return .{};
+    const reversed = @byteSwap(low);
+    if (reversed == low) return .{};
+    // Ambiguity is refusal: if both orders read as guest addresses, nothing
+    // here distinguishes them and asserting one would be a coin toss.
+    if (is_guest(context, low)) return .{};
+    if (!is_guest(context, reversed)) return .{};
+    return .{ .inverted = true, .corrected = reversed };
+}
+
+const TestWindow = struct {
+    fn isGuest(_: TestWindow, address: u64) bool {
+        const low: u32 = @truncate(address);
+        return low >= 0x8000_0000 and low < 0xA000_0000;
+    }
+};
+
+test "a reversed guest address carries its own correction" {
+    // The observed run: the dispatch target register held the guest return
+    // address with its bytes reversed, so Xenia's CALL_POSSIBLE_RETURN compare
+    // could not match and a return became an indirect dispatch.
+    const found = classifyInverted32(TestWindow, .{}, 0xa0a4_5882, TestWindow.isGuest);
+    try std.testing.expect(found.inverted);
+    try std.testing.expectEqual(@as(u32, 0x8258_a4a0), found.corrected);
+}
+
+test "a value that is already a guest address is not inverted" {
+    const found = classifyInverted32(TestWindow, .{}, 0x8258_a4a0, TestWindow.isGuest);
+    try std.testing.expect(!found.inverted);
+}
+
+test "a value that is a guest address in neither order says nothing" {
+    const found = classifyInverted32(TestWindow, .{}, 0x1234_5678, TestWindow.isGuest);
+    try std.testing.expect(!found.inverted);
+}
+
+test "a palindrome and zero are refused rather than reported as corrections" {
+    try std.testing.expect(!classifyInverted32(TestWindow, .{}, 0, TestWindow.isGuest).inverted);
+    // Byte-reversal fixed point: no evidence of an ordering problem at all.
+    try std.testing.expect(!classifyInverted32(TestWindow, .{}, 0x8181_8181, TestWindow.isGuest).inverted);
+}
+
 pub const ExecutionStamp = struct {
     present: bool = false,
     thread_handle: u64 = 0,

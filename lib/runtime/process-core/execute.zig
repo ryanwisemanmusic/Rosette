@@ -874,8 +874,12 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 // JIT-generated code (Xenia indirection dispatch) tail-calling
                 // through a zero function pointer is a recoverable code-cache
                 // miss: fall through to the epilogue instead of terminating.
-                if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "call_reg64_null")) {
-                    self.regs.rip = from_rip + d.len;
+                const outcome = memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "call_reg64_null");
+                if (outcome.recovered()) {
+                    // Only when the recovery left the continuation to us. A
+                    // recovery that installed RIP itself has already proven
+                    // where execution resumes.
+                    if (outcome.callerMayContinue()) self.regs.rip = from_rip + d.len;
                 } else {
                     self.logControlFlow("call_reg64_null", from_rip, target, d.len, return_addr);
                     self.terminateForInvalidControlTransfer(.{
@@ -952,8 +956,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 // JIT-generated code dispatching through a zero indirection
                 // entry is a recoverable code-cache miss: fall through to the
                 // epilogue instead of terminating.
-                if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "call_mem64_null")) {
-                    self.regs.rip = from_rip + d.len;
+                const outcome = memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "call_mem64_null");
+                if (outcome.recovered()) {
+                    if (outcome.callerMayContinue()) self.regs.rip = from_rip + d.len;
                     return;
                 }
                 self.logControlFlow("call_mem64_null", from_rip, target, d.len, return_addr);
@@ -1076,8 +1081,11 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 // function-exit epilogue (the CALL_POSSIBLE_RETURN path), so
                 // falling through double-deallocates the frame; return to the
                 // host caller via the rbp frame (leave;ret semantics) instead.
-                if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "jmp_reg64_null")) {
-                    if (!memory_access.applyGeneratedDispatchFrameReturn(self, "jmp_reg64_null")) {
+                const outcome = memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "jmp_reg64_null");
+                if (outcome.recovered()) {
+                    if (outcome.callerMayContinue() and
+                        !memory_access.applyGeneratedDispatchFrameReturn(self, "jmp_reg64_null"))
+                    {
                         self.regs.rip += d.len;
                     }
                 } else {
@@ -1139,9 +1147,12 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                     // the `jmp` are Xenia's dead function-exit epilogue, so
                     // return to the host caller via the rbp frame instead of
                     // falling through (which double-deallocates the frame).
-                    if (memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "jmp_mem64_null")) {
+                    const outcome = memory_access.tryRecoverGeneratedNullIndirectTransfer(self, "jmp_mem64_null");
+                    if (outcome.recovered()) {
                         self.pending_import_stub_rip = null;
-                        if (!memory_access.applyGeneratedDispatchFrameReturn(self, "jmp_mem64_null")) {
+                        if (outcome.callerMayContinue() and
+                            !memory_access.applyGeneratedDispatchFrameReturn(self, "jmp_mem64_null"))
+                        {
                             self.regs.rip = stub_rip + d.len;
                         }
                     } else {

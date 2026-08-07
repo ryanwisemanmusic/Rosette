@@ -19,6 +19,47 @@ const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
 const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;
 const IMPORT_ROUTE_CACHE_SIZE = constants.IMPORT_ROUTE_CACHE_SIZE;
 
+/// Report the window every guest-address decision was actually made against.
+///
+/// This predicate had two owners: the model, derived from observed mappings,
+/// and a free function over the bootstrap constants that every decision site
+/// called. The model has since been made the single owner — but a derived
+/// answer that nothing can audit is no better than an asserted one, so the run
+/// states which window it used, where that window came from, and whether it
+/// still matches the bootstrap range it replaced.
+///
+/// `source=bootstrap_default` at the end of a run that mapped guest memory is
+/// itself the finding: it means every observation was rejected, and the model
+/// answered from a constant all run. That is exactly what happened while the
+/// backend mapping route was not reporting to the model at all.
+fn logGuestWindowContract(self: anytype) void {
+    const model = &self.guest_address_space;
+    const guest_address_space_lib = @import("guest_address_space");
+    const bootstrap_base: u64 = guest_address_space_lib.window.bootstrap_base;
+    const bootstrap_end: u64 = guest_address_space_lib.window.bootstrap_end;
+    const agrees = model.base == bootstrap_base and model.end == bootstrap_end;
+    machoCapturePrint(
+        "macho-processor: guest window contract: window=[0x{x},0x{x}) source={s} derived={} observed_regions={d} ignored_observations={d} bootstrap=[0x{x},0x{x}) matches_bootstrap={}; every guest-address decision this run used this window — {s}\n",
+        .{
+            model.base,
+            model.end,
+            @tagName(model.source),
+            model.source.derived(),
+            model.region_count,
+            model.ignored_observations,
+            bootstrap_base,
+            bootstrap_end,
+            agrees,
+            if (!model.source.derived())
+                "NOTHING was derived: every observation was rejected as non-canonical, too small, or executable, so the window is a constant. If the run mapped guest RAM, a mapping route is not reporting to the model"
+            else if (agrees)
+                "derived from observation and identical to the bootstrap range, so the constant it replaced was correct for this workload"
+            else
+                "derived from observation and DIFFERENT from the bootstrap range; recoveries gated on guest-address membership classified against the observed layout, not the constant",
+        },
+    );
+}
+
 pub fn logDecodeCacheSummary(self: anytype) void {
     const total = self.decode_cache_hits + self.decode_cache_misses;
     const hit_percent = if (total == 0) 0 else self.decode_cache_hits * 100 / total;
@@ -31,10 +72,36 @@ pub fn logDecodeCacheSummary(self: anytype) void {
 pub fn logPerformanceAccelerationSummary(self: anytype) void {
     const total = self.import_route_cache_hits + self.import_route_cache_misses;
     const hit_percent = if (total == 0) 0 else self.import_route_cache_hits * 100 / total;
+    // A hit whose route is `.legacy`/`.strtoul` re-enters the slow path, so the
+    // lookup matched and nothing was saved. The effective rate is the one that
+    // describes work avoided, and it is the number worth optimising against.
+    const effective_hits = self.import_route_cache_hits -| self.import_route_cache_slow_hits;
+    const attempts = total + self.import_route_cache_fallbacks;
+    const effective_percent = if (attempts == 0) 0 else effective_hits * 100 / attempts;
     machoCapturePrint(
         "macho-processor: import route cache: entries={d} hits={d} misses={d} hit_rate={d}% collisions={d} fallbacks={d}\n",
         .{ IMPORT_ROUTE_CACHE_SIZE, self.import_route_cache_hits, self.import_route_cache_misses, hit_percent, self.import_route_cache_collisions, self.import_route_cache_fallbacks },
     );
+    if (comptime @hasField(@TypeOf(self.*), "import_route_cache_slow_hits")) {
+        machoCapturePrint(
+            "macho-processor: import route cache effectiveness: dispatches={d} slow_path_avoided={d} ({d}%) hits_that_re_entered_the_slow_path={d} fallbacks={d}; the headline hit rate counts lookups that matched, not work avoided — a `.legacy` hit runs the whole symbol chain anyway\n",
+            .{ attempts, effective_hits, effective_percent, self.import_route_cache_slow_hits, self.import_route_cache_fallbacks },
+        );
+    }
+    if (comptime @hasField(@TypeOf(self.*), "import_route_fallbacks")) {
+        if (self.import_route_cache_fallbacks != 0) {
+            const RouteEnum = @import("macho_core").types.ImportRoute;
+            inline for (@typeInfo(RouteEnum).@"enum".fields) |field| {
+                const count = self.import_route_fallbacks[field.value];
+                if (count != 0) {
+                    machoCapturePrint(
+                        "  route fallback: route={s} count={d}; this route was cached for a stub and then declined it, so its applicability is not a function of the stub address\n",
+                        .{ field.name, count },
+                    );
+                }
+            }
+        }
+    }
     machoCapturePrint(
         "macho-processor: bulk construction acceleration: page_entry_runs={d} bytes={d}\n",
         .{ self.page_entry_bulk_initializations, self.page_entry_bulk_bytes },
@@ -67,10 +134,75 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             );
         }
     }
+    if (comptime @hasField(@TypeOf(self.*), "dispatch_census")) {
+        if (self.dispatch_census.observations != 0) {
+            const coverage = self.dispatch_census.coverage();
+            machoCapturePrint(
+                "macho-processor: dispatch coverage: distinct_sites={d} traversed_always={d} sometimes={d} never={d} | observations={d} passes={d} halts={d} overflow_sites={d}. This is how much of the generated code the bounded machine could get through. `never` is the size of the gap; `sometimes` is more informative than either, because the same instruction traversing under one register state and not another makes the difference between them the defect\n",
+                .{
+                    coverage.sites,
+                    coverage.clean,
+                    coverage.mixed,
+                    coverage.halting,
+                    self.dispatch_census.observations,
+                    self.dispatch_census.traversals,
+                    self.dispatch_census.halts,
+                    self.dispatch_census.overflow_sites,
+                },
+            );
+            const Family = @import("dispatch_recovery").Family;
+            inline for (@typeInfo(Family).@"enum".fields) |field| {
+                const count = self.dispatch_census.by_family[field.value];
+                if (count != 0) {
+                    machoCapturePrint(
+                        "  traversals by family: {s}={d}\n",
+                        .{ field.name, count },
+                    );
+                }
+            }
+            var index: usize = 0;
+            while (index < self.dispatch_census.count) : (index += 1) {
+                const site = self.dispatch_census.sites[index];
+                if (site.traversals != 0 and site.halts == 0) continue;
+                machoCapturePrint(
+                    "  site rip=0x{x} block=0x{x} reached={d} passes={d} halts={d} last_family={s} last_halt_reason={d}\n",
+                    .{ site.rip, site.block_start, site.observations, site.traversals, site.halts, @tagName(site.last_family), site.last_halt_reason },
+                );
+            }
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "generated_byte_order_repair")) {
+        if (self.generated_byte_order_repair.recoveries != 0) {
+            machoCapturePrint(
+                "macho-processor: byte-reversed base registers repaired: {d}. Each was a guest address whose eight bytes were never converted from big-endian, leaving zero in the low half so that every 32-bit addressing form computed a null. These faults were NOT near-null casualties and did not enter that machinery; without the repair each would have halted the bounded machine at a site whose pointer was in fact present\n",
+                .{self.generated_byte_order_repair.recoveries},
+            );
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "generated_missed_guest_return")) {
+        if (self.generated_missed_guest_return.recoveries != 0) {
+            machoCapturePrint(
+                "macho-processor: missed guest returns recovered: {d}. Each one was a guest RETURN that executed as an indirect dispatch because the target register held the guest return address with its bytes reversed, defeating Xenia's CALL_POSSIBLE_RETURN compare. The recovery resumes the guest caller, but the reversal is the defect: a guest code address reached generated code in host byte order, so a store of that address into guest memory skipped its big-endian conversion. Every CALL_POSSIBLE_RETURN-guarded dispatch is exposed to it\n",
+                .{self.generated_missed_guest_return.recoveries},
+            );
+        }
+    }
     if (comptime @hasField(@TypeOf(self.*), "generated_null_indirect")) {
         if (self.generated_null_indirect.recoveries != 0) {
             machoCapturePrint(
                 "macho-processor: generated null indirect transfers: skipped_tail_calls={d} (JIT indirection misses; tail dispatches returned to host caller)\n",
+                .{self.generated_null_indirect.recoveries},
+            );
+            // A skipped *tail* call is not a skipped instruction. The dispatch
+            // was the last thing the generated function was going to do, so
+            // returning to the host caller abandons everything the callee would
+            // have done — and the caller sees a normal return, so nothing
+            // downstream reports an error. A subsystem that never initialises
+            // because its entry point was skipped looks exactly like a
+            // subsystem the guest chose not to use, and only this line
+            // distinguishes them.
+            machoCapturePrint(
+                "macho-processor: guest work abandoned: {d} tail dispatch(es) were skipped rather than resolved. Each one returned a generated frame to its host caller WITHOUT running the guest function it was dispatching to, and the caller cannot tell the difference from a normal return. Any guest-side initialisation behind those calls did not happen and will be reported downstream as \"never requested\" rather than as a failure. Resolve the dispatch — see the `null transfer table probe` lines for whether the table entry was missing or the whole table was unfilled — before treating any dependent subsystem's inactivity as a separate defect\n",
                 .{self.generated_null_indirect.recoveries},
             );
         }
@@ -102,16 +234,48 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
     if (comptime @hasField(@TypeOf(self.*), "bounded_dispatch")) {
         if (self.bounded_dispatch.observations != 0) {
             machoCapturePrint(
-                "macho-processor: bounded dispatch FST: observations={d} redirects={d} rejections={d} (a redirect needs either a surviving comparison operand that equals the guest return slot, or — when the comparison read the null base itself — a recovered pre-clear value that does; rejected cases remain terminal)\n",
-                .{ self.bounded_dispatch.observations, self.bounded_dispatch.redirects, self.bounded_dispatch.rejections },
+                "macho-processor: bounded dispatch FST: observations={d} proven_redirects={d} assumed_continuations={d} (of which after_discarded_backing={d}) rejections={d}. Proven redirects follow from evidence; assumed continuations do not — each one is a point where the guest's dispatch target was provably zero and the run continued anyway so the next failure could be observed. A non-zero assumed count means guest state after those points is Rosette's construction. The after_discarded_backing subset is weaker still: there the field's storage was replaced by the runtime, so its zero is not evidence that the guest never wrote it. Set ROSETTE_MACHO_STRICT_DISPATCH=1 to fail closed instead\n",
+                .{ self.bounded_dispatch.observations, self.bounded_dispatch.redirects, self.bounded_dispatch.assumed_continuations, self.bounded_dispatch.assumed_after_discarded_backing, self.bounded_dispatch.rejections },
             );
         }
     }
-    if (comptime @hasField(@TypeOf(self.*), "consecutive_dispatch_recoveries")) {
-        if (self.consecutive_dispatch_recoveries > 16) {
+    if (comptime @hasField(@TypeOf(self.*), "guest_lifetime")) {
+        if (self.guest_lifetime.events != 0) {
             machoCapturePrint(
-                "macho-processor: generated dispatch recovery loop: stopped after {d} consecutive recoveries at one site (guest not progressing)\n",
-                .{self.consecutive_dispatch_recoveries},
+                "macho-processor: guest range lifetime: discards={d} tracked_ranges={d} evictions={d} consulted(hits/misses)={d}/{d}. Each discard is a guest range whose backing Rosette replaced, unmapped or re-homed; write provenance, vtable identity and decoded bytes for it were retired at that point. A hit means a fault-time diagnosis asked about an address in one of these ranges — an absence of evidence there is Rosette's, not the guest's\n",
+                .{
+                    self.guest_lifetime.events,
+                    self.guest_lifetime.count,
+                    self.guest_lifetime.evictions,
+                    self.guest_lifetime.hits,
+                    self.guest_lifetime.misses,
+                },
+            );
+            var index: usize = 0;
+            while (index < self.guest_lifetime.count) : (index += 1) {
+                const record = self.guest_lifetime.entries[index];
+                machoCapturePrint(
+                    "  discarded range: base=0x{x} length={d} reason={s} discards={d} last_step={d}\n",
+                    .{ record.base, record.size, @tagName(record.reason), record.generation, record.step },
+                );
+            }
+        }
+    }
+    if (comptime @hasField(@TypeOf(self.*), "guest_address_space")) {
+        logGuestWindowContract(self);
+    }
+    // Loop-guard reporting now belongs to each family's own ledger; the shared
+    // `consecutive_dispatch_recoveries` field it read no longer exists.
+    if (comptime @hasField(@TypeOf(self.*), "bounded_dispatch_recoveries")) {
+        if (self.bounded_dispatch_recoveries.consecutive > 1) {
+            machoCapturePrint(
+                "macho-processor: bounded dispatch recoveries: {d} total, {d} consecutive at rip=0x{x} (limit {d})\n",
+                .{
+                    self.bounded_dispatch_recoveries.recoveries,
+                    self.bounded_dispatch_recoveries.consecutive,
+                    self.bounded_dispatch_recoveries.last_site,
+                    @import("ownership").ledger.Ledger.consecutive_limit,
+                },
             );
         }
     }
@@ -552,11 +716,18 @@ pub fn logExitDiagnostics(self: anytype) void {
         report.detail = "The interpreter did not execute these dynamic-library functions; the guest exit code is not authoritative.";
     }
 
-    const trace_count: usize = terminal_trace_count;
-    if (trace_count > 0) {
-        var trace_buf: [TRACE_BUFFER_LEN]exit_diagnostics.TraceEntry = undefined;
-        for (0..trace_count) |i| {
-            const entry = self.execution_history.chronological(self.active_guest_thread, i) orelse continue;
+    // The destination bounds the copy, not a separately-declared count. This
+    // buffer was sized from TRACE_BUFFER_LEN (256) while the loop count came
+    // from countFor() (512 after the history was partitioned per thread), so
+    // the dump wrote 256 entries past the end of a stack array and killed the
+    // process with SIGSEGV *while producing crash diagnostics* — the report
+    // truncated mid-trace and every later diagnostic was lost. Two constants
+    // that had to agree, with nothing enforcing it.
+    if (terminal_trace_count > 0) {
+        var raw_buf: [constants.TRACE_PER_THREAD_LEN]TraceEntry = undefined;
+        const copied = self.execution_history.copyRecentInto(self.active_guest_thread, &raw_buf);
+        var trace_buf: [constants.TRACE_PER_THREAD_LEN]exit_diagnostics.TraceEntry = undefined;
+        for (raw_buf[0..copied], 0..) |entry, i| {
             trace_buf[i] = .{
                 .thread_handle = entry.thread_handle,
                 .rip = entry.rip,
@@ -580,7 +751,7 @@ pub fn logExitDiagnostics(self: anytype) void {
                 .r15 = entry.r15,
             };
         }
-        report.last_instructions = trace_buf[0..trace_count];
+        report.last_instructions = trace_buf[0..copied];
     }
 
     exit_diagnostics.logExitReport(report);

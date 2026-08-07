@@ -221,7 +221,7 @@ pub fn handleInternalCompatibility(self: anytype) bool {
     if (self.internal_targets.imgui_mem_free != 0 and
         self.regs.rip == self.internal_targets.imgui_mem_free)
     {
-        self.memory_forwarder.release(self.regs.rdi);
+        self.memory_forwarder.releaseFrom(self.regs.rdi, self.regs.rip);
         self.vtable_tracker.forgetAddress(self.regs.rdi);
         self.regs.rip = self.pop();
         return true;
@@ -236,7 +236,7 @@ pub fn handleInternalCompatibility(self: anytype) bool {
     if (self.internal_targets.imgui_default_free != 0 and
         self.regs.rip == self.internal_targets.imgui_default_free)
     {
-        self.memory_forwarder.release(self.regs.rdi);
+        self.memory_forwarder.releaseFrom(self.regs.rdi, self.regs.rip);
         self.vtable_tracker.forgetAddress(self.regs.rdi);
         self.regs.rip = self.pop();
         return true;

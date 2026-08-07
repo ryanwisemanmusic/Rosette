@@ -13,7 +13,6 @@ pub const generated_endian_contract = @import("generated_endian_contract.zig");
 pub const guest_log = @import("guest_log.zig");
 pub const initializers = @import("initializers.zig");
 pub const native_window = @import("native_window.zig");
-pub const recovery_ledger = @import("recovery_ledger.zig");
 pub const scheduling = @import("scheduling.zig");
 pub const signal_handling = @import("signal_handling.zig");
 pub const syscalls = @import("syscalls.zig");

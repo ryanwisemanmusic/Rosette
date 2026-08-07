@@ -518,7 +518,7 @@ pub fn appendTrivialVector(self: anytype, vector: u64, item: u64, element_size: 
             const source = self.guestMemoryConst(data, used) orelse return false;
             const destination = self.guestMemory(new_data, used) orelse return false;
             std.mem.copyForwards(u8, destination, source);
-            self.memory_forwarder.release(data);
+            self.memory_forwarder.releaseFrom(data, self.regs.rip);
             self.vtable_tracker.forgetAddress(data);
         }
         data = new_data;

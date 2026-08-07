@@ -27,25 +27,10 @@ pub const NearNullBaseTransition = struct {
     distance: usize,
 };
 
+/// Delegates to the one owner of the RegId-to-snapshot-field mapping:
+/// `TraceEntry` itself. This module used to carry its own copy.
 fn traceRegisterValue(entry: TraceEntry, register: RegId) u64 {
-    return switch (@intFromEnum(register)) {
-        0 => entry.rax,
-        1 => entry.rcx,
-        2 => entry.rdx,
-        3 => entry.rbx,
-        4 => entry.rsp,
-        5 => entry.rbp,
-        6 => entry.rsi,
-        7 => entry.rdi,
-        8 => entry.r8,
-        9 => entry.r9,
-        10 => entry.r10,
-        11 => entry.r11,
-        12 => entry.r12,
-        13 => entry.r13,
-        14 => entry.r14,
-        15 => entry.r15,
-    };
+    return entry.registerValue(register);
 }
 
 pub fn isXModuleMatchesSymbol(symbol: []const u8) bool {
@@ -156,7 +141,7 @@ pub fn findNearNullBaseTransition(self: anytype, register: RegId, terminal_value
         if (before == after) continue;
         if (before == 0) return null;
 
-        const producer = self.decodeTraceInstruction(entry) orelse return null;
+        const producer = self.decodeWithSnapshotOperands(entry) orelse return null;
         if (producer.op != .mov_reg64_mem64 or producer.dst_reg != register) return null;
         const source = self.guestMemoryConst(producer.addr, @sizeOf(u64)) orelse return null;
         if (std.mem.readInt(u64, source[0..8], .little) != 0) return null;

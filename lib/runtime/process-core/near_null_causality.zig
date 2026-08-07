@@ -10,7 +10,10 @@ const x64_decoder = @import("x64_decoder");
 const macho_core = @import("macho_core");
 const vtable_ownership = @import("vtable").ownership;
 const memory_write_provenance = @import("memory").memory_write_provenance;
+const scan_limits = @import("execution_history").bounded_scan.Limits;
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
+const byte_order = @import("byte_order");
+const memory_access = @import("memory_access.zig");
 
 const RegId = x64_decoder.RegId;
 const Size = x64_decoder.OperandSize;
@@ -87,6 +90,8 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
             self.regs.rflags,
         },
     );
+
+    reportByteOrderSurvey(self);
 
     if (!decoded.sib_has_base and !decoded.sib_has_index and !decoded.rip_relative) {
         machoCapturePrint(
@@ -206,6 +211,80 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     }
 }
 
+/// Whether the register file holds guest addresses with their bytes reversed.
+///
+/// This runs before the causal walk on purpose. A 32-bit guest address reversed
+/// as a 64-bit value leaves **zero in the low half**, so a dispatch or load
+/// through the low register faults on a null base — and every question the walk
+/// then asks is about the null. The walk answers those questions correctly and
+/// the answers are about a symptom.
+///
+/// One reversed register is a site. More than one, independently, is the
+/// conversion path itself, and that is a different investigation. Only the count
+/// distinguishes them, and nothing was counting.
+fn reportByteOrderSurvey(self: anytype) void {
+    const Window = struct {
+        state: @TypeOf(self),
+        fn isGuest(ctx: @This(), address: u64) bool {
+            return memory_access.isGuestAddress(ctx.state, address);
+        }
+    };
+    const slots = [_]byte_order.Slot{
+        .{ .name = "rax", .value = self.regs.rax },
+        .{ .name = "rcx", .value = self.regs.rcx },
+        .{ .name = "rdx", .value = self.regs.rdx },
+        .{ .name = "rbx", .value = self.regs.rbx },
+        .{ .name = "rsp", .value = self.regs.rsp },
+        .{ .name = "rbp", .value = self.regs.rbp },
+        .{ .name = "rsi", .value = self.regs.rsi },
+        .{ .name = "rdi", .value = self.regs.rdi },
+        .{ .name = "r8", .value = self.regs.r8 },
+        .{ .name = "r9", .value = self.regs.r9 },
+        .{ .name = "r10", .value = self.regs.r10 },
+        .{ .name = "r11", .value = self.regs.r11 },
+        .{ .name = "r12", .value = self.regs.r12 },
+        .{ .name = "r13", .value = self.regs.r13 },
+        .{ .name = "r14", .value = self.regs.r14 },
+        .{ .name = "r15", .value = self.regs.r15 },
+    };
+    const found = byte_order.survey.survey(Window, .{ .state = self }, &slots, Window.isGuest);
+    if (found.reversed() == 0) return;
+
+    machoCapturePrint(
+        "macho-processor: near-null causality: BYTE ORDER SURVEY examined={d} native_guest={d} reversed32={d} reversed64={d} ambiguous={d} reversed_with_null_low_half={d} systematic={}; {s}\n",
+        .{
+            found.examined,
+            found.native,
+            found.reversed32,
+            found.reversed64,
+            found.ambiguous,
+            found.null_low_half,
+            found.systematic(),
+            if (found.systematic())
+                "more than one register independently holds a guest address in host byte order, so this is the guest-memory conversion path and not a single bad instruction. Do not spend the investigation on the faulting address"
+            else
+                "one register holds a guest address in host byte order; the fault site and the conversion site may be the same instruction",
+        },
+    );
+    var index: usize = 0;
+    while (index < found.reported) : (index += 1) {
+        const finding = found.findings[index];
+        machoCapturePrint(
+            "macho-processor: near-null causality: byte order {s}=0x{x} order={s} corrected=0x{x}{s}\n",
+            .{
+                found.names[index],
+                found.values[index],
+                @tagName(finding.order),
+                finding.corrected,
+                if (finding.low_half_zero)
+                    "; its low 32 bits are ZERO, so any dispatch or load through the low half of this register faults on a null base — a null derived from byte order, not from a missing store"
+                else
+                    "",
+            },
+        );
+    }
+}
+
 /// Comparison mask for register values observed at a given address width.
 /// Widths narrower than the trace ring's storage must be masked on both sides
 /// or the walk compares an architectural truncation against a whole register.
@@ -234,7 +313,7 @@ fn dumpRegisterChain(
     // depth is the same-thread count, not the ring size.
     const window = retainedWindow(self);
     machoCapturePrint(
-        "macho-processor: near-null causality: {s}_window register={s} terminal=0x{x} mask=0x{x} thread=0x{x} thread_entries={d}/{d} saturated={} live_threads={d} evicted_threads={d} memory_trace_entries={d}{s}\n",
+        "macho-processor: near-null causality: {s}_window register={s} terminal=0x{x} mask=0x{x} thread=0x{x} thread_entries={d}/{d} saturated={} live_threads={d} evicted_threads={d} recorded={d} filtered={d} status=\"{s}\" memory_trace_entries={d}{s}\n",
         .{
             role,
             @tagName(register),
@@ -246,9 +325,12 @@ fn dumpRegisterChain(
             window.saturated,
             window.live_threads,
             window.evictions,
+            window.recorded,
+            window.skipped,
+            window.reason,
             window.memory_entries,
             if (window.memory_entries == 0)
-                "; memory trace ring empty (set ROSETTE_MACHO_MEMORY_TRACE=1 to retain it) — exact-producer attribution unavailable, falling back to historical re-decode"
+                "; memory trace ring empty — the generated-code recording gate produced no entries for this thread, so exact-producer attribution is unavailable and the walk falls back to historical re-decode"
             else
                 "",
         },
@@ -420,6 +502,12 @@ fn findZeroThisBoundary(self: anytype) ?CallBoundary {
 /// process-wide, so a run with many live guest threads leaves each one only a
 /// fraction of it — the number that matters is the same-thread count.
 pub const RetainedWindow = struct {
+    /// Why an empty window is empty. Reported verbatim, because "the recogniser
+    /// found nothing" and "nothing was recorded" are different findings and the
+    /// second was silently presented as the first for a long time.
+    reason: []const u8,
+    recorded: u64,
+    skipped: u64,
     same_thread: usize,
     capacity: usize,
     /// The thread has filled its window, so "not found" may mean "overwritten".
@@ -436,6 +524,16 @@ pub fn retainedWindow(self: anytype) RetainedWindow {
     else
         self.memory_trace_index;
     return .{
+        .reason = if (window.emptyBecauseDisabled())
+            "instruction history recording is DISABLED; this is not an absence of evidence"
+        else if (window.emptyBecauseFiltered())
+            "no instruction in this thread's history passed the recording policy (generated-code-only); the fault's own fragment should have been recorded, so this is a policy or ordering defect"
+        else if (window.thread_entries == 0)
+            "recording is enabled but nothing was retained for this thread yet"
+        else
+            "retained",
+        .recorded = window.recorded,
+        .skipped = window.skipped,
         .same_thread = window.thread_entries,
         .capacity = window.thread_capacity,
         .saturated = window.saturated(),
@@ -497,9 +595,12 @@ pub fn lastNonZeroBeforeClear(self: anytype, register: RegId, value_mask: u64) ?
 /// `this` boundary.
 fn calleeDereferencesFirstArgument(self: anytype, callee_address: u64) bool {
     const arg0: RegId = .bh_di_edi_rdi;
+    const limits = scan_limits.callee_prologue;
     var cursor = callee_address;
     var examined: u8 = 0;
-    while (examined < 12 and cursor >= callee_address and cursor - callee_address <= 48) : (examined += 1) {
+    while (examined < limits.max_instructions and
+        cursor >= callee_address and limits.withinBytes(callee_address, cursor)) : (examined += 1)
+    {
         const bytes = self.guestMemoryConst(cursor, 16) orelse return false;
         const decoded = decodeInsn(bytes);
         if (decoded.op == .invalid or decoded.len == 0) return false;
@@ -610,7 +711,7 @@ fn findExactProducer(self: anytype, transition: Transition) ?Producer {
     const trace_count: usize = self.execution_history.countFor(self.active_guest_thread);
     if (transition.trace_ordinal >= trace_count) return null;
     const entry = traceEntry(self, transition.trace_ordinal) orelse return null;
-    const decoded = self.decodeTraceInstruction(entry) orelse return null;
+    const decoded = self.decodeWithSnapshotOperands(entry) orelse return null;
     if (decoded.op != .mov_reg64_mem64 or
         decoded.dst_reg != transition.register)
     {
@@ -780,23 +881,8 @@ fn isCall(entry: TraceEntry) bool {
     return std.mem.startsWith(u8, @tagName(entry.op), "call_");
 }
 
+/// Delegates to the one owner of the RegId-to-snapshot-field mapping:
+/// `TraceEntry` itself. This module used to carry its own copy.
 fn traceRegisterValue(entry: TraceEntry, register: RegId) u64 {
-    return switch (@intFromEnum(register)) {
-        0 => entry.rax,
-        1 => entry.rcx,
-        2 => entry.rdx,
-        3 => entry.rbx,
-        4 => entry.rsp,
-        5 => entry.rbp,
-        6 => entry.rsi,
-        7 => entry.rdi,
-        8 => entry.r8,
-        9 => entry.r9,
-        10 => entry.r10,
-        11 => entry.r11,
-        12 => entry.r12,
-        13 => entry.r13,
-        14 => entry.r14,
-        15 => entry.r15,
-    };
+    return entry.registerValue(register);
 }
