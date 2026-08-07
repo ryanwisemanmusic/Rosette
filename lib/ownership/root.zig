@@ -25,6 +25,8 @@
 //!     each decide independently to spend the run's wall clock.
 //!   * `lifetime` — when Rosette discarded a guest range's backing, so
 //!     address-keyed evidence is never mistaken for evidence about the guest.
+//!   * `allocation` — which allocator issued an address, so a release is routed
+//!     by owner rather than by the address range it happens to fall in.
 //!
 //! What it deliberately does not do is impose a shape on the owners themselves.
 //! They differ in what they prove and what they mutate, and unifying their
@@ -37,6 +39,7 @@ pub const authorship = @import("authorship.zig");
 pub const watch = @import("watch.zig");
 pub const budget = @import("budget.zig");
 pub const lifetime = @import("lifetime.zig");
+pub const allocation = @import("allocation.zig");
 
 pub const Arbiter = arbiter.Arbiter;
 pub const Outcome = arbiter.Outcome;
@@ -47,6 +50,8 @@ pub const AuthorScope = authorship.Scope;
 pub const WatchSet = watch.Set;
 pub const Budget = budget.Budget;
 pub const LifetimeRegistry = lifetime.Registry;
+pub const AllocationRegistry = allocation.Registry;
+pub const AllocationOwner = allocation.Owner;
 pub const DiscardReason = lifetime.Reason;
 
 test {
@@ -56,4 +61,5 @@ test {
     _ = watch;
     _ = budget;
     _ = lifetime;
+    _ = allocation;
 }
