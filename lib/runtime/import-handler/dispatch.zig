@@ -63,11 +63,24 @@ pub fn handleImportImpl(self: anytype, imported: macho_metadata.ImportedSymbol) 
     const cache_index = importRouteCacheIndex(imported.stub_address);
     const entry = &self.import_route_cache[cache_index];
     if (entry.valid and entry.stub_address == imported.stub_address) {
+        // `.legacy` and `.strtoul` both dispatch straight back into
+        // `handleImportSlow`, so a "hit" on either performs the entire
+        // string-compare chain the cache exists to avoid. Counting them as hits
+        // is what let a run report a 99% hit rate while most dispatches still
+        // paid full price. Count them apart so the headline rate means what it
+        // says: the slow path was skipped.
+        const skips_slow_path = entry.route != .legacy and entry.route != .strtoul;
         if (dispatchImportRoute(self, entry.route, imported)) |result| {
             self.import_route_cache_hits +|= 1;
+            if (!skips_slow_path) self.import_route_cache_slow_hits +|= 1;
             return result;
         }
+        // The cached route declined the symbol it was cached for. That is a
+        // route whose applicability is not a function of the stub address, and
+        // it costs a failed dispatch plus the full slow path every time.
+        // Attributed per route, because "70,725 fallbacks" names nothing.
         self.import_route_cache_fallbacks +|= 1;
+        self.import_route_fallbacks[@intFromEnum(entry.route)] +|= 1;
         entry.valid = false;
     } else {
         self.import_route_cache_misses +|= 1;
@@ -120,14 +133,8 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = dst };
     }
     if (std.mem.eql(u8, name, "_pthread_once")) {
-        self.resolving_import_route = .pthread;
-        const once_control = self.regs.rdi;
-        const init_routine = self.regs.rsi;
-        const once_value = self.readMemVal(once_control, .bits32);
-        if (once_value != 0) return .{ .handled = 0 };
-        self.writeMemVal(once_control, .bits32, 1);
-        self.regs.rip = init_routine;
-        return .control_transferred;
+        self.resolving_import_route = .pthread_once;
+        return handlePthreadOnce(self);
     }
     if (std.mem.eql(u8, name, "_bzero") or std.mem.eql(u8, name, "__bzero")) {
         self.resolving_import_route = .bzero;
@@ -250,7 +257,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         };
     }
     if (self.pthreads.dispatchCppSynchronization(self, name)) |resolution| {
-        self.resolving_import_route = .pthread;
+        self.resolving_import_route = .pthread_cpp_sync;
         self.import_provider_override = .pthread_runtime;
         self.import_confidence_override = .modeled;
         return switch (resolution) {
@@ -1026,7 +1033,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     }
     if (std.mem.eql(u8, name, "___cxa_free_exception")) {
         if (self.cxx_exceptions.freeException(self.regs.rdi)) |allocation| {
-            self.memory_forwarder.release(allocation.storage_address);
+            self.memory_forwarder.releaseFrom(allocation.storage_address, self.regs.rip);
             self.vtable_tracker.forgetAddress(allocation.storage_address);
         }
         return .handled_void;
@@ -1219,7 +1226,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         std.mem.endsWith(u8, name, "_free"))
     {
         self.resolving_import_route = .release;
-        self.memory_forwarder.release(self.regs.rdi);
+        self.memory_forwarder.releaseFrom(self.regs.rdi, self.regs.rip);
         self.vtable_tracker.forgetAddress(self.regs.rdi);
         return .handled_void;
     }
@@ -1888,6 +1895,16 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
                 .handled_void => .handled_void,
             };
         },
+        .pthread_cpp_sync => blk: {
+            const resolution = self.pthreads.dispatchCppSynchronization(self, name) orelse break :blk null;
+            self.import_provider_override = .pthread_runtime;
+            self.import_confidence_override = .modeled;
+            break :blk switch (resolution) {
+                .handled => |value| .{ .handled = value },
+                .handled_void => .handled_void,
+            };
+        },
+        .pthread_once => handlePthreadOnce(self),
         .dynamic_library => blk: {
             const resolution = self.dynamic_forwarder.forward(self, imported.dylib, name) orelse break :blk null;
             self.import_provider_override = .dynamic_library;
@@ -1900,7 +1917,7 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
         .shared_contract => dispatchSharedContract(self, name),
         .allocate => .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 },
         .release => blk: {
-            self.memory_forwarder.release(self.regs.rdi);
+            self.memory_forwarder.releaseFrom(self.regs.rdi, self.regs.rip);
             self.vtable_tracker.forgetAddress(self.regs.rdi);
             break :blk .handled_void;
         },
@@ -1916,6 +1933,22 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
         .sysconf => .{ .handled = guestSysconf(@bitCast(@as(u32, @truncate(self.regs.rdi)))) },
         .strtoul => handleImportSlow(self, imported),
     };
+}
+
+/// `pthread_once`: run the initializer exactly once by transferring control to
+/// it, marking the control word first so a re-entry returns immediately.
+///
+/// Extracted so the route cache replays the same code the slow path ran.
+/// Inline in `handleImportSlow`, it was unreachable from `dispatchImportRoute`,
+/// which is what made `.pthread` a tag with three owners and one replay.
+pub fn handlePthreadOnce(self: anytype) ImportHandlerResult {
+    const once_control = self.regs.rdi;
+    const init_routine = self.regs.rsi;
+    const once_value = self.readMemVal(once_control, .bits32);
+    if (once_value != 0) return .{ .handled = 0 };
+    self.writeMemVal(once_control, .bits32, 1);
+    self.regs.rip = init_routine;
+    return .control_transferred;
 }
 
 pub fn handleIdleAdd(self: anytype, name: []const u8) ImportHandlerResult {
