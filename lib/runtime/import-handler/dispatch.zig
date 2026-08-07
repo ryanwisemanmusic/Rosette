@@ -935,9 +935,13 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 return .{ .handled = self.regs.rdi };
             }
         }
+        // Reached only when the engine could not decide. A cast that correctly
+        // returns null now resolves as `.proven_negative` and never arrives
+        // here, so this message means what it says instead of firing on every
+        // legitimate type test a program performs.
         self.dynamic_casts.dumpTraceBuffer(self);
         machoCapturePrint(
-            "macho-processor: __dynamic_cast metadata unresolved: source=0x{x} source_type=0x{x} destination_type=0x{x} hint={d}; returning null\n",
+            "macho-processor: __dynamic_cast UNDECIDABLE: source=0x{x} source_type=0x{x} destination_type=0x{x} hint={d}; the type hierarchy could not be walked — the source type was not found in the object's own graph — so null is a fallback, NOT the language's answer. A caller that branches on this null is branching on a guess\n",
             .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, @as(i64, @bitCast(self.regs.rcx)) },
         );
         return .{ .handled = 0 };
@@ -2212,9 +2216,14 @@ pub fn handleDirectImportCall(self: anytype, imported: macho_metadata.ImportedSy
         .unsupported => |result| {
             self.regs.rax = result;
             recordUnresolvedImport(self, imported, return_address, result);
+            // Distinguish "no handler exists for this symbol" from "a handler
+            // (e.g. the primitive lib's strlen) exists but declined this call
+            // because the argument was not guest-readable". The latter is an
+            // input edge case, not an unhandled import.
+            const primitive_declined = self.primitiveMatches(imported.name);
             machoCapturePrint(
-                "  [unresolved direct import #{d}] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}\n",
-                .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, return_address, result },
+                "  [unresolved direct import #{d}] {s} from {s}; stub=0x{x} return=0x{x} -> rax=0x{x}{s}\n",
+                .{ self.unresolved_import_count, imported.name, imported.dylib, imported.stub_address, return_address, result, if (primitive_declined) " (primitive handler matched but declined: argument not guest-readable)" else "" },
             );
             if (self.strict_imports) {
                 self.terminateForUnresolvedImport();
