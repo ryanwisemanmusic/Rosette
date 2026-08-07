@@ -19,6 +19,7 @@
 //! a fragment, which is exactly when the instruction ring is useless.
 
 const std = @import("std");
+const bounded_scan = @import("bounded_scan.zig");
 
 /// Where a register's defining instruction was found, if anywhere.
 pub const Origin = enum {
@@ -35,6 +36,11 @@ pub const Origin = enum {
 
 pub const Definition = struct {
     origin: Origin = .block_unresolved,
+    /// How the search range terminated, when found adaptively.
+    convergence: bounded_scan.Convergence = .unresolved,
+    /// Window the answer was actually obtained at — an observation, not a
+    /// setting.
+    window_bytes: u64 = 0,
     /// Verified first byte of the reconstructed block.
     block_start: u64 = 0,
     /// Instructions between `block_start` and the anchor.
@@ -49,12 +55,10 @@ pub const Definition = struct {
     }
 };
 
-pub const Limits = struct {
-    /// Bytes to search backwards for a verifiable block start.
-    window_bytes: u64 = 64,
-    /// Instructions to decode in any single chain.
-    max_instructions: u8 = 24,
-};
+/// Block reconstruction uses the shared bounded-scan limits so it cannot drift
+/// away from the other readers. Callers may still pass a narrower window.
+pub const Limits = bounded_scan.Limits;
+pub const default_limits: Limits = bounded_scan.Limits.block_reconstruction;
 
 /// Reconstruct the instruction chain ending exactly at `anchor_rip` and report
 /// where `register_matches` was last written before it.
@@ -75,7 +79,7 @@ pub fn findDefinition(
     comptime decodeAt: fn (Ctx, u64) ?Decoded,
 ) Definition {
     var best_start: ?u64 = null;
-    var probe = anchor_rip -| limits.window_bytes;
+    var probe = anchor_rip -| limits.max_bytes;
     while (probe < anchor_rip) : (probe += 1) {
         var cursor = probe;
         var steps: u8 = 0;
@@ -109,6 +113,46 @@ pub fn findDefinition(
     }
     result.block_length = index;
     return result;
+}
+
+/// Reconstruct the block by *finding* the window rather than assuming one.
+///
+/// Widening can only move the block start earlier (an earlier probe that still
+/// chains exactly onto the anchor means there was more block). So the answer is
+/// converged the moment a wider window returns the same start: nothing further
+/// back verifies. That is a detected boundary, and the run reports both the
+/// window it needed and whether it converged.
+pub fn findDefinitionAdaptive(
+    comptime Ctx: type,
+    ctx: Ctx,
+    anchor_rip: u64,
+    adaptive: bounded_scan.Adaptive,
+    comptime decodeAt: fn (Ctx, u64) ?Decoded,
+) Definition {
+    var window = adaptive.initial_bytes;
+    var best: Definition = .{};
+    while (true) {
+        var attempt = findDefinition(Ctx, ctx, anchor_rip, adaptive.limitsAt(window), decodeAt);
+        attempt.window_bytes = window;
+        if (attempt.decided()) {
+            if (best.decided() and attempt.block_start == best.block_start) {
+                // A wider window found the same start: the boundary is real.
+                best = attempt;
+                best.convergence = .converged;
+                return best;
+            }
+            best = attempt;
+        }
+        const grown = adaptive.next(window) orelse break;
+        window = grown;
+    }
+    if (!best.decided()) {
+        best.convergence = .unresolved;
+        return best;
+    }
+    // The ceiling arrived before two consecutive windows agreed.
+    best.convergence = .ceiling_reached;
+    return best;
 }
 
 pub const Decoded = struct {
@@ -145,7 +189,7 @@ test "a definition inside the block is located with its distance" {
     program[5] = .{ .len = 4, .defines = false };
     const ctx = TestCtx{ .base = 0x1000, .program = &program };
 
-    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .window_bytes = 16 }, TestCtx.decode);
+    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .max_instructions = 24, .max_bytes = 16 }, TestCtx.decode);
     try std.testing.expectEqual(Origin.defined_in_block, found.origin);
     try std.testing.expectEqual(@as(u64, 0x1000), found.block_start);
     try std.testing.expectEqual(@as(u64, 0x1000), found.instruction_address);
@@ -163,7 +207,7 @@ test "a register never written in the block is reported as live-in, not unknown"
     program[5] = .{ .len = 4, .defines = false };
     const ctx = TestCtx{ .base = 0x1000, .program = &program };
 
-    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .window_bytes = 16 }, TestCtx.decode);
+    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .max_instructions = 24, .max_bytes = 16 }, TestCtx.decode);
     try std.testing.expectEqual(Origin.live_in_to_block, found.origin);
     try std.testing.expectEqual(@as(u64, 0x1000), found.block_start);
     try std.testing.expectEqual(@as(u8, 3), found.block_length);
@@ -177,9 +221,54 @@ test "the latest definition wins when a register is written twice" {
     program[5] = .{ .len = 4, .defines = false };
     const ctx = TestCtx{ .base = 0x1000, .program = &program };
 
-    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .window_bytes = 16 }, TestCtx.decode);
+    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .max_instructions = 24, .max_bytes = 16 }, TestCtx.decode);
     try std.testing.expectEqual(@as(u64, 0x1003), found.instruction_address);
     try std.testing.expectEqual(@as(u8, 1), found.distance);
+}
+
+test "an adaptive search converges and reports the window it needed" {
+    // Instructions at 0x1000(3) 0x1003(2) 0x1005(4) -> anchor 0x1009. The block
+    // start is 0x1000; every window at or beyond 9 bytes must agree.
+    var program = [_]TestByte{.{ .len = 0, .defines = false }} ** 64;
+    program[0] = .{ .len = 3, .defines = true };
+    program[3] = .{ .len = 2, .defines = false };
+    program[5] = .{ .len = 4, .defines = false };
+    const ctx = TestCtx{ .base = 0x1000, .program = &program };
+
+    const found = findDefinitionAdaptive(TestCtx, ctx, 0x1009, .{
+        .initial_bytes = 8,
+        .ceiling_bytes = 64,
+    }, TestCtx.decode);
+    try std.testing.expectEqual(Origin.defined_in_block, found.origin);
+    try std.testing.expectEqual(bounded_scan.Convergence.converged, found.convergence);
+    try std.testing.expect(found.convergence.trustworthy());
+    try std.testing.expectEqual(@as(u64, 0x1000), found.block_start);
+}
+
+test "a search that never converges reports the ceiling instead of pretending" {
+    // Every byte decodes as length 1, so every wider window finds a strictly
+    // earlier start and the answer never stabilises. Reporting this as a result
+    // would be reporting the ceiling as if it were the block boundary.
+    var program = [_]TestByte{.{ .len = 1, .defines = false }} ** 256;
+    program[0] = .{ .len = 1, .defines = true };
+    const ctx = TestCtx{ .base = 0x1000, .program = &program };
+
+    const found = findDefinitionAdaptive(TestCtx, ctx, 0x1080, .{
+        .initial_bytes = 8,
+        .ceiling_bytes = 32,
+        .max_instructions = 64,
+    }, TestCtx.decode);
+    try std.testing.expect(found.decided());
+    try std.testing.expectEqual(bounded_scan.Convergence.ceiling_reached, found.convergence);
+    try std.testing.expect(!found.convergence.trustworthy());
+    try std.testing.expectEqual(@as(u64, 32), found.window_bytes);
+}
+
+test "an adaptive search over unreadable bytes stays unresolved" {
+    const ctx = TestCtx{ .base = 0x1000, .program = &[_]TestByte{} };
+    const found = findDefinitionAdaptive(TestCtx, ctx, 0x1009, .{}, TestCtx.decode);
+    try std.testing.expectEqual(bounded_scan.Convergence.unresolved, found.convergence);
+    try std.testing.expect(!found.decided());
 }
 
 test "an anchor no chain reaches is unresolved rather than guessed" {
@@ -190,13 +279,13 @@ test "an anchor no chain reaches is unresolved rather than guessed" {
     program[5] = .{ .len = 5, .defines = true };
     const ctx = TestCtx{ .base = 0x1000, .program = &program };
 
-    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .window_bytes = 16 }, TestCtx.decode);
+    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .max_instructions = 24, .max_bytes = 16 }, TestCtx.decode);
     try std.testing.expectEqual(Origin.block_unresolved, found.origin);
     try std.testing.expect(!found.decided());
 }
 
 test "unreadable bytes do not fabricate a block" {
     const ctx = TestCtx{ .base = 0x1000, .program = &[_]TestByte{} };
-    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .window_bytes = 16 }, TestCtx.decode);
+    const found = findDefinition(TestCtx, ctx, 0x1009, .{ .max_instructions = 24, .max_bytes = 16 }, TestCtx.decode);
     try std.testing.expectEqual(Origin.block_unresolved, found.origin);
 }

@@ -14,14 +14,20 @@
 pub const ring = @import("ring.zig");
 pub const instruction_history = @import("instruction_history.zig");
 pub const generated_block = @import("generated_block.zig");
+pub const bounded_scan = @import("bounded_scan.zig");
+pub const dispatch_shape = @import("dispatch_shape.zig");
 
 pub const Ring = ring.Ring;
 pub const History = instruction_history.History;
 pub const BlockDefinition = generated_block.Definition;
 pub const BlockOrigin = generated_block.Origin;
+pub const ScanLimits = bounded_scan.Limits;
+pub const DispatchShape = dispatch_shape.Shape;
 
 test {
     _ = ring;
     _ = instruction_history;
     _ = generated_block;
+    _ = bounded_scan;
+    _ = dispatch_shape;
 }

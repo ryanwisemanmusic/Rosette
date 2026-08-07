@@ -35,6 +35,27 @@ pub fn History(comptime Entry: type) type {
             last_sequence: u64 = 0,
         };
 
+        /// What the history is allowed to record.
+        ///
+        /// This exists because the previous design had a `trace_ring_enabled`
+        /// boolean that was declared, defaulted to false, and **never assigned
+        /// anywhere**. Every history-based recognizer therefore ran against an
+        /// empty ring for the entire life of the code, and reported "no
+        /// evidence retained" — which reads as a fact about the program and was
+        /// actually a fact about a switch nobody turned on. A policy that
+        /// travels with the window makes that indistinguishability impossible.
+        pub const Policy = enum {
+            /// Record nothing. `Window.reaches()` is false and stays false.
+            disabled,
+            /// Record only where the recognizers actually ask questions:
+            /// JIT-generated code outside the host image. Host code dominates
+            /// the step count by orders of magnitude, so this keeps the tape
+            /// affordable while making it deep exactly where it is consulted.
+            generated_code_only,
+            /// Record everything.
+            all,
+        };
+
         pub const Window = struct {
             /// Retained entries for the queried thread.
             thread_entries: usize,
@@ -49,6 +70,21 @@ pub fn History(comptime Entry: type) type {
             /// A thread was evicted to make room at some point, so the queried
             /// thread's history may have been discarded and restarted.
             evictions: u64,
+            /// What recording was permitted while this window was filling.
+            policy: Policy,
+            /// Entries accepted, and entries the policy declined.
+            recorded: u64,
+            skipped: u64,
+
+            /// An empty window means different things depending on why. Callers
+            /// must not report "no evidence" when the answer is "no recording".
+            pub fn emptyBecauseDisabled(self: Window) bool {
+                return self.thread_entries == 0 and self.policy == .disabled;
+            }
+
+            pub fn emptyBecauseFiltered(self: Window) bool {
+                return self.thread_entries == 0 and self.recorded == 0 and self.skipped != 0;
+            }
 
             pub fn reaches(self: Window) bool {
                 return self.thread_entries != 0;
@@ -66,6 +102,9 @@ pub fn History(comptime Entry: type) type {
         thread_capacity: usize,
         sequence: u64 = 0,
         evictions: u64 = 0,
+        policy: Policy = .generated_code_only,
+        recorded: u64 = 0,
+        skipped: u64 = 0,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -131,10 +170,24 @@ pub fn History(comptime Entry: type) type {
         }
 
         pub fn record(self: *Self, thread: u64, entry: Entry) void {
-            const slot = self.slotFor(thread) orelse return;
+            if (self.policy == .disabled) {
+                self.skipped +|= 1;
+                return;
+            }
+            const slot = self.slotFor(thread) orelse {
+                self.skipped +|= 1;
+                return;
+            };
             self.sequence +|= 1;
+            self.recorded +|= 1;
             slot.last_sequence = self.sequence;
             slot.ring.push(entry);
+        }
+
+        /// Record that the caller's policy gate declined an instruction. Keeps
+        /// `skipped` meaningful when the filtering happens at the call site.
+        pub fn noteFiltered(self: *Self) void {
+            self.skipped +|= 1;
         }
 
         pub fn countFor(self: *const Self, thread: u64) usize {
@@ -164,6 +217,9 @@ pub fn History(comptime Entry: type) type {
                 .live_threads = self.liveThreads(),
                 .slot_capacity = self.slots.len,
                 .evictions = self.evictions,
+                .policy = self.policy,
+                .recorded = self.recorded,
+                .skipped = self.skipped,
             };
         }
 
@@ -199,6 +255,33 @@ pub fn History(comptime Entry: type) type {
                 }
             }
             return best;
+        }
+
+        /// Copy the most recent entries for `thread` into `dest`, oldest-first,
+        /// and return how many were written.
+        ///
+        /// The destination's own length is the bound, so a caller cannot
+        /// overflow its buffer by asking for a count from somewhere else. That
+        /// is not hypothetical: the exit-diagnostics dump sized its stack array
+        /// from `TRACE_BUFFER_LEN` (256) while taking its loop count from
+        /// `countFor()` (512 after partitioning), and wrote 256 entries past the
+        /// end of a stack buffer — corrupting the report and then killing the
+        /// process with SIGSEGV *while producing crash diagnostics*. Two
+        /// independent constants that had to agree, with nothing enforcing it.
+        ///
+        /// Most-recent rather than oldest: when a window cannot hold everything,
+        /// the instructions nearest the fault are the ones worth keeping.
+        pub fn copyRecentInto(self: *const Self, thread: u64, dest: []Entry) usize {
+            if (dest.len == 0) return 0;
+            const available = self.countFor(thread);
+            const wanted = @min(available, dest.len);
+            var index: usize = 0;
+            while (index < wanted) : (index += 1) {
+                // `wanted - 1 - index` counts back from the newest, so the
+                // destination ends up oldest-first.
+                dest[index] = self.recent(thread, wanted - 1 - index) orelse break;
+            }
+            return index;
         }
 
         /// Iterate every retained entry of every thread. Order is per-thread
@@ -304,6 +387,64 @@ test "per-thread chronological order is independent of interleaving" {
     try std.testing.expectEqual(@as(u64, 4), history.chronological(1, 4).?.value);
     try std.testing.expectEqual(@as(u64, 100), history.chronological(2, 0).?.value);
     try std.testing.expectEqual(@as(u64, 104), history.recent(2, 0).?.value);
+}
+
+test "an empty window distinguishes disabled from filtered from genuinely empty" {
+    const allocator = std.testing.allocator;
+    var history = try TestHistory.init(allocator, 4, 8);
+    defer history.deinit(allocator);
+
+    // Genuinely empty: recording allowed, nothing happened yet.
+    const fresh = history.windowFor(1);
+    try std.testing.expect(!fresh.reaches());
+    try std.testing.expect(!fresh.emptyBecauseDisabled());
+    try std.testing.expect(!fresh.emptyBecauseFiltered());
+
+    // Filtered: the call site's policy gate declined every instruction.
+    history.noteFiltered();
+    try std.testing.expect(history.windowFor(1).emptyBecauseFiltered());
+
+    // Disabled: the whole mechanism is off. This is the state the old
+    // `trace_ring_enabled` boolean was stuck in, indistinguishable from
+    // "the program produced no evidence".
+    history.policy = .disabled;
+    history.record(1, .{ .thread = 1 });
+    const off = history.windowFor(1);
+    try std.testing.expect(off.emptyBecauseDisabled());
+    try std.testing.expectEqual(@as(u64, 0), off.recorded);
+}
+
+test "copyRecentInto is bounded by the destination, not by the caller's count" {
+    const allocator = std.testing.allocator;
+    var history = try TestHistory.init(allocator, 2, 16);
+    defer history.deinit(allocator);
+
+    var i: u64 = 0;
+    while (i < 16) : (i += 1) history.record(1, .{ .thread = 1, .value = i });
+    try std.testing.expectEqual(@as(usize, 16), history.countFor(1));
+
+    // A destination smaller than the retained count must not be overrun. The
+    // exit-diagnostics dump did exactly this and wrote past a stack array.
+    var small: [4]TestEntry = undefined;
+    const written = history.copyRecentInto(1, &small);
+    try std.testing.expectEqual(@as(usize, 4), written);
+    // Oldest-first within the window, ending at the newest entry.
+    try std.testing.expectEqual(@as(u64, 12), small[0].value);
+    try std.testing.expectEqual(@as(u64, 15), small[3].value);
+}
+
+test "copyRecentInto handles empty history and empty destinations" {
+    const allocator = std.testing.allocator;
+    var history = try TestHistory.init(allocator, 2, 8);
+    defer history.deinit(allocator);
+
+    var dest: [4]TestEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 0), history.copyRecentInto(7, &dest));
+
+    history.record(7, .{ .thread = 7, .value = 1 });
+    var empty: [0]TestEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 0), history.copyRecentInto(7, &empty));
+    try std.testing.expectEqual(@as(usize, 1), history.copyRecentInto(7, &dest));
 }
 
 test "zero slots degrades to recording nothing rather than trapping" {
