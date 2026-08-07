@@ -20,6 +20,7 @@ const lazy_import_stub = @import("dyld").lazy_import_stub;
 const smart_stub_generator = @import("dyld").smart_stub_generator;
 const cxx_exception_diagnostics = @import("cxx_abi").cxx_exception_diagnostics;
 const spirv_cross_diagnostics = @import("diagnostics").spirv_cross_diagnostics;
+const log_repetition = @import("diagnostics").log_repetition;
 const fs_io_forwarder = @import("io").fs_io_forwarder;
 const memory_management_forwarder = @import("memory").memory_management_forwarder;
 const sparse_virtual_memory = @import("memory").sparse_virtual_memory;
@@ -92,6 +93,7 @@ const recovery_ledger = @import("ownership").ledger;
 const guest_address_space = @import("guest_address_space");
 const ownership_lib = @import("ownership");
 const dispatch_recovery = @import("dispatch_recovery");
+const gpu = @import("gpu");
 const guest_structure = @import("guest_structure");
 const execution_history = @import("execution_history");
 const ExecutionHistory = execution_history.History(TraceEntry);
@@ -514,6 +516,11 @@ pub const MachOState = struct {
     guest_stderr_pointer_address: u64 = 0,
     guest_log_buffer_address: u64 = 0,
     guest_log_mirror_fd: i32 = -1,
+    /// Collapses consecutive identical mirrored guest lines. A guest loop that
+    /// logs is the guest's defect, but a runtime whose diagnostics become
+    /// unusable because of it has adopted that defect as its own — and with a
+    /// workload whose source is unavailable there is no other remedy.
+    guest_log_repetition: log_repetition.Collapser = .{},
     guest_log_line_count: u64 = 0,
     guest_stdio_write_count: u64 = 0,
     guest_stdout_byte_count: u64 = 0,
@@ -620,6 +627,11 @@ pub const MachOState = struct {
     /// split by whether it got through. Individual recoveries each report
     /// themselves; only this says whether a run met one stubborn site or forty.
     dispatch_census: dispatch_recovery.Census = .{},
+    /// The guest-driven GPU bootstrap, as an ordered contract. A graphics stack
+    /// that produces nothing reports zeros everywhere; the frontier is what says
+    /// which step was the first not to happen and whether it was reachable —
+    /// the only reading that decides whether to look at the GPU at all.
+    gpu_bootstrap: gpu.Contract = .{},
     vtable_tracker: vt.VtableTracker,
     /// Tracks vtable writes for non-heap (stack-local / modeled) objects.
     /// Registered by the stream bridge during stringstream construction
@@ -1925,6 +1937,15 @@ pub const MachOState = struct {
         return false;
     }
 
+    /// Whether the primitive registry matches this import name. Distinct from
+    /// `tryPrimitiveDispatch`: this only asks whether a handler exists, so the
+    /// unresolved-import report can distinguish "no handler for this symbol"
+    /// from "handler matched but declined this input".
+    pub fn primitiveMatches(self: *MachOState, name: []const u8) bool {
+        _ = self;
+        return primitive.builtin().matchSymbol(name) != null;
+    }
+
     pub fn handleImport(self: *MachOState, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
         const name = imported.name;
         const return_address = self.read64(self.regs.rsp);
@@ -2019,7 +2040,12 @@ pub const MachOState = struct {
                         .readCStringFn = struct {
                             fn read(ptr: *const anyopaque, address: u64) ?[]const u8 {
                                 const inner_st: *const MachOState = @ptrCast(@alignCast(ptr));
-                                return inner_st.guestCString(address, 4096);
+                                // Match the slow-path import handlers (strlen,
+                                // strcmp, strcpy use a 1 MiB cap) so the
+                                // primitive layer services the same inputs the
+                                // slow path would instead of falling through
+                                // to it with a shorter 4096-byte window.
+                                return inner_st.guestCString(address, 1 << 20);
                             }
                         }.read,
                         .moveGuestFn = struct {
@@ -4778,9 +4804,21 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.dynamic_casts.logSummary();
     state.diagnostic_text.logSummary();
     state.pthreads.logSummary();
+    state.tlv.logSummary();
     state.sparse_memory.logSummary();
+    if (state.guest_log_repetition.active()) {
+        macho_log.machoCapturePrint(
+            "macho-processor: guest log mirror repetition: suppressed_lines={d} runs={d} longest_run={d} truncated_comparisons={d}; a collapsed run is a guest loop that logs, and its length is the finding — the copies were not\n",
+            .{
+                state.guest_log_repetition.suppressed,
+                state.guest_log_repetition.runs,
+                state.guest_log_repetition.longest_run,
+                state.guest_log_repetition.truncated_comparisons,
+            },
+        );
+    }
     if (state.guest_log_line_count != 0) {
-        machoCapturePrint(
+        macho_log.machoCapturePrint(
             "macho-processor: synchronous guest log bridge: mirrored_lines={d}\n",
             .{state.guest_log_line_count},
         );
