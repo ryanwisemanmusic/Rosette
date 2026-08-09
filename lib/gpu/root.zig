@@ -6,10 +6,11 @@
 //! "not started" from "started and stuck" from "stuck upstream of here" without
 //! knowing what order things were supposed to happen in.
 //!
-//! So this library owns the *order and its preconditions*, not the rendering.
-//! It answers one question — which step of the guest-driven bootstrap was the
-//! first not to happen, and was it even reachable — because that is the question
-//! that decides whether to look at the GPU at all.
+//! So this library owns both the guest-bootstrap observation contract and the
+//! backend-neutral host execution boundary. It answers which guest-driven step
+//! was first not to happen, then — only after authentic work arrives — provides
+//! Rosette-native devices, queues, resources, synchronization and presentation
+//! without exposing Vulkan or Metal handles to the emulator frontend.
 //!
 //! Two barriers stand between a translated title and real pixels, and they are
 //! independent: the guest must drive its GPU lifecycle (`bootstrap`), and the
@@ -24,6 +25,10 @@
 
 pub const bootstrap = @import("bootstrap.zig");
 pub const forwarding = @import("forwarding.zig");
+pub const api = @import("api.zig");
+pub const backend = @import("backend.zig");
+pub const handles = @import("handles.zig");
+pub const runtime = @import("runtime.zig");
 
 pub const Step = bootstrap.Step;
 pub const Contract = bootstrap.Contract;
@@ -31,8 +36,19 @@ pub const Frontier = bootstrap.Frontier;
 pub const ForwardingContract = forwarding.Contract;
 pub const Stage = forwarding.Stage;
 pub const Fidelity = forwarding.Fidelity;
+pub const Runtime = runtime.Runtime;
+pub const HandshakeRequest = api.HandshakeRequest;
+pub const HandshakeResponse = api.HandshakeResponse;
+pub const Capability = api.Capability;
+pub const CapabilitySet = api.CapabilitySet;
+pub const BackendKind = api.BackendKind;
+pub const Handle = handles.Handle;
 
 test {
     _ = bootstrap;
     _ = forwarding;
+    _ = api;
+    _ = backend;
+    _ = handles;
+    _ = runtime;
 }
