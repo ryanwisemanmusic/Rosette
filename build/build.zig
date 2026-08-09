@@ -1240,12 +1240,23 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // Backend-neutral host GPU ownership and the versioned consumer
+        // handshake. Created before dyld because the Vulkan loader forwarder is
+        // the first adapter feeding truthful native-boundary stages into it.
+        const gpu_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/gpu/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const gpu_test = b.addTest(.{ .root_module = gpu_mod });
+        check_step.dependOn(&b.addRunArtifact(gpu_test).step);
         const dyld_mod = b.createModule(.{
             .root_source_file = b.path("../lib/linker/dyld/root.zig"),
             .target = target,
             .optimize = optimize,
         });
         dyld_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
+        dyld_mod.addImport("gpu", gpu_mod);
         const scheduler_mod = b.createModule(.{
             .root_source_file = b.path("../lib/scheduler/root.zig"),
             .target = target,
@@ -1451,16 +1462,8 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&b.addRunArtifact(dispatch_recovery_test).step);
         process_core_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
 
-        // The guest-driven GPU bootstrap contract. Rooted and run: the whole
-        // value of it is the distinction between "unreachable" and "reachable
-        // and not taken", and the tests are what pin that distinction.
-        const gpu_mod = b.createModule(.{
-            .root_source_file = b.path("../lib/gpu/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const gpu_test = b.addTest(.{ .root_module = gpu_mod });
-        check_step.dependOn(&b.addRunArtifact(gpu_test).step);
+        // Guest bootstrap observation and the host execution API share one GPU
+        // module so neither can mistake synthetic host progress for guest work.
         process_core_mod.addImport("gpu", gpu_mod);
         process_core_mod.addImport("guest_structure", guest_structure_mod);
 
