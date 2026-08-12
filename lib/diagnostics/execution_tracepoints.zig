@@ -1,0 +1,392 @@
+//! Whether a function executed, decided by watching the instruction pointer
+//! rather than by reading the log it was supposed to write.
+//!
+//! `VdSwap=0` has been the central fact of this investigation for three passes,
+//! and it was never a fact about execution. It was a fact about text: the
+//! observer matched the mirrored string `VdSwap(` in Xenia's own log output, so
+//! a zero could equally mean the title never called it, the call took a route
+//! that logs differently, the line was filtered, or the log level suppressed
+//! it. Four causes, one number, and no way to tell them apart — which is how a
+//! run gets classified `SUBMITTING_BUT_NEVER_PRESENTING` when nothing was
+//! submitted, and how an investigation spends its time downstream of a
+//! boundary it never confirmed.
+//!
+//! Rosette can do better because Rosette *is* the interpreter. It knows the
+//! instruction pointer on every step, so "did this function run" is a question
+//! it can answer directly. Arming a tracepoint at a resolved symbol address
+//! turns a textual absence into an execution fact: entered, with a caller, a
+//! thread and a step, or genuinely never reached.
+//!
+//! The cost is the whole design constraint. This is consulted on every
+//! interpreted step at roughly nine million steps per second, so the common
+//! case — no tracepoint anywhere near the current address — must be two
+//! comparisons and nothing else. Hence the range gate: addresses outside
+//! `[low, high]` are rejected before any search happens, and the search itself
+//! is binary over a sorted array. An armed set that made the interpreter
+//! measurably slower would change the scheduling it exists to observe.
+
+const std = @import("std");
+
+pub const max_tracepoints: usize = 64;
+/// Buckets in the address filter. Sized so that arming every candidate for a
+/// question still leaves the filter sparse: with ~30 tracepoints, 1024 buckets
+/// reject about 97% of in-range addresses before any search happens.
+pub const filter_buckets: usize = 1024;
+const filter_words: usize = filter_buckets / 64;
+
+/// What a traced boundary means, so a hit report can say why it was watched.
+/// The categories are the frontier the graphics investigation is walking.
+pub const Role = enum(u8) {
+    /// The guest frame-boundary call. Its absence is the current frontier.
+    swap,
+    /// Ring publication by the kernel video path.
+    ring_publication,
+    /// Command-processor packet execution.
+    command_processor,
+    /// The presenter's own frame path inside the emulator.
+    presenter,
+    /// Anything else armed for a specific question.
+    other,
+
+    pub fn label(self: Role) []const u8 {
+        return switch (self) {
+            .swap => "guest frame boundary",
+            .ring_publication => "ring publication",
+            .command_processor => "command processor",
+            .presenter => "emulator presenter",
+            .other => "observation",
+        };
+    }
+};
+
+pub const Tracepoint = struct {
+    address: u64 = 0,
+    role: Role = .other,
+    /// Symbol name, borrowed. The metadata that resolved it outlives the run.
+    name: []const u8 = "",
+    hits: u64 = 0,
+    first_step: u64 = 0,
+    first_thread: u64 = 0,
+    first_caller: u64 = 0,
+    last_step: u64 = 0,
+    last_thread: u64 = 0,
+
+    pub fn entered(self: *const Tracepoint) bool {
+        return self.hits != 0;
+    }
+};
+
+pub const Set = struct {
+    entries: [max_tracepoints]Tracepoint = [_]Tracepoint{.{}} ** max_tracepoints,
+    count: usize = 0,
+    /// The range gate. `low > high` when empty, so the emptiness check and the
+    /// range check are the same comparison and a disarmed set costs nothing.
+    low: u64 = std.math.maxInt(u64),
+    high: u64 = 0,
+    /// A sparse filter over the armed addresses. The range gate alone is not
+    /// enough: Xenia's text segment spans megabytes, so most executing
+    /// addresses fall *between* the lowest and highest tracepoint and would
+    /// each pay for a binary search. One multiply and a bit test rejects them.
+    bucket_mask: [filter_words]u64 = [_]u64{0} ** filter_words,
+    sealed: bool = false,
+    /// Addresses offered that did not resolve to a symbol. Worth reporting:
+    /// a tracepoint that was never armed reads exactly like one that was armed
+    /// and never hit.
+    unresolved: u32 = 0,
+    probes: u64 = 0,
+    gate_rejections: u64 = 0,
+
+    /// Arm a tracepoint. Duplicate addresses collapse — several symbol names
+    /// commonly resolve to one address after inlining, and counting one entry
+    /// twice would overstate how much is being watched.
+    pub fn arm(self: *Set, name: []const u8, address: u64, role: Role) bool {
+        if (self.sealed or address == 0 or self.count >= max_tracepoints) {
+            if (address == 0) self.unresolved +|= 1;
+            return false;
+        }
+        for (self.entries[0..self.count]) |existing| {
+            if (existing.address == address) return false;
+        }
+        self.entries[self.count] = .{ .address = address, .role = role, .name = name };
+        self.count += 1;
+        return true;
+    }
+
+    pub fn noteUnresolved(self: *Set) void {
+        self.unresolved +|= 1;
+    }
+
+    /// Sort and compute the gate. Must be called before `match`: an unsealed
+    /// set deliberately matches nothing, so a caller that forgets gets silence
+    /// rather than a binary search over unsorted entries.
+    pub fn seal(self: *Set) void {
+        const entries = self.entries[0..self.count];
+        std.mem.sort(Tracepoint, entries, {}, struct {
+            fn lessThan(_: void, a: Tracepoint, b: Tracepoint) bool {
+                return a.address < b.address;
+            }
+        }.lessThan);
+        if (self.count == 0) {
+            self.low = std.math.maxInt(u64);
+            self.high = 0;
+        } else {
+            self.low = entries[0].address;
+            self.high = entries[self.count - 1].address;
+        }
+        self.bucket_mask = [_]u64{0} ** filter_words;
+        for (entries) |entry| {
+            const bucket = bucketOf(entry.address);
+            self.bucket_mask[bucket / 64] |= @as(u64, 1) << @truncate(bucket % 64);
+        }
+        self.sealed = true;
+    }
+
+    /// The hot path: two comparisons and a bit test. A false positive costs a
+    /// binary search that finds nothing, which is correct and rare; a false
+    /// negative is impossible, because every armed address sets its own bit.
+    pub fn mightMatch(self: *const Set, address: u64) bool {
+        if (address < self.low or address > self.high) return false;
+        const bucket = bucketOf(address);
+        return (self.bucket_mask[bucket / 64] >> @truncate(bucket % 64)) & 1 != 0;
+    }
+
+    /// Full lookup, only worth calling when `mightMatch` passed.
+    pub fn find(self: *Set, address: u64) ?*Tracepoint {
+        if (!self.sealed or !self.mightMatch(address)) return null;
+        var lower: usize = 0;
+        var upper: usize = self.count;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            const candidate = self.entries[middle].address;
+            if (candidate == address) return &self.entries[middle];
+            if (candidate < address) lower = middle + 1 else upper = middle;
+        }
+        return null;
+    }
+
+    /// Record a hit. Returns the tracepoint when this is the first time it has
+    /// been entered, because the first entry is the interesting event and
+    /// every subsequent one is a frame rate.
+    pub fn observe(self: *Set, address: u64, step: u64, thread: u64, caller: u64) ?*Tracepoint {
+        self.probes +|= 1;
+        if (!self.mightMatch(address)) {
+            self.gate_rejections +|= 1;
+            return null;
+        }
+        const entry = self.find(address) orelse return null;
+        const first = entry.hits == 0;
+        entry.hits +|= 1;
+        entry.last_step = step;
+        entry.last_thread = thread;
+        if (first) {
+            entry.first_step = step;
+            entry.first_thread = thread;
+            entry.first_caller = caller;
+            return entry;
+        }
+        return null;
+    }
+
+    pub fn byRole(self: *const Set, role: Role) ?*const Tracepoint {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.role == role) return entry;
+        }
+        return null;
+    }
+
+    /// Whether any tracepoint with this role was entered. The distinction that
+    /// matters: `false` here with `count > 0` means genuinely not executed,
+    /// while `count == 0` means nothing was watching.
+    pub fn roleEntered(self: *const Set, role: Role) bool {
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.role == role and entry.entered()) return true;
+        }
+        return false;
+    }
+
+    pub fn roleArmed(self: *const Set, role: Role) bool {
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.role == role) return true;
+        }
+        return false;
+    }
+
+    /// What a zero hit count for this role actually licenses a reader to
+    /// conclude. This is the sentence three passes of this investigation
+    /// needed and did not have.
+    pub fn verdict(self: *const Set, role: Role) []const u8 {
+        if (!self.roleArmed(role)) {
+            return "NOT WATCHED: no tracepoint was armed for this role, so a zero count says nothing about whether it executed. Resolve the symbol first";
+        }
+        if (self.roleEntered(role)) {
+            return "ENTERED: the instruction pointer reached this function, so its absence from any log is a logging question, not an execution one";
+        }
+        return "NEVER ENTERED: a tracepoint was armed at the resolved address and the instruction pointer never reached it. This is an execution fact, not a missing log line";
+    }
+};
+
+/// Top bits of a multiplicative hash: cheap, and it spreads aligned function
+/// entry addresses that would collide under a plain shift-and-mask.
+fn bucketOf(address: u64) usize {
+    const mixed = (address *% 0x9E37_79B9_7F4A_7C15) >> 54;
+    return @intCast(mixed % filter_buckets);
+}
+
+test "an empty set matches nothing and costs one comparison" {
+    var set = Set{};
+    set.seal();
+    try std.testing.expect(!set.mightMatch(0));
+    try std.testing.expect(!set.mightMatch(0x4000));
+    try std.testing.expect(!set.mightMatch(std.math.maxInt(u64)));
+}
+
+// The hot path is the whole design constraint: nine million steps a second
+// must not pay for a search.
+test "addresses outside the range are rejected by the gate alone" {
+    var set = Set{};
+    _ = set.arm("mid", 0x5000, .swap);
+    _ = set.arm("high", 0x9000, .ring_publication);
+    set.seal();
+
+    try std.testing.expect(!set.mightMatch(0x4FFF));
+    try std.testing.expect(!set.mightMatch(0x9001));
+    try std.testing.expect(set.mightMatch(0x5000));
+    // An address inside the range that no tracepoint claims is normally
+    // rejected by the bucket filter, and when it collides the search still
+    // finds nothing. Both outcomes are correct.
+    try std.testing.expect(set.find(0x7000) == null);
+
+    _ = set.observe(0x100, 1, 1, 0);
+    try std.testing.expectEqual(@as(u64, 1), set.gate_rejections);
+}
+
+test "entries are found regardless of the order they were armed in" {
+    var set = Set{};
+    _ = set.arm("c", 0x9000, .other);
+    _ = set.arm("a", 0x1000, .swap);
+    _ = set.arm("b", 0x5000, .ring_publication);
+    set.seal();
+    try std.testing.expect(set.find(0x1000) != null);
+    try std.testing.expect(set.find(0x5000) != null);
+    try std.testing.expect(set.find(0x9000) != null);
+    try std.testing.expectEqualStrings("a", set.find(0x1000).?.name);
+}
+
+// Inlining commonly maps several names onto one address, and counting that
+// twice would overstate how much is being watched.
+test "a duplicate address is armed once" {
+    var set = Set{};
+    try std.testing.expect(set.arm("first", 0x2000, .swap));
+    try std.testing.expect(!set.arm("alias", 0x2000, .other));
+    try std.testing.expectEqual(@as(usize, 1), set.count);
+}
+
+test "an unresolved symbol is counted rather than silently skipped" {
+    var set = Set{};
+    try std.testing.expect(!set.arm("missing", 0, .swap));
+    try std.testing.expectEqual(@as(u32, 1), set.unresolved);
+    try std.testing.expectEqual(@as(usize, 0), set.count);
+}
+
+// An unsealed set matching nothing is deliberate: silence beats a binary
+// search over unsorted entries returning wrong answers.
+test "an unsealed set matches nothing" {
+    var set = Set{};
+    _ = set.arm("a", 0x1000, .swap);
+    try std.testing.expect(set.find(0x1000) == null);
+    set.seal();
+    try std.testing.expect(set.find(0x1000) != null);
+}
+
+test "the first entry is reported and later ones are only counted" {
+    var set = Set{};
+    _ = set.arm("VdSwap", 0x8000, .swap);
+    set.seal();
+
+    const first = set.observe(0x8000, 1000, 0x7fff2000, 0x4400).?;
+    try std.testing.expectEqual(@as(u64, 1000), first.first_step);
+    try std.testing.expectEqual(@as(u64, 0x7fff2000), first.first_thread);
+    try std.testing.expectEqual(@as(u64, 0x4400), first.first_caller);
+
+    try std.testing.expect(set.observe(0x8000, 2000, 0x7fff2000, 0x4400) == null);
+    try std.testing.expectEqual(@as(u64, 2), set.byRole(.swap).?.hits);
+    try std.testing.expectEqual(@as(u64, 2000), set.byRole(.swap).?.last_step);
+}
+
+// The distinction three passes of this investigation lacked: not-watched,
+// watched-and-never-entered, and entered are three different findings.
+test "an unwatched role is distinguished from one that never executed" {
+    var nothing_armed = Set{};
+    nothing_armed.seal();
+    try std.testing.expect(std.mem.indexOf(u8, nothing_armed.verdict(.swap), "NOT WATCHED") != null);
+
+    var armed = Set{};
+    _ = armed.arm("VdSwap", 0x8000, .swap);
+    armed.seal();
+    try std.testing.expect(std.mem.indexOf(u8, armed.verdict(.swap), "NEVER ENTERED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, armed.verdict(.swap), "not a missing log line") != null);
+
+    _ = armed.observe(0x8000, 1, 1, 0);
+    try std.testing.expect(std.mem.indexOf(u8, armed.verdict(.swap), "ENTERED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, armed.verdict(.swap), "logging question") != null);
+}
+
+test "roles report armed and entered independently" {
+    var set = Set{};
+    _ = set.arm("VdSwap", 0x8000, .swap);
+    set.seal();
+    try std.testing.expect(set.roleArmed(.swap));
+    try std.testing.expect(!set.roleEntered(.swap));
+    try std.testing.expect(!set.roleArmed(.presenter));
+}
+
+test "the set refuses to overflow" {
+    var set = Set{};
+    var index: usize = 0;
+    while (index < max_tracepoints + 8) : (index += 1) {
+        _ = set.arm("x", 0x1000 + index * 0x10, .other);
+    }
+    try std.testing.expectEqual(max_tracepoints, set.count);
+    set.seal();
+    try std.testing.expect(set.find(0x1000) != null);
+}
+
+// A false negative would silently disarm a tracepoint; a false positive only
+// costs a fruitless search.
+test "every armed address passes its own filter" {
+    var set = Set{};
+    var index: usize = 0;
+    while (index < max_tracepoints) : (index += 1) {
+        _ = set.arm("x", 0x1_0000 + index * 0x137, .other);
+    }
+    set.seal();
+    for (set.entries[0..set.count]) |entry| {
+        try std.testing.expect(set.mightMatch(entry.address));
+        try std.testing.expect(set.find(entry.address) != null);
+    }
+}
+
+// The filter must actually reject: without it every in-range address pays for
+// a binary search on every interpreted step.
+test "the filter rejects most in-range addresses that are not tracepoints" {
+    var set = Set{};
+    _ = set.arm("low", 0x10_0000, .swap);
+    _ = set.arm("high", 0x90_0000, .presenter);
+    set.seal();
+
+    var rejected: usize = 0;
+    var probe: u64 = 0x10_0000;
+    while (probe < 0x90_0000) : (probe += 0x40) {
+        if (!set.mightMatch(probe)) rejected += 1;
+    }
+    // Two buckets of a thousand are live, so all but a fraction of a percent
+    // of in-range probes must never reach the search.
+    try std.testing.expect(rejected > 33000);
+}
+
+test "every role explains itself" {
+    inline for (@typeInfo(Role).@"enum".fields) |field| {
+        const role: Role = @enumFromInt(field.value);
+        try std.testing.expect(role.label().len > 0);
+    }
+}

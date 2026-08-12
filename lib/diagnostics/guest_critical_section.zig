@@ -23,10 +23,12 @@
 
 const std = @import("std");
 
-/// `X_RTL_CRITICAL_SECTION` as the guest lays it out: a 16-byte dispatcher
-/// header followed by the lock triple. Big-endian, because the guest is
-/// PowerPC and a little-endian read of `-1` is still `-1` — which is exactly
-/// why a byte-order mistake here survives casual inspection.
+/// `X_RTL_CRITICAL_SECTION` as Xenia lays it out: a 16-byte dispatcher header
+/// followed by the lock triple. Most multi-byte guest fields are big-endian,
+/// but Xenia deliberately keeps `lock_count` as a native `int32_t` because its
+/// host atomics operate on it directly. On the translated x86-64 build that
+/// one member is little-endian. `-1` looks the same in both orders, which is
+/// why the mixed layout survived earlier diagnostics.
 pub const size_bytes: usize = 28;
 
 pub const header_offset: usize = 0;
@@ -63,7 +65,7 @@ pub fn decode(bytes: []const u8) ?Fields {
         .signal_state = std.mem.readInt(u32, bytes[4..8], .big),
         .wait_list_flink = std.mem.readInt(u32, bytes[8..12], .big),
         .wait_list_blink = std.mem.readInt(u32, bytes[12..16], .big),
-        .lock_count = std.mem.readInt(i32, bytes[16..20], .big),
+        .lock_count = std.mem.readInt(i32, bytes[16..20], .little),
         .recursion_count = std.mem.readInt(i32, bytes[20..24], .big),
         .owning_thread = std.mem.readInt(u32, bytes[24..28], .big),
     };
@@ -136,7 +138,7 @@ test "a zeroed structure is never-initialised rather than free" {
 // The distinction the whole file exists for: zero is not free.
 test "a free lock holds minus one, so zero is not free" {
     var bytes = [_]u8{0} ** size_bytes;
-    std.mem.writeInt(i32, bytes[lock_count_offset..][0..4], -1, .big);
+    std.mem.writeInt(i32, bytes[lock_count_offset..][0..4], -1, .little);
     const fields = decode(&bytes).?;
     try std.testing.expectEqual(@as(i32, -1), fields.lock_count);
     try std.testing.expectEqual(State.free, classify(fields));
@@ -145,7 +147,7 @@ test "a free lock holds minus one, so zero is not free" {
 
 test "a held lock names its owner" {
     var bytes = [_]u8{0} ** size_bytes;
-    std.mem.writeInt(i32, bytes[lock_count_offset..][0..4], 0, .big);
+    std.mem.writeInt(i32, bytes[lock_count_offset..][0..4], 0, .little);
     std.mem.writeInt(i32, bytes[recursion_count_offset..][0..4], 1, .big);
     std.mem.writeInt(u32, bytes[owning_thread_offset..][0..4], 0x3002A018, .big);
     const fields = decode(&bytes).?;
@@ -159,7 +161,7 @@ test "a held lock names its owner" {
 test "a written structure with no owner is impossible rather than merely held" {
     var bytes = [_]u8{0} ** size_bytes;
     std.mem.writeInt(u32, bytes[0..4], 0x00000100, .big);
-    std.mem.writeInt(i32, bytes[lock_count_offset..][0..4], 1, .big);
+    std.mem.writeInt(i32, bytes[lock_count_offset..][0..4], 1, .little);
     const fields = decode(&bytes).?;
     try std.testing.expect(!fields.blank());
     try std.testing.expectEqual(State.held_by_nobody, classify(fields));
@@ -167,10 +169,12 @@ test "a written structure with no owner is impossible rather than merely held" {
 }
 
 // Big-endian matters and is easy to get wrong precisely because -1 hides it.
-test "fields are read big-endian as the guest wrote them" {
+test "guest fields are big-endian while the host-atomic lock is little-endian" {
     var bytes = [_]u8{0} ** size_bytes;
     std.mem.writeInt(u32, bytes[owning_thread_offset..][0..4], 0x12345678, .big);
+    std.mem.writeInt(i32, bytes[lock_count_offset..][0..4], 0x01020304, .little);
     try std.testing.expectEqual(@as(u32, 0x12345678), decode(&bytes).?.owning_thread);
+    try std.testing.expectEqual(@as(i32, 0x01020304), decode(&bytes).?.lock_count);
     // Read the other way round it would be 0x78563412, which is a plausible
     // thread id and would not look wrong.
     try std.testing.expect(decode(&bytes).?.owning_thread != 0x78563412);
