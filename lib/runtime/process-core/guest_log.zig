@@ -9,6 +9,7 @@ const macho_log = @import("dyld").event_log;
 const gpu = @import("gpu");
 const machoCapturePrint = macho_log.machoCapturePrint;
 const startup_observer = @import("diagnostics").startup_observer;
+const guest_critical_section = @import("diagnostics").guest_critical_section;
 const preflight_lib = @import("preflight");
 const constants = @import("macho_core").constants;
 const utils = @import("macho_core").utils;
@@ -281,7 +282,7 @@ pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
             candidate.marker;
         if (std.mem.indexOf(u8, message, marker) == null) continue;
         const before = self.gpu_bootstrap.frontier();
-        self.gpu_bootstrap.observe(candidate.step, self.executed_steps);
+        self.gpu_bootstrap.observeEvidence(candidate.step, self.executed_steps);
         const after = self.gpu_bootstrap.frontier();
         if (before.step != after.step) {
             machoCapturePrint(
@@ -335,11 +336,69 @@ fn observeGuestCriticalSection(self: anytype, message: []const u8) void {
         const address = parseHexAfter(message, "registered cs=") orelse return;
         if (address == 0 or self.critical_section_watch_base == address) return;
         self.critical_section_watch_base = address;
-        const armed = self.provenance_watch.watchPage(address, .declared);
+        self.critical_section_initial_valid = false;
+
+        const host_virtual = self.xenia_memory_views.virtualHostAddress(address) orelse 0;
+        const host_physical = self.xenia_memory_views.physicalAliasHostAddress(address) orelse 0;
+        self.critical_section_watch_host_virtual = host_virtual;
+        self.critical_section_watch_host_physical = host_physical;
+        const virtual_armed = host_virtual != 0 and self.provenance_watch.watchPage(host_virtual, .declared);
+        const physical_armed = host_physical != 0 and self.provenance_watch.watchPage(host_physical, .declared);
+
+        if (host_virtual != 0) {
+            if (self.guestMemoryConst(host_virtual, guest_critical_section.size_bytes)) |bytes| {
+                @memcpy(self.critical_section_initial_image[0..], bytes[0..guest_critical_section.size_bytes]);
+                self.critical_section_initial_valid = true;
+            }
+        }
+        const initial_fields = if (self.critical_section_initial_valid)
+            guest_critical_section.decode(&self.critical_section_initial_image)
+        else
+            null;
         machoCapturePrint(
-            "macho-processor: guest critical section watch armed: cs=0x{x} watch={s}; the next contention on this lock can say whether anything ever wrote it\n",
-            .{ address, if (armed) "armed" else "unavailable" },
+            "macho-processor: guest critical section aliases resolved: cs=0x{x} host_virtual=0x{x} host_physical=0x{x} watch_virtual={s} watch_physical={s} initial_read={s} initial_state={s}; later clearing is attributed at the address Xenia actually writes\n",
+            .{
+                address,
+                host_virtual,
+                host_physical,
+                if (virtual_armed or (host_virtual != 0 and self.provenance_watch.covers(host_virtual))) "armed" else "unavailable",
+                if (physical_armed or (host_physical != 0 and self.provenance_watch.covers(host_physical))) "armed" else "unavailable",
+                if (self.critical_section_initial_valid) "YES" else "NO",
+                if (initial_fields) |fields| guest_critical_section.classify(fields).label() else "unreadable",
+            },
         );
+        return;
+    }
+
+    // Xenia emits this checkpoint synchronously before the bounded integrity
+    // repair writes a single byte. Read provenance here: waiting for the later
+    // contention would never work once the repair succeeds, and reading after
+    // repair would attribute the repair rather than the casualty.
+    if (std.mem.indexOf(u8, message, "GPU CRITICAL SECTION INTEGRITY: exact-zero casualty detected") != null) {
+        const address = parseHexAfter(message, "cs=") orelse return;
+        const host_virtual = if (address == self.critical_section_watch_base)
+            self.critical_section_watch_host_virtual
+        else
+            self.xenia_memory_views.virtualHostAddress(address) orelse 0;
+        const host_physical = if (address == self.critical_section_watch_base)
+            self.critical_section_watch_host_physical
+        else
+            self.xenia_memory_views.physicalAliasHostAddress(address) orelse 0;
+        const slot_offset = guest_critical_section.lock_count_offset;
+        const virtual_writer = if (host_virtual != 0) self.memory_writes.lookup((host_virtual + slot_offset) & ~@as(u64, 7)) else null;
+        const physical_writer = if (host_physical != 0) self.memory_writes.lookup((host_physical + slot_offset) & ~@as(u64, 7)) else null;
+        const writer = virtual_writer orelse physical_writer;
+        if (writer) |entry| {
+            machoCapturePrint(
+                "macho-processor: GUEST CRITICAL SECTION PRE-REPAIR CAUSAL WRITER: cs=0x{x} host_virtual=0x{x} host_physical=0x{x} write_address=0x{x} previous=0x{x} value=0x{x} rip=0x{x} {s} step={d} thread=0x{x} kind={s}; this write destroyed the captured unlocked lock-count slot\n",
+                .{ address, host_virtual, host_physical, entry.address, entry.previous_value, entry.value, entry.instruction_address, self.metadata.symbolLabel(entry.instruction_address), entry.step, entry.thread, @tagName(entry.kind) },
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: GUEST CRITICAL SECTION PRE-REPAIR CAUSAL WRITER: cs=0x{x} host_virtual=0x{x} host_physical=0x{x} writer=NOT_RETAINED; the exact-zero transition is proven by Xenia, but it arrived through a store path that did not commit bounded provenance\n",
+                .{ address, host_virtual, host_physical },
+            );
+        }
         return;
     }
 
@@ -352,22 +411,40 @@ fn observeGuestCriticalSection(self: anytype, message: []const u8) void {
     // is the rest of the run.
     if (self.critical_section_zero_owner_reports != 1) return;
 
-    const critical_section = @import("diagnostics").guest_critical_section;
-    const bytes = self.guestMemoryConst(address, critical_section.size_bytes);
+    const critical_section = guest_critical_section;
+    const host_virtual = if (address == self.critical_section_watch_base)
+        self.critical_section_watch_host_virtual
+    else
+        self.xenia_memory_views.virtualHostAddress(address) orelse 0;
+    const host_physical = if (address == self.critical_section_watch_base)
+        self.critical_section_watch_host_physical
+    else
+        self.xenia_memory_views.physicalAliasHostAddress(address) orelse 0;
+    const bytes = if (host_virtual != 0)
+        self.guestMemoryConst(host_virtual, critical_section.size_bytes)
+    else
+        null;
     if (bytes == null) {
         machoCapturePrint(
-            "macho-processor: GUEST CRITICAL SECTION UNREADABLE: cs=0x{x} is not mapped for reading, so the guest is contending a lock Rosette cannot see. That is the finding: the waiter's address does not resolve\n",
-            .{address},
+            "macho-processor: GUEST CRITICAL SECTION UNREADABLE: cs=0x{x} host_virtual=0x{x} host_physical=0x{x} mapping_base=0x{x}; the Xbox address could not be resolved to readable translated backing\n",
+            .{ address, host_virtual, host_physical, self.xenia_memory_views.mapping_base },
         );
         return;
     }
     const fields = critical_section.decode(bytes.?) orelse return;
     const state = critical_section.classify(fields);
-    const ever_written = self.provenance_watch.covers(address);
+    const virtual_writer = if (host_virtual != 0) self.memory_writes.lookup((host_virtual + critical_section.lock_count_offset) & ~@as(u64, 7)) else null;
+    const physical_writer = if (host_physical != 0) self.memory_writes.lookup((host_physical + critical_section.lock_count_offset) & ~@as(u64, 7)) else null;
+    const writer = virtual_writer orelse physical_writer;
+    const ever_written = writer != null;
+    const changed_since_registration = self.critical_section_initial_valid and
+        !std.mem.eql(u8, &self.critical_section_initial_image, bytes.?[0..critical_section.size_bytes]);
     machoCapturePrint(
-        "macho-processor: GUEST CRITICAL SECTION ZERO-OWNER CONTENTION: cs=0x{x} state={s} lock_count={d} recursion={d} owner=0x{x} header(type=0x{x} signal=0x{x} flink=0x{x} blink=0x{x}) watched={s} impossible={s}\n",
+        "macho-processor: GUEST CRITICAL SECTION ZERO-OWNER CONTENTION: cs=0x{x} host_virtual=0x{x} host_physical=0x{x} state={s} lock_count={d} recursion={d} owner=0x{x} header(type=0x{x} signal=0x{x} flink=0x{x} blink=0x{x}) initial_valid={s} changed_since_registration={s} writer_retained={s} impossible={s}\n",
         .{
             address,
+            host_virtual,
+            host_physical,
             state.label(),
             fields.lock_count,
             fields.recursion_count,
@@ -376,10 +453,18 @@ fn observeGuestCriticalSection(self: anytype, message: []const u8) void {
             fields.signal_state,
             fields.wait_list_flink,
             fields.wait_list_blink,
+            if (self.critical_section_initial_valid) "YES" else "NO",
+            if (changed_since_registration) "YES" else "NO",
             if (ever_written) "YES" else "NO",
             if (state.impossible()) "YES" else "NO",
         },
     );
+    if (writer) |entry| {
+        machoCapturePrint(
+            "macho-processor: GUEST CRITICAL SECTION LAST WRITER: address=0x{x} previous=0x{x} value=0x{x} rip=0x{x} step={d} thread=0x{x} kind={s}; this is the producer that changed the lock-count/recursion slot after registration\n",
+            .{ entry.address, entry.previous_value, entry.value, entry.instruction_address, entry.step, entry.thread, @tagName(entry.kind) },
+        );
+    }
     machoCapturePrint(
         "macho-processor: GUEST CRITICAL SECTION GUIDANCE: {s}\n",
         .{critical_section.guidance(state, ever_written)},
@@ -504,13 +589,25 @@ fn observeRingBufferAddress(self: anytype, message: []const u8) void {
 
     self.gpu_ring_watch_base = base;
     self.gpu_ring_watch_size = size;
+    self.gpu_ring_watch_host_physical = self.xenia_memory_views.physicalHostAddress(base) orelse 0;
+    // The 4 KiB physical view maps physical P at E0000000 + P - 1000.
+    const virtual_alias = if (base >= 0x1000) 0xE000_0000 + base - 0x1000 else 0;
+    self.gpu_ring_watch_host_virtual = if (virtual_alias != 0)
+        self.xenia_memory_views.virtualHostAddress(virtual_alias) orelse 0
+    else
+        0;
     // Watch the head of the ring: the first packet goes at the base, and the
     // watch set is deliberately small, so covering the whole ring would evict
     // everything else it holds.
-    _ = self.provenance_watch.watchPage(base, .declared);
+    if (self.gpu_ring_watch_host_physical != 0) {
+        _ = self.provenance_watch.watchPage(self.gpu_ring_watch_host_physical, .declared);
+    }
+    if (self.gpu_ring_watch_host_virtual != 0) {
+        _ = self.provenance_watch.watchPage(self.gpu_ring_watch_host_virtual, .declared);
+    }
     machoCapturePrint(
-        "macho-processor: gpu ring watch armed: physical_base=0x{x} size=0x{x} (size_log2={d}); write provenance now covers the ring head, so the next run can say whether the guest ever stored a command dword there — and, if it stored one somewhere else, which physical alias it used\n",
-        .{ base, size, size_log2 },
+        "macho-processor: gpu ring watch armed: physical_base=0x{x} size=0x{x} (size_log2={d}) host_physical=0x{x} host_virtual_alias=0x{x}; provenance now watches the addresses the translated stores actually use\n",
+        .{ base, size, size_log2, self.gpu_ring_watch_host_physical, self.gpu_ring_watch_host_virtual },
     );
 }
 

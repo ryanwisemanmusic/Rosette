@@ -3901,12 +3901,28 @@ pub fn noteRingBufferWrite(self: anytype, address: u64, size: Size, value: u64) 
     if (comptime !@hasField(State, "gpu_ring_watch_base")) return;
     const base = self.gpu_ring_watch_base;
     if (base == 0 or self.gpu_ring_watch_size == 0) return;
-    // The ring address the guest gave is physical. Rosette models the physical
-    // views as guest addresses, so compare on the low 32 bits and record which
-    // view the store actually used — that is the alias-coherence question.
-    const low: u32 = @truncate(address);
-    const ring_low: u32 = @truncate(base);
-    if (low < ring_low or low -% ring_low >= self.gpu_ring_watch_size) return;
+    // The ring address Xenia prints is Xbox physical, but interpreted x86
+    // stores use one of Xenia's host aliases. Compare against the discovered
+    // translated aliases first. The low-32 fallback is retained for runtimes
+    // that do not expose the view model yet.
+    var ring_offset: ?u64 = null;
+    if (comptime @hasField(State, "gpu_ring_watch_host_physical")) {
+        const physical = self.gpu_ring_watch_host_physical;
+        const virtual = self.gpu_ring_watch_host_virtual;
+        if (physical != 0 and address >= physical and address - physical < self.gpu_ring_watch_size) {
+            ring_offset = address - physical;
+        } else if (virtual != 0 and address >= virtual and address - virtual < self.gpu_ring_watch_size) {
+            ring_offset = address - virtual;
+        }
+    }
+    if (ring_offset == null) {
+        const low: u32 = @truncate(address);
+        const ring_low: u32 = @truncate(base);
+        if (low >= ring_low and low -% ring_low < self.gpu_ring_watch_size) {
+            ring_offset = low -% ring_low;
+        }
+    }
+    const offset = ring_offset orelse return;
 
     self.gpu_ring_writes +|= 1;
     if (!recovery_ledger.throttled(self.gpu_ring_writes)) return;
@@ -3915,7 +3931,7 @@ pub fn noteRingBufferWrite(self: anytype, address: u64, size: Size, value: u64) 
         .{
             self.gpu_ring_writes,
             address,
-            low -% ring_low,
+            offset,
             bytesForSize(size),
             value,
             self.regs.rip,
