@@ -24,19 +24,42 @@
 //! then report progress that did not happen.
 
 pub const bootstrap = @import("bootstrap.zig");
+pub const refresh_liveness = @import("refresh_liveness.zig");
 pub const forwarding = @import("forwarding.zig");
+pub const provenance = @import("provenance.zig");
+pub const ring_publication = @import("ring_publication.zig");
+pub const frame_source = @import("frame_source.zig");
 pub const api = @import("api.zig");
 pub const backend = @import("backend.zig");
 pub const handles = @import("handles.zig");
+pub const hardware_description = @import("hardware_description.zig");
 pub const runtime = @import("runtime.zig");
+pub const vulkan = @import("vulkan/root.zig");
 
 pub const Step = bootstrap.Step;
 pub const Contract = bootstrap.Contract;
 pub const Frontier = bootstrap.Frontier;
+pub const LivenessMonitor = refresh_liveness.Monitor;
+pub const LivenessSample = refresh_liveness.Sample;
+pub const LivenessVerdict = refresh_liveness.Verdict;
+pub const LivenessReport = refresh_liveness.Report;
 pub const ForwardingContract = forwarding.Contract;
 pub const Stage = forwarding.Stage;
 pub const Fidelity = forwarding.Fidelity;
+pub const FrameSource = frame_source.Descriptor;
+pub const FrameInbox = frame_source.Inbox;
+pub const FrameAbsence = frame_source.Absence;
+pub const RingPublication = ring_publication.Tracker;
+pub const RingGeometry = ring_publication.Geometry;
+pub const FrameProvenance = provenance.Ledger;
+pub const FrameProducer = provenance.Producer;
+pub const FrameClassification = provenance.Classification;
+pub const NativePresenter = vulkan.Presenter;
+pub const NativePresenterStage = vulkan.Stage;
+pub const NativeFrameSource = vulkan.Source;
 pub const Runtime = runtime.Runtime;
+pub const BridgeHealth = runtime.BridgeHealth;
+pub const BridgeHealthStage = runtime.BridgeHealthStage;
 pub const HandshakeRequest = api.HandshakeRequest;
 pub const HandshakeResponse = api.HandshakeResponse;
 pub const Capability = api.Capability;
@@ -46,9 +69,15 @@ pub const Handle = handles.Handle;
 
 test {
     _ = bootstrap;
+    _ = refresh_liveness;
     _ = forwarding;
+    _ = provenance;
+    _ = ring_publication;
+    _ = frame_source;
     _ = api;
     _ = backend;
     _ = handles;
+    _ = hardware_description;
     _ = runtime;
+    _ = vulkan;
 }

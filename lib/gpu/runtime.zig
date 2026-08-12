@@ -2,6 +2,8 @@ const std = @import("std");
 const api = @import("api.zig");
 const backend = @import("backend.zig");
 const handles = @import("handles.zig");
+const hardware_description = @import("hardware_description.zig");
+const device_tree = @import("device_tree");
 
 pub const Error = backend.Error || handles.ValidationError || error{
     MissingCapability,
@@ -24,6 +26,8 @@ pub const TraceKind = enum(u8) {
     command_submitted,
     synchronization,
     presented,
+    hardware_description_updated,
+    hardware_description_failed,
 };
 
 pub const TraceEvent = struct {
@@ -33,6 +37,45 @@ pub const TraceEvent = struct {
     related: handles.Handle = .{},
     value: u64 = 0,
     backend_kind: api.BackendKind = .none,
+};
+
+/// Concise, backend-neutral health of the host execution boundary. This is an
+/// observation only: it never changes guest/Xenos state and a degraded result
+/// must not become a substitute for authentic guest GPU bootstrap.
+pub const BridgeHealthStage = enum(u8) {
+    unavailable,
+    loader,
+    instance,
+    instance_and_surface,
+    physical_adapter,
+    logical_device,
+    graphics_queue,
+    resources,
+    command_execution,
+    presentation,
+};
+
+pub const BridgeHealth = struct {
+    stage: BridgeHealthStage = .unavailable,
+    first_missing_execution_capability: ?api.Capability = null,
+    advisory_only: bool = true,
+    authentic_submission_seen: bool = false,
+    authentic_presentation_seen: bool = false,
+
+    pub fn readyForHostExecution(self: BridgeHealth) bool {
+        return self.first_missing_execution_capability == null;
+    }
+
+    pub fn fingerprint(self: BridgeHealth) u64 {
+        const missing: u64 = if (self.first_missing_execution_capability) |capability|
+            @as(u64, @intFromEnum(capability)) + 1
+        else
+            0;
+        return @as(u64, @intFromEnum(self.stage)) |
+            (missing << 8) |
+            (@as(u64, @intFromBool(self.authentic_submission_seen)) << 24) |
+            (@as(u64, @intFromBool(self.authentic_presentation_seen)) << 25);
+    }
 };
 
 const max_sessions: usize = 16;
@@ -70,6 +113,9 @@ pub const Runtime = struct {
     handshake_failures: u64 = 0,
     submissions: u64 = 0,
     presentations: u64 = 0,
+    hardware_tree: device_tree.Tree = .{},
+    hardware_tree_valid: bool = false,
+    hardware_description_failures: u64 = 0,
 
     pub fn installBackend(self: *Runtime, adapter: backend.Adapter) void {
         for (0..self.sessions.len) |index| {
@@ -79,6 +125,7 @@ pub const Runtime = struct {
         if (self.adapter.operations.shutdown) |shutdown| shutdown(self.adapter.context);
         self.adapter = adapter;
         self.record(.backend_selected, .{}, .{}, 0);
+        self.refreshHardwareDescription();
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -92,6 +139,47 @@ pub const Runtime = struct {
 
     pub fn installVulkanBoundary(self: *Runtime, boundary: backend.VulkanBoundary) void {
         self.installBackend(boundary.adapter(.{}, null));
+    }
+
+    pub fn hardwareDescription(self: *const Runtime) ?*const device_tree.Tree {
+        return if (self.hardware_tree_valid) &self.hardware_tree else null;
+    }
+
+    pub fn bridgeHealth(self: *const Runtime) BridgeHealth {
+        const provided = self.adapter.description.provided;
+        const execution_required = api.HandshakeRequest.xeniaHostExecution().required;
+        const first_missing = execution_required.difference(provided).first();
+        const stage: BridgeHealthStage = if (self.presentations != 0 and
+            provided.contains(.presentation))
+            .presentation
+        else if (self.submissions != 0)
+            .command_execution
+        else if (provided.contains(.command_buffer) and
+            provided.contains(.resource_barrier))
+            .command_execution
+        else if (provided.contains(.buffer) and provided.contains(.image_2d) and
+            provided.contains(.guest_memory_mapping))
+            .resources
+        else if (provided.contains(.queue_graphics))
+            .graphics_queue
+        else if (provided.contains(.logical_device))
+            .logical_device
+        else if (provided.contains(.physical_adapter))
+            .physical_adapter
+        else if (provided.contains(.backend_instance) and provided.contains(.surface))
+            .instance_and_surface
+        else if (provided.contains(.backend_instance))
+            .instance
+        else if (self.adapter.description.kind != .none)
+            .loader
+        else
+            .unavailable;
+        return .{
+            .stage = stage,
+            .first_missing_execution_capability = first_missing,
+            .authentic_submission_seen = self.submissions != 0,
+            .authentic_presentation_seen = self.presentations != 0,
+        };
     }
 
     pub fn negotiate(self: *Runtime, request: api.HandshakeRequest) api.HandshakeResponse {
@@ -456,6 +544,17 @@ pub const Runtime = struct {
             .backend_kind = self.adapter.description.kind,
         };
     }
+
+    fn refreshHardwareDescription(self: *Runtime) void {
+        self.hardware_tree = hardware_description.fromBackend(&self.adapter.description) catch {
+            self.hardware_tree_valid = false;
+            self.hardware_description_failures +|= 1;
+            self.record(.hardware_description_failed, .{}, .{}, self.hardware_description_failures);
+            return;
+        };
+        self.hardware_tree_valid = true;
+        self.record(.hardware_description_updated, .{}, .{}, self.hardware_tree.fingerprint());
+    }
 };
 
 fn addQueueCapabilities(set: *api.CapabilitySet, mask: u32) void {
@@ -582,6 +681,9 @@ fn fullTestAdapter(fake: *FakeBackend) backend.Adapter {
 test "shadow Vulkan boundary reports the first real missing capability" {
     var runtime = Runtime{};
     runtime.installVulkanBoundary(.{ .instance_native = true, .surface_native = true });
+    const hardware = runtime.hardwareDescription() orelse return error.MissingHardwareDescription;
+    try std.testing.expect(hardware.property("/gpu/capabilities", "backend_instance").?.value.boolean);
+    try std.testing.expect(!hardware.property("/gpu/capabilities", "logical_device").?.value.boolean);
     const observation = runtime.negotiate(api.HandshakeRequest.xeniaObservation());
     try std.testing.expectEqual(api.Status.degraded, observation.statusValue());
     try std.testing.expect(observation.negotiated.contains(.backend_instance));
@@ -591,6 +693,12 @@ test "shadow Vulkan boundary reports the first real missing capability" {
     try std.testing.expectEqual(api.Status.missing_capability, execution.statusValue());
     try std.testing.expectEqual(@as(u32, @intFromEnum(api.Capability.physical_adapter)), execution.first_missing_capability);
     try std.testing.expectEqualStrings("missing required capability: physical_adapter", execution.reasonSlice());
+
+    const health = runtime.bridgeHealth();
+    try std.testing.expectEqual(BridgeHealthStage.instance_and_surface, health.stage);
+    try std.testing.expectEqual(api.Capability.physical_adapter, health.first_missing_execution_capability.?);
+    try std.testing.expect(!health.readyForHostExecution());
+    try std.testing.expect(health.advisory_only);
 }
 
 test "Rosette handles contain backend resources and reject stale use" {
