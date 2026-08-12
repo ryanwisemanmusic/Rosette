@@ -22,6 +22,30 @@
           "value_kind": "text",
           "text_value": "host-compatible",
           "mutability": "configurable"
+        },
+        {
+          "name": "guest-core-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 3,
+          "mutability": "read_only"
+        },
+        {
+          "name": "guest-threads-per-core",
+          "value_kind": "unsigned",
+          "unsigned_value": 2,
+          "mutability": "read_only"
+        },
+        {
+          "name": "guest-logical-processor-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 6,
+          "mutability": "read_only"
+        },
+        {
+          "name": "topology-description-only",
+          "value_kind": "boolean",
+          "boolean_value": true,
+          "mutability": "read_only"
         }
       ]
     },

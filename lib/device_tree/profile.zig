@@ -32,3 +32,22 @@ test "safe Xenia profile cannot synthesize guest GPU startup" {
     try std.testing.expect(!implication.value.boolean);
     try std.testing.expectEqual(schema.Mutability.read_only, implication.mutability);
 }
+
+test "safe Xenia topology describes Xenon without enabling host parallelism" {
+    const tree = try xeniaSafe(std.testing.allocator);
+    const cores = tree.property("/cpu", "guest-core-count") orelse
+        return error.MissingCoreCount;
+    const threads = tree.property("/cpu", "guest-threads-per-core") orelse
+        return error.MissingThreadsPerCore;
+    const logical = tree.property("/cpu", "guest-logical-processor-count") orelse
+        return error.MissingLogicalProcessorCount;
+    const description_only = tree.property("/cpu", "topology-description-only") orelse
+        return error.MissingTopologySafetyGate;
+
+    try std.testing.expectEqual(@as(u64, 3), cores.value.unsigned);
+    try std.testing.expectEqual(@as(u64, 2), threads.value.unsigned);
+    try std.testing.expectEqual(@as(u64, 6), logical.value.unsigned);
+    try std.testing.expect(description_only.value.boolean);
+    try std.testing.expectEqual(schema.Mutability.read_only, cores.mutability);
+    try std.testing.expectEqual(schema.Mutability.read_only, description_only.mutability);
+}
