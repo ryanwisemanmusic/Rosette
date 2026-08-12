@@ -1,6 +1,6 @@
 const std = @import("std");
 const compact_unwind = @import("compact_unwind.zig");
-const itanium_dynamic_cast = @import("itanium_dynamic_cast.zig");
+const itanium_dynamic_cast = @import("dynamic_cast");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 const MAX_FRAMES: usize = 48;
