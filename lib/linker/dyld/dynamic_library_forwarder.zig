@@ -1783,12 +1783,33 @@ pub const Forwarder = struct {
                 "macho-processor: native Vulkan surface backing: loader(attempts/failures)={d}/{d} instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
                 .{ self.native_vulkan_loader_attempts, self.native_vulkan_loader_failures, self.native_vulkan_instance_attempts, self.native_vulkan_surface_attempts, self.native_vulkan_failures, if (self.native_vulkan_instance) |instance| @intFromPtr(instance) else 0, self.native_vulkan_surface, self.native_vulkan_library_token },
             );
-            const presenter = &self.native_presenter;
-            const presenter_ledger = &presenter.ledger;
             machoCapturePrint(
                 "macho-processor: Vulkan forwarding contract: guest_objects=MODELLED (physical_device+logical_device+swapchain+images+commands+submit+present) rosette_presenter={s} capability_queries={d} device_void_calls={d} modelled_commands={d}\n",
-                .{ @tagName(presenter.stage), self.vulkan_surface_capability_queries, self.vulkan_device_void_calls, self.vulkan_modeled_command_calls },
+                .{ @tagName(self.native_presenter.stage), self.vulkan_surface_capability_queries, self.vulkan_device_void_calls, self.vulkan_modeled_command_calls },
             );
+            self.logGraphicsProvenance();
+            machoCapturePrint("macho-processor: Vulkan proc inventory:\n", .{});
+            for (&self.guest_symbols) |*entry| {
+                if (entry.token == 0) continue;
+                machoCapturePrint(
+                    "  token=0x{x} kind={s} calls={d} name={s}\n",
+                    .{ entry.token, @tagName(entry.kind), entry.calls, entry.name[0..entry.name_length] },
+                );
+            }
+        }
+    }
+
+    /// The presentation-provenance block, emitted on a schedule rather than
+    /// only at exit.
+    ///
+    /// A run killed by the harness timeout produced none of these lines, which
+    /// made every graphics counter in that run unavailable precisely because
+    /// the run was the interesting kind. A diagnostic that requires a clean
+    /// shutdown is a diagnostic for the runs that did not need it.
+    pub fn logGraphicsProvenance(self: *const Forwarder) void {
+        const presenter = &self.native_presenter;
+        const presenter_ledger = &presenter.ledger;
+        {
             // The counters the audit requires never to be conflated. Each
             // answers a different question and none is a sum of the others.
             machoCapturePrint(
@@ -1833,14 +1854,6 @@ pub const Forwarder = struct {
                     presenter_ledger.displayNote(),
                 },
             );
-            machoCapturePrint("macho-processor: Vulkan proc inventory:\n", .{});
-            for (&self.guest_symbols) |*entry| {
-                if (entry.token == 0) continue;
-                machoCapturePrint(
-                    "  token=0x{x} kind={s} calls={d} name={s}\n",
-                    .{ entry.token, @tagName(entry.kind), entry.calls, entry.name[0..entry.name_length] },
-                );
-            }
         }
     }
 
