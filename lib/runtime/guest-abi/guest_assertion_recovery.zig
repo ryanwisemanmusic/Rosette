@@ -17,6 +17,21 @@ pub const TimerQueueSnapshot = struct {
     interval_nanoseconds: ?u64,
 };
 
+/// Apple's assertion entry point is declared `noreturn`. A translated program
+/// may therefore place padding, a trap, or the next unrelated function directly
+/// after the call. Returning into these patterns can never be a valid recovery.
+pub fn isUnsafeNoreturnContinuation(bytes: []const u8) bool {
+    if (bytes.len == 0) return true;
+    if (bytes[0] == 0x90 or bytes[0] == 0xCC or bytes[0] == 0x00) return true;
+    if (bytes.len >= 2 and bytes[0] == 0x0F and
+        (bytes[1] == 0x0B or bytes[1] == 0x1F))
+    {
+        return true;
+    }
+    return bytes.len >= 3 and bytes[0] == 0x66 and
+        bytes[1] == 0x0F and bytes[2] == 0x1F;
+}
+
 pub fn timerQueueSnapshot(state: anytype, rbp: u64) ?TimerQueueSnapshot {
     // Debug Xenia stores the compare_exchange expected byte at rbp-0x79
     // followed by the active shared_ptr at rbp-0x78.
@@ -95,6 +110,15 @@ test "assertion classifier separates timer cause from breakpoint fallout" {
         "export_entry->ordinal < xbdm_exports.size()",
     ));
     try std.testing.expectEqual(Class.none, classify("func", "false"));
+}
+
+test "noreturn assertion continuation rejects padding and traps only" {
+    try std.testing.expect(isUnsafeNoreturnContinuation(&.{ 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 }));
+    try std.testing.expect(isUnsafeNoreturnContinuation(&.{ 0x0F, 0x1F, 0x40, 0x00 }));
+    try std.testing.expect(isUnsafeNoreturnContinuation(&.{ 0x0F, 0x0B }));
+    try std.testing.expect(isUnsafeNoreturnContinuation(&.{0xCC}));
+    try std.testing.expect(!isUnsafeNoreturnContinuation(&.{ 0x48, 0x8B, 0x45, 0xF8 }));
+    try std.testing.expect(!isUnsafeNoreturnContinuation(&.{ 0xE9, 0x10, 0x00, 0x00, 0x00 }));
 }
 
 test "timer snapshot is diagnostic-only and does not mutate state" {

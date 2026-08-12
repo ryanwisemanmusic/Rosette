@@ -30,7 +30,7 @@ extern fn rosette_macho_native_window_set_size(width: u32, height: u32) c_int;
 extern fn rosette_macho_native_window_show() c_int;
 extern fn rosette_macho_native_window_set_fullscreen(fullscreen: c_int) c_int;
 extern fn rosette_macho_native_window_attach_metal_layer() c_int;
-extern fn rosette_macho_native_window_present_synthetic_vulkan_frame(
+extern fn rosette_macho_native_window_present_diagnostic_frame(
     serial: u64,
     width: u32,
     height: u32,
@@ -54,9 +54,9 @@ pub const Runtime = struct {
     layer_attachments: u64 = 0,
     layer_attachment_failures: u64 = 0,
     surface_bindings: u64 = 0,
-    synthetic_vulkan_frame_attempts: u64 = 0,
-    synthetic_vulkan_frames_presented: u64 = 0,
-    synthetic_vulkan_frame_failures: u64 = 0,
+    diagnostic_frame_attempts: u64 = 0,
+    diagnostic_frames_presented: u64 = 0,
+    diagnostic_frame_failures: u64 = 0,
     event_pump_calls: u64 = 0,
     objc_messages: u64 = 0,
     window_ready_logged: bool = false,
@@ -213,32 +213,39 @@ pub const Runtime = struct {
         );
     }
 
-    pub fn presentSyntheticVulkanFrame(
+    /// A host Metal clear on the window's drawable. This is a liveness probe:
+    /// it distinguishes a blank window from a dead Cocoa/Metal boundary, and it
+    /// is the fallback for when Rosette's native Vulkan presenter could not be
+    /// brought up. It involves no guest image, no Vulkan command buffer, no
+    /// swapchain image and no guest swap, so its output is never guest output —
+    /// the log line says so on every frame it reports rather than leaving the
+    /// reader to infer it.
+    pub fn presentDiagnosticFrame(
         self: *Runtime,
         serial: u64,
         drawable_width: u32,
         drawable_height: u32,
         stage: u32,
     ) bool {
-        self.synthetic_vulkan_frame_attempts +|= 1;
-        const frame = rosette_macho_native_window_present_synthetic_vulkan_frame(
+        self.diagnostic_frame_attempts +|= 1;
+        const frame = rosette_macho_native_window_present_diagnostic_frame(
             serial,
             drawable_width,
             drawable_height,
             stage,
         );
         if (frame == 0) {
-            self.synthetic_vulkan_frame_failures +|= 1;
+            self.diagnostic_frame_failures +|= 1;
             machoCapturePrint(
-                "macho-processor: forced Vulkan-to-Metal frame failed: attempt={d} serial=0x{x} stage={d} drawable={d}x{d}\n",
-                .{ self.synthetic_vulkan_frame_attempts, serial, stage, drawable_width, drawable_height },
+                "macho-processor: diagnostic Metal frame failed: attempt={d} serial=0x{x} stage={d} drawable={d}x{d}\n",
+                .{ self.diagnostic_frame_attempts, serial, stage, drawable_width, drawable_height },
             );
             return false;
         }
-        self.synthetic_vulkan_frames_presented = frame;
+        self.diagnostic_frames_presented = frame;
         if (frame <= 8 or frame % 64 == 0) {
             machoCapturePrint(
-                "macho-processor: forced Vulkan-to-Metal frame presented: frame={d} serial=0x{x} stage={d} drawable={d}x{d} authority=diagnostic_until_native_commands\n",
+                "macho-processor: diagnostic Metal frame presented: frame={d} serial=0x{x} stage={d} drawable={d}x{d} provenance=DIAGNOSTIC_ONLY source=host_clear native_swapchain=NO native_queue_submit=NO guest_output=NO\n",
                 .{ frame, serial, stage, drawable_width, drawable_height },
             );
         }
@@ -328,8 +335,8 @@ pub const Runtime = struct {
         if (self.application_ensure_attempts == 0 and self.window_ensure_attempts == 0) return;
         const status = rosette_macho_native_window_status();
         machoCapturePrint(
-            "macho-processor: native window bridge: app_attempts={d} window_attempts={d} failures={d} objc={d} view_requests={d} layer(requests/attached/failures)={d}/{d}/{d} surface_bindings={d} forced_frames(attempts/presented/failures)={d}/{d}/{d} event_pumps={d} host(app/window/view/layer/device)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x} drawable={d}x{d} ready(app/window/layer/visible/main)={}/{}/{}/{}/{} events={d}\n",
-            .{ self.application_ensure_attempts, self.window_ensure_attempts, self.window_ensure_failures, self.objc_messages, self.view_requests, self.layer_requests, self.layer_attachments, self.layer_attachment_failures, self.surface_bindings, self.synthetic_vulkan_frame_attempts, self.synthetic_vulkan_frames_presented, self.synthetic_vulkan_frame_failures, self.event_pump_calls, status.application, status.window, status.view, status.metal_layer, status.metal_device, status.width, status.height, status.application_ready != 0, status.window_ready != 0, status.layer_attached != 0, status.visible != 0, status.on_main_thread != 0, status.events_pumped },
+            "macho-processor: native window bridge: app_attempts={d} window_attempts={d} failures={d} objc={d} view_requests={d} layer(requests/attached/failures)={d}/{d}/{d} surface_bindings={d} diagnostic_metal_frames(attempts/presented/failures)={d}/{d}/{d} event_pumps={d} host(app/window/view/layer/device)=0x{x}/0x{x}/0x{x}/0x{x}/0x{x} drawable={d}x{d} ready(app/window/layer/visible/main)={}/{}/{}/{}/{} events={d}\n",
+            .{ self.application_ensure_attempts, self.window_ensure_attempts, self.window_ensure_failures, self.objc_messages, self.view_requests, self.layer_requests, self.layer_attachments, self.layer_attachment_failures, self.surface_bindings, self.diagnostic_frame_attempts, self.diagnostic_frames_presented, self.diagnostic_frame_failures, self.event_pump_calls, status.application, status.window, status.view, status.metal_layer, status.metal_device, status.width, status.height, status.application_ready != 0, status.window_ready != 0, status.layer_attached != 0, status.visible != 0, status.on_main_thread != 0, status.events_pumped },
         );
     }
 };
