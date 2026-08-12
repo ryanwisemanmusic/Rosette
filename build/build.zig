@@ -1240,14 +1240,34 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // Versioned, typed hardware facts remain separate from the code that
+        // consumes them. The GPU runtime publishes its negotiated backend into
+        // this description; it cannot use the tree to actuate guest state.
+        const device_tree_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/device_tree/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const device_tree_test = b.addTest(.{ .root_module = device_tree_mod });
+        check_step.dependOn(&b.addRunArtifact(device_tree_test).step);
+
         // Backend-neutral host GPU ownership and the versioned consumer
         // handshake. Created before dyld because the Vulkan loader forwarder is
         // the first adapter feeding truthful native-boundary stages into it.
+        const preflight_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/preflight/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const preflight_test = b.addTest(.{ .root_module = preflight_mod });
+        check_step.dependOn(&b.addRunArtifact(preflight_test).step);
+
         const gpu_mod = b.createModule(.{
             .root_source_file = b.path("../lib/gpu/root.zig"),
             .target = target,
             .optimize = optimize,
         });
+        gpu_mod.addImport("device_tree", device_tree_mod);
         const gpu_test = b.addTest(.{ .root_module = gpu_mod });
         check_step.dependOn(&b.addRunArtifact(gpu_test).step);
         const dyld_mod = b.createModule(.{
@@ -1374,6 +1394,16 @@ pub fn build(b: *std.Build) void {
         // The forwarder routes a release by owner, which is an ownership
         // question, so the memory module depends on this rather than
         // re-deriving provenance from address ranges.
+        // Who refused a guest access, and whether the refusal is the runtime's
+        // granularity leaking or the guest's own trap firing. Rooted and run.
+        const guest_protection_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/runtime/guest-protection/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const guest_protection_test = b.addTest(.{ .root_module = guest_protection_mod });
+        check_step.dependOn(&b.addRunArtifact(guest_protection_test).step);
+        memory_mod.addImport("guest_protection", guest_protection_mod);
         memory_mod.addImport("ownership", ownership_mod);
         const ownership_test = b.addTest(.{ .root_module = ownership_mod });
         check_step.dependOn(&b.addRunArtifact(ownership_test).step);
@@ -1465,6 +1495,13 @@ pub fn build(b: *std.Build) void {
         // Guest bootstrap observation and the host execution API share one GPU
         // module so neither can mistake synthetic host progress for guest work.
         process_core_mod.addImport("gpu", gpu_mod);
+        process_core_mod.addImport("preflight", preflight_mod);
+        // Rooted so these run rather than merely compile. Until this target
+        // existed the module's tests only ever type-checked as part of the
+        // processor build, where they are never instantiated — two of them had
+        // silently stopped compiling as a result.
+        const process_core_test = b.addTest(.{ .root_module = process_core_mod });
+        check_step.dependOn(&b.addRunArtifact(process_core_test).step);
         process_core_mod.addImport("guest_structure", guest_structure_mod);
 
         // The bounded dispatch transducer is a self-contained decision
@@ -1562,6 +1599,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("process_core", process_core_mod);
         macho_processor_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_mod.addImport("gpu", gpu_mod);
+        macho_processor_mod.addImport("preflight", preflight_mod);
         macho_processor_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
@@ -1605,6 +1643,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("process_core", process_core_mod);
         macho_processor_test_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_test_mod.addImport("gpu", gpu_mod);
+        macho_processor_test_mod.addImport("preflight", preflight_mod);
         macho_processor_test_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
