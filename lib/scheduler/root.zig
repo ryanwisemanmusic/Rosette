@@ -12,6 +12,7 @@ pub const guest_time = @import("guest_time.zig");
 pub const spin_parking = @import("spin_parking.zig");
 pub const polling_detection = @import("polling_detection.zig");
 pub const wait_graph = @import("wait_graph.zig");
+pub const notifier_liveness = @import("notifier_liveness.zig");
 pub const native_thread_backend = @import("native_thread_backend.zig");
 
 // Re-export main types for convenience
@@ -90,6 +91,7 @@ test "scheduler module integration" {
     _ = spin_parking;
     _ = polling_detection;
     _ = wait_graph;
+    _ = notifier_liveness;
     // _ = native_thread_backend; // Skip for now due to threading complexity
 
     // Test global functions

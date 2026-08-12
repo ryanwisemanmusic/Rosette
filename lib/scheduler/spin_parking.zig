@@ -331,7 +331,7 @@ pub const SpinParkingManager = struct {
     }
     
     /// Get spin state for a thread
-    pub fn getSpinState(self: *const SpinParkingManager, thread_handle: u64) ?*const SpinState {
+    pub fn getSpinState(self: *const SpinParkingManager, thread_handle: u64) ?SpinState {
         return self.spin_states.get(thread_handle);
     }
     

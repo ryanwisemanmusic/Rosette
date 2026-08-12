@@ -87,7 +87,7 @@ pub const WaitForGraph = struct {
     
     /// Add an edge between nodes
     pub fn addEdge(self: *WaitForGraph, from_id: u64, to_id: u64) !void {
-        const from_node = self.findNode(from_id) orelse return error.NodeNotFound;
+        const from_node = self.findNodeMut(from_id) orelse return error.NodeNotFound;
         if (from_node.edge_count >= from_node.edges.len) return error.EdgeLimitExceeded;
         
         // Check if edge already exists
@@ -99,8 +99,19 @@ pub const WaitForGraph = struct {
         from_node.edge_count += 1;
     }
     
-    /// Find a node by ID
-    pub fn findNode(self: *const WaitForGraph, id: u64) ?*WaitNode {
+    /// Find a node by ID. Read-only: a lookup through a const graph handing
+    /// back a mutable pointer is how an "immutable" query silently edits the
+    /// graph, and it is why this module never compiled.
+    pub fn findNode(self: *const WaitForGraph, id: u64) ?*const WaitNode {
+        for (&self.nodes) |*node| {
+            if (node.active and node.id == id) return node;
+        }
+        return null;
+    }
+
+    /// Find a node for modification. Separate from `findNode` so the mutable
+    /// case is requested deliberately rather than obtained by accident.
+    pub fn findNodeMut(self: *WaitForGraph, id: u64) ?*WaitNode {
         for (&self.nodes) |*node| {
             if (node.active and node.id == id) return node;
         }

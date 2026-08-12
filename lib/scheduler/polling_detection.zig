@@ -178,7 +178,7 @@ pub const PollingDetectionManager = struct {
             .is_write = is_write,
             .timestamp = current_step,
         };
-        state.memory_access_index = (idx + 1) % state.memory_accesses.len;
+        state.memory_access_index = @intCast((@as(usize, idx) + 1) % state.memory_accesses.len);
         if (state.memory_access_count < state.memory_accesses.len) {
             state.memory_access_count += 1;
         }
@@ -378,7 +378,7 @@ pub const PollingDetectionManager = struct {
     }
     
     /// Get polling state for a thread
-    pub fn getState(self: *const PollingDetectionManager, thread_handle: u64) ?*const PollingState {
+    pub fn getState(self: *const PollingDetectionManager, thread_handle: u64) ?PollingState {
         return self.polling_states.get(thread_handle);
     }
     
