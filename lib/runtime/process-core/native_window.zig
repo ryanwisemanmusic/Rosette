@@ -76,14 +76,16 @@ pub fn noteNativeVulkanSurfaceBound(self: anytype, layer_token: u64, guest_surfa
     self.native_window.noteSurfaceBound(layer_token, guest_surface, host_surface);
 }
 
-pub fn presentNativeSyntheticVulkanFrame(
+/// The host Metal clear fallback. Named diagnostic because that is all it is:
+/// see `native_window_runtime.presentDiagnosticFrame`.
+pub fn presentNativeDiagnosticFrame(
     self: anytype,
     serial: u64,
     width: u32,
     height: u32,
     stage: u32,
 ) bool {
-    return self.native_window.presentSyntheticVulkanFrame(serial, width, height, stage);
+    return self.native_window.presentDiagnosticFrame(serial, width, height, stage);
 }
 
 pub fn pumpNativeWindowEvents(self: anytype) void {

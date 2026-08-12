@@ -16,3 +16,11 @@ pub const native_window = @import("native_window.zig");
 pub const scheduling = @import("scheduling.zig");
 pub const signal_handling = @import("signal_handling.zig");
 pub const syscalls = @import("syscalls.zig");
+
+// Rooted so these run rather than merely compile. Until this block existed the
+// module had no test target at all: every test in it type-checked as part of
+// the processor build and none of them was ever executed, which is the failure
+// mode where a test file's presence is mistaken for its coverage.
+test {
+    _ = memory_access;
+}

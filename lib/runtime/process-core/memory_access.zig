@@ -20,6 +20,7 @@ const memory_write_provenance = memory_mod.memory_write_provenance;
 const memory_provenance = @import("dyld").memory_provenance;
 const pointer_firewall = @import("dyld").pointer_firewall;
 const semantic_fault_classifier = @import("diagnostics").semantic_fault_classifier;
+const zero_adjudication = @import("diagnostics").zero_adjudication;
 const opaque_lifetime_recovery = @import("diagnostics").opaque_lifetime_recovery;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const vt = @import("vtable");
@@ -145,6 +146,40 @@ pub fn describeGuestAccess(self: anytype, address: u64, size: u64, access: Guest
     };
 }
 
+/// Whether the mapped-image section containing `address` holds instructions,
+/// remembering the last section's extent so the answer is a range compare
+/// rather than a search.
+///
+/// This is on the instruction hot path, and without the memo every single
+/// instruction pays a binary search over the section index plus up to four
+/// string comparisons against section names — to re-derive a fact that cannot
+/// change. Sections are fixed once the image is loaded, so the containing
+/// range and its verdict are both immutable, which is what makes a one-entry
+/// cache sound rather than merely lucky.
+///
+/// One entry is enough because instruction fetch is local: straight-line code
+/// and loops stay inside a single section for millions of consecutive steps,
+/// so a bigger cache would buy hit rate that a single entry already has.
+///
+/// The mutable parts of the decision deliberately stay outside this: sparse
+/// mappings and page permissions can change under `mmap`/`mprotect`, so
+/// caching those would be caching something that moves.
+fn cachedSectionExecutable(self: anytype, address: u64) bool {
+    if (address >= self.executable_section_low and address < self.executable_section_high) {
+        return self.executable_section_verdict;
+    }
+    const section = self.metadata.sectionAtAddress(address) orelse return false;
+    const verdict = isExecutableMachOSection(section);
+    // Diagnostic callers hold this state by const pointer; they still read the
+    // memo, they just cannot refresh it.
+    if (!@typeInfo(@TypeOf(self)).pointer.is_const) {
+        self.executable_section_low = section.address;
+        self.executable_section_high = section.address +| section.size;
+        self.executable_section_verdict = verdict;
+    }
+    return verdict;
+}
+
 fn isExecutableMachOSection(section: anytype) bool {
     // Mach-O segment permissions are page/segment-level, but __TEXT also
     // contains non-code sections such as __gcc_except_tab, __const, and
@@ -168,8 +203,7 @@ pub fn isExecutableAddress(self: anytype, address: u64) bool {
     // r-x __TEXT segment, so mapped addresses still need section validation.
     if (self.sparse_memory.isExecutable(address, 1)) return true;
     if (translateGuest(self, address, 1, .execute) != null) {
-        const section = self.metadata.sectionAtAddress(address) orelse return false;
-        return isExecutableMachOSection(section);
+        return cachedSectionExecutable(self, address);
     }
 
     // Synthetic thunks live outside the mapped image. Only pay for their
@@ -293,21 +327,70 @@ pub fn write16(self: anytype, vaddr: u64, val: u16) void {
 
 pub fn write32(self: anytype, vaddr: u64, val: u32) void {
     if (self.sparse_memory.bytes(vaddr, 4, true)) |bytes| {
+        const pointer_provenance = shouldRecordGuestCodePointer(self, .bits32, val) and
+            !self.write_diagnostics_armed and !self.provenance_watch.covers(vaddr);
+        const previous = if (pointer_provenance) std.mem.readInt(u32, bytes[0..4], .little) else 0;
         const mutation = captureMemoryMutation(self, vaddr, 4);
         noteGuestWrite(self, vaddr, 4);
         std.mem.writeInt(u32, bytes[0..4], val, .little);
         commitMemoryMutation(self, mutation, .partial_scalar);
+        if (pointer_provenance) recordGuestCodePointerWrite(self, vaddr, previous, val);
         return;
     }
     const off = translateGuest(self, vaddr, 4, .write) orelse return;
     if (off + 4 <= self.mem.len) {
+        const pointer_provenance = shouldRecordGuestCodePointer(self, .bits32, val) and
+            !self.write_diagnostics_armed and !self.provenance_watch.covers(vaddr);
+        const previous = if (pointer_provenance) std.mem.readInt(u32, self.mem[off..][0..4], .little) else 0;
         const mutation = captureMemoryMutation(self, vaddr, 4);
         self.initializer_memory.capture(self.mem, @intCast(off), 4);
         noteGuestWrite(self, vaddr, 4);
         std.mem.writeInt(u32, self.mem[off..][0..4], val, .little);
         commitMemoryMutation(self, mutation, .partial_scalar);
+        if (pointer_provenance) recordGuestCodePointerWrite(self, vaddr, previous, val);
     }
 }
+
+/// Retain the rare stores that can explain a guest-code dispatch even when
+/// full write diagnostics are disabled. Both the native and byte-reversed
+/// representations count: the latter is precisely the defect diagnosed by the
+/// generated-endian contract. This avoids tracing ordinary integer stores.
+fn shouldRecordGuestCodePointer(self: anytype, size: Size, value: u64) bool {
+    return switch (size) {
+        .bits32 => blk: {
+            const narrowed: u32 = @truncate(value);
+            break :blk isGuestAddress(self, narrowed) or
+                isGuestAddress(self, @byteSwap(narrowed));
+        },
+        .bits64 => isGuestAddress(self, value) or
+            isGuestAddress(self, @byteSwap(value)),
+        else => false,
+    };
+}
+
+fn recordGuestCodePointerWrite(
+    self: anytype,
+    address: u64,
+    previous_value: u64,
+    value: u64,
+) void {
+    const kind: memory_write_provenance.WriteKind =
+        if (comptime @hasField(@TypeOf(self.*), "host_repair_in_flight"))
+            (if (self.host_repair_in_flight) .host_repair else .scalar)
+        else
+            .scalar;
+    self.memory_writes.recordKind(
+        self.allocator,
+        address,
+        previous_value,
+        value,
+        self.regs.rip,
+        self.executed_steps,
+        self.active_guest_thread,
+        kind,
+    );
+}
+
 pub fn write64(self: anytype, vaddr: u64, val: u64) void {
     // Suspicious write: value points into executable (code) memory — likely
     // a tree node pointer getting corrupted with function prologue bytes.
@@ -339,9 +422,15 @@ pub fn write64(self: anytype, vaddr: u64, val: u64) void {
         }
     }
     if (self.sparse_memory.bytes(vaddr, 8, true)) |bytes| {
-        if (self.write_diagnostics_armed) {
+        const provenance = provenanceWanted(self, vaddr);
+        const pointer_provenance = shouldRecordGuestCodePointer(self, .bits64, val);
+        if (provenance or pointer_provenance) {
             const prev = std.mem.readInt(u64, bytes[0..8], .little);
-            self.memory_writes.record(self.allocator, vaddr, prev, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+            if (provenance) {
+                self.memory_writes.record(self.allocator, vaddr, prev, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+            } else {
+                recordGuestCodePointerWrite(self, vaddr, prev, val);
+            }
         }
         noteGuestWrite(self, vaddr, 8);
         std.mem.writeInt(u64, bytes[0..8], val, .little);
@@ -352,9 +441,15 @@ pub fn write64(self: anytype, vaddr: u64, val: u64) void {
     }
     const off = translateGuest(self, vaddr, 8, .write) orelse return;
     if (off + 8 <= self.mem.len) {
-        if (self.write_diagnostics_armed) {
+        const provenance = provenanceWanted(self, vaddr);
+        const pointer_provenance = shouldRecordGuestCodePointer(self, .bits64, val);
+        if (provenance or pointer_provenance) {
             const prev = std.mem.readInt(u64, self.mem[off..][0..8], .little);
-            self.memory_writes.record(self.allocator, vaddr, prev, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+            if (provenance) {
+                self.memory_writes.record(self.allocator, vaddr, prev, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+            } else {
+                recordGuestCodePointerWrite(self, vaddr, prev, val);
+            }
         }
         self.initializer_memory.capture(self.mem, @intCast(off), 8);
         noteGuestWrite(self, vaddr, 8);
@@ -772,6 +867,167 @@ fn tryRecoverGeneratedEndianAddress(
             recovery.producer_instruction,
             recovery.source_address,
             recovery.witness_instruction,
+            source_writable,
+            if (previous_writer) |writer| writer.instruction_address else 0,
+            if (previous_writer) |writer| writer.step else 0,
+            if (previous_writer) |writer| writer.thread else 0,
+        },
+    );
+    return recovery.address;
+}
+
+/// Apply the generated-endian contract at the CALL_POSSIBLE_RETURN predicate,
+/// before a proven byte-reversed guest return can fall through into Xenia's
+/// indirection table. The comparison is an independent witness: its stack
+/// operand contains the original guest address, while the live register holds
+/// exactly the MOVBE-swapped form loaded earlier in the same scheduler slice.
+///
+/// This does not choose a branch. It repairs the demonstrated byte-order
+/// boundary, then the ordinary CMP/Jcc instructions decide control flow.
+pub fn tryRepairGeneratedEndianBeforeDispatch(
+    self: anytype,
+    compared_register: RegId,
+    comparison_address: u64,
+    comparison_value: u64,
+    comparison_len: u8,
+) ?u64 {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "generated_endian_contract") or
+        !@hasField(State, "endian_evidence_entries") or
+        !@hasField(State, "has_xenia_compat"))
+    {
+        return null;
+    }
+    if (!self.has_xenia_compat) return null;
+    if (comptime @hasField(State, "executable_min") and @hasField(State, "executable_max")) {
+        if (self.regs.rip >= self.executable_min and self.regs.rip < self.executable_max) return null;
+    }
+
+    // Most comparisons, including generated ones, compare equal. Establish
+    // that a repair could be needed before probing executable mappings or
+    // decoding the following branch/dispatch pair.
+    const register_index: u8 = @intCast(@intFromEnum(compared_register));
+    const live_value: u32 = @truncate(self.regVal(compared_register, .bits32));
+    const witness_value: u32 = @truncate(comparison_value);
+    if (live_value == 0 or live_value == witness_value) return null;
+    if (!self.sparse_memory.isExecutable(self.regs.rip, comparison_len)) return null;
+
+    // Prove the exact generated tail before treating the comparison as a
+    // return-address witness: CMP; JE; address-size MOV EAX,[same register].
+    const branch_rip = self.regs.rip +| comparison_len;
+    const branch = decodeStatic(self, branch_rip) orelse return null;
+    if ((branch.op != .jcc_rel8 and branch.op != .jcc_rel32) or
+        branch.cond != .e or branch.len == 0)
+    {
+        return null;
+    }
+    const dispatch_rip = branch_rip +| branch.len;
+    const dispatch = decodeStatic(self, dispatch_rip) orelse return null;
+    if (!isBoundedDispatchIndirectionForm(dispatch) or
+        dispatch.sib_base_reg != compared_register)
+    {
+        return null;
+    }
+
+    var load: ?generated_endian_contract.MovbeLoad = null;
+    const evidence_count: usize = if (self.endian_evidence_filled)
+        ENDIAN_EVIDENCE_BUFFER_LEN
+    else
+        self.endian_evidence_index;
+    var examined: usize = 0;
+    while (examined < evidence_count and examined < 8) : (examined += 1) {
+        const index = (self.endian_evidence_index + ENDIAN_EVIDENCE_BUFFER_LEN - 1 - examined) % ENDIAN_EVIDENCE_BUFFER_LEN;
+        const entry = self.endian_evidence_entries[index];
+        if (entry.kind != .movbe_load or entry.width_bytes != 4 or
+            entry.register != register_index)
+        {
+            continue;
+        }
+        const raw_value: u32 = @truncate(entry.raw_value);
+        load = .{
+            .execution = entry.execution,
+            .instruction_address = entry.instruction_address,
+            .source_address = entry.source_address,
+            .width_bytes = entry.width_bytes,
+            .destination_register = entry.register,
+            .raw_value = raw_value,
+            .swapped_value = generated_endian_contract.swapped(raw_value, .dword),
+            .distance = @intCast(examined + 1),
+        };
+        break;
+    }
+    const observed_load = load orelse return null;
+
+    // The source must still contain the value the MOVBE evidence recorded.
+    // Otherwise a concurrent or later store invalidated the proof.
+    const source_bytes = self.guestMemoryConst(observed_load.source_address, 4) orelse return null;
+    if (source_bytes.len < 4 or
+        std.mem.readInt(u32, source_bytes[0..4], .little) != @as(u32, @truncate(observed_load.raw_value)))
+    {
+        return null;
+    }
+
+    const candidate_readable = self.sparse_memory.bytesConst(witness_value, 4) != null or
+        translateGuest(self, witness_value, 4, .read) != null;
+    const assessment = generated_endian_contract.assess(observed_load, .{
+        .execution = .{
+            .present = true,
+            .thread_handle = self.active_guest_thread,
+            .scheduler_epoch = self.cooperative_thread_switches,
+            .step = self.executed_steps,
+        },
+        .instruction_address = self.regs.rip,
+        .width_bytes = 4,
+        .compared_register = register_index,
+        .memory_value = witness_value,
+        .distance = 1,
+    }, .{
+        // The verified fall-through dispatch is the pending fault boundary.
+        // Giving it the next step preserves the contract's strict load <
+        // witness < use ordering without claiming it has executed already.
+        .execution = .{
+            .present = true,
+            .thread_handle = self.active_guest_thread,
+            .scheduler_epoch = self.cooperative_thread_switches,
+            .step = self.executed_steps +| 1,
+        },
+        .address = live_value,
+        .width_bytes = 4,
+        .base_register = register_index,
+        .address_size_override = dispatch.has_0x67,
+        .base_only = dispatch.sib_has_base and !dispatch.sib_has_index and !dispatch.rip_relative,
+        .displacement = dispatch.addr,
+        .generated_code = true,
+        .original_value_readable = candidate_readable,
+    });
+    const recovery = switch (assessment) {
+        .recovery => |value| value,
+        .rejected => return null,
+    };
+
+    const previous_writer = self.memory_writes.lookup(recovery.source_address);
+    const source_writable = self.sparse_memory.bytes(recovery.source_address, 4, true) != null or
+        translateGuest(self, recovery.source_address, 4, .write) != null;
+    self.setReg(compared_register, .bits32, recovery.address);
+    if (source_writable) {
+        // Store the representation MOVBE expects. The live (invalid) value is
+        // byte-swapped relative to the restored guest address, so writing it
+        // makes the next MOVBE load naturally produce the restored address.
+        writeMemValAsHostRepair(self, recovery.source_address, .bits32, live_value);
+    }
+    self.generated_endian_contract.note();
+    machoCapturePrint(
+        "macho-processor: generated endian contract proactive repair #{d}: compare_rip=0x{x} compare_source=0x{x} dispatch_rip=0x{x} register={s} invalid=0x{x} restored=0x{x} movbe=0x{x} source=0x{x} source_rewritten={} writer=0x{x}@{d} writer_thread=0x{x}; CMP/Jcc will now execute normally\n",
+        .{
+            self.generated_endian_contract.recoveries,
+            self.regs.rip,
+            comparison_address,
+            dispatch_rip,
+            @tagName(compared_register),
+            live_value,
+            recovery.address,
+            recovery.producer_instruction,
+            recovery.source_address,
             source_writable,
             if (previous_writer) |writer| writer.instruction_address else 0,
             if (previous_writer) |writer| writer.step else 0,
@@ -1312,17 +1568,53 @@ fn reportValueOrigin(self: anytype, label: []const u8, origin: ValueOrigin) void
     }
     if (origin.terminal != .memory_load or origin.definition.source_address == 0) return;
     const seeded = self.provenance_watch.watchPage(origin.definition.source_address, .declared);
-    machoCapturePrint(
-        "macho-processor: {s} origin chain: the value was LOADED from guest memory at 0x{x} (width={d}). Provenance is now watching that page (newly_seeded={} entries={d}/{d}); the next store to it is attributed, which names whoever wrote a guest address in the wrong byte order. That store is the defect — the conversion must happen exactly once, at the guest-memory boundary\n",
-        .{
-            label,
-            origin.definition.source_address,
-            origin.definition.source_bytes,
-            seeded,
-            self.provenance_watch.count,
-            self.provenance_watch.entries.len,
-        },
-    );
+
+    // Which store to go and find depends on what the loaded value *is*. A
+    // pointer that names the wrong memory and a slot seeded with a constant
+    // that was never a pointer are both "a bad address loaded from memory",
+    // and only the first is a byte-order question. Deciding that here keeps
+    // the report from sending the reader after a conversion bug whenever the
+    // slot simply holds a small integer.
+    //
+    // No mapping probe is offered: this runtime's mapping table describes the
+    // emulated x86 process, while the value is an address in whatever guest
+    // that process is itself emulating. Answering "is it mapped" from the
+    // wrong address space would be worse than declining to answer, so the
+    // plausibility floor is the only discriminator used.
+    const value_verdict = zero_adjudication.adjudicate(.{
+        .value = origin.definition.source_value,
+        .width_bytes = origin.definition.source_bytes,
+        .domain = .address,
+        .writer = if (self.memory_writes.lookup(origin.definition.source_address) != null) .unknown else .none,
+    });
+
+    if (value_verdict.finding == .non_address_constant) {
+        machoCapturePrint(
+            "macho-processor: {s} origin chain: the value was LOADED from guest memory at 0x{x} (width={d}), and it is 0x{x} — too small to have ever been an address. Provenance is now watching that page (newly_seeded={} entries={d}/{d}); the next store to it is attributed. Byte order is not the question here: no conversion of a real pointer produces this, so the slot was seeded with a non-address constant and that store is the defect (code=0x{x})\n",
+            .{
+                label,
+                origin.definition.source_address,
+                origin.definition.source_bytes,
+                origin.definition.source_value,
+                seeded,
+                self.provenance_watch.count,
+                self.provenance_watch.entries.len,
+                value_verdict.notificationCode() orelse 0,
+            },
+        );
+    } else {
+        machoCapturePrint(
+            "macho-processor: {s} origin chain: the value was LOADED from guest memory at 0x{x} (width={d}). Provenance is now watching that page (newly_seeded={} entries={d}/{d}); the next store to it is attributed, which names whoever wrote a guest address in the wrong byte order. That store is the defect — the conversion must happen exactly once, at the guest-memory boundary\n",
+            .{
+                label,
+                origin.definition.source_address,
+                origin.definition.source_bytes,
+                seeded,
+                self.provenance_watch.count,
+                self.provenance_watch.entries.len,
+            },
+        );
+    }
     if (self.memory_writes.lookup(origin.definition.source_address)) |writer| {
         machoCapturePrint(
             "macho-processor: {s} origin chain: slot already has a recorded writer rip=0x{x} {s} value=0x{x} kind={s} step={d} thread=0x{x}\n",
@@ -1673,6 +1965,112 @@ fn reportDispatchCoverage(self: anytype, block_start: u64) void {
                 "more than one distinct site halts, so this is the shape recogniser's coverage rather than one stubborn instruction",
         },
     );
+}
+
+/// Effective addresses at or below this are near-null: a pointer that was
+/// never set, or one that was set and then lost most of its value. Above it,
+/// a protection fault is about the page, not about the pointer.
+const near_null_effective_limit: u64 = 0x10000;
+
+/// What produced the address a protection fault refused.
+///
+/// The fault site knew the address and the instruction *name* and nothing else,
+/// so a pointer that arrived as `0x1` reached the guest's signal handler with
+/// no record of where the `1` came from — and a near-null protection fault is
+/// almost never a question about the page. The page is protected deliberately;
+/// the pointer is the finding.
+///
+/// This reuses the evidence the near-null owner already produces rather than
+/// growing a second version of it: full operand decode, the register file, the
+/// byte-order survey, and a bounded def-use walk on the base register through
+/// register moves to whatever actually produced the value.
+///
+/// Runs only on a confirmed protection fault, which is already a terminal-class
+/// event, and only when the effective address is near-null. A fault at a real
+/// address gets the page diagnostics it always did.
+fn reportProtectionFaultOperands(self: anytype, address: u64, bytes: u8, access: GuestAccess) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_address_space")) return;
+    // Relative to the mapping the address is actually in. The process image
+    // base is the wrong origin for a sparse address — it yields an enormous
+    // offset for every one of them, which is how this reporter silently skipped
+    // the exact faults it was written for.
+    const origin = self.sparse_memory.containingMappingBase(address) orelse self.mem_base;
+    const effective = address -| origin;
+    if (effective > near_null_effective_limit) return;
+
+    const decoded = decodeStatic(self, self.regs.rip) orelse {
+        machoCapturePrint(
+            "macho-processor: near-null protection fault: rip=0x{x} address=0x{x} guest_effective=0x{x} bytes={d} access={s}; the faulting instruction could not be decoded, so no operand evidence is available\n",
+            .{ self.regs.rip, address, effective, bytes, @tagName(access) },
+        );
+        return;
+    };
+    machoCapturePrint(
+        "macho-processor: near-null protection fault: rip=0x{x} address=0x{x} guest_effective=0x{x} bytes={d} access={s} op={s} len={d} has_0x67={} base({s})=0x{x} index({s},scale={d})=0x{x} displacement=0x{x} rip_relative={} symbol={s}; the page is protected deliberately, so the pointer is the finding, not the page\n",
+        .{
+            self.regs.rip,
+            address,
+            effective,
+            bytes,
+            @tagName(access),
+            @tagName(decoded.op),
+            decoded.len,
+            decoded.has_0x67,
+            if (decoded.sib_has_base) @tagName(decoded.sib_base_reg) else "<none>",
+            if (decoded.sib_has_base) self.regVal(decoded.sib_base_reg, .bits64) else 0,
+            if (decoded.sib_has_index) @tagName(decoded.sib_index_reg) else "<none>",
+            @as(u8, 1) << decoded.sib_scale,
+            if (decoded.sib_has_index) self.regVal(decoded.sib_index_reg, .bits64) else 0,
+            decoded.addr,
+            decoded.rip_relative,
+            self.metadata.symbolLabel(self.regs.rip),
+        },
+    );
+    // The register file plus the byte-order survey: a near-null pointer whose
+    // 64-bit byte reversal is a guest address is a conversion defect, not a
+    // missing store, and the two want opposite investigations.
+    near_null_causality.dumpTerminal(self, effective);
+    // Follow the operand that *varies*, not whichever one is written first.
+    //
+    // Translated guest loads are emitted as `[membase + guest_address]`, so the
+    // base register holds a runtime constant and the index holds the value that
+    // decides the address. Walking the base spends the whole retained tape
+    // proving the membase never changed and then reports UNDECIDABLE — a true
+    // statement about the wrong operand, and it reads like a failure of the
+    // walk rather than a question that was never asked.
+    //
+    // A base that is not a plausible guest value and does not vary is the
+    // membase or an equivalent anchor; when an index is present alongside it,
+    // the index is the causal operand.
+    const base_value = if (decoded.sib_has_base) self.regVal(decoded.sib_base_reg, .bits64) else 0;
+    const base_is_anchor = decoded.sib_has_base and decoded.sib_has_index and
+        !isGuestMappedValue(self, base_value) and
+        self.sparse_memory.containingMappingBase(base_value) == base_value;
+    const causal: ?x64_decoder.RegId = if (base_is_anchor)
+        decoded.sib_index_reg
+    else if (decoded.sib_has_base)
+        decoded.sib_base_reg
+    else if (decoded.sib_has_index)
+        decoded.sib_index_reg
+    else
+        null;
+    if (causal) |register| {
+        machoCapturePrint(
+            "macho-processor: near-null protection fault: causal operand={s} (base={s} anchor={} index={s}); {s}\n",
+            .{
+                @tagName(register),
+                if (decoded.sib_has_base) @tagName(decoded.sib_base_reg) else "<none>",
+                base_is_anchor,
+                if (decoded.sib_has_index) @tagName(decoded.sib_index_reg) else "<none>",
+                if (base_is_anchor)
+                    "the base register holds a mapping anchor (a guest membase), so it is a constant by construction and cannot be the cause. The index carries the guest address and is the operand worth following"
+                else
+                    "the base register is the addressing operand that varies",
+            },
+        );
+        reportValueOrigin(self, "near-null protection fault", boundedValueOrigin(self, self.regs.rip, register));
+    }
 }
 
 /// A null base register that is not null: the address is there, byte-reversed.
@@ -3043,16 +3441,39 @@ pub fn vtableIdentityEvidence(self: anytype, value: u64) vt.IdentityEvidence {
 /// Record only validated vptr identities.  Generic write provenance remains
 /// in memory_writes and cannot authorize vptr recovery.
 pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) void {
-    // R3 (N4): vtable/provenance tracking is fault-time diagnostics. The flag
-    // gates it so unarmed runs pay one branch per 64-bit store instead of the
-    // allocation probe + observeWrite (+ occasional write-protection work).
-    if (!self.write_diagnostics_armed) return;
     if (size != .bits64) return;
     if (addr < 0x1000 or (addr & 7) != 0) return;
+
+    // Correctness and diagnostics have different owners here.
+    //
+    // An authentic constructor write of an image-owned `_ZTV` address point
+    // must always establish identity. Otherwise read-time recovery silently
+    // depends on ROSETTE_MACHO_WRITE_DIAGNOSTICS and the same constructed C++
+    // object is valid in an instrumented run but has a null vptr in a normal
+    // run. Keep the production path cheap: two image-range comparisons reject
+    // ordinary integers, heap/stack pointers and JIT addresses before either
+    // an allocation-map lookup or a symbol lookup.
+    //
+    // Full diagnostics still observes clears and arbitrary replacements so it
+    // can name the writer and protect immediately at write time. In the normal
+    // path, only trusted vtable establishments/transitions are retained; a
+    // later low read is repaired exclusively from that authentic history.
+    if (!shouldObserveVtableWrite(
+        self.write_diagnostics_armed,
+        val,
+        self.mapped_min,
+        self.image_end,
+    )) return;
+
+    // Destination ownership is cheaper and more selective than symbol/section
+    // classification. Prove this is an exact live allocation base before
+    // asking metadata to identify an image pointer as an Itanium vtable.
     _ = self.memory_forwarder.allocationSize(addr) orelse return;
+    const evidence = vtableIdentityEvidence(self, val);
+    if (!self.write_diagnostics_armed and !evidence.isTrusted(self.vtable_tracker.policy)) return;
     const result = self.vtable_tracker.observeWrite(
         addr,
-        vtableIdentityEvidence(self, val),
+        evidence,
         .{
             .writer_rip = self.regs.rip,
             .writer_step = self.executed_steps,
@@ -3162,6 +3583,57 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
     }
 }
 
+/// Whether a 64-bit allocation-base store can affect trusted vtable identity.
+///
+/// Armed diagnostics must see all values so they can attribute clears and
+/// corruption. The production path only admits pointers into the original
+/// Mach-O image; strict `_ZTV` evidence is checked immediately afterwards.
+pub fn shouldObserveVtableWrite(
+    write_diagnostics_armed: bool,
+    value: u64,
+    mapped_min: u64,
+    image_end: u64,
+) bool {
+    if (write_diagnostics_armed) return true;
+    return mapped_min != std.math.maxInt(u64) and
+        value >= mapped_min and value < image_end;
+}
+
+test "production vtable observation is independent from diagnostic provenance" {
+    const mapped_min: u64 = 0x4000;
+    const image_end: u64 = 0x0200_0000;
+
+    // The VulkanPresenter vptr shape: an address point in Mach-O data must be
+    // admitted even in the ordinary non-diagnostic run.
+    try std.testing.expect(shouldObserveVtableWrite(
+        false,
+        0x0198_1b10,
+        mapped_min,
+        image_end,
+    ));
+
+    // Heap, stack and generated-code values stay off the symbol/allocation
+    // lookup path. Full diagnostics intentionally admits them for attribution.
+    try std.testing.expect(!shouldObserveVtableWrite(
+        false,
+        0x0678_ebb0,
+        mapped_min,
+        image_end,
+    ));
+    try std.testing.expect(shouldObserveVtableWrite(
+        true,
+        0,
+        mapped_min,
+        image_end,
+    ));
+    try std.testing.expect(!shouldObserveVtableWrite(
+        false,
+        0x0198_1b10,
+        std.math.maxInt(u64),
+        image_end,
+    ));
+}
+
 /// Check if a pointer value looks like x86 function prologue bytes.
 /// Returns true if `value` starts with common push rbp; mov rbp, rsp patterns.
 /// This indicates heap corruption where code bytes overwrote a data pointer.
@@ -3269,17 +3741,30 @@ pub fn timerQueueWatchWrite(self: anytype, addr: u64, size: Size, val: u64) void
 }
 
 pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
+    noteRingBufferWrite(self, addr, size, val);
     const bytes = bytesForSize(size);
     if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
         recordMemoryAccess(self, addr, size, "write", val);
         noteGuestWrite(self, addr, bytes);
         if (size == .bits64 and (addr & 7) == 0) {
-            if (self.write_diagnostics_armed) {
+            const provenance = provenanceWanted(self, addr);
+            const pointer_provenance = shouldRecordGuestCodePointer(self, size, val);
+            if (provenance or pointer_provenance) {
                 const previous = std.mem.readInt(u64, storage[0..8], .little);
-                self.memory_writes.record(self.allocator, addr, previous, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+                if (provenance) {
+                    self.memory_writes.record(self.allocator, addr, previous, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+                } else {
+                    recordGuestCodePointerWrite(self, addr, previous, val);
+                }
             }
             std.mem.writeInt(u64, storage[0..8], val, .little);
         } else {
+            const pointer_provenance = shouldRecordGuestCodePointer(self, size, val) and
+                !self.write_diagnostics_armed and !self.provenance_watch.covers(addr);
+            const pointer_previous: u64 = if (pointer_provenance and size == .bits32)
+                std.mem.readInt(u32, storage[0..4], .little)
+            else
+                0;
             const mutation = captureMemoryMutation(self, addr, bytes);
             switch (size) {
                 .bits8 => storage[0] = @truncate(val),
@@ -3288,6 +3773,7 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
                 .bits64 => std.mem.writeInt(u64, storage[0..8], val, .little),
             }
             commitMemoryMutation(self, mutation, .partial_scalar);
+            if (pointer_provenance) recordGuestCodePointerWrite(self, addr, pointer_previous, val);
         }
         recordAllocationWrite(self, addr, size, val);
         // Suspicious write: 64-bit value pointing into executable (code) segment
@@ -3330,12 +3816,24 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
     self.initializer_memory.capture(self.mem, @intCast(off), bytes);
     noteGuestWrite(self, addr, bytes);
     if (size == .bits64 and (addr & 7) == 0) {
-        if (self.write_diagnostics_armed) {
+        const provenance = provenanceWanted(self, addr);
+        const pointer_provenance = shouldRecordGuestCodePointer(self, size, val);
+        if (provenance or pointer_provenance) {
             const previous = std.mem.readInt(u64, self.mem[off..][0..8], .little);
-            self.memory_writes.record(self.allocator, addr, previous, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+            if (provenance) {
+                self.memory_writes.record(self.allocator, addr, previous, val, self.regs.rip, self.executed_steps, self.active_guest_thread);
+            } else {
+                recordGuestCodePointerWrite(self, addr, previous, val);
+            }
         }
         std.mem.writeInt(u64, self.mem[off..][0..8], val, .little);
     } else {
+        const pointer_provenance = shouldRecordGuestCodePointer(self, size, val) and
+            !self.write_diagnostics_armed and !self.provenance_watch.covers(addr);
+        const pointer_previous: u64 = if (pointer_provenance and size == .bits32)
+            std.mem.readInt(u32, self.mem[off..][0..4], .little)
+        else
+            0;
         const mutation = captureMemoryMutation(self, addr, bytes);
         switch (size) {
             .bits8 => self.mem[off] = @truncate(val),
@@ -3344,6 +3842,7 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
             .bits64 => std.mem.writeInt(u64, self.mem[off..][0..8], val, .little),
         }
         commitMemoryMutation(self, mutation, .partial_scalar);
+        if (pointer_provenance) recordGuestCodePointerWrite(self, addr, pointer_previous, val);
     }
     recordAllocationWrite(self, addr, size, val);
     // Suspicious write: 64-bit value pointing into executable (code) segment
@@ -3387,6 +3886,45 @@ pub fn provenanceWanted(self: anytype, address: u64) bool {
     return self.provenance_watch.contains(address);
 }
 
+/// Report a guest store that landed inside the GPU command ring.
+///
+/// The first such store is the transition the whole graphics stack is waiting
+/// on: it is the difference between "the producer prepared a packet and did not
+/// publish it" and "the producer never ran". Bounded to the first few, because
+/// once the ring is being written the interesting fact is that it started, not
+/// every dword.
+///
+/// Deliberately observation only — nothing here writes to the ring, advances a
+/// pointer, or reports a payload the guest did not produce.
+pub fn noteRingBufferWrite(self: anytype, address: u64, size: Size, value: u64) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_ring_watch_base")) return;
+    const base = self.gpu_ring_watch_base;
+    if (base == 0 or self.gpu_ring_watch_size == 0) return;
+    // The ring address the guest gave is physical. Rosette models the physical
+    // views as guest addresses, so compare on the low 32 bits and record which
+    // view the store actually used — that is the alias-coherence question.
+    const low: u32 = @truncate(address);
+    const ring_low: u32 = @truncate(base);
+    if (low < ring_low or low -% ring_low >= self.gpu_ring_watch_size) return;
+
+    self.gpu_ring_writes +|= 1;
+    if (!recovery_ledger.throttled(self.gpu_ring_writes)) return;
+    machoCapturePrint(
+        "macho-processor: gpu ring write #{d}: address=0x{x} ring_offset=0x{x} width={d} value=0x{x} rip=0x{x} {s} thread=0x{x}; this is an authentic guest store into the command ring — the producer is running. The view used is the address above; if the command processor reads a different physical alias of this page it will not see this dword\n",
+        .{
+            self.gpu_ring_writes,
+            address,
+            low -% ring_low,
+            bytesForSize(size),
+            value,
+            self.regs.rip,
+            self.metadata.symbolLabel(self.regs.rip),
+            self.active_guest_thread,
+        },
+    );
+}
+
 pub fn captureMemoryMutation(
     self: anytype,
     address: u64,
@@ -3408,6 +3946,7 @@ pub fn commitMemoryMutation(
 ) void {
     // R3 (N4): matching gate to captureMemoryMutation. When unarmed the
     // capture is empty and the re-read/compare/record work is skipped.
+    if (capture.count == 0) return;
     if (!provenanceWanted(self, capture.address)) return;
     // The writer recorded below is `regs.rip` — the *faulting guest*
     // instruction — even when the write came from a Rosette repair rather than
@@ -3611,6 +4150,18 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
                 },
             );
         }
+        // A protection fault at a *near-null* effective address is a different
+        // finding from one at a real address: the page is protected on purpose
+        // (a null-page guard), so the question is never "why is this page
+        // protected" but "what made the pointer near-null". That question has
+        // an evidence path already — the same operand decode, register survey
+        // and def-use walk the near-null owner uses — and this site was not
+        // taking it, so a pointer that became 0x1 arrived at the guest's signal
+        // handler with nothing recorded about where the 1 came from.
+        //
+        // Delivering the signal is still correct: the guest installed the guard
+        // and has a handler. Only the evidence was missing.
+        reportProtectionFaultOperands(self, address, bytes, access);
         const instruction_len = currentGuestInstructionLength(self);
         if (self.deliverGuestSignal(GUEST_SIGSEGV, self.regs.rip, instruction_len, address, access, bytes, instruction)) {
             machoCapturePrint(
@@ -3899,19 +4450,29 @@ pub fn recordMemoryAccess(self: anytype, address: u64, size: Size, access: []con
         if (!self.memory_trace_budget.take()) return;
     }
     const bytes = bytesForSize(size);
-    const offset = translateGuest(self, address, bytes, if (std.mem.eql(u8, access, "write")) .write else .read);
-    const backed = if (offset) |off| off + bytes <= self.mem.len else false;
-    const trace_count: usize = self.execution_history.countFor(self.active_guest_thread);
-    const instruction_snapshot = if (self.sparse_memory.isExecutable(self.regs.rip, 1))
+    // recordMemoryAccess is invoked only after a read succeeded or after the
+    // write path selected a valid sparse/linear mapping. Re-translating the
+    // same address is useful only for full diagnostics; the lightweight
+    // generated-code ring can accurately mark the completed access backed.
+    const backed = if (self.memory_trace_enabled) blk: {
+        const offset = translateGuest(self, address, bytes, if (std.mem.eql(u8, access, "write")) .write else .read);
+        break :blk if (offset) |off| off + bytes <= self.mem.len else self.sparse_memory.containsMapped(address, bytes);
+    } else true;
+    const latest_trace = self.execution_history.latestFor(self.active_guest_thread);
+    // Exact bytes are opt-in. In the default generated-code ring, execution
+    // history already owns the decoded operation; re-decoding every memory
+    // access merely to duplicate its bytes was the dominant observer cost.
+    const instruction_snapshot = if (self.memory_trace_enabled and
+        self.sparse_memory.isExecutable(self.regs.rip, 1))
         currentInstructionSnapshot(self)
     else
         InstructionSnapshot{};
     const instruction = if (instruction_snapshot.operation.len != 0)
         instruction_snapshot.operation
-    else if (trace_count == 0)
-        "<runtime>"
+    else if (latest_trace) |entry|
+        @tagName(entry.op)
     else
-        @tagName(if (self.execution_history.latestFor(self.active_guest_thread)) |e| e.op else .invalid);
+        "<runtime>";
     // Check for near-null or negative addresses (high bit set in 64-bit, or very small positive addresses)
     const near_null = (address & 0x8000_0000_0000_0000) != 0 or address < 0x1000;
     self.memory_trace_entries[self.memory_trace_index] = .{
@@ -3957,6 +4518,12 @@ pub fn recordEndianEvidence(
     // so the always-on recorder stays effectively free outside the compat path.
     if (comptime @hasField(State, "has_xenia_compat")) {
         if (!self.has_xenia_compat) return;
+    }
+    // Evidence can only authorize a generated-code repair. Keep native Mach-O
+    // comparisons and MOVBE instructions out even if a future call site
+    // forgets to apply its own hot-path gate.
+    if (comptime @hasField(State, "executable_min") and @hasField(State, "executable_max")) {
+        if (self.regs.rip >= self.executable_min and self.regs.rip < self.executable_max) return;
     }
     self.endian_evidence_entries[self.endian_evidence_index] = .{
         .kind = kind,
@@ -4593,7 +5160,9 @@ fn sparseCStringTestState(allocator: std.mem.Allocator) !struct {
 }
 
 test "guestCString reads sparse-backed strings outside the primary image" {
-    const setup = try sparseCStringTestState(std.testing.allocator);
+    // `manager.bytes` needs mutable storage; a const binding here is why this
+    // test stopped compiling the moment the module gained a test target.
+    var setup = try sparseCStringTestState(std.testing.allocator);
     defer setup.manager.deinit();
     defer setup.firewall.deinit();
     defer std.testing.allocator.free(setup.state.mem);
@@ -4620,7 +5189,9 @@ test "guestCString reads sparse-backed strings outside the primary image" {
 }
 
 test "guestCString resolves a sparse string that ends at the mapping boundary" {
-    const setup = try sparseCStringTestState(std.testing.allocator);
+    // `manager.bytes` needs mutable storage; a const binding here is why this
+    // test stopped compiling the moment the module gained a test target.
+    var setup = try sparseCStringTestState(std.testing.allocator);
     defer setup.manager.deinit();
     defer setup.firewall.deinit();
     defer std.testing.allocator.free(setup.state.mem);
@@ -4646,4 +5217,63 @@ test "guestCString resolves a sparse string that ends at the mapping boundary" {
     const untruncated = setup.manager.bytes(tail, 500, true) orelse return error.TestUnexpectedResult;
     untruncated[0] = 'b';
     try std.testing.expect(guestCString(state, tail, 32) == null);
+}
+
+// The memo must answer exactly as the search does, including for the sections
+// that live inside r-x __TEXT and are not code. A cache that returned "still
+// executable" for an address just past __text would turn an exception table
+// into an instruction stream.
+test "the executable-section memo agrees with the search at range edges" {
+    const Section = struct { name: []const u8, address: u64, size: u64, flags: u32 };
+    const Meta = struct {
+        sections: []const Section,
+        fn sectionAtAddress(self: *const @This(), address: u64) ?Section {
+            for (self.sections) |section| {
+                if (address >= section.address and address < section.address + section.size) return section;
+            }
+            return null;
+        }
+    };
+    const Host = struct {
+        metadata: Meta,
+        executable_section_low: u64 = 1,
+        executable_section_high: u64 = 0,
+        executable_section_verdict: bool = false,
+    };
+
+    var host = Host{ .metadata = .{ .sections = &.{
+        .{ .name = "__text", .address = 0x1000, .size = 0x1000, .flags = 0 },
+        .{ .name = "__gcc_except_tab", .address = 0x2000, .size = 0x1000, .flags = 0 },
+    } } };
+
+    // Warm on __text, then walk off its end into the exception table.
+    try std.testing.expect(cachedSectionExecutable(&host, 0x1000));
+    try std.testing.expect(cachedSectionExecutable(&host, 0x1FFF));
+    try std.testing.expect(!cachedSectionExecutable(&host, 0x2000));
+    // Coming back re-warms rather than keeping the stale verdict.
+    try std.testing.expect(cachedSectionExecutable(&host, 0x1800));
+    try std.testing.expect(!cachedSectionExecutable(&host, 0x2800));
+    // An address in no section is not executable and leaves no range behind.
+    try std.testing.expect(!cachedSectionExecutable(&host, 0x9000));
+    try std.testing.expect(cachedSectionExecutable(&host, 0x1234));
+}
+
+test "an unwarmed memo matches nothing" {
+    const Section = struct { name: []const u8, address: u64, size: u64, flags: u32 };
+    const Meta = struct {
+        fn sectionAtAddress(_: *const @This(), _: u64) ?Section {
+            return null;
+        }
+    };
+    const Host = struct {
+        metadata: Meta = .{},
+        executable_section_low: u64 = 1,
+        executable_section_high: u64 = 0,
+        executable_section_verdict: bool = true,
+    };
+    var host = Host{};
+    // The sentinel range must not swallow address 0, or a null RIP would read
+    // as executable before anything has been looked up.
+    try std.testing.expect(!cachedSectionExecutable(&host, 0));
+    try std.testing.expect(!cachedSectionExecutable(&host, 1));
 }

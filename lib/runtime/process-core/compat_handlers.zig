@@ -1,4 +1,5 @@
 const std = @import("std");
+const guest_log = @import("guest_log.zig");
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const compat_runtime = @import("macho_compat_runtime");
@@ -328,8 +329,17 @@ pub fn handleInternalCompatibility(self: anytype) bool {
     {
         self.startup.enter(.config_load, self.executed_steps);
         if (self.diagnostic_text.buildConfigDump(self, &self.fs_forwarder, self.regs.rdi)) |dump| {
+            // This dump is built by Rosette from the configuration file, so it
+            // is the FILE's reading, not the guest's. Feed it as such and mark
+            // the guest side unavailable: comparing this against itself would
+            // report agreement for every key and mean nothing at all.
+            self.preflight_dump_is_accelerated = true;
+            guest_log.observePreflightConfigFile(self, dump.address, dump.length);
             const emitted = self.emitGuestLog('i', dump.address, dump.length);
             self.logging.recordEmission(dump.length, emitted);
+            // After the dump, never during it: a verdict printed ahead of the
+            // evidence it judges reads as though it were about something else.
+            guest_log.finishPreflightConfigPhase(self);
             self.regs.rip = self.pop();
             return true;
         }
@@ -464,7 +474,12 @@ pub fn handleCxxoptsSplitOptionNames(self: anytype) bool {
     if (token_start == final_end) return false;
 
     const storage_size = std.math.mul(u64, token_count, 24) catch return false;
-    const storage = self.guestAlloc(storage_size, 8) orelse return false;
+    // The returned vector is guest-owned libc++ storage. Its destructor calls
+    // operator delete, so allocating it from the runtime-only bump arena
+    // creates split ownership: construction succeeds, but the forwarded heap
+    // has no matching allocation when libc++ releases the vector. Use the
+    // tracked guest heap so allocation and destruction share one owner.
+    const storage = self.guestHeapAllocate(storage_size, 8) orelse return false;
     @memset(self.guestMemory(output, 24).?, 0);
 
     token_start = 0;

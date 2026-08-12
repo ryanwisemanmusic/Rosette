@@ -9,6 +9,7 @@ const macho_log = @import("dyld").event_log;
 const gpu = @import("gpu");
 const machoCapturePrint = macho_log.machoCapturePrint;
 const startup_observer = @import("diagnostics").startup_observer;
+const preflight_lib = @import("preflight");
 const constants = @import("macho_core").constants;
 const utils = @import("macho_core").utils;
 
@@ -145,8 +146,10 @@ pub fn emitRuntimeSummaryHeartbeat(self: anytype, snapshot: startup_observer.Sna
 pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
     const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
     const message = self.guestMemoryConst(address, length) orelse return false;
+    observePreflightGuestLog(self, message);
     observeXeniaPipelineGuestLog(self, message);
     observeGpuBootstrapGuestLog(self, message);
+    observeXeniaGpuHandoffGuestLog(self, message);
     self.observeBackendGuestLog(message);
     const raw_char: u8 = @truncate(prefix_char_raw);
     const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
@@ -250,21 +253,33 @@ fn writeMirroredLine(self: anytype, prefix: []const u8, message: []const u8) voi
 pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "gpu_bootstrap")) return;
-    const steps = [_]struct { name: []const u8, step: gpu.Step }{
-        .{ .name = "VdInitializeEngines", .step = .initialize_engines },
-        .{ .name = "VdGetSystemCommandBuffer", .step = .system_command_buffer },
-        .{ .name = "VdSetGraphicsInterruptCallback", .step = .graphics_interrupt_callback },
-        .{ .name = "VdInitializeRingBuffer", .step = .ring_buffer },
-        .{ .name = "VdEnableRingBufferRPtrWriteBack", .step = .rptr_writeback },
-        .{ .name = "VdSwap", .step = .swap },
+    const steps = [_]struct { marker: []const u8, step: gpu.Step, export_call: bool = false }{
+        .{ .marker = "VdInitializeEngines", .step = .initialize_engines, .export_call = true },
+        .{ .marker = "VdGetSystemCommandBuffer", .step = .system_command_buffer, .export_call = true },
+        .{ .marker = "VdSetGraphicsInterruptCallback", .step = .graphics_interrupt_callback, .export_call = true },
+        .{ .marker = "GPU callback dispatch completed", .step = .graphics_interrupt_dispatch },
+        .{ .marker = "VdInitializeRingBuffer", .step = .ring_buffer, .export_call = true },
+        .{ .marker = "VdEnableRingBufferRPtrWriteBack", .step = .rptr_writeback, .export_call = true },
+        .{ .marker = "RING BUFFER: authentic payload prepared", .step = .ring_payload_prepared },
+        .{ .marker = "RING BUFFER: first authentic PM4 packet consumed", .step = .pm4_packet_consumed },
+        .{ .marker = "VdSwap", .step = .swap, .export_call = true },
     };
+    // The write pointer is observed separately because a write to the register
+    // is not an advance of it. The guest may store the value it already holds,
+    // which publishes nothing, and counting that as a submission moves the
+    // bootstrap frontier past a producer that never produced.
+    observeRingWritePointer(self, message);
+    observeGuestCriticalSection(self, message);
     for (steps) |candidate| {
         // The export-verification lines name these symbols without calling
         // them, so a bare occurrence is not evidence. Only the call-trace form
         // `Name(` counts.
-        var buffer: [64]u8 = undefined;
-        const called = std.fmt.bufPrint(&buffer, "{s}(", .{candidate.name}) catch continue;
-        if (std.mem.indexOf(u8, message, called) == null) continue;
+        var buffer: [96]u8 = undefined;
+        const marker = if (candidate.export_call)
+            std.fmt.bufPrint(&buffer, "{s}(", .{candidate.marker}) catch continue
+        else
+            candidate.marker;
+        if (std.mem.indexOf(u8, message, marker) == null) continue;
         const before = self.gpu_bootstrap.frontier();
         self.gpu_bootstrap.observe(candidate.step, self.executed_steps);
         const after = self.gpu_bootstrap.frontier();
@@ -275,11 +290,228 @@ pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
                     candidate.step.label(),
                     if (after.step) |next| next.label() else "<complete>",
                     after.reached,
-                    gpu.bootstrap.step_count,
+                    gpu.bootstrap.required_step_count,
                 },
             );
         }
     }
+    observeRingBufferAddress(self, message);
+}
+
+pub fn observeXeniaGpuHandoffGuestLog(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "xenia_gpu_handoff")) return;
+    const observation = self.xenia_gpu_handoff.observeLine(message, self.executed_steps) orelse return;
+    if (!observation.advanced) return;
+    machoCapturePrint(
+        "macho-processor: Xenia GPU handoff advanced: {s} -> {s} at step={d}\n",
+        .{ @tagName(observation.previous), @tagName(observation.current), self.executed_steps },
+    );
+}
+
+/// Read the critical section the guest says it is contending, when the guest
+/// names nobody as its owner.
+///
+/// `owner=00000000` on a contention is self-contradictory — no thread has id
+/// zero — so the waiter is parked for a release that cannot arrive. The
+/// transition log cannot say why, because it records what the guest concluded
+/// rather than what the memory holds, and the two diverge in exactly the case
+/// that matters: on this ABI a free lock holds -1, so a structure that reads
+/// zero is not free, it is held by nobody. `lock=0->1` therefore describes a
+/// lock nothing ever initialised, and looks identical to an ordinary
+/// acquisition.
+///
+/// Rosette can settle it, because Rosette can read the bytes. It arms a write
+/// watch when the guest registers the lock and dumps the structure when the
+/// impossible contention appears; the two together separate "the initialiser
+/// never ran" from "the initialiser wrote somewhere the waiter does not read".
+/// Nothing is repaired: writing -1 into a lock the guest believes it holds
+/// would trade a visible hang for a silent double-entry.
+fn observeGuestCriticalSection(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "critical_section_watch_base")) return;
+
+    if (std.mem.indexOf(u8, message, "GPU CRITICAL SECTION: registered cs=") != null) {
+        const address = parseHexAfter(message, "registered cs=") orelse return;
+        if (address == 0 or self.critical_section_watch_base == address) return;
+        self.critical_section_watch_base = address;
+        const armed = self.provenance_watch.watchPage(address, .declared);
+        machoCapturePrint(
+            "macho-processor: guest critical section watch armed: cs=0x{x} watch={s}; the next contention on this lock can say whether anything ever wrote it\n",
+            .{ address, if (armed) "armed" else "unavailable" },
+        );
+        return;
+    }
+
+    if (std.mem.indexOf(u8, message, "GPU CRITICAL SECTION: contention") == null) return;
+    const owner = parseHexAfter(message, "owner=") orelse return;
+    if (owner != 0) return;
+    const address = parseHexAfter(message, "cs=") orelse return;
+    self.critical_section_zero_owner_reports +|= 1;
+    // Reported once: it repeats for as long as the thread stays parked, which
+    // is the rest of the run.
+    if (self.critical_section_zero_owner_reports != 1) return;
+
+    const critical_section = @import("diagnostics").guest_critical_section;
+    const bytes = self.guestMemoryConst(address, critical_section.size_bytes);
+    if (bytes == null) {
+        machoCapturePrint(
+            "macho-processor: GUEST CRITICAL SECTION UNREADABLE: cs=0x{x} is not mapped for reading, so the guest is contending a lock Rosette cannot see. That is the finding: the waiter's address does not resolve\n",
+            .{address},
+        );
+        return;
+    }
+    const fields = critical_section.decode(bytes.?) orelse return;
+    const state = critical_section.classify(fields);
+    const ever_written = self.provenance_watch.covers(address);
+    machoCapturePrint(
+        "macho-processor: GUEST CRITICAL SECTION ZERO-OWNER CONTENTION: cs=0x{x} state={s} lock_count={d} recursion={d} owner=0x{x} header(type=0x{x} signal=0x{x} flink=0x{x} blink=0x{x}) watched={s} impossible={s}\n",
+        .{
+            address,
+            state.label(),
+            fields.lock_count,
+            fields.recursion_count,
+            fields.owning_thread,
+            fields.type_flags,
+            fields.signal_state,
+            fields.wait_list_flink,
+            fields.wait_list_blink,
+            if (ever_written) "YES" else "NO",
+            if (state.impossible()) "YES" else "NO",
+        },
+    );
+    machoCapturePrint(
+        "macho-processor: GUEST CRITICAL SECTION GUIDANCE: {s}\n",
+        .{critical_section.guidance(state, ever_written)},
+    );
+}
+
+/// Separate a write-pointer *write* from a write-pointer *advance*.
+///
+/// The observed run reports two guest MMIO writes to `CP_RB_WPTR` and equal
+/// read and write pointers. Treating each write as a submission marked the
+/// bootstrap's `ring_write_pointer` step reached, moved the frontier to PM4
+/// consumption, and sent every subsequent reading of the log downstream — to
+/// the command processor, and from there to the presenter. The producer, which
+/// is where the stall actually is, was never implicated because the step that
+/// would have implicated it had been recorded as done.
+///
+/// So the value is parsed and compared. The step is observed only when the
+/// pointer genuinely moved, or when the ring's own geometry reports an
+/// outstanding span; a rewritten value advances nothing and is logged as such.
+/// Nothing here is inferred — an unobserved value stays unobserved, because the
+/// whole point is to stop the runtime from crediting the guest with a step it
+/// did not take.
+fn observeRingWritePointer(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_ring_publication")) return;
+
+    if (parseHexAfter(message, "rb_size=")) |size_bytes| {
+        // The ring diagnosis line carries the pointers the command processor
+        // and the guest actually hold, which is the only place an outstanding
+        // span is directly visible.
+        const geometry = gpu.RingGeometry{
+            .base = parseHexAfter(message, "rb_base=") orelse 0,
+            .size_bytes = size_bytes,
+            .read_pointer = parseHexAfter(message, "read_ptr=") orelse 0,
+            .write_pointer = parseHexAfter(message, "write_ptr=") orelse 0,
+        };
+        const before = self.gpu_ring_publication.published();
+        self.gpu_ring_publication.observeGeometry(geometry);
+        if (!before and self.gpu_ring_publication.published()) {
+            machoCapturePrint(
+                "macho-processor: gpu ring publication: an outstanding span appeared: rb_base=0x{x} rb_size=0x{x} read_ptr=0x{x} write_ptr=0x{x} span_dwords={d} of {d}\n",
+                .{ geometry.base, geometry.size_bytes, geometry.read_pointer, geometry.write_pointer, geometry.spanDwords() orelse 0, geometry.sizeDwords() },
+            );
+            self.gpu_bootstrap.observe(.ring_write_pointer, self.executed_steps);
+        }
+    }
+
+    const marker = "DEBUG: REGISTER WRITE: CP_RB_WPTR";
+    if (std.mem.indexOf(u8, message, marker) == null) return;
+    const value = parseHexAfter(message, "CP_RB_WPTR = ") orelse
+        parseHexAfter(message, "CP_RB_WPTR=") orelse return;
+    const previous = self.gpu_ring_publication.last_value;
+    const outcome = self.gpu_ring_publication.observeWritePointer(value);
+    const tracker = &self.gpu_ring_publication;
+    machoCapturePrint(
+        "macho-processor: gpu ring write pointer: old={s}0x{x} new=0x{x} outcome={s} writes={d} advances={d} repeats={d} span={s} published={s}\n",
+        .{
+            if (previous == null) "unobserved:" else "",
+            previous orelse 0,
+            value,
+            @tagName(outcome),
+            tracker.writes,
+            tracker.advances,
+            tracker.repeats,
+            @tagName(tracker.span()),
+            if (tracker.published()) "YES" else "NO",
+        },
+    );
+    if (outcome == .advanced) {
+        self.gpu_bootstrap.observe(.ring_write_pointer, self.executed_steps);
+        return;
+    }
+    if (outcome == .repeated and tracker.repeats == 1) {
+        machoCapturePrint(
+            "macho-processor: gpu ring publication: {s}\n",
+            .{tracker.verdict()},
+        );
+    }
+}
+
+fn parseHexAfter(line: []const u8, marker: []const u8) ?u32 {
+    const index = std.mem.indexOf(u8, line, marker) orelse return null;
+    var text = line[index + marker.len ..];
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) text = text[2..];
+    var length: usize = 0;
+    while (length < text.len and std.ascii.isHex(text[length])) : (length += 1) {}
+    if (length == 0) return null;
+    return std.fmt.parseInt(u32, text[0..length], 16) catch null;
+}
+
+/// Learn the ring's physical address from the guest's own call and put it under
+/// write provenance.
+///
+/// The unanswered question is not whether the write pointer advanced — that is
+/// already known — but whether the guest ever *wrote a command dword into the
+/// ring at all*. Those are different failures: a producer that prepared a packet
+/// and did not publish it is a control-flow problem, and one that never wrote is
+/// a producer that never ran. Nothing distinguished them, because nobody was
+/// watching the memory.
+///
+/// The address only becomes knowable when the guest names it, which is exactly
+/// the case `ownership.watch` exists for. It also settles the alias question:
+/// provenance records the address the store actually used, so a write landing in
+/// a different physical view of the same page shows up as a write to a different
+/// address rather than as no write at all.
+fn observeRingBufferAddress(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_ring_watch_base")) return;
+    if (self.gpu_ring_watch_base != 0) return;
+    const marker = "VdInitializeRingBuffer(";
+    const start = std.mem.indexOf(u8, message, marker) orelse return;
+    const rest = message[start + marker.len ..];
+    const comma = std.mem.indexOfScalar(u8, rest, ',') orelse return;
+    const base = std.fmt.parseInt(u64, std.mem.trim(u8, rest[0..comma], " "), 16) catch return;
+    if (base == 0) return;
+
+    const tail = rest[comma + 1 ..];
+    const close = std.mem.indexOfScalar(u8, tail, ')') orelse tail.len;
+    const size_log2 = std.fmt.parseInt(u6, std.mem.trim(u8, tail[0..close], " "), 10) catch 12;
+    // Xenia's own contract: size_bytes = 1 << (size_log2 + 3).
+    const size: u64 = @as(u64, 1) << (@as(u6, @intCast(@min(@as(u32, size_log2) + 3, 40))));
+
+    self.gpu_ring_watch_base = base;
+    self.gpu_ring_watch_size = size;
+    // Watch the head of the ring: the first packet goes at the base, and the
+    // watch set is deliberately small, so covering the whole ring would evict
+    // everything else it holds.
+    _ = self.provenance_watch.watchPage(base, .declared);
+    machoCapturePrint(
+        "macho-processor: gpu ring watch armed: physical_base=0x{x} size=0x{x} (size_log2={d}); write provenance now covers the ring head, so the next run can say whether the guest ever stored a command dword there — and, if it stored one somewhere else, which physical alias it used\n",
+        .{ base, size, size_log2 },
+    );
 }
 
 pub fn observeXeniaPipelineGuestLog(self: anytype, message: []const u8) void {
@@ -523,4 +755,175 @@ pub fn noteBackendMprotect(self: anytype, route: []const u8, address: u64, lengt
         "macho-processor: x64 backend mprotect #{d}: route={s} phase={s} step={d} address=0x{x} length={d} prot=0x{x} succeeded={}\n",
         .{ self.backend_diagnostics.mprotect_attempts_during_backend, route, @tagName(self.backend_diagnostics.phase), self.executed_steps, address, length, prot, succeeded },
     );
+}
+
+/// Keys whose binding this run depends on, and what a failure to bind costs.
+///
+/// Each earned its place by having already been silently false: an option set
+/// in the configuration file, read back by the guest as its compiled-in
+/// default, and nothing anywhere reporting the gap. `gpu_debug_force_swap_*`
+/// is the case that cost a week — the forced-swap probe was configured, never
+/// enabled, and every downstream counter reported the consequence.
+const watched_config_keys = [_]struct { key: []const u8, severity: preflight_lib.Severity }{
+    .{ .key = "gpu_debug_force_swap_after_ms", .severity = .degraded },
+    .{ .key = "gpu_debug_force_swap_interval_ms", .severity = .degraded },
+    .{ .key = "gpu_debug_force_swap_once", .severity = .degraded },
+    .{ .key = "gpu_debug_force_interrupt_callback_after_vblank", .severity = .degraded },
+    .{ .key = "gpu_log_no_swap_after_ms", .severity = .advisory },
+    .{ .key = "kernel_debug_monitor", .severity = .degraded },
+    .{ .key = "gpu_mmio_cp_endian_autofix", .severity = .degraded },
+    .{ .key = "inline_mmio_access", .severity = .degraded },
+    .{ .key = "gpu", .severity = .fatal },
+};
+
+/// Feed a guest-printed line to preflight and, once the guest's configuration
+/// dump has been seen in full, report what disagrees.
+///
+/// Evaluated at the dump's close rather than at a fixed step count: that is the
+/// first moment both readings exist, and evaluating before then would report
+/// `indeterminate` for everything — correct but useless. Reported once, because
+/// a binding failure does not change during a run and restating it every line
+/// would bury it in exactly the way this gate exists to prevent.
+pub fn observePreflightGuestLog(self: anytype, message: []const u8) void {
+    if (self.preflight.count == 0) {
+        for (watched_config_keys) |entry| self.preflight.watch(entry.key, entry.severity);
+    }
+    // A dump Rosette built from the file restates the file. Accepting it as the
+    // guest's own belief would make every key agree with itself, which is the
+    // false green this library exists to refuse.
+    if (!self.preflight_dump_is_accelerated) self.preflight.observeGuestLine(message);
+    if (self.preflight_evaluated or self.preflight_dump_is_accelerated) return;
+
+    // The guest's own dump ends with the closing rule after the last key.
+    if (!self.preflight.guest_dump_captured) return;
+    if (std.mem.indexOf(u8, message, "-----------") == null) return;
+    if (std.mem.indexOf(u8, message, "CONFIG DUMP") != null) return;
+    finishPreflightConfigPhase(self);
+}
+
+/// Close the configuration phase and report. Called after the dump has been
+/// emitted, never during it: a verdict printed before the evidence it judges
+/// reads as though it were about something else entirely.
+pub fn finishPreflightConfigPhase(self: anytype) void {
+    if (self.preflight_evaluated) return;
+    if (!self.preflight.config_file_read) return;
+    self.preflight_evaluated = true;
+    reportPreflight(self);
+}
+
+fn reportPreflight(self: anytype) void {
+    var storage: [preflight_lib.collector.max_watched]preflight_lib.ConfigReading = undefined;
+    const readings = self.preflight.readings(&storage);
+
+    // When this runtime builds the configuration dump itself, the guest never
+    // prints its own, so the second reading does not exist. That is a limit of
+    // Rosette's acceleration, not a defect in the application — blocking on it
+    // would refuse every launch for a reason that has nothing to do with the
+    // program being run. Report it, loudly, and let the run proceed.
+    const guest_reading_unavailable = self.preflight_dump_is_accelerated;
+    for (readings) |reading| {
+        var adjusted = reading;
+        if (guest_reading_unavailable) adjusted.severity = .advisory;
+        self.preflight_report.record(preflight_lib.observation.checkConfigAgreement(
+            adjusted,
+            self.preflight.guest_dump_captured,
+            self.preflight.config_file_read,
+        ));
+    }
+    if (guest_reading_unavailable) {
+        machoCapturePrint(
+            "macho-processor: preflight: config dump is built by this runtime from the file, so the guest never states what it bound. The agreement check has one reading, not two, and is reporting UNKNOWN rather than comparing the file against itself. {d} file value(s) were read\n",
+            .{countFileReadings(readings)},
+        );
+    }
+
+    if (self.preflight_report.isClean()) {
+        machoCapturePrint(
+            "macho-processor: preflight: config agreement OK across {d} watched key(s); the values this process runs on are the values its configuration declares\n",
+            .{readings.len},
+        );
+        return;
+    }
+
+    // Nine identical lines saying the same thing about nine keys is the wall of
+    // text this gate exists to replace. Report each VIOLATION in full — those
+    // differ and each is actionable — and collapse the UNKNOWNs into one line
+    // naming the keys, because they share a single cause.
+    var unknown_count: usize = 0;
+    for (self.preflight_report.items()) |result| {
+        switch (result.outcome) {
+            .satisfied => {},
+            .indeterminate => unknown_count += 1,
+            .violated => machoCapturePrint(
+                "macho-processor: preflight VIOLATED [{s}/{s}] key={s}: {s}; expected={s} observed={s}. {s}\n",
+                .{
+                    result.severity.label(),
+                    result.subsystem,
+                    result.evidence.source,
+                    result.requirement,
+                    result.evidence.expected,
+                    result.evidence.observed,
+                    result.remedy,
+                },
+            ),
+        }
+    }
+    if (unknown_count != 0) {
+        const first_unknown = firstUnknown(self);
+        machoCapturePrint(
+            "macho-processor: preflight UNKNOWN: {d} watched key(s) could not be decided — {s}. First: {s}. This is not a pass; it is the gate declining to guess\n",
+            .{ unknown_count, first_unknown.evidence.observed, first_unknown.evidence.source },
+        );
+    }
+
+    if (self.preflight_report.firstBlocker()) |blocker| {
+        machoCapturePrint(
+            "macho-processor: preflight BLOCKER [{s}] key={s}: {s}. Terminating with SIGTERM rather than running a session whose results would describe a consequence and never a cause\n",
+            .{ blocker.outcome.label(), blocker.evidence.source, blocker.requirement },
+        );
+        terminateForPreflight(self);
+    }
+}
+
+fn countFileReadings(readings: []const preflight_lib.ConfigReading) usize {
+    var total: usize = 0;
+    for (readings) |reading| {
+        if (reading.file_present) total += 1;
+    }
+    return total;
+}
+
+fn firstUnknown(self: anytype) preflight_lib.Result {
+    for (self.preflight_report.items()) |result| {
+        if (result.outcome == .indeterminate) return result;
+    }
+    return self.preflight_report.items()[0];
+}
+
+/// Stop the run at the gate. Both halves matter: the runtime's own termination
+/// state so the exit summary explains itself, and a real SIGTERM so anything
+/// supervising this process — a shell script, a build harness — sees an ordinary
+/// signalled exit rather than a silent one.
+fn terminateForPreflight(self: anytype) void {
+    self.faulted = true;
+    self.terminated = true;
+    // 128 + SIGTERM, the conventional shell encoding for a signalled exit.
+    self.exit_code = 143;
+    std.posix.raise(std.posix.SIG.TERM) catch |err| {
+        machoCapturePrint(
+            "macho-processor: preflight could not raise SIGTERM ({s}); the run is still marked terminated\n",
+            .{@errorName(err)},
+        );
+    };
+}
+
+/// Feed the configuration file's own text, read by this runtime rather than
+/// reported by the guest.
+pub fn observePreflightConfigFile(self: anytype, address: u64, length: u64) void {
+    if (self.preflight.count == 0) {
+        for (watched_config_keys) |entry| self.preflight.watch(entry.key, entry.severity);
+    }
+    const text = self.guestMemoryConst(address, length) orelse return;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| self.preflight.observeFileLine(line);
 }

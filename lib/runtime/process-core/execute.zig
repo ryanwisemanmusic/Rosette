@@ -1925,16 +1925,16 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             const converted: f32 = @floatCast(@as(f64, @bitCast(source_bits)));
             std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(converted), .little);
         },
-        .vaddss, .vmulss, .vsubss, .vdivss => {
+        .vaddss, .vmulss, .vsubss, .vdivss, .vminss, .vmaxss => {
             self.executeVexScalarF32(d, vexArithmeticForOp(d.op));
         },
-        .vaddsd, .vmulsd, .vsubsd, .vdivsd => {
+        .vaddsd, .vmulsd, .vsubsd, .vdivsd, .vminsd, .vmaxsd => {
             self.executeVexScalarF64(d, vexArithmeticForOp(d.op));
         },
-        .vaddps, .vmulps, .vsubps, .vdivps => {
+        .vaddps, .vmulps, .vsubps, .vdivps, .vminps, .vmaxps => {
             self.executeVexPackedF32(d, vexArithmeticForOp(d.op));
         },
-        .vaddpd, .vmulpd, .vsubpd, .vdivpd => {
+        .vaddpd, .vmulpd, .vsubpd, .vdivpd, .vminpd, .vmaxpd => {
             self.executeVexPackedF64(d, vexArithmeticForOp(d.op));
         },
         .vsqrtss => {

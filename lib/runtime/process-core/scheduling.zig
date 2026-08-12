@@ -141,7 +141,7 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
                     if (!self.ui_handoff.ownsCallbackHandle(candidate.handle)) continue;
                     selected_index = index;
                     const resume_ordinal = self.ui_handoff.callback_resumptions +| 1;
-                    if (resume_ordinal <= 8 or resume_ordinal % 1000 == 0) {
+                    if (resume_ordinal <= 4) {
                         machoCapturePrint(
                             "scheduler: UI handoff priority resume: generation={d} callback_handle=0x{x} skipped_fifo_entries={d} step={d} resume={d}\n",
                             .{ self.ui_handoff.generation, candidate.handle, index, self.executed_steps, resume_ordinal },
@@ -195,7 +195,7 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
             .reason = context.reason,
         });
         const resume_count = self.cooperative_preserved_register_resumes + self.cooperative_wait_result_resumes;
-        if (resume_count <= 16 or resume_count % 1000 == 0) {
+        if (resume_count <= 4) {
             machoCapturePrint(
                 "scheduler: guest context resume #{d}: thread=0x{x} reason={s} suspended_step={d} rip=0x{x} rsp=0x{x} rax(saved/restored)=0x{x}/0x{x} policy={s}\n",
                 .{ resume_count, context.handle, context.reason, context.suspended_step, self.regs.rip, self.regs.rsp, saved_rax, self.regs.rax, if (resume_decision.?.rax_override != null) "wait_result_override" else "preserve_all_registers" },
@@ -209,7 +209,7 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
             self.logThreadTable("UI handoff scheduling thread resumed");
         } else if (self.ui_handoff.ownsCallbackHandle(context.handle)) {
             self.ui_handoff.callbackResumed(self.regs.rip, self.executed_steps);
-            if (self.ui_handoff.callback_resumptions <= 8 or self.ui_handoff.callback_resumptions % 1000 == 0) {
+            if (self.ui_handoff.callback_resumptions <= 4) {
                 self.logThreadTable("UI callback resumed");
             }
         } else if (self.ui_handoff.isActive()) {
@@ -301,7 +301,7 @@ pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
     }
     if (worker == waiter) {
         self.cooperative_self_resumes +|= 1;
-        if (self.cooperative_self_resumes <= 8 or self.cooperative_self_resumes % 1000 == 0) {
+        if (self.cooperative_self_resumes <= 4) {
             machoCapturePrint(
                 "scheduler: cooperative yield resumed caller (no alternate runnable context; not blocked): thread=0x{x} reason={s} suspended={d} deferred={d} self_resumes={d}\n",
                 .{ waiter, reason, self.suspended_guest_thread_count, self.pthreads.deferred_threads, self.cooperative_self_resumes },
@@ -319,13 +319,13 @@ pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
         .blocked = self.pthreads.blocked_threads,
         .reason = reason,
     });
-    if (self.cooperative_wait_yields <= 16 or self.cooperative_wait_yields % 100 == 0) {
+    if (self.cooperative_wait_yields <= 4) {
         machoCapturePrint(
             "macho-processor: cooperative wait yield #{d}: waiter=0x{x} -> worker=0x{x} reason={s} deferred_remaining={d} suspended={d} gtk_idle_pending={d}\n",
             .{ self.cooperative_wait_yields, waiter, worker, reason, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.pendingIdleCallbackCount() },
         );
     }
-    if (self.ui_handoff.isActive() or self.cooperative_wait_yields <= 8) {
+    if (self.cooperative_wait_yields <= 4) {
         self.logThreadTable(reason);
     }
     return true;
@@ -354,6 +354,31 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
         self.cooperative_scheduler_scan_steps = 0;
     }
     if (scan_due) {
+        // Deadlines must advance even while one runnable context stays in a
+        // polling loop. `resumeSuspendedGuestThread` also advances execution
+        // time, but reaching that function is gated by the runnable cache
+        // below. Without this scheduler-boundary update the cache can keep
+        // observing a frozen clock forever: a sleeper's deadline never becomes
+        // runnable, so no resume is attempted, so the clock never advances.
+        //
+        // Keep the update on the existing bounded scan cadence rather than on
+        // every interpreted instruction. GuestTimeService uses an execution
+        // watermark, so the elapsed instruction count is still accounted for
+        // exactly once.
+        const clock_before = self.guest_time.now();
+        const deadline_before = self.guest_time.nextDeadline();
+        const clock_after = self.guest_time.advanceForExecution(self.executed_steps);
+        if (deadline_before) |deadline| {
+            if (clock_before < deadline and clock_after >= deadline) {
+                self.scheduler_execution_deadline_crossings +|= 1;
+                if (self.scheduler_execution_deadline_crossings <= 4) {
+                    machoCapturePrint(
+                        "scheduler: active execution crossed virtual deadline #{d}: thread=0x{x} rip=0x{x} step={d} clock_before_ns={d} clock_after_ns={d} deadline_ns={d} lateness_ns={d} cached_runnable={d}\n",
+                        .{ self.scheduler_execution_deadline_crossings, self.active_guest_thread, self.regs.rip, self.executed_steps, clock_before, clock_after, deadline, clock_after - deadline, self.cached_suspended_runnable },
+                    );
+                }
+            }
+        }
         self.cached_suspended_runnable = self.refreshSuspendedRunnableCache();
     }
     const pending_idle = self.cached_pending_idle;
@@ -389,13 +414,13 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
                 const callback = self.active_guest_thread;
                 if (self.yieldActiveGuestThreadForWait("UI callback worker rendezvous")) {
                     self.cooperative_quantum_yields +|= 1;
-                    if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
+                    if (self.ui_callback_retained_quanta <= 4) {
                         machoCapturePrint(
                             "scheduler: UI callback rendezvous: quantum={d} callback=0x{x} -> worker=0x{x} deferred={d} runnable_suspended={d}; callback ownership retained\n",
                             .{ self.ui_callback_retained_quanta, callback, self.active_guest_thread, self.pthreads.deferred_threads, boundary_suspended_runnable },
                         );
                     }
-                } else if (self.ui_callback_retained_quanta <= 8 or self.ui_callback_retained_quanta % 1000 == 0) {
+                } else if (self.ui_callback_retained_quanta <= 4) {
                     machoCapturePrint(
                         "scheduler: retained active UI callback: quantum={d} callback_handle=0x{x} rip=0x{x} deferred_workers={d} runnable_suspended={d}; no eligible rendezvous target\n",
                         .{ self.ui_callback_retained_quanta, self.active_guest_thread, self.regs.rip, self.pthreads.deferred_threads, boundary_suspended_runnable },
@@ -451,7 +476,7 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
     if (!self.yieldActiveGuestThreadForWait(reason)) return;
     self.cooperative_quantum_yields +|= 1;
     if (work == .suspended_thread) self.cooperative_rotation_yields +|= 1;
-    if (self.cooperative_quantum_yields <= 8 or self.cooperative_quantum_yields % 100 == 0) {
+    if (self.cooperative_quantum_yields <= 4) {
         machoCapturePrint(
             "macho-processor: cooperative quantum yield #{d}: work={s} from=0x{x} to=0x{x} deferred={d} suspended={d} runnable_rotations={d}\n",
             .{ self.cooperative_quantum_yields, @tagName(work), previous_thread, self.active_guest_thread, self.pthreads.deferred_threads, self.suspended_guest_thread_count, self.cooperative_rotation_yields },

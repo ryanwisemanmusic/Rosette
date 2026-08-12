@@ -134,22 +134,56 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             );
         }
     }
+    if (comptime @hasField(@TypeOf(self.*), "gpu_ring_watch_base")) {
+        if (self.gpu_ring_watch_base != 0) {
+            machoCapturePrint(
+                "macho-processor: gpu ring production: physical_base=0x{x} size=0x{x} authentic_guest_writes={d}; {s}\n",
+                .{
+                    self.gpu_ring_watch_base,
+                    self.gpu_ring_watch_size,
+                    self.gpu_ring_writes,
+                    if (self.gpu_ring_writes == 0)
+                        "the guest never stored a single dword into the ring it asked for. The producer did not merely fail to publish a write pointer — it never produced. Look at the thread that called VdInitializeRingBuffer and what it waits on afterwards, not at the write-pointer path"
+                    else
+                        "the guest DID write authentic command data into the ring. If the write pointer is still zero, the defect is publication, not production — and if the command processor sees zeroes, compare the physical alias each side used",
+                },
+            );
+        }
+    }
     if (comptime @hasField(@TypeOf(self.*), "gpu_bootstrap")) {
         const gpu = @import("gpu");
         const frontier = self.gpu_bootstrap.frontier();
         if (frontier.step) |blocked| {
+            const ended_before_frontier = self.terminated and !self.gpu_bootstrap.observations[0].seen;
             machoCapturePrint(
-                "macho-processor: gpu bootstrap frontier: reached={d}/{d} first_missing={s} precondition_met={} blocked_by={s} out_of_order={d}; {s}\n",
+                "macho-processor: gpu bootstrap frontier: reached={d}/{d} optional_observed={d} first_missing={s} precondition_met={} blocked_by={s} out_of_order={d}; {s}\n",
                 .{
                     frontier.reached,
-                    gpu.bootstrap.step_count,
+                    gpu.bootstrap.required_step_count,
+                    frontier.optional_observed,
                     blocked.label(),
                     frontier.precondition_met,
                     if (frontier.blocked_by) |required| required.label() else "<none>",
                     self.gpu_bootstrap.out_of_order,
-                    blocked.guidance(),
+                    if (ended_before_frontier)
+                        "end-of-run snapshot: execution stopped before the first GPU bootstrap call. This proves only that the call was not reached before termination; inspect the termination owner and live parked threads before classifying a stable graphics stall"
+                    else
+                        blocked.guidance(),
                 },
             );
+            if (ended_before_frontier) {
+                machoCapturePrint(
+                    "macho-processor: gpu bootstrap stop context: termination_reason={s} exit_code={d} faulted={} active_thread=0x{x} blocked_threads={d} suspended_contexts={d}; a zero frontier with live parked threads is an upstream lifecycle/scheduler finding, not evidence that VdInitializeEngines itself failed\n",
+                    .{
+                        @tagName(exit_diagnostics.reasonFromValue(self.termination_reason)),
+                        self.exit_code,
+                        self.faulted,
+                        self.active_guest_thread,
+                        self.pthreads.blocked_threads,
+                        self.suspended_guest_thread_count,
+                    },
+                );
+            }
             inline for (@typeInfo(gpu.Step).@"enum".fields) |field| {
                 const step: gpu.Step = @enumFromInt(field.value);
                 const entry = self.gpu_bootstrap.observations[field.value];
@@ -160,8 +194,8 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             }
         } else if (self.gpu_bootstrap.observations[0].seen) {
             machoCapturePrint(
-                "macho-processor: gpu bootstrap frontier: complete ({d}/{d} steps observed, out_of_order={d}); the guest drove the whole bootstrap, so any remaining absence of output is downstream of command submission\n",
-                .{ frontier.reached, gpu.bootstrap.step_count, self.gpu_bootstrap.out_of_order },
+                "macho-processor: gpu bootstrap frontier: complete ({d}/{d} required steps observed, optional_observed={d}, out_of_order={d}); the guest drove the whole bootstrap, so any remaining absence of output is downstream of command submission\n",
+                .{ frontier.reached, gpu.bootstrap.required_step_count, frontier.optional_observed, self.gpu_bootstrap.out_of_order },
             );
         }
     }

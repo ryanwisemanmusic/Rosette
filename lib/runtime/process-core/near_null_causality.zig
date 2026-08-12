@@ -255,7 +255,7 @@ fn reportByteOrderSurvey(self: anytype) void {
     if (found.reversed() == 0) return;
 
     machoCapturePrint(
-        "macho-processor: near-null causality: BYTE ORDER SURVEY examined={d} native_guest={d} reversed32={d} reversed64={d} ambiguous={d} reversed_with_null_low_half={d} systematic={}; {s}\n",
+        "macho-processor: near-null causality: BYTE ORDER SURVEY examined={d} native_guest={d} reversed32={d} reversed64={d} ambiguous={d} reversed_with_null_low_half={d} independent={d} systematic={}; {s}\n",
         .{
             found.examined,
             found.native,
@@ -263,9 +263,12 @@ fn reportByteOrderSurvey(self: anytype) void {
             found.reversed64,
             found.ambiguous,
             found.null_low_half,
+            found.independent,
             found.systematic(),
             if (found.systematic())
                 "more than one register independently holds a guest address in host byte order, so this is the guest-memory conversion path and not a single bad instruction. Do not spend the investigation on the faulting address"
+            else if (found.independent <= 1 and found.reversed() > 1)
+                "several registers classify as reversed, but they hold one allocation's worth of pointers rather than independent data — one witness, not several. A host pointer whose low byte lands in the guest window reverses into it by arithmetic alone, so treat this as coincidence and investigate the faulting address normally"
             else
                 "one register holds a guest address in host byte order; the fault site and the conversion site may be the same instruction",
         },
@@ -316,6 +319,12 @@ fn dumpRegisterChain(
     // enough". The ring is process-wide and filtered per thread, so the useful
     // depth is the same-thread count, not the ring size.
     const window = retainedWindow(self);
+    const memory_trace_status: []const u8 = if (window.memory_entries != 0)
+        ""
+    else if (!self.memory_trace_enabled)
+        "; memory trace disabled by ROSETTE_MACHO_MEMORY_TRACE=0; exact memory-producer attribution is unavailable"
+    else
+        "; memory trace enabled but no entries were retained for this thread";
     machoCapturePrint(
         "macho-processor: near-null causality: {s}_window register={s} terminal=0x{x} mask=0x{x} thread=0x{x} thread_entries={d}/{d} saturated={} live_threads={d} evicted_threads={d} recorded={d} filtered={d} status=\"{s}\" memory_trace_entries={d}{s}\n",
         .{
@@ -333,10 +342,7 @@ fn dumpRegisterChain(
             window.skipped,
             window.reason,
             window.memory_entries,
-            if (window.memory_entries == 0)
-                "; memory trace ring empty — the generated-code recording gate produced no entries for this thread, so exact-producer attribution is unavailable and the walk falls back to historical re-decode"
-            else
-                "",
+            memory_trace_status,
         },
     );
     if (count == 0) return;
@@ -374,8 +380,24 @@ fn dumpRegisterChain(
             break;
         };
         const symbol = self.metadata.nearestSymbol(transition.instruction_address);
+        // Decode the instruction that performed the transition. A value pair on
+        // its own leaves the reader to infer the operation — `0x80000000 -> 0x1`
+        // is a sign-bit extract, but only if you notice that 0x80000000 >> 31
+        // is 1. Naming the op turns a puzzle into a reading, and the bytes make
+        // it checkable when the decoder and the reader disagree.
+        var op_bytes: [8]u8 = undefined;
+        var op_len: usize = 0;
+        var op_name: []const u8 = "<undecoded>";
+        if (self.guestMemoryConst(transition.instruction_address, 16)) |raw| {
+            const decoded_transition = decodeInsn(raw);
+            if (decoded_transition.op != .invalid and decoded_transition.len != 0) {
+                op_name = @tagName(decoded_transition.op);
+                op_len = @min(@as(usize, decoded_transition.len), op_bytes.len);
+                @memcpy(op_bytes[0..op_len], raw[0..op_len]);
+            }
+        }
         machoCapturePrint(
-            "macho-processor: near-null causality: {s}_chain[{d}] register={s} before=0x{x} after=0x{x} instruction=0x{x} {s}+0x{x} retained_distance={d}\n",
+            "macho-processor: near-null causality: {s}_chain[{d}] register={s} before=0x{x} after=0x{x} instruction=0x{x} op={s} bytes={any} {s}+0x{x} retained_distance={d}\n",
             .{
                 role,
                 chain_depth,
@@ -383,6 +405,8 @@ fn dumpRegisterChain(
                 transition.before,
                 transition.after,
                 transition.instruction_address,
+                op_name,
+                op_bytes[0..op_len],
                 self.metadata.symbolLabel(transition.instruction_address),
                 if (symbol) |resolved| resolved.offset else 0,
                 transition.retained_distance,
@@ -531,7 +555,10 @@ pub fn retainedWindow(self: anytype) RetainedWindow {
         .reason = if (window.emptyBecauseDisabled())
             "instruction history recording is DISABLED; this is not an absence of evidence"
         else if (window.emptyBecauseFiltered())
-            "no instruction in this thread's history passed the recording policy (generated-code-only); the fault's own fragment should have been recorded, so this is a policy or ordering defect"
+            filteredWindowReason(
+                self.regs.rip >= self.executable_min and
+                    self.regs.rip < self.executable_max,
+            )
         else if (window.thread_entries == 0)
             "recording is enabled but nothing was retained for this thread yet"
         else
@@ -545,6 +572,30 @@ pub fn retainedWindow(self: anytype) RetainedWindow {
         .evictions = window.evictions,
         .memory_entries = memory_entries,
     };
+}
+
+/// Explain an empty generated-code-only history without changing a deliberate
+/// host-code filter into a false runtime defect. A generated fault with no
+/// retained entries remains a real policy/ordering problem; a native Mach-O
+/// fault is outside this tape by construction.
+pub fn filteredWindowReason(fault_in_host_image: bool) []const u8 {
+    return if (fault_in_host_image)
+        "fault is in native Mach-O host code, intentionally outside the generated-code-only history; use fault-local ownership evidence or explicitly enable all-instruction tracing"
+    else
+        "fault is in generated code but no instruction in this thread passed the generated-code-only policy; this is a policy or ordering defect";
+}
+
+test "filtered history distinguishes native exclusion from generated policy defect" {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        filteredWindowReason(true),
+        "intentionally outside",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        filteredWindowReason(false),
+        "policy or ordering defect",
+    ) != null);
 }
 
 /// The value a register held on the faulting thread at the most recent
@@ -697,8 +748,8 @@ fn findExactProducer(self: anytype, transition: Transition) ?Producer {
         const access = self.memory_trace_entries[index];
         if (access.instruction_address != transition.instruction_address or
             !std.mem.eql(u8, access.access, "read") or
-            access.bytes != @sizeOf(u64) or
-            access.value != transition.after)
+            (access.bytes != 1 and access.bytes != 2 and access.bytes != 4 and access.bytes != 8) or
+            access.value != 0)
         {
             continue;
         }
@@ -716,11 +767,45 @@ fn findExactProducer(self: anytype, transition: Transition) ?Producer {
     if (transition.trace_ordinal >= trace_count) return null;
     const entry = traceEntry(self, transition.trace_ordinal) orelse return null;
     const decoded = self.decodeWithSnapshotOperands(entry) orelse return null;
-    if (decoded.op != .mov_reg64_mem64 or
-        decoded.dst_reg != transition.register)
-    {
-        return null;
-    }
+    const load_size: Size = switch (decoded.op) {
+        .mov_reg8_mem8 => .bits8,
+        .mov_reg16_mem16 => .bits16,
+        .mov_reg32_mem32 => .bits32,
+        .mov_reg64_mem64 => .bits64,
+        .movbe_reg_mem => decoded.size,
+        else => return null,
+    };
+    if (decoded.dst_reg != transition.register) return null;
+
+    // Re-reading is admissible only if the source still demonstrates the
+    // transition. The previous implementation returned every historical
+    // MOV64 address without checking its value and therefore attributed a
+    // later MOVBE-produced zero to an unrelated earlier slot.
+    const byte_count: usize = switch (load_size) {
+        .bits8 => 1,
+        .bits16 => 2,
+        .bits32 => 4,
+        .bits64 => 8,
+    };
+    const source = self.guestMemoryConst(decoded.addr, byte_count) orelse return null;
+    if (source.len < byte_count) return null;
+    const raw_value: u64 = switch (load_size) {
+        .bits8 => source[0],
+        .bits16 => std.mem.readInt(u16, source[0..2], .little),
+        .bits32 => std.mem.readInt(u32, source[0..4], .little),
+        .bits64 => std.mem.readInt(u64, source[0..8], .little),
+    };
+    const loaded_value = if (decoded.op == .movbe_reg_mem)
+        x64_decoder.byteSwap(load_size, raw_value)
+    else
+        raw_value;
+    const value_mask: u64 = switch (load_size) {
+        .bits8 => std.math.maxInt(u8),
+        .bits16 => std.math.maxInt(u16),
+        .bits32 => std.math.maxInt(u32),
+        .bits64 => std.math.maxInt(u64),
+    };
+    if ((loaded_value & value_mask) != (transition.after & value_mask)) return null;
     return .{
         .slot = decoded.addr,
         .instruction_address = transition.instruction_address,
@@ -808,7 +893,7 @@ fn dumpProducer(self: anytype, producer: Producer) void {
         }
     } else {
         machoCapturePrint(
-            "macho-processor: near-null causality: producer_last_writer slot=0x{x} absent; no retained pointer-bearing initialization or clear reached this member\n",
+            "macho-processor: near-null causality: producer_last_writer slot=0x{x} absent; no retained initialization or clear reached this member. This is missing evidence, not proof that no write occurred: the bounded watch may have armed after initialization or filled before this page was discovered\n",
             .{producer.slot},
         );
     }
@@ -821,10 +906,14 @@ fn dumpRootClassification(
     role: []const u8,
     terminal_register_value: u64,
 ) void {
+    const producer_history = if (self.memory_writes.lookup(producer.slot) != null)
+        "retained"
+    else
+        "not_retained";
     if (!std.mem.eql(u8, role, "this") and terminal_register_value < 0x1000) {
         if (self.memory_forwarder.containingAllocation(producer.slot)) |allocation| {
             machoCapturePrint(
-                "macho-processor: near-null ROOT CAUSE: class=zero_container_backing_pointer_to_derived_near_null allocation=0x{x} member_offset=0x{x} source_slot=0x{x} source_value=0x0 derived_{s}=0x{x} displaced_prior_register=0x{x}; inspect the source slot's clear/free/reuse history, not the terminal stdlib helper\n",
+                "macho-processor: near-null FIRST INVALID TRANSITION: class=zero_container_backing_pointer_to_derived_near_null allocation=0x{x} member_offset=0x{x} source_slot=0x{x} source_value=0x0 derived_{s}=0x{x} displaced_prior_register=0x{x} producer_history={s}; this proves where valid state became zero-derived, not why the source was zero. Inspect its producer/dependency path, not the terminal helper\n",
                 .{
                     allocation.base,
                     allocation.offset,
@@ -832,31 +921,33 @@ fn dumpRootClassification(
                     role,
                     terminal_register_value,
                     previous_register_value,
+                    producer_history,
                 },
             );
             return;
         }
         machoCapturePrint(
-            "macho-processor: near-null ROOT CAUSE: class=zero_backing_pointer_to_derived_near_null source_slot=0x{x} source_value=0x0 derived_{s}=0x{x} displaced_prior_register=0x{x}; inspect the source slot's clear/free/reuse history, not the terminal stdlib helper\n",
+            "macho-processor: near-null FIRST INVALID TRANSITION: class=zero_backing_pointer_to_derived_near_null source_slot=0x{x} source_value=0x0 derived_{s}=0x{x} displaced_prior_register=0x{x} producer_history={s}; this proves where valid state became zero-derived, not why the source was zero. Correlate earlier failed dependencies or allocations before attributing a clear\n",
             .{
                 producer.slot,
                 role,
                 terminal_register_value,
                 previous_register_value,
+                producer_history,
             },
         );
         return;
     }
     if (self.memory_forwarder.containingAllocation(producer.slot)) |allocation| {
         machoCapturePrint(
-            "macho-processor: near-null ROOT CAUSE: class=null_object_member_to_invalid_this object=0x{x} member_offset=0x{x} member_slot=0x{x} member_value=0x0 displaced_prior_register=0x{x}; inspect object/base-constructor initialization or the call that supplied this dependency, not the terminal container access\n",
-            .{ allocation.base, allocation.offset, producer.slot, previous_register_value },
+            "macho-processor: near-null FIRST INVALID TRANSITION: class=null_object_member_to_invalid_this object=0x{x} member_offset=0x{x} member_slot=0x{x} member_value=0x0 displaced_prior_register=0x{x} producer_history={s}; inspect object initialization or the dependency that supplied this member\n",
+            .{ allocation.base, allocation.offset, producer.slot, previous_register_value, producer_history },
         );
         return;
     }
     machoCapturePrint(
-        "macho-processor: near-null ROOT CAUSE: class=zero_pointer_load_to_invalid_this source_slot=0x{x} displaced_prior_register=0x{x}; inspect the exact producer and its initialization path\n",
-        .{ producer.slot, previous_register_value },
+        "macho-processor: near-null FIRST INVALID TRANSITION: class=zero_pointer_load_to_invalid_this source_slot=0x{x} displaced_prior_register=0x{x} producer_history={s}; inspect the source's producer and initialization path\n",
+        .{ producer.slot, previous_register_value, producer_history },
     );
 }
 
