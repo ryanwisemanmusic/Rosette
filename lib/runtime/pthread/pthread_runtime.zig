@@ -141,6 +141,10 @@ pub const Runtime = struct {
     threads: [MAX_THREADS]Thread = [_]Thread{.{}} ** MAX_THREADS,
     mutexes: [MAX_MUTEXES]Mutex = [_]Mutex{.{}} ** MAX_MUTEXES,
     condvars: [MAX_CONDVARS]CondVar = [_]CondVar{.{}} ** MAX_CONDVARS,
+    /// Who has notified each object, not merely how often. A blocked count
+    /// cannot say whether a wake can still arrive; a notifier that is itself
+    /// waiting on the object it used to signal can be shown never to send one.
+    waits: scheduler.notifier_liveness.Graph = .{},
     created_threads: u64 = 0,
     deferred_threads: u64 = 0,
     joined_threads: u64 = 0,
@@ -214,12 +218,14 @@ pub const Runtime = struct {
         if (std.mem.eql(u8, name, "_pthread_cond_destroy")) return .{ .handled = self.condvarDestroy(state.regs.rdi) };
         if (std.mem.eql(u8, name, "_pthread_cond_signal")) {
             self.condition_notifications +|= 1;
+            self.noteNotifier(state.regs.rdi, self.currentThreadHandle(state), state.regs.rip, schedulerStep(state));
             self.condvarSignal(state.regs.rdi);
             return .{ .handled = 0 };
         }
         if (std.mem.eql(u8, name, "_pthread_cond_broadcast")) {
             self.condition_notifications +|= 1;
             self.condition_broadcasts +|= 1;
+            self.noteNotifier(state.regs.rdi, self.currentThreadHandle(state), state.regs.rip, schedulerStep(state));
             self.condvarBroadcast(state.regs.rdi);
             return .{ .handled = 0 };
         }
@@ -242,12 +248,14 @@ pub const Runtime = struct {
         const owner = self.currentThreadHandle(state);
         if (std.mem.indexOf(u8, name, "condition_variable10notify_one") != null) {
             self.condition_notifications +|= 1;
+            self.noteNotifier(state.regs.rdi, owner, state.regs.rip, schedulerStep(state));
             self.condvarSignal(state.regs.rdi);
             return .handled_void;
         }
         if (std.mem.indexOf(u8, name, "condition_variable10notify_all") != null) {
             self.condition_notifications +|= 1;
             self.condition_broadcasts +|= 1;
+            self.noteNotifier(state.regs.rdi, owner, state.regs.rip, schedulerStep(state));
             self.condvarBroadcast(state.regs.rdi);
             return .handled_void;
         }
@@ -265,6 +273,93 @@ pub const Runtime = struct {
             return .{ .handled = @intFromBool(self.mutexTryLockForThread(state.regs.rdi, owner) == 0) };
         }
         return null;
+    }
+
+    /// Per-thread state, not an aggregate.
+    ///
+    /// `blocked=15` says fifteen threads are waiting and nothing about what
+    /// they are waiting for, so a run whose producer never advances looks the
+    /// same as one whose producer is finished. What decides between those is
+    /// which resource each thread is parked on and how long it has been there:
+    /// a thread blocked since a step millions behind the current one is not
+    /// participating in the run any more, and if it is the producer, naming
+    /// its resource names the missing signaller.
+    ///
+    /// Bounded on purpose — the census reports every active thread once per
+    /// call, and calls are on the heartbeat cadence rather than per step.
+    pub fn logThreadCensus(self: *const Runtime, current_step: u64, active_handle: u64) void {
+        var reported: u32 = 0;
+        var blocked: u32 = 0;
+        var longest_block: u64 = 0;
+        for (&self.threads) |*thread| {
+            if (!thread.active) continue;
+            reported += 1;
+            const parked = switch (thread.state) {
+                .waiting_mutex,
+                .waiting_condvar,
+                .waiting_semaphore,
+                .waiting_event,
+                .waiting_futex_address,
+                .waiting_join,
+                .sleeping_indefinitely,
+                .sleeping_until_deadline,
+                => true,
+                else => false,
+            };
+            if (parked) {
+                blocked += 1;
+                const age = current_step -| thread.blocked_since_step;
+                if (age > longest_block) longest_block = age;
+            }
+            machoCapturePrint(
+                "  thread handle=0x{x} id={d} state={s}{s} reason={s} waiting(mutex=0x{x} condvar=0x{x} address=0x{x}) generation={d}/{d} timed={} deadline={d} result={s} blocked_since_step={d} age_steps={d} start_routine=0x{x}\n",
+                .{
+                    thread.handle,
+                    thread.numeric_id,
+                    @tagName(thread.state),
+                    if (thread.handle == active_handle) " (ACTIVE)" else "",
+                    if (thread.blocked_reason.len != 0) thread.blocked_reason else "none",
+                    thread.waiting_mutex,
+                    thread.waiting_condvar,
+                    thread.wait_address,
+                    thread.wait_generation,
+                    thread.notified_generation,
+                    thread.timed_wait,
+                    thread.wait_deadline_nanoseconds,
+                    @tagName(thread.wait_result),
+                    thread.blocked_since_step,
+                    if (parked) current_step -| thread.blocked_since_step else 0,
+                    thread.start_routine,
+                },
+            );
+        }
+        machoCapturePrint(
+            "macho-processor: THREAD CENSUS: active={d} parked={d} longest_park_steps={d} active_handle=0x{x} step={d}; {s}\n",
+            .{
+                reported,
+                blocked,
+                longest_block,
+                active_handle,
+                current_step,
+                if (reported == 0)
+                    "no guest threads are registered, so nothing here can be producing work"
+                else if (blocked == reported)
+                    "EVERY registered thread is parked. Whatever the run is still doing, no guest thread is advancing, and the resource named above for the longest-parked thread is the one with no signaller"
+                else if (blocked == 0)
+                    "no thread is parked; a stalled frontier here is a control-flow problem inside running code, not a missing wake"
+                else
+                    "some threads are running and some are parked; correlate the parked resources against the frontier before blaming a wait",
+            },
+        );
+    }
+
+    /// The object whose waiters are most stuck, for a caller that can resolve
+    /// the notifier's program counter to a name. Reported from there rather
+    /// than here because "last signalled from 0x48b150" is an address and
+    /// "last signalled from CommandProcessor::WorkerThreadMain" is an answer.
+    pub fn worstWaitObject(self: *Runtime, current_step: u64) ?scheduler.notifier_liveness.Object {
+        const object = self.waits.worstObject(current_step, scheduler.notifier_liveness.default_stall_steps) orelse return null;
+        return object.*;
     }
 
     pub fn logSummary(self: *const Runtime) void {
@@ -528,6 +623,9 @@ pub const Runtime = struct {
             waiting_thread.wait_address = cond_addr;
             waiting_thread.wait_result = .pending;
             waiting_thread.spurious_wake_pending = false;
+            if (self.threadSlot(handle)) |slot| {
+                self.waits.noteWait(cond_addr, slot, schedulerStep(state));
+            }
             self.bumpStateVersion();
         }
         const State = @TypeOf(state.*);
@@ -635,6 +733,11 @@ pub const Runtime = struct {
         thread.blocked_reason = "";
         thread.waiting_condvar = 0;
         thread.waiting_mutex = 0;
+        if (thread.waiting_condvar != 0) {
+            if (self.threadSlot(thread.handle)) |slot| {
+                self.waits.noteWake(thread.waiting_condvar, slot);
+            }
+        }
         thread.wait_generation = 0;
         thread.notified_generation = 0;
         thread.timed_wait = false;
@@ -950,6 +1053,15 @@ pub const Runtime = struct {
         return 0;
     }
 
+    /// `notifier` is the thread that sent the notification and `pc` where it
+    /// sent it from. Recorded because the useful question about a stalled wait
+    /// is whether its notifier can still run, and a notification count cannot
+    /// answer that.
+    pub fn noteNotifier(self: *Runtime, address: u64, notifier: u64, pc: u64, step: u64) void {
+        const slot = self.threadSlot(notifier) orelse return;
+        self.waits.noteNotify(address, slot, notifier, pc, step);
+    }
+
     fn condvarSignal(self: *Runtime, address: u64) void {
         if (self.condvarForAddress(address)) |cv| {
             cv.generation +|= 1;
@@ -1089,6 +1201,13 @@ pub const Runtime = struct {
             if (mutex.active) continue;
             mutex.* = .{ .active = true, .address = address };
             return mutex;
+        }
+        return null;
+    }
+
+    fn threadSlot(self: *const Runtime, handle: u64) ?usize {
+        for (&self.threads, 0..) |*thread, index| {
+            if (thread.active and thread.handle == handle) return index;
         }
         return null;
     }
