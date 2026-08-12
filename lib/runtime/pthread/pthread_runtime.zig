@@ -174,7 +174,6 @@ pub const Runtime = struct {
     next_numeric_thread_id: u64 = 2,
     main_thread_handle: u64 = CURRENT_THREAD_HANDLE,
     last_diagnostic_step: u64 = 0,
-    last_reported_expected_parks: u32 = 0,
     event_log: ?*scheduler.SchedulerEventLog = null,
 
     pub fn attachEventLog(self: *Runtime, event_log: *scheduler.SchedulerEventLog) void {
@@ -306,7 +305,6 @@ pub const Runtime = struct {
         if (current_step -| self.last_diagnostic_step < 5_000_000) return;
         var actionable_blocked_count: u32 = 0;
         var expected_parked_count: u32 = 0;
-        var oldest_expected_park_steps: u64 = 0;
         for (&self.threads) |*thread| {
             if (!thread.active or thread.state == .runnable or thread.state == .running or
                 thread.state == .terminated or thread.state == .cancelled)
@@ -328,7 +326,6 @@ pub const Runtime = struct {
             };
             if (expected_dependency_wait) {
                 expected_parked_count += 1;
-                oldest_expected_park_steps = @max(oldest_expected_park_steps, current_step -| thread.blocked_since_step);
                 continue;
             }
             actionable_blocked_count += 1;
@@ -350,13 +347,6 @@ pub const Runtime = struct {
                 "macho-processor: scheduler health: modeled_pthreads_runnable={d} actionable_waits={d} expected_parked={d} total_created={d}\n",
                 .{ active, actionable_blocked_count, expected_parked_count, self.created_threads },
             );
-        }
-        if (expected_parked_count != self.last_reported_expected_parks) {
-            machoCapturePrint(
-                "macho-processor: scheduler: expected parks={d} oldest_age={d} steps; these are pending finite deadlines or dormant dependency waits, not deadlock evidence\n",
-                .{ expected_parked_count, oldest_expected_park_steps },
-            );
-            self.last_reported_expected_parks = expected_parked_count;
         }
         self.last_diagnostic_step = current_step;
     }
@@ -502,12 +492,6 @@ pub const Runtime = struct {
         const deadline = if (timed_wait) cppDeadlineNanoseconds(state) else 0;
         if (timed_wait and state.regs.rdx == cpp_infinite_time_point) {
             self.cpp_indefinite_waits_started +|= 1;
-            if (self.cpp_indefinite_waits_started <= 8) {
-                machoCapturePrint(
-                    "macho-processor: libc++ condition wait classified indefinite: thread=0x{x} cond=0x{x} raw_time_point=INT64_MAX; no finite guest timer scheduled\n",
-                    .{ handle, cond_addr },
-                );
-            }
         }
         return self.beginCooperativeWait(state, handle, cond_addr, mutex_addr, deadline);
     }
@@ -570,10 +554,10 @@ pub const Runtime = struct {
             .deadline_ns = deadline_nanoseconds,
             .reason = "pthread_cond_wait",
         });
-        if (self.collapsed_waits <= 8 or self.collapsed_waits % 1000 == 0) {
+        if (self.collapsed_waits <= 4) {
             machoCapturePrint(
-                "macho-processor: cooperative condvar wait #{d} cond=0x{x} released_mutex=0x{x} thread=0x{x} waiters={d} timed={} now_ns={d} deadline_ns={d}\n",
-                .{ self.collapsed_waits, cond_addr, mutex_addr, handle, cv.waiters, deadline_nanoseconds != 0, monotonicNow(state), deadline_nanoseconds },
+                "macho-processor: cooperative condvar wait #{d} cond=0x{x} released_mutex=0x{x} thread=0x{x} waiters={d} timed={} now_ns={d} deadline_ns={d} classification={s}\n",
+                .{ self.collapsed_waits, cond_addr, mutex_addr, handle, cv.waiters, deadline_nanoseconds != 0, monotonicNow(state), deadline_nanoseconds, if (deadline_nanoseconds == 0) "expected_dependency_park" else "finite_timer_wait" },
             );
         }
         return true;
