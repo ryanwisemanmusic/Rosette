@@ -172,7 +172,13 @@ pub const Model = struct {
     }
 
     pub fn isGuestAddress(self: *const Model, address: u64) bool {
-        return self.classify(address).in_window;
+        // Membership in the guest window does not depend on the optional
+        // containing-region detail returned by classify(). This predicate is
+        // used by store provenance on the interpreter hot path, where walking
+        // all observed regions for every ordinary integer store turned a
+        // two-bound check into an O(region_count) scan.
+        const low = canonical32(address) orelse return false;
+        return low >= self.base and low < self.end;
     }
 };
 
@@ -206,6 +212,18 @@ test "a guest that maps outside the assumed range is classified correctly" {
     try std.testing.expect(!model.isGuestAddress(0x8258_2cc8));
     try std.testing.expectEqual(@as(u64, 0x4000_0000), model.base);
     try std.testing.expectEqual(@as(u64, 0x6000_0000), model.end);
+}
+
+test "window membership does not require a containing region" {
+    var model = Model{};
+    model.declare(0x4000_0000, 0x6000_0000);
+
+    // Retained regions are explanatory metadata. They need not contain a
+    // value for the canonical window predicate to answer it correctly.
+    model.observe(.{ .base = 0x1000, .size = 0x1000 });
+    try std.testing.expect(model.isGuestAddress(0x4100_0000));
+    try std.testing.expect(!model.isGuestAddress(0x6100_0000));
+    try std.testing.expect(!model.isGuestAddress(0x1_4100_0000));
 }
 
 test "small mappings never redefine the window" {
