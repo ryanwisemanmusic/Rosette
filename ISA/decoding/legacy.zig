@@ -392,6 +392,19 @@ test "shared VEX decoder handles both VMOVD transfer directions" {
     try std.testing.expect(!to_memory.is_reg_form);
 }
 
+test "shared legacy path decodes Xenia VMINSD absolute SIB form" {
+    const decoded = decodeLegacyInstruction(
+        &[_]u8{ 0xC5, 0xDB, 0x5D, 0x0C, 0x25, 0x10, 0xC4, 0x77, 0x06 },
+        .long64,
+    );
+    try std.testing.expectEqual(Op.vminsd, decoded.op);
+    try std.testing.expectEqual(@as(u8, 9), decoded.len);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 4), decoded.xmm_src);
+    try std.testing.expect(!decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u64, 0x0677_C410), decoded.addr);
+}
+
 test "shared VEX decoder owns MXCSR transfer encodings" {
     const load = decodeVexInstruction(&[_]u8{ 0xC5, 0xF8, 0xAE, 0x56, 0xF0 }) orelse
         return error.ExpectedVldmxcsr;

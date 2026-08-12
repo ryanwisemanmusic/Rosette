@@ -3116,9 +3116,21 @@ pub fn findByName(name: []const u8) ?InstructionTable {
 }
 
 fn findExact(name: []const u8) ?InstructionTable {
+    // Most lookups are the canonical mnemonic encoded in the table filename.
+    // Keep this pass source-free: metadata() parses the full .inc payload, and
+    // doing that for every table on every decoder operation made ABI checks
+    // O(decoder_ops * tables * source_bytes).
     for (tables) |table| {
-        const meta = table.metadata();
-        if (std.ascii.eqlIgnoreCase(meta.name, name)) return table;
+        if (std.ascii.eqlIgnoreCase(mnemonicFromPath(table.path), name)) return table;
+    }
+
+    // Only uncommon declared-name overrides and aliases need to inspect table
+    // source. Keeping them in a second pass preserves all existing matching
+    // behavior without taxing canonical lookups.
+    for (tables) |table| {
+        if (anyStringAssignment(table.source, &[_][]const u8{ "name", "instruction" })) |declared_name| {
+            if (std.ascii.eqlIgnoreCase(declared_name, name)) return table;
+        }
         // Alias lookups: several specs declare canonical aliases (e.g. FSTSW
         // declares FNSTSW) that consumers (ISA ABI contract, CLEO routing)
         // resolve by mnemonic.

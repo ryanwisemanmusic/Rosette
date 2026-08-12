@@ -1140,7 +1140,9 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    if (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or opcode == 0x5E) {
+    if (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or
+        opcode == 0x5D or opcode == 0x5E or opcode == 0x5F)
+    {
         if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
 
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
@@ -1176,11 +1178,25 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
                 3 => .vsubsd,
                 else => unreachable,
             },
+            0x5D => switch (prefix) {
+                0 => .vminps,
+                1 => .vminpd,
+                2 => .vminss,
+                3 => .vminsd,
+                else => unreachable,
+            },
             0x5E => switch (prefix) {
                 0 => .vdivps,
                 1 => .vdivpd,
                 2 => .vdivss,
                 3 => .vdivsd,
+                else => unreachable,
+            },
+            0x5F => switch (prefix) {
+                0 => .vmaxps,
+                1 => .vmaxpd,
+                2 => .vmaxss,
+                3 => .vmaxsd,
                 else => unreachable,
             },
             else => unreachable,
@@ -1657,10 +1673,12 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    // VEX.0F arithmetic: VADD (58), VMUL (59), VSUB (5C), VDIV (5E)
+    // VEX.0F arithmetic/extrema: VADD (58), VMUL (59), VSUB (5C),
+    // VMIN (5D), VDIV (5E), VMAX (5F).
     // Prefix: 0=PS, 1=PD, 2=SS, 3=SD
     if (opcode_map == 1 and
-        (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or opcode == 0x5E))
+        (opcode == 0x58 or opcode == 0x59 or opcode == 0x5C or
+            opcode == 0x5D or opcode == 0x5E or opcode == 0x5F))
     {
         if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
 
@@ -1697,11 +1715,25 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
                 3 => .vsubsd,
                 else => unreachable,
             },
+            0x5D => switch (prefix) {
+                0 => .vminps,
+                1 => .vminpd,
+                2 => .vminss,
+                3 => .vminsd,
+                else => unreachable,
+            },
             0x5E => switch (prefix) {
                 0 => .vdivps,
                 1 => .vdivpd,
                 2 => .vdivss,
                 3 => .vdivsd,
+                else => unreachable,
+            },
+            0x5F => switch (prefix) {
+                0 => .vmaxps,
+                1 => .vmaxpd,
+                2 => .vmaxss,
+                3 => .vmaxsd,
                 else => unreachable,
             },
             else => unreachable,
