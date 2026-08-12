@@ -25,6 +25,7 @@ pub const RunOptions = struct {
     kill_grace_ms: u64 = 750,
     isolate_process_group: bool = true,
     signal_policy: SignalPolicy = .process_group,
+    cleanup_process_group_on_exit: bool = true,
     stdin: std.process.SpawnOptions.StdIo = .inherit,
     stdout: std.process.SpawnOptions.StdIo = .inherit,
     stderr: std.process.SpawnOptions.StdIo = .inherit,
@@ -54,6 +55,57 @@ pub const TimeoutReport = struct {
     survived: bool,
 };
 
+pub const ProcessGroupCleanupReport = struct {
+    found_members: bool = false,
+    sent_sigterm: bool = false,
+    sent_sigkill: bool = false,
+    survived: bool = false,
+};
+
+const SignalHandler = ?*const fn (c_int) callconv(.c) void;
+
+extern "c" fn signal(c_int, SignalHandler) SignalHandler;
+
+var forwarded_process_group: c.sig_atomic_t = 0;
+
+pub const SignalForwarding = struct {
+    previous_hup: SignalHandler = null,
+    previous_int: SignalHandler = null,
+    previous_quit: SignalHandler = null,
+    previous_term: SignalHandler = null,
+    installed: bool = false,
+
+    pub fn install(process_group: i32) SignalForwarding {
+        if (process_group <= 0) return .{};
+        const active: *volatile c.sig_atomic_t = &forwarded_process_group;
+        active.* = @intCast(process_group);
+        return .{
+            .previous_hup = signal(c.SIGHUP, forwardTerminationSignal),
+            .previous_int = signal(c.SIGINT, forwardTerminationSignal),
+            .previous_quit = signal(c.SIGQUIT, forwardTerminationSignal),
+            .previous_term = signal(c.SIGTERM, forwardTerminationSignal),
+            .installed = true,
+        };
+    }
+
+    pub fn deinit(self: *SignalForwarding) void {
+        if (!self.installed) return;
+        const active: *volatile c.sig_atomic_t = &forwarded_process_group;
+        active.* = 0;
+        _ = signal(c.SIGHUP, self.previous_hup);
+        _ = signal(c.SIGINT, self.previous_int);
+        _ = signal(c.SIGQUIT, self.previous_quit);
+        _ = signal(c.SIGTERM, self.previous_term);
+        self.installed = false;
+    }
+};
+
+fn forwardTerminationSignal(sig: c_int) callconv(.c) void {
+    const active: *volatile c.sig_atomic_t = &forwarded_process_group;
+    const process_group: i32 = @intCast(active.*);
+    if (process_group > 0) _ = c.kill(-process_group, sig);
+}
+
 pub fn run(io: std.Io, options: RunOptions) !RunStatus {
     if (options.argv.len == 0) return error.EmptyArgv;
 
@@ -74,8 +126,23 @@ pub fn run(io: std.Io, options: RunOptions) !RunStatus {
     const pid = child.id orelse return error.MissingChildPid;
     traceLaunch(options, pid);
 
+    var signal_forwarding = if (options.isolate_process_group and options.signal_policy == .process_group)
+        SignalForwarding.install(pid)
+    else
+        SignalForwarding{};
+    defer signal_forwarding.deinit();
+
+    var completed = false;
+    defer if (!completed and options.isolate_process_group and options.cleanup_process_group_on_exit) {
+        _ = cleanupProcessGroup(pid, options.kill_grace_ms);
+    };
+
     if (options.timeout_ms) |timeout_ms| {
         const status = try waitWithTimeout(&child, pid, timeout_ms, options.kill_grace_ms, options.signal_policy);
+        if (options.isolate_process_group and options.cleanup_process_group_on_exit) {
+            traceGroupCleanup(options, pid, cleanupProcessGroup(pid, options.kill_grace_ms));
+        }
+        completed = true;
         traceExit(options, pid, status);
         return status;
     }
@@ -85,6 +152,10 @@ pub fn run(io: std.Io, options: RunOptions) !RunStatus {
         return err;
     };
     const status = fromChildTerm(term);
+    if (options.isolate_process_group and options.cleanup_process_group_on_exit) {
+        traceGroupCleanup(options, pid, cleanupProcessGroup(pid, options.kill_grace_ms));
+    }
+    completed = true;
     traceExit(options, pid, status);
     return status;
 }
@@ -184,16 +255,24 @@ fn waitWithTimeout(
     }
 
     signalChild(pid, signal_policy, c.SIGKILL);
-    sleepMs(100);
+    var kill_elapsed: u64 = 0;
+    var reaped = false;
+    while (kill_elapsed <= @max(kill_grace_ms, 250)) : (kill_elapsed += poll_ms) {
+        if (try pollChild(child, pid) != null) {
+            reaped = true;
+            break;
+        }
+        sleepMs(poll_ms);
+    }
 
-    const survived = childStillAlive(pid);
-    if (!survived) {
-        _ = try pollChild(child, pid);
-    } else {
+    const survived = !reaped and childStillAlive(pid);
+    if (survived) {
         signalChild(pid, signal_policy, c.SIGSTOP);
         quarantineSurvivor(pid, signal_policy);
+        child.id = null;
+    } else if (!reaped) {
+        _ = try pollChild(child, pid);
     }
-    child.id = null;
     return .{ .timed_out = .{
         .pid = pid,
         .signaled_group = signal_policy == .process_group,
@@ -249,6 +328,36 @@ fn signalChild(pid: i32, signal_policy: SignalPolicy, sig: c_int) void {
     _ = c.kill(target, sig);
 }
 
+pub fn cleanupProcessGroup(process_group: i32, grace_ms: u64) ProcessGroupCleanupReport {
+    var report = ProcessGroupCleanupReport{};
+    if (process_group <= 0 or !processGroupStillAlive(process_group)) return report;
+
+    report.found_members = true;
+    if (c.kill(-process_group, c.SIGTERM) == 0) report.sent_sigterm = true;
+    if (waitForProcessGroupExit(process_group, grace_ms)) return report;
+
+    if (c.kill(-process_group, c.SIGKILL) == 0) report.sent_sigkill = true;
+    report.survived = !waitForProcessGroupExit(process_group, @max(grace_ms, 250));
+    if (report.survived) quarantineSurvivor(process_group, .process_group);
+    return report;
+}
+
+fn waitForProcessGroupExit(process_group: i32, timeout_ms: u64) bool {
+    const poll_ms: u64 = 25;
+    var elapsed_ms: u64 = 0;
+    while (elapsed_ms <= timeout_ms) : (elapsed_ms += poll_ms) {
+        if (!processGroupStillAlive(process_group)) return true;
+        sleepMs(poll_ms);
+    }
+    return !processGroupStillAlive(process_group);
+}
+
+fn processGroupStillAlive(process_group: i32) bool {
+    if (process_group <= 0) return false;
+    if (c.kill(-process_group, 0) == 0) return true;
+    return std.c._errno().* != c.ESRCH;
+}
+
 fn childStillAlive(pid: i32) bool {
     if (pid <= 0) return false;
     if (c.kill(pid, 0) == 0) return true;
@@ -294,6 +403,35 @@ fn traceLaunch(options: RunOptions, pid: i32) void {
 fn traceExit(options: RunOptions, pid: i32, status: RunStatus) void {
     traceLine(options, pid, "exit", status);
     writeActivePidRecord(options, pid, "exit", status);
+}
+
+fn traceGroupCleanup(options: RunOptions, pid: i32, report: ProcessGroupCleanupReport) void {
+    if (!report.found_members) return;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = tracePathFromEnv(allocator) orelse return;
+    if (std.fs.path.dirname(path)) |parent| makePathRecursive(allocator, parent) catch {};
+
+    const path_z = allocator.dupeZ(u8, path) catch return;
+    const fp = c.fopen(path_z.ptr, "a");
+    if (fp == null) return;
+    defer _ = c.fclose(fp);
+
+    var buf: [1024]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "{d}\tgroup_cleanup\tpid={d}\tlabel={s}\tsigterm={s}\tsigkill={s}\tsurvived={s}\n",
+        .{
+            @as(i64, @intCast(c.time(null))),
+            pid,
+            options.label,
+            if (report.sent_sigterm) "yes" else "no",
+            if (report.sent_sigkill) "yes" else "no",
+            if (report.survived) "yes" else "no",
+        },
+    ) catch return;
+    _ = c.fwrite(line.ptr, 1, line.len, fp);
 }
 
 fn writeActivePidRecord(options: RunOptions, pid: i32, event: []const u8, status: ?RunStatus) void {
@@ -412,4 +550,33 @@ test "active pid record identifies the routed child" {
     try std.testing.expect(std.mem.indexOf(u8, record, "event=launch\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, record, "label=apple_rosetta2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, record, "argv0=/usr/bin/env\n") != null);
+}
+
+test "process group cleanup drains a descendant after its leader exits" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+
+    const leader = c.fork();
+    if (leader < 0) return error.ForkFailed;
+    if (leader == 0) {
+        if (c.setpgid(0, 0) != 0) c._exit(126);
+        const descendant = c.fork();
+        if (descendant < 0) c._exit(125);
+        if (descendant == 0) {
+            while (true) _ = c.pause();
+        }
+        _ = c.usleep(50_000);
+        c._exit(0);
+    }
+
+    _ = c.setpgid(leader, leader);
+    var raw_status: c_int = 0;
+    while (c.waitpid(leader, &raw_status, 0) < 0) {
+        if (std.c._errno().* != c.EINTR) return error.WaitPidFailed;
+    }
+
+    const report = cleanupProcessGroup(leader, 500);
+    try std.testing.expect(report.found_members);
+    try std.testing.expect(report.sent_sigterm or report.sent_sigkill);
+    try std.testing.expect(!report.survived);
+    try std.testing.expect(!processGroupStillAlive(leader));
 }
