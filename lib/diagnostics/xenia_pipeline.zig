@@ -261,7 +261,9 @@ pub fn classifyLine(line: []const u8) ?Stage {
         contains(line, "module fully ready"))
         return .user_module_ready;
     if (contains(line, "Shader storage init request completed")) return .shader_storage_ready;
-    if (contains(line, "Guest main thread ready")) return .guest_main_ready;
+    if (contains(line, "Guest main thread ready") or
+        (contains(line, "GUEST EXECUTE:") and contains(line, "fid=0")))
+        return .guest_main_ready;
     if (contains(line, "CompleteLaunch SUCCEEDED")) return .complete_launch_ready;
     if (contains(line, "RING BUFFER INITIALIZED") or
         contains(line, "InitializeRingBuffer completed") or
@@ -318,6 +320,17 @@ test "pipeline records the setup launch and first-frame frontier" {
         "presentation API returned success; visible drawable pixels are not independently proven",
         engine.verdict(),
     );
+}
+
+test "first guest execution proves the main thread even without a breadcrumb" {
+    var engine = Engine{};
+    const observation = engine.observeLine(
+        "[xenia] i> GUEST EXECUTE: fid=0 address=82582A98 thread_id=5",
+        624_000_000,
+    ) orelse return error.TestExpectedEqual;
+
+    try std.testing.expectEqual(Stage.guest_main_ready, observation.stage);
+    try std.testing.expect(engine.hasReached(.guest_main_ready));
 }
 
 test "pipeline recognizes the Xenia ring-buffer completion breadcrumb" {
