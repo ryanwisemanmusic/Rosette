@@ -60,7 +60,7 @@ pub const decodeSetcc = x64_decoder.decodeSetcc;
 pub const decodeMovupsMovss = x64_decoder.decodeMovupsMovss;
 pub const decodeMovaps = x64_decoder.decodeMovaps;
 
-pub const VexArithmetic = enum { add, multiply, subtract, divide };
+pub const VexArithmetic = enum { add, multiply, subtract, divide, minimum, maximum };
 pub const VexBitwise = enum { @"and", and_not, @"or", xor };
 pub fn shuffleBytes(source: [16]u8, mask: [16]u8) [16]u8 {
     var result = [_]u8{0} ** 16;
@@ -183,6 +183,8 @@ pub fn vexArithmeticForOp(op: Op) VexArithmetic {
         .vmulss, .vmulsd, .vmulps, .vmulpd => .multiply,
         .vsubss, .vsubsd, .vsubps, .vsubpd => .subtract,
         .vdivss, .vdivsd, .vdivps, .vdivpd => .divide,
+        .vminss, .vminsd, .vminps, .vminpd => .minimum,
+        .vmaxss, .vmaxsd, .vmaxps, .vmaxpd => .maximum,
         else => unreachable,
     };
 }
@@ -193,6 +195,11 @@ pub fn applyVexArithmetic(comptime Float: type, lhs: Float, rhs: Float, operatio
         .multiply => lhs * rhs,
         .subtract => lhs - rhs,
         .divide => lhs / rhs,
+        // Intel MIN/MAX select the second operand for unordered inputs and
+        // equal zeroes. Plain comparisons reproduce that selection rule and
+        // preserve the second operand's NaN/sign-zero payload.
+        .minimum => if (lhs < rhs) lhs else rhs,
+        .maximum => if (lhs > rhs) lhs else rhs,
     };
 }
 

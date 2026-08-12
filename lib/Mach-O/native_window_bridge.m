@@ -28,7 +28,7 @@ static uint32_t g_height = 720;
 static uint32_t g_events_pumped;
 static BOOL g_fullscreen;
 static BOOL g_reported_off_main_thread;
-static uint64_t g_synthetic_vulkan_frames_presented;
+static uint64_t g_diagnostic_frames_presented;
 
 static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
   if (![NSThread isMainThread]) {
@@ -258,7 +258,7 @@ int rosette_macho_native_window_attach_metal_layer(void) {
   return result ? 1 : 0;
 }
 
-uint64_t rosette_macho_native_window_present_synthetic_vulkan_frame(
+uint64_t rosette_macho_native_window_present_diagnostic_frame(
     uint64_t serial, uint32_t width, uint32_t height, uint32_t stage) {
   __block uint64_t presented = 0;
   @autoreleasepool {
@@ -275,11 +275,13 @@ uint64_t rosette_macho_native_window_present_synthetic_vulkan_frame(
         return;
       }
 
-      // The translated Vulkan device and command stream are still modeled,
-      // so no authoritative guest pixels exist here yet. Put an unmistakable
-      // frame on the real CAMetalLayer anyway: this proves the final Cocoa /
-      // Metal forwarding boundary is live and prevents a permanently blank
-      // window while the native Vulkan object bridge is being completed.
+      // A liveness probe, not a frame. Nothing here involves a guest image, a
+      // Vulkan command buffer, a swapchain image, or a guest swap: it clears
+      // the drawable so a blank window can be distinguished from a dead
+      // Cocoa/Metal boundary. Rosette's native Vulkan presenter is what puts
+      // real frames on this layer; this exists for the case where that
+      // presenter could not be brought up, and its output must only ever be
+      // counted as `diagnostic_frames_presented`.
       const double phase = (double)((serial >> 4) % 7u) / 6.0;
       const double stage_bias = (double)(stage % 4u) * 0.08;
       MTLRenderPassDescriptor *pass =
@@ -298,7 +300,7 @@ uint64_t rosette_macho_native_window_present_synthetic_vulkan_frame(
       [encoder endEncoding];
       [command_buffer presentDrawable:drawable];
       [command_buffer commit];
-      presented = ++g_synthetic_vulkan_frames_presented;
+      presented = ++g_diagnostic_frames_presented;
     });
   }
   return presented;
@@ -370,7 +372,7 @@ void rosette_macho_native_window_shutdown(void) {
       g_view = nil;
       g_window = nil;
       g_fullscreen = NO;
-      g_synthetic_vulkan_frames_presented = 0;
+      g_diagnostic_frames_presented = 0;
     });
   }
 }

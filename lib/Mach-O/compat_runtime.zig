@@ -365,6 +365,29 @@ fn appleCtypeMask(character: u8) u32 {
 
 /// Initializes the libc++ ABI v1 `basic_string<char>` representation used by
 /// Apple libc++ ABI tag v160006.
+fn guestOwnedAllocate(state: anytype, size: u64, alignment: u64) ?u64 {
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    if (comptime @hasDecl(State, "guestHeapAllocate")) {
+        return state.guestHeapAllocate(size, alignment);
+    }
+    return state.guestAlloc(size, alignment);
+}
+
+fn guestOwnedRelease(state: anytype, address: u64) void {
+    if (address == 0) return;
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    if (comptime @hasDecl(State, "guestHeapRelease")) {
+        state.guestHeapRelease(address);
+    }
+}
+
+fn libcppLongAllocation(state: anytype, object: u64) ?u64 {
+    const object_bytes = state.guestMemoryConst(object, 24) orelse return null;
+    if (object_bytes[0] & 1 == 0) return null;
+    const address = state.read64(object + 16);
+    return if (address != 0) address else null;
+}
+
 pub fn initLibcppString(state: anytype, object: u64, source: u64, length: u64) bool {
     // A null pointer is valid for an empty string. Avoid asking the guest
     // address translator to map it, since real Mach-O mappings intentionally
@@ -399,7 +422,7 @@ pub fn initLibcppString(state: anytype, object: u64, source: u64, length: u64) b
 
     const capacity = std.math.add(u64, length, 16) catch return false;
     const allocation_size = capacity & ~@as(u64, 15);
-    const data = state.guestAlloc(allocation_size, 16) orelse return false;
+    const data = guestOwnedAllocate(state, allocation_size, 16) orelse return false;
     const data_bytes = state.guestMemory(data, allocation_size) orelse return false;
     const len: usize = @intCast(length);
     @memcpy(data_bytes[0..len], source_bytes);
@@ -412,7 +435,9 @@ pub fn initLibcppString(state: anytype, object: u64, source: u64, length: u64) b
 
 pub fn destroyLibcppString(state: anytype, object: u64) bool {
     const object_bytes = state.guestMemory(object, 24) orelse return false;
+    const allocation = libcppLongAllocation(state, object);
     @memset(object_bytes, 0);
+    if (allocation) |address| guestOwnedRelease(state, address);
     return true;
 }
 
@@ -435,7 +460,7 @@ pub fn initLibcppStringFromSlice(state: anytype, object: u64, value: []const u8)
         return true;
     }
     const capacity = (std.math.add(u64, value.len, 16) catch return false) & ~@as(u64, 15);
-    const allocation = state.guestAlloc(capacity, 16) orelse return false;
+    const allocation = guestOwnedAllocate(state, capacity, 16) orelse return false;
     const storage = state.guestMemory(allocation, capacity) orelse return false;
     @memcpy(storage[0..value.len], value);
     storage[value.len] = 0;
@@ -460,7 +485,7 @@ pub fn initLibcppStringFill(state: anytype, object: u64, length: u64, value: u8)
 
     const capacity = std.math.add(u64, length, 16) catch return false;
     const allocation_size = capacity & ~@as(u64, 15);
-    const data = state.guestAlloc(allocation_size, 16) orelse return false;
+    const data = guestOwnedAllocate(state, allocation_size, 16) orelse return false;
     const data_bytes = state.guestMemory(data, allocation_size) orelse return false;
     const len: usize = @intCast(length);
     @memset(data_bytes[0..len], value);
@@ -503,12 +528,13 @@ pub fn resizeLibcppString(state: anytype, object: u64, new_size: u64, fill_char:
         // need to grow
         const old_bytes = state.guestMemoryConst(data_ptr, old_len) orelse return false;
         const new_capacity = (std.math.add(u64, new_size, 16) catch return false) & ~@as(u64, 15);
-        const new_data = state.guestAlloc(new_capacity, 16) orelse return false;
+        const new_data = guestOwnedAllocate(state, new_capacity, 16) orelse return false;
         const new_bytes = state.guestMemory(new_data, new_capacity) orelse return false;
         const ol_us: usize = @intCast(old_len);
         @memcpy(new_bytes[0..ol_us], old_bytes);
         @memset(new_bytes[ol_us..ns], fill_char);
         new_bytes[ns] = 0;
+        guestOwnedRelease(state, data_ptr);
         state.write64(object, new_capacity | 1);
         state.write64(object + 8, new_size);
         state.write64(object + 16, new_data);
@@ -529,7 +555,7 @@ pub fn resizeLibcppString(state: anytype, object: u64, new_size: u64, fill_char:
 
     // short -> long transition
     const capacity = (std.math.add(u64, new_size, 16) catch return false) & ~@as(u64, 15);
-    const data = state.guestAlloc(capacity, 16) orelse return false;
+    const data = guestOwnedAllocate(state, capacity, 16) orelse return false;
     const data_bytes = state.guestMemory(data, capacity) orelse return false;
     const ol_us: usize = @intCast(old_len);
     @memcpy(data_bytes[0..ol_us], object_bytes[1..(1 + ol_us)]);
@@ -563,6 +589,28 @@ pub fn copyLibcppString(state: anytype, destination: u64, source: u64) bool {
     return initLibcppString(state, destination, view.address, view.length);
 }
 
+pub fn assignLibcppString(state: anytype, destination: u64, source: u64) bool {
+    const old_allocation = libcppLongAllocation(state, destination);
+    const view = libcppStringView(state, source) orelse return false;
+    if (!initLibcppString(state, destination, view.address, view.length)) return false;
+    if (old_allocation) |address| guestOwnedRelease(state, address);
+    return true;
+}
+
+pub fn assignLibcppStringFromBytes(state: anytype, object: u64, source: u64, length: u64) bool {
+    const old_allocation = libcppLongAllocation(state, object);
+    if (!initLibcppString(state, object, source, length)) return false;
+    if (old_allocation) |address| guestOwnedRelease(state, address);
+    return true;
+}
+
+pub fn assignLibcppStringLiteral(state: anytype, object: u64, value: []const u8) bool {
+    const old_allocation = libcppLongAllocation(state, object);
+    if (!initLibcppStringLiteral(state, object, value)) return false;
+    if (old_allocation) |address| guestOwnedRelease(state, address);
+    return true;
+}
+
 /// Implements the value-producing libc++ `basic_string::substr(pos, count)`
 /// operation without entering another libc++ constructor. Returns null when
 /// `pos` is out of range so the caller may retain libc++'s exception behavior.
@@ -588,6 +636,7 @@ pub fn compareLibcppStringWithBytes(state: anytype, object: u64, rhs_address: u6
 
 pub fn appendLibcppString(state: anytype, object: u64, source: u64, source_length: u64) bool {
     const current = libcppStringView(state, object) orelse return false;
+    const old_allocation = libcppLongAllocation(state, object);
     const total = std.math.add(u64, current.length, source_length) catch return false;
     const temporary = state.guestAlloc(@max(total, 1), 1) orelse return false;
     const temporary_bytes = state.guestMemory(temporary, total) orelse return false;
@@ -596,7 +645,9 @@ pub fn appendLibcppString(state: anytype, object: u64, source: u64, source_lengt
     const current_len: usize = @intCast(current.length);
     @memcpy(temporary_bytes[0..current_len], current_bytes);
     @memcpy(temporary_bytes[current_len..], source_bytes);
-    return initLibcppString(state, object, temporary, total);
+    if (!initLibcppString(state, object, temporary, total)) return false;
+    if (old_allocation) |address| guestOwnedRelease(state, address);
+    return true;
 }
 
 pub fn pushBackLibcppString(state: anytype, object: u64, character: u8) bool {
@@ -629,7 +680,10 @@ pub fn pushBackLibcppString(state: anytype, object: u64, character: u8) bool {
     const old_length: usize = @intCast(current.length);
     @memcpy(destination[0..old_length], source);
     destination[old_length] = character;
-    return initLibcppString(state, object, temporary, new_length);
+    const old_allocation = libcppLongAllocation(state, object);
+    if (!initLibcppString(state, object, temporary, new_length)) return false;
+    if (old_allocation) |address| guestOwnedRelease(state, address);
+    return true;
 }
 
 pub fn growLibcppString(
@@ -651,7 +705,7 @@ pub fn growLibcppString(
     const doubled = std.math.mul(u64, old_capacity, 2) catch requested;
     const recommended = @max(requested, doubled);
     const allocation_size = (std.math.add(u64, recommended, 16) catch return false) & ~@as(u64, 15);
-    const allocation = state.guestAlloc(@max(allocation_size, 16), 16) orelse return false;
+    const allocation = guestOwnedAllocate(state, @max(allocation_size, 16), 16) orelse return false;
     const destination = state.guestMemory(allocation, @max(allocation_size, 16)) orelse return false;
 
     const prefix: usize = @intCast(prefix_size);
@@ -667,14 +721,17 @@ pub fn growLibcppString(
         );
     }
 
+    const old_allocation = libcppLongAllocation(state, object);
     state.write64(object, allocation_size | 1);
     state.write64(object + 8, old_size);
     state.write64(object + 16, allocation);
+    if (old_allocation) |address| guestOwnedRelease(state, address);
     return true;
 }
 
 pub fn insertLibcppString(state: anytype, object: u64, position: u64, source: u64, source_length: u64) bool {
     const current = libcppStringView(state, object) orelse return false;
+    const old_allocation = libcppLongAllocation(state, object);
     if (position > current.length) return false;
 
     const total = std.math.add(u64, current.length, source_length) catch return false;
@@ -691,7 +748,9 @@ pub fn insertLibcppString(state: anytype, object: u64, position: u64, source: u6
     @memcpy(temporary_bytes[pos .. pos + source_len], source_bytes);
     @memcpy(temporary_bytes[pos + source_len .. pos + source_len + current_len - pos], current_bytes[pos..current_len]);
 
-    return initLibcppString(state, object, temporary, total);
+    if (!initLibcppString(state, object, temporary, total)) return false;
+    if (old_allocation) |address| guestOwnedRelease(state, address);
+    return true;
 }
 
 pub fn concatCStringAndLibcppString(
@@ -764,8 +823,13 @@ fn rangesOverlap(lhs: u64, lhs_len: u64, rhs: u64, rhs_len: u64) bool {
 }
 
 const TestState = struct {
-    mem: [2048]u8 = [_]u8{0} ** 2048,
+    // Two modeled locale facets each carry a 1 KiB ctype table. Keep enough
+    // room for that existing test in addition to the string lifecycle tests.
+    mem: [4096]u8 = [_]u8{0} ** 4096,
     heap_next: u64 = 256,
+    guest_heap_allocations: u64 = 0,
+    guest_heap_releases: u64 = 0,
+    last_guest_heap_release: u64 = 0,
 
     pub fn guestMemory(self: *TestState, address: u64, count: u64) ?[]u8 {
         if (address + count > self.mem.len) return null;
@@ -782,6 +846,17 @@ const TestState = struct {
         if (start + count > self.mem.len) return null;
         self.heap_next = start + count;
         return start;
+    }
+
+    pub fn guestHeapAllocate(self: *TestState, count: u64, alignment: u64) ?u64 {
+        const address = self.guestAlloc(count, alignment) orelse return null;
+        self.guest_heap_allocations += 1;
+        return address;
+    }
+
+    pub fn guestHeapRelease(self: *TestState, address: u64) void {
+        self.guest_heap_releases += 1;
+        self.last_guest_heap_release = address;
     }
 
     pub fn write64(self: *TestState, address: u64, value: u64) void {
@@ -819,6 +894,11 @@ test "libc++ short and long string layouts" {
     try std.testing.expectEqual(@as(u64, 32), std.mem.readInt(u64, state.mem[88..96], .little));
     const data = std.mem.readInt(u64, state.mem[96..104], .little);
     try std.testing.expectEqualSlices(u8, state.mem[48..80], state.mem[@intCast(data)..@intCast(data + 32)]);
+    try std.testing.expectEqual(@as(u64, 1), state.guest_heap_allocations);
+    try std.testing.expect(destroyLibcppString(&state, 80));
+    try std.testing.expectEqual(@as(u64, 1), state.guest_heap_releases);
+    try std.testing.expectEqual(data, state.last_guest_heap_release);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), state.mem[80..104]);
 }
 
 test "libc++ empty string initialization does not dereference its source" {

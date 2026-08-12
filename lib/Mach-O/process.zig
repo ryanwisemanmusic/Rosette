@@ -42,6 +42,7 @@ const native_window_runtime = @import("guest_abi").native_window_runtime;
 const logging_runtime = @import("diagnostics").logging_runtime;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const xenia_pipeline = @import("diagnostics").xenia_pipeline;
+const xenia_gpu_handoff = @import("diagnostics").xenia_gpu_handoff;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
 const memory_mod = @import("memory");
@@ -55,6 +56,7 @@ const pthread_runtime = @import("pthread").pthread_runtime;
 const runtime_output = @import("diagnostics").runtime_output;
 const tlv_runtime = @import("guest_abi").tlv_runtime;
 const diagnostic_text_accelerator = @import("diagnostics").diagnostic_text_accelerator;
+const preflight_lib = @import("preflight");
 const symbol_assembly_context = macho_core.symbol_assembly_context;
 const export_table_manager = @import("dyld").export_table_manager;
 const export_table_lifecycle = @import("dyld").export_table_lifecycle;
@@ -479,6 +481,7 @@ pub const MachOState = struct {
     // (which changes runnability with no explicit transition) also refreshes.
     cached_suspended_version: u64 = std.math.maxInt(u64),
     cached_suspended_next_deadline: ?u64 = null,
+    scheduler_execution_deadline_crossings: u64 = 0,
     coop_bootstrap_active: bool = false,
     coop_bootstrap_index: u8 = 0,
     coop_bootstrap_entries: [24]GtkBootstrapEntry = [_]GtkBootstrapEntry{.{}} ** 24,
@@ -558,12 +561,30 @@ pub const MachOState = struct {
     logging: logging_runtime.Engine = .{},
     backend_diagnostics: x64_backend_diagnostics.Engine = .{},
     xenia_pipeline: xenia_pipeline.Engine = .{},
+    /// One-entry memo for the mapped-image half of `isExecutableAddress`.
+    /// Empty by construction: low > high matches no address, so the first
+    /// lookup falls through to the section search that fills it.
+    executable_section_low: u64 = 1,
+    executable_section_high: u64 = 0,
+    executable_section_verdict: bool = false,
+    xenia_gpu_handoff: xenia_gpu_handoff.Ledger = .{},
     pthreads: pthread_runtime.Runtime = .{},
     scheduler_log: scheduler.SchedulerEventLog = .{},
     jit_log: jit.JitEventLog = .{},
     macho_log: macho_log.Logger = .{},
     tlv: tlv_runtime.Runtime = .{},
     diagnostic_text: diagnostic_text_accelerator.Engine = .{},
+    /// Preflight watches a handful of configuration keys whose binding the run
+    /// depends on, comparing the file Rosette serviced the open for against the
+    /// values the guest itself prints. Both readings cross this runtime, so
+    /// nothing is asked of the guest and nothing about it is trusted.
+    preflight: preflight_lib.Collector = .{},
+    preflight_report: preflight_lib.Report = .{},
+    preflight_evaluated: bool = false,
+    /// Set when Rosette builds the configuration dump itself from the file. The
+    /// dump then restates the file rather than reporting what the guest bound,
+    /// so it must never be used as the second, independent reading.
+    preflight_dump_is_accelerated: bool = false,
     memory_forwarder: memory_management_forwarder.Manager,
     sparse_memory: sparse_virtual_memory.Manager,
     /// Derived model of the guest address window. Replaces the hardcoded
@@ -632,6 +653,25 @@ pub const MachOState = struct {
     /// which step was the first not to happen and whether it was reachable —
     /// the only reading that decides whether to look at the GPU at all.
     gpu_bootstrap: gpu.Contract = .{},
+    /// Physical base and size of the ring the guest named in
+    /// VdInitializeRingBuffer. Learned from the guest's own call, because that
+    /// is the only moment the address exists.
+    gpu_ring_watch_base: u64 = 0,
+    gpu_ring_watch_size: u64 = 0,
+    /// Whether the guest ever *changed* the ring write pointer, as opposed to
+    /// writing the register. Two writes of the same value publish nothing, and
+    /// counting them as submissions credits the producer with work it never
+    /// did — which is what sends a no-frame investigation past the producer and
+    /// into the command processor.
+    gpu_ring_publication: gpu.RingPublication = .{},
+    /// The guest critical section the GPU path registered, put under write
+    /// provenance so a later zero-owner contention can say whether anything
+    /// ever wrote it. Learned from the guest's own registration, because that
+    /// is the only moment the address exists.
+    critical_section_watch_base: u64 = 0,
+    critical_section_zero_owner_reports: u64 = 0,
+    /// Authentic guest stores observed inside the ring.
+    gpu_ring_writes: u64 = 0,
     vtable_tracker: vt.VtableTracker,
     /// Tracks vtable writes for non-heap (stack-local / modeled) objects.
     /// Registered by the stream bridge during stringstream construction
@@ -709,14 +749,20 @@ pub const MachOState = struct {
     // so the fast path is a direct slice read; enable with
     // ROSETTE_MACHO_MEMORY_TRACE=1 when diagnosing faults/near-null causality.
     memory_trace_enabled: bool = false,
-    // R3 (perf audit, N4): write bookkeeping — capture/commit mutation
-    // before-images, memory_writes provenance records, recordAllocationWrite
-    // (vtable tracking + write-protection), and the suspicious-write detector
-    // — serves fault-time diagnostics but used to run on every guest store.
-    // Off by default so stores pay ~2 ops (translate + write + generation
-    // note); arm with ROSETTE_MACHO_WRITE_DIAGNOSTICS=1 for full diagnosis.
-    // noteGuestWrite (decode-cache invalidation, correctness-critical) stays
-    // always-on regardless of this flag.
+    // R3 (perf audit, N4): expensive write bookkeeping — capture/commit
+    // before-images, the general memory_writes provenance ledger, detailed
+    // vtable mutation attribution, and the suspicious-write detector — serves
+    // fault-time diagnostics but used to run on every guest store. Off by
+    // default so stores keep their fast path; arm with
+    // ROSETTE_MACHO_WRITE_DIAGNOSTICS=1 for full diagnosis.
+    //
+    // Trusted vtable *establishment* is deliberately not owned by this flag.
+    // It is correctness-bearing: read-time recovery may only restore a vptr
+    // that an authentic constructor write established. Making that identity
+    // dependent on a diagnostic environment variable caused native virtual
+    // dispatch to regress after otherwise successful object construction.
+    // noteGuestWrite (decode-cache invalidation, also correctness-critical)
+    // likewise stays always-on.
     write_diagnostics_armed: bool = false,
     /// Set while a Rosette fault repair is writing guest memory, so
     /// write-provenance records the store as `host_repair` instead of
@@ -759,6 +805,10 @@ pub const MachOState = struct {
     decode_cache_stale_rejections: u64 = 0,
     code_generation: u64 = 1,
     mapped_min: u64,
+    /// End of the immutable Mach-O image, before the forwarded guest heap.
+    /// Used as a two-comparison filter for rare image-owned vtable values so
+    /// correctness tracking doesn't put symbol lookups on ordinary stores.
+    image_end: u64,
     executable_min: u64,
     executable_max: u64,
 
@@ -866,6 +916,7 @@ pub const MachOState = struct {
             .guard_rollback = guard_rollback_lib.GuardRollback.init(allocator),
             .decode_cache = decode_cache,
             .mapped_min = mapped_min,
+            .image_end = image_end,
             .executable_min = executable_min,
             .executable_max = executable_max,
         };
@@ -1545,6 +1596,7 @@ pub const MachOState = struct {
     const timerQueueWatchWrite = memory_access.timerQueueWatchWrite;
     pub const writeMemVal = memory_access.writeMemVal;
     pub const recordEndianEvidence = memory_access.recordEndianEvidence;
+    pub const tryRepairGeneratedEndianBeforeDispatch = memory_access.tryRepairGeneratedEndianBeforeDispatch;
     pub const captureMemoryMutation = memory_access.captureMemoryMutation;
     pub const commitMemoryMutation = memory_access.commitMemoryMutation;
     const deferInitializerRuntimeDependency = memory_access.deferInitializerRuntimeDependency;
@@ -1626,14 +1678,14 @@ pub const MachOState = struct {
     pub fn noteNativeVulkanSurfaceBound(self: *MachOState, layer_token: u64, guest_surface: u64, host_surface: u64) void {
         return native_window.noteNativeVulkanSurfaceBound(self, layer_token, guest_surface, host_surface);
     }
-    pub fn presentNativeSyntheticVulkanFrame(
+    pub fn presentNativeDiagnosticFrame(
         self: *MachOState,
         serial: u64,
         width: u32,
         height: u32,
         stage: u32,
     ) bool {
-        return native_window.presentNativeSyntheticVulkanFrame(self, serial, width, height, stage);
+        return native_window.presentNativeDiagnosticFrame(self, serial, width, height, stage);
     }
     pub fn pumpNativeWindowEvents(self: *MachOState) void {
         return native_window.pumpNativeWindowEvents(self);
@@ -2596,14 +2648,23 @@ pub const MachOState = struct {
         const reg = if (direction == .memory_to_register) d.dst_reg else d.src_reg;
         const reg_high8 = if (direction == .memory_to_register) d.dst_high8 else d.src_high8;
         const memory_value = self.readMemVal(d.addr, size);
-        // Endian-contract witness: a 32-bit register/memory comparison retains
-        // the original (unswapped) value. Recorded at the execute site, always
-        // on, so the generated-endian contract can substantiate repairs without
-        // the diagnostic-gated memory trace.
-        if (op == .cmp and size == .bits32 and direction == .memory_to_register) {
+        // Endian-contract evidence belongs only to JIT-generated code. Native
+        // Xenia executes a large number of 32-bit memory comparisons; sending
+        // each through a sparse executable probe and evidence ring made an
+        // exceptional recovery predicate part of the ordinary hot path.
+        const generated_endian_candidate =
+            op == .cmp and size == .bits32 and direction == .memory_to_register and
+            (self.regs.rip < self.executable_min or self.regs.rip >= self.executable_max);
+        if (generated_endian_candidate) {
             self.recordEndianEvidence(.cmp_witness, reg, d.addr, size, memory_value);
         }
-        const evaluated = x64_decoder.highway.evaluateMemory(op, width, self.regOperandVal(reg, size, reg_high8), memory_value, direction, self.regs.rflags);
+        var register_value = self.regOperandVal(reg, size, reg_high8);
+        if (generated_endian_candidate) {
+            if (self.tryRepairGeneratedEndianBeforeDispatch(reg, d.addr, memory_value, d.len)) |restored| {
+                register_value = restored;
+            }
+        }
+        const evaluated = x64_decoder.highway.evaluateMemory(op, width, register_value, memory_value, direction, self.regs.rflags);
         self.regs.rflags = evaluated.rflags;
         if (evaluated.write_register) self.setRegOperand(reg, size, reg_high8, evaluated.value);
         if (evaluated.write_memory) self.writeMemVal(d.addr, size, evaluated.value);
@@ -4586,10 +4647,10 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.memory_trace_enabled = environmentFlag("ROSETTE_MACHO_MEMORY_TRACE");
     state.allow_assumed_dispatch_continuation = !environmentFlag("ROSETTE_MACHO_STRICT_DISPATCH");
-    // R3 (perf audit): write diagnostics (mutation provenance, vtable
-    // tracking, suspicious-write detector) default off so the store path is
-    // ~2 ops; arm with ROSETTE_MACHO_WRITE_DIAGNOSTICS=1 when a fault needs
-    // write-order diagnosis.
+    // R3 (perf audit): full mutation provenance, detailed vtable mutation
+    // attribution and the suspicious-write detector default off. The narrow
+    // constructor-vptr identity path remains active independently because it
+    // authorizes correctness-bearing recovery, not merely diagnostics.
     state.write_diagnostics_armed = environmentFlag("ROSETTE_MACHO_WRITE_DIAGNOSTICS");
     state.strict_initializers = environmentFlag("ROSETTE_MACHO_STRICT_INITIALIZERS");
     state.strict_imports = environmentFlag("ROSETTE_MACHO_STRICT_IMPORTS");
@@ -4722,6 +4783,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.logging.logSummary();
         state.backend_diagnostics.logSummary();
         state.xenia_pipeline.logSummary(state.executed_steps);
+        state.xenia_gpu_handoff.logSummary(state.executed_steps);
         state.export_table_mgr.logSummary();
         state.export_table_lc.logSummary();
         state.export_registry.logSummary();
@@ -4776,7 +4838,18 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         output.human("✗ Waiting guest threads: {d}\n", .{state.pthreads.blocked_threads});
     }
 
-    machoCapturePrint("macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}\n", .{ state.exit_code, state.faulted, state.terminated });
+    machoCapturePrint(
+        "macho-processor: execution finished: exit_code={d}, faulted={}, terminated={}, reason={s}, active_thread=0x{x}, blocked_threads={d}, suspended_contexts={d}\n",
+        .{
+            state.exit_code,
+            state.faulted,
+            state.terminated,
+            @tagName(exit_diagnostics.reasonFromValue(state.termination_reason)),
+            state.active_guest_thread,
+            state.pthreads.blocked_threads,
+            state.suspended_guest_thread_count,
+        },
+    );
     state.logDecodeCacheSummary();
     state.logPerformanceAccelerationSummary();
     state.import_resolver.logSummary();
@@ -4789,6 +4862,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.logging.logSummary();
     state.backend_diagnostics.logSummary();
     state.xenia_pipeline.logSummary(state.executed_steps);
+    state.xenia_gpu_handoff.logSummary(state.executed_steps);
     state.pthreads.logSummary();
     state.logCooperativeSchedulerSummary();
     state.memory_forwarder.logSummary();
