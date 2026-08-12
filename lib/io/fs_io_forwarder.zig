@@ -877,6 +877,11 @@ pub const Forwarder = struct {
                 );
             }
             if (comptime @hasDecl(@TypeOf(state.*), "noteBackendMmapResult")) state.noteBackendMmapResult(mapped, if (mapped) state.regs.rdi else 0, "fixed_sparse_map");
+            if (mapped) {
+                if (comptime @hasDecl(@TypeOf(state.*), "observeXeniaFixedMemoryView")) {
+                    state.observeXeniaFixedMemoryView(state.regs.rdi, length, @bitCast(offset), map_flags.ANONYMOUS);
+                }
+            }
             return if (mapped) state.regs.rdi else @bitCast(@as(i64, -1));
         }
         if (x64_code_cache_hint) {
