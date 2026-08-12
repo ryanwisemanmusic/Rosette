@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "profile": "xenia-safe",
+  "nodes": [
+    {
+      "path": "/",
+      "kind": "root",
+      "properties": [
+        {
+          "name": "description-only",
+          "value_kind": "boolean",
+          "boolean_value": true
+        }
+      ]
+    },
+    {
+      "path": "/cpu",
+      "kind": "cpu",
+      "properties": [
+        {
+          "name": "selection-mode",
+          "value_kind": "text",
+          "text_value": "host-compatible",
+          "mutability": "configurable"
+        }
+      ]
+    },
+    {
+      "path": "/memory",
+      "kind": "memory",
+      "properties": [
+        {
+          "name": "guest-page-bytes",
+          "value_kind": "unsigned",
+          "unsigned_value": 4096
+        },
+        {
+          "name": "guest-host-ownership-distinct",
+          "value_kind": "boolean",
+          "boolean_value": true
+        }
+      ]
+    },
+    {
+      "path": "/gpu",
+      "kind": "gpu",
+      "properties": [
+        {
+          "name": "backend-selection",
+          "value_kind": "text",
+          "text_value": "auto",
+          "mutability": "configurable"
+        },
+        {
+          "name": "host-execution-owner",
+          "value_kind": "text",
+          "text_value": "rosette"
+        }
+      ]
+    },
+    {
+      "path": "/consumer",
+      "kind": "consumer"
+    },
+    {
+      "path": "/consumer/xenia",
+      "kind": "consumer",
+      "properties": [
+        {
+          "name": "guest-isa",
+          "value_kind": "text",
+          "text_value": "powerpc64-big-endian"
+        }
+      ]
+    },
+    {
+      "path": "/consumer/xenia/gpu",
+      "kind": "gpu",
+      "properties": [
+        {
+          "name": "guest-semantics-owner",
+          "value_kind": "text",
+          "text_value": "xenia-xenos-pm4"
+        },
+        {
+          "name": "startup-producer",
+          "value_kind": "text",
+          "text_value": "authentic-guest"
+        },
+        {
+          "name": "allow-synthetic-bootstrap",
+          "value_kind": "boolean",
+          "boolean_value": false,
+          "mutability": "read_only"
+        },
+        {
+          "name": "submission-publication-owner",
+          "value_kind": "text",
+          "text_value": "authentic-guest",
+          "mutability": "read_only"
+        },
+        {
+          "name": "prepared-payload-implies-published-write-pointer",
+          "value_kind": "boolean",
+          "boolean_value": false,
+          "mutability": "read_only"
+        },
+        {
+          "name": "bootstrap-observation-mode",
+          "value_kind": "text",
+          "text_value": "non-forcing",
+          "mutability": "read_only"
+        }
+      ]
+    }
+  ]
+}
