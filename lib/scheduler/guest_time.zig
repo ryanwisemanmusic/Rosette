@@ -244,8 +244,12 @@ test "quiescence advances time by bounded scheduler ticks" {
 
 test "execution advances finite deadlines while runnable work continues" {
     var service = Service{ .monotonic_ns = 10 };
+    defer service.deinit(std.testing.allocator);
+    _ = try service.schedule(std.testing.allocator, 500_010, 0x2140, 0, 0);
     try std.testing.expectEqual(@as(u64, 10), service.advanceForExecution(1_000));
+    try std.testing.expectEqual(@as(?TimerEntry, null), service.popDue());
     try std.testing.expectEqual(@as(u64, 1_000_010), service.advanceForExecution(1_001_000));
+    try std.testing.expectEqual(@as(u64, 0x2140), service.popDue().?.thread);
     try std.testing.expectEqual(@as(u64, 1_000_010), service.advanceForExecution(1_001_000));
     try std.testing.expectEqual(@as(u64, 1_000_010), service.advanceForExecution(900_000));
     try std.testing.expectEqual(@as(u64, 1), service.execution_advances);
