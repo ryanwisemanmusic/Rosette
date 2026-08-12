@@ -1282,6 +1282,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // Rooted here so the scheduler's tests actually run rather than merely
+        // compile as a dependency of something else: notifier-liveness and
+        // wait-graph logic decides whether a stalled run is diagnosable, and an
+        // untested version of it is worse than none.
+        const scheduler_test = b.addTest(.{ .root_module = scheduler_mod });
+        check_step.dependOn(&b.addRunArtifact(scheduler_test).step);
         dyld_mod.addImport("scheduler", scheduler_mod);
         const cxx_abi_mod = b.createModule(.{
             .root_source_file = b.path("../lib/abi/cxx-abi/root.zig"),
@@ -1307,6 +1313,21 @@ pub fn build(b: *std.Build) void {
         // dependency — which is precisely what rooting a module as a test
         // surfaces.
         cxx_abi_mod.addImport("event_log", event_log_mod);
+
+        // `__dynamic_cast` is its own library: reading a foreign process's
+        // RTTI, walking a live object's subobject graph, and separating the
+        // null C++ defines from the null that means Rosette could not decide.
+        // Rooted here so its rules are executed, not merely compiled.
+        const dynamic_cast_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/abi/dynamic-cast/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        dynamic_cast_mod.addImport("event_log", event_log_mod);
+        const dynamic_cast_test = b.addTest(.{ .root_module = dynamic_cast_mod });
+        check_step.dependOn(&b.addRunArtifact(dynamic_cast_test).step);
+        cxx_abi_mod.addImport("dynamic_cast", dynamic_cast_mod);
+
         const cxx_abi_test = b.addTest(.{ .root_module = cxx_abi_mod });
         check_step.dependOn(&b.addRunArtifact(cxx_abi_test).step);
         dyld_mod.addImport("event_log", event_log_mod);
