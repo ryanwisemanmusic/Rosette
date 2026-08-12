@@ -54,6 +54,7 @@ pub const Entry = struct {
 /// its immediate neighbours; overflow is counted and reported rather than
 /// silently dropping evidence.
 pub const max_entries: usize = 8;
+const index_capacity: usize = 16;
 
 /// A displacement larger than this is not a structure field access — it is an
 /// array index or an unrelated computation, and seeding on it would watch
@@ -63,6 +64,12 @@ pub const max_field_displacement: u64 = 0x1000;
 pub const Set = struct {
     entries: [max_entries]Entry = undefined,
     count: usize = 0,
+    // Open-addressed page index. The previous implementation linearly walked
+    // all watched pages on every interpreted store. Eight entries sounds
+    // small, but that scan sits inside capture and commit and therefore grows
+    // into billions of comparisons during Xenia's JIT emission. Zero means an
+    // empty slot; populated slots store entry index + 1.
+    page_index: [index_capacity]u8 = [_]u8{0} ** index_capacity,
     /// Seed attempts that arrived after the set was full.
     overflows: u64 = 0,
     /// Stores that matched some watched region.
@@ -71,14 +78,45 @@ pub const Set = struct {
     /// cost of the mechanism.
     rejected: u64 = 0,
 
-    pub fn contains(self: *Set, address: u64) bool {
-        var index: usize = 0;
-        while (index < self.count) : (index += 1) {
-            if (self.entries[index].region.contains(address)) {
-                self.entries[index].hits +|= 1;
-                self.recorded +|= 1;
-                return true;
+    fn initialSlot(page_base: u64) usize {
+        const page = page_base / page_size;
+        const mixed = page ^ (page >> 16) ^ (page >> 32);
+        return @as(usize, @truncate(mixed)) & (index_capacity - 1);
+    }
+
+    fn entryIndexFor(self: *const Set, address: u64) ?usize {
+        const page_base = address & ~(page_size - 1);
+        var slot = initialSlot(page_base);
+        var probes: usize = 0;
+        while (probes < index_capacity) : (probes += 1) {
+            const encoded = self.page_index[slot];
+            if (encoded == 0) return null;
+            const entry_index: usize = encoded - 1;
+            if (self.entries[entry_index].region.contains(address)) return entry_index;
+            slot = (slot + 1) & (index_capacity - 1);
+        }
+        return null;
+    }
+
+    fn indexEntry(self: *Set, entry_index: usize) void {
+        const page_base = self.entries[entry_index].region.base;
+        var slot = initialSlot(page_base);
+        var probes: usize = 0;
+        while (probes < index_capacity) : (probes += 1) {
+            if (self.page_index[slot] == 0) {
+                self.page_index[slot] = @intCast(entry_index + 1);
+                return;
             }
+            slot = (slot + 1) & (index_capacity - 1);
+        }
+        unreachable;
+    }
+
+    pub fn contains(self: *Set, address: u64) bool {
+        if (self.entryIndexFor(address)) |entry_index| {
+            self.entries[entry_index].hits +|= 1;
+            self.recorded +|= 1;
+            return true;
         }
         self.rejected +|= 1;
         return false;
@@ -86,28 +124,23 @@ pub const Set = struct {
 
     /// Non-mutating membership, for reporting.
     pub fn covers(self: *const Set, address: u64) bool {
-        var index: usize = 0;
-        while (index < self.count) : (index += 1) {
-            if (self.entries[index].region.contains(address)) return true;
-        }
-        return false;
+        return self.entryIndexFor(address) != null;
     }
 
     pub fn watchPage(self: *Set, address: u64, origin: Origin) bool {
         const base = address & ~(page_size - 1);
-        var index: usize = 0;
-        while (index < self.count) : (index += 1) {
-            if (self.entries[index].region.base == base) return false;
-        }
+        if (self.entryIndexFor(base) != null) return false;
         if (self.count == self.entries.len) {
             self.overflows +|= 1;
             return false;
         }
-        self.entries[self.count] = .{
+        const entry_index = self.count;
+        self.entries[entry_index] = .{
             .region = .{ .base = base, .size = page_size },
             .origin = origin,
         };
         self.count += 1;
+        self.indexEntry(entry_index);
         return true;
     }
 
@@ -184,4 +217,14 @@ test "covers does not disturb the counters used to report cost" {
     try std.testing.expect(!set.covers(0x2000));
     try std.testing.expectEqual(@as(u64, 0), set.recorded);
     try std.testing.expectEqual(@as(u64, 0), set.rejected);
+}
+
+test "page index resolves collisions without scanning the watch set" {
+    var set = Set{};
+    // These page numbers share the same initial slot in the compact index.
+    try std.testing.expect(set.watchPage(0, .declared));
+    try std.testing.expect(set.watchPage(0x1_0000, .declared));
+    try std.testing.expect(set.contains(0x80));
+    try std.testing.expect(set.contains(0x1_0080));
+    try std.testing.expect(!set.contains(0x2_0080));
 }
