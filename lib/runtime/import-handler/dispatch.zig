@@ -54,6 +54,27 @@ fn sdlCompatibilityVersion() [3]u8 {
     return .{ 2, 0, 0 };
 }
 
+/// `pthread_exit` terminates only the calling pthread.  While the intercepted
+/// Cocoa/GTK main loop owns cooperative guest threads, treating it as process
+/// exit drops every parked Xenia worker (including the title main thread).
+/// Outside that scheduler there is no alternate register context to resume,
+/// so the legacy process-exit fallback remains necessary.
+fn pthreadExitIsThreadLocal(cooperative_ui_active: bool, active_thread: u64) bool {
+    return cooperative_ui_active and active_thread != 0;
+}
+
+/// Return the guest call site that entered an imported allocator routine.
+/// `regs.rip` is the synthetic import thunk while dispatch is active, which
+/// made every invalid free appear to come from the same 0xfffffc... address.
+/// The saved return address identifies the actual C++ owner/destructor.
+fn importCallerAddress(self: anytype) u64 {
+    if (self.regs.rsp == 0 or self.guestMemoryConst(self.regs.rsp, @sizeOf(u64)) == null) {
+        return self.regs.rip;
+    }
+    const caller = self.read64(self.regs.rsp);
+    return if (caller != 0) caller else self.regs.rip;
+}
+
 pub fn handleImportImpl(self: anytype, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
     if (self.tryPrimitiveDispatch(imported)) |result| {
         self.import_handler.primitive_dispatch_hits +|= 1;
@@ -585,6 +606,21 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             self.initializer_abort_requested = true;
             if (self.initializer_abort_reason == .none) self.initializer_abort_reason = .assertion;
         }
+        const continuation = if (return_address != 0)
+            self.guestMemoryConst(return_address, 16)
+        else
+            null;
+        if (continuation == null or
+            guest_assertion_recovery.isUnsafeNoreturnContinuation(continuation.?))
+        {
+            machoCapturePrint(
+                "macho-processor: noreturn assertion continuation rejected: return=0x{x} bytes={any}; the compiler emitted padding/trap or no readable continuation, so Rosette will not fall through into an adjacent function\n",
+                .{ return_address, if (continuation) |bytes| bytes[0..@min(bytes.len, 8)] else &[_]u8{} },
+            );
+            self.faulted = true;
+            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+            return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
+        }
         return .{ .handled = 0 };
     }
 
@@ -722,7 +758,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     }
     if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc") != null) {
         const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
-        const ok = compat_runtime.initLibcppString(self, self.regs.rdi, self.regs.rsi, source.len);
+        const ok = compat_runtime.assignLibcppStringFromBytes(self, self.regs.rdi, self.regs.rsi, source.len);
         if (self.verbose_trace) machoCapturePrint(
             "    [libc++] basic_string::assign(this=0x{x}, source=0x{x}, length={d}) -> {}\n",
             .{ self.regs.rdi, self.regs.rsi, source.len, ok },
@@ -735,7 +771,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     }
     if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc") != null) {
         const value = [_]u8{@truncate(self.regs.rsi)};
-        const ok = compat_runtime.initLibcppStringLiteral(self, self.regs.rdi, &value);
+        const ok = compat_runtime.assignLibcppStringLiteral(self, self.regs.rdi, &value);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
     if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm") != null) {
@@ -803,7 +839,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
     if (std.mem.indexOf(u8, name, "basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_") != null) {
-        const ok = compat_runtime.copyLibcppString(self, self.regs.rdi, self.regs.rsi);
+        const ok = compat_runtime.assignLibcppString(self, self.regs.rdi, self.regs.rsi);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
     if (std.mem.indexOf(u8, name, "__ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EEPKS6_RKS9_") != null) {
@@ -1230,7 +1266,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         std.mem.endsWith(u8, name, "_free"))
     {
         self.resolving_import_route = .release;
-        self.memory_forwarder.releaseFrom(self.regs.rdi, self.regs.rip);
+        self.memory_forwarder.releaseFrom(self.regs.rdi, importCallerAddress(self));
         self.vtable_tracker.forgetAddress(self.regs.rdi);
         return .handled_void;
     }
@@ -1575,6 +1611,17 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = result };
     }
     if (std.mem.endsWith(u8, name, "_pthread_exit")) {
+        if (pthreadExitIsThreadLocal(self.cooperative_ui_context != null, self.active_guest_thread)) {
+            const exiting_thread = self.active_guest_thread;
+            machoCapturePrint(
+                "macho-processor: cooperative pthread_exit: completing caller thread=0x{x} while preserving the process and parked guest threads\n",
+                .{exiting_thread},
+            );
+            self.import_provider_override = .pthread_runtime;
+            self.finishActiveGuestThread();
+            return .control_transferred;
+        }
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.exit_syscall);
         self.terminated = true;
         self.exit_code = 0;
         return .control_transferred;
@@ -1819,14 +1866,18 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
             const destination = self.regs.rdi;
             if (self.regs.rdx != 0) {
                 const bytes = self.guestMemory(destination, self.regs.rdx) orelse break :blk .{ .unsupported = 0 };
+                const mutation = self.captureMemoryMutation(destination, self.regs.rdx);
                 @memset(bytes, @truncate(self.regs.rsi));
+                self.commitMemoryMutation(mutation, .bulk_fill);
             }
             break :blk .{ .handled = destination };
         },
         .bzero => blk: {
             if (self.regs.rsi != 0) {
                 const bytes = self.guestMemory(self.regs.rdi, self.regs.rsi) orelse break :blk .{ .unsupported = 0 };
+                const mutation = self.captureMemoryMutation(self.regs.rdi, self.regs.rsi);
                 @memset(bytes, 0);
+                self.commitMemoryMutation(mutation, .bulk_fill);
             }
             break :blk .{ .handled = 0 };
         },
@@ -1921,7 +1972,7 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
         .shared_contract => dispatchSharedContract(self, name),
         .allocate => .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 },
         .release => blk: {
-            self.memory_forwarder.releaseFrom(self.regs.rdi, self.regs.rip);
+            self.memory_forwarder.releaseFrom(self.regs.rdi, importCallerAddress(self));
             self.vtable_tracker.forgetAddress(self.regs.rdi);
             break :blk .handled_void;
         },
@@ -2058,7 +2109,7 @@ pub fn handleCooperativeYieldImport(self: anytype, imported: macho_metadata.Impo
     const switched = self.yieldActiveGuestThreadForWait(imported.name);
     self.resolving_import_route = .pthread;
     self.import_provider_override = .pthread_runtime;
-    if (self.pthreads.scheduler_yields <= 8 or self.pthreads.scheduler_yields % 1000 == 0) {
+    if (self.pthreads.scheduler_yields <= 4) {
         machoCapturePrint(
             "scheduler: explicit guest yield #{d}: import={s} from=0x{x} to=0x{x} switched={} suspended={d} deferred={d}\n",
             .{ self.pthreads.scheduler_yields, imported.name, previous_thread, self.active_guest_thread, switched, self.suspended_guest_thread_count, self.pthreads.deferred_threads },
@@ -2155,7 +2206,7 @@ pub fn handleSleepSchedulingBoundary(self: anytype, decision: scheduler.GuestSle
     }
     const switched = self.yieldActiveGuestThreadForWait(reason);
     if (switched) self.cooperative_sleep_yields +|= 1;
-    if (self.cooperative_sleep_yields <= 16 or self.cooperative_sleep_yields % 100 == 0 or decision.kind == .indefinite) {
+    if (self.cooperative_sleep_yields <= 4 or decision.kind == .indefinite) {
         machoCapturePrint(
             "scheduler: virtual sleep boundary: sleeper=0x{x} resumed=0x{x} kind={s} parked={} switched={} deadline_ns={d} suspended={d} deferred={d}\n",
             .{ sleeping_thread, self.active_guest_thread, @tagName(decision.kind), parked, switched, if (decision.kind == .timed) self.guest_time.now() +| decision.effective_nanoseconds else 0, self.suspended_guest_thread_count, self.pthreads.deferred_threads },
@@ -2465,4 +2516,10 @@ pub fn continueGuestExit(self: anytype) bool {
     }
     dispatchNextAtexit(self);
     return !self.terminated;
+}
+
+test "pthread exit is thread-local only with an active cooperative context" {
+    try std.testing.expect(pthreadExitIsThreadLocal(true, 0x7fff_2140));
+    try std.testing.expect(!pthreadExitIsThreadLocal(true, 0));
+    try std.testing.expect(!pthreadExitIsThreadLocal(false, 0x7fff_2140));
 }
