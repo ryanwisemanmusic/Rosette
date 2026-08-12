@@ -181,6 +181,21 @@ pub const Contract = struct {
         entry.count +|= 1;
     }
 
+    /// Record evidence whose meaning proves earlier data-path transitions.
+    ///
+    /// A consumed *authentic* PM4 packet cannot exist unless payload bytes
+    /// were present and the producer published them to the command processor.
+    /// Closing those two steps is deduction from a downstream observation,
+    /// not synthetic GPU progress. Ordinary write-pointer observations still
+    /// use `observe` because advancing a pointer alone does not prove payload.
+    pub fn observeEvidence(self: *Contract, step: Step, executed_steps: u64) void {
+        if (step == .pm4_packet_consumed) {
+            self.observe(.ring_payload_prepared, executed_steps);
+            self.observe(.ring_write_pointer, executed_steps);
+        }
+        self.observe(step, executed_steps);
+    }
+
     pub fn seen(self: *const Contract, step: Step) bool {
         return self.observations[@intFromEnum(step)].seen;
     }
@@ -303,6 +318,20 @@ test "a swap before any submission is recorded as out of order" {
     try std.testing.expectEqual(@as(u64, 1), contract.out_of_order);
     try std.testing.expectEqual(@as(u64, 2), contract.observations[@intFromEnum(Step.swap)].count);
     try std.testing.expectEqual(@as(u64, 10), contract.observations[@intFromEnum(Step.swap)].first_step);
+}
+
+test "authentic PM4 consumption proves payload and publication" {
+    var contract = Contract{};
+    contract.observe(.initialize_engines, 1);
+    contract.observe(.graphics_interrupt_callback, 2);
+    contract.observe(.graphics_interrupt_dispatch, 3);
+    contract.observe(.ring_buffer, 4);
+    contract.observeEvidence(.pm4_packet_consumed, 5);
+
+    try std.testing.expect(contract.seen(.ring_payload_prepared));
+    try std.testing.expect(contract.seen(.ring_write_pointer));
+    try std.testing.expect(contract.seen(.pm4_packet_consumed));
+    try std.testing.expectEqual(Step.swap, contract.frontier().step.?);
 }
 
 test "a complete bootstrap has no frontier" {
