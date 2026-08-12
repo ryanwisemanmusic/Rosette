@@ -19,6 +19,8 @@ const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
 const exit_diagnostics = @import("exit_diagnostics");
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
+const cpp_allocation = @import("guest_abi").cpp_allocation;
+const libcpp_thread = @import("guest_abi").libcpp_thread;
 const spirv_cross_diagnostics = @import("diagnostics").spirv_cross_diagnostics;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const symbol_assembly_context = macho_core.symbol_assembly_context;
@@ -430,6 +432,25 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 .{ if (caller) |symbol| symbol.name else function_name, assertion_observation.occurrence, assertion_observation.suppressed_since_emit, self.guest_assertion_count },
             );
         } else if (assertion_observation.disposition == .detail) {
+            // Recorded as well as printed. A printed assertion is a line in a
+            // log nobody re-reads; a ledger entry has to be classified before
+            // the run can be called clean, which is what stops a permanently
+            // non-zero counter from becoming invisible.
+            if (comptime @hasField(@TypeOf(self.*), "anomalies")) {
+                var detail_buffer: [120]u8 = undefined;
+                const detail = std.fmt.bufPrint(
+                    &detail_buffer,
+                    "{s}:{d} {s}",
+                    .{ file_name, self.regs.rdx, function_name },
+                ) catch file_name;
+                _ = self.anomalies.note(
+                    .host_assertion,
+                    detail,
+                    self.executed_steps,
+                    self.active_guest_thread,
+                    return_address,
+                );
+            }
             machoCapturePrint(
                 "macho-processor: guest assertion #{d}: {s}:{d} {s}: {s}\n",
                 .{ self.guest_assertion_count, file_name, self.regs.rdx, function_name, expression },
@@ -921,11 +942,17 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
         return .{ .handled = self.regs.rdi };
     }
-    if (std.mem.indexOf(u8, name, "__thread_structC1Ev") != null or
-        std.mem.indexOf(u8, name, "__thread_structC2Ev") != null)
-    {
-        if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
-        return .{ .handled = self.regs.rdi };
+    if (libcpp_thread.classify(name)) |operation| {
+        return switch (operation) {
+            .construct => blk: {
+                if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
+                break :blk .{ .handled = self.regs.rdi };
+            },
+            // Construction is intercepted and creates no native libc++ TLS
+            // list, so destruction is intentionally empty. This closes the
+            // ownership pair instead of leaving D1/D2 as unresolved imports.
+            .destroy => .handled_void,
+        };
     }
     if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path16__root_directoryEv")) {
         const path = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
@@ -972,14 +999,33 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             }
         }
         // Reached only when the engine could not decide. A cast that correctly
-        // returns null now resolves as `.proven_negative` and never arrives
-        // here, so this message means what it says instead of firing on every
-        // legitimate type test a program performs.
-        self.dynamic_casts.dumpTraceBuffer(self);
-        machoCapturePrint(
-            "macho-processor: __dynamic_cast UNDECIDABLE: source=0x{x} source_type=0x{x} destination_type=0x{x} hint={d}; the type hierarchy could not be walked — the source type was not found in the object's own graph — so null is a fallback, NOT the language's answer. A caller that branches on this null is branching on a guess\n",
-            .{ self.regs.rdi, self.regs.rsi, self.regs.rdx, @as(i64, @bitCast(self.regs.rcx)) },
+        // returns null — because the destination is not an unambiguous public
+        // base of the dynamic type, or is only reachable privately, or is
+        // reachable two ways — now resolves as `.proven_negative` and never
+        // arrives here. So this message means what it says instead of firing on
+        // every legitimate type test a program performs.
+        const report = self.dynamic_casts.metadataFailureReportDecision(
+            self.regs.rsi,
+            self.regs.rdx,
+            self.regs.rcx,
         );
+        if (report.emit) {
+            self.dynamic_casts.dumpTraceBuffer(self);
+            const reason = self.dynamic_casts.undecidedReason();
+            machoCapturePrint(
+                "macho-processor: __dynamic_cast UNDECIDABLE: source=0x{x} source_type=0x{x} destination_type=0x{x} hint={d} reason={s} occurrence={d} suppressed_total={d}; {s}, so null is a fallback and NOT the language's answer. A caller that branches on this null is branching on a guess. Repeats of this same type pair are summarized logarithmically\n",
+                .{
+                    self.regs.rdi,
+                    self.regs.rsi,
+                    self.regs.rdx,
+                    @as(i64, @bitCast(self.regs.rcx)),
+                    if (reason) |value| @tagName(value) else "unrecorded",
+                    report.occurrence,
+                    report.suppressed_total,
+                    if (reason) |value| value.describe() else "the engine recorded no reason",
+                },
+            );
+        }
         return .{ .handled = 0 };
     }
 
@@ -1247,24 +1293,16 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
     }
 
-    if (std.mem.eql(u8, name, "__Znwm") or std.mem.eql(u8, name, "__Znam") or
-        std.mem.eql(u8, name, "__ZnwmRKSt9nothrow_t") or
-        std.mem.eql(u8, name, "__ZnwmSt11align_val_t") or
-        std.mem.eql(u8, name, "__ZnamSt11align_val_t") or
-        std.mem.endsWith(u8, name, "_malloc"))
-    {
+    if (cpp_allocation.classifyNew(name)) |new_form| {
         self.resolving_import_route = .allocate;
-        const alignment: u64 = if (std.mem.endsWith(u8, name, "St11align_val_t")) self.regs.rsi else 16;
+        const alignment = new_form.alignment(self.regs.rsi);
         return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, alignment) orelse 0 };
     }
-    if (std.mem.eql(u8, name, "__ZdlPv") or std.mem.eql(u8, name, "__ZdaPv") or
-        std.mem.eql(u8, name, "__ZdlPvm") or std.mem.eql(u8, name, "__ZdaPvm") or
-        std.mem.eql(u8, name, "__ZdlPvSt11align_val_t") or
-        std.mem.eql(u8, name, "__ZdaPvSt11align_val_t") or
-        std.mem.eql(u8, name, "__ZdlPvmSt11align_val_t") or
-        std.mem.eql(u8, name, "__ZdaPvmSt11align_val_t") or
-        std.mem.endsWith(u8, name, "_free"))
-    {
+    if (std.mem.endsWith(u8, name, "_malloc")) {
+        self.resolving_import_route = .allocate;
+        return .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 };
+    }
+    if (cpp_allocation.isDelete(name) or std.mem.endsWith(u8, name, "_free")) {
         self.resolving_import_route = .release;
         self.memory_forwarder.releaseFrom(self.regs.rdi, importCallerAddress(self));
         self.vtable_tracker.forgetAddress(self.regs.rdi);
@@ -1970,7 +2008,13 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
             };
         },
         .shared_contract => dispatchSharedContract(self, name),
-        .allocate => .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, 16) orelse 0 },
+        .allocate => blk: {
+            const alignment = if (cpp_allocation.classifyNew(name)) |new_form|
+                new_form.alignment(self.regs.rsi)
+            else
+                16;
+            break :blk .{ .handled = self.memory_forwarder.allocate(self, self.regs.rdi, alignment) orelse 0 };
+        },
         .release => blk: {
             self.memory_forwarder.releaseFrom(self.regs.rdi, importCallerAddress(self));
             self.vtable_tracker.forgetAddress(self.regs.rdi);
