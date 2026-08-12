@@ -110,7 +110,7 @@ pub fn forceKillProcess(pid: i32, label: []const u8) bool {
 
     // Try SIGTERM first
     if (c.kill(pid, c.SIGTERM) == 0) {
-        // std.time.sleep(100 * std.time.ns_per_ms); // 100ms grace period (removed in Zig 0.16.0)
+        _ = c.usleep(100_000);
 
         if (!isProcessRunning(pid)) {
             std.debug.print("[PID] Process terminated with SIGTERM: pid={d}\n", .{pid});
@@ -120,7 +120,7 @@ pub fn forceKillProcess(pid: i32, label: []const u8) bool {
 
     // Try SIGKILL
     if (c.kill(pid, c.SIGKILL) == 0) {
-        // std.time.sleep(50 * std.time.ns_per_ms); // 50ms to verify (removed in Zig 0.16.0)
+        _ = c.usleep(50_000);
 
         if (!isProcessRunning(pid)) {
             std.debug.print("[PID] Process terminated with SIGKILL: pid={d}\n", .{pid});
@@ -158,10 +158,10 @@ pub fn killProcessesMatchingPattern(allocator: std.mem.Allocator, pattern: []con
     defer allocator.free(pids);
 
     for (pids) |pid| {
-        const command = getProcessCommand(allocator, pid) catch "unknown";
-        defer allocator.free(command);
+        const owned_command: ?[]const u8 = getProcessCommand(allocator, pid) catch null;
+        defer if (owned_command) |command| allocator.free(command);
 
-        _ = forceKillProcess(pid, command);
+        _ = forceKillProcess(pid, owned_command orelse "unknown");
     }
 }
 
@@ -228,7 +228,6 @@ pub fn killRosetteHelpers(allocator: std.mem.Allocator) !void {
         "rosette-arch",
         "rosette-compiler-sanitize",
         "rosette-clean-state",
-        "zig", // Also clean up any stray zig processes from compilation
     };
 
     for (patterns) |pattern| {

@@ -311,7 +311,7 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
         }
     }
 
-    std.debug.print("[INSTALL] Pre-flight cleanup: skipped during install/update; use rosette-clean-state explicitly for stale helpers\n", .{});
+    try auditRosetteProcessState(allocator, "pre-install");
 
     std.debug.print("[INSTALL] Step 1: Building directory paths\n", .{});
     const bin_dir = std.fs.path.join(allocator, &.{ rosette_dir, "bin" }) catch |err| {
@@ -627,13 +627,12 @@ fn installOrUpdate(init: std.process.Init, allocator: std.mem.Allocator, source_
     };
     std.debug.print("[INSTALL] Installation stamp written to: {s}\n", .{stamp_path_final});
 
-    // Post-installation cleanup to ensure no processes are left behind
-    std.debug.print("[INSTALL] Running post-installation process cleanup\n", .{});
+    // Reap only children owned by this installer, then verify that no prior
+    // Rosette/Xenia launch boundary remains alive. This is deliberately an
+    // audit rather than a broad name-based kill.
+    std.debug.print("[INSTALL] Reaping installer-owned child processes\n", .{});
     pid_manager.reapZombies();
-
-    // Final check for any remaining Rosette processes
-    std.debug.print("[INSTALL] Final process check\n", .{});
-    pid_manager.printTrackedProcessStatus();
+    try auditRosetteProcessState(allocator, "post-install");
 
     std.debug.print("[INSTALL] Installation/update completed successfully\n", .{});
 }
@@ -1139,6 +1138,23 @@ fn collectCleanupCandidates(allocator: std.mem.Allocator, options: CleanOptions)
     return try candidates.toOwnedSlice(allocator);
 }
 
+fn auditRosetteProcessState(allocator: std.mem.Allocator, phase: []const u8) !void {
+    pid_manager.reapZombies();
+    const candidates = try collectCleanupCandidates(allocator, .{ .dry_run = true, .include_xenia = true });
+    if (candidates.len == 0) {
+        std.debug.print("[INSTALL] Process ownership audit ({s}): clean\n", .{phase});
+        return;
+    }
+
+    std.debug.print(
+        "[INSTALL] Process ownership audit ({s}) found {d} live Rosette/Xenia process{s}; refusing to update over an active or abandoned session.\n",
+        .{ phase, candidates.len, if (candidates.len == 1) "" else "es" },
+    );
+    for (candidates) |candidate| printCleanupCandidate("[INSTALL] remaining process", candidate);
+    std.debug.print("[INSTALL] Close the active session or run `rosette-clean-state --scan` before retrying.\n", .{});
+    return error.RosetteProcessAuditFailed;
+}
+
 fn cleanupReason(command: []const u8, options: CleanOptions) ?[]const u8 {
     if (containsIgnoreCase(command, " rosette-shell clean-state")) return null;
     if (containsIgnoreCase(command, "/rosette-shell clean-state")) return null;
@@ -1216,27 +1232,43 @@ fn readDarwinProcessInfo(allocator: std.mem.Allocator, pid: c_int) !ProcessInfo 
 
 fn readDarwinProcessCommand(allocator: std.mem.Allocator, pid: c_int, path: []const u8) ![]const u8 {
     var mib = [_]c_int{ c.CTL_KERN, c.KERN_PROCARGS2, pid };
-    var buffer = try allocator.alloc(u8, 128 * 1024);
+    const buffer = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(buffer);
     var size: usize = buffer.len;
     if (c.sysctl(&mib, mib.len, buffer.ptr, &size, null, 0) != 0) {
         if (path.len != 0) return try allocator.dupe(u8, path);
         return error.InvalidProcessLine;
     }
 
+    const bytes = buffer[0..size];
+    if (bytes.len < @sizeOf(c_int)) return error.InvalidProcessLine;
+    var argc: c_int = 0;
+    @memcpy(std.mem.asBytes(&argc), bytes[0..@sizeOf(c_int)]);
+    if (argc < 0) return error.InvalidProcessLine;
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     if (path.len != 0) try out.appendSlice(allocator, path);
 
-    const bytes = buffer[0..size];
+    // KERN_PROCARGS2 is laid out as argc, executable path, padding, argv, then
+    // the environment. Stop after exactly argc argv strings. Reading until an
+    // arbitrary string count made inherited variables such as
+    // ROSETTE_COMPILER_SANITIZER look like the process's executable and caused
+    // the ownership audit to classify Codex, editors, and language servers as
+    // live Rosette launchers.
     var index: usize = @sizeOf(c_int);
-    var strings_seen: usize = 0;
-    while (index < bytes.len and strings_seen < 64 and out.items.len < 64 * 1024) {
+    while (index < bytes.len and bytes[index] != 0) : (index += 1) {}
+    while (index < bytes.len and bytes[index] == 0) : (index += 1) {}
+
+    const argument_count: usize = @intCast(argc);
+    var arguments_seen: usize = 0;
+    while (index < bytes.len and arguments_seen < argument_count and out.items.len < 64 * 1024) {
         while (index < bytes.len and bytes[index] == 0) : (index += 1) {}
         const start = index;
         while (index < bytes.len and bytes[index] != 0) : (index += 1) {}
         if (index <= start) continue;
         const value = bytes[start..index];
-        strings_seen += 1;
+        arguments_seen += 1;
         if (value.len == 0) continue;
         if (path.len != 0 and std.mem.eql(u8, value, path)) continue;
         if (out.items.len != 0) try out.append(allocator, ' ');
@@ -3049,13 +3081,44 @@ const clean_state_backend_script =
     \\done
     \\
     \\tmp="${TMPDIR:-/tmp}/rosette-clean-state.$$"
-    \\trap 'rm -f "$tmp.ps" "$tmp.candidates"' EXIT INT TERM
+    \\trap 'rm -f "$tmp.ps" "$tmp.candidates" "$tmp.zombie-parents"' EXIT INT TERM
     \\self_pgid="$(/bin/ps -o pgid= -p "$$" 2>/dev/null | /usr/bin/awk '{print $1}')"
     \\quarantine_path="${ROSETTE_PROCESS_QUARANTINE:-$HOME/.rosette/process-quarantine.log}"
     \\
     \\if ! /bin/ps -axo pid=,ppid=,pgid=,stat=,command= > "$tmp.ps" 2>/dev/null; then
     \\  echo "rosette-clean-state: failed to read process list" >&2
     \\  exit 1
+    \\fi
+    \\
+    \\# Zombies cannot be killed: only their direct parent can reap them with
+    \\# wait/waitpid. Report ownership before filtering for Rosette helpers so
+    \\# forkpty/process-table exhaustion is attributed to the application that
+    \\# can actually fix it. This is deliberately diagnostic-only; clean-state
+    \\# must never terminate an unrelated parent application.
+    \\/usr/bin/awk '
+    \\{
+    \\  pid=$1; ppid=$2; stat=$4
+    \\  cmd=$0
+    \\  sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", cmd)
+    \\  parent_cmd[pid]=cmd
+    \\  if (stat ~ /^Z/) { zombies[ppid]++; total++ }
+    \\}
+    \\END {
+    \\  if (total < 8) exit
+    \\  printf "total\t%d\n", total
+    \\  for (parent in zombies) {
+    \\    cmd=(parent in parent_cmd) ? parent_cmd[parent] : "<parent exited or unavailable>"
+    \\    gsub(/\t/, " ", cmd)
+    \\    printf "%s\t%d\t%s\n", parent, zombies[parent], cmd
+    \\  }
+    \\}
+    \\' "$tmp.ps" > "$tmp.zombie-parents"
+    \\if [ -s "$tmp.zombie-parents" ]; then
+    \\  zombie_total="$(/usr/bin/awk -F '\t' '$1 == "total" { print $2; exit }' "$tmp.zombie-parents")"
+    \\  echo "rosette-clean-state: PROCESS PRESSURE: $zombie_total zombie process(es) detected"
+    \\  echo "  zombies cannot be signaled or reaped by Rosette; only each direct parent can call wait/waitpid"
+    \\  /usr/bin/awk -F '\t' '$1 != "total" { printf "  owner: ppid=%s zombies=%s command=%s\n", $1, $2, $3 }' "$tmp.zombie-parents"
+    \\  echo "  action: save work and restart the listed parent application; a full macOS reboot is normally unnecessary"
     \\fi
     \\
     \\/usr/bin/awk -v self="$$" -v parent="$PPID" -v include_xenia="$include_xenia" '
@@ -4268,6 +4331,7 @@ fn execForkWait(argv: [](?[*:0]const u8), path: [*:0]const u8, env: [](?[*:0]con
             std.process.exit(127);
         },
         0 => {
+            if (c.setpgid(0, 0) != 0) c._exit(126);
             // Child: exec with clean environment.
             _ = c.execve(path, @ptrCast(argv.ptr), @ptrCast(env.ptr));
             // Only reachable if execve fails.
@@ -4278,6 +4342,12 @@ fn execForkWait(argv: [](?[*:0]const u8), path: [*:0]const u8, env: [](?[*:0]con
             c._exit(127);
         },
         else => {
+            // Close the fork/exec race from the parent side. EACCES simply
+            // means the child has already completed exec after setting its own
+            // process group.
+            _ = c.setpgid(pid, pid);
+            _ = process_guard.SignalForwarding.install(pid);
+
             // Parent: wait with timeout.
             const timeout_ms: u64 = 30000;
             const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
@@ -4295,18 +4365,26 @@ fn execForkWait(argv: [](?[*:0]const u8), path: [*:0]const u8, env: [](?[*:0]con
             while (true) {
                 const now_ms = monotonicMs();
                 if (now_ms >= deadline_ms) {
-                    // Timeout — kill child and report.
-                    _ = c.kill(pid, c.SIGKILL);
-                    // Small grace for kill to take effect.
-                    _ = c.usleep(100_000);
-                    _ = c.kill(pid, c.SIGKILL);
-                    std.debug.print("rosette-shell: {s} timed out after {}ms — killed\n", .{
-                        std.mem.sliceTo(path, 0), now_ms - (deadline_ms - timeout_ms),
-                    });
-
-                    // Print diagnostics about the stuck process.
+                    // Diagnose first, then drain the entire isolated group.
                     _ = tryResolveProcPath(pid);
                     _ = tryKmemStack(pid);
+                    const cleanup = process_guard.cleanupProcessGroup(pid, 750);
+
+                    // Reap the direct child after the group drain. A bounded
+                    // loop avoids turning an uninterruptible kernel wait into
+                    // a permanently wedged shell process.
+                    var reap_elapsed_ms: u64 = 0;
+                    while (reap_elapsed_ms <= 1000) : (reap_elapsed_ms += 25) {
+                        const reap_rc = c.waitpid(pid, &status, c.WNOHANG);
+                        if (reap_rc == pid or (reap_rc < 0 and currentErrno() == c.ECHILD)) break;
+                        if (reap_rc < 0 and currentErrno() != c.EINTR) break;
+                        _ = c.usleep(25_000);
+                    }
+
+                    std.debug.print("rosette-shell: {s} timed out after {}ms — process group drained (survived={s})\n", .{
+                        std.mem.sliceTo(path, 0),              now_ms - (deadline_ms - timeout_ms),
+                        if (cleanup.survived) "yes" else "no",
+                    });
 
                     std.process.exit(124);
                 }
@@ -4314,6 +4392,10 @@ fn execForkWait(argv: [](?[*:0]const u8), path: [*:0]const u8, env: [](?[*:0]con
                 const rc = c.waitpid(pid, &status, c.WNOHANG);
                 if (rc == pid) {
                     // Child exited.
+                    const cleanup = process_guard.cleanupProcessGroup(pid, 750);
+                    if (cleanup.survived) {
+                        std.debug.print("rosette-shell: warning: process group {d} survived teardown and was quarantined\n", .{pid});
+                    }
                     if (c.WIFEXITED(status)) std.process.exit(@intCast(c.WEXITSTATUS(status)));
                     if (c.WIFSIGNALED(status)) {
                         const sig = c.WTERMSIG(status);
@@ -4363,8 +4445,9 @@ fn runArgvResult(io: std.Io, argv: []const []const u8) !u8 {
         .stderr = .inherit,
         .label = "rosette-shell",
         .timeout_ms = process_guard.timeoutFromEnv(null),
-        .isolate_process_group = false,
-        .signal_policy = .child_only,
+        .isolate_process_group = true,
+        .signal_policy = .process_group,
+        .cleanup_process_group_on_exit = true,
     }) catch |err| {
         if (argv.len > 0) {
             std.debug.print("rosette-shell: guarded spawn failed for {s}: {s}\n", .{ argv[0], @errorName(err) });
@@ -4630,8 +4713,7 @@ fn compileDylibFromSource(init: std.process.Init, allocator: std.mem.Allocator, 
         .signal_policy = .process_group,
     }) catch |err| {
         std.debug.print("[DYLIB] Error: failed to compile rosette-exec.dylib: {s}\n", .{@errorName(err)});
-        std.debug.print("[DYLIB] Attempting cleanup of any zig processes...\n", .{});
-        pid_manager.killProcessesMatchingPattern(allocator, "zig") catch {};
+        std.debug.print("[DYLIB] The isolated compiler process group has been drained by the process guard.\n", .{});
         std.debug.print("  elf_processor binary installed, DYLD interposition not available\n", .{});
         return;
     };
@@ -4640,8 +4722,7 @@ fn compileDylibFromSource(init: std.process.Init, allocator: std.mem.Allocator, 
 
     if (code != 0) {
         std.debug.print("[DYLIB] Warning: zig cc returned exit code {d} for dylib compilation\n", .{code});
-        std.debug.print("[DYLIB] Attempting cleanup of any zig processes...\n", .{});
-        pid_manager.killProcessesMatchingPattern(allocator, "zig") catch {};
+        std.debug.print("[DYLIB] The isolated compiler process group has been drained by the process guard.\n", .{});
         std.debug.print("  elf_processor binary installed, DYLD interposition not available\n", .{});
         return;
     }
@@ -5086,6 +5167,8 @@ test "clean-state matcher can include or exclude Xenia launches" {
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "rosette-arch"));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "xenia_canary.app/contents/macos/xenia_canary"));
     try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "--no-xenia"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "process pressure"));
+    try std.testing.expect(containsIgnoreCase(clean_state_backend_script, "only each direct parent can call wait/waitpid"));
 }
 
 test "assembly global parser handles lists and bracket directives" {
