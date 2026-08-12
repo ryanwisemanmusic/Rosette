@@ -60,9 +60,10 @@ pub const InvalidFree = struct {
 };
 
 /// Bounded, because an unbounded record of a pathological run is just the run.
-/// Eight is enough to see whether the kinds are mixed or uniform, which is the
-/// question the count could not answer.
-pub const max_recorded_invalid_frees: usize = 8;
+/// Sixteen retains the complete set from ordinary startup failures while
+/// remaining strictly bounded. The previous eight-entry cap hid the final two
+/// callers in the Xenia ownership report.
+pub const max_recorded_invalid_frees: usize = 16;
 
 pub const Manager = struct {
     allocator: std.mem.Allocator,

@@ -6,6 +6,7 @@ const machoCapturePrint = @import("event_log").machoCapturePrint;
 extern "c" fn mprotect(addr: [*]align(std.heap.page_size_min) u8, len: usize, prot: c_int) c_int;
 
 pub const PAGE_64K: u64 = 64 * 1024;
+const guest_protection = @import("guest_protection");
 pub const PAGE_4K: u64 = guest_memory_geometry.guest_page_size;
 pub const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 
@@ -138,6 +139,11 @@ pub const Manager = struct {
     activations: std.ArrayList(Activation) = .empty,
     total_reserved: u64 = 0,
     protection_sequence: u64 = 0,
+    /// Set once the guest installs its own fault handler. A refusal at a page
+    /// the guest protected is that handler's trap firing, which is the
+    /// mechanism working — indistinguishable from a real violation without
+    /// knowing whether anyone is listening.
+    guest_fault_handler_installed: bool = false,
     // R1 (perf audit): page-granular sparse classification cache (see the
     // PAGE_CACHE_* constants above). Bumped on every mapping/activation
     // mutation so a single bump invalidates all entries at once.
@@ -296,6 +302,58 @@ pub const Manager = struct {
     /// no business knowing which observers keep state keyed by guest address.
     /// Callers that do keep such state ask this first, so a discard retires
     /// their records instead of silently invalidating them.
+    /// Base of the mapping containing `address`, or null when none does.
+    ///
+    /// A guest address space modelled as sparse mappings has no single origin,
+    /// so "how far into guest memory is this" can only be answered relative to
+    /// the mapping the address is in. Judging near-null against the process
+    /// image base instead gives an enormous offset for every sparse address and
+    /// silently skips exactly the faults worth reporting.
+    pub fn containingMappingBase(self: *const Manager, address: u64) ?u64 {
+        var index = self.activations.items.len;
+        while (index != 0) {
+            index -= 1;
+            const active = self.activations.items[index];
+            const end = active.guest_base +| active.memory.len;
+            if (address >= active.guest_base and address < end) return active.guest_base;
+        }
+        for (self.mappings.items) |mapping| {
+            const end = mapping.guest_base + mapping.memory.len;
+            if (address >= mapping.guest_base and address < end) return mapping.guest_base;
+        }
+        return null;
+    }
+
+    /// Permission bits the guest recorded for the guest-sized page containing
+    /// `address`, independent of what the host page enforces. This is the half
+    /// of the picture the host cannot express, and the only thing that can tell
+    /// a granularity artifact from a real denial.
+    pub fn guestPagePermissions(self: *const Manager, address: u64) u8 {
+        const page = address & ~(guest_memory_geometry.guest_page_size - 1);
+        var index = self.activations.items.len;
+        while (index != 0) {
+            index -= 1;
+            const active = self.activations.items[index];
+            const active_end = active.guest_base +| active.memory.len;
+            if (page < active.guest_base or page >= active_end) continue;
+            var bits: u8 = 0;
+            if (active.readable) bits |= 1;
+            if (active.writable) bits |= 2;
+            if (active.executable) bits |= 4;
+            return bits;
+        }
+        for (self.mappings.items) |mapping| {
+            const mapping_end = mapping.guest_base + mapping.memory.len;
+            if (page < mapping.guest_base or page >= mapping_end) continue;
+            var bits: u8 = 0;
+            if (mapping.readable) bits |= 1;
+            if (mapping.writable) bits |= 2;
+            if (mapping.executable) bits |= 4;
+            return bits;
+        }
+        return 0;
+    }
+
     pub fn replacesExisting(self: *const Manager, guest_base: u64, length: u64) bool {
         const end = std.math.add(u64, guest_base, length) catch return false;
         for (self.mappings.items) |mapping| {
@@ -888,6 +946,36 @@ pub const Manager = struct {
             );
             printed += 1;
         }
+        // Who refused it, and was that correct. A refusal at an address the
+        // guest itself protected is the guest's trap firing — the mechanism
+        // working — and reporting it identically to a granularity artifact is
+        // what makes every occurrence a fresh investigation. The guest-page
+        // permission is the discriminator, and only the runtime keeps it.
+        const guest_permissions = self.guestPagePermissions(address);
+        const verdict = guest_protection.refusal.classify(.{
+            .address = address,
+            .length = length,
+            .access = if (write) .write else .read,
+            .mapped = containing_mappings != 0 or overlap_count != 0,
+            .host_permissions = if (newest_overlap_allows) (if (write) @as(u8, 2) else @as(u8, 1)) else 0,
+            .guest_permissions = guest_permissions,
+            .guest_handler_installed = self.guest_fault_handler_installed,
+            .guest_page_size = guest_memory_geometry.guest_page_size,
+            .host_page_size = guest_memory_geometry.host_vm_page_size,
+        });
+        machoCapturePrint(
+            "macho-processor:   sparse refusal classified: {s} guest_page=[0x{x}] host_page=[0x{x}] guest_pages_per_host_page={d} guest_permissions=0x{x} runtime_defect={} expected={}; {s}\n",
+            .{
+                @tagName(verdict.classification),
+                verdict.guest_page_base,
+                verdict.host_page_base,
+                verdict.guest_pages_per_host_page,
+                guest_permissions,
+                verdict.classification.isRuntimeDefect(),
+                verdict.classification.isExpected(),
+                verdict.describe(),
+            },
+        );
         if (overlap_count > printed) {
             machoCapturePrint(
                 "macho-processor:   sparse activation diagnostics truncated: printed={d} omitted={d}\n",
