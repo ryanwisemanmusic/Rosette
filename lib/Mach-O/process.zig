@@ -43,6 +43,12 @@ const logging_runtime = @import("diagnostics").logging_runtime;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const xenia_pipeline = @import("diagnostics").xenia_pipeline;
 const xenia_gpu_handoff = @import("diagnostics").xenia_gpu_handoff;
+const xenia_memory_views = @import("diagnostics").xenia_memory_views;
+const event_identity = @import("diagnostics").event_identity;
+const execution_tracepoints = @import("diagnostics").execution_tracepoints;
+const anomaly_ledger = @import("diagnostics").anomaly_ledger;
+const notifier_liveness = @import("scheduler").notifier_liveness;
+const guest_critical_section = @import("diagnostics").guest_critical_section;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
 const memory_mod = @import("memory");
@@ -568,6 +574,10 @@ pub const MachOState = struct {
     executable_section_high: u64 = 0,
     executable_section_verdict: bool = false,
     xenia_gpu_handoff: xenia_gpu_handoff.Ledger = .{},
+    /// Translation between the Xbox addresses Xenia prints and the host-view
+    /// addresses Rosette actually interprets. Learned from Xenia's mmap rather
+    /// than hardcoded to this process run.
+    xenia_memory_views: xenia_memory_views.Model = .{},
     pthreads: pthread_runtime.Runtime = .{},
     scheduler_log: scheduler.SchedulerEventLog = .{},
     jit_log: jit.JitEventLog = .{},
@@ -658,6 +668,8 @@ pub const MachOState = struct {
     /// is the only moment the address exists.
     gpu_ring_watch_base: u64 = 0,
     gpu_ring_watch_size: u64 = 0,
+    gpu_ring_watch_host_virtual: u64 = 0,
+    gpu_ring_watch_host_physical: u64 = 0,
     /// Whether the guest ever *changed* the ring write pointer, as opposed to
     /// writing the register. Two writes of the same value publish nothing, and
     /// counting them as submissions credits the producer with work it never
@@ -669,7 +681,30 @@ pub const MachOState = struct {
     /// ever wrote it. Learned from the guest's own registration, because that
     /// is the only moment the address exists.
     critical_section_watch_base: u64 = 0,
+    critical_section_watch_host_virtual: u64 = 0,
+    critical_section_watch_host_physical: u64 = 0,
+    critical_section_initial_image: [guest_critical_section.size_bytes]u8 =
+        [_]u8{0} ** guest_critical_section.size_bytes,
+    critical_section_initial_valid: bool = false,
     critical_section_zero_owner_reports: u64 = 0,
+    /// One identity for every boundary record in this run, so evidence from
+    /// two runs can never be joined and ordering is a fact rather than an
+    /// inference from wall-clock timestamps.
+    event_stream: event_identity.Stream = .{},
+    /// Execution-boundary tracepoints on the emulator's own graphics entry
+    /// points. Whether `VdSwap` ran has been inferred from a log line for three
+    /// investigation passes; these answer it from the instruction pointer.
+    execution_tracepoints: execution_tracepoints.Set = .{},
+    graphics_summary_emissions: u64 = 0,
+    graphics_last_frontier_tag: u8 = std.math.maxInt(u8),
+    graphics_last_frontier_reached: usize = std.math.maxInt(usize),
+    graphics_last_role_mask: u8 = 0,
+    graphics_last_ring_published: bool = false,
+    graphics_last_anomaly_count: usize = std.math.maxInt(usize),
+    /// Guest anomalies with what happened after each. A count alone has been
+    /// non-zero in every run of this investigation and has therefore stopped
+    /// being read; a disposition is what makes one actionable or dismissible.
+    anomalies: anomaly_ledger.Ledger = .{},
     /// Authentic guest stores observed inside the ring.
     gpu_ring_writes: u64 = 0,
     vtable_tracker: vt.VtableTracker,
@@ -1691,6 +1726,317 @@ pub const MachOState = struct {
         return native_window.pumpNativeWindowEvents(self);
     }
 
+    /// Arm execution tracepoints on the emulator's own graphics entry points.
+    ///
+    /// The question "did the title call `VdSwap`" has been answered from a
+    /// mirrored log string, which cannot distinguish a call that never happened
+    /// from one that logged differently, was filtered, or took another route.
+    /// Rosette is the interpreter, so it can answer from the instruction
+    /// pointer instead — but only if it knows the address, which is what this
+    /// resolves from the emulator's own symbol table.
+    ///
+    /// `_entry` suffixed names are preferred because that is the shim the
+    /// export dispatch actually calls; a lambda or thunk sharing the fragment
+    /// would be a less direct boundary.
+    pub fn armGraphicsTracepoints(self: *MachOState) void {
+        const wanted = [_]struct { fragment: []const u8, role: execution_tracepoints.Role }{
+            .{ .fragment = "VdSwap_entry", .role = .swap },
+            .{ .fragment = "NotifyVdSwapCall", .role = .swap },
+            .{ .fragment = "IssueSwap", .role = .swap },
+            .{ .fragment = "VdInitializeRingBuffer_entry", .role = .ring_publication },
+            .{ .fragment = "VdEnableRingBufferRPtrWriteBack_entry", .role = .ring_publication },
+            .{ .fragment = "ExecutePrimaryBuffer", .role = .command_processor },
+            .{ .fragment = "RefreshGuestOutput", .role = .presenter },
+        };
+        // Every executable candidate is armed, but ranked before the cap
+        // applies. Taking the first four in hash order armed only the standard
+        // library's closure machinery for `IssueSwap` — the allocator, the
+        // compressed pair, `unique_ptr::get`, `__alloc_func::destroy` — and
+        // never `VulkanCommandProcessor::IssueSwap` itself, so the role
+        // reported NEVER ENTERED for a function nothing was watching.
+        //
+        // Ranking by mangled-name length separates them reliably: a real
+        // method's name is short, and a template instantiation that merely
+        // mentions it carries the whole enclosing type. Keeping four still
+        // covers a virtual and its overrides.
+        const per_fragment: usize = 4;
+        for (wanted) |target| {
+            var best_name: [per_fragment][]const u8 = [_][]const u8{""} ** per_fragment;
+            var best_address: [per_fragment]u64 = [_]u64{0} ** per_fragment;
+            var matches: u32 = 0;
+            var rejected_non_executable: u32 = 0;
+            var iterator = self.metadata.definedSymbolIterator();
+            while (iterator.next()) |symbol| {
+                const name = symbol.key_ptr.*;
+                if (std.mem.indexOf(u8, name, target.fragment) == null) continue;
+                const address = symbol.value_ptr.*;
+                matches += 1;
+                // A guard variable or a static inside the function carries the
+                // same fragment and is never executed, so a tracepoint there
+                // would report "never entered" forever.
+                if (address < self.executable_min or address >= self.executable_max) {
+                    rejected_non_executable += 1;
+                    continue;
+                }
+                var candidate_name = name;
+                var candidate_address = address;
+                var slot: usize = 0;
+                while (slot < per_fragment) : (slot += 1) {
+                    if (best_address[slot] == 0) {
+                        best_name[slot] = candidate_name;
+                        best_address[slot] = candidate_address;
+                        break;
+                    }
+                    if (candidate_name.len >= best_name[slot].len) continue;
+                    const displaced_name = best_name[slot];
+                    const displaced_address = best_address[slot];
+                    best_name[slot] = candidate_name;
+                    best_address[slot] = candidate_address;
+                    candidate_name = displaced_name;
+                    candidate_address = displaced_address;
+                }
+            }
+            var armed: usize = 0;
+            for (best_name, best_address) |name, address| {
+                if (address == 0) continue;
+                if (self.execution_tracepoints.arm(name, address, target.role)) {
+                    armed += 1;
+                    machoCapturePrint(
+                        "macho-processor: graphics tracepoint armed: role={s} ({s}) address=0x{x} candidates={d} symbol={s}\n",
+                        .{ @tagName(target.role), target.role.label(), address, matches, name },
+                    );
+                }
+            }
+            if (armed == 0) {
+                self.execution_tracepoints.noteUnresolved();
+                machoCapturePrint(
+                    "macho-processor: graphics tracepoint UNRESOLVED: fragment={s} role={s} name_matches={d} rejected_non_executable={d}; a zero hit count for this role will mean nothing was watching, NOT that it never ran\n",
+                    .{ target.fragment, @tagName(target.role), matches, rejected_non_executable },
+                );
+            }
+        }
+        self.execution_tracepoints.seal();
+        machoCapturePrint(
+            "macho-processor: graphics tracepoints sealed: armed={d} unresolved={d} range=0x{x}..0x{x} executable=0x{x}..0x{x}; whether VdSwap executes is now read from the instruction pointer rather than inferred from a log line\n",
+            .{
+                self.execution_tracepoints.count,
+                self.execution_tracepoints.unresolved,
+                self.execution_tracepoints.low,
+                self.execution_tracepoints.high,
+                self.executable_min,
+                self.executable_max,
+            },
+        );
+    }
+
+    /// The instruction pointer reached an armed boundary. Only the first entry
+    /// is reported: the rest are a frame rate, and the first is the fact the
+    /// investigation has been missing.
+    fn noteExecutionTracepoint(self: *MachOState) void {
+        // At a function's entry instruction the return address is still on top
+        // of the stack, so the caller is knowable without unwinding.
+        const caller = self.read64(self.regs.rsp);
+        const hit = self.execution_tracepoints.observe(
+            self.regs.rip,
+            self.executed_steps,
+            self.active_guest_thread,
+            caller,
+        ) orelse return;
+        const identity = self.event_stream.next(
+            .execution_boundary,
+            self.executed_steps,
+            self.active_guest_thread,
+            0,
+            caller,
+        ) orelse return;
+        const caller_symbol = self.metadata.nearestSymbol(caller);
+        machoCapturePrint(
+            "macho-processor: EXECUTION BOUNDARY ENTERED: run=0x{x} seq={d} role={s} symbol={s} address=0x{x} step={d} guest_thread=0x{x} caller=0x{x} caller_symbol={s}+0x{x}\n",
+            .{
+                identity.run_id,
+                identity.sequence,
+                @tagName(hit.role),
+                hit.name,
+                hit.address,
+                identity.guest_step,
+                identity.guest_thread,
+                caller,
+                if (caller_symbol) |resolved| resolved.name else "<unknown>",
+                if (caller_symbol) |resolved| resolved.offset else 0,
+            },
+        );
+    }
+
+    /// Which producer stopped, when threads are waiting for something that will
+    /// never arrive.
+    ///
+    /// A blocked count cannot distinguish a thread pool at idle from a lost
+    /// wakeup. The notifier's identity can: if every thread that ever signalled
+    /// the object is now itself waiting on it, no wake is coming, and the last
+    /// signaller's program counter is where the missing notification went.
+    pub fn logNotifierLiveness(self: *MachOState) void {
+        const object = self.pthreads.worstWaitObject(self.executed_steps) orelse return;
+        const progress = notifier_liveness.classify(
+            object,
+            self.executed_steps,
+            notifier_liveness.default_stall_steps,
+        );
+        const notifier_symbol = self.metadata.nearestSymbol(object.last_notify_pc);
+        machoCapturePrint(
+            "macho-processor: NOTIFIER LIVENESS: object=0x{x} state={s} waiters={d} distinct_notifiers={d} notifications={d} steps_since_notify={d} waiting_since_step={d} last_notify(step={d} thread=0x{x} pc=0x{x} symbol={s}+0x{x})\n",
+            .{
+                object.address,
+                progress.label(),
+                object.waiterCount(),
+                object.notifierCount(),
+                object.notifications,
+                self.executed_steps -| object.last_notify_step,
+                object.first_wait_step,
+                object.last_notify_step,
+                object.last_notify_thread,
+                object.last_notify_pc,
+                if (notifier_symbol) |resolved| resolved.name else "<unknown>",
+                if (notifier_symbol) |resolved| resolved.offset else 0,
+            },
+        );
+        machoCapturePrint("macho-processor: NOTIFIER LIVENESS GUIDANCE: {s}\n", .{progress.guidance()});
+    }
+
+    /// Anomalies with their dispositions, so a non-zero count is either acted
+    /// on or explicitly dismissed rather than accumulating unread.
+    pub fn logAnomalyLedger(self: *const MachOState) void {
+        const ledger = &self.anomalies;
+        if (ledger.count == 0) return;
+        machoCapturePrint(
+            "macho-processor: ANOMALY LEDGER: distinct={d} unclassified={d} implicated={d} overflow={d} signoff_clean={s}; {s}\n",
+            .{
+                ledger.count,
+                ledger.unclassified(),
+                ledger.implicated(),
+                ledger.overflow,
+                if (ledger.signoffClean()) "YES" else "NO",
+                ledger.verdict(),
+            },
+        );
+        for (ledger.records[0..ledger.count]) |record| {
+            machoCapturePrint(
+                "  anomaly kind={s} occurrences={d} disposition={s} first_step={d} thread=0x{x} caller=0x{x} detail={s}\n",
+                .{
+                    record.kind.label(),
+                    record.occurrences,
+                    record.disposition.label(),
+                    record.step,
+                    record.guest_thread,
+                    record.caller_pc,
+                    record.detailSlice(),
+                },
+            );
+        }
+    }
+
+    /// The graphics frontier, emitted on a schedule rather than only at exit.
+    ///
+    /// The 21:17 run produced none of the graphics summaries at all, because
+    /// the wrapper killed the process on a timeout and every summary was
+    /// written from the exit path. A diagnostic that only survives a clean
+    /// shutdown is unavailable in exactly the runs that need it, so this is
+    /// emitted periodically and again at exit.
+    pub fn logGraphicsFrontier(self: *MachOState, force: bool) void {
+        self.graphics_summary_emissions +|= 1;
+        const tracepoints = &self.execution_tracepoints;
+        const frontier = self.gpu_bootstrap.frontier();
+        const frontier_tag = if (frontier.step) |frontier_step|
+            @intFromEnum(frontier_step)
+        else
+            std.math.maxInt(u8);
+        var role_mask: u8 = 0;
+        inline for (@typeInfo(execution_tracepoints.Role).@"enum".fields) |field| {
+            const role: execution_tracepoints.Role = @enumFromInt(field.value);
+            if (tracepoints.roleEntered(role)) {
+                role_mask |= @as(u8, 1) << @intCast(field.value);
+            }
+        }
+        const ring_published = self.gpu_ring_publication.published();
+        const state_changed =
+            frontier_tag != self.graphics_last_frontier_tag or
+            frontier.reached != self.graphics_last_frontier_reached or
+            role_mask != self.graphics_last_role_mask or
+            ring_published != self.graphics_last_ring_published or
+            self.anomalies.count != self.graphics_last_anomaly_count;
+        self.graphics_last_frontier_tag = frontier_tag;
+        self.graphics_last_frontier_reached = frontier.reached;
+        self.graphics_last_role_mask = role_mask;
+        self.graphics_last_ring_published = ring_published;
+        self.graphics_last_anomaly_count = self.anomalies.count;
+
+        // Heartbeats already say that execution is alive. Repeat the lengthy
+        // causal report only when its state changes, every 16 heartbeats as a
+        // bounded timeout checkpoint, or at shutdown. This keeps an active PM4
+        // stream from turning diagnosis itself into the workload.
+        if (!force and !state_changed and self.graphics_summary_emissions % 16 != 0) {
+            return;
+        }
+        machoCapturePrint(
+            "macho-processor: GRAPHICS FRONTIER #{d}: run=0x{x} step={d} events={d} swap={s}\n",
+            .{
+                self.graphics_summary_emissions,
+                self.event_stream.run_id,
+                self.executed_steps,
+                self.event_stream.sequence,
+                tracepoints.verdict(.swap),
+            },
+        );
+        for (tracepoints.entries[0..tracepoints.count]) |entry| {
+            machoCapturePrint(
+                "  tracepoint role={s} hits={d} first_step={d} first_thread=0x{x} first_caller=0x{x} last_step={d} address=0x{x} symbol={s}\n",
+                .{ @tagName(entry.role), entry.hits, entry.first_step, entry.first_thread, entry.first_caller, entry.last_step, entry.address, entry.name },
+            );
+        }
+        inline for (@typeInfo(execution_tracepoints.Role).@"enum".fields) |field| {
+            const role: execution_tracepoints.Role = @enumFromInt(field.value);
+            if (tracepoints.roleArmed(role) or role == .swap) {
+                machoCapturePrint(
+                    "  role={s}: {s}\n",
+                    .{ @tagName(role), tracepoints.verdict(role) },
+                );
+            }
+        }
+        const publication = &self.gpu_ring_publication;
+        machoCapturePrint(
+            "  ring writes={d} advances={d} repeats={d} span={s} published={s}; {s}\n",
+            .{
+                publication.writes,
+                publication.advances,
+                publication.repeats,
+                @tagName(publication.span()),
+                if (publication.published()) "YES" else "NO",
+                publication.verdict(),
+            },
+        );
+        machoCapturePrint(
+            "  bootstrap reached={d}/{d} frontier={s} precondition_met={} blocked_by={s}\n",
+            .{
+                frontier.reached,
+                gpu.bootstrap.required_step_count,
+                if (frontier.step) |pending| pending.label() else "<complete>",
+                frontier.precondition_met,
+                if (frontier.blocked_by) |blocked| blocked.label() else "none",
+            },
+        );
+        self.dynamic_forwarder.logGraphicsProvenance();
+        // A blocked count is an aggregate; the frontier needs to know which
+        // resource the producer is parked on and for how long.
+        self.pthreads.logThreadCensus(self.executed_steps, self.active_guest_thread);
+        self.logNotifierLiveness();
+        self.logAnomalyLedger();
+        if (self.event_stream.anySuppressed()) {
+            machoCapturePrint(
+                "  NOTE: some event kinds hit their budget and were suppressed; a flat count is a budget, not a cessation\n",
+                .{},
+            );
+        }
+    }
+
     pub fn standardStreamPointer(self: *MachOState, symbol_name: []const u8) ?u64 {
         return guest_log.standardStreamPointer(self, symbol_name);
     }
@@ -1749,6 +2095,21 @@ pub const MachOState = struct {
 
     pub fn noteBackendMmapResult(self: *MachOState, succeeded: bool, result: u64, stage: []const u8) void {
         return guest_log.noteBackendMmapResult(self, succeeded, result, stage);
+    }
+
+    pub fn observeXeniaFixedMemoryView(self: *MachOState, address: u64, length: u64, offset: u64, anonymous: bool) void {
+        const discovery = self.xenia_memory_views.observeFixedFileView(address, length, offset, anonymous);
+        switch (discovery) {
+            .ignored, .confirmed => {},
+            .discovered => machoCapturePrint(
+                "macho-processor: Xenia memory-view model discovered: mapping_base=0x{x} source=fixed_file_view length=0x{x}; Xbox virtual and physical log addresses can now be resolved to translated host aliases\n",
+                .{ address, length },
+            ),
+            .conflicting => machoCapturePrint(
+                "macho-processor: Xenia memory-view model CONFLICT: retained_base=0x{x} observed_base=0x{x}; translated provenance is disabled rather than attributing writes to the wrong process view\n",
+                .{ self.xenia_memory_views.mapping_base, address },
+            ),
+        }
     }
 
     pub fn noteBackendMprotect(self: *MachOState, route: []const u8, address: u64, length: u64, prot: u64, succeeded: bool) void {
@@ -3659,6 +4020,13 @@ pub const MachOState = struct {
         while (!self.terminated and stepBudgetAllows(self.max_steps, steps)) : (steps +|= 1) {
             self.executed_steps = steps;
 
+            // Two comparisons and a bit test on the overwhelmingly common
+            // path. This is what turns "no log line said VdSwap(" into "the
+            // instruction pointer did or did not reach VdSwap".
+            if (self.execution_tracepoints.mightMatch(self.regs.rip)) {
+                self.noteExecutionTracepoint();
+            }
+
             // Never interpret the register file after the cooperative
             // scheduler has parked its owner. A zero active handle means the
             // registers are merely the last saved context, not executable
@@ -3740,6 +4108,10 @@ pub const MachOState = struct {
             next_heartbeat -|= 1;
             if (next_heartbeat == 0) {
                 next_heartbeat = HEARTBEAT_INTERVAL;
+                // Emitted here rather than only at exit: a run killed by the
+                // harness timeout still has to say where the graphics frontier
+                // stopped, and the exit path never runs in that case.
+                self.logGraphicsFrontier(false);
                 const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
                 const heartbeat_snapshot: startup_observer.Snapshot = .{
                     .step = steps,
@@ -4764,6 +5136,19 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     machoCapturePrint("ROSETTE: This confirms Rosetta is routing Xenia through compatibility layer\n", .{});
     output.human("Initializing pthread runtime...\n", .{});
     state.setupMachOState(options.path, options.args);
+    // Seeded from the process identity and a load-address the kernel
+    // randomises per launch. Deliberately not a wall clock: two runs started in
+    // the same second must not share a run identifier, because the whole point
+    // of the identifier is that evidence from two runs cannot be joined by
+    // accident.
+    state.event_stream.begin(
+        (@as(u64, @intCast(std.c.getpid())) << 32) ^ @intFromPtr(&state),
+    );
+    machoCapturePrint(
+        "macho-processor: run identity established: run=0x{x}; every boundary record in this log carries it, so records from two runs can never be joined\n",
+        .{state.event_stream.run_id},
+    );
+    state.armGraphicsTracepoints();
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
     machoCapturePrint("ROSETTE: MachO state setup completed successfully\n", .{});
 
@@ -4863,6 +5248,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.backend_diagnostics.logSummary();
     state.xenia_pipeline.logSummary(state.executed_steps);
     state.xenia_gpu_handoff.logSummary(state.executed_steps);
+    state.logGraphicsFrontier(true);
     state.pthreads.logSummary();
     state.logCooperativeSchedulerSummary();
     state.memory_forwarder.logSummary();
