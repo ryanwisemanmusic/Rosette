@@ -12,6 +12,7 @@
 //! Module-level dependencies (provided via build.zig addImport):
 //!   - macho_compat_runtime  (used by import_engine)
 //!   - scheduler             (used by dynamic_library_forwarder)
+//!   - gpu                   (backend-neutral host GPU handshake/runtime)
 
 pub const event_log = @import("event_log");
 pub const pointer_firewall = @import("pointer_firewall.zig");

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const guest_sleep = @import("scheduler").guest_sleep;
+const rosette_gpu = @import("gpu");
 const guest_memory_geometry = @import("guest_memory_geometry.zig");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 
@@ -27,6 +28,7 @@ pub const Signature = enum {
     libcxx_getloc,
     libcxx_istream_sentry_constructor,
     guest_virtual_sleep,
+    locale_info_pointer,
     socket_three_args,
     setsockopt_five_args,
     snprintf_three_args,
@@ -70,6 +72,7 @@ const specs = [_]Spec{
     .{ .symbol = "_ZNKSt3__18ios_base6getlocEv", .library = .libcxx, .signature = .libcxx_getloc },
     .{ .symbol = "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEE6sentryC1ERS3_b", .library = .libcxx, .signature = .libcxx_istream_sentry_constructor },
     .{ .symbol = "_ZNSt3__111this_thread9sleep_forERKNS_6chrono8durationIxNS_5ratioILl1ELl1000000000EEEEE", .library = .libcxx, .signature = .guest_virtual_sleep },
+    .{ .symbol = "nl_langinfo", .library = .libsystem, .signature = .locale_info_pointer },
     .{ .symbol = "socket", .library = .libsystem, .signature = .socket_three_args },
     .{ .symbol = "setsockopt", .library = .libsystem, .signature = .setsockopt_five_args },
     .{ .symbol = "snprintf", .library = .libsystem, .signature = .snprintf_three_args },
@@ -131,6 +134,8 @@ const GuestSymbolKind = enum {
     allocate_descriptor_sets,
     allocate_memory,
     map_memory,
+    bind_image_memory,
+    bind_buffer_memory,
     get_memory_requirements,
     create_graphics_pipelines,
     destroy_device_object,
@@ -157,9 +162,11 @@ const VulkanPresenterStage = enum {
     // handles. This is sufficient for Vulkan initialization discovery, but it
     // cannot put pixels in the CAMetalLayer.
     synthetic_swapchain_ready,
-    // Reserved for the native device + native swapchain + command submission
-    // bridge. Nothing may report this state until vkQueuePresentKHR targets a
-    // real host swapchain backed by the window's CAMetalLayer.
+    // Rosette's own native Vulkan presenter owns a real device, a real
+    // swapchain and real images on the window's CAMetalLayer, and frames reach
+    // the display through vkQueueSubmit and vkQueuePresentKHR. This says
+    // nothing about the guest's Vulkan objects, which remain modelled: it means
+    // the host half of the path is no longer synthetic.
     native_drawable_ready,
     failed,
 };
@@ -221,6 +228,43 @@ const VulkanMemoryAllocation = struct {
     mapped_size: u64 = 0,
 };
 
+// Offsets into VkImageCreateInfo and VkBufferCreateInfo. Read from the guest's
+// own structures rather than guessed, because the extent and format they carry
+// are the only description of what the guest intends to draw into.
+const VK_IMAGE_CREATE_INFO_FORMAT_OFFSET: u64 = 24;
+const VK_IMAGE_CREATE_INFO_EXTENT_OFFSET: u64 = 28;
+const VK_IMAGE_CREATE_INFO_MIP_LEVELS_OFFSET: u64 = 40;
+const VK_IMAGE_CREATE_INFO_ARRAY_LAYERS_OFFSET: u64 = 44;
+const VK_IMAGE_CREATE_INFO_TILING_OFFSET: u64 = 52;
+const VK_IMAGE_CREATE_INFO_USAGE_OFFSET: u64 = 56;
+const VK_IMAGE_CREATE_INFO_SIZE: u64 = 88;
+const VK_BUFFER_CREATE_INFO_SIZE_OFFSET: u64 = 24;
+const VK_BUFFER_CREATE_INFO_USAGE_OFFSET: u64 = 32;
+const VK_BUFFER_CREATE_INFO_SIZE: u64 = 56;
+
+const MAX_VULKAN_RESOURCES = 128;
+const VulkanResourceKind = enum { image, buffer };
+
+/// What the guest said it was creating. Recorded because a modelled
+/// `vkCreateImage` is the only place the runtime ever learns an image's extent
+/// and format, and without them a later `vkGetImageMemoryRequirements` cannot
+/// answer with a size that matches what the guest will write.
+const VulkanResource = struct {
+    handle: u64 = 0,
+    kind: VulkanResourceKind = .buffer,
+    format: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    mip_levels: u32 = 1,
+    array_layers: u32 = 1,
+    tiling: u32 = 0,
+    usage: u32 = 0,
+    size_bytes: u64 = 0,
+    row_pitch_bytes: u64 = 0,
+    memory: u64 = 0,
+    memory_offset: u64 = 0,
+};
+
 pub const Forwarder = struct {
     libraries: [MAX_LIBRARIES]Library = [_]Library{.{}} ** MAX_LIBRARIES,
     library_count: usize = 0,
@@ -249,6 +293,10 @@ pub const Forwarder = struct {
     vulkan_memory_map_reuses: u64 = 0,
     vulkan_memory_records: [MAX_VULKAN_MEMORY_ALLOCATIONS]VulkanMemoryAllocation =
         [_]VulkanMemoryAllocation{.{}} ** MAX_VULKAN_MEMORY_ALLOCATIONS,
+    vulkan_resources: [MAX_VULKAN_RESOURCES]VulkanResource =
+        [_]VulkanResource{.{}} ** MAX_VULKAN_RESOURCES,
+    vulkan_resource_overflow: u64 = 0,
+    vulkan_image_bindings: u64 = 0,
     vulkan_presenter_bind_attempts: u64 = 0,
     vulkan_presenter_bind_failures: u64 = 0,
     vulkan_presenter_off_ui_calls: u64 = 0,
@@ -261,6 +309,28 @@ pub const Forwarder = struct {
     native_vulkan_failures: u64 = 0,
     native_vulkan_loader_attempts: u64 = 0,
     native_vulkan_loader_failures: u64 = 0,
+    gpu_runtime: rosette_gpu.Runtime = .{},
+    gpu_handshake_response: rosette_gpu.HandshakeResponse = .{},
+    gpu_handshake_updates: u64 = 0,
+    gpu_health_fingerprint: u64 = std.math.maxInt(u64),
+    // Rosette's own presentation path, independent of the guest's modelled
+    // Vulkan objects. The guest calling vkQueuePresentKHR is a request; this is
+    // what actually reaches the display.
+    native_presenter: rosette_gpu.NativePresenter = .{},
+    native_presenter_attempts: u64 = 0,
+    native_presenter_stage_logged: ?rosette_gpu.NativePresenterStage = null,
+    // Counts guest-visible Vulkan activity and the Metal fallback. The
+    // presenter keeps its own ledger for native driver work; the two are never
+    // summed, because they answer different questions.
+    frame_provenance: rosette_gpu.FrameProvenance = .{},
+    forwarding_contract: rosette_gpu.ForwardingContract = .{},
+    // Where a completed guest frame lands on its way to the presenter. Empty
+    // until something publishes; `absence()` says which link is missing rather
+    // than leaving a reader with "no source".
+    frame_inbox: rosette_gpu.FrameInbox = .{},
+    frame_source_scans: u64 = 0,
+    frame_source_discoveries: u64 = 0,
+    frame_source_absence_logged: ?rosette_gpu.FrameAbsence = null,
     vulkan_swapchain_image_handles: [4]u64 = [_]u64{0} ** 4,
     vulkan_swapchain_image_count: u32 = 0,
     considered: u64 = 0,
@@ -283,6 +353,7 @@ pub const Forwarder = struct {
 
     pub fn deinit(self: *Forwarder) void {
         self.destroyNativeVulkanObjects();
+        self.gpu_runtime.deinit();
         for (self.libraries[0..self.library_count]) |loaded_library| {
             if (loaded_library.handle) |handle| _ = dlclose(handle);
         }
@@ -355,6 +426,7 @@ pub const Forwarder = struct {
         if (self.guestLibraryEntry(entry.library_token) == null) return false;
         self.guest_thunk_calls +|= 1;
         entry.calls +|= 1;
+        self.frame_provenance.noteGuestVulkanCall();
         switch (entry.kind) {
             .get_instance_proc_addr, .get_device_proc_addr => {
                 const symbol = state.guestCString(state.regs.rsi, 512) orelse {
@@ -414,7 +486,9 @@ pub const Forwarder = struct {
             .acquire_next_image => state.regs.rax = self.acquireNextImage(state, state.regs.r9),
             .queue_submit => state.regs.rax = self.queueSubmit(),
             .queue_present => state.regs.rax = self.queuePresent(state),
-            .create_device_object => state.regs.rax = self.createVulkanObject(state, state.regs.rcx, entry.name[0..entry.name_length]),
+            .create_device_object => state.regs.rax = self.createVulkanObject(state, state.regs.rsi, state.regs.rcx, entry.name[0..entry.name_length]),
+            .bind_image_memory => state.regs.rax = self.bindResourceMemory(state.regs.rsi, state.regs.rdx, state.regs.rcx, .image),
+            .bind_buffer_memory => state.regs.rax = self.bindResourceMemory(state.regs.rsi, state.regs.rdx, state.regs.rcx, .buffer),
             .allocate_command_buffers => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 28, entry.name[0..entry.name_length]),
             .allocate_descriptor_sets => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 24, entry.name[0..entry.name_length]),
             .allocate_memory => state.regs.rax = self.allocateVulkanMemory(state, state.regs.rsi, state.regs.rcx),
@@ -425,7 +499,7 @@ pub const Forwarder = struct {
                 state.regs.rcx,
                 state.regs.r9,
             ),
-            .get_memory_requirements => state.regs.rax = writeMemoryRequirements(state, state.regs.rdx),
+            .get_memory_requirements => state.regs.rax = self.writeResourceMemoryRequirements(state, state.regs.rsi, state.regs.rdx),
             .create_graphics_pipelines => state.regs.rax = self.createMultipleVulkanObjects(state, state.regs.rdx, state.regs.r9, entry.name[0..entry.name_length]),
             .destroy_device_object => state.regs.rax = 0,
             .device_success => state.regs.rax = 0,
@@ -464,16 +538,116 @@ pub const Forwarder = struct {
         return result;
     }
 
-    fn createVulkanObject(self: *Forwarder, state: anytype, output: u64, name: []const u8) u64 {
+    fn createVulkanObject(self: *Forwarder, state: anytype, create_info: u64, output: u64, name: []const u8) u64 {
         if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
         const handle = self.nextVulkanObject();
         state.write64(output, handle);
         registerOpaqueHandle(state, handle, name);
         machoCapturePrint("macho-processor: Vulkan object created: {s} handle=0x{x} output=0x{x}\n", .{ name, handle, output });
-        if (std.mem.eql(u8, name, "vkCreateImage")) {
-            _ = presentNativeSyntheticVulkanFrame(state, handle, 0, 0, 2);
+        // Deliberately no frame here. An ordinary vkCreateImage is a resource
+        // event: the image may be a texture, a depth buffer, a staging image or
+        // a render target, it need not have presentation usage, it does not
+        // belong to a swapchain, it may not be bound to memory, and it may hold
+        // no pixels. Treating it as a presentation trigger produced a frame
+        // whose only relationship to the guest was that the guest had allocated
+        // something.
+        //
+        // The description is worth keeping even so. An image the guest later
+        // fills and presents is the only route to authentic pixels, and its
+        // extent and format exist nowhere but in this structure.
+        if (std.mem.eql(u8, name, "vkCreateImage")) self.recordImage(state, handle, create_info);
+        if (std.mem.eql(u8, name, "vkCreateBuffer")) self.recordBuffer(state, handle, create_info);
+        return 0;
+    }
+
+    fn trackedImageCount(self: *const Forwarder) u64 {
+        var count: u64 = 0;
+        for (self.vulkan_resources) |record| {
+            if (record.handle != 0 and record.kind == .image) count += 1;
+        }
+        return count;
+    }
+
+    fn resourceSlot(self: *Forwarder, handle: u64) ?*VulkanResource {
+        for (&self.vulkan_resources) |*record| {
+            if (record.handle == handle) return record;
+        }
+        for (&self.vulkan_resources) |*record| {
+            if (record.handle == 0) return record;
+        }
+        self.vulkan_resource_overflow +|= 1;
+        return null;
+    }
+
+    fn findResource(self: *Forwarder, handle: u64) ?*VulkanResource {
+        if (handle == 0) return null;
+        for (&self.vulkan_resources) |*record| {
+            if (record.handle == handle) return record;
+        }
+        return null;
+    }
+
+    fn recordImage(self: *Forwarder, state: anytype, handle: u64, create_info: u64) void {
+        if (create_info == 0 or state.guestMemoryConst(create_info, VK_IMAGE_CREATE_INFO_SIZE) == null) return;
+        const record = self.resourceSlot(handle) orelse return;
+        const format = state.read32(create_info + VK_IMAGE_CREATE_INFO_FORMAT_OFFSET);
+        const width = state.read32(create_info + VK_IMAGE_CREATE_INFO_EXTENT_OFFSET);
+        const height = state.read32(create_info + VK_IMAGE_CREATE_INFO_EXTENT_OFFSET + 4);
+        const bytes_per_pixel = rosette_gpu.vulkan.selection.bytesPerPixel(format) orelse 0;
+        const row_pitch = @as(u64, width) * bytes_per_pixel;
+        record.* = .{
+            .handle = handle,
+            .kind = .image,
+            .format = format,
+            .width = width,
+            .height = height,
+            .mip_levels = state.read32(create_info + VK_IMAGE_CREATE_INFO_MIP_LEVELS_OFFSET),
+            .array_layers = state.read32(create_info + VK_IMAGE_CREATE_INFO_ARRAY_LAYERS_OFFSET),
+            .tiling = state.read32(create_info + VK_IMAGE_CREATE_INFO_TILING_OFFSET),
+            .usage = state.read32(create_info + VK_IMAGE_CREATE_INFO_USAGE_OFFSET),
+            .row_pitch_bytes = row_pitch,
+            .size_bytes = row_pitch * height,
+        };
+    }
+
+    fn recordBuffer(self: *Forwarder, state: anytype, handle: u64, create_info: u64) void {
+        if (create_info == 0 or state.guestMemoryConst(create_info, VK_BUFFER_CREATE_INFO_SIZE) == null) return;
+        const record = self.resourceSlot(handle) orelse return;
+        record.* = .{
+            .handle = handle,
+            .kind = .buffer,
+            .usage = state.read32(create_info + VK_BUFFER_CREATE_INFO_USAGE_OFFSET),
+            .size_bytes = state.read64(create_info + VK_BUFFER_CREATE_INFO_SIZE_OFFSET),
+        };
+    }
+
+    fn bindResourceMemory(self: *Forwarder, resource: u64, memory: u64, offset: u64, kind: VulkanResourceKind) u64 {
+        const record = self.findResource(resource) orelse return 0;
+        record.memory = memory;
+        record.memory_offset = offset;
+        if (kind == .image) {
+            self.vulkan_image_bindings +|= 1;
+            if (self.vulkan_image_bindings <= 4) {
+                machoCapturePrint(
+                    "macho-processor: Vulkan image bound to memory: image=0x{x} memory=0x{x} offset={d} extent={d}x{d} format={d} tiling={d} usage=0x{x} size={d}\n",
+                    .{ resource, memory, offset, record.width, record.height, record.format, record.tiling, record.usage, record.size_bytes },
+                );
+            }
         }
         return 0;
+    }
+
+    /// Answer with a size the resource actually needs.
+    ///
+    /// This previously replied 4096 bytes for everything. A 1280×720 image was
+    /// therefore backed by a 4 KiB allocation, so a guest that filled it wrote
+    /// 3.5 MB past its own allocation — and an image that cannot hold a frame
+    /// can never become one, which puts a floor under every attempt to find
+    /// authentic pixels.
+    fn writeResourceMemoryRequirements(self: *Forwarder, state: anytype, resource: u64, output: u64) u64 {
+        const record = self.findResource(resource);
+        const size = if (record) |found| found.size_bytes else 0;
+        return writeMemoryRequirements(state, output, size);
     }
 
     fn createLogicalDevice(self: *Forwarder, state: anytype, output: u64) u64 {
@@ -556,6 +730,7 @@ pub const Forwarder = struct {
         }
         self.native_vulkan_instance = instance;
         self.native_vulkan_library_token = library_token;
+        self.negotiateRosetteGpuBoundary("native_instance_ready");
         machoCapturePrint(
             "macho-processor: native Vulkan shadow instance ready: instance=0x{x} library_token=0x{x} attempt={d}\n",
             .{ @intFromPtr(instance.?), library_token, self.native_vulkan_instance_attempts },
@@ -611,6 +786,7 @@ pub const Forwarder = struct {
             return .{ .enforced = true, .result = if (result != 0) result else vkErrorInitializationFailedSigned(), .surface = 0 };
         }
         self.native_vulkan_surface = surface;
+        self.negotiateRosetteGpuBoundary("native_surface_ready");
         machoCapturePrint(
             "macho-processor: native vkCreateMetalSurfaceEXT succeeded: attempt={d} instance=0x{x} CAMetalLayer=0x{x} VkSurfaceKHR=0x{x}\n",
             .{ self.native_vulkan_surface_attempts, @intFromPtr(self.native_vulkan_instance.?), host_layer, surface },
@@ -630,6 +806,10 @@ pub const Forwarder = struct {
     }
 
     fn destroyNativeVulkanObjects(self: *Forwarder) void {
+        // The presenter owns a device, a swapchain and a surface of its own,
+        // all parented by an instance in this same library. It has to go first,
+        // and in its own dependency order.
+        self.native_presenter.shutdown();
         self.destroyNativeSurface();
         const instance = self.native_vulkan_instance orelse return;
         if (self.guestLibrary(self.native_vulkan_library_token)) |library| {
@@ -641,6 +821,345 @@ pub const Forwarder = struct {
         self.native_vulkan_instance = null;
         self.native_vulkan_library_token = 0;
         self.native_vulkan_surface = 0;
+    }
+
+    /// Hands the presenter the host loader without teaching the GPU library
+    /// anything about `dlopen`: resolving symbols is dyld's job, and this is
+    /// dyld.
+    fn resolveNativeVulkanSymbol(context: ?*anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque {
+        const handle = context orelse return null;
+        return dlsym(handle, name);
+    }
+
+    /// Bring Rosette's own native presenter up against the window's
+    /// `CAMetalLayer`. Independent of the guest's Vulkan objects: the guest's
+    /// device and swapchain stay modelled, while this owns a real device, a
+    /// real swapchain and real images, so something other than a host clear can
+    /// reach the display.
+    fn bringUpNativePresenter(self: *Forwarder, state: anytype, library_token: u64) rosette_gpu.NativePresenterStage {
+        const State = @typeInfo(@TypeOf(state)).pointer.child;
+        if (self.native_presenter.stage.isReady()) return .ready;
+        if (self.native_presenter.stage == .device_lost) return .device_lost;
+        if (!@hasDecl(State, "nativeMetalLayerHostPointer")) return self.native_presenter.stage;
+        const layer = state.nativeMetalLayerHostPointer();
+        if (layer == 0) return self.native_presenter.stage;
+        const library = self.materializeNativeVulkanLibrary(library_token) orelse return self.native_presenter.stage;
+
+        const width = if (@hasDecl(State, "nativeWindowWidth")) state.nativeWindowWidth() else 1280;
+        const height = if (@hasDecl(State, "nativeWindowHeight")) state.nativeWindowHeight() else 720;
+        self.native_presenter_attempts +|= 1;
+        const stage = self.native_presenter.bringUp(
+            .{ .context = library, .lookup = resolveNativeVulkanSymbol },
+            layer,
+            @max(width, 1),
+            @max(height, 1),
+        );
+        if (self.native_presenter_stage_logged != stage) {
+            self.native_presenter_stage_logged = stage;
+            const report = &self.native_presenter.report;
+            machoCapturePrint(
+                "macho-processor: native Vulkan presenter: attempt={d} stage={s} ({s}) VkResult={d} rejection={s} adapter={s} api=0x{x} physical_devices={d} queues(graphics/present/unified)={d}/{d}/{} portability(enumeration/subset)={}/{} swapchain(images/extent/format/colorspace/present_mode/usage)={d}/{d}x{d}/{d}/{d}/{d}/0x{x} CAMetalLayer=0x{x}\n",
+                .{
+                    self.native_presenter_attempts,
+                    @tagName(stage),
+                    stage.label(),
+                    report.last_result,
+                    report.rejectionLabel(),
+                    if (report.adapter_name_length != 0) report.adapterName() else "unselected",
+                    report.api_version,
+                    report.physical_device_count,
+                    report.graphics_family,
+                    report.present_family,
+                    report.unified_queue,
+                    report.portability_enumeration,
+                    report.portability_subset,
+                    report.swapchain_image_count,
+                    report.extent_width,
+                    report.extent_height,
+                    report.surface_format,
+                    report.surface_color_space,
+                    report.present_mode,
+                    report.image_usage,
+                    layer,
+                },
+            );
+        }
+        if (stage.isReady()) {
+            self.vulkan_presenter_stage = .native_drawable_ready;
+            self.negotiateRosetteGpuBoundary("native_presenter_ready");
+        }
+        return stage;
+    }
+
+    /// Look for a guest image that could be this frame.
+    ///
+    /// Deliberately generic: no address, title, or symbol name appears here.
+    /// The question asked is structural — is there an image the guest described
+    /// with a presentable format and extent, bound to memory the guest can
+    /// write, that the guest has actually written? An image satisfying all four
+    /// is the guest's frame whatever produced it, and an image failing any of
+    /// them is named by which one it failed, so the next run says what to fix
+    /// rather than that nothing was found.
+    ///
+    /// It does not synthesise. If the guest wrote nothing, this publishes
+    /// nothing, and the window keeps showing a frame labelled diagnostic.
+    fn discoverGuestFrameSource(self: *Forwarder, state: anytype) void {
+        self.frame_source_scans +|= 1;
+        var best: ?*VulkanResource = null;
+        var best_pixels: u64 = 0;
+        var saw_image = false;
+        var saw_bound = false;
+        var saw_mapped = false;
+        var saw_format = false;
+        for (&self.vulkan_resources) |*record| {
+            if (record.handle == 0 or record.kind != .image) continue;
+            saw_image = true;
+            if (record.width == 0 or record.height == 0) continue;
+            if (rosette_gpu.vulkan.selection.bytesPerPixel(record.format) == null) continue;
+            saw_format = true;
+            if (record.memory == 0) continue;
+            saw_bound = true;
+            const allocation = self.findVulkanMemoryRecord(record.memory) orelse continue;
+            if (allocation.mapped_base == 0) continue;
+            saw_mapped = true;
+            const pixels = @as(u64, record.width) * record.height;
+            if (pixels <= best_pixels) continue;
+            best_pixels = pixels;
+            best = record;
+        }
+        const chosen = best orelse {
+            // Each of these is a different missing link, and "no source" alone
+            // would send a reader nowhere.
+            self.frame_inbox.noteUnusable(if (!saw_image)
+                .never_published
+            else if (!saw_format)
+                .format_unsupported
+            else if (!saw_bound or !saw_mapped)
+                .source_unmapped
+            else
+                .never_published);
+            return;
+        };
+        const allocation = self.findVulkanMemoryRecord(chosen.memory) orelse return;
+        const address = allocation.mapped_base + chosen.memory_offset;
+        const required = chosen.size_bytes;
+        const readable = state.guestMemoryConst(address, required);
+        if (readable == null) {
+            self.frame_inbox.noteUnusable(.source_truncated);
+            return;
+        }
+        // An allocated, mapped, never-written image is zero throughout.
+        // Presenting it would put a black frame on the window and label it
+        // guest output, which is worse than showing nothing.
+        var written = false;
+        for (readable.?) |byte| {
+            if (byte != 0) {
+                written = true;
+                break;
+            }
+        }
+        if (!written) {
+            self.frame_inbox.noteUnusable(.never_published);
+            return;
+        }
+        const serial = self.frame_inbox.publish(.{
+            .source_address = address,
+            .source_length = required,
+            .width = chosen.width,
+            .height = chosen.height,
+            .format = chosen.format,
+            .row_pitch_bytes = chosen.row_pitch_bytes,
+            .orientation = .top_down,
+            .fit = .letterbox,
+            .producer = .xenia_host,
+            // Only the bootstrap's own swap observation may set this, and it is
+            // supplied by the caller rather than inferred from a frame arriving.
+            .guest_swap_observed = false,
+        });
+        if (serial == 0) return;
+        self.frame_source_discoveries +|= 1;
+        if (self.frame_source_discoveries == 1) {
+            machoCapturePrint(
+                "macho-processor: GUEST FRAME SOURCE FOUND: image=0x{x} extent={d}x{d} format={d} pitch={d} bytes={d} guest_address=0x{x} serial={d}; a written, mapped, presentable guest image now feeds the native presenter\n",
+                .{ chosen.handle, chosen.width, chosen.height, chosen.format, chosen.row_pitch_bytes, required, address, serial },
+            );
+        }
+    }
+
+    /// Put a frame on the window. Prefers a completed guest image, falls back to
+    /// Rosette's native Vulkan presenter showing a diagnostic clear, and falls
+    /// back again to the host Metal clear only when that presenter could not be
+    /// brought up. Every one of those is labelled with what it actually is.
+    fn presentWindowFrame(self: *Forwarder, state: anytype, serial: u64, width: u32, height: u32, stage_hint: u32) bool {
+        if (self.native_presenter.stage.isReady()) {
+            self.discoverGuestFrameSource(state);
+            if (self.frame_inbox.acquire()) |descriptor| {
+                const pixels = state.guestMemoryConst(descriptor.source_address, descriptor.source_length);
+                if (pixels) |bytes| {
+                    const report = self.native_presenter.present(.{ .cpu_image = .{
+                        .pixels = bytes,
+                        .width = descriptor.width,
+                        .height = descriptor.height,
+                        .format = self.native_presenter.surface_format.format,
+                        .row_pitch_bytes = descriptor.row_pitch_bytes,
+                        .orientation = descriptor.orientation,
+                        .fit = descriptor.fit,
+                        .producer = descriptor.producer,
+                        .guest_swap_observed = descriptor.guest_swap_observed,
+                    } });
+                    self.frame_inbox.release(report.presented and report.source_copied);
+                    if (report.presented and report.source_copied) {
+                        const frames = self.native_presenter.ledger.host_frames_presented +
+                            self.native_presenter.ledger.guest_output_frames_presented;
+                        if (frames <= 8 or frames % 120 == 0) {
+                            machoCapturePrint(
+                                "macho-processor: guest-sourced frame presented: serial={d} extent={d}x{d} composite={s} destination={d},{d} {d}x{d} class={s} guest_swap_observed={s}\n",
+                                .{
+                                    descriptor.serial,
+                                    descriptor.width,
+                                    descriptor.height,
+                                    @tagName(report.composite),
+                                    report.destination.x,
+                                    report.destination.y,
+                                    report.destination.width,
+                                    report.destination.height,
+                                    report.classification.label(),
+                                    if (descriptor.guest_swap_observed) "YES" else "NO",
+                                },
+                            );
+                        }
+                        return true;
+                    }
+                    // The presenter could not use it. Say so rather than
+                    // falling through silently to a clear that looks the same.
+                    machoCapturePrint(
+                        "macho-processor: guest-sourced frame rejected by the presenter: serial={d} extent={d}x{d} swapchain={d}x{d} source_format={d} swapchain_format={d} composite={s}; falling back to a diagnostic clear\n",
+                        .{
+                            descriptor.serial,
+                            descriptor.width,
+                            descriptor.height,
+                            self.native_presenter.extent.width,
+                            self.native_presenter.extent.height,
+                            descriptor.format,
+                            self.native_presenter.surface_format.format,
+                            @tagName(report.composite),
+                        },
+                    );
+                } else {
+                    self.frame_inbox.release(false);
+                    self.frame_inbox.noteUnusable(.source_unmapped);
+                }
+            } else if (self.frame_source_absence_logged != self.frame_inbox.absence()) {
+                self.frame_source_absence_logged = self.frame_inbox.absence();
+                machoCapturePrint(
+                    "macho-processor: no guest frame source: {s} (scans={d} discoveries={d} images_tracked={d} image_bindings={d})\n",
+                    .{
+                        self.frame_inbox.absence().label(),
+                        self.frame_source_scans,
+                        self.frame_source_discoveries,
+                        self.trackedImageCount(),
+                        self.vulkan_image_bindings,
+                    },
+                );
+            }
+            // Cycled so a stalled presenter is visibly distinguishable from a
+            // running one that has nothing new to show.
+            const phase: f32 = @as(f32, @floatFromInt(serial % 120)) / 120.0;
+            const report = self.native_presenter.present(.{
+                .clear = .{ 0.05, 0.08 + phase * 0.3, 0.16 + (1.0 - phase) * 0.4, 1.0 },
+            });
+            const frames = self.native_presenter.ledger.diagnostic_frames_presented;
+            if (frames <= 8 or frames % 120 == 0 or !report.presented) {
+                machoCapturePrint(
+                    "macho-processor: native Vulkan frame: serial={d} attempted={} generation={d} slot={d} image={d} acquire={d}({s}) submit={d} present={d}({s}) health={s} provenance={s} source=host_clear native_swapchain=YES native_queue_submit={s} guest_output=NO\n",
+                    .{
+                        serial,
+                        report.attempted,
+                        report.generation,
+                        report.frame_slot,
+                        report.image_index,
+                        report.acquire_result,
+                        @tagName(report.acquire_outcome),
+                        report.submit_result,
+                        report.present_result,
+                        @tagName(report.present_outcome),
+                        @tagName(report.health),
+                        report.classification.label(),
+                        if (report.submitted) "YES" else "NO",
+                    },
+                );
+            }
+            return report.presented;
+        }
+        const presented = presentDiagnosticMetalFrame(state, serial, width, height, stage_hint);
+        _ = self.frame_provenance.record(.{
+            .producer = .diagnostic,
+            .source_ready = true,
+            // A Metal clear reaches the drawable without any of these.
+            .native_command_recording = false,
+            .native_submission = false,
+            .native_presentation = false,
+            .present_accepted = presented,
+        });
+        return presented;
+    }
+
+    fn negotiateRosetteGpuBoundary(self: *Forwarder, reason: []const u8) void {
+        // The presenter is authoritative once it exists: it is the only thing
+        // that has actually created a device, a queue and a swapchain.
+        if (self.native_presenter.stage != .unstarted) {
+            self.gpu_runtime.installVulkanBoundary(self.native_presenter.boundary());
+            self.forwarding_contract = .{};
+            self.native_presenter.declareInto(&self.forwarding_contract);
+        } else {
+            self.gpu_runtime.installVulkanBoundary(.{
+                .instance_native = self.native_vulkan_instance != null,
+                .surface_native = self.native_vulkan_surface != 0,
+            });
+        }
+        self.gpu_handshake_response = self.gpu_runtime.negotiate(rosette_gpu.HandshakeRequest.xeniaObservation());
+        self.gpu_handshake_updates +|= 1;
+        const response = &self.gpu_handshake_response;
+        machoCapturePrint(
+            "macho-processor: Rosette GPU handshake #{d}: reason={s} api={d} backend={s} status={s} session=0x{x} negotiated=0x{x}:0x{x} missing_required=0x{x}:0x{x} missing_desired=0x{x}:0x{x} first_missing={s} detail={s}\n",
+            .{
+                self.gpu_handshake_updates,
+                reason,
+                response.version,
+                @tagName(response.backendValue()),
+                @tagName(response.statusValue()),
+                response.session,
+                response.negotiated.high,
+                response.negotiated.low,
+                response.missing_required.high,
+                response.missing_required.low,
+                response.missing_desired.high,
+                response.missing_desired.low,
+                if (response.first_missing_capability == rosette_gpu.api.no_capability)
+                    "none"
+                else
+                    rosette_gpu.api.capabilityName(@enumFromInt(response.first_missing_capability)),
+                response.reasonSlice(),
+            },
+        );
+        const health = self.gpu_runtime.bridgeHealth();
+        const health_fingerprint = health.fingerprint();
+        if (health_fingerprint != self.gpu_health_fingerprint) {
+            self.gpu_health_fingerprint = health_fingerprint;
+            machoCapturePrint(
+                "macho-processor: Rosette GPU bridge health: stage={s} advisory_only=YES host_execution_ready={s} first_missing={s} authentic_submit={s} authentic_present={s}; this report is non-fatal and does not alter guest GPU bootstrap\n",
+                .{
+                    @tagName(health.stage),
+                    if (health.readyForHostExecution()) "YES" else "NO",
+                    if (health.first_missing_execution_capability) |missing|
+                        rosette_gpu.api.capabilityName(missing)
+                    else
+                        "none",
+                    if (health.authentic_submission_seen) "YES" else "NO",
+                    if (health.authentic_presentation_seen) "YES" else "NO",
+                },
+            );
+        }
     }
 
     fn createMetalSurface(self: *Forwarder, state: anytype, library_token: u64, instance: u64, create_info: u64, output: u64) u64 {
@@ -688,10 +1207,15 @@ pub const Forwarder = struct {
             }
             if (self.vulkan_metal_surfaces_created == 1) {
                 machoCapturePrint(
-                    "macho-processor: Vulkan milestone: metal_surface_created surface=0x{x} layer=0x{x} output=0x{x} gtk_idle_source={d}\n",
+                    "macho-processor: Vulkan milestone: metal_surface_created guest_surface=0x{x} (MODELLED) layer=0x{x} output=0x{x} gtk_idle_source={d}\n",
                     .{ VK_SYNTHETIC_SURFACE, layer, output, state.active_idle_source },
                 );
             }
+            // The layer is live and the host loader is open, which is the
+            // earliest point Rosette's own presenter can exist. Bringing it up
+            // here rather than at first present means a failure is reported
+            // while there is still context for it.
+            _ = self.bringUpNativePresenter(state, library_token);
         } else {
             self.vulkan_presenter_stage = .failed;
             self.vulkan_presenter_bind_failures +|= 1;
@@ -762,11 +1286,11 @@ pub const Forwarder = struct {
         );
         if (self.vulkan_swapchains_created == 1) {
             machoCapturePrint(
-                "macho-processor: GRAPHICS FORWARDING BOUNDARY: Cocoa window, CAMetalLayer, and native VkSurfaceKHR are ready; physical device, logical device, swapchain images, commands, queue submission, and presentation are synthetic. Diagnostic Metal frames are forced to the window, but authoritative guest pixels still require native Vulkan handle and structure translation.\n",
-                .{},
+                "macho-processor: GRAPHICS FORWARDING BOUNDARY: the guest's VkDevice, VkSwapchainKHR, swapchain images, commands, queue submissions and presents are MODELLED by Rosette and reach no driver. Rosette's own native presenter (stage={s}) owns the host half of the path. Guest pixels require Xenia to hand the presenter a completed image; until then every frame on the window is diagnostic.\n",
+                .{@tagName(self.native_presenter.stage)},
             );
         }
-        _ = presentNativeSyntheticVulkanFrame(state, handle, image_width, image_height, 1);
+        _ = self.presentWindowFrame(state, handle, image_width, image_height, 1);
         return 0;
     }
 
@@ -816,9 +1340,10 @@ pub const Forwarder = struct {
 
     fn queueSubmit(self: *Forwarder) u64 {
         self.vulkan_queue_submits +|= 1;
+        self.frame_provenance.noteGuestVulkanCall();
         if (self.vulkan_queue_submits == 1) {
             machoCapturePrint(
-                "macho-processor: Vulkan modeled milestone: first_queue_submit (synthetic success; no native VkQueue submission)\n",
+                "macho-processor: Vulkan MODELLED milestone: first_queue_submit. Rosette answered the call; no native VkQueue saw it and no command executed. This counts guest intent, not host work.\n",
                 .{},
             );
         }
@@ -827,17 +1352,20 @@ pub const Forwarder = struct {
 
     fn queuePresent(self: *Forwarder, state: anytype) u64 {
         self.vulkan_presents +|= 1;
-        const presented = presentNativeSyntheticVulkanFrame(
-            state,
-            self.vulkan_presents,
-            0,
-            0,
-            3,
-        );
+        self.frame_provenance.noteGuestVulkanCall();
+        // The guest asking to present is a reason to put a frame up, not a
+        // frame. What reaches the display is Rosette's own presenter, and its
+        // source is still a host clear because the guest's modelled command
+        // stream produced no image to carry.
+        const presented = self.presentWindowFrame(state, self.vulkan_presents, 0, 0, 3);
         if (self.vulkan_presents == 1) {
             machoCapturePrint(
-                "macho-processor: Vulkan modeled milestone: first_queue_present (synthetic command stream, forced_native_drawable={})\n",
-                .{presented},
+                "macho-processor: Vulkan MODELLED milestone: first_queue_present. presentation provenance=DIAGNOSTIC_ONLY source=host_clear native_swapchain={s} native_queue_submit={s} guest_output=NO displayed={}\n",
+                .{
+                    if (self.native_presenter.stage.isReady()) "YES" else "NO",
+                    if (self.native_presenter.ledger.native_submissions != 0) "YES" else "NO",
+                    presented,
+                },
             );
         }
         return 0;
@@ -968,6 +1496,7 @@ pub const Forwarder = struct {
                 entry.* = .{ .token = token, .virtual_vulkan = true, .path_length = path_length };
                 @memcpy(entry.path[0..path_length], path[0..path_length]);
                 self.guest_open_count +|= 1;
+                self.negotiateRosetteGpuBoundary("vulkan_loader_opened");
                 machoCapturePrint(
                     "macho-processor: Vulkan guest loader virtualized: path={s} mode=0x{x} token=0x{x}; native dyld load deferred until Metal surface bind and is currently limited to the shadow instance + surface bridge\n",
                     .{ path, mode, token },
@@ -1072,6 +1601,22 @@ pub const Forwarder = struct {
                 break :blk .{ .handled = guest_memory_geometry.host_vm_page_size };
             },
             .guest_virtual_sleep => self.virtualGuestSleep(state),
+            .locale_info_pointer => blk: {
+                // Darwin CODESET is nl_item 0. Keep the returned storage in
+                // guest memory rather than leaking a host libc pointer across
+                // the ABI boundary. Other locale items are not currently
+                // consumed by Xenia/SPIRV-Cross and receive the C-locale empty
+                // string rather than an unresolved-import null.
+                const text: []const u8 = if (@as(u32, @truncate(state.regs.rdi)) == 0)
+                    "UTF-8"
+                else
+                    "";
+                const address = state.guestAlloc(text.len + 1, 1) orelse return null;
+                const storage = state.guestMemory(address, text.len + 1) orelse return null;
+                @memcpy(storage[0..text.len], text);
+                storage[text.len] = 0;
+                break :blk .{ .handled = address };
+            },
             .socket_three_args => .{ .handled = @bitCast(@as(i64, -1)) },
             .setsockopt_five_args => .{ .handled = 0 },
             .snprintf_three_args => blk: {
@@ -1110,6 +1655,56 @@ pub const Forwarder = struct {
         return .handled_void;
     }
 
+    /// The handoff Phase 5 needs: a completed image from Xenia's host renderer,
+    /// uploaded through a staging buffer and copied into a real swapchain
+    /// image. `guest_swap_observed` is the caller's assertion that the guest
+    /// performed the swap this image belongs to — it is the only thing that
+    /// separates an authentic host frame from guest output, so it must come
+    /// from an observed `VdSwap` and never from the fact that a frame arrived.
+    pub fn presentXeniaOutputFrame(
+        self: *Forwarder,
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        row_pitch_bytes: u64,
+        orientation: rosette_gpu.frame_source.Orientation,
+        guest_swap_observed: bool,
+    ) rosette_gpu.FrameClassification {
+        if (!self.native_presenter.stage.isReady()) return .rejected;
+        const report = self.native_presenter.present(.{ .cpu_image = .{
+            .pixels = pixels,
+            .width = width,
+            .height = height,
+            .format = self.native_presenter.surface_format.format,
+            .row_pitch_bytes = row_pitch_bytes,
+            .orientation = orientation,
+            .fit = .letterbox,
+            .producer = .xenia_host,
+            .guest_swap_observed = guest_swap_observed,
+        } });
+        return report.classification;
+    }
+
+    /// Called when the guest's own bootstrap observes a `VdSwap`, so a frame
+    /// discovered afterwards may be classified as guest output. Kept separate
+    /// from frame delivery because a frame arriving is not a swap happening,
+    /// and merging them is exactly how a host frame becomes mislabelled.
+    pub fn noteGuestSwapObserved(self: *Forwarder) void {
+        self.frame_provenance.noteGuestRingPacket();
+        self.native_presenter.ledger.noteGuestRingPacket();
+    }
+
+    /// The window changed size or backing scale. The swapchain is rebuilt from
+    /// the surface's own capabilities at the next frame rather than from these
+    /// numbers, which are only the fallback for a surface with no fixed size.
+    pub fn noteNativeWindowResize(self: *Forwarder, width: u32, height: u32) void {
+        if (self.native_presenter.stage.isReady()) self.native_presenter.noteResize(width, height);
+    }
+
+    pub fn nativePresenterStage(self: *const Forwarder) rosette_gpu.NativePresenterStage {
+        return self.native_presenter.stage;
+    }
+
     pub fn virtualSleepCallCount(self: *const Forwarder) u64 {
         return self.virtual_sleep_calls;
     }
@@ -1141,6 +1736,27 @@ pub const Forwarder = struct {
                 self.virtual_sleep_repairs,
             },
         );
+        if (self.gpu_handshake_updates != 0) {
+            const response = &self.gpu_handshake_response;
+            machoCapturePrint(
+                "macho-processor: Rosette GPU runtime: handshake_updates={d} attempts={d} successes={d} failures={d} trace_events={d} backend={s} status={s} API={d} adapter={s} buffer_alignment={d} image_alignment={d} guest_mapping_alignment={d} detail={s}\n",
+                .{
+                    self.gpu_handshake_updates,
+                    self.gpu_runtime.handshake_attempts,
+                    self.gpu_runtime.handshake_successes,
+                    self.gpu_runtime.handshake_failures,
+                    self.gpu_runtime.trace_sequence,
+                    @tagName(response.backendValue()),
+                    @tagName(response.statusValue()),
+                    response.version,
+                    self.gpu_runtime.adapter.description.adapterName(),
+                    response.buffer_alignment,
+                    response.image_alignment,
+                    response.guest_mapping_alignment,
+                    response.reasonSlice(),
+                },
+            );
+        }
         if (self.guest_proc_queries != 0) {
             machoCapturePrint(
                 "macho-processor: Vulkan lifecycle: device={d} queue={d} metal_surface={d} swapchain={d} swapchain_images={d} acquired={d} submits={d} presents={d} memory(alloc/maps/reuses)={d}/{d}/{d} opaque={d} presenter(stage/attempts/failures/off_ui_calls)={s}/{d}/{d}/{d}\n",
@@ -1167,25 +1783,54 @@ pub const Forwarder = struct {
                 "macho-processor: native Vulkan surface backing: loader(attempts/failures)={d}/{d} instance_attempts={d} surface_attempts={d} failures={d} instance=0x{x} host_surface=0x{x} library_token=0x{x}\n",
                 .{ self.native_vulkan_loader_attempts, self.native_vulkan_loader_failures, self.native_vulkan_instance_attempts, self.native_vulkan_surface_attempts, self.native_vulkan_failures, if (self.native_vulkan_instance) |instance| @intFromPtr(instance) else 0, self.native_vulkan_surface, self.native_vulkan_library_token },
             );
+            const presenter = &self.native_presenter;
+            const presenter_ledger = &presenter.ledger;
             machoCapturePrint(
-                "macho-processor: Vulkan forwarding contract: native=instance+Metal_surface synthetic=physical_device+logical_device+swapchain+commands+submit+present capability_queries={d} device_void_calls={d} modeled_commands={d}; rendered pixels are not authoritative until native device/command forwarding is installed\n",
-                .{ self.vulkan_surface_capability_queries, self.vulkan_device_void_calls, self.vulkan_modeled_command_calls },
+                "macho-processor: Vulkan forwarding contract: guest_objects=MODELLED (physical_device+logical_device+swapchain+images+commands+submit+present) rosette_presenter={s} capability_queries={d} device_void_calls={d} modelled_commands={d}\n",
+                .{ @tagName(presenter.stage), self.vulkan_surface_capability_queries, self.vulkan_device_void_calls, self.vulkan_modeled_command_calls },
             );
-            const native_drawable = self.vulkan_presenter_stage == .native_drawable_ready;
+            // The counters the audit requires never to be conflated. Each
+            // answers a different question and none is a sum of the others.
             machoCapturePrint(
-                "macho-processor: graphics visibility: blank_window_expected={} reason={s}\n",
+                "macho-processor: PRESENTATION PROVENANCE: guest_vulkan_calls_seen={d} native_driver_calls={d} native_submissions={d} native_present_requests={d} diagnostic_metal_frames={d} native_diagnostic_frames={d} xenia_host_frames={d} guest_output_frames={d} claims_demoted={d} guest_ring_packets={d}\n",
                 .{
-                    !native_drawable or self.vulkan_images_acquired == 0 or self.vulkan_queue_submits == 0 or self.vulkan_presents == 0,
-                    if (!native_drawable)
-                        "native drawable authority is unavailable; the Vulkan swapchain/submit/present path is synthetic"
-                    else if (self.vulkan_images_acquired == 0)
-                        "no swapchain image was acquired"
-                    else if (self.vulkan_queue_submits == 0)
-                        "no Vulkan command submission reached the queue"
-                    else if (self.vulkan_presents == 0)
-                        "no image reached vkQueuePresentKHR"
-                    else
-                        "presentation calls occurred; native pixel authority is still unproven",
+                    self.frame_provenance.guest_vulkan_calls_seen,
+                    presenter_ledger.native_driver_calls,
+                    presenter_ledger.native_submissions,
+                    presenter_ledger.native_present_requests,
+                    self.frame_provenance.diagnostic_frames_presented,
+                    presenter_ledger.diagnostic_frames_presented,
+                    presenter_ledger.host_frames_presented,
+                    presenter_ledger.guest_output_frames_presented,
+                    presenter_ledger.claims_demoted + self.frame_provenance.claims_demoted,
+                    presenter_ledger.guest_ring_packets,
+                },
+            );
+            // The Phase 5 handoff, reported as a chain so the first broken link
+            // is visible rather than inferred from a frame count of zero.
+            machoCapturePrint(
+                "macho-processor: GUEST FRAME SOURCE: images_tracked={d} image_bindings={d} resource_overflow={d} scans={d} discoveries={d} published={d} consumed={d} dropped={d} blit_supported={s} filter={d} absence={s}\n",
+                .{
+                    self.trackedImageCount(),
+                    self.vulkan_image_bindings,
+                    self.vulkan_resource_overflow,
+                    self.frame_source_scans,
+                    self.frame_source_discoveries,
+                    self.frame_inbox.published,
+                    self.frame_inbox.consumed,
+                    self.frame_inbox.dropped,
+                    if (presenter.report.blit_supported) "YES" else "NO",
+                    presenter.report.blit_filter,
+                    self.frame_inbox.absence().label(),
+                },
+            );
+            machoCapturePrint(
+                "macho-processor: graphics visibility: guest_output={s} first_non_native_pixel_stage={s} next={s} display_note={s}\n",
+                .{
+                    if (presenter_ledger.guest_output_frames_presented != 0) "YES" else "NO",
+                    if (self.forwarding_contract.firstNonNativePixelStage()) |stage| stage.label() else "none",
+                    presenter.blockingReason(),
+                    presenter_ledger.displayNote(),
                 },
             );
             machoCapturePrint("macho-processor: Vulkan proc inventory:\n", .{});
@@ -1307,6 +1952,7 @@ pub const Forwarder = struct {
                 break :blk .handled_void;
             },
             .guest_virtual_sleep => self.virtualGuestSleep(state),
+            .locale_info_pointer => unreachable,
             .socket_three_args => blk: {
                 // These are handled by handleStubSignature and should never reach here
                 break :blk .{ .handled = @bitCast(@as(i64, -1)) };
@@ -1464,8 +2110,6 @@ fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
     const success_calls = [_][]const u8{
         "vkBeginCommandBuffer",
         "vkEndCommandBuffer",
-        "vkBindBufferMemory",
-        "vkBindImageMemory",
         "vkFlushMappedMemoryRanges",
         "vkGetFenceStatus",
         "vkInvalidateMappedMemoryRanges",
@@ -1475,6 +2119,8 @@ fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
         "vkWaitForFences",
     };
     for (success_calls) |name| if (std.mem.eql(u8, symbol, name)) return .device_success;
+    if (std.mem.eql(u8, symbol, "vkBindImageMemory")) return .bind_image_memory;
+    if (std.mem.eql(u8, symbol, "vkBindBufferMemory")) return .bind_buffer_memory;
     if (std.mem.startsWith(u8, symbol, "vkCmd") or
         std.mem.eql(u8, symbol, "vkUpdateDescriptorSets") or
         std.mem.eql(u8, symbol, "vkUnmapMemory")) return .device_void;
@@ -1860,11 +2506,21 @@ fn writeBoolResult(state: anytype, output: u64, value: bool) u64 {
     return 0;
 }
 
-fn writeMemoryRequirements(state: anytype, output: u64) u64 {
+/// `requested_size` of zero means the resource was never described — an
+/// unrecorded handle, or a create-info the guest placed out of reach — so the
+/// old page-sized answer stands as the only defensible fallback. Any described
+/// resource gets its own size, rounded up to the alignment reported alongside
+/// it, because a guest that trusts this number allocates exactly it.
+fn writeMemoryRequirements(state: anytype, output: u64, requested_size: u64) u64 {
     const bytes = state.guestMemory(output, 24) orelse return vkErrorInitializationFailed();
+    const alignment: u64 = 256;
+    const size = if (requested_size == 0)
+        4096
+    else
+        std.mem.alignForward(u64, requested_size, alignment);
     @memset(bytes, 0);
-    std.mem.writeInt(u64, bytes[0..8], 4096, .little);
-    std.mem.writeInt(u64, bytes[8..16], 256, .little);
+    std.mem.writeInt(u64, bytes[0..8], size, .little);
+    std.mem.writeInt(u64, bytes[8..16], alignment, .little);
     std.mem.writeInt(u32, bytes[16..20], 1, .little);
     return 0;
 }
@@ -1898,7 +2554,10 @@ fn registerOpaqueHandle(state: anytype, handle: u64, owner: []const u8) void {
     }
 }
 
-fn presentNativeSyntheticVulkanFrame(
+/// The host Metal clear. Only reached when the native Vulkan presenter could
+/// not be brought up: a frame from here proves the Cocoa/Metal boundary is
+/// alive and nothing about the guest.
+fn presentDiagnosticMetalFrame(
     state: anytype,
     serial: u64,
     requested_width: u32,
@@ -1906,7 +2565,7 @@ fn presentNativeSyntheticVulkanFrame(
     stage: u32,
 ) bool {
     const State = @typeInfo(@TypeOf(state)).pointer.child;
-    if (!@hasDecl(State, "presentNativeSyntheticVulkanFrame")) return false;
+    if (!@hasDecl(State, "presentNativeDiagnosticFrame")) return false;
     const width = if (requested_width != 0)
         requested_width
     else if (@hasDecl(State, "nativeWindowWidth"))
@@ -1919,7 +2578,7 @@ fn presentNativeSyntheticVulkanFrame(
         state.nativeWindowHeight()
     else
         720;
-    return state.presentNativeSyntheticVulkanFrame(
+    return state.presentNativeDiagnosticFrame(
         serial,
         @max(width, 1),
         @max(height, 1),
@@ -2196,6 +2855,23 @@ test "forwarding registry only admits typed libSystem functions" {
     try std.testing.expectEqual(Signature.snprintf_three_args, specFor(normalizeMachOSymbol("_snprintf")).?.signature);
     try std.testing.expectEqual(Signature.connect_three_args, specFor(normalizeMachOSymbol("_connect")).?.signature);
     try std.testing.expectEqual(Signature.send_four_args, specFor(normalizeMachOSymbol("_send")).?.signature);
+    try std.testing.expectEqual(Signature.locale_info_pointer, specFor(normalizeMachOSymbol("_nl_langinfo")).?.signature);
+}
+
+test "nl_langinfo materializes CODESET in guest-owned memory" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    state.regs.rdi = 0; // Darwin CODESET.
+
+    const outcome = forwarder.forward(
+        &state,
+        "/usr/lib/libSystem.B.dylib",
+        "_nl_langinfo",
+    ) orelse return error.SymbolUnavailable;
+    const address = outcome.handled;
+    const value = state.guestMemoryConst(address, 6) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("UTF-8\x00", value);
 }
 
 test "getpagesize observes the Darwin VM geometry required by host mmap" {
