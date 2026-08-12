@@ -57,6 +57,17 @@ pub const Finding = struct {
     low_half_zero: bool = false,
 };
 
+/// Below this, a value is far more likely to be a small integer — a count, a
+/// size, a flag — than a pointer that lost its byte order.
+///
+/// The reversal test is decidable *because* reversing an unrelated value almost
+/// never yields a guest address. Small integers are the exception: every value
+/// from 0x80 to 0x9F reverses into the 0x80000000-0x9F000000 window, so `0x80`
+/// reports as "the guest address 0x80000000 with its bytes reversed" when it is
+/// simply 128. One such false positive is enough to send an investigation at a
+/// register that was never a pointer.
+pub const min_plausible_pointer: u64 = 0x1_0000;
+
 pub fn classify(
     comptime Context: type,
     context: Context,
@@ -65,6 +76,9 @@ pub fn classify(
 ) Finding {
     if (value == 0) return .{};
     if (is_guest(context, value)) return .{ .order = .native };
+    // A value too small to be a pointer in its own right is a small integer that
+    // happens to reverse into the window, not evidence of a lost conversion.
+    if (value < min_plausible_pointer) return .{};
 
     const low: u32 = @truncate(value);
     const swapped32: u64 = @byteSwap(low);
@@ -90,6 +104,21 @@ pub fn classify(
     return .{};
 }
 
+/// Whether `value` is far enough from every value already counted to be a
+/// separate witness, recording it when it is. Once the cluster table is full
+/// the answer is no: a survey with more than `max_reported` distinct reversals
+/// is already past any threshold this decides.
+fn noteIndependentImpl(clusters: []u64, count: *usize, value: u64) bool {
+    for (clusters[0..count.*]) |base| {
+        const distance = if (value > base) value - base else base - value;
+        if (distance < locality_window) return false;
+    }
+    if (count.* >= clusters.len) return false;
+    clusters[count.*] = value;
+    count.* += 1;
+    return true;
+}
+
 /// Named slot in a survey, so a report can say *which* register.
 pub const Slot = struct {
     name: []const u8,
@@ -112,16 +141,45 @@ pub const Survey = struct {
     findings: [max_reported]Finding = [_]Finding{.{}} ** max_reported,
     values: [max_reported]u64 = [_]u64{0} ** max_reported,
 
+    /// Reversed slots whose originals were far enough apart to be separate
+    /// data. This, not the raw slot count, is the number of *witnesses*.
+    independent: u16 = 0,
+    cluster_count: usize = 0,
+    clusters: [max_reported]u64 = [_]u64{0} ** max_reported,
+
     pub fn reversed(self: Survey) u16 {
         return self.reversed32 + self.reversed64;
     }
 
     /// More than one independently reversed value is not a coincidence. One is
     /// a site; several is the conversion itself.
+    ///
+    /// Counted over independent values rather than over slots. A register file
+    /// routinely holds the same pointer in three or four places at once — an
+    /// argument, a copy, a spill — and counting those as separate witnesses
+    /// turns one datum into a quorum. That failure is not hypothetical: it is
+    /// how a plain null-pointer fault in host code gets reported as a
+    /// systematic conversion failure, complete with the advice to stop
+    /// investigating the faulting address, which is the one thing that was
+    /// worth investigating.
     pub fn systematic(self: Survey) bool {
-        return self.reversed() > 1;
+        return self.independent > 1;
+    }
+
+    fn noteIndependent(self: *Survey, value: u64) bool {
+        return noteIndependentImpl(&self.clusters, &self.cluster_count, value);
     }
 };
+
+/// Two values this close came from the same object, allocation, or pointer
+/// copied through several registers. Reversing them yields corrections that
+/// differ in their *high* byte — 128 MB apart in the corrected space — which is
+/// the signature of coincidence rather than of a shared conversion bug.
+///
+/// A page is deliberately generous. Under-counting witnesses costs a
+/// "systematic" verdict that would have been right; over-counting costs a wrong
+/// verdict that redirects the whole investigation, and the second is worse.
+pub const locality_window: u64 = 4096;
 
 pub fn survey(
     comptime Context: type,
@@ -141,11 +199,14 @@ pub fn survey(
             .unrelated => {},
         }
         if (finding.low_half_zero) result.null_low_half +|= 1;
-        if (finding.order.isReversed() and result.reported < max_reported) {
-            result.names[result.reported] = slot.name;
-            result.findings[result.reported] = finding;
-            result.values[result.reported] = slot.value;
-            result.reported += 1;
+        if (finding.order.isReversed()) {
+            if (result.noteIndependent(slot.value)) result.independent +|= 1;
+            if (result.reported < max_reported) {
+                result.names[result.reported] = slot.name;
+                result.findings[result.reported] = finding;
+                result.values[result.reported] = slot.value;
+                result.reported += 1;
+            }
         }
     }
     return result;
@@ -176,6 +237,26 @@ test "a 64-bit reversal of a 32-bit guest address zeroes the low half" {
     try std.testing.expectEqual(Order.reversed64, found.order);
     try std.testing.expectEqual(@as(u64, 0x8219_8338), found.corrected);
     try std.testing.expect(found.low_half_zero);
+}
+
+// The observed false positive: r9 held 128, whose 32-bit reversal is
+// 0x80000000 — a perfectly good guest address, and completely coincidental.
+test "a small integer is not a reversed pointer" {
+    const found = classify(TestWindow, .{}, 0x80, TestWindow.isGuest);
+    try std.testing.expectEqual(Order.unrelated, found.order);
+    try std.testing.expectEqual(@as(u64, 0), found.corrected);
+
+    // Every value in 0x80..0x9F reverses into the window; none is a pointer.
+    var candidate: u64 = 0x80;
+    while (candidate <= 0x9F) : (candidate += 1) {
+        try std.testing.expectEqual(Order.unrelated, classify(TestWindow, .{}, candidate, TestWindow.isGuest).order);
+    }
+
+    // A genuine reversal stays detected: it is far above the threshold.
+    try std.testing.expectEqual(
+        Order.reversed32,
+        classify(TestWindow, .{}, 0xa0a4_5882, TestWindow.isGuest).order,
+    );
 }
 
 test "a native guest address and an unrelated value are both non-findings" {
@@ -249,4 +330,54 @@ test "the report is bounded and never overruns its slots" {
     const found = survey(TestWindow, .{}, &slots, TestWindow.isGuest);
     try std.testing.expectEqual(@as(u16, 32), found.reversed64);
     try std.testing.expectEqual(max_reported, found.reported);
+    // Thirty-two copies of one pointer are one witness, not thirty-two.
+    try std.testing.expectEqual(@as(u16, 1), found.independent);
+    try std.testing.expect(!found.systematic());
+}
+
+// The observed failure. Ordinary 8-byte-aligned host heap pointers ending in
+// 0x80 or 0x88 reverse into the 0x80000000-0x9FFFFFFF guest window every single
+// time, so a register file holding one such pointer in four places reported
+// four reversals and declared the conversion path systematically broken. The
+// fault was a null pointer in host code, and the survey's advice — stop
+// investigating the faulting address — was the worst possible answer.
+test "one host pointer copied across registers is not a systematic reversal" {
+    const slots = [_]Slot{
+        .{ .name = "rax", .value = 0x1607_4440 },
+        .{ .name = "rcx", .value = 0x1607_4488 },
+        .{ .name = "rdx", .value = 0x1607_4488 },
+        .{ .name = "r8", .value = 0x1607_4488 },
+        .{ .name = "r9", .value = 0x1607_4400 },
+        .{ .name = "r10", .value = 0x1607_4480 },
+    };
+    const found = survey(TestWindow, .{}, &slots, TestWindow.isGuest);
+    // They still classify as reversed — the arithmetic is what it is.
+    try std.testing.expect(found.reversed() > 1);
+    // But they are one allocation's worth of pointers, so one witness.
+    try std.testing.expectEqual(@as(u16, 1), found.independent);
+    try std.testing.expect(!found.systematic());
+}
+
+// Independence is about the data, not the register count: two genuinely
+// separate guest addresses must still cross the threshold.
+test "reversals from separate allocations remain systematic" {
+    const slots = [_]Slot{
+        .{ .name = "rbx", .value = 0x3883_1982_0000_0000 },
+        .{ .name = "rsi", .value = 0xa0a4_5882 },
+        .{ .name = "rdi", .value = 0xa0a4_5882 },
+    };
+    const found = survey(TestWindow, .{}, &slots, TestWindow.isGuest);
+    try std.testing.expectEqual(@as(u16, 3), found.reversed());
+    try std.testing.expectEqual(@as(u16, 2), found.independent);
+    try std.testing.expect(found.systematic());
+}
+
+test "values a page apart are separate witnesses" {
+    var clusters = [_]u64{0} ** max_reported;
+    var count: usize = 0;
+    try std.testing.expect(noteIndependentImpl(&clusters, &count, 0x1000_0000));
+    try std.testing.expect(!noteIndependentImpl(&clusters, &count, 0x1000_0008));
+    try std.testing.expect(!noteIndependentImpl(&clusters, &count, 0x1000_0FFF));
+    try std.testing.expect(noteIndependentImpl(&clusters, &count, 0x1000_1000));
+    try std.testing.expectEqual(@as(usize, 2), count);
 }
