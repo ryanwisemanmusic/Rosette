@@ -15,6 +15,7 @@ pub const native_window_runtime = @import("native_window_runtime.zig");
 pub const guest_assertion_recovery = @import("guest_assertion_recovery.zig");
 pub const cpp_allocation = @import("cpp_allocation.zig");
 pub const libcpp_thread = @import("libcpp_thread.zig");
+pub const sdl_runtime = @import("sdl_runtime.zig");
 pub const tlv_runtime = @import("tlv_runtime.zig");
 
 test {
@@ -23,5 +24,6 @@ test {
     _ = guest_assertion_recovery;
     _ = cpp_allocation;
     _ = libcpp_thread;
+    _ = sdl_runtime;
     _ = tlv_runtime;
 }
