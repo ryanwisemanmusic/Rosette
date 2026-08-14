@@ -721,6 +721,7 @@ pub const Runtime = struct {
         const thread = self.threadForHandle(handle) orelse return result;
         if (thread.state != .waiting_condvar) return result;
         const was_timed = thread.timed_wait;
+        const completed_condvar = thread.waiting_condvar;
         if (thread.waiting_mutex != 0 and self.mutexTryLockForThread(thread.waiting_mutex, handle) != 0) {
             return null;
         }
@@ -733,9 +734,9 @@ pub const Runtime = struct {
         thread.blocked_reason = "";
         thread.waiting_condvar = 0;
         thread.waiting_mutex = 0;
-        if (thread.waiting_condvar != 0) {
+        if (completed_condvar != 0) {
             if (self.threadSlot(thread.handle)) |slot| {
-                self.waits.noteWake(thread.waiting_condvar, slot);
+                self.waits.noteWake(completed_condvar, slot);
             }
         }
         thread.wait_generation = 0;
@@ -1058,7 +1059,11 @@ pub const Runtime = struct {
     /// is whether its notifier can still run, and a notification count cannot
     /// answer that.
     pub fn noteNotifier(self: *Runtime, address: u64, notifier: u64, pc: u64, step: u64) void {
-        const slot = self.threadSlot(notifier) orelse return;
+        // UI callbacks and other synthetic producers do not occupy pthread
+        // table slots, but their notifications are still real. The graph uses
+        // an out-of-range slot to retain the event and identity without
+        // fabricating a runnable-thread bit for it.
+        const slot = self.threadSlot(notifier) orelse scheduler.notifier_liveness.max_threads;
         self.waits.noteNotify(address, slot, notifier, pc, step);
     }
 
@@ -1440,6 +1445,19 @@ test "cooperative condition wait releases and reacquires its mutex" {
     try std.testing.expectEqual(@as(u64, 1), runtime.mutexes[0].depth);
     try std.testing.expectEqual(worker, runtime.mutexes[0].owner_thread);
     try std.testing.expectEqual(ThreadState.runnable, runtime.threads[0].state);
+    try std.testing.expectEqual(@as(u32, 0), runtime.waits.find(state.regs.rdi).?.waiterCount());
+}
+
+test "synthetic condition notifier history is retained without claiming a pthread slot" {
+    var runtime = Runtime{};
+    const condvar: u64 = 0x4800;
+    const callback_handle: u64 = 0xffff_f900_0000_0004;
+    runtime.noteNotifier(condvar, callback_handle, 0xa361ef, 77);
+    const object = runtime.waits.find(condvar).?;
+    try std.testing.expectEqual(@as(u64, 1), object.notifications);
+    try std.testing.expectEqual(@as(u64, 1), object.untracked_notifications);
+    try std.testing.expectEqual(@as(u32, 0), object.notifierCount());
+    try std.testing.expectEqual(callback_handle, object.last_notify_thread);
 }
 
 test "cooperative timed wait returns ETIMEDOUT without a signal" {
