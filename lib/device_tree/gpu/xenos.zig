@@ -79,6 +79,101 @@ pub fn aliasesSameStorage(first: u64, second: u64) bool {
     return a == b;
 }
 
+/// The memory-mapped register aperture.
+///
+/// Xenos is programmed by storing to a 64 KiB window of guest physical address
+/// space, not by calling anything. That is the fact this block exists to state,
+/// because it changes how one specific observation must be read: the pages
+/// behind this window are deliberately mapped **with no access at all**, so
+/// that every store into them faults and the fault is what delivers the
+/// register write. A runtime looking at those page permissions sees exactly
+/// what a corrupted mapping looks like, and "NO_ACCESS" here is not a defect to
+/// repair — repairing it would make the writes land in ordinary memory and
+/// silently stop reaching the GPU.
+///
+/// The second thing it makes answerable: a run in which the ring never starts
+/// has two very different explanations — the title never stored to these
+/// registers, or it did and the stores never arrived. Those are opposite
+/// findings pointing at opposite subsystems, and telling them apart requires
+/// knowing which addresses are registers before anything touches them.
+pub const register_aperture_base: u32 = 0x7FC8_0000;
+pub const register_aperture_size: u32 = 0x1_0000;
+pub const register_stride: u32 = 4;
+
+pub fn registerApertureContains(guest_address: u64) bool {
+    const low: u32 = @truncate(guest_address);
+    return low >= register_aperture_base and
+        low - register_aperture_base < register_aperture_size;
+}
+
+/// The register index a guest address selects, or null when the address is not
+/// in the aperture. Indices are dword-numbered, which is why the ring write
+/// pointer at index 0x1C5 appears at byte offset 0x714.
+pub fn registerIndexOf(guest_address: u64) ?u32 {
+    if (!registerApertureContains(guest_address)) return null;
+    const low: u32 = @truncate(guest_address);
+    return (low - register_aperture_base) / register_stride;
+}
+
+/// Registers whose traffic decides whether the command ring ever starts.
+///
+/// Deliberately not the whole register file: a name Rosette cannot vouch for is
+/// worse than an index, because it invites a reader to trust it. Unknown
+/// indices report as indices.
+pub const RegisterName = struct {
+    index: u32,
+    name: []const u8,
+};
+
+pub const named_registers = [_]RegisterName{
+    .{ .index = 0x01C0, .name = "CP_RB_BASE" },
+    .{ .index = 0x01C1, .name = "CP_RB_CNTL" },
+    .{ .index = 0x01C3, .name = "CP_RB_RPTR_ADDR" },
+    .{ .index = 0x01C4, .name = "CP_RB_RPTR" },
+    .{ .index = 0x01C5, .name = "CP_RB_WPTR" },
+    .{ .index = 0x01C6, .name = "CP_RB_WPTR_DELAY" },
+    .{ .index = 0x01C7, .name = "CP_RB_RPTR_WR" },
+    .{ .index = 0x01C8, .name = "CP_DMA_SRC_ADDR" },
+    .{ .index = 0x01C9, .name = "CP_DMA_DST_ADDR" },
+    .{ .index = 0x01CA, .name = "CP_DMA_COMMAND" },
+    .{ .index = 0x01CC, .name = "CP_IB1_BASE" },
+    .{ .index = 0x01CD, .name = "CP_IB1_BUFSZ" },
+    .{ .index = 0x01CE, .name = "CP_IB2_BASE" },
+    .{ .index = 0x01CF, .name = "CP_IB2_BUFSZ" },
+};
+
+pub fn registerName(index: u32) ?[]const u8 {
+    for (named_registers) |entry| {
+        if (entry.index == index) return entry.name;
+    }
+    return null;
+}
+
+/// The three registers that constitute ring setup. A run that reaches none of
+/// them has not started the GPU, whatever else it reached.
+pub const ring_setup_registers = [_]u32{ 0x01C0, 0x01C1, 0x01C5 };
+
+pub fn isRingSetupRegister(index: u32) bool {
+    for (ring_setup_registers) |candidate| {
+        if (candidate == index) return true;
+    }
+    return false;
+}
+
+/// Whether a no-access page at this address is the hardware's design or a
+/// mapping defect. Asked before "repairing" a protection, because repairing
+/// this one converts every future register write into a silent write to RAM.
+pub fn checkRegisterProtection(guest_address: u64, readable_or_writable: bool) constraint.Check {
+    if (!registerApertureContains(guest_address)) {
+        return constraint.unconstrained("register-aperture-protection");
+    }
+    if (!readable_or_writable) return constraint.permitted("register-aperture-protection");
+    return constraint.violation(
+        "register-aperture-protection",
+        "this address is inside the Xenos register aperture, which must be mapped with no access so that stores fault and are delivered to the register write handler. A page here that permits access will absorb register writes into ordinary memory, and the command processor will never see them — with no fault raised anywhere to say so",
+    );
+}
+
 /// A command ring must live in physical memory, because the command processor
 /// reads it through a physical view. A ring the guest names by a virtual
 /// address outside the physical windows cannot be read by the hardware.
