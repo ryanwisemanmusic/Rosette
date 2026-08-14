@@ -62,7 +62,10 @@ pub const Step = enum(u8) {
     ring_write_pointer,
     /// The command processor consumed the first authentic PM4 packet.
     pm4_packet_consumed,
-    /// A completed frame presentation.
+    /// The command processor consumed an authentic guest-published
+    /// PM4_XE_SWAP. Reaching VdSwap is intentionally not enough: that export
+    /// only encodes a caller-owned buffer, and a diagnostic injection reaches
+    /// the same decoder without proving guest publication.
     swap,
 
     pub fn label(self: Step) []const u8 {
@@ -76,7 +79,7 @@ pub const Step = enum(u8) {
             .ring_payload_prepared => "authentic ring payload prepared",
             .ring_write_pointer => "ring write-pointer advance",
             .pm4_packet_consumed => "first authentic PM4 packet consumed",
-            .swap => "VdSwap",
+            .swap => "authentic PM4_XE_SWAP consumed",
         };
     }
 
@@ -122,7 +125,7 @@ pub const Step = enum(u8) {
             .ring_payload_prepared => "the ring is configured but contains no authentic command payload; inspect the guest producer thread and the callback path that wakes it",
             .ring_write_pointer => "authentic PM4 data is already prepared in ring memory, but the guest has not published it. Inspect the producer's post-write control flow and the CP_RB_WPTR MMIO boundary; do not infer or force the pointer",
             .pm4_packet_consumed => "the guest published work, but the command processor has not consumed its first packet; inspect the worker wake event, reader offsets and packet decoder",
-            .swap => "commands have reached the command processor but no frame has been presented; this is the first step where the presenter is implicated",
+            .swap => "ordinary guest commands reached the command processor, but no authentic guest-published PM4_XE_SWAP was consumed. Inspect VdSwap completion, the caller-owned command buffer and the guest's subsequent publication control flow before implicating the presenter",
         };
     }
 };
