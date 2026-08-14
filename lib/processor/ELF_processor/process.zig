@@ -2693,6 +2693,21 @@ pub const ElfState = struct {
                 // For now, implement as a no-op since we don't have full SIMD execution
                 // The instruction is decoded correctly, so execution can proceed
             },
+            .vshufps => {
+                const lhs = self.xmm[d.xmm_src];
+                const rhs = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+                var result: [16]u8 = undefined;
+                const control: u8 = @truncate(d.imm);
+                for (0..4) |destination_lane| {
+                    const shift: u3 = @intCast(destination_lane * 2);
+                    const source_lane = (control >> shift) & 0x03;
+                    const source = if (destination_lane < 2) lhs else rhs;
+                    const destination_offset = destination_lane * 4;
+                    const source_offset = @as(usize, source_lane) * 4;
+                    @memcpy(result[destination_offset..][0..4], source[source_offset..][0..4]);
+                }
+                self.xmm[d.xmm_dst] = result;
+            },
             .vpmuludq,
             .vpblendw,
             .vpinsrd,
@@ -2950,7 +2965,9 @@ pub const ElfState = struct {
             .vhsubps,
             .vhsubpd,
             .vrcpps,
+            .vrcpss,
             .vrsqrtps,
+            .vrsqrtss,
             // AVX SIMD compare
             .vcmpps,
             .vcmppd,
