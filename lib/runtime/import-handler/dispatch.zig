@@ -21,6 +21,7 @@ const exit_diagnostics = @import("exit_diagnostics");
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const cpp_allocation = @import("guest_abi").cpp_allocation;
 const libcpp_thread = @import("guest_abi").libcpp_thread;
+const sdl_runtime = @import("guest_abi").sdl_runtime;
 const spirv_cross_diagnostics = @import("diagnostics").spirv_cross_diagnostics;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const symbol_assembly_context = macho_core.symbol_assembly_context;
@@ -50,10 +51,6 @@ const UNSUPPORTED_RUNTIME_EXIT_CODE = constants.UNSUPPORTED_RUNTIME_EXIT_CODE;
 fn guestSysconf(selector: i32) u64 {
     return guest_memory_geometry.darwinSysconf(selector) orelse
         @bitCast(@as(i64, -1));
-}
-
-fn sdlCompatibilityVersion() [3]u8 {
-    return .{ 2, 0, 0 };
 }
 
 /// `pthread_exit` terminates only the calling pthread.  While the intercepted
@@ -207,16 +204,10 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = address };
     }
-    if (std.mem.eql(u8, name, "_SDL_GetVersion")) {
-        const output = self.guestMemory(self.regs.rdi, 3) orelse return .{ .unsupported = 0 };
-        output[0..3].* = sdlCompatibilityVersion();
-        if (self.verbose_trace) {
-            machoCapturePrint(
-                "    [SDL2] SDL_GetVersion(output=0x{x}) -> {d}.{d}.{d}\n",
-                .{ self.regs.rdi, output[0], output[1], output[2] },
-            );
-        }
-        return .handled_void;
+    if (self.sdl.dispatch(self, name)) |resolution| {
+        self.resolving_import_route = .sdl_compat;
+        self.import_confidence_override = .modeled;
+        return sdlResolution(resolution);
     }
     if (self.main_loop_type == .gtk) {
         if (std.mem.eql(u8, name, "_gtk_main") and self.beginCooperativeMainLoop()) {
@@ -1795,6 +1786,47 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = 0 };
     }
 
+    // Base-2 exponential and logarithm.
+    //
+    // These are worth spelling out because of how they fail when they are
+    // missing. The unresolved-import fallback returns `rax = 0`, and rax is not
+    // where a floating-point result lives — the SysV return register for a
+    // double or a float is xmm0. So an unhandled `exp2` did not return zero to
+    // its caller; it returned *whatever was already in xmm0*, which at the call
+    // site is the argument the caller had just converted into it. The caller
+    // then read a plausible number and carried on, and every value derived from
+    // it was quietly wrong. A missing math import is not a missing value here,
+    // it is a wrong one, which is why these are handled rather than left to the
+    // fallback that reports itself as returning zero.
+    if (std.mem.eql(u8, name, "_exp2")) {
+        const argument: f64 = @bitCast(std.mem.readInt(u64, self.xmm[0][0..8], .little));
+        const result = exp2Double(argument);
+        std.mem.writeInt(u64, self.xmm[0][0..8], @bitCast(result), .little);
+        if (self.verbose_trace) machoCapturePrint("    [import] _exp2({d}) -> {d}\n", .{ argument, result });
+        return .{ .handled = 0 };
+    }
+    if (std.mem.eql(u8, name, "_exp2f")) {
+        const argument: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
+        const result = exp2Single(argument);
+        std.mem.writeInt(u32, self.xmm[0][0..4], @bitCast(result), .little);
+        if (self.verbose_trace) machoCapturePrint("    [import] _exp2f({d}) -> {d}\n", .{ argument, result });
+        return .{ .handled = 0 };
+    }
+    if (std.mem.eql(u8, name, "_log2")) {
+        const argument: f64 = @bitCast(std.mem.readInt(u64, self.xmm[0][0..8], .little));
+        const result = log2Double(argument);
+        std.mem.writeInt(u64, self.xmm[0][0..8], @bitCast(result), .little);
+        if (self.verbose_trace) machoCapturePrint("    [import] _log2({d}) -> {d}\n", .{ argument, result });
+        return .{ .handled = 0 };
+    }
+    if (std.mem.eql(u8, name, "_log2f")) {
+        const argument: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
+        const result = log2Single(argument);
+        std.mem.writeInt(u32, self.xmm[0][0..4], @bitCast(result), .little);
+        if (self.verbose_trace) machoCapturePrint("    [import] _log2f({d}) -> {d}\n", .{ argument, result });
+        return .{ .handled = 0 };
+    }
+
     if (self.verbose_trace) machoCapturePrint("    [import] (unhandled) {s}\n", .{name});
     return .{ .unsupported = 0 };
 }
@@ -1937,6 +1969,11 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
             if (self.startNextIdleCallback(name, false)) break :blk .control_transferred;
             break :blk .{ .handled = 0 };
         },
+        .sdl_compat => blk: {
+            const resolution = self.sdl.dispatch(self, name) orelse break :blk null;
+            self.import_confidence_override = .modeled;
+            break :blk sdlResolution(resolution);
+        },
         .local_definition => blk: {
             const target = self.metadata.definedSymbolAddress(name) orelse break :blk null;
             if (target == imported.stub_address or !self.isExecutableAddress(target)) break :blk null;
@@ -2031,6 +2068,13 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
         .chkstk => .{ .handled = self.regs.rax },
         .sysconf => .{ .handled = guestSysconf(@bitCast(@as(u32, @truncate(self.regs.rdi)))) },
         .strtoul => handleImportSlow(self, imported),
+    };
+}
+
+fn sdlResolution(resolution: sdl_runtime.Resolution) ImportHandlerResult {
+    return switch (resolution) {
+        .handled => |value| .{ .handled = value },
+        .handled_void => .handled_void,
     };
 }
 
@@ -2562,8 +2606,59 @@ pub fn continueGuestExit(self: anytype) bool {
     return !self.terminated;
 }
 
+/// Base-2 math, one function per (operation, width).
+///
+/// Split out from the dispatch arms so the part that is easy to get wrong is
+/// reachable from a test: the *width*. `exp2` takes and returns a double,
+/// `exp2f` a single, and they occupy different halves of xmm0. Handling a
+/// single-precision import with the double-precision reader would consume eight
+/// bytes of a register holding four meaningful ones and produce a number with
+/// no relationship to the argument.
+fn exp2Double(argument: f64) f64 {
+    return @exp2(argument);
+}
+
+fn exp2Single(argument: f32) f32 {
+    return @exp2(argument);
+}
+
+fn log2Double(argument: f64) f64 {
+    return @log2(argument);
+}
+
+fn log2Single(argument: f32) f32 {
+    return @log2(argument);
+}
+
 test "pthread exit is thread-local only with an active cooperative context" {
     try std.testing.expect(pthreadExitIsThreadLocal(true, 0x7fff_2140));
     try std.testing.expect(!pthreadExitIsThreadLocal(true, 0));
     try std.testing.expect(!pthreadExitIsThreadLocal(false, 0x7fff_2140));
+}
+
+// The failure these replaced was not a missing value but a wrong one: the
+// unresolved-import fallback reports `rax = 0`, and a floating-point result is
+// returned in xmm0, so the caller read back whatever it had just placed there —
+// its own argument — and treated it as the answer.
+test "base-2 math imports return the value, at the width the ABI expects" {
+    // Exact at powers of two, in both widths.
+    try std.testing.expectEqual(@as(f64, 8.0), exp2Double(3.0));
+    try std.testing.expectEqual(@as(f64, 0.25), exp2Double(-2.0));
+    try std.testing.expectEqual(@as(f32, 8.0), exp2Single(3.0));
+    try std.testing.expectEqual(@as(f64, 3.0), log2Double(8.0));
+    try std.testing.expectEqual(@as(f32, 10.0), log2Single(1024.0));
+
+    // Round-trip, which is what the callers in the log actually do: a critical
+    // frequency divided into a log domain and exponentiated back out.
+    try std.testing.expectApproxEqRel(@as(f64, 440.0), exp2Double(log2Double(440.0)), 1e-12);
+    try std.testing.expectApproxEqRel(@as(f32, 440.0), exp2Single(log2Single(440.0)), 1e-6);
+
+    // Identity at 1.0 and 0.0 — the arguments most likely to make a wrong
+    // implementation look right, so they are pinned rather than assumed.
+    try std.testing.expectEqual(@as(f64, 1.0), exp2Double(0.0));
+    try std.testing.expectEqual(@as(f64, 0.0), log2Double(1.0));
+
+    // Domain edges match libm rather than trapping.
+    try std.testing.expect(std.math.isNegativeInf(log2Double(0.0)));
+    try std.testing.expect(std.math.isNan(log2Double(-1.0)));
 }

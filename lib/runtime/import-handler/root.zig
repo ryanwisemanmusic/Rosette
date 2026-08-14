@@ -104,8 +104,12 @@ pub const ImportHandler = struct {
         const action = switch (result_byte) {
             0 => "handled",
             1 => "handled_void",
-            2 => "unsupported",
-            3 => "fallback",
+            // These are not final import failures: the caller immediately
+            // continues through the authoritative legacy handler chain. Name
+            // the transition rather than making a successful fallback look
+            // like an unresolved primitive-library defect.
+            2 => "declined_to_legacy",
+            3 => "requested_legacy_fallback",
             else => "unknown",
         };
 
