@@ -11,12 +11,14 @@ pub const Segment = enum(u3) {
     gs,
 };
 
-pub const SegmentRegister = struct {
+// `extern` here is not about C interop: `Regs` below must have a guaranteed
+// field order, and an extern struct may only contain extern-layout fields.
+pub const SegmentRegister = extern struct {
     selector: u16 = 0,
     base: u64 = 0,
 };
 
-pub const SegmentState = struct {
+pub const SegmentState = extern struct {
     es: SegmentRegister = .{},
     cs: SegmentRegister = .{},
     ss: SegmentRegister = .{},
@@ -71,7 +73,32 @@ pub const RegId = enum(u4) {
     }
 };
 
-pub const Regs = struct {
+/// The guest register file.
+///
+/// F2 (throughput audit): the sixteen GPRs are declared first, in x86 encoding
+/// order, and the struct is `extern` so that order is guaranteed rather than
+/// merely written down. `regVal`/`setReg` then index them as an array.
+///
+/// This is a codegen fix, not a style preference. With the previous plain
+/// struct, Zig's auto layout reordered the fields (rax at offset 8, rcx at 112,
+/// rdx at 88 in the shipped binary), so LLVM could not turn the 16-way switch
+/// these accessors used into an indexed load. It emitted a jump table instead:
+///
+///     adrp/add/adr/ldrb/add ; br x10   <- indirect branch, 16 targets
+///
+/// The register index differs on nearly every instruction, so that branch
+/// mispredicts constantly. `setReg` paid it twice (once to read the old value,
+/// once to write back), which made a plain `mov r64, r64` cost three of them.
+/// The array form is a single `ldr x8, [x0, w1, uxtw #3]`, and `_execute.execute`
+/// alone contained 60 out-of-line calls to `regVal` and 33 to `setReg`.
+///
+/// The named fields are kept because ~1,800 call sites across the tree read
+/// them directly, and because `regs.rsp` says more at a use site than
+/// `regs.gpr[4]`. The `comptime` block below is what makes both true at once:
+/// it proves each named field sits exactly where its `RegId` says, so a future
+/// edit that reorders, retypes, or inserts a field is a compile error rather
+/// than a silent misindex of the register file.
+pub const Regs = extern struct {
     rax: u64 = 0,
     rcx: u64 = 0,
     rdx: u64 = 0,
@@ -95,6 +122,43 @@ pub const Regs = struct {
     mxcsr: u32 = 0x0000_1F80,
     segments: SegmentState = .{},
 
+    /// Number of GPRs addressable through `RegId`. `rip` follows them and is
+    /// deliberately outside this window: it is not encodable as a `RegId`, and
+    /// an out-of-range index must not silently alias it.
+    pub const gpr_count = 16;
+
+    comptime {
+        // The layout contract, proved rather than assumed.
+        const std = @import("std");
+        const names = [gpr_count][]const u8{
+            "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+            "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
+        };
+        for (names, 0..) |name, index| {
+            if (@offsetOf(Regs, name) != index * @sizeOf(u64)) {
+                @compileError("Regs GPR layout broken: " ++ name ++ " is not at its RegId index");
+            }
+        }
+        // `RegId` must enumerate exactly those slots, in that order.
+        const fields = @typeInfo(RegId).@"enum".fields;
+        if (fields.len != gpr_count) @compileError("RegId no longer has 16 members");
+        for (fields, 0..) |field, index| {
+            if (field.value != index) @compileError("RegId values are no longer 0..15 in order");
+        }
+        std.debug.assert(@offsetOf(Regs, "rip") == gpr_count * @sizeOf(u64));
+    }
+
+    /// The GPRs as a flat array. Sound because the fields above are the first
+    /// `gpr_count` members of an `extern` struct of `u64`, which the `comptime`
+    /// block proves.
+    pub inline fn gprs(self: *Regs) *[gpr_count]u64 {
+        return @ptrCast(self);
+    }
+
+    pub inline fn gprsConst(self: *const Regs) *const [gpr_count]u64 {
+        return @ptrCast(self);
+    }
+
     pub fn get(self: *const Regs, comptime reg: []const u8) u64 {
         _ = self;
         _ = reg;
@@ -102,27 +166,8 @@ pub const Regs = struct {
     }
 };
 
-pub fn regVal(regs: *const Regs, id: RegId, size: OperandSize) u64 {
-    const r = @as(u64, @intFromEnum(id));
-    const val: u64 = switch (r) {
-        0 => regs.rax,
-        1 => regs.rcx,
-        2 => regs.rdx,
-        3 => regs.rbx,
-        4 => regs.rsp,
-        5 => regs.rbp,
-        6 => regs.rsi,
-        7 => regs.rdi,
-        8 => regs.r8,
-        9 => regs.r9,
-        10 => regs.r10,
-        11 => regs.r11,
-        12 => regs.r12,
-        13 => regs.r13,
-        14 => regs.r14,
-        15 => regs.r15,
-        else => unreachable,
-    };
+pub inline fn regVal(regs: *const Regs, id: RegId, size: OperandSize) u64 {
+    const val = regs.gprsConst()[@intFromEnum(id)];
     return switch (size) {
         .bits8 => if (id.highByte()) (val >> 8) & 0xFF else val & 0xFF,
         .bits16 => val & 0xFFFF,
@@ -131,52 +176,17 @@ pub fn regVal(regs: *const Regs, id: RegId, size: OperandSize) u64 {
     };
 }
 
-pub fn setReg(regs: *Regs, id: RegId, size: OperandSize, val: u64) void {
-    const r = @as(u64, @intFromEnum(id));
-    const old: u64 = switch (r) {
-        0 => regs.rax,
-        1 => regs.rcx,
-        2 => regs.rdx,
-        3 => regs.rbx,
-        4 => regs.rsp,
-        5 => regs.rbp,
-        6 => regs.rsi,
-        7 => regs.rdi,
-        8 => regs.r8,
-        9 => regs.r9,
-        10 => regs.r10,
-        11 => regs.r11,
-        12 => regs.r12,
-        13 => regs.r13,
-        14 => regs.r14,
-        15 => regs.r15,
-        else => unreachable,
-    };
-    const new = switch (size) {
-        .bits8 => if (id.highByte()) (old & 0xFFFF_FFFF_FFFF_00FF) | ((val & 0xFF) << 8) else (old & 0xFFFF_FFFF_FFFF_FF00) | (val & 0xFF),
-        .bits16 => (old & 0xFFFF_FFFF_FFFF_0000) | (val & 0xFFFF),
+pub inline fn setReg(regs: *Regs, id: RegId, size: OperandSize, val: u64) void {
+    const slot = &regs.gprs()[@intFromEnum(id)];
+    slot.* = switch (size) {
+        .bits8 => if (id.highByte())
+            (slot.* & 0xFFFF_FFFF_FFFF_00FF) | ((val & 0xFF) << 8)
+        else
+            (slot.* & 0xFFFF_FFFF_FFFF_FF00) | (val & 0xFF),
+        .bits16 => (slot.* & 0xFFFF_FFFF_FFFF_0000) | (val & 0xFFFF),
         .bits32 => val & 0xFFFFFFFF,
         .bits64 => val,
     };
-    switch (r) {
-        0 => regs.rax = new,
-        1 => regs.rcx = new,
-        2 => regs.rdx = new,
-        3 => regs.rbx = new,
-        4 => regs.rsp = new,
-        5 => regs.rbp = new,
-        6 => regs.rsi = new,
-        7 => regs.rdi = new,
-        8 => regs.r8 = new,
-        9 => regs.r9 = new,
-        10 => regs.r10 = new,
-        11 => regs.r11 = new,
-        12 => regs.r12 = new,
-        13 => regs.r13 = new,
-        14 => regs.r14 = new,
-        15 => regs.r15 = new,
-        else => unreachable,
-    }
 }
 
 test "32-bit register writes zero-extend into 64-bit parent" {

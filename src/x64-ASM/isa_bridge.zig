@@ -205,7 +205,9 @@ pub const BridgeResult = struct {
             .vhsubps,
             .vhsubpd,
             .vrcpps,
+            .vrcpss,
             .vrsqrtps,
+            .vrsqrtss,
             // ═══ SIMD Compare ═══
             .vcmpps,
             .vcmppd,
