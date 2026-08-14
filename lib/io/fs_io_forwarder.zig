@@ -27,6 +27,13 @@ pub const Forwarder = struct {
     open_count: u64 = 0,
     read_count: u64 = 0,
     write_count: u64 = 0,
+    /// Positioned reads that returned less than asked for. Counted separately
+    /// from failures because they are not failures to the caller — they are
+    /// end-of-file, which is exactly the problem when the offset was nowhere
+    /// near the end.
+    short_positioned_reads: u64 = 0,
+    failed_positioned_reads: u64 = 0,
+    failed_positioned_writes: u64 = 0,
     close_count: u64 = 0,
     mmap_count: u64 = 0,
     shm_open_count: u64 = 0,
@@ -217,15 +224,79 @@ pub const Forwarder = struct {
 
     pub fn pread(self: *Forwarder, state: anytype) i64 {
         self.read_count += 1;
-        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return -1;
-        const bytes = state.guestMemory(state.regs.rsi, state.regs.rdx) orelse return -1;
+        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse {
+            self.reportPositionedFailure("pread", state.regs.rdi, null, 0, state.regs.rdx, .BADF);
+            return @bitCast(self.fail(state, .BADF));
+        };
+        const bytes = state.guestMemory(state.regs.rsi, state.regs.rdx) orelse {
+            self.reportPositionedFailure("pread", state.regs.rdi, host_fd, 0, state.regs.rdx, .FAULT);
+            return @bitCast(self.fail(state, .FAULT));
+        };
         const offset: i64 = @bitCast(state.regs.rcx);
         while (true) {
             const rc = std.c.pread(host_fd, bytes.ptr, bytes.len, offset);
-            if (rc >= 0) return @intCast(rc);
+            if (rc >= 0) {
+                reportShortPositionedRead(self, state.regs.rdi, host_fd, offset, bytes.len, rc);
+                return @intCast(rc);
+            }
             const err = std.c.errno(rc);
-            if (err != .INTR and err != .AGAIN) return @bitCast(self.fail(state, err));
+            if (err != .INTR and err != .AGAIN) {
+                self.failed_positioned_reads +|= 1;
+                self.reportPositionedFailure("pread", state.regs.rdi, host_fd, offset, bytes.len, err);
+                return @bitCast(self.fail(state, err));
+            }
         }
+    }
+
+    /// Report a positioned read that returned fewer bytes than asked for, and
+    /// say whether the file could actually have ended there.
+    ///
+    /// A `pread` returning 0 is the caller's end-of-file signal, and callers
+    /// act on it immediately — the disc-image reader treats it as a corrupt or
+    /// truncated image and fails the file. But 0 is *also* what a wrong file
+    /// descriptor or a mangled offset produces, and those are runtime defects
+    /// wearing the caller's EOF clothes. The observed case was a 32 KiB read at
+    /// offset 315 MB of a 6.1 GiB image: the emulator reported a failed backing
+    /// read and there was nothing anywhere to say the offset was nowhere near
+    /// the end of the file.
+    ///
+    /// `fstat` settles it, costs one syscall on a path that is already doing
+    /// I/O, and only runs when the read came up short.
+    fn reportShortPositionedRead(
+        self: *Forwarder,
+        guest_fd: u64,
+        host_fd: i32,
+        offset: i64,
+        requested: usize,
+        returned: isize,
+    ) void {
+        if (requested == 0) return;
+        if (returned >= 0 and @as(usize, @intCast(returned)) == requested) return;
+
+        var status: std.c.Stat = undefined;
+        const stat_rc = std.c.fstat(host_fd, &status);
+        const size: i64 = if (stat_rc == 0) @intCast(status.size) else -1;
+        const past_end = size >= 0 and offset >= size;
+        self.short_positioned_reads +|= 1;
+
+        machoCapturePrint(
+            "macho-processor: fs pread SHORT: guest_fd={d} host_fd={d} offset={d} requested={d} returned={d} file_size={d} at_or_past_end={}; {s}\n",
+            .{
+                guest_fd,
+                host_fd,
+                offset,
+                requested,
+                returned,
+                size,
+                past_end,
+                if (size < 0)
+                    "the descriptor could not be stat'd, so whether this is a real end of file is unknown — treat the short read as unexplained rather than as EOF"
+                else if (past_end)
+                    "the offset is at or past the end of the file, so this short read is a genuine end of file and the caller's request was out of range"
+                else
+                    "the offset is INSIDE the file, so this is not an end of file. A positioned read that comes up short inside a file means the descriptor or the offset is wrong, not that the data is missing — and any caller treating this as EOF is acting on a runtime defect",
+            },
+        );
     }
 
     pub fn readv(self: *Forwarder, state: anytype) i64 {
@@ -281,11 +352,61 @@ pub const Forwarder = struct {
 
     pub fn pwrite(self: *Forwarder, state: anytype) i64 {
         self.write_count += 1;
-        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse return -1;
-        const bytes = state.guestMemoryConst(state.regs.rsi, state.regs.rdx) orelse return -1;
+        const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse {
+            self.reportPositionedFailure("pwrite", state.regs.rdi, null, 0, state.regs.rdx, .BADF);
+            return @bitCast(self.fail(state, .BADF));
+        };
+        const bytes = state.guestMemoryConst(state.regs.rsi, state.regs.rdx) orelse {
+            self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, 0, state.regs.rdx, .FAULT);
+            return @bitCast(self.fail(state, .FAULT));
+        };
         const offset: i64 = @bitCast(state.regs.rcx);
-        const rc = std.c.pwrite(host_fd, bytes.ptr, bytes.len, offset);
-        return if (rc < 0) -1 else @intCast(rc);
+        while (true) {
+            const rc = std.c.pwrite(host_fd, bytes.ptr, bytes.len, offset);
+            if (rc >= 0) return @intCast(rc);
+            const err = std.c.errno(rc);
+            if (err != .INTR and err != .AGAIN) {
+                self.failed_positioned_writes +|= 1;
+                self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, offset, bytes.len, err);
+                return @bitCast(self.fail(state, err));
+            }
+        }
+    }
+
+    fn reportPositionedFailure(
+        self: *Forwarder,
+        operation: []const u8,
+        guest_fd: u64,
+        host_fd: ?c_int,
+        offset: i64,
+        requested: u64,
+        err: std.c.E,
+    ) void {
+        _ = self;
+        var file_size: i64 = -1;
+        var host_is_live = false;
+        if (host_fd) |fd| {
+            var status: std.c.Stat = undefined;
+            host_is_live = std.c.fstat(fd, &status) == 0;
+            if (host_is_live) file_size = @intCast(status.size);
+        }
+        machoCapturePrint(
+            "macho-processor: fs {s} FAILED: guest_fd={d} host_fd={any} offset={d} requested={d} errno={s} descriptor_live={} file_size={d}; {s}\n",
+            .{
+                operation,
+                guest_fd,
+                host_fd,
+                offset,
+                requested,
+                @tagName(err),
+                host_is_live,
+                file_size,
+                if (err == .BADF)
+                    "the virtual descriptor is missing or its host descriptor was closed; inspect fdopen/fclose/close ownership and generation"
+                else
+                    "the host rejected positioned I/O; this is an I/O failure, not an end-of-file result",
+            },
+        );
     }
 
     pub fn close(self: *Forwarder, state: anytype) u64 {
@@ -1062,7 +1183,7 @@ pub const Forwarder = struct {
 
     pub fn logSummary(self: *const Forwarder) void {
         machoCapturePrint(
-            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} shm_open={d} shm_fallback={d} ftruncate={d} access={d} errno_updates={d} last_errno={d}\n",
+            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} shm_open={d} shm_fallback={d} ftruncate={d} access={d} pread(short/failed)={d}/{d} pwrite_failed={d} errno_updates={d} last_errno={d}\n",
             .{
                 self.open_count,
                 self.read_count,
@@ -1076,6 +1197,9 @@ pub const Forwarder = struct {
                 self.shm_fallback_count,
                 self.ftruncate_count,
                 self.access_count,
+                self.short_positioned_reads,
+                self.failed_positioned_reads,
+                self.failed_positioned_writes,
                 self.errno_updates,
                 self.last_errno,
             },
@@ -1147,6 +1271,35 @@ test "small mmap fallback owns a complete Darwin VM page" {
     try std.testing.expectEqual(@as(?u64, page_size * 2), pageOwnedMmapLength(page_size + 1));
     try std.testing.expectEqual(@as(?u64, null), pageOwnedMmapLength(0));
     try std.testing.expectEqual(@as(?u64, null), pageOwnedMmapLength(std.math.maxInt(u64)));
+}
+
+test "positioned IO reports missing virtual descriptors as EBADF" {
+    const TestState = struct {
+        regs: struct { rdi: u64 = 999, rsi: u64 = 0, rdx: u64 = 16, rcx: u64 = 0 } = .{},
+        guest_errno: c_int = 0,
+
+        fn setGuestErrno(self: *@This(), value: c_int) void {
+            self.guest_errno = value;
+        }
+
+        fn guestMemory(_: *@This(), _: u64, _: u64) ?[]u8 {
+            return null;
+        }
+
+        fn guestMemoryConst(_: *@This(), _: u64, _: u64) ?[]const u8 {
+            return null;
+        }
+    };
+
+    var forwarder = Forwarder.init(std.testing.allocator);
+    defer forwarder.deinit();
+    var state = TestState{};
+
+    try std.testing.expectEqual(@as(i64, -1), forwarder.pread(&state));
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(std.c.E.BADF)), state.guest_errno);
+    state.guest_errno = 0;
+    try std.testing.expectEqual(@as(i64, -1), forwarder.pwrite(&state));
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(std.c.E.BADF)), state.guest_errno);
 }
 
 fn isMacOSMetadataEntry(name: []const u8) bool {
