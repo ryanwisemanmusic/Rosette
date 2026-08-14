@@ -136,7 +136,10 @@ const GuestSymbolKind = enum {
     map_memory,
     bind_image_memory,
     bind_buffer_memory,
+    bind_image_memory2,
+    bind_buffer_memory2,
     get_memory_requirements,
+    get_memory_requirements2,
     create_graphics_pipelines,
     destroy_device_object,
     device_success,
@@ -489,6 +492,8 @@ pub const Forwarder = struct {
             .create_device_object => state.regs.rax = self.createVulkanObject(state, state.regs.rsi, state.regs.rcx, entry.name[0..entry.name_length]),
             .bind_image_memory => state.regs.rax = self.bindResourceMemory(state.regs.rsi, state.regs.rdx, state.regs.rcx, .image),
             .bind_buffer_memory => state.regs.rax = self.bindResourceMemory(state.regs.rsi, state.regs.rdx, state.regs.rcx, .buffer),
+            .bind_image_memory2 => state.regs.rax = self.bindResourcesMemory2(state, state.regs.rsi, state.regs.rdx, .image),
+            .bind_buffer_memory2 => state.regs.rax = self.bindResourcesMemory2(state, state.regs.rsi, state.regs.rdx, .buffer),
             .allocate_command_buffers => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 28, entry.name[0..entry.name_length]),
             .allocate_descriptor_sets => state.regs.rax = self.allocateVulkanObjects(state, state.regs.rsi, state.regs.rdx, 24, entry.name[0..entry.name_length]),
             .allocate_memory => state.regs.rax = self.allocateVulkanMemory(state, state.regs.rsi, state.regs.rcx),
@@ -500,6 +505,7 @@ pub const Forwarder = struct {
                 state.regs.r9,
             ),
             .get_memory_requirements => state.regs.rax = self.writeResourceMemoryRequirements(state, state.regs.rsi, state.regs.rdx),
+            .get_memory_requirements2 => state.regs.rax = self.writeResourceMemoryRequirements2(state, state.regs.rsi, state.regs.rdx),
             .create_graphics_pipelines => state.regs.rax = self.createMultipleVulkanObjects(state, state.regs.rdx, state.regs.r9, entry.name[0..entry.name_length]),
             .destroy_device_object => state.regs.rax = 0,
             .device_success => state.regs.rax = 0,
@@ -637,6 +643,30 @@ pub const Forwarder = struct {
         return 0;
     }
 
+    /// Vulkan 1.1 groups resource bindings into an array. Keep the operation
+    /// in Rosette's resource model and only decode the public Vulkan ABI at
+    /// this edge; the resource records below remain backend-independent.
+    fn bindResourcesMemory2(
+        self: *Forwarder,
+        state: anytype,
+        count: u64,
+        infos: u64,
+        kind: VulkanResourceKind,
+    ) u64 {
+        const info_size: u64 = 40;
+        const byte_count = std.math.mul(u64, count, info_size) catch return vkErrorInitializationFailed();
+        if (count != 0 and state.guestMemoryConst(infos, byte_count) == null) return vkErrorInitializationFailed();
+        var index: u64 = 0;
+        while (index < count) : (index += 1) {
+            const info = infos + index * info_size;
+            const resource = state.read64(info + 16);
+            const memory = state.read64(info + 24);
+            const offset = state.read64(info + 32);
+            _ = self.bindResourceMemory(resource, memory, offset, kind);
+        }
+        return 0;
+    }
+
     /// Answer with a size the resource actually needs.
     ///
     /// This previously replied 4096 bytes for everything. A 1280×720 image was
@@ -648,6 +678,18 @@ pub const Forwarder = struct {
         const record = self.findResource(resource);
         const size = if (record) |found| found.size_bytes else 0;
         return writeMemoryRequirements(state, output, size);
+    }
+
+    /// Vulkan 1.1 wraps both the resource and the result in extensible
+    /// structures. The payload is still the same Rosette memory requirement;
+    /// preserve the caller-owned sType/pNext headers and write only the nested
+    /// VkMemoryRequirements at offset 16.
+    fn writeResourceMemoryRequirements2(self: *Forwarder, state: anytype, info: u64, output: u64) u64 {
+        if (state.guestMemoryConst(info, 24) == null or state.guestMemory(output, 40) == null) {
+            return vkErrorInitializationFailed();
+        }
+        const resource = state.read64(info + 16);
+        return self.writeResourceMemoryRequirements(state, resource, output + 16);
     }
 
     fn createLogicalDevice(self: *Forwarder, state: anytype, output: u64) u64 {
@@ -2073,6 +2115,14 @@ fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
     if (std.mem.eql(u8, symbol, "vkQueuePresentKHR")) return .queue_present;
     if (std.mem.eql(u8, symbol, "vkAllocateMemory")) return .allocate_memory;
     if (std.mem.eql(u8, symbol, "vkMapMemory")) return .map_memory;
+    if (std.mem.eql(u8, symbol, "vkBindImageMemory2") or
+        std.mem.eql(u8, symbol, "vkBindImageMemory2KHR")) return .bind_image_memory2;
+    if (std.mem.eql(u8, symbol, "vkBindBufferMemory2") or
+        std.mem.eql(u8, symbol, "vkBindBufferMemory2KHR")) return .bind_buffer_memory2;
+    if (std.mem.eql(u8, symbol, "vkGetBufferMemoryRequirements2") or
+        std.mem.eql(u8, symbol, "vkGetBufferMemoryRequirements2KHR") or
+        std.mem.eql(u8, symbol, "vkGetImageMemoryRequirements2") or
+        std.mem.eql(u8, symbol, "vkGetImageMemoryRequirements2KHR")) return .get_memory_requirements2;
     if (std.mem.eql(u8, symbol, "vkGetBufferMemoryRequirements") or
         std.mem.eql(u8, symbol, "vkGetImageMemoryRequirements")) return .get_memory_requirements;
     const create_objects = [_][]const u8{
@@ -2629,6 +2679,10 @@ test "Vulkan guest symbol classification covers surface bootstrap" {
     try std.testing.expectEqual(GuestSymbolKind.allocate_memory, guestSymbolKind("vkAllocateMemory"));
     try std.testing.expectEqual(GuestSymbolKind.map_memory, guestSymbolKind("vkMapMemory"));
     try std.testing.expectEqual(GuestSymbolKind.get_memory_requirements, guestSymbolKind("vkGetImageMemoryRequirements"));
+    try std.testing.expectEqual(GuestSymbolKind.get_memory_requirements2, guestSymbolKind("vkGetImageMemoryRequirements2"));
+    try std.testing.expectEqual(GuestSymbolKind.get_memory_requirements2, guestSymbolKind("vkGetBufferMemoryRequirements2KHR"));
+    try std.testing.expectEqual(GuestSymbolKind.bind_image_memory2, guestSymbolKind("vkBindImageMemory2"));
+    try std.testing.expectEqual(GuestSymbolKind.bind_buffer_memory2, guestSymbolKind("vkBindBufferMemory2KHR"));
     try std.testing.expectEqual(GuestSymbolKind.device_void, guestSymbolKind("vkCmdDrawIndexed"));
     try std.testing.expectEqual(GuestSymbolKind.device_success, guestSymbolKind("vkWaitForFences"));
     try std.testing.expectEqual(GuestSymbolKind.create_graphics_pipelines, guestSymbolKind("vkCreateGraphicsPipelines"));
@@ -2761,6 +2815,50 @@ test "modeled Vulkan objects register opaque pointer provenance" {
     try std.testing.expectEqual(@as(u64, 0), forwarder.createVulkanObject(&state, 8, "vkCreateBuffer"));
     try std.testing.expectEqual(state.read64(8), state.last_opaque_handle);
     try std.testing.expectEqualStrings("vkCreateBuffer", state.last_opaque_owner);
+}
+
+test "Vulkan 1.1 image requirements and binding use the Rosette resource record" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    const create_info: u64 = 128;
+    const handle_output: u64 = 256;
+    state.write32(create_info + VK_IMAGE_CREATE_INFO_FORMAT_OFFSET, 37);
+    state.write32(create_info + VK_IMAGE_CREATE_INFO_EXTENT_OFFSET, 1280);
+    state.write32(create_info + VK_IMAGE_CREATE_INFO_EXTENT_OFFSET + 4, 720);
+    state.write32(create_info + VK_IMAGE_CREATE_INFO_MIP_LEVELS_OFFSET, 1);
+    state.write32(create_info + VK_IMAGE_CREATE_INFO_ARRAY_LAYERS_OFFSET, 1);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        forwarder.createVulkanObject(&state, create_info, handle_output, "vkCreateImage"),
+    );
+    const image = state.read64(handle_output);
+
+    const requirements_info: u64 = 320;
+    const requirements_output: u64 = 384;
+    state.write32(requirements_output, 1000146003); // VkStructureType, caller-owned.
+    state.write64(requirements_output + 8, 0xCAFE_BABE); // pNext, caller-owned.
+    state.write64(requirements_info + 16, image);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        forwarder.writeResourceMemoryRequirements2(&state, requirements_info, requirements_output),
+    );
+    try std.testing.expectEqual(@as(u32, 1000146003), state.read32(requirements_output));
+    try std.testing.expectEqual(@as(u64, 0xCAFE_BABE), state.read64(requirements_output + 8));
+    try std.testing.expectEqual(@as(u64, 1280 * 720 * 4), state.read64(requirements_output + 16));
+    try std.testing.expectEqual(@as(u64, 256), state.read64(requirements_output + 24));
+    try std.testing.expectEqual(@as(u32, 1), state.read32(requirements_output + 32));
+
+    const bind_info: u64 = 448;
+    state.write64(bind_info + 16, image);
+    state.write64(bind_info + 24, 0xFFFF_F500_1234_0001);
+    state.write64(bind_info + 32, 512);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        forwarder.bindResourcesMemory2(&state, 1, bind_info, .image),
+    );
+    const record = forwarder.findResource(image).?;
+    try std.testing.expectEqual(@as(u64, 0xFFFF_F500_1234_0001), record.memory);
+    try std.testing.expectEqual(@as(u64, 512), record.memory_offset);
 }
 
 test "modeled Vulkan memory uses allocationSize and reuses one mapping" {
