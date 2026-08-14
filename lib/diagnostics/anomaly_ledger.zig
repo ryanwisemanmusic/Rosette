@@ -105,6 +105,12 @@ pub const Ledger = struct {
     overflow: u64 = 0,
     totals: [@typeInfo(Kind).@"enum".fields.len]u64 =
         [_]u64{0} ** @typeInfo(Kind).@"enum".fields.len,
+    /// Step of the most recent structural progress. Anomalies after it are the
+    /// ones the run never got past.
+    last_advance_step: u64 = 0,
+    /// Whether the run is over. Only then does "still unclassified" mean
+    /// "the pipeline never advanced past it" rather than "not yet".
+    sealed: bool = false,
 
     /// Record an anomaly. Repeats of an identical detail collapse into one
     /// record with an occurrence count: the same assertion firing in a loop is
@@ -159,6 +165,53 @@ pub const Ledger = struct {
         return classified;
     }
 
+    /// Classify by progress: the pipeline reached a new milestone at `step`, so
+    /// every anomaly recorded before it is one the run *continued past*.
+    ///
+    /// This exists because `classify` had no callers. Every run of this
+    /// investigation ended `unclassified=N` with N never falling, and an
+    /// unclassified ledger blocks signoff by design — so the design was
+    /// producing a permanent blocker instead of a verdict. Asking each
+    /// subsystem to classify its own anomalies never happened and was never
+    /// going to: the subsystem that trips an assertion is precisely the one
+    /// that does not yet know whether anything recovered.
+    ///
+    /// Structural progress is the evidence that is actually available, and it
+    /// is the audit's own test — "record the next relevant milestone". An
+    /// anomaly the pipeline advanced past did not stop the pipeline. It may
+    /// still have degraded something, which is why a subsystem that *does*
+    /// know may still call `classify` and say so; this only moves records off
+    /// `unclassified`, never off a disposition someone else established.
+    pub fn notePipelineAdvance(self: *Ledger, step: u64) usize {
+        var advanced: usize = 0;
+        for (self.records[0..self.count]) |*record| {
+            if (record.disposition != .unclassified) continue;
+            if (record.step >= step) continue;
+            record.disposition = .continued_benign;
+            advanced += 1;
+        }
+        self.last_advance_step = step;
+        return advanced;
+    }
+
+    /// Close the ledger. Anything still unclassified is an anomaly the pipeline
+    /// never advanced past, which is the definition of being on the path to the
+    /// stall under investigation.
+    ///
+    /// Deliberately not called from `verdict`: sealing is an assertion that the
+    /// run is over, and a mid-run snapshot that sealed the ledger would report
+    /// every recent anomaly as implicated while the run was still working.
+    pub fn seal(self: *Ledger) usize {
+        var implicated_now: usize = 0;
+        for (self.records[0..self.count]) |*record| {
+            if (record.disposition != .unclassified) continue;
+            record.disposition = .implicated;
+            implicated_now += 1;
+        }
+        self.sealed = true;
+        return implicated_now;
+    }
+
     pub fn total(self: *const Ledger, kind: Kind) u64 {
         return self.totals[@intFromEnum(kind)];
     }
@@ -198,18 +251,70 @@ pub const Ledger = struct {
             return "the ledger overflowed, so some anomalies were never recorded. The count is a floor, not a total";
         }
         if (self.unclassified() != 0) {
-            return "anomalies were recorded and nobody has said what happened after them. Until each is classified, this run cannot be called clean and none of them can be dismissed";
+            return if (self.sealed)
+                "anomalies remain unclassified after the run was sealed, which should be impossible: sealing implicates whatever the pipeline never advanced past. Treat this as a defect in the ledger, not a finding about the guest"
+            else
+                "anomalies have been recorded and the pipeline has not yet advanced past them. They are pending, not dismissed: if the run ends here they become implicated";
         }
         return "every recorded anomaly was classified and none is implicated";
     }
 };
+
+// The gap this closes: `classify` existed and nothing called it, so every run
+// ended `unclassified=N`, blocked its own signoff, and said nothing about
+// whether any anomaly mattered.
+test "structural progress classifies the anomalies it advanced past" {
+    var ledger = Ledger{};
+    _ = ledger.note(.host_assertion, "spa_info.cc:95 LoadAchievements", 100, 0x7fff2000, 0x647536);
+    _ = ledger.note(.host_assertion, "xboxkrnl_memory.cc:79", 200, 0x7fff2000, 0x647600);
+    try std.testing.expectEqual(@as(usize, 2), ledger.unclassified());
+
+    // A milestone between the two settles only the earlier one; the later
+    // anomaly has no progress after it yet.
+    try std.testing.expectEqual(@as(usize, 1), ledger.notePipelineAdvance(150));
+    try std.testing.expectEqual(@as(usize, 1), ledger.unclassified());
+    try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "pending, not dismissed") != null);
+
+    try std.testing.expectEqual(@as(usize, 1), ledger.notePipelineAdvance(300));
+    try std.testing.expectEqual(@as(usize, 0), ledger.unclassified());
+    try std.testing.expect(ledger.signoffClean());
+}
+
+test "sealing implicates whatever the pipeline never advanced past" {
+    var ledger = Ledger{};
+    _ = ledger.note(.host_assertion, "spa_info.cc:378 ReadXLast", 100, 0x7fff2000, 0x647536);
+    _ = ledger.note(.recovered_fault, "guest fault at 82450390", 900, 0x7fff20e0, 0xa00f4301);
+    _ = ledger.notePipelineAdvance(500);
+
+    // One anomaly had progress after it; the other did not, and the run ending
+    // is what makes that difference a finding.
+    try std.testing.expectEqual(@as(usize, 1), ledger.seal());
+    try std.testing.expectEqual(@as(usize, 1), ledger.implicated());
+    try std.testing.expectEqual(@as(usize, 0), ledger.unclassified());
+    try std.testing.expect(!ledger.signoffClean());
+    try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "evidence, not noise") != null);
+}
+
+// Progress must not overwrite a disposition a subsystem actually established.
+test "a subsystem's own classification outranks the progress heuristic" {
+    var ledger = Ledger{};
+    _ = ledger.note(.invalid_free, "forwarder free of unowned block", 100, 0, 0);
+    try std.testing.expect(ledger.classify(.invalid_free, "unowned", .continued_degraded));
+    try std.testing.expectEqual(@as(usize, 0), ledger.notePipelineAdvance(500));
+    try std.testing.expectEqual(Disposition.continued_degraded, ledger.records[0].disposition);
+    _ = ledger.seal();
+    try std.testing.expectEqual(Disposition.continued_degraded, ledger.records[0].disposition);
+}
 
 test "an unclassified anomaly blocks signoff" {
     var ledger = Ledger{};
     _ = ledger.note(.host_assertion, "spa_info.cc:61 LoadLanguageData", 558249460, 0x7fff2000, 0x647536);
     try std.testing.expectEqual(@as(usize, 1), ledger.unclassified());
     try std.testing.expect(!ledger.signoffClean());
-    try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "cannot be called clean") != null);
+    // Unclassified still blocks signoff. What changed is that an unsealed
+    // ledger now says the record is *pending* rather than permanently
+    // unexplained — the run has simply not advanced past it yet.
+    try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "pending, not dismissed") != null);
 }
 
 // The distinction that makes a permanently non-zero counter readable again:

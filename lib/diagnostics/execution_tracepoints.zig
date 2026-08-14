@@ -37,12 +37,23 @@ const filter_words: usize = filter_buckets / 64;
 /// What a traced boundary means, so a hit report can say why it was watched.
 /// The categories are the frontier the graphics investigation is walking.
 pub const Role = enum(u8) {
-    /// The guest frame-boundary call. Its absence is the current frontier.
+    /// Entry into the authentic guest VdSwap export path. This proves the call
+    /// executed, but deliberately does not claim the guest published an
+    /// XE_SWAP packet. Host diagnostic work must never satisfy this role.
     swap,
     /// Ring publication by the kernel video path.
     ring_publication,
     /// Command-processor packet execution.
     command_processor,
+    /// A swap that has reached a command processor. This can be reached by an
+    /// authentic guest packet or by an explicitly-labelled host diagnostic.
+    command_swap,
+    /// Entry into the PM4_XE_SWAP decoder. A diagnostic ring injection reaches
+    /// this same function, so this role proves decoding, not guest provenance.
+    xe_swap_decode,
+    /// A host-only swap probe. Entering this proves the host presentation path
+    /// without claiming that the guest produced a frame boundary.
+    diagnostic_swap,
     /// The presenter's own frame path inside the emulator.
     presenter,
     /// Anything else armed for a specific question.
@@ -50,11 +61,55 @@ pub const Role = enum(u8) {
 
     pub fn label(self: Role) []const u8 {
         return switch (self) {
-            .swap => "guest frame boundary",
+            .swap => "guest VdSwap call",
             .ring_publication => "ring publication",
             .command_processor => "command processor",
+            .command_swap => "command-processor swap",
+            .xe_swap_decode => "PM4_XE_SWAP decoder",
+            .diagnostic_swap => "host diagnostic swap",
             .presenter => "emulator presenter",
             .other => "observation",
+        };
+    }
+
+    /// The role that must execute before this one can. Ordering is the ABI's,
+    /// not a preference: a title publishes a ring before the command processor
+    /// has anything to consume, and consumes packets before a swap can name a
+    /// finished frame.
+    ///
+    /// This exists so a zero can be read correctly. A role whose predecessor
+    /// also never ran has not been skipped — the run has not arrived at it, and
+    /// reporting it as "never entered" points the next investigation at the
+    /// wrong end of the pipeline.
+    pub fn predecessor(self: Role) ?Role {
+        return switch (self) {
+            .ring_publication => null,
+            .command_processor => .ring_publication,
+            .swap => .command_processor,
+            .command_swap => .command_processor,
+            .xe_swap_decode => .command_processor,
+            .diagnostic_swap => null,
+            .presenter => .command_swap,
+            .other => null,
+        };
+    }
+};
+
+/// What a zero hit count licenses a reader to conclude.
+pub const Verdict = enum {
+    not_watched,
+    entered,
+    entered_but_not_recorded,
+    not_yet_reached,
+    never_entered,
+
+    pub fn describe(self: Verdict) []const u8 {
+        return switch (self) {
+            .not_watched => "NOT WATCHED: no tracepoint was armed for this role, so a zero count says nothing about whether it executed. Resolve the symbol first",
+            .entered => "ENTERED: the instruction pointer reached this function, so its absence from any log is a logging question, not an execution one",
+            .entered_but_not_recorded => "ENTERED BUT NOT RECORDED: the instruction pointer reached this function and the subsystem that owns it produced no record of the work. The execution happened; the accounting for it did not, so every downstream counter reading zero is measuring the gap and not the guest",
+            .not_yet_reached => "NOT YET REACHED: armed, unentered, and the role that must precede it is also unentered. The run has not arrived here yet, so this zero is a consequence of the earlier gap and names nothing on its own — read the predecessor's verdict instead",
+            .never_entered => "NEVER ENTERED: a tracepoint was armed at the resolved address, the role that must precede it did execute, and the instruction pointer still never reached it. This is an execution fact, not a missing log line",
         };
     }
 };
@@ -70,6 +125,14 @@ pub const Tracepoint = struct {
     first_caller: u64 = 0,
     last_step: u64 = 0,
     last_thread: u64 = 0,
+    /// Records the owning subsystem produced for this boundary — ring writes,
+    /// consumed packets, presented frames. Left at zero by subsystems that do
+    /// not report one, which is why `records_expected` gates the comparison
+    /// rather than the count alone.
+    records: u64 = 0,
+    /// Whether the owning subsystem promises to call `record`. Only then does
+    /// `hits > 0 and records == 0` mean anything.
+    records_expected: bool = false,
 
     pub fn entered(self: *const Tracepoint) bool {
         return self.hits != 0;
@@ -211,17 +274,58 @@ pub const Set = struct {
         return false;
     }
 
+    /// Whether the subsystem owning this role promised records and produced
+    /// none despite the boundary executing.
+    pub fn roleEnteredWithoutRecords(self: *const Set, role: Role) bool {
+        var expected = false;
+        var records: u64 = 0;
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.role != role) continue;
+            if (entry.records_expected) expected = true;
+            records +|= entry.records;
+        }
+        return expected and records == 0;
+    }
+
+    /// Attribute a record to whichever tracepoint owns `address`, so the
+    /// "executed but produced nothing" case can be told from "never executed".
+    pub fn record(self: *Set, address: u64) void {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.address != address) continue;
+            entry.records +|= 1;
+            entry.records_expected = true;
+            return;
+        }
+    }
+
+    /// Declare that this role's owner will report records, so a later zero is
+    /// readable as a gap rather than as silence.
+    pub fn expectRecords(self: *Set, role: Role) void {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.role == role) entry.records_expected = true;
+        }
+    }
+
     /// What a zero hit count for this role actually licenses a reader to
     /// conclude. This is the sentence three passes of this investigation
     /// needed and did not have.
-    pub fn verdict(self: *const Set, role: Role) []const u8 {
-        if (!self.roleArmed(role)) {
-            return "NOT WATCHED: no tracepoint was armed for this role, so a zero count says nothing about whether it executed. Resolve the symbol first";
-        }
+    pub fn classify(self: *const Set, role: Role) Verdict {
+        if (!self.roleArmed(role)) return .not_watched;
         if (self.roleEntered(role)) {
-            return "ENTERED: the instruction pointer reached this function, so its absence from any log is a logging question, not an execution one";
+            return if (self.roleEnteredWithoutRecords(role)) .entered_but_not_recorded else .entered;
         }
-        return "NEVER ENTERED: a tracepoint was armed at the resolved address and the instruction pointer never reached it. This is an execution fact, not a missing log line";
+        // A predecessor that never ran means this role was never eligible. Only
+        // when the predecessor did run is a zero here a fact about *this*
+        // boundary — that is the difference between naming the frontier and
+        // naming everything downstream of it.
+        if (role.predecessor()) |earlier| {
+            if (self.roleArmed(earlier) and !self.roleEntered(earlier)) return .not_yet_reached;
+        }
+        return .never_entered;
+    }
+
+    pub fn verdict(self: *const Set, role: Role) []const u8 {
+        return self.classify(role).describe();
     }
 };
 
@@ -331,6 +435,64 @@ test "an unwatched role is distinguished from one that never executed" {
     try std.testing.expect(std.mem.indexOf(u8, armed.verdict(.swap), "logging question") != null);
 }
 
+// The whole pipeline reads zero when the *first* stage never ran. Saying
+// "NEVER ENTERED" four times names four frontiers, and there is only one.
+test "a downstream zero is not a finding while its predecessor is also zero" {
+    var set = Set{};
+    _ = set.arm("VdInitializeRingBuffer", 0x1000, .ring_publication);
+    _ = set.arm("ExecutePrimaryBuffer", 0x2000, .command_processor);
+    _ = set.arm("VdSwap", 0x3000, .swap);
+    set.seal();
+
+    // Nothing has run: only the head of the pipeline is a real finding.
+    try std.testing.expectEqual(Verdict.never_entered, set.classify(.ring_publication));
+    try std.testing.expectEqual(Verdict.not_yet_reached, set.classify(.command_processor));
+    try std.testing.expectEqual(Verdict.not_yet_reached, set.classify(.swap));
+
+    // Once the ring publishes, the command processor's zero becomes its own
+    // finding, and the frontier moves one stage down.
+    _ = set.observe(0x1000, 10, 1, 0);
+    try std.testing.expectEqual(Verdict.entered, set.classify(.ring_publication));
+    try std.testing.expectEqual(Verdict.never_entered, set.classify(.command_processor));
+    try std.testing.expectEqual(Verdict.not_yet_reached, set.classify(.swap));
+}
+
+// An unarmed predecessor cannot license "not yet reached": nothing was
+// watching it, so it may well have run.
+test "an unwatched predecessor leaves the downstream zero a finding" {
+    var set = Set{};
+    _ = set.arm("ExecutePrimaryBuffer", 0x2000, .command_processor);
+    set.seal();
+    try std.testing.expectEqual(Verdict.not_watched, set.classify(.ring_publication));
+    try std.testing.expectEqual(Verdict.never_entered, set.classify(.command_processor));
+}
+
+test "a boundary that executed and recorded nothing is its own verdict" {
+    var set = Set{};
+    _ = set.arm("VdInitializeRingBuffer", 0x1000, .ring_publication);
+    set.seal();
+    set.expectRecords(.ring_publication);
+
+    _ = set.observe(0x1000, 10, 1, 0);
+    // Executed, and the subsystem that owns it produced nothing. That is a
+    // different problem from never executing, and pointed a whole pass of this
+    // investigation at the guest when the gap was in the accounting.
+    try std.testing.expectEqual(Verdict.entered_but_not_recorded, set.classify(.ring_publication));
+
+    set.record(0x1000);
+    try std.testing.expectEqual(Verdict.entered, set.classify(.ring_publication));
+}
+
+// Without a promise of records, zero records is silence and must not be read
+// as a gap.
+test "a subsystem that never promised records is not accused of losing them" {
+    var set = Set{};
+    _ = set.arm("VdSwap", 0x3000, .swap);
+    set.seal();
+    _ = set.observe(0x3000, 10, 1, 0);
+    try std.testing.expectEqual(Verdict.entered, set.classify(.swap));
+}
+
 test "roles report armed and entered independently" {
     var set = Set{};
     _ = set.arm("VdSwap", 0x8000, .swap);
@@ -338,6 +500,37 @@ test "roles report armed and entered independently" {
     try std.testing.expect(set.roleArmed(.swap));
     try std.testing.expect(!set.roleEntered(.swap));
     try std.testing.expect(!set.roleArmed(.presenter));
+}
+
+test "diagnostic and command swaps do not satisfy authentic guest swap" {
+    var set = Set{};
+    _ = set.arm("ExecutePrimaryBuffer", 0x1000, .command_processor);
+    _ = set.arm("DebugIssueSwapFromHost", 0x2000, .diagnostic_swap);
+    _ = set.arm("VulkanCommandProcessor::IssueSwap", 0x3000, .command_swap);
+    _ = set.arm("VdSwap", 0x4000, .swap);
+    set.seal();
+
+    _ = set.observe(0x1000, 1, 1, 0);
+    _ = set.observe(0x2000, 2, 1, 0);
+    _ = set.observe(0x3000, 3, 1, 0);
+
+    try std.testing.expect(set.roleEntered(.diagnostic_swap));
+    try std.testing.expect(set.roleEntered(.command_swap));
+    try std.testing.expect(!set.roleEntered(.swap));
+    try std.testing.expectEqual(Verdict.never_entered, set.classify(.swap));
+}
+
+test "XE swap decode does not imply authentic guest provenance" {
+    var set = Set{};
+    _ = set.arm("ExecutePacketType3_XE_SWAP", 0x2800, .xe_swap_decode);
+    _ = set.arm("DebugIssueSwapFromHost", 0x2000, .diagnostic_swap);
+    set.seal();
+
+    _ = set.observe(0x2000, 10, 1, 0);
+    _ = set.observe(0x2800, 11, 1, 0);
+    try std.testing.expect(set.roleEntered(.diagnostic_swap));
+    try std.testing.expect(set.roleEntered(.xe_swap_decode));
+    try std.testing.expect(!set.roleEntered(.swap));
 }
 
 test "the set refuses to overflow" {
