@@ -60,6 +60,7 @@ const PackedIntegerOperation = packed_ops.PackedIntegerOperation;
 const packedIntegerBinary = packed_ops.packedIntegerBinary;
 const multiplyUnsignedEvenDwords = packed_ops.multiplyUnsignedEvenDwords;
 const shufflePackedDwords = packed_ops.shufflePackedDwords;
+const shufflePackedSingles = packed_ops.shufflePackedSingles;
 const unpackLowQwords = packed_ops.unpackLowQwords;
 const blendPackedWords = packed_ops.blendPackedWords;
 const blendPackedElements = packed_ops.blendPackedElements;
@@ -217,12 +218,17 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
     // ops (mov/lea/cmp/test/jcc/add/sub/push/pop, plus the byte/word/dword/
     // qword store forms that dominate Xenia's JIT-emission loops) bypass the
     // ~700-arm jump table with a small, branch-predictable comparison tree.
-    // Only ops whose general arms have no extra side effects are fast-pathed:
-    // loads are excluded because mov_reg32_mem32/mov_reg64_mem64 carry
-    // bounded-dispatch / near-null recovery, and all fault-recovery and
-    // tracing logic stays in the general switch. writeMemVal (R3: gated write
-    // bookkeeping) and the highway helpers are the exact same calls the
-    // general arms make.
+    // Every arm here is a verbatim copy, side effects included: the scalar
+    // register forms, the store forms that dominate the JIT-emission loops,
+    // and the load forms with their bounded-dispatch and near-null recovery
+    // intact. All other fault-recovery and tracing logic stays in the general
+    // switch. writeMemVal (R3: gated write bookkeeping) and the highway
+    // helpers are the exact same calls the general arms make.
+    //
+    // The general switch is the last statement in this function, so returning
+    // from an arm here is equivalent to falling out of it — that equivalence
+    // is what makes copying an arm up safe, and it is the thing to re-check
+    // before adding one.
     switch (d.op) {
         .nop => {
             return;
@@ -245,6 +251,39 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         },
         .mov_reg_imm => {
             self.setRegOperand(d.dst_reg, d.size, d.dst_high8, d.imm);
+            return;
+        },
+        // Loads. Previously excluded on the grounds that they "carry
+        // bounded-dispatch / near-null recovery" — but that recovery is
+        // statements in the arm, not a reason the arm cannot be here, and the
+        // rule for this tree has always been that the copy is verbatim. A load
+        // is the single most frequent thing the guest does, so excluding it
+        // meant the most common instruction in the program was the one paying
+        // two dispatches instead of one. Copied exactly, recovery included;
+        // keep in sync with the general arms as with every other entry here.
+        .mov_reg8_mem8 => {
+            self.setRegOperand(d.dst_reg, .bits8, d.dst_high8, self.readMemVal(d.addr, .bits8));
+            return;
+        },
+        .mov_reg16_mem16 => {
+            self.setReg(d.dst_reg, .bits16, self.readMemVal(d.addr, .bits16));
+            return;
+        },
+        .mov_reg32_mem32 => {
+            const load_rip = self.regs.rip;
+            const value = self.readMemVal(d.addr, .bits32);
+            // A bounded dispatch recovery may redirect the entire generated
+            // frame while resolving this load. In that case the load belongs
+            // to the abandoned JIT frame and must not clobber the caller's
+            // destination register after the host continuation is installed.
+            if (!self.terminated and self.regs.rip == load_rip) {
+                self.setReg(d.dst_reg, .bits32, value);
+            }
+            return;
+        },
+        .mov_reg64_mem64 => {
+            _ = self.recoverNearNullBaseRegister(&d);
+            self.setReg(d.dst_reg, .bits64, self.readMemVal(d.addr, .bits64));
             return;
         },
         .mov_mem8_reg8 => {
@@ -1943,6 +1982,22 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         .vsqrtsd => {
             self.executeVexSqrtScalarF64(d);
         },
+        // The predicate decides whether this executes at all: an encoding the
+        // comparison model does not cover falls through to the unimplemented
+        // report rather than writing a mask nobody verified.
+        // Split rather than merged: the double/single selection is a comptime
+        // parameter, so each arm has to name its own width.
+        .vcmpps => self.reportUnsupportedComparePredicate(d, self.executeVexComparePacked(d, false)),
+        .vcmppd => self.reportUnsupportedComparePredicate(d, self.executeVexComparePacked(d, true)),
+        .vcmpss => self.reportUnsupportedComparePredicate(d, self.executeVexCompareScalar(d, false)),
+        .vcmpsd => self.reportUnsupportedComparePredicate(d, self.executeVexCompareScalar(d, true)),
+        .vrcpps => self.executeVexReciprocalPacked(d, false),
+        .vrsqrtps => self.executeVexReciprocalPacked(d, true),
+        .vrcpss => self.executeVexReciprocalScalar(d, false),
+        .vrsqrtss => self.executeVexReciprocalScalar(d, true),
+        .vcvtdq2ps => self.executeVexConvertPacked(d, .dword_to_float),
+        .vcvtps2dq => self.executeVexConvertPacked(d, .float_to_dword_round),
+        .vcvttps2dq => self.executeVexConvertPacked(d, .float_to_dword_truncate),
         .vsqrtps => {
             self.executeVexSqrtPackedF32(d);
         },
@@ -2048,6 +2103,19 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             if (d.vector_256) {
                 const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src] else self.readMem128(d.addr + 16);
                 self.ymm_hi[d.xmm_dst] = shufflePackedDwords(source_high, control);
+            } else {
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            }
+        },
+        .vshufps => {
+            const control: u8 = @truncate(d.imm);
+            const lhs_low = self.xmm[d.xmm_src];
+            const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+            self.xmm[d.xmm_dst] = shufflePackedSingles(lhs_low, rhs_low, control);
+            if (d.vector_256) {
+                const lhs_high = self.ymm_hi[d.xmm_src];
+                const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                self.ymm_hi[d.xmm_dst] = shufflePackedSingles(lhs_high, rhs_high, control);
             } else {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }

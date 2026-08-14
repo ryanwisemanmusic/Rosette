@@ -263,7 +263,17 @@ pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
         .{ .marker = "VdEnableRingBufferRPtrWriteBack", .step = .rptr_writeback, .export_call = true },
         .{ .marker = "RING BUFFER: authentic payload prepared", .step = .ring_payload_prepared },
         .{ .marker = "RING BUFFER: first authentic PM4 packet consumed", .step = .pm4_packet_consumed },
-        .{ .marker = "VdSwap", .step = .swap, .export_call = true },
+        // Current Xenia emits one provenance-bearing milestone after the
+        // command processor has consumed a guest-published batch. This is
+        // stronger evidence than the legacy wording: consumption proves the
+        // payload existed and that its write pointer was published, and
+        // `observeEvidence` closes those preceding transitions without
+        // synthesising any guest action.
+        .{ .marker = "PM4 AUTHENTIC MILESTONE: first guest-published command batch consumed", .step = .pm4_packet_consumed },
+        // This is the first provenance-bearing point that closes the final
+        // bootstrap transition. VdSwap entry and packet encoding are tracked
+        // separately below; neither implies that the guest published it.
+        .{ .marker = "PM4 AUTHENTIC MILESTONE: first guest-published PM4_XE_SWAP consumed", .step = .swap },
     };
     // The write pointer is observed separately because a write to the register
     // is not an advance of it. The guest may store the value it already holds,
@@ -271,6 +281,12 @@ pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
     // bootstrap frontier past a producer that never produced.
     observeRingWritePointer(self, message);
     observeGuestCriticalSection(self, message);
+    if (std.mem.indexOf(u8, message, "VDSWAP PATH: stage=packet_encoded") != null) {
+        self.guest_vdswap_packet_encoded = true;
+    }
+    if (std.mem.indexOf(u8, message, "VDSWAP PATH: stage=completed") != null) {
+        self.guest_vdswap_entry_completed = true;
+    }
     for (steps) |candidate| {
         // The export-verification lines name these symbols without calling
         // them, so a bare occurrence is not evidence. Only the call-trace form
@@ -616,6 +632,16 @@ pub fn observeXeniaPipelineGuestLog(self: anytype, message: []const u8) void {
     if (!observation.first_observation) return;
 
     const spec = @import("diagnostics").xenia_pipeline_contracts.spec(observation.stage);
+    // Structural progress settles every anomaly that came before it: the run
+    // did not merely keep executing, it reached a new stage. Without this the
+    // ledger ends every run at `unclassified=N` and blocks its own signoff.
+    const settled = self.anomalies.notePipelineAdvance(observation.step);
+    if (settled != 0) {
+        machoCapturePrint(
+            "macho-processor: anomaly ledger: {d} anomaly record(s) classified as continued-benign by reaching stage={s} at step={d}; the pipeline advanced past them, so they did not stop it\n",
+            .{ settled, @tagName(observation.stage), observation.step },
+        );
+    }
     machoCapturePrint(
         "macho-processor: Xenia pipeline milestone: stage={s} subsystem={s} step={d} prerequisite_missing={} frontier={s} evidence={s}\n",
         .{

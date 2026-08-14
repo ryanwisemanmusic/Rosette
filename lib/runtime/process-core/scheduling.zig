@@ -380,12 +380,16 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
             }
         }
         self.cached_suspended_runnable = self.refreshSuspendedRunnableCache();
+        // SDL audio is a callback producer, not an import return-value shim.
+        // Keep its deadline check on the existing bounded scheduler cadence
+        // so audio support adds no work to the per-instruction hot path.
+        if (self.sdl.dispatchDueAudioCallback(self, GUEST_THREAD_RETURN_SENTINEL)) return;
     }
     const pending_idle = self.cached_pending_idle;
     const suspended_runnable = self.cached_suspended_runnable;
     const idle_callback_inflight = self.active_idle_source != 0;
     const idle_callback_running = idle_callback_inflight and
-        self.isSyntheticCallbackHandle(self.active_guest_thread);
+        self.isIdleCallbackHandle(self.active_guest_thread);
 
     if (idle_callback_running) {
         self.cooperative_quantum_steps +|= 1;
@@ -486,7 +490,10 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
 
 pub fn finishActiveGuestThread(self: anytype) void {
     if (self.active_guest_thread != 0) {
-        if (self.isSyntheticCallbackHandle(self.active_guest_thread)) {
+        if (self.sdl.finishAudioCallback(self.active_guest_thread)) {
+            self.cooperative_thread_returns +|= 1;
+            self.active_guest_thread = 0;
+        } else if (self.isIdleCallbackHandle(self.active_guest_thread)) {
             const source = self.active_idle_source;
             const callback = self.active_idle_callback;
             const duration = self.executed_steps -| self.active_idle_started_step;
@@ -682,12 +689,16 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
 }
 
 pub fn isSyntheticCallbackHandle(self: anytype, handle: u64) bool {
+    return self.isIdleCallbackHandle(handle) or self.sdl.isAudioCallbackHandle(handle);
+}
+
+pub fn isIdleCallbackHandle(self: anytype, handle: u64) bool {
     _ = self;
     return handle >= IDLE_CALLBACK_HANDLE_BASE and handle < IDLE_CALLBACK_HANDLE_BASE + MAX_IDLE_CALLBACKS + 1024;
 }
 
 pub fn currentCooperativeThreadHandle(self: anytype) u64 {
-    if (self.active_guest_thread == 0 or self.isSyntheticCallbackHandle(self.active_guest_thread)) {
+    if (self.active_guest_thread == 0 or self.isIdleCallbackHandle(self.active_guest_thread)) {
         return self.pthreads.main_thread_handle;
     }
     return self.active_guest_thread;
@@ -700,7 +711,8 @@ pub fn threadNumericId(self: anytype, handle: u64) u64 {
 }
 
 pub fn threadRole(self: anytype, handle: u64, address: u64) []const u8 {
-    if (self.isSyntheticCallbackHandle(handle)) return "ui_callback";
+    if (self.isIdleCallbackHandle(handle)) return "ui_callback";
+    if (self.sdl.isAudioCallbackHandle(handle)) return "sdl_audio";
     if (handle == self.pthreads.main_thread_handle) return "main_ui";
     const symbol = self.metadata.nearestSymbol(address) orelse return "worker";
     if (std.mem.indexOf(u8, symbol.name, "WindowedAppContext") != null or

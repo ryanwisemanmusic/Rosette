@@ -304,6 +304,68 @@ fn addressWidthMask(size: Size) u64 {
     };
 }
 
+/// The call forms a register transition can be attributed to.
+const CallForm = enum { indirect_register, indirect_memory, direct };
+
+fn callBoundary(op_name: []const u8) ?CallForm {
+    if (std.mem.eql(u8, op_name, "call_reg64")) return .indirect_register;
+    if (std.mem.eql(u8, op_name, "call_mem64")) return .indirect_memory;
+    if (std.mem.eql(u8, op_name, "call_rel32")) return .direct;
+    return null;
+}
+
+/// Recover the callee of the call that ended a chain.
+///
+/// For `call reg` the answer needs no decoding: the transition already records
+/// what the register held immediately before the call, and for the target
+/// register that *is* the callee. Every other form has to be decoded, and a
+/// form whose target cannot be recovered reports zero rather than a guess.
+fn calleeOf(self: anytype, form: CallForm, transition: anytype) u64 {
+    switch (form) {
+        .indirect_register => return transition.before,
+        .direct => {
+            const raw = self.guestMemoryConst(transition.instruction_address, 16) orelse return 0;
+            const decoded = decodeInsn(raw);
+            if (decoded.op == .invalid or decoded.len == 0) return 0;
+            return transition.instruction_address +% decoded.len +% decoded.imm;
+        },
+        .indirect_memory => return 0,
+    }
+}
+
+/// What a register means across a call under the System V AMD64 ABI. The three
+/// cases are different findings, and reporting them as one loses the
+/// distinction between "a function returned this" and "a function destroyed
+/// this".
+const CallRole = enum {
+    return_value,
+    clobbered,
+    preserved,
+
+    fn describe(self: CallRole) []const u8 {
+        return switch (self) {
+            .return_value => "this register carries the callee's return value, so the value is what the callee decided to return",
+            .clobbered => "this register is caller-saved, so the callee was free to leave anything in it and the value may be incidental rather than intended",
+            .preserved => "this register is callee-saved, so a change across the call means either the callee restored a value established before it or the frames do not line up; the producer is on the caller's side of the call, before it",
+        };
+    }
+};
+
+fn registerRoleAcrossCall(register: RegId) CallRole {
+    return switch (register) {
+        .al_ax_eax_rax, .dl_dx_edx_rdx => .return_value,
+        .bl_bx_ebx_rbx,
+        .ch_bp_ebp_rbp,
+        .ah_sp_esp_rsp,
+        .r12b_r12w_r12d_r12,
+        .r13b_r13w_r13d_r13,
+        .r14b_r14w_r14d_r14,
+        .r15b_r15w_r15d_r15,
+        => .preserved,
+        else => .clobbered,
+    };
+}
+
 fn dumpRegisterChain(
     self: anytype,
     register: RegId,
@@ -417,6 +479,37 @@ fn dumpRegisterChain(
             if (self.libcxx_streams.modeledStreamObjectForAddress(transition.before)) |streambuf| {
                 modeled_streambuf = streambuf;
             }
+        }
+
+        // A call is where a register chain ends, not a link in it.
+        //
+        // Walking past one produces pure noise: the value a register held
+        // *before* a call has no relationship to the value it holds after, so
+        // every hop beyond this point reports instructions that never
+        // contributed to the faulting value. The observed case was a chain of
+        // twelve hops — `mov eax, <callee>`, then unrelated earlier values of
+        // rax — when the whole answer was "a function returned zero".
+        //
+        // For an indirect call the callee is already in hand: `before` is the
+        // value the target register held at the call, which is the callee.
+        if (callBoundary(op_name)) |form| {
+            const callee = calleeOf(self, form, transition);
+            machoCapturePrint(
+                "macho-processor: near-null causality: {s}_chain TERMINATES AT A CALL register={s} value=0x{x} call_site=0x{x} {s}+0x{x} callee=0x{x} {s} role={s}; {s}. The producer is inside the callee, so this chain cannot name it — the register's value before the call is unrelated to its value after, and every further hop would be an instruction that did not contribute\n",
+                .{
+                    role,
+                    @tagName(register),
+                    transition.after,
+                    transition.instruction_address,
+                    self.metadata.symbolLabel(transition.instruction_address),
+                    if (symbol) |resolved| resolved.offset else 0,
+                    callee,
+                    if (callee != 0) self.metadata.symbolLabel(callee) else "<indirect target not recoverable>",
+                    @tagName(registerRoleAcrossCall(register)),
+                    registerRoleAcrossCall(register).describe(),
+                },
+            );
+            break;
         }
 
         if (allow_direct_producer) {

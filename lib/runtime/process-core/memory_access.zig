@@ -35,6 +35,10 @@ const dispatch_shape = @import("execution_history").dispatch_shape;
 const bounded_scan_mod = @import("execution_history").bounded_scan;
 const scan_limits = bounded_scan_mod.Limits;
 const guest_address_space = @import("guest_address_space");
+// Hardware facts the fault path has to ask before interpreting a protection
+// failure: a no-access page inside the GPU register aperture is the delivery
+// mechanism, not a defect.
+const device_tree = @import("device_tree");
 const dispatch_table = @import("dispatch_table");
 const byte_order = @import("byte_order");
 const dispatch_recovery = @import("dispatch_recovery");
@@ -1441,6 +1445,10 @@ pub const ValueOrigin = struct {
         op: x64_decoder.Op = .invalid,
         from: x64_decoder.RegId = .al_ax_eax_rax,
         to: x64_decoder.RegId = .al_ax_eax_rax,
+        /// Constant added by this hop. Non-zero only for address arithmetic,
+        /// where the followed register carries the value and the displacement
+        /// is the field offset applied to it.
+        displacement: i64 = 0,
     };
 
     pub const Terminal = enum {
@@ -1450,8 +1458,27 @@ pub const ValueOrigin = struct {
         /// Followed to an immediate. The value was materialised in code, so no
         /// store is responsible for it.
         immediate,
-        /// A definition was found but it is neither a load, an immediate, nor a
-        /// move this reader follows — arithmetic, a call result, something else.
+        /// Followed to `xor reg, reg` — the instruction that *made the value
+        /// zero*. For a near-null fault this is the end of the search and not
+        /// a step on the way to it: nothing produced the null, an instruction
+        /// created it, and this names that instruction.
+        zeroed,
+        /// An address form with no register operand: `lea reg, [disp]` or a
+        /// RIP-relative `lea`. The value is a constant the code computed, so
+        /// no register and no store is responsible for it.
+        computed_constant,
+        /// Address arithmetic combining two registers, or scaling one. The
+        /// value has more than one producer, so attributing it to a single
+        /// register would be a guess. Both operands are named instead.
+        address_arithmetic,
+        /// The value was popped off the stack. The producing store is the push
+        /// or the frame write, which is not reconstructible from the
+        /// instruction stream alone — naming the pop is the honest stopping
+        /// point.
+        stack_load,
+        /// A definition was found but it is none of the forms this reader
+        /// follows — a call result, a real arithmetic combination, something
+        /// else.
         opaque_definition,
         /// No definition could be reconstructed at some hop.
         unresolved,
@@ -1466,6 +1493,16 @@ pub const ValueOrigin = struct {
     definition: BoundedDefinition = .{},
     hops: [max_move_chain]Hop = [_]Hop{.{}} ** max_move_chain,
     hop_count: u8 = 0,
+    /// Sum of the constants the followed address arithmetic applied. The
+    /// terminal value plus this is the faulting value, which is what makes a
+    /// chain through `lea` reportable rather than merely followed.
+    total_displacement: i64 = 0,
+    /// The register the chain declined to follow, set only for
+    /// `address_arithmetic`. Naming it turns a dead end into the next thing to
+    /// look at.
+    unfollowed: x64_decoder.RegId = .al_ax_eax_rax,
+    /// Constant value for `computed_constant`.
+    constant: u64 = 0,
 };
 
 /// True when `op` copies one register into another without transforming it, so
@@ -1481,6 +1518,56 @@ fn isRegisterMove(op: x64_decoder.Op) bool {
         => true,
         else => false,
     };
+}
+
+/// `xor reg, reg` against itself. The one arithmetic form whose result needs no
+/// evaluation: it is zero, always, and every JIT emits it to materialise a null.
+fn isSelfZeroing(decoded: DecodedInsn) bool {
+    return switch (decoded.op) {
+        .xor_reg32_reg32, .xor_reg64_reg64 => decoded.src_reg == decoded.dst_reg,
+        else => false,
+    };
+}
+
+/// How a `lea` produces its value.
+///
+/// A `lea` is the *most* transparent definition in the instruction set — its
+/// result is literally `base + index*scale + disp`, every term of which is
+/// named in the encoding — and treating it as opaque ends a search one hop
+/// before the register that actually went wrong. Generated code reaches guest
+/// fields exactly this way: `lea edx, [ebx+0x20]` then a load through `edx`, so
+/// a chain that stops at the `lea` reports the field offset as the origin and
+/// never mentions the pointer.
+const LeaShape = union(enum) {
+    /// Exactly one register contributes at scale 1: the value is that
+    /// register plus a constant, so following it preserves the identity of the
+    /// pointer being computed.
+    single: struct { register: x64_decoder.RegId, displacement: i64 },
+    /// No register contributes; the value is a constant.
+    constant: u64,
+    /// Two registers, or one that is scaled. More than one producer.
+    combined: struct { first: x64_decoder.RegId, second: x64_decoder.RegId },
+};
+
+fn leaShape(decoded: DecodedInsn, instruction_address: u64) LeaShape {
+    const displacement: i64 = @bitCast(decoded.addr);
+    if (decoded.rip_relative) {
+        return .{ .constant = instruction_address +% decoded.len +% decoded.addr };
+    }
+    const scaled_index = decoded.sib_has_index and decoded.sib_scale != 0;
+    if (decoded.sib_has_base and decoded.sib_has_index) {
+        return .{ .combined = .{ .first = decoded.sib_base_reg, .second = decoded.sib_index_reg } };
+    }
+    if (decoded.sib_has_base) {
+        return .{ .single = .{ .register = decoded.sib_base_reg, .displacement = displacement } };
+    }
+    if (decoded.sib_has_index) {
+        if (scaled_index) {
+            return .{ .combined = .{ .first = decoded.sib_index_reg, .second = decoded.sib_index_reg } };
+        }
+        return .{ .single = .{ .register = decoded.sib_index_reg, .displacement = displacement } };
+    }
+    return .{ .constant = decoded.addr };
 }
 
 /// Follow a register back through moves to whatever actually produced its value.
@@ -1509,31 +1596,80 @@ pub fn boundedValueOrigin(
             result.terminal = .immediate;
             return result;
         }
-        if (!isRegisterMove(definition.op)) {
-            result.terminal = .opaque_definition;
-            return result;
-        }
         const decoded = decodeStatic(self, definition.instruction_address) orelse {
             result.terminal = .unresolved;
             return result;
         };
-        // A move whose source is its own destination cannot be followed, and
-        // following it would loop.
-        if (decoded.src_reg == reg) {
+        if (isSelfZeroing(decoded)) {
+            result.terminal = .zeroed;
+            return result;
+        }
+        if (definition.op == .pop_reg) {
+            result.terminal = .stack_load;
+            return result;
+        }
+
+        // Which register the next hop follows, and what constant this hop adds
+        // to it.
+        var next_reg: x64_decoder.RegId = undefined;
+        var hop_displacement: i64 = 0;
+        if (definition.op == .lea_reg_mem) {
+            switch (leaShape(decoded, definition.instruction_address)) {
+                .constant => |value| {
+                    result.terminal = .computed_constant;
+                    result.constant = value;
+                    return result;
+                },
+                .combined => |pair| {
+                    result.terminal = .address_arithmetic;
+                    result.definition.op = definition.op;
+                    result.unfollowed = pair.second;
+                    // Report the first operand as the chain's end rather than
+                    // silently picking one to follow: with two producers, a
+                    // single attribution would be a guess.
+                    result.hops[@min(result.hop_count, result.hops.len - 1)] = .{
+                        .instruction_address = definition.instruction_address,
+                        .op = definition.op,
+                        .from = pair.first,
+                        .to = reg,
+                    };
+                    if (result.hop_count < result.hops.len) result.hop_count += 1;
+                    return result;
+                },
+                .single => |source| {
+                    next_reg = source.register;
+                    hop_displacement = source.displacement;
+                },
+            }
+        } else if (isRegisterMove(definition.op)) {
+            // A move whose source is its own destination cannot be followed,
+            // and following it would loop.
+            if (decoded.src_reg == reg) {
+                result.terminal = .opaque_definition;
+                return result;
+            }
+            next_reg = decoded.src_reg;
+        } else {
             result.terminal = .opaque_definition;
             return result;
         }
+
         if (result.hop_count < result.hops.len) {
             result.hops[result.hop_count] = .{
                 .instruction_address = definition.instruction_address,
                 .op = definition.op,
-                .from = decoded.src_reg,
+                .from = next_reg,
                 .to = reg,
+                .displacement = hop_displacement,
             };
             result.hop_count += 1;
         }
+        result.total_displacement +%= hop_displacement;
+        // The definition search is strictly backwards from the anchor, so a
+        // self-referential address advance (`lea rbx, [rbx+0x20]`) moves the
+        // anchor rather than looping.
         anchor = definition.instruction_address;
-        reg = decoded.src_reg;
+        reg = next_reg;
     }
     result.terminal = .depth_exhausted;
     return result;
@@ -1562,10 +1698,45 @@ fn reportValueOrigin(self: anytype, label: []const u8, origin: ValueOrigin) void
     while (index < origin.hop_count) : (index += 1) {
         const hop = origin.hops[index];
         machoCapturePrint(
-            "  {s} hop[{d}]: 0x{x} {s} {s} <- {s}\n",
-            .{ label, index, hop.instruction_address, @tagName(hop.op), @tagName(hop.to), @tagName(hop.from) },
+            "  {s} hop[{d}]: 0x{x} {s} {s} <- {s} + {d}\n",
+            .{
+                label,
+                index,
+                hop.instruction_address,
+                @tagName(hop.op),
+                @tagName(hop.to),
+                @tagName(hop.from),
+                hop.displacement,
+            },
         );
     }
+
+    switch (origin.terminal) {
+        .zeroed => machoCapturePrint(
+            "macho-processor: {s} origin chain: the value was SET TO ZERO by the instruction at 0x{x} ({s}); the displacement the chain accumulated is {d}, so the faulting address is that offset applied to a register a nearby instruction had just cleared. Nothing loaded a bad pointer here — the null is the code's own constant, and the question is which branch reached a zeroing that the following dereference did not expect\n",
+            .{ label, origin.definition.instruction_address, @tagName(origin.definition.op), origin.total_displacement },
+        ),
+        .computed_constant => machoCapturePrint(
+            "macho-processor: {s} origin chain: the value is the CONSTANT 0x{x}, computed by the address form at 0x{x}. No register carried it and no store produced it, so provenance has nothing to watch; the defect is upstream in whatever selected this address\n",
+            .{ label, origin.constant, origin.definition.instruction_address },
+        ),
+        .address_arithmetic => machoCapturePrint(
+            "macho-processor: {s} origin chain: the value combines TWO registers at 0x{x} ({s}); the unfollowed operand is {s}. Attributing it to one of them would be a guess, so both are named. Re-run the chain against {s} to take the other branch\n",
+            .{
+                label,
+                origin.definition.instruction_address,
+                @tagName(origin.definition.op),
+                @tagName(origin.unfollowed),
+                @tagName(origin.unfollowed),
+            },
+        ),
+        .stack_load => machoCapturePrint(
+            "macho-processor: {s} origin chain: the value was POPPED off the stack at 0x{x}. The producing write is the matching push or frame store, which the instruction stream alone does not name; the stack slot is the thing to watch\n",
+            .{ label, origin.definition.instruction_address },
+        ),
+        else => {},
+    }
+
     if (origin.terminal != .memory_load or origin.definition.source_address == 0) return;
     const seeded = self.provenance_watch.watchPage(origin.definition.source_address, .declared);
 
@@ -1988,6 +2159,58 @@ const near_null_effective_limit: u64 = 0x10000;
 /// Runs only on a confirmed protection fault, which is already a terminal-class
 /// event, and only when the effective address is near-null. A fault at a real
 /// address gets the page diagnostics it always did.
+/// Record a protection fault that landed in the Xenos register aperture.
+///
+/// The aperture's pages are unreadable by design — that is the mechanism, not a
+/// defect — so every register access the guest performs arrives here and
+/// nowhere else. Counting them is what lets the run state positively that the
+/// title did or did not program the GPU, instead of inferring it from a log
+/// line nobody wrote.
+fn observeRegisterApertureAccess(self: anytype, address: u64, access: GuestAccess, delivered: bool) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_register_aperture")) return;
+    // The aperture is a fact in *guest* terms and the fault is in host terms.
+    // The emulator's own discovered mapping base is the only thing that relates
+    // them, so the range is derived from it rather than from a constant — a
+    // hardcoded membase would silently attribute unrelated faults to GPU
+    // registers the first time the mapping moved.
+    const aperture_host = self.xenia_memory_views.virtualHostAddress(
+        device_tree.gpu.xenos.register_aperture_base,
+    ) orelse return;
+    if (address < aperture_host) return;
+    const offset = address - aperture_host;
+    if (offset >= device_tree.gpu.xenos.register_aperture_size) return;
+
+    self.gpu_register_aperture.observe(
+        device_tree.gpu.xenos.register_aperture_base + offset,
+        access == .write,
+        storedValueForFault(self),
+        if (delivered) .delivered else .undelivered,
+        self.regs.rip,
+        self.active_guest_thread,
+        self.executed_steps,
+    );
+}
+
+/// The value a faulting store was trying to write, when the instruction form
+/// makes it recoverable. A register write whose value is unknown says almost
+/// nothing — the ring base register's *value* is the ring address — so this is
+/// worth recovering, and worth reporting as zero rather than guessed when the
+/// form does not carry it.
+fn storedValueForFault(self: anytype) u64 {
+    const decoded = decodeStatic(self, self.regs.rip) orelse return 0;
+    return switch (decoded.op) {
+        .mov_mem8_reg8,
+        .mov_mem16_reg16,
+        .mov_mem32_reg32,
+        .mov_mem64_reg64,
+        .movbe_mem_reg,
+        => self.regVal(decoded.src_reg, decoded.size),
+        .mov_mem8_imm8, .mov_mem16_imm16, .mov_mem32_imm32, .mov_mem64_imm32 => decoded.imm,
+        else => 0,
+    };
+}
+
 fn reportProtectionFaultOperands(self: anytype, address: u64, bytes: u8, access: GuestAccess) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "guest_address_space")) return;
@@ -3198,6 +3421,90 @@ pub fn tryRecoverGeneratedGuestDispatchMiss(self: anytype, context: anytype, ret
     return false;
 }
 
+/// Outcome of the scalar-read recovery cascade.
+///
+/// `satisfied_zero` covers both the recoveries that answer the load as zero and
+/// the terminal case, because the caller does the same thing for both: return
+/// zero. Which of the two happened is recorded in the ledgers and, for the
+/// terminal case, in `terminal_memory_failure`.
+const ScalarReadResolution = union(enum) {
+    resolved: struct { address: u64, storage: ?[]const u8, offset: ?u64 },
+    satisfied_zero,
+};
+
+/// F1 (throughput audit): the scalar-read fault cascade, held out of line.
+///
+/// Reached only when a load's address translates through neither the sparse
+/// mappings nor the contiguous image — that is, essentially never on a healthy
+/// run. Inlined, it made `readMemVal` a 16 KB function of which 81% of the call
+/// sites were diagnostic formatting, and `readMemVal` is the most frequently
+/// executed function in the program. The interpreter's hot closure measured
+/// 189 KB against a 128-192 KB L1I, so this code was evicting the loop that
+/// calls it.
+///
+/// Behaviour is unchanged: same classification, same owners, same order, same
+/// early returns. `noinline` is required rather than advisory — the function
+/// has one call site, so LLVM inlines it straight back otherwise.
+noinline fn recoverScalarReadFault(self: anytype, addr: u64, bytes: u8) ScalarReadResolution {
+    var effective_address = addr;
+    var sparse_storage: ?[]const u8 = null;
+    var sparse_readable = false;
+    var off: ?u64 = null;
+
+    // Decide the owner once, from state no repair has touched yet, and
+    // dispatch to exactly that owner. The previous fall-through chain
+    // re-derived ownership after each attempt, so the endian repair —
+    // which writes the base register — could hand its own fault to the
+    // near-null owners. One classification, one owner, no cascade.
+    const classification = classifyGeneratedScalarFault(self, effective_address, bytes);
+    switch (classification.owner) {
+        .none => {},
+        .endian_swapped_base => {
+            if (tryRecoverGeneratedEndianAddress(self, classification, effective_address, bytes)) |recovered_address| {
+                effective_address = recovered_address;
+                sparse_storage = self.sparse_memory.bytesConst(effective_address, bytes);
+                sparse_readable = sparse_storage != null;
+                off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
+            }
+        },
+        .null_base_dispatch => {
+            // A base register is only null if it is *actually* null. A
+            // 32-bit guest address that arrived byte-reversed as 64 bits
+            // has zero in its low half, so it reads as null through every
+            // 32-bit addressing form while the address it should have
+            // carried is still sitting in the register. Ask that question
+            // before treating the zero as an absence — it is the difference
+            // between a pointer that was never set and a pointer that was
+            // set and not converted.
+            if (tryRepairByteReversedBase(self, classification)) |repaired| {
+                effective_address = repaired;
+                sparse_storage = self.sparse_memory.bytesConst(effective_address, bytes);
+                sparse_readable = sparse_storage != null;
+                off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
+            } else if (tryRedirectBoundedNullDispatch(self, classification.fault)) {
+                return .satisfied_zero;
+            }
+        },
+        .null_base_scalar => {
+            if (tryRepairByteReversedBase(self, classification)) |repaired| {
+                effective_address = repaired;
+                sparse_storage = self.sparse_memory.bytesConst(effective_address, bytes);
+                sparse_readable = sparse_storage != null;
+                off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
+            } else if (tryRecoverGeneratedNullScalarRead(self, classification, bytes)) {
+                return .satisfied_zero;
+            }
+        },
+    }
+    if (!sparse_readable and off == null) {
+        const snapshot = currentInstructionSnapshot(self);
+        const instruction = if (snapshot.operation.len != 0) snapshot.operation else @tagName(if (self.execution_history.latestFor(self.active_guest_thread)) |e| e.op else .invalid);
+        terminateForGuestAccess(self, effective_address, bytes, .read, instruction);
+        return .satisfied_zero;
+    }
+    return .{ .resolved = .{ .address = effective_address, .storage = sparse_storage, .offset = off } };
+}
+
 pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     const State = @TypeOf(self.*);
     const bytes = bytesForSize(size);
@@ -3207,81 +3514,138 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     // followed this ordering; keeping reads symmetric prevents valid mprotect
     // activations from being reported as permission faults.
     var effective_address = addr;
-    var sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
+    // Keep the slice, not just the fact that there was one. The probe is the
+    // expensive half of deciding where this address lives, and the read below
+    // needs exactly what it already found.
+    var sparse_storage = self.sparse_memory.bytesConst(effective_address, bytes);
+    const sparse_readable = sparse_storage != null;
     var off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
     if (!sparse_readable and off == null) {
-        // Decide the owner once, from state no repair has touched yet, and
-        // dispatch to exactly that owner. The previous fall-through chain
-        // re-derived ownership after each attempt, so the endian repair —
-        // which writes the base register — could hand its own fault to the
-        // near-null owners. One classification, one owner, no cascade.
-        const classification = classifyGeneratedScalarFault(self, effective_address, bytes);
-        switch (classification.owner) {
-            .none => {},
-            .endian_swapped_base => {
-                if (tryRecoverGeneratedEndianAddress(self, classification, effective_address, bytes)) |recovered_address| {
-                    effective_address = recovered_address;
-                    sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
-                    off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
-                }
+        switch (recoverScalarReadFault(self, effective_address, bytes)) {
+            .satisfied_zero => return 0,
+            .resolved => |resolved| {
+                effective_address = resolved.address;
+                sparse_storage = resolved.storage;
+                off = resolved.offset;
             },
-            .null_base_dispatch => {
-                // A base register is only null if it is *actually* null. A
-                // 32-bit guest address that arrived byte-reversed as 64 bits
-                // has zero in its low half, so it reads as null through every
-                // 32-bit addressing form while the address it should have
-                // carried is still sitting in the register. Ask that question
-                // before treating the zero as an absence — it is the difference
-                // between a pointer that was never set and a pointer that was
-                // set and not converted.
-                if (tryRepairByteReversedBase(self, classification)) |repaired| {
-                    effective_address = repaired;
-                    sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
-                    off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
-                } else if (tryRedirectBoundedNullDispatch(self, classification.fault)) {
-                    return 0;
-                }
-            },
-            .null_base_scalar => {
-                if (tryRepairByteReversedBase(self, classification)) |repaired| {
-                    effective_address = repaired;
-                    sparse_readable = self.sparse_memory.bytesConst(effective_address, bytes) != null;
-                    off = if (sparse_readable) null else translateGuest(self, effective_address, bytes, .read);
-                } else if (tryRecoverGeneratedNullScalarRead(self, classification, bytes)) {
-                    return 0;
-                }
-            },
-        }
-        if (!sparse_readable and off == null) {
-            const snapshot = currentInstructionSnapshot(self);
-            const instruction = if (snapshot.operation.len != 0) snapshot.operation else @tagName(if (self.execution_history.latestFor(self.active_guest_thread)) |e| e.op else .invalid);
-            terminateForGuestAccess(self, effective_address, bytes, .read, instruction);
-            return 0;
         }
     }
-    const ctx: *anyopaque = @ptrCast(self);
-    return memReadMemVal(&ms(self), effective_address, size, off, .{
-        .ctx = ctx,
-        .recoverVtable = struct {
-            fn recover(c: *anyopaque, a: u64, suspect: u64) ?u64 {
-                const st: *State = @ptrCast(@alignCast(c));
-                return recoverLiveAllocationVtable(st, a, suspect);
+    // The read itself, written out rather than dispatched through the memory
+    // manager's callback form.
+    //
+    // That form cost three things on every single load, all of them invisible
+    // at the call site: it re-probed the sparse mapping this function had
+    // already probed above; it reached both observers through function
+    // pointers, so their fast rejections happened *after* an indirect call and
+    // a pair of pointer casts; and it asked the vtable observer about every
+    // 64-bit value, including the overwhelming majority that its own first
+    // line immediately rejects. A load is the most frequent thing a guest
+    // does, so each of those is multiplied by everything.
+    //
+    // Both observers are still called, under exactly the conditions their own
+    // bodies test first — the conditions are simply asked here, where they
+    // cost a compare instead of a call.
+    _ = State;
+    if (sparse_storage) |storage| {
+        var value = readSized(storage, size);
+        if (size == .bits64 and vtableRecoveryWanted(self, value)) {
+            if (recoverLiveAllocationVtable(self, effective_address, value)) |recovered| {
+                if (self.sparse_memory.bytes(effective_address, @sizeOf(u64), true)) |mutable| {
+                    std.mem.writeInt(u64, mutable[0..8], recovered, .little);
+                    value = recovered;
+                }
             }
-        }.recover,
-        .recordAccess = struct {
-            fn record(c: *anyopaque, a: u64, bytes_count: u8, v: u64) void {
-                const st: *State = @ptrCast(@alignCast(c));
-                const sz: Size = switch (bytes_count) {
-                    1 => .bits8,
-                    2 => .bits16,
-                    4 => .bits32,
-                    8 => .bits64,
-                    else => .bits64,
-                };
-                recordMemoryAccess(st, a, sz, "read", v);
-            }
-        }.record,
-    });
+        }
+        if (memoryTraceWanted(self)) recordMemoryAccess(self, effective_address, size, "read", value);
+        return value;
+    }
+
+    const offset = off orelse return 0;
+    if (offset + bytes > self.mem.len) return 0;
+    var value = readSized(self.mem[@intCast(offset)..], size);
+    if (size == .bits64 and vtableRecoveryWanted(self, value)) {
+        if (recoverLiveAllocationVtable(self, effective_address, value)) |recovered| {
+            std.mem.writeInt(u64, self.mem[@intCast(offset)..][0..8], recovered, .little);
+            value = recovered;
+        }
+    }
+    if (memoryTraceWanted(self)) recordMemoryAccess(self, effective_address, size, "read", value);
+    return value;
+}
+
+fn readSized(storage: []const u8, size: Size) u64 {
+    return switch (size) {
+        .bits8 => storage[0],
+        .bits16 => std.mem.readInt(u16, storage[0..2], .little),
+        .bits32 => std.mem.readInt(u32, storage[0..4], .little),
+        .bits64 => std.mem.readInt(u64, storage[0..8], .little),
+    };
+}
+
+/// Whether the vtable observer can possibly do anything for this value.
+///
+/// Mirrors the first line of `recoverLiveAllocationVtable`. Asking it here
+/// turns the common 64-bit load — a pointer, a count, anything at or above
+/// 0x1000 — from "indirect call that returns null" into one compare.
+inline fn vtableRecoveryWanted(self: anytype, value: u64) bool {
+    return value < 0x1000 or self.vtable_tracker.policy.repair_nonzero_corruption;
+}
+
+/// Whether the memory-access ring can possibly want this access.
+///
+/// Mirrors the outer gate of `recordMemoryAccess`: the flag forces recording
+/// everywhere, and otherwise only generated code is recorded. The budget check
+/// deliberately stays inside, because taking from it is a state change and must
+/// happen once, at the point that actually records.
+inline fn memoryTraceWanted(self: anytype) bool {
+    if (self.memory_trace_enabled) return true;
+    return self.regs.rip < self.executable_min or self.regs.rip >= self.executable_max;
+}
+
+/// How far back a vptr slot may sit from the start of its object before this
+/// runtime stops trying to attribute it.
+///
+/// A secondary base's vptr lies at the offset of that base subobject, which for
+/// the shapes that occur in practice is within the first few pointers of the
+/// object. The bound exists because the alternative — asking which allocation
+/// contains an arbitrary interior address — is a linear scan over every live
+/// allocation, and putting that on a path taken by ordinary guest writes costs
+/// more as the run gets longer. A class whose secondary base sits beyond this
+/// is simply not tracked, which is the behaviour that already existed.
+const max_subobject_probe_slots: usize = 8;
+
+/// The base of the live allocation owning `address`, in bounded time.
+///
+/// `memory_forwarder.allocationSize` answers in O(1) but only at an exact base,
+/// and `containingAllocation` answers for interior addresses by scanning every
+/// live allocation. Neither is usable here on its own: the first cannot see a
+/// secondary vptr, and the second turned a per-write check into work
+/// proportional to the heap and cost roughly an order of magnitude of
+/// throughput, degrading as the run allocated more.
+///
+/// Walking back pointer-by-pointer is O(1) hash lookups with a stated bound.
+/// The first base found going backwards is the only candidate: anything before
+/// it belongs to a different block, so a base that does not cover `address`
+/// means `address` is not in a tracked allocation rather than "keep looking".
+fn owningAllocationBase(self: anytype, address: u64) ?struct { base: u64, size: u64 } {
+    // The overwhelming majority of tracked slots: a primary vptr at the
+    // object's own base. One hash lookup, which is exactly what this cost
+    // before secondary bases were tracked at all.
+    if (self.memory_forwarder.allocationSize(address)) |size| {
+        return .{ .base = address, .size = size };
+    }
+    // Two comparisons reject everything that is not heap. An image pointer
+    // stored into a global, a static or a stack slot never reaches the probe.
+    if (!self.memory_forwarder.withinArena(address)) return null;
+
+    var probe = address;
+    var steps: usize = 0;
+    while (steps < max_subobject_probe_slots and probe >= 8) : (steps += 1) {
+        probe -= 8;
+        const size = self.memory_forwarder.allocationSize(probe) orelse continue;
+        return if (address - probe < size) .{ .base = probe, .size = size } else null;
+    }
+    return null;
 }
 
 pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u64) ?u64 {
@@ -3296,13 +3660,28 @@ pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u
     if (!has_heap_history and !has_modeled_history) return null;
 
     const exact_live_base = has_heap_history and self.memory_forwarder.allocationSize(address) != null;
+    // A secondary base's vptr sits at a non-zero offset inside the object, so
+    // "is this the allocation base" is the wrong liveness question for it —
+    // asking it left every multiple-inheritance object with its primary vptr
+    // repaired and its secondary still cleared. What authorises the repair is
+    // the tracked record at this exact address; liveness only has to establish
+    // that the storage is still the same object, which is what the owner check
+    // below adds. Without it, an allocation that was freed and handed to a
+    // different class could have the previous occupant's vtable written into
+    // what is now an ordinary data member — silently, and with no fault
+    // anywhere to report it. That would be worse than the null being repaired.
+    const within_live_allocation = has_heap_history and blk: {
+        const live = owningAllocationBase(self, address) orelse break :blk false;
+        const record = self.vtable_tracker.lookupRecord(address) orelse break :blk false;
+        break :blk record.owner_base == 0 or record.owner_base == live.base;
+    };
 
     // Phase 1: low-read recovery (value < 0x1000, e.g. cleared to 0 or small sentinel)
     if (has_heap_history) {
         if (self.vtable_tracker.assessLowRead(
             address,
             current_value,
-            exact_live_base,
+            within_live_allocation,
         )) |recovery| {
             return logAndReturnRecovery(self, address, recovery, current_value);
         }
@@ -3335,49 +3714,59 @@ pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u
     // Only low-value reads are repaired; non-zero corruption recovery
     // for modeled objects is intentionally not supported to avoid false
     // positives from objects that legitimately change their vptr.
-    if (has_modeled_history) {
-        if (self.vtable_stack_registry.assessLowRead(address, current_value)) |recovery| {
-            if (!self.vtable_stack_registry.noteRecovery(address, recovery.generation)) return null;
-            const recovered = recovery.value;
-            const kind = "stack-modeled low-read";
-            const symbol = self.metadata.nearestSymbol(recovered);
-            const prior = recovery.prior_recoveries;
-            machoCapturePrint(
-                "macho-processor: trusted vtable {s} recovery: object=0x{x} generation={d} allocation_size=0 observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
-                .{
-                    kind,
-                    address,
-                    recovery.generation,
-                    current_value,
-                    recovered,
-                    self.metadata.symbolLabel(recovered),
-                    if (symbol) |s| s.offset else 0,
-                    recovery.established_by.writer_rip,
-                    recovery.established_by.writer_step,
-                    recovery.last_write.writer_rip,
-                    recovery.last_write.writer_step,
-                    prior,
-                    self.active_guest_thread,
-                },
-            );
-            return recovered;
-        }
-    }
+    if (has_modeled_history) return recoverModeledStackVtable(self, address, current_value);
 
     return null;
 }
 
-fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recovery, observed: u64) ?u64 {
-    const symbol = self.metadata.nearestSymbol(recovery.value) orelse return null;
-    if (!self.vtable_tracker.noteRecovery(address, recovery.generation)) return null;
-    const kind = if (observed < 0x1000) "low-read" else "corruption";
+/// Phase 3 reporting, held out of line (F1). Reached only for an address the
+/// synthetic C++ object model itself wrote a vptr to.
+noinline fn recoverModeledStackVtable(self: anytype, address: u64, current_value: u64) ?u64 {
+    const recovery = self.vtable_stack_registry.assessLowRead(address, current_value) orelse return null;
+    if (!self.vtable_stack_registry.noteRecovery(address, recovery.generation)) return null;
+    const recovered = recovery.value;
+    const kind = "stack-modeled low-read";
+    const symbol = self.metadata.nearestSymbol(recovered);
+    const prior = recovery.prior_recoveries;
     machoCapturePrint(
-        "macho-processor: trusted vtable {s} recovery: object=0x{x} generation={d} allocation_size={d} observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
+        "macho-processor: trusted vtable {s} recovery: object=0x{x} generation={d} allocation_size=0 observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
         .{
             kind,
             address,
             recovery.generation,
-            self.memory_forwarder.allocationSize(address) orelse 0,
+            current_value,
+            recovered,
+            self.metadata.symbolLabel(recovered),
+            if (symbol) |s| s.offset else 0,
+            recovery.established_by.writer_rip,
+            recovery.established_by.writer_step,
+            recovery.last_write.writer_rip,
+            recovery.last_write.writer_step,
+            prior,
+            self.active_guest_thread,
+        },
+    );
+    return recovered;
+}
+
+noinline fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recovery, observed: u64) ?u64 {
+    const symbol = self.metadata.nearestSymbol(recovery.value) orelse return null;
+    if (!self.vtable_tracker.noteRecovery(address, recovery.generation)) return null;
+    const kind = if (observed < 0x1000) "low-read" else "corruption";
+    // Which subobject this vptr belongs to. A repair at a non-zero offset is a
+    // secondary base's vptr, and reading the log without that offset makes two
+    // repairs on one object look like two unrelated objects.
+    const allocation = owningAllocationBase(self, address);
+    const object_base = if (allocation) |live| live.base else address;
+    machoCapturePrint(
+        "macho-processor: trusted vtable {s} recovery: object=0x{x} subobject_offset={d} slot={s} generation={d} allocation_size={d} observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
+        .{
+            kind,
+            address,
+            address -% object_base,
+            if (address == object_base) "primary" else "secondary_base",
+            recovery.generation,
+            self.memory_forwarder.allocationSize(object_base) orelse 0,
             observed,
             recovery.value,
             symbol.name,
@@ -3395,7 +3784,7 @@ fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recovery, obse
 
 pub fn logLiveVtableGuardSummary(self: anytype) void {
     machoCapturePrint(
-        "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} guard_tracked={d} memory_writes={d} range_mutations={d} truncated_range_mutations={d}; recovery requires a live allocation base and strict mapped Itanium ZTV evidence\n",
+        "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} guard_tracked={d} memory_writes={d} range_mutations={d} truncated_range_mutations={d}; recovery requires a tracked vptr slot inside a live allocation and strict mapped Itanium ZTV evidence — the slot may be a secondary base's vptr at a non-zero offset, not only the object's primary\n",
         .{
             self.vtable_tracker.live_vtable_guard_checks,
             self.vtable_tracker.live_vtable_guard_recoveries,
@@ -3466,9 +3855,21 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
     )) return;
 
     // Destination ownership is cheaper and more selective than symbol/section
-    // classification. Prove this is an exact live allocation base before
-    // asking metadata to identify an image pointer as an Itanium vtable.
-    _ = self.memory_forwarder.allocationSize(addr) orelse return;
+    // classification. Prove this write lands in a live allocation before asking
+    // metadata to identify an image pointer as an Itanium vtable.
+    //
+    // Deliberately the *containing* allocation and not the exact base: a class
+    // with multiple inheritance writes a vptr per non-primary base at non-zero
+    // offsets inside the object, and requiring offset zero dropped every one of
+    // them here — before evidence was even built. The read side then had
+    // nothing to recover from, so a cleared secondary vptr stayed null and the
+    // first virtual call through that base dispatched through it.
+    //
+    // The cost is unchanged in the common case: `shouldObserveVtableWrite`
+    // above has already rejected everything whose value is not an image
+    // pointer, so this lookup is only reached by the rare write that plausibly
+    // stores a vtable.
+    const owner = owningAllocationBase(self, addr) orelse return;
     const evidence = vtableIdentityEvidence(self, val);
     if (!self.write_diagnostics_armed and !evidence.isTrusted(self.vtable_tracker.policy)) return;
     const result = self.vtable_tracker.observeWrite(
@@ -3478,6 +3879,7 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
             .writer_rip = self.regs.rip,
             .writer_step = self.executed_steps,
             .writer_thread = self.active_guest_thread,
+            .owner_base = owner.base,
         },
     );
     const transition_count = self.vtable_tracker.trusted_transitions;
@@ -3740,11 +4142,80 @@ pub fn timerQueueWatchWrite(self: anytype, addr: u64, size: Size, val: u64) void
     );
 }
 
+/// Whether the GPU ring watch has been armed at all. Two loads and a compare,
+/// asked before the call rather than as its first statement.
+inline fn ringBufferWatchActive(self: anytype) bool {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_ring_watch_base")) return false;
+    return self.gpu_ring_watch_base != 0 and self.gpu_ring_watch_size != 0;
+}
+
+/// Whether a store can possibly be a vtable establishment. Mirrors the first
+/// two lines of `recordAllocationWrite`: only an aligned 64-bit store above the
+/// null page can be one, which excludes every byte the JIT emits.
+inline fn allocationWriteWanted(addr: u64, size: Size) bool {
+    return size == .bits64 and addr >= 0x1000 and (addr & 7) == 0;
+}
+
+/// Whether a store could possibly be the heap-corruption pattern the write
+/// diagnostics look for: an aligned 64-bit store of a value inside the host
+/// image's executable range.
+///
+/// Note the two former copies of this test disagreed on their lower bound —
+/// the sparse arm used `MIN_PLAUSIBLE_CODE_POINTER`, the linear arm the literal
+/// `0x100000`. They are the same number; the constant now names it once, so a
+/// future change to it cannot move only one of the two arms.
+inline fn suspiciousCodePointerWriteWanted(self: anytype, size: Size, val: u64) bool {
+    return self.write_diagnostics_armed and size == .bits64 and
+        val >= MIN_PLAUSIBLE_CODE_POINTER and
+        val >= self.executable_min and val < self.executable_max;
+}
+
+/// Report a 64-bit store of a function-prologue address into heap or mapped
+/// data — the tree-node structural corruption pattern.
+///
+/// Held out of line (F1): reached only under `ROSETTE_MACHO_WRITE_DIAGNOSTICS`,
+/// and both former copies were inlined into `writeMemVal`, which every guest
+/// store calls.
+noinline fn reportSuspiciousCodePointerWrite(self: anytype, addr: u64, val: u64, route: []const u8) void {
+    if (self.memory_forwarder.allocationSize(addr) == null and !isAddressInMappedMemory(self, addr)) return;
+    if (!detectFunctionProloguePtr(val)) return;
+    self.vtable_tracker.heap_corruption_detections +|= 1;
+    const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
+    machoCapturePrint(
+        "macho-processor: suspicious allocation write ({s}): addr=0x{x} value=0x{x} (function prologue) writer=0x{x} {s}+0x{x} step={d}\n",
+        .{
+            route,
+            addr,
+            val,
+            self.regs.rip,
+            self.metadata.symbolLabel(self.regs.rip),
+            if (writer_symbol) |s| s.offset else 0,
+            self.executed_steps,
+        },
+    );
+}
+
+/// A store whose address translates through neither the sparse mappings nor
+/// the contiguous image. Terminal unless it is an initializer dependency the
+/// runtime can defer. Held out of line for the same reason as the read side.
+noinline fn reportScalarWriteFault(self: anytype, addr: u64, size: Size, bytes: u8) void {
+    if (deferInitializerRuntimeDependency(self, addr, size)) return;
+    const snapshot = currentInstructionSnapshot(self);
+    const instruction = if (snapshot.operation.len != 0) snapshot.operation else @tagName(if (self.execution_history.latestFor(self.active_guest_thread)) |e| e.op else .invalid);
+    terminateForGuestAccess(self, addr, bytes, .write, instruction);
+}
+
 pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
-    noteRingBufferWrite(self, addr, size, val);
+    // Each of these observers begins by testing state the store already has in
+    // hand, and every one of those tests used to happen on the far side of a
+    // call. A store is the other most frequent thing a guest does — the JIT
+    // code generator writes every byte it emits — so the gates are asked here,
+    // where an uninterested observer costs a compare instead of a call frame.
+    if (ringBufferWatchActive(self)) noteRingBufferWrite(self, addr, size, val);
     const bytes = bytesForSize(size);
     if (self.sparse_memory.bytes(addr, bytes, true)) |storage| {
-        recordMemoryAccess(self, addr, size, "write", val);
+        if (memoryTraceWanted(self)) recordMemoryAccess(self, addr, size, "write", val);
         noteGuestWrite(self, addr, bytes);
         if (size == .bits64 and (addr & 7) == 0) {
             const provenance = provenanceWanted(self, addr);
@@ -3775,7 +4246,7 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
             commitMemoryMutation(self, mutation, .partial_scalar);
             if (pointer_provenance) recordGuestCodePointerWrite(self, addr, pointer_previous, val);
         }
-        recordAllocationWrite(self, addr, size, val);
+        if (allocationWriteWanted(addr, size)) recordAllocationWrite(self, addr, size, val);
         // Suspicious write: 64-bit value pointing into executable (code) segment
         // written to any heap/data memory — tree node structural corruption pattern.
         // Values below 0x100000 are not plausible code pointers (e.g. MicroProfile token IDs).
@@ -3783,36 +4254,17 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
         // code_address writes are legitimate initialization (Export struct
         // function pointer storage, hash table bucket counts, CommandVar
         // default value pointers).
-        if (self.write_diagnostics_armed and size == .bits64 and val >= MIN_PLAUSIBLE_CODE_POINTER and val >= self.executable_min and val < self.executable_max) {
-            if (self.memory_forwarder.allocationSize(addr) != null or isAddressInMappedMemory(self, addr)) {
-                if (detectFunctionProloguePtr(val)) {
-                    self.vtable_tracker.heap_corruption_detections +|= 1;
-                    const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
-                    machoCapturePrint(
-                        "macho-processor: suspicious allocation write (writeMemVal sparse): addr=0x{x} value=0x{x} (function prologue) writer=0x{x} {s}+0x{x} step={d}\n",
-                        .{
-                            addr,
-                            val,
-                            self.regs.rip,
-                            self.metadata.symbolLabel(self.regs.rip),
-                            if (writer_symbol) |s| s.offset else 0,
-                            self.executed_steps,
-                        },
-                    );
-                }
-            }
+        if (suspiciousCodePointerWriteWanted(self, size, val)) {
+            reportSuspiciousCodePointerWrite(self, addr, val, "writeMemVal sparse");
         }
-        timerQueueWatchWrite(self, addr, size, val);
+        if (self.timer_queue_watch.active) timerQueueWatchWrite(self, addr, size, val);
         return;
     }
     const off = translateGuest(self, addr, bytes, .write) orelse {
-        if (deferInitializerRuntimeDependency(self, addr, size)) return;
-        const snapshot = currentInstructionSnapshot(self);
-        const instruction = if (snapshot.operation.len != 0) snapshot.operation else @tagName(if (self.execution_history.latestFor(self.active_guest_thread)) |e| e.op else .invalid);
-        terminateForGuestAccess(self, addr, bytes, .write, instruction);
+        reportScalarWriteFault(self, addr, size, bytes);
         return;
     };
-    recordMemoryAccess(self, addr, size, "write", val);
+    if (memoryTraceWanted(self)) recordMemoryAccess(self, addr, size, "write", val);
     self.initializer_memory.capture(self.mem, @intCast(off), bytes);
     noteGuestWrite(self, addr, bytes);
     if (size == .bits64 and (addr & 7) == 0) {
@@ -3844,7 +4296,7 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
         commitMemoryMutation(self, mutation, .partial_scalar);
         if (pointer_provenance) recordGuestCodePointerWrite(self, addr, pointer_previous, val);
     }
-    recordAllocationWrite(self, addr, size, val);
+    if (allocationWriteWanted(addr, size)) recordAllocationWrite(self, addr, size, val);
     // Suspicious write: 64-bit value pointing into executable (code) segment
     // written to any heap/data memory — tree node structural corruption pattern.
     // Values below 0x100000 are not plausible code pointers (e.g. MicroProfile token IDs).
@@ -3852,26 +4304,10 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
     // code_address writes are legitimate initialization (Export struct
     // function pointer storage, hash table bucket counts, CommandVar
     // default value pointers).
-    if (self.write_diagnostics_armed and size == .bits64 and val >= 0x100000 and val >= self.executable_min and val < self.executable_max) {
-        if (self.memory_forwarder.allocationSize(addr) != null or isAddressInMappedMemory(self, addr)) {
-            if (detectFunctionProloguePtr(val)) {
-                self.vtable_tracker.heap_corruption_detections +|= 1;
-                const writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
-                machoCapturePrint(
-                    "macho-processor: suspicious allocation write (writeMemVal reg): addr=0x{x} value=0x{x} (function prologue) writer=0x{x} {s}+0x{x} step={d}\n",
-                    .{
-                        addr,
-                        val,
-                        self.regs.rip,
-                        self.metadata.symbolLabel(self.regs.rip),
-                        if (writer_symbol) |s| s.offset else 0,
-                        self.executed_steps,
-                    },
-                );
-            }
-        }
+    if (suspiciousCodePointerWriteWanted(self, size, val)) {
+        reportSuspiciousCodePointerWrite(self, addr, val, "writeMemVal reg");
     }
-    timerQueueWatchWrite(self, addr, size, val);
+    if (self.timer_queue_watch.active) timerQueueWatchWrite(self, addr, size, val);
 }
 
 /// Should this store be recorded in write provenance?
@@ -4179,7 +4615,15 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
         // and has a handler. Only the evidence was missing.
         reportProtectionFaultOperands(self, address, bytes, access);
         const instruction_len = currentGuestInstructionLength(self);
-        if (self.deliverGuestSignal(GUEST_SIGSEGV, self.regs.rip, instruction_len, address, access, bytes, instruction)) {
+        const delivered = self.deliverGuestSignal(GUEST_SIGSEGV, self.regs.rip, instruction_len, address, access, bytes, instruction);
+        // A fault inside the GPU register aperture is not a fault: it is how a
+        // register write is delivered. Record it before deciding anything else,
+        // because whether these arrive is the difference between "the title
+        // never programmed the GPU" and "the title programmed it and Rosette
+        // dropped the writes" — two opposite findings that otherwise both
+        // present as an absence of log lines.
+        observeRegisterApertureAccess(self, address, access, delivered);
+        if (delivered) {
             machoCapturePrint(
                 "macho-processor: mapped guest protection fault routed to SIGSEGV handler: rip=0x{x} address=0x{x} bytes={d} access={s} instruction={s}\n",
                 .{ self.regs.rip, address, bytes, @tagName(access), instruction },
@@ -4609,8 +5053,12 @@ pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
     const touches_image_code =
         self.executable_min != std.math.maxInt(u64) and
         address < self.executable_max and end > self.executable_min;
-    const touches_sparse_code = self.sparse_memory.isExecutable(address, count);
-    if (!touches_image_code and !touches_sparse_code) return;
+    // Short-circuit rather than computing both. The sparse probe is the
+    // expensive half, and a write that already touches image code has its
+    // answer; `and`/`or` in Zig are short-circuiting but two `const` bindings
+    // are not, so this was paying for the probe on every store that hit the
+    // cheap case.
+    if (!touches_image_code and !self.sparse_memory.isExecutable(address, count)) return;
 
     self.code_generation +%= 1;
     if (self.code_generation == 0) self.code_generation = 1;

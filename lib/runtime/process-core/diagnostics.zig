@@ -60,6 +60,110 @@ fn logGuestWindowContract(self: anytype) void {
     );
 }
 
+/// Per-heartbeat throughput and acceleration telemetry, reported as deltas.
+///
+/// The counters below already existed; they were reachable only from
+/// `logDecodeCacheSummary` and `logPerformanceAccelerationSummary`, both of
+/// which run on the exit path. A run killed by the harness timeout never
+/// reaches that path, so the runs whose throughput is actually in question were
+/// precisely the runs that produced no throughput telemetry at all.
+///
+/// Deltas rather than totals, for the reason recorded on `PerformanceSample`:
+/// a cumulative rate averages the fast image-load prefix with the slow steady
+/// state and hides the transition between them, which is the thing worth
+/// seeing.
+///
+/// Cost: one clock read and ~10 loads per HEARTBEAT_INTERVAL (25M) steps. That
+/// is 4e-8 of a step's budget — this measures the hot path without joining it.
+pub fn logPerformanceHeartbeat(self: anytype) void {
+    const startup_observer = @import("diagnostics").startup_observer;
+    const now = startup_observer.monotonicNanoseconds();
+    const previous = self.performance_sample;
+
+    self.performance_sample = .{
+        .step = self.executed_steps,
+        .wall_ns = now,
+        .decode_cache_hits = self.decode_cache_hits,
+        .decode_cache_misses = self.decode_cache_misses,
+        .decode_cache_stale_rejections = self.decode_cache_stale_rejections,
+        .code_generation = self.code_generation,
+        .import_route_cache_hits = self.import_route_cache_hits,
+        .import_route_cache_misses = self.import_route_cache_misses,
+        .import_route_cache_slow_hits = self.import_route_cache_slow_hits,
+        .import_route_cache_fallbacks = self.import_route_cache_fallbacks,
+        .cleo_dispatch_hits = self.cleo_dispatch_hits,
+    };
+    self.performance_sample.primed = true;
+    if (!previous.primed) return;
+
+    const step_delta = self.executed_steps -| previous.step;
+    const interval_ns = now -| previous.wall_ns;
+    const steps_per_second = stepsPerSecond(step_delta, interval_ns);
+
+    const decode_hits = self.decode_cache_hits -| previous.decode_cache_hits;
+    const decode_misses = self.decode_cache_misses -| previous.decode_cache_misses;
+    const decode_stale = self.decode_cache_stale_rejections -| previous.decode_cache_stale_rejections;
+    const decode_total = decode_hits + decode_misses;
+    const decode_hit_rate = percentage(decode_hits, decode_total);
+
+    // A decode that reached the byte-comparison path is a hit whose fast path
+    // was refused. It is charged here rather than folded into the hit rate,
+    // because the generation-keyed fast path and the memcmp fallback differ by
+    // roughly an order of magnitude in cost, and a run where every hit takes
+    // the slow path reports a 100% hit rate while running at fallback speed.
+    const generation_delta = self.code_generation -| previous.code_generation;
+
+    const import_hits = self.import_route_cache_hits -| previous.import_route_cache_hits;
+    const import_misses = self.import_route_cache_misses -| previous.import_route_cache_misses;
+    const import_slow_hits = self.import_route_cache_slow_hits -| previous.import_route_cache_slow_hits;
+    const import_fallbacks = self.import_route_cache_fallbacks -| previous.import_route_cache_fallbacks;
+    const import_effective = import_hits -| import_slow_hits;
+    const import_attempts = import_hits + import_misses + import_fallbacks;
+
+    const cleo_hits = self.cleo_dispatch_hits -| previous.cleo_dispatch_hits;
+
+    machoCapturePrint(
+        "macho-processor: perf heartbeat: step={d} interval(steps/ms)={d}/{d} {d}steps/s" ++
+            " decode(hits/misses/stale)={d}/{d}/{d} hit_rate={d}% code_generation_bumps={d}" ++
+            " import(effective/slow/miss/fallback)={d}/{d}/{d}/{d} of {d} cleo_hits={d}\n",
+        .{
+            self.executed_steps,
+            step_delta,
+            interval_ns / std.time.ns_per_ms,
+            steps_per_second,
+            decode_hits,
+            decode_misses,
+            decode_stale,
+            decode_hit_rate,
+            generation_delta,
+            import_effective,
+            import_slow_hits,
+            import_misses,
+            import_fallbacks,
+            import_attempts,
+            cleo_hits,
+        },
+    );
+}
+
+fn stepsPerSecond(step_delta: u64, interval_ns: u64) u64 {
+    if (interval_ns == 0) return 0;
+    const scaled = @as(u128, step_delta) * std.time.ns_per_s;
+    return @intCast(@min(scaled / interval_ns, std.math.maxInt(u64)));
+}
+
+fn percentage(part: u64, whole: u64) u64 {
+    if (whole == 0) return 0;
+    return part * 100 / whole;
+}
+
+test "performance heartbeat rate arithmetic" {
+    try std.testing.expectEqual(@as(u64, 6_140_000), stepsPerSecond(6_140_000, std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u64, 0), stepsPerSecond(25_000_000, 0));
+    try std.testing.expectEqual(@as(u64, 99), percentage(99, 100));
+    try std.testing.expectEqual(@as(u64, 0), percentage(1, 0));
+}
+
 pub fn logDecodeCacheSummary(self: anytype) void {
     const total = self.decode_cache_hits + self.decode_cache_misses;
     const hit_percent = if (total == 0) 0 else self.decode_cache_hits * 100 / total;
