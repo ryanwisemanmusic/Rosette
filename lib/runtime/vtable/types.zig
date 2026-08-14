@@ -30,10 +30,31 @@ pub const Policy = struct {
     repair_nonzero_corruption: bool = false,
 };
 
+/// How many pointer slots past an object's base may hold a tracked vptr.
+///
+/// One number, used by both sides on purpose. The write side probes backwards
+/// this far to find the object a secondary base's vptr belongs to, and free
+/// retires forwards this far to take those slots with it. If the two ever
+/// disagreed, a slot could be tracked and never retired — a stale vtable
+/// waiting for the storage to be handed to something else.
+///
+/// It is a bound rather than a search because the alternative on either side is
+/// work proportional to the heap, on a path taken by ordinary guest writes.
+pub const max_subobject_slots: usize = 8;
+
 pub const Provenance = struct {
     writer_rip: u64 = 0,
     writer_step: u64 = 0,
     writer_thread: u64 = 0,
+    /// Base of the allocation the written slot belongs to.
+    ///
+    /// A class with multiple inheritance keeps one vptr per non-primary base at
+    /// a non-zero offset inside the object, so a tracked slot is not always the
+    /// allocation base. Recording which object a slot belongs to is what makes
+    /// two things possible: retiring every slot of an allocation when it is
+    /// freed, and refusing to restore a vptr into storage that has since been
+    /// handed to a different object.
+    owner_base: u64 = 0,
 };
 
 pub const IdentityRejection = enum {
@@ -98,6 +119,9 @@ pub const AllocationRecord = struct {
     valid_transitions: u64 = 0,
     low_clears_observed: u64 = 0,
     recoveries: u64 = 0,
+    /// The object this slot belongs to. Equal to the slot address for a
+    /// primary vptr and lower for every secondary base's.
+    owner_base: u64 = 0,
 };
 
 pub const WriteDisposition = enum {

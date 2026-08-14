@@ -100,6 +100,7 @@ pub const VtableTracker = struct {
             record.trusted_vptr = evidence.value;
             record.trusted_symbol_offset = evidence.symbol_offset;
             record.established_by = provenance;
+            if (provenance.owner_base != 0) record.owner_base = provenance.owner_base;
             record.valid_transitions +|= 1;
             self.trusted_transitions +|= 1;
             return .{
@@ -119,6 +120,7 @@ pub const VtableTracker = struct {
             .established_by = provenance,
             .last_write = provenance,
             .last_observed_value = evidence.value,
+            .owner_base = if (provenance.owner_base != 0) provenance.owner_base else address,
         }) catch return .{ .disposition = .ignored_non_vtable };
         self.trusted_establishments +|= 1;
         return .{
@@ -128,18 +130,31 @@ pub const VtableTracker = struct {
         };
     }
 
-    /// Return a recovery proposal only for a low read at the exact base of a
-    /// still-live allocation.  The caller owns the actual memory write and
+    /// Return a recovery proposal for a low read at a tracked vptr slot inside
+    /// a still-live allocation.  The caller owns the actual memory write and
     /// must call noteRecovery only after that write succeeds.
+    ///
+    /// `within_live_allocation` deliberately does *not* mean "the exact
+    /// allocation base". A class with multiple inheritance carries one vptr per
+    /// non-primary base, and those live at non-zero offsets inside the object —
+    /// `MacConditionHandle<Semaphore>` keeps the `MacConditionBase` vptr eight
+    /// bytes in. Requiring offset zero meant the primary vptr was repaired and
+    /// the secondary was left cleared, so the very next virtual call through
+    /// the secondary base loaded null and dispatched through it. That is not a
+    /// weaker safety condition than before: what licenses the repair is the
+    /// *record*, which only exists because a value passing the full Itanium
+    /// vtable-identity test was previously written to this exact address.
+    /// Liveness of the containing allocation is the second condition, not the
+    /// first.
     pub fn assessLowRead(
         self: *VtableTracker,
         address: u64,
         current_value: u64,
-        exact_live_allocation_base: bool,
+        within_live_allocation: bool,
     ) ?types.Recovery {
         self.live_vtable_guard_checks +|= 1;
         if (self.policy.recovery_mode != .repair_trusted_low_read) return null;
-        if (!exact_live_allocation_base or current_value >= 0x1000) return null;
+        if (!within_live_allocation or current_value >= 0x1000) return null;
         const record = self.records.get(address) orelse return null;
         return .{
             .value = record.trusted_vptr,
@@ -201,10 +216,37 @@ pub const VtableTracker = struct {
 
     /// Retiring on free/reuse is the collision barrier: no vptr from a former
     /// occupant can be proposed for the next object at the same address.
+    /// Retire every slot belonging to the object based at `address`, not only
+    /// the slot at that address.
+    ///
+    /// An object with multiple inheritance has a tracked vptr per non-primary
+    /// base, all inside one allocation. Removing only the base's record left
+    /// the others behind, and a stale secondary record outliving its object is
+    /// worse than the null it was meant to repair: the next occupant of that
+    /// storage would have a previous class's vtable written into what is now an
+    /// ordinary data member, silently and with no fault anywhere.
+    ///
+    /// The scan is over tracked slots rather than over the allocation's bytes
+    /// because the size is not known here, and it runs only on free/reuse.
     pub fn retireAddress(self: *VtableTracker, address: u64) bool {
-        if (!self.records.remove(address)) return false;
-        self.retired_records +|= 1;
-        return true;
+        var retired = self.records.remove(address);
+        if (retired) self.retired_records +|= 1;
+
+        // Bounded probe forwards rather than a scan of every tracked slot.
+        // Free is not rare — an interface that allocates and releases objects
+        // in a loop would pay for the whole table on each release — and the
+        // slots reachable here are exactly the ones the write side could have
+        // recorded, because both use `max_subobject_slots`.
+        var slot: usize = 1;
+        while (slot <= types.max_subobject_slots) : (slot += 1) {
+            const candidate = address +| (slot * 8);
+            const record = self.records.get(candidate) orelse continue;
+            if (record.owner_base != address) continue;
+            if (!self.records.remove(candidate)) continue;
+            self.retired_records +|= 1;
+            retired = true;
+        }
+        return retired;
     }
 
     pub fn forgetAddress(self: *VtableTracker, address: u64) void {
@@ -279,6 +321,138 @@ test "trusted write then low read creates a narrow recovery proposal" {
     try std.testing.expectEqual(@as(u64, 0x1950b28), recovery.value);
     try std.testing.expect(tracker.noteRecovery(0x4000, recovery.generation));
     try std.testing.expectEqual(@as(u64, 1), tracker.live_vtable_guard_recoveries);
+}
+
+// A class with multiple inheritance carries one vptr per non-primary base, at
+// non-zero offsets inside the object. Repairing only the one at offset zero
+// leaves the object half-constructed: the primary dispatches, the secondary
+// loads null, and the first virtual call through the secondary base calls
+// through it.
+//
+// Observed as `MacConditionHandle<Semaphore>`, whose `MacConditionBase` vptr
+// lives eight bytes in: the primary at 0x473dab0 was restored and the call at
+// `[0x473dab8]+0x18` still went through a null.
+test "a secondary base's vptr is recoverable, not only the object's primary" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    const object: u64 = 0x473dab0;
+    const secondary = object + 8;
+
+    // Construction writes both vptrs: the primary and the secondary base's,
+    // each a distinct address inside one allocation.
+    try std.testing.expectEqual(
+        types.WriteDisposition.established,
+        tracker.observeWrite(object, trustedEvidence(0x1959688, 0x10), .{ .writer_rip = 0x1d74b4 }).disposition,
+    );
+    try std.testing.expectEqual(
+        types.WriteDisposition.established,
+        tracker.observeWrite(secondary, trustedEvidence(0x19596c0, 0x48), .{ .writer_rip = 0x1d74b4 }).disposition,
+    );
+
+    // Both are cleared.
+    _ = tracker.observeWrite(object, .{ .value = 0 }, .{ .writer_rip = 0x300 });
+    _ = tracker.observeWrite(secondary, .{ .value = 0 }, .{ .writer_rip = 0x300 });
+
+    // Both must be recoverable. The second of these was the bug: liveness was
+    // asked as "is this the allocation base", which a secondary vptr never is.
+    const primary_recovery = tracker.assessLowRead(object, 0, true).?;
+    try std.testing.expectEqual(@as(u64, 0x1959688), primary_recovery.value);
+
+    const secondary_recovery = tracker.assessLowRead(secondary, 0, true).?;
+    try std.testing.expectEqual(@as(u64, 0x19596c0), secondary_recovery.value);
+    try std.testing.expect(tracker.noteRecovery(secondary, secondary_recovery.generation));
+}
+
+// Freeing the object has to take its secondary slots with it. A stale
+// secondary record outliving its object is worse than the null it repairs: the
+// next occupant of that storage gets a previous class's vtable written into
+// what is now a data member.
+test "retiring an object retires every slot that belongs to it" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    const object: u64 = 0x473dab0;
+    const owned: types.Provenance = .{ .writer_rip = 0x1d74b4, .owner_base = object };
+    _ = tracker.observeWrite(object, trustedEvidence(0x1959688, 0x10), owned);
+    _ = tracker.observeWrite(object + 8, trustedEvidence(0x19596c0, 0x48), owned);
+    // A different object's slot, which must survive.
+    _ = tracker.observeWrite(0x5000, trustedEvidence(0x1950b28, 0x50), .{ .owner_base = 0x5000 });
+    try std.testing.expectEqual(@as(usize, 3), tracker.trackedAllocationCount());
+
+    try std.testing.expect(tracker.retireAddress(object));
+    try std.testing.expectEqual(@as(usize, 1), tracker.trackedAllocationCount());
+    try std.testing.expect(tracker.assessLowRead(object, 0, true) == null);
+    try std.testing.expect(tracker.assessLowRead(object + 8, 0, true) == null);
+    try std.testing.expect(tracker.assessLowRead(0x5000, 0, true) != null);
+}
+
+// Retirement must reach every slot the write side could have recorded. Both
+// sides read `types.max_subobject_slots`; this pins that they agree, because a
+// slot that can be tracked and cannot be retired is a stale vtable waiting for
+// the storage to be reused.
+test "retirement reaches the furthest slot the write side can record" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    const object: u64 = 0x8000;
+    const furthest = object + types.max_subobject_slots * 8;
+    const owned: types.Provenance = .{ .owner_base = object };
+    _ = tracker.observeWrite(object, trustedEvidence(0x1959688, 0x10), owned);
+    _ = tracker.observeWrite(furthest, trustedEvidence(0x19596c0, 0x48), owned);
+    try std.testing.expectEqual(@as(usize, 2), tracker.trackedAllocationCount());
+
+    try std.testing.expect(tracker.retireAddress(object));
+    try std.testing.expectEqual(@as(usize, 0), tracker.trackedAllocationCount());
+}
+
+// A slot claiming an owner it does not have must not be collateral damage when
+// that owner is freed.
+test "retirement does not take a slot owned by a different object" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    const object: u64 = 0x8000;
+    _ = tracker.observeWrite(object, trustedEvidence(0x1959688, 0x10), .{ .owner_base = object });
+    // An adjacent object whose base happens to fall inside the probe window.
+    _ = tracker.observeWrite(object + 8, trustedEvidence(0x1950b28, 0x50), .{ .owner_base = object + 8 });
+
+    try std.testing.expect(tracker.retireAddress(object));
+    try std.testing.expectEqual(@as(usize, 1), tracker.trackedAllocationCount());
+    try std.testing.expect(tracker.lookupRecord(object + 8) != null);
+}
+
+// Ownership is recorded so the caller can refuse a repair into storage that has
+// since been handed to something else.
+test "a tracked slot remembers which object it belongs to" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    const object: u64 = 0x473dab0;
+    _ = tracker.observeWrite(
+        object + 8,
+        trustedEvidence(0x19596c0, 0x48),
+        .{ .writer_rip = 0x1d74b4, .owner_base = object },
+    );
+    try std.testing.expectEqual(@as(u64, object), tracker.lookupRecord(object + 8).?.owner_base);
+
+    // A caller that supplies no owner gets the slot itself, which preserves the
+    // old behaviour for primary vptrs.
+    _ = tracker.observeWrite(0x6000, trustedEvidence(0x1950b28, 0x50), .{});
+    try std.testing.expectEqual(@as(u64, 0x6000), tracker.lookupRecord(0x6000).?.owner_base);
+}
+
+// The record is what authorises a repair. An address inside a live allocation
+// that never held a trusted vtable is ordinary data and must stay untouched.
+test "an untracked offset inside a live allocation is never repaired" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    const object: u64 = 0x473dab0;
+    _ = tracker.observeWrite(object, trustedEvidence(0x1959688, 0x10), .{ .writer_rip = 0x1d74b4 });
+    // +0x10 is a data member, not a vptr slot: no record, so no proposal even
+    // though the allocation is live and the value reads as zero.
+    try std.testing.expect(tracker.assessLowRead(object + 0x10, 0, true) == null);
 }
 
 test "valid construction transition is not a collision" {
