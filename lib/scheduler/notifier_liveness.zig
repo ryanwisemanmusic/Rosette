@@ -2,13 +2,10 @@
 //! will never arrive.
 //!
 //! Distinct from `wait_graph.zig` in this same module, which detects classical
-//! wait-for cycles through resource ownership. The failure here has no
-//! ownership edge and no cycle in that sense: a thread that signalled a
-//! condition variable and then waited on it owns nothing and blocks nobody. It
-//! is only unsatisfiable because the set of threads that ever notified the
-//! object and the set now waiting on it have become the same set — which is a
-//! fact about notifier liveness, not about a resource graph, and no cycle
-//! detector will find it.
+//! wait-for cycles through resource ownership. This history has no ownership
+//! edge and therefore cannot prove a cycle: a thread that signalled a
+//! condition variable and then waited on it owns nothing and an external queue
+//! producer may still wake it.
 //!
 //! "blocked=15" is the least useful true statement a runtime can make. Fifteen
 //! threads waiting is what a healthy emulator looks like between frames and
@@ -22,14 +19,16 @@
 //! identity of the threads that have *notified* the object in the past. With
 //! it, three situations separate cleanly — notifications are still arriving;
 //! notifications have stopped but a notifier is alive and could resume; and
-//! every thread that has ever notified this object is now itself waiting on it,
-//! which is a closed cycle that cannot open no matter how long anyone waits.
+//! every *observed* thread that has notified this object is now itself waiting
+//! on it. The last situation is evidence worth reporting, but it is not a
+//! closed-cycle proof: a UI thread, queue owner, timer, or producer that has not
+//! notified this particular object yet may still do so later.
 //!
-//! The third case is a proof, not a heuristic, and it is worth the bookkeeping
-//! precisely because it is the one that looks identical to idling from the
-//! outside. A run that ends with it should name the object and the last thread
-//! to signal it, because that thread's final path is where the missing
-//! notification went.
+//! A run that ends with the third case should still name the object and the last
+//! observed notifier, but must not claim the wait is unsatisfiable without a
+//! complete producer graph. Thread pools routinely park every worker that has
+//! previously notified while an external submitter remains able to enqueue the
+//! next job.
 
 const std = @import("std");
 
@@ -55,12 +54,18 @@ pub const Progress = enum(u8) {
     /// Notifications have stopped, but at least one thread that used to send
     /// them is still able to run. Recoverable, and worth watching.
     starved,
-    /// Every thread that has ever notified this object is now itself waiting
-    /// on it. No amount of time changes this.
-    unsatisfiable,
+    /// A notification was observed from a callback, host bridge, or other
+    /// execution context that has no scheduler thread slot. Its identity and
+    /// call site are retained, but its current liveness cannot be inferred.
+    untracked_notifier_stale,
+    /// Every notifier seen so far is now waiting on this object. An external or
+    /// not-yet-observed producer may still open the wait.
+    observed_notifiers_parked,
 
-    pub fn terminal(self: Progress) bool {
-        return self == .unsatisfiable;
+    pub fn terminal(_: Progress) bool {
+        // Notifier history is not a complete producer graph, so none of these
+        // observations alone proves a terminal wait cycle.
+        return false;
     }
 
     pub fn label(self: Progress) []const u8 {
@@ -69,7 +74,8 @@ pub const Progress = enum(u8) {
             .progressing => "progressing (a notification arrived recently)",
             .never_notified => "NEVER NOTIFIED (waiters exist and nothing has ever signalled this object)",
             .starved => "STARVED (notifications stopped; a past notifier is still runnable)",
-            .unsatisfiable => "UNSATISFIABLE (every thread that ever notified this object is now waiting on it)",
+            .untracked_notifier_stale => "UNTRACKED NOTIFIER STALE (notifications stopped; at least one notifier was a synthetic or external execution context)",
+            .observed_notifiers_parked => "OBSERVED NOTIFIERS PARKED (all previously seen notifiers currently wait here; external producers remain possible)",
         };
     }
 
@@ -79,7 +85,8 @@ pub const Progress = enum(u8) {
             .progressing => "this wait is being served; look elsewhere for the stall",
             .never_notified => "find the code that should signal this object and confirm it ran. Waiters chose this object, so something intended to signal it",
             .starved => "the last notifier is still able to run and has not signalled since. Follow that thread's path from its last notification forward — the notification it did not send is on it",
-            .unsatisfiable => "this is a closed wait cycle and it will never open. The last thread to signal this object then waited on it, so the wake it owed was never sent. That thread's path between its last notification and its own wait is the defect",
+            .untracked_notifier_stale => "follow the retained notifier thread and PC through the callback, UI, timer, or host-bridge producer. Its notification is proven, but a scheduler-slot liveness verdict would be fabricated",
+            .observed_notifiers_parked => "follow the last observed notifier, but do not synthesize a wake or call this a closed cycle until every external queue, UI, timer and producer path has also been ruled out",
         };
     }
 };
@@ -92,6 +99,9 @@ pub const Object = struct {
     waiter_mask: ThreadMask = 0,
     /// Threads that have ever notified. The field that makes the difference.
     notifier_mask: ThreadMask = 0,
+    /// Notifications from contexts without a scheduler thread slot. They must
+    /// count as real notifications without pretending their liveness is known.
+    untracked_notifications: u64 = 0,
     notifications: u64 = 0,
     last_notify_step: u64 = 0,
     last_notify_thread: u64 = 0,
@@ -126,7 +136,8 @@ pub fn classify(object: Object, current_step: u64, stall_steps: u64) Progress {
     if (object.waiter_mask == 0) return .idle;
     if (object.notifications == 0) return .never_notified;
     if (current_step -| object.last_notify_step < stall_steps) return .progressing;
-    if (object.notifiersAllWaitingHere()) return .unsatisfiable;
+    if (object.untracked_notifications != 0) return .untracked_notifier_stale;
+    if (object.notifiersAllWaitingHere()) return .observed_notifiers_parked;
     return .starved;
 }
 
@@ -171,7 +182,9 @@ pub const Graph = struct {
     /// send another.
     pub fn noteNotify(self: *Graph, address: u64, slot: usize, thread: u64, pc: u64, step: u64) void {
         const object = self.findOrCreate(address) orelse return;
-        object.notifier_mask |= maskOf(slot);
+        const notifier_bit = maskOf(slot);
+        object.notifier_mask |= notifier_bit;
+        if (notifier_bit == 0) object.untracked_notifications +|= 1;
         object.notifications +|= 1;
         object.last_notify_step = step;
         object.last_notify_thread = thread;
@@ -179,8 +192,9 @@ pub const Graph = struct {
     }
 
     /// The object most worth reporting: the one whose waiters are most stuck.
-    /// An unsatisfiable object outranks a starved one however long the starved
-    /// one has waited, because only one of them is a proof.
+    /// An object whose observed notifiers are all parked outranks an ordinary
+    /// starved object as a diagnostic lead, though it is not a proof that no
+    /// external producer exists.
     pub fn worstObject(self: *Graph, current_step: u64, stall_steps: u64) ?*Object {
         var worst: ?*Object = null;
         var worst_rank: u8 = 0;
@@ -190,9 +204,9 @@ pub const Graph = struct {
             const progress = classify(object.*, current_step, stall_steps);
             const rank: u8 = switch (progress) {
                 .idle, .progressing => 0,
-                .starved => 1,
+                .starved, .untracked_notifier_stale => 1,
                 .never_notified => 2,
-                .unsatisfiable => 3,
+                .observed_notifiers_parked => 3,
             };
             if (rank == 0) continue;
             const age = current_step -| object.first_wait_step;
@@ -232,7 +246,7 @@ test "waiters with no notification history are a different finding from a stall"
 }
 
 // The distinction the whole file exists for.
-test "a closed wait cycle is proven, not guessed" {
+test "parked observed notifiers are a lead rather than a closed-cycle proof" {
     // Thread 7 notified this object 384 times and is now waiting on it, and it
     // is the only thread that ever notified it.
     const closed = Object{
@@ -244,10 +258,10 @@ test "a closed wait cycle is proven, not guessed" {
         .last_notify_step = 3_381_773_258,
     };
     const progress = classify(closed, 10_175_000_000, default_stall_steps);
-    try std.testing.expectEqual(Progress.unsatisfiable, progress);
-    try std.testing.expect(progress.terminal());
-    try std.testing.expect(std.mem.indexOf(u8, progress.label(), "UNSATISFIABLE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, progress.guidance(), "closed wait cycle") != null);
+    try std.testing.expectEqual(Progress.observed_notifiers_parked, progress);
+    try std.testing.expect(!progress.terminal());
+    try std.testing.expect(std.mem.indexOf(u8, progress.label(), "OBSERVED NOTIFIERS PARKED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, progress.guidance(), "external") != null);
 }
 
 // If any past notifier is still outside the wait set, the cycle is open and a
@@ -293,13 +307,25 @@ test "a notifier is remembered by identity, not just counted" {
     try std.testing.expectEqual(@as(u64, 950), object.last_notify_step);
 }
 
-// A proof outranks a long wait: reporting the oldest stall first would bury it.
-test "an unsatisfiable object outranks an older starved one" {
+test "an untracked notifier remains real without a fabricated liveness verdict" {
+    var graph = Graph{};
+    graph.noteNotify(0x3100, max_threads, 0xffff_f900_0000_0004, 0xa361ef, 100);
+    graph.noteWait(0x3100, 2, 200);
+    const object = graph.find(0x3100).?;
+    try std.testing.expectEqual(@as(u64, 1), object.notifications);
+    try std.testing.expectEqual(@as(u64, 1), object.untracked_notifications);
+    try std.testing.expectEqual(@as(u32, 0), object.notifierCount());
+    try std.testing.expectEqual(@as(u64, 0xffff_f900_0000_0004), object.last_notify_thread);
+    try std.testing.expectEqual(Progress.untracked_notifier_stale, classify(object.*, default_stall_steps + 101, default_stall_steps));
+}
+
+// The stronger lead outranks a long wait so it is not buried.
+test "parked observed notifiers outrank an older starved lead" {
     var graph = Graph{};
     // Old and starved.
     graph.noteNotify(0x4000, 1, 0xaa, 0, 10);
     graph.noteWait(0x4000, 2, 20);
-    // Newer, but a closed cycle.
+    // Newer, with every observed notifier parked.
     graph.noteNotify(0x5000, 3, 0xbb, 0, 5_000_000);
     graph.noteWait(0x5000, 3, 5_000_100);
 
