@@ -377,6 +377,16 @@ fn guestOwnedRelease(state: anytype, address: u64) void {
     if (address == 0) return;
     const State = @typeInfo(@TypeOf(state)).pointer.child;
     if (comptime @hasDecl(State, "guestHeapRelease")) {
+        // A libc++ object may have been constructed by native Xenia before a
+        // later method/destructor crossed Rosette's modeled ABI. Its long
+        // string pointer is then valid, but it belongs to the native allocator
+        // rather than the memory forwarder. Sending it to the forwarder was
+        // both an ownership violation and the source of the misleading
+        // never-forwarded invalid-free reports. Only the allocator that can
+        // prove this exact live base may release it.
+        if (comptime @hasDecl(State, "guestHeapContains")) {
+            if (!state.guestHeapContains(address)) return;
+        }
         state.guestHeapRelease(address);
     }
 }
@@ -830,6 +840,7 @@ const TestState = struct {
     guest_heap_allocations: u64 = 0,
     guest_heap_releases: u64 = 0,
     last_guest_heap_release: u64 = 0,
+    guest_heap_contains: bool = true,
 
     pub fn guestMemory(self: *TestState, address: u64, count: u64) ?[]u8 {
         if (address + count > self.mem.len) return null;
@@ -857,6 +868,10 @@ const TestState = struct {
     pub fn guestHeapRelease(self: *TestState, address: u64) void {
         self.guest_heap_releases += 1;
         self.last_guest_heap_release = address;
+    }
+
+    pub fn guestHeapContains(self: *TestState, _: u64) bool {
+        return self.guest_heap_contains;
     }
 
     pub fn write64(self: *TestState, address: u64, value: u64) void {
@@ -905,6 +920,16 @@ test "libc++ empty string initialization does not dereference its source" {
     var state = TestState{};
     try std.testing.expect(initLibcppString(&state, 160, std.math.maxInt(u64), 0));
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), state.mem[160..184]);
+}
+
+test "libc++ destructor never releases a foreign allocator's long string" {
+    var state = TestState{};
+    @memset(state.mem[48..80], 'x');
+    try std.testing.expect(initLibcppString(&state, 80, 48, 32));
+    state.guest_heap_contains = false;
+    try std.testing.expect(destroyLibcppString(&state, 80));
+    try std.testing.expectEqual(@as(u64, 0), state.guest_heap_releases);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 24), state.mem[80..104]);
 }
 
 test "libc++ string assignment tolerates an overlapping source" {

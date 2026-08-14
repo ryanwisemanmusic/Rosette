@@ -32,6 +32,21 @@ pub fn shufflePackedDwords(source: [16]u8, control: u8) [16]u8 {
     return result;
 }
 
+/// Implements one 128-bit lane of VSHUFPS. The low two destination dwords
+/// are selected from `lhs`, and the high two are selected from `rhs`.
+pub fn shufflePackedSingles(lhs: [16]u8, rhs: [16]u8, control: u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |destination_lane| {
+        const shift: u3 = @intCast(destination_lane * 2);
+        const selected_lane = (control >> shift) & 0x03;
+        const source = if (destination_lane < 2) lhs else rhs;
+        const destination_offset = destination_lane * 4;
+        const source_offset = @as(usize, selected_lane) * 4;
+        @memcpy(result[destination_offset..][0..4], source[source_offset..][0..4]);
+    }
+    return result;
+}
+
 /// Interleaves the low qwords of two 16-byte vectors.
 pub fn unpackLowQwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
     var result: [16]u8 = undefined;
@@ -194,4 +209,19 @@ test "packed integer operations round-trip" {
     // Shift right: all zeros
     const shifted64 = shiftPackedElements(a, 64, 64, false);
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, shifted64[0..8], .little));
+}
+
+test "VSHUFPS selects low lanes from lhs and high lanes from rhs" {
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    for (0..4) |lane| {
+        std.mem.writeInt(u32, lhs[lane * 4 ..][0..4], @intCast(10 + lane), .little);
+        std.mem.writeInt(u32, rhs[lane * 4 ..][0..4], @intCast(20 + lane), .little);
+    }
+
+    const shuffled = shufflePackedSingles(lhs, rhs, 0x93);
+    try std.testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, shuffled[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, shuffled[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 21), std.mem.readInt(u32, shuffled[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 22), std.mem.readInt(u32, shuffled[12..16], .little));
 }

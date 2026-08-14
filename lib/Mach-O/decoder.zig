@@ -380,3 +380,160 @@ test "CMPXCHG decoder preserves opcode-selected operand width" {
     try std.testing.expectEqual(Op.cmpxchg_mem64_reg64, qword_memory.op);
     try std.testing.expectEqual(Size.bits64, qword_memory.size);
 }
+
+/// The AVX comparison predicate an immediate selects.
+///
+/// Only the low five bits are the predicate. The first eight are the SSE set
+/// and the rest are the AVX extension; the difference between an `_OQ` and an
+/// `_OS` form is whether a quiet NaN raises the invalid-operation exception,
+/// which is an FP-exception distinction this interpreter does not model — the
+/// *result* of the comparison is the same either way, and the result is what
+/// the mask is built from.
+///
+/// Returned as an optional so an encoding this does not model produces "not
+/// executed" rather than a mask computed from a guessed predicate. A wrong mask
+/// is a wrong branch in the guest with nothing to show for it.
+pub const VexComparePredicate = enum {
+    equal,
+    less_than,
+    less_or_equal,
+    unordered,
+    not_equal,
+    not_less_than,
+    not_less_or_equal,
+    ordered,
+
+    pub fn fromImmediate(immediate: u8) ?VexComparePredicate {
+        // Bit 3 of the AVX predicate selects the signalling variant and bit 4
+        // the extended set; both leave the comparison itself unchanged for the
+        // eight base relations, so they are masked off rather than rejected.
+        return switch (immediate & 0x07) {
+            0 => .equal,
+            1 => .less_than,
+            2 => .less_or_equal,
+            3 => .unordered,
+            4 => .not_equal,
+            5 => .not_less_than,
+            6 => .not_less_or_equal,
+            7 => .ordered,
+            else => null,
+        };
+    }
+
+    pub fn evaluate(self: VexComparePredicate, left: anytype, right: @TypeOf(left)) bool {
+        const unordered_pair = std.math.isNan(left) or std.math.isNan(right);
+        return switch (self) {
+            .equal => !unordered_pair and left == right,
+            .less_than => !unordered_pair and left < right,
+            .less_or_equal => !unordered_pair and left <= right,
+            .unordered => unordered_pair,
+            .not_equal => unordered_pair or left != right,
+            .not_less_than => unordered_pair or !(left < right),
+            .not_less_or_equal => unordered_pair or !(left <= right),
+            .ordered => !unordered_pair,
+        };
+    }
+};
+
+/// Lane-wise compare producing an all-ones or all-zeros mask per lane, which is
+/// what the guest then uses as a blend selector or feeds to a movmsk.
+pub fn compareVexPackedF32(left: [16]u8, right: [16]u8, predicate: VexComparePredicate) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const a: f32 = @bitCast(std.mem.readInt(u32, left[offset..][0..4], .little));
+        const b: f32 = @bitCast(std.mem.readInt(u32, right[offset..][0..4], .little));
+        const mask: u32 = if (predicate.evaluate(a, b)) 0xFFFF_FFFF else 0;
+        std.mem.writeInt(u32, result[offset..][0..4], mask, .little);
+    }
+    return result;
+}
+
+pub fn compareVexPackedF64(left: [16]u8, right: [16]u8, predicate: VexComparePredicate) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..2) |lane| {
+        const offset = lane * 8;
+        const a: f64 = @bitCast(std.mem.readInt(u64, left[offset..][0..8], .little));
+        const b: f64 = @bitCast(std.mem.readInt(u64, right[offset..][0..8], .little));
+        const mask: u64 = if (predicate.evaluate(a, b)) 0xFFFF_FFFF_FFFF_FFFF else 0;
+        std.mem.writeInt(u64, result[offset..][0..8], mask, .little);
+    }
+    return result;
+}
+
+/// x86's result for a float-to-int conversion that cannot be represented: the
+/// "integer indefinite" value. NaN, an infinity, and anything outside the
+/// signed 32-bit range all produce it, and a conversion that instead saturated
+/// or wrapped would hand the guest a plausible wrong number rather than the
+/// sentinel its own code may be testing for.
+pub const integer_indefinite: i32 = std.math.minInt(i32);
+
+fn convertFloatToDword(value: f32, comptime truncate_toward_zero: bool) i32 {
+    if (std.math.isNan(value)) return integer_indefinite;
+    const rounded: f32 = if (truncate_toward_zero) @trunc(value) else @round(value);
+    if (!(rounded >= @as(f32, @floatFromInt(std.math.minInt(i32)))) or
+        rounded > @as(f32, @floatFromInt(std.math.maxInt(i32))))
+    {
+        return integer_indefinite;
+    }
+    return @intFromFloat(rounded);
+}
+
+/// VCVTPS2DQ / VCVTTPS2DQ — four packed singles to four packed signed dwords.
+/// `truncate_toward_zero` is the difference between the two: the F3 form
+/// truncates, the 66 form uses the current rounding mode, which this models as
+/// round-to-nearest since that is the default MXCSR state and the interpreter
+/// does not track changes to it.
+pub fn convertVexPackedFloatToDword(source: [16]u8, comptime truncate_toward_zero: bool) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const value: f32 = @bitCast(std.mem.readInt(u32, source[offset..][0..4], .little));
+        const converted = convertFloatToDword(value, truncate_toward_zero);
+        std.mem.writeInt(i32, result[offset..][0..4], converted, .little);
+    }
+    return result;
+}
+
+/// VCVTDQ2PS — four packed signed dwords to four packed singles.
+pub fn convertVexPackedDwordToFloat(source: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const value = std.mem.readInt(i32, source[offset..][0..4], .little);
+        const converted: f32 = @floatFromInt(value);
+        std.mem.writeInt(u32, result[offset..][0..4], @bitCast(converted), .little);
+    }
+    return result;
+}
+
+/// Approximate reciprocal and reciprocal square root, lane-wise.
+///
+/// The hardware instructions are *approximations* — RCPPS is specified only to
+/// a relative error below 1.5 * 2^-12, and the exact bits differ between CPU
+/// models. Computing the exact value is therefore within spec and is what the
+/// guest's own error budget already tolerates; a title that depended on a
+/// particular approximation would not run on two different x86 CPUs either.
+///
+/// The special cases are not approximations and do have to match: reciprocal of
+/// zero is a same-signed infinity, of an infinity a same-signed zero, and the
+/// square-root forms produce a NaN for a negative input.
+pub fn approximateReciprocal(value: f32) f32 {
+    return 1.0 / value;
+}
+
+pub fn approximateReciprocalSqrt(value: f32) f32 {
+    if (value < 0.0) return std.math.nan(f32);
+    return 1.0 / @sqrt(value);
+}
+
+pub fn reciprocalVexPackedF32(source: [16]u8, comptime square_root: bool) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const value: f32 = @bitCast(std.mem.readInt(u32, source[offset..][0..4], .little));
+        const computed = if (square_root) approximateReciprocalSqrt(value) else approximateReciprocal(value);
+        std.mem.writeInt(u32, result[offset..][0..4], @bitCast(computed), .little);
+    }
+    return result;
+}

@@ -26,6 +26,8 @@ const X87State = macho_core.types.X87State;
 const X87Tag = macho_core.types.X87Tag;
 
 const decoder = @import("macho_core").decoder;
+const process = @import("process.zig");
+const DecodedInsn = x64_decoder.DecodedInsn;
 
 const decodeInsn = decoder.decodeInsn;
 const decodeVex2 = decoder.decodeVex2;
@@ -94,6 +96,10 @@ fn multiplyUnsignedEvenDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
 
 fn shufflePackedDwords(source: [16]u8, control: u8) [16]u8 {
     return packed_ops.shufflePackedDwords(source, control);
+}
+
+fn shufflePackedSingles(lhs: [16]u8, rhs: [16]u8, control: u8) [16]u8 {
+    return packed_ops.shufflePackedSingles(lhs, rhs, control);
 }
 
 fn unpackLowQwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
@@ -759,6 +765,42 @@ test "VPSHUFD applies its immediate independently to every 128-bit lane" {
     }
 }
 
+test "VSHUFPS decodes the exact Xenia JIT fault and preserves three-operand semantics" {
+    const decoded = decodeInsn(&[_]u8{ 0xC5, 0xD0, 0xC6, 0xED, 0x93 });
+    try std.testing.expectEqual(Op.vshufps, decoded.op);
+    try std.testing.expectEqual(@as(u8, 5), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 5), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 5), decoded.xmm_src2);
+    try std.testing.expectEqual(@as(u64, 0x93), decoded.imm);
+    try std.testing.expect(decoded.uses_imm);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    for (0..4) |lane| {
+        std.mem.writeInt(u32, lhs[lane * 4 ..][0..4], @intCast(10 + lane), .little);
+        std.mem.writeInt(u32, rhs[lane * 4 ..][0..4], @intCast(20 + lane), .little);
+    }
+    const shuffled = shufflePackedSingles(lhs, rhs, 0x93);
+    try std.testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, shuffled[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, shuffled[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 21), std.mem.readInt(u32, shuffled[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 22), std.mem.readInt(u32, shuffled[12..16], .little));
+
+    const memory = decodeInsn(&[_]u8{ 0xC5, 0xE8, 0xC6, 0x48, 0x20, 0x1B });
+    try std.testing.expectEqual(Op.vshufps, memory.op);
+    try std.testing.expectEqual(@as(u8, 1), memory.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 2), memory.xmm_src);
+    try std.testing.expect(!memory.is_reg_form);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, memory.sib_base_reg);
+    try std.testing.expectEqual(@as(u64, 0x20), memory.addr);
+
+    const wide = decodeInsn(&[_]u8{ 0xC5, 0xEC, 0xC6, 0xCB, 0x1B });
+    try std.testing.expectEqual(Op.vshufps, wide.op);
+    try std.testing.expect(wide.vector_256);
+}
+
 test "decode and execute the XXH3 packed integer VEX cluster" {
     const addq_memory = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xD4, 0x45, 0xE0 });
     try std.testing.expectEqual(Op.vpaddq, addq_memory.op);
@@ -1087,13 +1129,27 @@ test "decode VPSUB/VPADD/VPUNPCK 3-operand VEX2 with real vvvv source" {
     try std.testing.expectEqual(@as(u8, 4), sub_b.len);
     try std.testing.expect(sub_b.is_reg_form);
 
-    // VPXOR xmm1, xmm0, [rip+0x06778350] — memory form with RIP-relative addressing
+    // VPXOR xmm1, xmm0, [0x06778350] — ModRM 0x0C selects a SIB byte, and SIB
+    // 0x25 is index=none, base=101. With mod=00 that escape means "no base
+    // register, disp32 follows": an *absolute* address, not a RIP-relative one.
+    // RIP-relative is only mod=00 rm=101 with no SIB at all, which the case
+    // below covers. This test asserted `rip_relative` on the absolute form and
+    // never ran to be contradicted.
     const xor_mem = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xEF, 0x0C, 0x25, 0x50, 0x83, 0x77, 0x06 });
     try std.testing.expectEqual(Op.vpxor, xor_mem.op);
     try std.testing.expectEqual(@as(u8, 1), xor_mem.xmm_dst);
     try std.testing.expectEqual(@as(u8, 0), xor_mem.xmm_src);
     try std.testing.expect(!xor_mem.is_reg_form);
-    try std.testing.expect(xor_mem.rip_relative);
+    try std.testing.expect(!xor_mem.rip_relative);
+    try std.testing.expect(!xor_mem.sib_has_base);
+    try std.testing.expectEqual(@as(u64, 0x0677_8350), xor_mem.addr);
+
+    // The genuine RIP-relative encoding of the same instruction, for contrast:
+    // ModRM 0x0D is mod=00 rm=101 with no SIB byte.
+    const xor_rip = decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xEF, 0x0D, 0x50, 0x83, 0x77, 0x06 });
+    try std.testing.expectEqual(Op.vpxor, xor_rip.op);
+    try std.testing.expect(xor_rip.rip_relative);
+    try std.testing.expect(!xor_rip.sib_has_base);
 
     // 256-bit VPADDD ymm0, ymm1, ymm3 — L=1 (0xF5) with a real vvvv source
     const add_d = decodeInsn(&[_]u8{ 0xC5, 0xF5, 0xFE, 0xC3 });
@@ -1453,7 +1509,14 @@ test "decode observed PPC Format AA bit extraction sequence" {
     try std.testing.expectEqual(@as(u8, 2), sbb.len);
 
     const bit_and = decodeInsn(bytes[bit_test.len + sbb.len ..]);
-    try std.testing.expectEqual(Op.and_accum_imm, bit_and.op);
+    // Opcode 0x24 is `AND AL, imm8`. The decoder routes the 8-bit accumulator
+    // forms (0x24/0x2C/0x34/0x3C) through the reg8 arm with the destination
+    // fixed to AL rather than giving them a separate `*_accum_imm` opcode; the
+    // wider forms (0x25 and friends) keep the accumulator naming. Same
+    // destination, same immediate, same length — only the opcode name differs,
+    // and this assertion expected the wider form's name.
+    try std.testing.expectEqual(Op.and_reg8_imm8, bit_and.op);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, bit_and.dst_reg);
     try std.testing.expectEqual(Size.bits8, bit_and.size);
     try std.testing.expectEqual(@as(u64, 1), bit_and.imm);
 }
@@ -1726,4 +1789,281 @@ test "decode C7 memory immediate sign extends to 64 bits" {
     try std.testing.expectEqual(Size.bits64, decoded.size);
     try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.sib_base_reg);
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), decoded.imm);
+}
+
+// A5 (perf audit): a decode-cache hit skips address resolution when no live
+// register contributes. The claim being pinned is an equivalence, not a
+// heuristic — an instruction whose address names no base, no index and no
+// FS/GS segment resolves to the same value on every hit, so the value stored
+// when the entry was populated is still correct.
+//
+// Getting this wrong is silent: the interpreter would execute against a stale
+// effective address rather than fault, so the predicate is tested directly.
+test "address resolution is skipped only when nothing live contributes to it" {
+    const needsLive = process.MachOState.addressNeedsLiveRegisters;
+
+    // `mov eax, [rbx+0x20]` — a base register contributes.
+    var with_base = DecodedInsn{ .op = .mov_reg32_mem32 };
+    with_base.sib_has_base = true;
+    with_base.sib_base_reg = .bl_bx_ebx_rbx;
+    try std.testing.expect(needsLive(with_base));
+
+    // `mov eax, [rbx*4+0x20]` — an index register contributes.
+    var with_index = DecodedInsn{ .op = .mov_reg32_mem32 };
+    with_index.sib_has_index = true;
+    with_index.sib_index_reg = .bl_bx_ebx_rbx;
+    try std.testing.expect(needsLive(with_index));
+
+    // RIP-relative was already excluded before this change and stays excluded:
+    // the populate path resolves it and the hit path must not touch it.
+    var rip_relative = DecodedInsn{ .op = .mov_reg32_mem32 };
+    rip_relative.rip_relative = true;
+    try std.testing.expect(!needsLive(rip_relative));
+
+    // FS and GS are the only segments with a non-zero base in long mode, and a
+    // thread-local address moves with the thread.
+    var thread_local = DecodedInsn{ .op = .mov_reg64_mem64 };
+    thread_local.segment = .fs;
+    try std.testing.expect(needsLive(thread_local));
+    var gs_relative = DecodedInsn{ .op = .mov_reg64_mem64 };
+    gs_relative.segment = .gs;
+    try std.testing.expect(needsLive(gs_relative));
+
+    // Register-to-register, an immediate form and a plain displacement: none
+    // of these has anything that can change between hits.
+    try std.testing.expect(!needsLive(DecodedInsn{ .op = .mov_reg64_reg64 }));
+    try std.testing.expect(!needsLive(DecodedInsn{ .op = .mov_reg_imm }));
+    try std.testing.expect(!needsLive(DecodedInsn{ .op = .jcc_rel32 }));
+    var absolute = DecodedInsn{ .op = .mov_reg32_mem32 };
+    absolute.addr = 0x1234;
+    try std.testing.expect(!needsLive(absolute));
+}
+
+// The encoding that killed a run at step 5.37B: `C5 F8 C2 D1 04`, which is
+// `vcmpps xmm2, xmm0, xmm1, 4` — Xenia's mask-producing float compare. Both
+// VEX forms were missing, which the VEX2/VEX3 differential test cannot catch:
+// that test proves the two forms *agree*, and here they agreed on rejecting a
+// real instruction.
+test "VEX 0F C2 decodes to the four compare forms in both VEX encodings" {
+    const two_byte = decodeInsn(&[_]u8{ 0xC5, 0xF8, 0xC2, 0xD1, 0x04, 0x0F });
+    try std.testing.expectEqual(Op.vcmpps, two_byte.op);
+    try std.testing.expectEqual(@as(u8, 5), two_byte.len);
+    try std.testing.expectEqual(@as(u8, 2), two_byte.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 0), two_byte.xmm_src);
+    try std.testing.expectEqual(@as(u8, 1), two_byte.xmm_src2);
+    try std.testing.expectEqual(@as(u64, 4), two_byte.imm);
+    try std.testing.expect(two_byte.is_reg_form);
+
+    // The prefix selects the width and packing, exactly as for the arithmetic
+    // forms next to it.
+    try std.testing.expectEqual(Op.vcmppd, decodeInsn(&[_]u8{ 0xC5, 0xF9, 0xC2, 0xD1, 0x04, 0x0F }).op);
+    try std.testing.expectEqual(Op.vcmpss, decodeInsn(&[_]u8{ 0xC5, 0xFA, 0xC2, 0xD1, 0x04, 0x0F }).op);
+    try std.testing.expectEqual(Op.vcmpsd, decodeInsn(&[_]u8{ 0xC5, 0xFB, 0xC2, 0xD1, 0x04, 0x0F }).op);
+
+    // The three-byte form a register above xmm7 forces.
+    const three_byte = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x78, 0xC2, 0xD1, 0x04, 0x0F });
+    try std.testing.expectEqual(Op.vcmpps, three_byte.op);
+    try std.testing.expectEqual(@as(u8, 6), three_byte.len);
+    try std.testing.expectEqual(@as(u64, 4), three_byte.imm);
+}
+
+test "SIMD compare predicates produce lane masks and reject what is not modelled" {
+    const VexComparePredicate = decoder.VexComparePredicate;
+
+    // The eight base relations, and the NaN rule that separates the ordered
+    // forms from the unordered ones.
+    const quiet_nan = std.math.nan(f32);
+    try std.testing.expect(VexComparePredicate.fromImmediate(0).?.evaluate(@as(f32, 1.0), 1.0));
+    try std.testing.expect(!VexComparePredicate.fromImmediate(0).?.evaluate(quiet_nan, quiet_nan));
+    try std.testing.expect(VexComparePredicate.fromImmediate(3).?.evaluate(quiet_nan, @as(f32, 1.0)));
+    try std.testing.expect(VexComparePredicate.fromImmediate(4).?.evaluate(quiet_nan, @as(f32, 1.0)));
+    try std.testing.expect(VexComparePredicate.fromImmediate(7).?.evaluate(@as(f32, 1.0), 2.0));
+    try std.testing.expect(!VexComparePredicate.fromImmediate(7).?.evaluate(quiet_nan, @as(f32, 1.0)));
+
+    // The signalling and extended variants select the same relation; only the
+    // exception behaviour differs, and that is not modelled here.
+    try std.testing.expectEqual(
+        VexComparePredicate.equal,
+        VexComparePredicate.fromImmediate(0x08).?,
+    );
+    try std.testing.expectEqual(
+        VexComparePredicate.not_equal,
+        VexComparePredicate.fromImmediate(0x14).?,
+    );
+
+    // A whole-vector mask: `vcmpps ..., 4` (NEQ) over four lanes, two equal.
+    var left: [16]u8 = undefined;
+    var right: [16]u8 = undefined;
+    const lanes = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const others = [_]f32{ 1.0, 9.0, 3.0, 9.0 };
+    for (0..4) |lane| {
+        std.mem.writeInt(u32, left[lane * 4 ..][0..4], @bitCast(lanes[lane]), .little);
+        std.mem.writeInt(u32, right[lane * 4 ..][0..4], @bitCast(others[lane]), .little);
+    }
+    const mask = decoder.compareVexPackedF32(left, right, .not_equal);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, mask[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), std.mem.readInt(u32, mask[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, mask[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), std.mem.readInt(u32, mask[12..16], .little));
+}
+
+// The encoding that ended the previous run: `C4 C1 7A 5B C0`, which is
+// `vcvttps2dq xmm0, xmm8` — a three-byte VEX only because the source is above
+// xmm7. Both VEX forms of 0F 5B were missing from the real decode paths, and
+// the test-only path had the F3 case mapped to the wrong opcode entirely.
+test "VEX 0F 5B decodes the packed float/dword conversions in both VEX forms" {
+    const failing = decodeInsn(&[_]u8{ 0xC4, 0xC1, 0x7A, 0x5B, 0xC0, 0x0F });
+    try std.testing.expectEqual(Op.vcvttps2dq, failing.op);
+    try std.testing.expectEqual(@as(u8, 5), failing.len);
+    try std.testing.expectEqual(@as(u8, 0), failing.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 8), failing.xmm_src2);
+    try std.testing.expect(failing.is_reg_form);
+
+    // The prefix picks the direction, and F3 additionally picks truncation
+    // over the current rounding mode. Getting F3 and no-prefix the same way
+    // round converts in the opposite direction — the bug in the old mapping.
+    try std.testing.expectEqual(Op.vcvtdq2ps, decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x5B, 0xC1, 0x0F }).op);
+    try std.testing.expectEqual(Op.vcvtps2dq, decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x5B, 0xC1, 0x0F }).op);
+    try std.testing.expectEqual(Op.vcvttps2dq, decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x5B, 0xC1, 0x0F }).op);
+    // F2 0F 5B is not an instruction and must stay rejected.
+    try std.testing.expectEqual(Op.invalid, decodeInsn(&[_]u8{ 0xC5, 0xFB, 0x5B, 0xC1, 0x0F }).op);
+}
+
+test "packed float/dword conversion rounds, truncates and reports the indefinite" {
+    var source: [16]u8 = undefined;
+    const lanes = [_]f32{ 2.7, -2.7, 1.5, 2.5 };
+    for (0..4) |lane| {
+        std.mem.writeInt(u32, source[lane * 4 ..][0..4], @bitCast(lanes[lane]), .little);
+    }
+
+    // Truncation is toward zero, in both signs.
+    const truncated = decoder.convertVexPackedFloatToDword(source, true);
+    try std.testing.expectEqual(@as(i32, 2), std.mem.readInt(i32, truncated[0..4], .little));
+    try std.testing.expectEqual(@as(i32, -2), std.mem.readInt(i32, truncated[4..8], .little));
+
+    // Rounding is the other form's behaviour, and differs from truncation
+    // exactly where it should.
+    const rounded = decoder.convertVexPackedFloatToDword(source, false);
+    try std.testing.expectEqual(@as(i32, 3), std.mem.readInt(i32, rounded[0..4], .little));
+    try std.testing.expectEqual(@as(i32, -3), std.mem.readInt(i32, rounded[4..8], .little));
+
+    // Anything unrepresentable is the integer indefinite, not a saturated or
+    // wrapped value: guest code may test for exactly this sentinel.
+    var extremes: [16]u8 = undefined;
+    const unrepresentable = [_]f32{
+        std.math.nan(f32),
+        std.math.inf(f32),
+        -std.math.inf(f32),
+        4.0e9,
+    };
+    for (0..4) |lane| {
+        std.mem.writeInt(u32, extremes[lane * 4 ..][0..4], @bitCast(unrepresentable[lane]), .little);
+    }
+    const converted = decoder.convertVexPackedFloatToDword(extremes, true);
+    for (0..4) |lane| {
+        try std.testing.expectEqual(
+            decoder.integer_indefinite,
+            std.mem.readInt(i32, converted[lane * 4 ..][0..4], .little),
+        );
+    }
+
+    // And the reverse direction round-trips the values it can represent.
+    const back = decoder.convertVexPackedDwordToFloat(truncated);
+    try std.testing.expectEqual(@as(f32, 2.0), @as(f32, @bitCast(std.mem.readInt(u32, back[0..4], .little))));
+    try std.testing.expectEqual(@as(f32, -2.0), @as(f32, @bitCast(std.mem.readInt(u32, back[4..8], .little))));
+}
+
+// `C4 C1 39 72 F0 1F` = `vpslld xmm8, xmm8, 31`. A *group* opcode: ModRM.reg
+// selects the shift, VEX.vvvv is the destination and ModRM.r/m the source, so a
+// source above xmm7 needs REX.B and therefore the three-byte prefix — which was
+// the form the decoder lacked.
+test "VEX 0F 71/72/73 immediate shifts decode in both VEX forms" {
+    const failing = decodeInsn(&[_]u8{ 0xC4, 0xC1, 0x39, 0x72, 0xF0, 0x1F, 0x0F });
+    try std.testing.expectEqual(Op.vpslld, failing.op);
+    try std.testing.expectEqual(@as(u8, 6), failing.len);
+    try std.testing.expectEqual(@as(u8, 8), failing.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 8), failing.xmm_src);
+    try std.testing.expectEqual(@as(u64, 31), failing.imm);
+
+    // Every member of the group, in the three-byte form. ModRM.reg is the
+    // selector: /2 and /3 shift right, /6 and /7 left.
+    const members = [_]struct { opcode: u8, reg: u8, op: Op }{
+        .{ .opcode = 0x71, .reg = 2, .op = .vpsrlw },
+        .{ .opcode = 0x71, .reg = 6, .op = .vpsllw },
+        .{ .opcode = 0x72, .reg = 2, .op = .vpsrld },
+        .{ .opcode = 0x72, .reg = 6, .op = .vpslld },
+        .{ .opcode = 0x73, .reg = 2, .op = .vpsrlq },
+        .{ .opcode = 0x73, .reg = 3, .op = .vpsrldq },
+        .{ .opcode = 0x73, .reg = 6, .op = .vpsllq },
+        .{ .opcode = 0x73, .reg = 7, .op = .vpslldq },
+    };
+    for (members) |member| {
+        const modrm: u8 = 0xC0 | (member.reg << 3);
+        const decoded = decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x79, member.opcode, modrm, 0x04, 0x0F });
+        try std.testing.expectEqual(member.op, decoded.op);
+        try std.testing.expectEqual(@as(u64, 4), decoded.imm);
+    }
+
+    // A reg field that is not a group member stays rejected rather than
+    // decoding as whichever arm happened to be last.
+    try std.testing.expectEqual(
+        Op.invalid,
+        decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x79, 0x72, 0xC0, 0x04, 0x0F }).op,
+    );
+}
+
+// `C5 FA 53 C0` = `vrcpss xmm0, xmm0, xmm0`. Unlike the previous four decoder
+// gaps this one was in the *image*, not in generated code — Xenia's own
+// compiled reciprocal — so it was reached the moment the pipeline cache built
+// its first pipeline rather than after billions of JIT steps.
+test "VEX 0F 52/53 reciprocal forms decode, packed and scalar" {
+    const failing = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x53, 0xC0, 0x0F });
+    try std.testing.expectEqual(Op.vrcpss, failing.op);
+    try std.testing.expectEqual(@as(u8, 4), failing.len);
+
+    // The prefix picks packed versus scalar, and the scalar forms are
+    // three-operand: VEX.vvvv supplies the upper lanes.
+    try std.testing.expectEqual(Op.vrcpps, decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x53, 0xC1, 0x0F }).op);
+    try std.testing.expectEqual(Op.vrsqrtss, decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x52, 0xC0, 0x0F }).op);
+    try std.testing.expectEqual(Op.vrsqrtps, decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x52, 0xC1, 0x0F }).op);
+    try std.testing.expectEqual(Op.vrcpss, decodeInsn(&[_]u8{ 0xC4, 0xE1, 0x7A, 0x53, 0xC0, 0x0F }).op);
+
+    // 66 and F2 are not defined for either opcode and stay rejected.
+    try std.testing.expectEqual(Op.invalid, decodeInsn(&[_]u8{ 0xC5, 0xF9, 0x53, 0xC1, 0x0F }).op);
+    try std.testing.expectEqual(Op.invalid, decodeInsn(&[_]u8{ 0xC5, 0xFB, 0x52, 0xC1, 0x0F }).op);
+
+    // The two instructions that follow the faulting one in the image, so the
+    // stream is verified to resynchronise rather than just the one encoding.
+    try std.testing.expectEqual(Op.vmovaps_mem_xmm, decodeInsn(&[_]u8{ 0xC5, 0xF8, 0x29, 0x45, 0xC0, 0x0F }).op);
+    try std.testing.expectEqual(Op.vmovss_xmm_mem, decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x10, 0x4D, 0xC0, 0x0F }).op);
+}
+
+test "approximate reciprocals match the hardware's special cases" {
+    // The approximation itself is within spec at any accuracy — RCPPS is only
+    // guaranteed to ~12 bits and differs between CPU models — but the special
+    // cases are exact and must match.
+    try std.testing.expectEqual(@as(f32, 0.25), decoder.approximateReciprocal(4.0));
+    try std.testing.expectEqual(@as(f32, 0.5), decoder.approximateReciprocalSqrt(4.0));
+
+    try std.testing.expect(std.math.isPositiveInf(decoder.approximateReciprocal(0.0)));
+    try std.testing.expect(std.math.isNegativeInf(decoder.approximateReciprocal(-0.0)));
+    try std.testing.expectEqual(@as(f32, 0.0), decoder.approximateReciprocal(std.math.inf(f32)));
+    // A negative input to the square-root form is a NaN, not a reciprocal.
+    try std.testing.expect(std.math.isNan(decoder.approximateReciprocalSqrt(-1.0)));
+    try std.testing.expect(std.math.isPositiveInf(decoder.approximateReciprocalSqrt(0.0)));
+
+    // Packed form covers every lane independently.
+    var source: [16]u8 = undefined;
+    const lanes = [_]f32{ 1.0, 2.0, 4.0, 8.0 };
+    for (0..4) |lane| {
+        std.mem.writeInt(u32, source[lane * 4 ..][0..4], @bitCast(lanes[lane]), .little);
+    }
+    const reciprocals = decoder.reciprocalVexPackedF32(source, false);
+    const expected = [_]f32{ 1.0, 0.5, 0.25, 0.125 };
+    for (0..4) |lane| {
+        try std.testing.expectEqual(
+            expected[lane],
+            @as(f32, @bitCast(std.mem.readInt(u32, reciprocals[lane * 4 ..][0..4], .little))),
+        );
+    }
 }

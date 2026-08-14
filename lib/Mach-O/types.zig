@@ -271,6 +271,37 @@ pub const DecodeCacheEntry = struct {
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
 pub const HEARTBEAT_INTERVAL: u64 = 25_000_000;
 
+/// Previous-heartbeat readings of the acceleration counters, so the heartbeat
+/// can report **deltas** rather than run-cumulative totals.
+///
+/// Cumulative is the wrong shape for this question. The interpreter's rate is
+/// not constant — image load and hashing run several times faster than steady
+/// state — so a run-cumulative hit rate averages the fast prefix with the slow
+/// body and reports a number that describes neither. Every interesting change
+/// to throughput is a change *between* two heartbeats, which is exactly what a
+/// cumulative counter cannot show.
+///
+/// This exists at all because the counters it samples were previously emitted
+/// only from the exit path, and the runs that matter are the ones the harness
+/// kills at its timeout — where the exit path never executes. A counter that is
+/// only readable on a clean exit is not readable on the runs being diagnosed.
+pub const PerformanceSample = struct {
+    step: u64 = 0,
+    wall_ns: u64 = 0,
+    decode_cache_hits: u64 = 0,
+    decode_cache_misses: u64 = 0,
+    decode_cache_stale_rejections: u64 = 0,
+    code_generation: u64 = 0,
+    import_route_cache_hits: u64 = 0,
+    import_route_cache_misses: u64 = 0,
+    import_route_cache_slow_hits: u64 = 0,
+    import_route_cache_fallbacks: u64 = 0,
+    cleo_dispatch_hits: u64 = 0,
+    /// False until the first sample is taken; the first heartbeat has no
+    /// predecessor and must report that rather than a delta against zero.
+    primed: bool = false,
+};
+
 pub const ImportHandlerResult = union(enum) {
     handled: u64,
     handled_void,
@@ -290,6 +321,7 @@ pub const ImportRoute = enum(u8) {
     idle_source_remove,
     events_pending,
     coop_main_iteration,
+    sdl_compat,
     local_definition,
     libcxx_stream,
     foreign_object,
@@ -371,6 +403,8 @@ pub const GuestFile = struct {
     error_flag: bool = false,
     kind: GuestFileKind = .regular,
     descriptor_alias: u64 = std.math.maxInt(u64),
+    descriptor_generation: u64 = 0,
+    descriptor_alias_is_primary: bool = false,
 };
 
 pub const BoundImportThunk = struct {

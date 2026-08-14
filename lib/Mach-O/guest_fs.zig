@@ -254,19 +254,23 @@ pub fn handleFdopen(self: anytype) ?u64 {
         return null;
     };
     const guest_fd = self.regs.rdi;
-    const host_fd = self.fs_forwarder.fd_manager.take(guest_fd) orelse {
+    const borrowed = self.fs_forwarder.fd_manager.borrowForStream(guest_fd) orelse {
         self.setGuestErrno(@intFromEnum(std.c.E.BADF));
         machoCapturePrint("macho-processor: fdopen rejected: invalid guest_fd={d} mode={s}\n", .{ guest_fd, mode });
         return null;
     };
-    const handle = self.allocGuestFile(host_fd, .regular) orelse {
-        _ = std.c.close(host_fd);
+    const handle = self.allocGuestFile(borrowed.host_fd, .regular) orelse {
+        // A failed fdopen leaves the caller's descriptor open.
         self.setGuestErrno(@intFromEnum(std.c.E.NOMEM));
         return null;
     };
+    const file = self.guestFileFromHandle(handle).?;
+    file.descriptor_alias = guest_fd;
+    file.descriptor_generation = borrowed.generation;
+    file.descriptor_alias_is_primary = true;
     machoCapturePrint(
-        "macho-processor: fdopen: guest_fd={d} host_fd={d} mode={s} -> FILE=0x{x}\n",
-        .{ guest_fd, host_fd, mode, handle },
+        "macho-processor: fdopen: guest_fd={d} host_fd={d} generation={d} mode={s} -> FILE=0x{x}\n",
+        .{ guest_fd, borrowed.host_fd, borrowed.generation, mode, handle },
     );
     return handle;
 }
@@ -274,22 +278,41 @@ pub fn handleFdopen(self: anytype) ?u64 {
 pub fn handleFileno(self: anytype) u64 {
     const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
     if (file.descriptor_alias != std.math.maxInt(u64) and
-        self.fs_forwarder.fd_manager.hostFd(file.descriptor_alias) != null)
+        self.fs_forwarder.fd_manager.generationMatches(file.descriptor_alias, file.descriptor_generation))
     {
         return file.descriptor_alias;
+    }
+    if (file.descriptor_alias != std.math.maxInt(u64)) {
+        self.setGuestErrno(@intFromEnum(std.c.E.BADF));
+        return @bitCast(@as(i64, -1));
     }
     const duplicate = std.c.dup(file.fd);
     if (duplicate < 0) return @bitCast(@as(i64, -1));
     const guest_fd = self.fs_forwarder.fd_manager.register(duplicate, .file) orelse return @bitCast(@as(i64, -1));
+    const borrowed = self.fs_forwarder.fd_manager.borrowForStream(guest_fd).?;
     file.descriptor_alias = guest_fd;
+    file.descriptor_generation = borrowed.generation;
     return guest_fd;
 }
 
 pub fn handleFclose(self: anytype) u64 {
     const file = self.guestFileFromHandle(self.regs.rdi) orelse return @bitCast(@as(i64, -1));
     if (file.descriptor_alias != std.math.maxInt(u64)) {
-        _ = self.fs_forwarder.fd_manager.close(file.descriptor_alias);
+        const alias_is_primary = file.descriptor_alias_is_primary;
+        const close_result = self.fs_forwarder.fd_manager.closeGeneration(
+            file.descriptor_alias,
+            file.descriptor_generation,
+        );
         file.descriptor_alias = std.math.maxInt(u64);
+        if (alias_is_primary) file.fd = -1;
+        if (close_result != 0) {
+            if (!alias_is_primary and file.kind == .regular and file.fd >= 0) {
+                _ = std.c.close(file.fd);
+            }
+            self.setGuestErrno(@intFromEnum(std.c.E.BADF));
+            file.* = .{};
+            return @bitCast(@as(i64, -1));
+        }
     }
     if (file.kind == .regular and file.fd >= 0) {
         if (std.c.close(file.fd) != 0) {

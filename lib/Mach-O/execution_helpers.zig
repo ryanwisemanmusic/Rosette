@@ -10,6 +10,7 @@ const x64_decoder = @import("x64_decoder");
 const DecodedInsn = x64_decoder.DecodedInsn;
 const BitScanKind = x64_decoder.BitScanKind;
 const bitScan = x64_decoder.bitScan;
+const decoder = @import("decoder.zig");
 const VexArithmetic = @import("decoder.zig").VexArithmetic;
 const VexBitwise = @import("decoder.zig").VexBitwise;
 const applyVexArithmetic = @import("decoder.zig").applyVexArithmetic;
@@ -277,4 +278,108 @@ pub fn executeVexBitwise(self: anytype, d: DecodedInsn, operation: VexBitwise) v
     } else {
         @memset(&self.ymm_hi[d.xmm_dst], 0);
     }
+}
+
+/// VCMPPS / VCMPPD — packed compare to a lane mask.
+///
+/// Returns false when the predicate is one this interpreter does not model, so
+/// the caller leaves the instruction unexecuted instead of writing a mask built
+/// from a guess. A wrong mask is a wrong branch in the guest with nothing
+/// anywhere to indicate it happened.
+pub fn executeVexComparePacked(self: anytype, d: DecodedInsn, comptime double: bool) bool {
+    const predicate = decoder.VexComparePredicate.fromImmediate(@truncate(d.imm)) orelse return false;
+    const compare = if (double) decoder.compareVexPackedF64 else decoder.compareVexPackedF32;
+
+    const right_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    self.xmm[d.xmm_dst] = compare(self.xmm[d.xmm_src], right_low, predicate);
+    if (d.vector_256) {
+        const right_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+        self.ymm_hi[d.xmm_dst] = compare(self.ymm_hi[d.xmm_src], right_high, predicate);
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+    return true;
+}
+
+/// VCMPSS / VCMPSD — scalar compare. Only the low lane is compared; the rest of
+/// the destination is taken from the first source, which is what makes this a
+/// merge rather than a write.
+pub fn executeVexCompareScalar(self: anytype, d: DecodedInsn, comptime double: bool) bool {
+    const predicate = decoder.VexComparePredicate.fromImmediate(@truncate(d.imm)) orelse return false;
+    const width = if (double) 8 else 4;
+    const Lane = if (double) u64 else u32;
+    const Float = if (double) f64 else f32;
+
+    const left: Float = @bitCast(std.mem.readInt(Lane, self.xmm[d.xmm_src][0..width], .little));
+    const right_bits: Lane = if (d.is_reg_form)
+        std.mem.readInt(Lane, self.xmm[d.xmm_src2][0..width], .little)
+    else
+        @truncate(self.readMemVal(d.addr, if (double) .bits64 else .bits32));
+    const right: Float = @bitCast(right_bits);
+
+    self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+    const mask: Lane = if (predicate.evaluate(left, right)) ~@as(Lane, 0) else 0;
+    std.mem.writeInt(Lane, self.xmm[d.xmm_dst][0..width], mask, .little);
+    @memset(&self.ymm_hi[d.xmm_dst], 0);
+    return true;
+}
+
+/// VCVTDQ2PS / VCVTPS2DQ / VCVTTPS2DQ — packed conversion between signed
+/// dwords and singles. Two operands: the destination is written whole, so
+/// unlike the scalar forms there is nothing to merge.
+pub fn executeVexConvertPacked(
+    self: anytype,
+    d: DecodedInsn,
+    comptime direction: enum { dword_to_float, float_to_dword_round, float_to_dword_truncate },
+) void {
+    const convert = struct {
+        fn apply(source: [16]u8) [16]u8 {
+            return switch (direction) {
+                .dword_to_float => decoder.convertVexPackedDwordToFloat(source),
+                .float_to_dword_round => decoder.convertVexPackedFloatToDword(source, false),
+                .float_to_dword_truncate => decoder.convertVexPackedFloatToDword(source, true),
+            };
+        }
+    }.apply;
+
+    const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    self.xmm[d.xmm_dst] = convert(source_low);
+    if (d.vector_256) {
+        const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+        self.ymm_hi[d.xmm_dst] = convert(source_high);
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+/// VRCPPS / VRSQRTPS — packed approximate reciprocal. Two operands.
+pub fn executeVexReciprocalPacked(self: anytype, d: DecodedInsn, comptime square_root: bool) void {
+    const source_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+    self.xmm[d.xmm_dst] = decoder.reciprocalVexPackedF32(source_low, square_root);
+    if (d.vector_256) {
+        const source_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+        self.ymm_hi[d.xmm_dst] = decoder.reciprocalVexPackedF32(source_high, square_root);
+    } else {
+        @memset(&self.ymm_hi[d.xmm_dst], 0);
+    }
+}
+
+/// VRCPSS / VRSQRTSS — scalar approximate reciprocal. Three operands: only the
+/// low lane is computed, and the upper lanes come from the *first* source
+/// rather than from the operand being reciprocated. Taking them from the wrong
+/// place is invisible in any test that only inspects lane zero.
+pub fn executeVexReciprocalScalar(self: anytype, d: DecodedInsn, comptime square_root: bool) void {
+    const source_bits: u32 = if (d.is_reg_form)
+        std.mem.readInt(u32, self.xmm[d.xmm_src2][0..4], .little)
+    else
+        @truncate(self.readMemVal(d.addr, .bits32));
+    const value: f32 = @bitCast(source_bits);
+    const computed = if (square_root)
+        decoder.approximateReciprocalSqrt(value)
+    else
+        decoder.approximateReciprocal(value);
+
+    self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
+    std.mem.writeInt(u32, self.xmm[d.xmm_dst][0..4], @bitCast(computed), .little);
+    @memset(&self.ymm_hi[d.xmm_dst], 0);
 }

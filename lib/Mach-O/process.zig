@@ -39,6 +39,7 @@ const libcpp_stream_bridge = @import("io").libcpp_stream_bridge;
 const vtt_resolution = @import("dyld").vtt_resolver;
 const foreign_object_runtime = @import("guest_abi").foreign_object_runtime;
 const native_window_runtime = @import("guest_abi").native_window_runtime;
+const sdl_runtime = @import("guest_abi").sdl_runtime;
 const logging_runtime = @import("diagnostics").logging_runtime;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const xenia_pipeline = @import("diagnostics").xenia_pipeline;
@@ -102,6 +103,7 @@ const guest_address_space = @import("guest_address_space");
 const ownership_lib = @import("ownership");
 const dispatch_recovery = @import("dispatch_recovery");
 const gpu = @import("gpu");
+const device_tree = @import("device_tree");
 const guest_structure = @import("guest_structure");
 const execution_history = @import("execution_history");
 const ExecutionHistory = execution_history.History(TraceEntry);
@@ -556,6 +558,7 @@ pub const MachOState = struct {
     libcxx_filesystem: libcpp_filesystem.Bridge = .{},
     libcxx_streams: libcpp_stream_bridge.Bridge = .{},
     foreign_objects: foreign_object_runtime.Runtime = .{},
+    sdl: sdl_runtime.Runtime = .{},
     native_window: native_window_runtime.Runtime = .{},
     native_window_handles_registered: bool = false,
     local_libcpp_stream_targets: std.AutoHashMap(u64, []const u8),
@@ -663,6 +666,12 @@ pub const MachOState = struct {
     /// which step was the first not to happen and whether it was reachable —
     /// the only reading that decides whether to look at the GPU at all.
     gpu_bootstrap: gpu.Contract = .{},
+    /// VdSwap's call, encoding, completion, publication and consumption are
+    /// distinct facts. The call itself comes from execution tracepoints; these
+    /// two stages come from Xenia's structured encoder contract, while the
+    /// bootstrap's final step requires an authentic CP-consumed XE_SWAP.
+    guest_vdswap_packet_encoded: bool = false,
+    guest_vdswap_entry_completed: bool = false,
     /// Physical base and size of the ring the guest named in
     /// VdInitializeRingBuffer. Learned from the guest's own call, because that
     /// is the only moment the address exists.
@@ -676,6 +685,14 @@ pub const MachOState = struct {
     /// did — which is what sends a no-frame investigation past the producer and
     /// into the command processor.
     gpu_ring_publication: gpu.RingPublication = .{},
+    /// Guest traffic to the Xenos memory-mapped register aperture. The pages
+    /// behind it are unreadable by design, so every register access the title
+    /// performs arrives as a protection fault and nowhere else — which makes
+    /// this the only place that can say whether the title programmed the GPU
+    /// at all. Without it, "the guest never wrote CP_RB_BASE" and "the guest
+    /// wrote it and Rosette lost the store" produce identical evidence:
+    /// nothing.
+    gpu_register_aperture: gpu.RegisterApertureObserver = .{},
     /// The guest critical section the GPU path registered, put under write
     /// provenance so a later zero-owner contention can say whether anything
     /// ever wrote it. Learned from the guest's own registration, because that
@@ -839,6 +856,11 @@ pub const MachOState = struct {
     decode_cache_misses: u64 = 0,
     decode_cache_stale_rejections: u64 = 0,
     code_generation: u64 = 1,
+    /// Previous heartbeat's reading of the acceleration counters. See
+    /// `types.PerformanceSample`: the counters are sampled per heartbeat so a
+    /// timed-out run still reports its throughput, and reported as deltas so
+    /// the fast startup prefix does not average away the steady state.
+    performance_sample: types.PerformanceSample = .{},
     mapped_min: u64,
     /// End of the immutable Mach-O image, before the forwarded guest heap.
     /// Used as a two-comparison filter for rare image-owned vtable values so
@@ -1742,7 +1764,9 @@ pub const MachOState = struct {
         const wanted = [_]struct { fragment: []const u8, role: execution_tracepoints.Role }{
             .{ .fragment = "VdSwap_entry", .role = .swap },
             .{ .fragment = "NotifyVdSwapCall", .role = .swap },
-            .{ .fragment = "IssueSwap", .role = .swap },
+            .{ .fragment = "IssueSwap", .role = .command_swap },
+            .{ .fragment = "ExecutePacketType3_XE_SWAP", .role = .xe_swap_decode },
+            .{ .fragment = "DebugIssueSwapFromHost", .role = .diagnostic_swap },
             .{ .fragment = "VdInitializeRingBuffer_entry", .role = .ring_publication },
             .{ .fragment = "VdEnableRingBufferRPtrWriteBack_entry", .role = .ring_publication },
             .{ .fragment = "ExecutePrimaryBuffer", .role = .command_processor },
@@ -1769,6 +1793,15 @@ pub const MachOState = struct {
             while (iterator.next()) |symbol| {
                 const name = symbol.key_ptr.*;
                 if (std.mem.indexOf(u8, name, target.fragment) == null) continue;
+                // `DebugIssueSwapFromHost` contains `IssueSwap`, but it is a
+                // different provenance boundary. Without this exclusion a
+                // forced host probe is armed twice and can be misreported as
+                // authentic guest progress.
+                if (target.role == .command_swap and
+                    std.mem.indexOf(u8, name, "DebugIssueSwapFromHost") != null)
+                {
+                    continue;
+                }
                 const address = symbol.value_ptr.*;
                 matches += 1;
                 // A guard variable or a static inside the function carries the
@@ -1832,7 +1865,7 @@ pub const MachOState = struct {
     /// The instruction pointer reached an armed boundary. Only the first entry
     /// is reported: the rest are a frame rate, and the first is the fact the
     /// investigation has been missing.
-    fn noteExecutionTracepoint(self: *MachOState) void {
+    noinline fn noteExecutionTracepoint(self: *MachOState) void {
         // At a function's entry instruction the return address is still on top
         // of the stack, so the caller is knowable without unwinding.
         const caller = self.read64(self.regs.rsp);
@@ -1902,6 +1935,56 @@ pub const MachOState = struct {
         machoCapturePrint("macho-processor: NOTIFIER LIVENESS GUIDANCE: {s}\n", .{progress.guidance()});
     }
 
+    /// Guest traffic to the GPU register aperture, and what it licenses a
+    /// reader to conclude.
+    ///
+    /// This report is deliberately emitted even when the count is zero. Zero is
+    /// the whole finding: the aperture faults on every access, so an empty
+    /// table is positive evidence that the title never programmed the GPU, and
+    /// that is a statement about the title rather than about the graphics
+    /// stack. Suppressing it would leave exactly the silence this was built to
+    /// remove.
+    pub fn logRegisterApertureTraffic(self: *const MachOState) void {
+        const observer = &self.gpu_register_aperture;
+        const ring = observer.ringSetupWrites();
+        machoCapturePrint(
+            "  gpu register aperture: base=0x{x} size=0x{x} reads={d} writes={d} delivered={d} undelivered={d} ring_setup_writes={d} (delivered={d}) registers_touched={d} untracked={d} misaligned={d} verdict={s}; {s}\n",
+            .{
+                device_tree.gpu.xenos.register_aperture_base,
+                device_tree.gpu.xenos.register_aperture_size,
+                observer.total_reads,
+                observer.total_writes,
+                observer.total_delivered,
+                observer.total_undelivered,
+                ring.writes,
+                ring.delivered,
+                observer.count,
+                observer.untracked_accesses,
+                observer.misaligned,
+                @tagName(observer.verdict()),
+                observer.verdict().describe(),
+            },
+        );
+        for (observer.registers[0..observer.count]) |entry| {
+            machoCapturePrint(
+                "    register index=0x{x} {s} reads={d} writes={d} delivered={d} undelivered={d} last_value=0x{x} nonzero_write={} first_step={d} first_rip=0x{x} first_thread=0x{x}\n",
+                .{
+                    entry.index,
+                    entry.name(),
+                    entry.reads,
+                    entry.writes,
+                    entry.delivered,
+                    entry.undelivered,
+                    entry.last_value,
+                    entry.saw_nonzero_write,
+                    entry.first_step,
+                    entry.first_rip,
+                    entry.first_thread,
+                },
+            );
+        }
+    }
+
     /// Anomalies with their dispositions, so a non-zero count is either acted
     /// on or explicitly dismissed rather than accumulating unread.
     pub fn logAnomalyLedger(self: *const MachOState) void {
@@ -1969,15 +2052,38 @@ pub const MachOState = struct {
         self.graphics_last_ring_published = ring_published;
         self.graphics_last_anomaly_count = self.anomalies.count;
 
-        // Heartbeats already say that execution is alive. Repeat the lengthy
-        // causal report only when its state changes, every 16 heartbeats as a
-        // bounded timeout checkpoint, or at shutdown. This keeps an active PM4
-        // stream from turning diagnosis itself into the workload.
-        if (!force and !state_changed and self.graphics_summary_emissions % 16 != 0) {
+        // Heartbeats already say that execution is alive. The complete report
+        // includes every tracepoint and the full thread census, so emit it only
+        // on an actual state transition or at shutdown. A compact unchanged
+        // checkpoint every 64 calls preserves liveness without making the
+        // observer itself the dominant source of log traffic.
+        if (!force and !state_changed) {
+            if (self.graphics_summary_emissions % 64 != 0) return;
+            machoCapturePrint(
+                "macho-processor: GRAPHICS FRONTIER unchanged: run=0x{x} step={d} checkpoint={d} bootstrap={d}/{d} frontier={s} guest_vdswap_call_seen={s} guest_vdswap_entry_completed={s} guest_swap_command_buffer_write_seen={s} guest_swap_publication_proven={s} guest_pm4_xe_swap_seen={s} cp_xe_swap_decode_seen={s} host_issue_swap_seen={s} diagnostic_injection_seen={s} presenter_refresh_seen={s} ring_published={s}\n",
+                .{
+                    self.event_stream.run_id,
+                    self.executed_steps,
+                    self.graphics_summary_emissions,
+                    frontier.reached,
+                    gpu.bootstrap.required_step_count,
+                    if (frontier.step) |pending| pending.label() else "<complete>",
+                    if (tracepoints.roleEntered(.swap)) "YES" else "NO",
+                    if (self.guest_vdswap_entry_completed) "YES" else "NO",
+                    if (self.guest_vdswap_packet_encoded) "YES" else "NO",
+                    if (self.gpu_bootstrap.seen(.swap)) "YES" else "NO",
+                    if (self.gpu_bootstrap.seen(.swap)) "YES" else "NO",
+                    if (tracepoints.roleEntered(.xe_swap_decode)) "YES" else "NO",
+                    if (tracepoints.roleEntered(.command_swap)) "YES" else "NO",
+                    if (tracepoints.roleEntered(.diagnostic_swap)) "YES" else "NO",
+                    if (tracepoints.roleEntered(.presenter)) "YES" else "NO",
+                    if (ring_published) "YES" else "NO",
+                },
+            );
             return;
         }
         machoCapturePrint(
-            "macho-processor: GRAPHICS FRONTIER #{d}: run=0x{x} step={d} events={d} swap={s}\n",
+            "macho-processor: GRAPHICS FRONTIER #{d}: run=0x{x} step={d} events={d} guest_vdswap_call={s}\n",
             .{
                 self.graphics_summary_emissions,
                 self.event_stream.run_id,
@@ -2001,6 +2107,7 @@ pub const MachOState = struct {
                 );
             }
         }
+        self.logRegisterApertureTraffic();
         const publication = &self.gpu_ring_publication;
         machoCapturePrint(
             "  ring writes={d} advances={d} repeats={d} span={s} published={s}; {s}\n",
@@ -2146,7 +2253,12 @@ pub const MachOState = struct {
         for (&self.guest_files) |*file| {
             if (!file.active) continue;
             if (file.descriptor_alias != std.math.maxInt(u64)) {
-                _ = self.fs_forwarder.fd_manager.close(file.descriptor_alias);
+                const alias_is_primary = file.descriptor_alias_is_primary;
+                _ = self.fs_forwarder.fd_manager.closeGeneration(
+                    file.descriptor_alias,
+                    file.descriptor_generation,
+                );
+                if (alias_is_primary) file.fd = -1;
             }
             if (file.kind == .regular and file.fd >= 0) {
                 _ = std.c.close(file.fd);
@@ -2234,7 +2346,7 @@ pub const MachOState = struct {
         }
     }
 
-    fn handleStubHelperTransition(self: *MachOState) bool {
+    noinline fn handleStubHelperTransition(self: *MachOState) bool {
         // Lazy helper decoding used to touch guest memory for every interpreted
         // instruction. All classic helper entries live in __stub_helper, so the
         // overwhelmingly common path can reject them without translation or
@@ -2631,7 +2743,14 @@ pub const MachOState = struct {
         import_dispatch.recordUnresolvedImport(self, imported, return_address, synthetic_result);
     }
 
-    fn continueGuestExit(self: *MachOState) bool {
+    // F1 (throughput audit): `noinline` on the special-RIP chain and the
+    // sentinel handlers. Every one of these is reached at most once per step,
+    // and only when `specialRipPossible()` (or a sentinel compare) already
+    // said so — which is false for essentially every instruction. Inlined,
+    // their bodies and their diagnostic formatting sat inside `step`, on the
+    // same cache lines as the fetch/decode/dispatch sequence that does run
+    // every instruction. Cost when they do fire: one `bl`.
+    noinline fn continueGuestExit(self: *MachOState) bool {
         return import_dispatch.continueGuestExit(self);
     }
 
@@ -2660,7 +2779,7 @@ pub const MachOState = struct {
         return signal_handling.ensureGuestSignalFrameStorage(self, frame);
     }
 
-    pub fn finishGuestSignalReturn(self: *MachOState) bool {
+    pub noinline fn finishGuestSignalReturn(self: *MachOState) bool {
         return signal_handling.finishGuestSignalReturn(self);
     }
 
@@ -2941,19 +3060,23 @@ pub const MachOState = struct {
         }
     }
 
-    pub fn regVal(self: *const MachOState, id: RegId, size: Size) u64 {
+    // F2 (throughput audit): these four forward to the register-file accessors
+    // and must not become call frames of their own. Before `inline`, the
+    // shipped binary contained 60 out-of-line `bl` to this wrapper and 33 to
+    // `setReg` from `execute` alone.
+    pub inline fn regVal(self: *const MachOState, id: RegId, size: Size) u64 {
         return x64_decoder.regVal(&self.regs, id, size);
     }
 
-    pub fn setReg(self: *MachOState, id: RegId, size: Size, val: u64) void {
+    pub inline fn setReg(self: *MachOState, id: RegId, size: Size, val: u64) void {
         x64_decoder.setReg(&self.regs, id, size, val);
     }
 
-    pub fn regOperandVal(self: *const MachOState, id: RegId, size: Size, high8: bool) u64 {
+    pub inline fn regOperandVal(self: *const MachOState, id: RegId, size: Size, high8: bool) u64 {
         return x64_decoder.registerOperandValue(&self.regs, .{ .id = id, .high8 = high8 }, size);
     }
 
-    pub fn setRegOperand(self: *MachOState, id: RegId, size: Size, high8: bool, val: u64) void {
+    pub inline fn setRegOperand(self: *MachOState, id: RegId, size: Size, high8: bool, val: u64) void {
         x64_decoder.setRegisterOperand(&self.regs, .{ .id = id, .high8 = high8 }, size, val);
     }
 
@@ -3289,7 +3412,7 @@ pub const MachOState = struct {
         return compat_handlers.handleLibcppBasicStringSubstr(self);
     }
 
-    pub fn handleInternalCompatibility(self: *MachOState) bool {
+    pub noinline fn handleInternalCompatibility(self: *MachOState) bool {
         return compat_handlers.handleInternalCompatibility(self);
     }
 
@@ -3313,15 +3436,15 @@ pub const MachOState = struct {
         return compat_handlers.handleCxxoptsSplitOptionNames(self);
     }
 
-    pub fn handleTomlAsciiFastPath(self: *MachOState) bool {
+    pub noinline fn handleTomlAsciiFastPath(self: *MachOState) bool {
         return compat_handlers.handleTomlAsciiFastPath(self);
     }
 
-    pub fn handleTomlReadNextIntegrity(self: *MachOState) void {
+    pub noinline fn handleTomlReadNextIntegrity(self: *MachOState) void {
         compat_handlers.handleTomlReadNextIntegrity(self);
     }
 
-    pub fn handlePatchDbEmptyPatchArray(self: *MachOState) bool {
+    pub noinline fn handlePatchDbEmptyPatchArray(self: *MachOState) bool {
         return compat_handlers.handlePatchDbEmptyPatchArray(self);
     }
 
@@ -3490,6 +3613,31 @@ pub const MachOState = struct {
     /// Decode the instruction at the current RIP and resolve its memory operand
     /// against the **live** register file, via the decode cache. This is the
     /// execution path's decoder; the other two are readers.
+    /// Whether a cached decode's address has to be recomputed from live registers.
+    ///
+    /// The address is `displacement + base + index*scale (+ segment base)`. Every
+    /// term but the registers and the FS/GS base is fixed for the lifetime of a
+    /// cache entry, so an instruction that names no base and no index resolves to
+    /// the same address on every hit — the one already stored when the entry was
+    /// populated. Re-deriving it meant every register-form instruction, every
+    /// immediate form and every jump paid `resolveMemoryAddress` to arrive back at
+    /// the value it started with.
+    ///
+    /// FS and GS are the exception and are treated as live: in long mode they are
+    /// the only segments with a non-zero base, and a thread-local access moves when
+    /// the thread does.
+    ///
+    /// Note what this deliberately does *not* do: cache the resolved address
+    /// against a "the registers still hold these values" stamp. Deciding that the
+    /// stamp still matches requires reading the base and index registers, and
+    /// reading them through `regVal`'s register switch is the expensive half of the
+    /// resolution — so the check would cost about what it saves.
+    pub fn addressNeedsLiveRegisters(decoded: DecodedInsn) bool {
+        if (decoded.rip_relative) return false;
+        return decoded.sib_has_base or decoded.sib_has_index or
+            decoded.segment == .fs or decoded.segment == .gs;
+    }
+
     fn decodeWithLiveOperands(self: *MachOState) ?DecodedInsn {
         const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
         const cache_index = constants.decodeCacheIndex(fetch_address);
@@ -3506,7 +3654,7 @@ pub const MachOState = struct {
         if (entry.rip == fetch_address and entry.code_generation == self.code_generation) {
             self.decode_cache_hits +|= 1;
             var decoded = entry.decoded;
-            if (!decoded.rip_relative) {
+            if (addressNeedsLiveRegisters(decoded)) {
                 const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
                 decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
                     .displacement = entry.displacement,
@@ -3542,7 +3690,7 @@ pub const MachOState = struct {
             self.decode_cache_hits +|= 1;
             entry.code_generation = self.code_generation;
             var decoded = entry.decoded;
-            if (!decoded.rip_relative) {
+            if (addressNeedsLiveRegisters(decoded)) {
                 const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
                 decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
                     .displacement = entry.displacement,
@@ -3606,6 +3754,177 @@ pub const MachOState = struct {
         return decoded;
     }
 
+    /// F1 (throughput audit): terminal decode diagnostics, held off the fetch
+    /// path.
+    ///
+    /// Both bodies below run at most once per process — they end the run — and
+    /// both were inlined into `step`, where they accounted for roughly half of
+    /// its 18.7 KB and shared cache lines with the fetch/dispatch sequence that
+    /// runs every instruction. Same reporting, same exit codes, same order;
+    /// only the address changed. Returns `step`'s return value directly so the
+    /// call sites stay one-liners.
+    noinline fn reportDecodeFailure(self: *MachOState) bool {
+        if (self.terminated) return false;
+        const rip = self.regs.rip;
+        machoCapturePrint("macho-processor: decode failed at rip=0x{x}\n", .{rip});
+        if (self.sparse_memory.containsMapped(rip, 1)) {
+            const bytes = self.executableInstructionBytesAt(rip) orelse
+                self.sparse_memory.bytesConst(rip, 1) orelse &.{};
+            machoCapturePrint(
+                "macho-processor: decode failed in sparse generated-code mapping: mapped=true executable={} readable={} bytes={any}; this is not an unmapped Mach-O address\n",
+                .{
+                    self.sparse_memory.isExecutable(rip, 1),
+                    self.sparse_memory.bytesConst(rip, 1) != null,
+                    bytes,
+                },
+            );
+        } else if (self.fileOffsetForVaddr(rip)) |file_off| {
+            const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
+            const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
+            machoCapturePrint("macho-processor: decode failed file_offset=0x{x} bytes={any}\n", .{ file_off, file_bytes });
+        } else {
+            machoCapturePrint("macho-processor: decode failed at unmapped address\n", .{});
+        }
+        self.faulted = true;
+        self.exit_code = 127;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.decode_failed);
+        self.terminated = true;
+        return false;
+    }
+
+    /// Operator-requested per-instruction trace for an explicit RIP window.
+    /// Inert unless `trace_range_start` was set, so its formatting has no
+    /// business sharing cache lines with the dispatch sequence.
+    noinline fn emitTargetTrace(self: *MachOState, decoded: DecodedInsn) void {
+        const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
+        const trace_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
+        const trace_key = self.regs.rip;
+        const op_key = @intFromEnum(decoded.op);
+        if (trace_key == self.last_trace_rip and op_key == self.last_trace_op) {
+            self.trace_repeat_count +|= 1;
+            return;
+        }
+        if (self.trace_repeat_count > 0) {
+            log.info("target-trace: previous trace repeated {d} times", .{self.trace_repeat_count + 1});
+        }
+        self.last_trace_rip = trace_key;
+        self.last_trace_op = op_key;
+        self.trace_repeat_count = 0;
+        log.info("target-trace: rip=0x{x} op={s} len={d} bytes={any} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
+            self.regs.rip,
+            @tagName(decoded.op),
+            decoded.len,
+            trace_bytes,
+            self.regs.rsp,
+            self.regs.rax,
+            self.regs.rcx,
+            self.regs.rdx,
+        });
+    }
+
+    /// Fires once, on the 24th recorded bootstrap instruction.
+    noinline fn reportCoopBootstrapComplete(self: *MachOState) void {
+        self.coop_bootstrap_active = false;
+        const first = &self.coop_bootstrap_entries[0];
+        const last = &self.coop_bootstrap_entries[23];
+        const symbol = self.metadata.nearestSymbol(first.rip);
+        machoCapturePrint(
+            "macho-processor: GTK worker bootstrapping successful: thread=0x{x} first_rip=0x{x} last_rip=0x{x} first_symbol={s}\n",
+            .{
+                first.thread,                            first.rip, last.rip,
+                if (symbol) |s| s.name else "<unknown>",
+            },
+        );
+    }
+
+    /// RIP is not an executable instruction target: either a recoverable
+    /// generated-dispatch miss, or the end of the run.
+    ///
+    /// Held off the fetch path for the same reason as the two reporters below
+    /// it. The recovery attempt lives here too rather than at the call site,
+    /// because it is reached only through this same failed predicate — one
+    /// `bl` on a path taken once per process, against a branch that `step`
+    /// evaluates on every instruction.
+    noinline fn recoverNonExecutableRip(self: *MachOState) bool {
+        if (self.pending_control_transfer) |context| {
+            // Generated code dispatching to an unpatched Xenia indirection
+            // sentinel (a guest-module address) is the same recoverable
+            // code-cache miss as a null function pointer: skip the
+            // transfer and keep the run alive. The target poll below runs
+            // only at this terminal raise site, never on the hot path.
+            // Only recover when the failed RIP is exactly the transfer
+            // target: a stale pending context (from an earlier transfer
+            // that was never consulted) must not hijack an unrelated
+            // non-executable RIP.
+            if (context.target_address == self.regs.rip and
+                memory_access.tryRecoverGeneratedGuestDispatchMiss(self, context, context.return_address != 0))
+            {
+                return true;
+            }
+            memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
+            memory_access.logNonExecutableTarget(self, self.regs.rip, context);
+            self.terminateForInvalidControlTransfer(context);
+            self.dumpRecentTrace();
+            return false;
+        }
+        memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
+        memory_access.logNonExecutableTarget(self, self.regs.rip, null);
+        machoCapturePrint(
+            "macho-processor: invalid control-flow target rip=0x{x}; address is not an executable instruction target\n",
+            .{self.regs.rip},
+        );
+        self.dumpRecentTrace();
+        self.faulted = true;
+        self.exit_code = 127;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+        self.terminated = true;
+        return false;
+    }
+
+    noinline fn reportInvalidInstruction(self: *MachOState) bool {
+        const mem_bytes = self.executableInstructionBytesAt(self.regs.rip) orelse &.{};
+        const rip = self.regs.rip;
+        if (self.addrToOffset(rip)) |mem_off| {
+            machoCapturePrint("macho-processor: invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}\n", .{ rip, mem_off, mem_bytes });
+        } else if (self.sparse_memory.containsMapped(rip, 1)) {
+            machoCapturePrint("macho-processor: invalid instruction in sparse generated code at rip=0x{x}, bytes: {any}\n", .{ rip, mem_bytes });
+        } else {
+            machoCapturePrint("macho-processor: invalid instruction at unmapped rip=0x{x}, bytes: {any}\n", .{ rip, mem_bytes });
+        }
+        if (x64_decoder.capabilities.classifyRequirement(mem_bytes)) |requirement| {
+            machoCapturePrint(
+                "macho-processor: ISA requirement: {s} encoding requires {s}; virtual profile={s}, advertised={}\n",
+                .{
+                    @tagName(requirement.encoding),
+                    x64_decoder.capabilities.featureLabel(requirement.feature),
+                    self.cpu_profile.label(),
+                    x64_decoder.capabilities.supports(self.cpu_profile, requirement.feature),
+                },
+            );
+        }
+        if (self.fileOffsetForVaddr(rip)) |file_off| {
+            const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
+            const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
+            machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=0x{x} file_bytes={any}\n", .{ rip, file_off, file_bytes });
+        } else {
+            machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=<unmapped>\n", .{rip});
+        }
+        self.dumpStepTraceBuffer();
+        self.dumpCoopBootstrapTrace();
+        self.dumpMemInitTrace();
+        self.dumpCoopHeartbeatTrace();
+        self.dumpUiHandoffTrace();
+        self.dumpRecentTrace();
+        if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, 1, self.regs.rip, null, 0, mem_bytes)) {
+            return true;
+        }
+        self.faulted = true;
+        self.exit_code = 127;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
+        self.terminated = true;
+        return false;
+    }
+
     pub fn step(self: *MachOState) bool {
         if (@import("builtin").mode != .ReleaseFast) self.observeProfileAccountFlow();
         if (self.regs.rip == GUEST_ATEXIT_RETURN_SENTINEL) {
@@ -3637,113 +3956,10 @@ pub const MachOState = struct {
             if (self.handleTomlAsciiFastPath()) return !self.terminated;
             if (self.handlePatchDbEmptyPatchArray()) return !self.terminated;
         }
-        if (!self.isExecutableAddress(self.regs.rip)) {
-            if (self.pending_control_transfer) |context| {
-                // Generated code dispatching to an unpatched Xenia indirection
-                // sentinel (a guest-module address) is the same recoverable
-                // code-cache miss as a null function pointer: skip the
-                // transfer and keep the run alive. The target poll below runs
-                // only at this terminal raise site, never on the hot path.
-                // Only recover when the failed RIP is exactly the transfer
-                // target: a stale pending context (from an earlier transfer
-                // that was never consulted) must not hijack an unrelated
-                // non-executable RIP.
-                if (context.target_address == self.regs.rip and
-                    memory_access.tryRecoverGeneratedGuestDispatchMiss(self, context, context.return_address != 0))
-                {
-                    return true;
-                }
-                memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
-                memory_access.logNonExecutableTarget(self, self.regs.rip, context);
-                self.terminateForInvalidControlTransfer(context);
-                self.dumpRecentTrace();
-                return false;
-            }
-            memory_access.dumpGuestDispatchTargetPoll(self, self.regs.rip);
-            memory_access.logNonExecutableTarget(self, self.regs.rip, null);
-            machoCapturePrint(
-                "macho-processor: invalid control-flow target rip=0x{x}; address is not an executable instruction target\n",
-                .{self.regs.rip},
-            );
-            self.dumpRecentTrace();
-            self.faulted = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
-            self.terminated = true;
-            return false;
-        }
+        if (!self.isExecutableAddress(self.regs.rip)) return self.recoverNonExecutableRip();
         self.pending_control_transfer = null;
-        const decoded = self.decodeWithLiveOperands() orelse {
-            if (self.terminated) return false;
-            const rip = self.regs.rip;
-            machoCapturePrint("macho-processor: decode failed at rip=0x{x}\n", .{rip});
-            if (self.sparse_memory.containsMapped(rip, 1)) {
-                const bytes = self.executableInstructionBytesAt(rip) orelse
-                    self.sparse_memory.bytesConst(rip, 1) orelse &.{};
-                machoCapturePrint(
-                    "macho-processor: decode failed in sparse generated-code mapping: mapped=true executable={} readable={} bytes={any}; this is not an unmapped Mach-O address\n",
-                    .{
-                        self.sparse_memory.isExecutable(rip, 1),
-                        self.sparse_memory.bytesConst(rip, 1) != null,
-                        bytes,
-                    },
-                );
-            } else if (self.fileOffsetForVaddr(rip)) |file_off| {
-                const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
-                const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
-                machoCapturePrint("macho-processor: decode failed file_offset=0x{x} bytes={any}\n", .{ file_off, file_bytes });
-            } else {
-                machoCapturePrint("macho-processor: decode failed at unmapped address\n", .{});
-            }
-            self.faulted = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.decode_failed);
-            self.terminated = true;
-            return false;
-        };
-        if (decoded.op == .invalid) {
-            const mem_bytes = self.executableInstructionBytesAt(self.regs.rip) orelse &.{};
-            const rip = self.regs.rip;
-            if (self.addrToOffset(rip)) |mem_off| {
-                machoCapturePrint("macho-processor: invalid instruction at rip=0x{x}, mem_off=0x{x}, bytes: {any}\n", .{ rip, mem_off, mem_bytes });
-            } else if (self.sparse_memory.containsMapped(rip, 1)) {
-                machoCapturePrint("macho-processor: invalid instruction in sparse generated code at rip=0x{x}, bytes: {any}\n", .{ rip, mem_bytes });
-            } else {
-                machoCapturePrint("macho-processor: invalid instruction at unmapped rip=0x{x}, bytes: {any}\n", .{ rip, mem_bytes });
-            }
-            if (x64_decoder.capabilities.classifyRequirement(mem_bytes)) |requirement| {
-                machoCapturePrint(
-                    "macho-processor: ISA requirement: {s} encoding requires {s}; virtual profile={s}, advertised={}\n",
-                    .{
-                        @tagName(requirement.encoding),
-                        x64_decoder.capabilities.featureLabel(requirement.feature),
-                        self.cpu_profile.label(),
-                        x64_decoder.capabilities.supports(self.cpu_profile, requirement.feature),
-                    },
-                );
-            }
-            if (self.fileOffsetForVaddr(rip)) |file_off| {
-                const remaining = if (file_off < self.data.len) self.data.len - file_off else 0;
-                const file_bytes = self.data[file_off..][0..@min(@as(usize, 16), remaining)];
-                machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=0x{x} file_bytes={any}\n", .{ rip, file_off, file_bytes });
-            } else {
-                machoCapturePrint("macho-processor: invalid instruction source-map: rip=0x{x} file_off=<unmapped>\n", .{rip});
-            }
-            self.dumpStepTraceBuffer();
-            self.dumpCoopBootstrapTrace();
-            self.dumpMemInitTrace();
-            self.dumpCoopHeartbeatTrace();
-            self.dumpUiHandoffTrace();
-            self.dumpRecentTrace();
-            if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, 1, self.regs.rip, null, 0, mem_bytes)) {
-                return true;
-            }
-            self.faulted = true;
-            self.exit_code = 127;
-            self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_instruction);
-            self.terminated = true;
-            return false;
-        }
+        const decoded = self.decodeWithLiveOperands() orelse return self.reportDecodeFailure();
+        if (decoded.op == .invalid) return self.reportInvalidInstruction();
         // Instruction history, gated behaviourally rather than by a flag.
         //
         // The predecessor of this line was `if (self.trace_ring_enabled)`, and
@@ -3780,19 +3996,7 @@ pub const MachOState = struct {
                 .len = decoded.len,
             };
             self.coop_bootstrap_index = idx + 1;
-            if (self.coop_bootstrap_index == 24) {
-                self.coop_bootstrap_active = false;
-                const first = &self.coop_bootstrap_entries[0];
-                const last = &self.coop_bootstrap_entries[23];
-                const symbol = self.metadata.nearestSymbol(first.rip);
-                machoCapturePrint(
-                    "macho-processor: GTK worker bootstrapping successful: thread=0x{x} first_rip=0x{x} last_rip=0x{x} first_symbol={s}\n",
-                    .{
-                        first.thread,                            first.rip, last.rip,
-                        if (symbol) |s| s.name else "<unknown>",
-                    },
-                );
-            }
+            if (self.coop_bootstrap_index == 24) self.reportCoopBootstrapComplete();
         }
         if (self.verbose_trace) log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
         // Observe the resolved function entry itself rather than relying on
@@ -3805,32 +4009,7 @@ pub const MachOState = struct {
         {
             self.sha1_tracer.onProcessBytesEntry(self);
         }
-        if (self.shouldTraceRIP(self.regs.rip)) {
-            const mem_off = self.addrToOffset(self.regs.rip) orelse 0;
-            const trace_bytes = self.mem[mem_off..][0..@min(@as(usize, 16), self.mem.len - mem_off)];
-            const trace_key = self.regs.rip;
-            const op_key = @intFromEnum(decoded.op);
-            if (trace_key == self.last_trace_rip and op_key == self.last_trace_op) {
-                self.trace_repeat_count +|= 1;
-            } else {
-                if (self.trace_repeat_count > 0) {
-                    log.info("target-trace: previous trace repeated {d} times", .{self.trace_repeat_count + 1});
-                }
-                self.last_trace_rip = trace_key;
-                self.last_trace_op = op_key;
-                self.trace_repeat_count = 0;
-                log.info("target-trace: rip=0x{x} op={s} len={d} bytes={any} rsp=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x}", .{
-                    self.regs.rip,
-                    @tagName(decoded.op),
-                    decoded.len,
-                    trace_bytes,
-                    self.regs.rsp,
-                    self.regs.rax,
-                    self.regs.rcx,
-                    self.regs.rdx,
-                });
-            }
-        }
+        if (self.shouldTraceRIP(self.regs.rip)) self.emitTargetTrace(decoded);
         const old_rip = self.regs.rip;
         x64_interpreter.execute(self, decoded);
         if (!self.terminated and self.regs.rip == old_rip) {
@@ -3895,7 +4074,7 @@ pub const MachOState = struct {
         return scheduling.refreshSuspendedRunnableCache(self);
     }
 
-    pub fn finishActiveGuestThread(self: *MachOState) void {
+    pub noinline fn finishActiveGuestThread(self: *MachOState) void {
         scheduling.finishActiveGuestThread(self);
     }
 
@@ -3927,8 +4106,12 @@ pub const MachOState = struct {
         return scheduling.isSyntheticCallbackHandle(self, handle);
     }
 
+    pub fn isIdleCallbackHandle(self: *const MachOState, handle: u64) bool {
+        return scheduling.isIdleCallbackHandle(self, handle);
+    }
+
     pub fn currentCooperativeThreadHandle(self: *const MachOState) u64 {
-        if (self.active_guest_thread == 0 or self.isSyntheticCallbackHandle(self.active_guest_thread)) {
+        if (self.active_guest_thread == 0 or self.isIdleCallbackHandle(self.active_guest_thread)) {
             return self.pthreads.main_thread_handle;
         }
         return self.active_guest_thread;
@@ -3982,20 +4165,225 @@ pub const MachOState = struct {
         scheduling.logMemoryInitializationProgress(self, steps);
     }
 
-    pub fn handleSyntheticRuntimeThunk(self: *MachOState) bool {
+    pub noinline fn handleSyntheticRuntimeThunk(self: *MachOState) bool {
         return thunk_handler.handleSyntheticRuntimeThunk(self);
     }
 
-    pub fn handleTlvBootstrap(self: *MachOState) bool {
+    pub noinline fn handleTlvBootstrap(self: *MachOState) bool {
         return thunk_handler.handleTlvBootstrap(self);
     }
 
-    pub fn handleBoundImportThunk(self: *MachOState) bool {
+    pub noinline fn handleBoundImportThunk(self: *MachOState) bool {
         return thunk_handler.handleBoundImportThunk(self);
     }
 
-    pub fn handleDynamicLibraryThunk(self: *MachOState) bool {
+    pub noinline fn handleDynamicLibraryThunk(self: *MachOState) bool {
         return thunk_handler.handleDynamicLibraryThunk(self);
+    }
+
+    // F1 (throughput audit): the three periodic report bodies below used to be
+    // inlined directly into `run`'s loop body. Each fires once per 500K, 25M or
+    // 100M steps; together they compiled to ~96 KB of the loop's 99 KB, and
+    // that code shares instruction-cache lines with the ~60 instructions that
+    // actually run every step. The interpreter's hot closure measured 189 KB
+    // against a 128-192 KB L1I, so the loop could not stay resident.
+    //
+    // `noinline` is load-bearing, not a hint: LLVM inlines these back into the
+    // single call site without it, which is exactly how they got here. The
+    // bodies are unchanged; only their address is.
+    noinline fn reportProgressCheckpoint(self: *MachOState, steps: u64) void {
+        const symbol = self.metadata.nearestSymbol(self.regs.rip);
+        const heap_summary = self.memory_forwarder.summary();
+        const snapshot: startup_observer.Snapshot = .{
+            .step = steps,
+            .rip = self.regs.rip,
+            .symbol = if (symbol) |resolved| resolved.name else "<unknown>",
+            .symbol_offset = if (symbol) |resolved| resolved.offset else 0,
+            .heap_next = self.heap_next,
+            .import_calls = self.import_resolver.total_calls,
+            .fs_open = self.fs_forwarder.open_count,
+            .fs_read = self.fs_forwarder.read_count,
+            .fs_write = self.fs_forwarder.write_count,
+            .heap_allocations = heap_summary.allocations,
+            .heap_live = heap_summary.live_allocations,
+            .options_seen = self.launch_options.registrations_seen,
+            .options_kept = self.launch_options.registrations_kept,
+            .options_skipped = self.launch_options.registrations_skipped,
+            .logging_lines = self.logging.emitted_lines,
+            .pthread_created = self.pthreads.created_threads,
+            .pthread_waits_collapsed = self.pthreads.collapsed_waits,
+            .diagnostic_text_runs = self.diagnostic_text.accelerations,
+            .diagnostic_text_lines = self.diagnostic_text.lines_retained,
+            .pthread_blocked = self.pthreads.blocked_threads,
+            .thread_id = self.active_guest_thread,
+        };
+        if (self.startup.enabled) {
+            self.startup.checkpoint(snapshot);
+        } else {
+            const entry = &self.step_trace_entries[self.step_trace_index];
+            entry.step = steps;
+            entry.rip = self.regs.rip;
+            self.step_trace_index +|= 1;
+            if (self.step_trace_index == 5) {
+                self.step_trace_index = 0;
+                self.step_trace_filled = true;
+            }
+        }
+    }
+
+    noinline fn reportHeartbeat(self: *MachOState, steps: u64) void {
+        // Emitted here rather than only at exit: a run killed by the
+        // harness timeout still has to say where the graphics frontier
+        // stopped, and the exit path never runs in that case.
+        self.logGraphicsFrontier(false);
+        const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
+        const heartbeat_snapshot: startup_observer.Snapshot = .{
+            .step = steps,
+            .rip = self.regs.rip,
+            .symbol = if (hb_symbol) |resolved| resolved.name else "<unknown>",
+            .symbol_offset = if (hb_symbol) |resolved| resolved.offset else 0,
+            .heap_next = self.heap_next,
+            .import_calls = self.import_resolver.total_calls,
+            .fs_open = self.fs_forwarder.open_count,
+            .fs_read = self.fs_forwarder.read_count,
+            .fs_write = self.fs_forwarder.write_count,
+            .heap_allocations = 0,
+            .heap_live = 0,
+            .options_seen = self.launch_options.registrations_seen,
+            .options_kept = self.launch_options.registrations_kept,
+            .options_skipped = self.launch_options.registrations_skipped,
+            .logging_lines = self.logging.emitted_lines,
+            .pthread_created = self.pthreads.created_threads,
+            .pthread_waits_collapsed = self.pthreads.collapsed_waits,
+            .pthread_blocked = self.pthreads.blocked_threads,
+            .thread_id = self.active_guest_thread,
+            .execution_fingerprint = self.executionFingerprint(),
+        };
+        self.startup.heartbeat(heartbeat_snapshot);
+        self.logPerformanceHeartbeat();
+        self.emitRuntimeSummaryHeartbeat(heartbeat_snapshot);
+        if (self.startup.takeStallDiagnostic()) self.logStalledInstructionDetails();
+        self.pthreads.diagnoseStuck(steps, self.regs.rip, self.guest_time.now());
+        self.pumpNativeWindowEvents();
+        self.logCooperativeHeartbeat();
+        self.pthreads.profileThreadStates(&self.wait_profiler, steps, self.guest_time.now());
+        if (hb_symbol) |resolved| {
+            if (std.mem.indexOf(u8, resolved.name, "CommitExecutableRange") != null) {
+                self.jit_commit_count +|= 1;
+                self.jit_log.emit(.{
+                    .kind = .code_cache_allocated,
+                    .step = steps,
+                    .guest_addr = @intCast(self.regs.rip & 0xFFFFFFFF),
+                    .host_addr = self.regs.rip,
+                    .size = 4096,
+                    .total_functions = @intCast(self.import_resolver.total_calls),
+                    .unique_ordinals = @intCast(self.import_resolver.total_calls),
+                    .call_count = self.jit_commit_count,
+                    .thread_id = self.active_guest_thread,
+                    .reason = "commit",
+                });
+            }
+            if (std.mem.indexOf(u8, resolved.name, "GetProcAddressByOrdinal") != null) {
+                self.jit_export_count +|= 1;
+                if (self.jit_export_count % 100 == 0) {
+                    self.macho_log.emit(.{
+                        .kind = .import_resolution,
+                        .step = steps,
+                        .thread_id = self.active_guest_thread,
+                        .import_calls = self.import_resolver.total_calls,
+                        .reason = "GetProcAddressByOrdinal",
+                    });
+                }
+                if (self.jit_export_count % 10 == 0) {
+                    self.jit_log.emit(.{
+                        .kind = .host_to_guest_call,
+                        .step = steps,
+                        .guest_addr = @intCast(self.regs.rip & 0xFFFFFFFF),
+                        .call_count = self.jit_export_count,
+                        .total_functions = @intCast(self.import_resolver.total_calls),
+                        .unique_ordinals = @intCast(self.import_resolver.total_calls),
+                        .thread_id = self.active_guest_thread,
+                        .reason = "export_resolution",
+                    });
+                }
+            }
+        }
+        self.jit_log.emit(.{
+            .kind = .monitor_snapshot,
+            .step = steps,
+            .total_functions = @intCast(self.import_resolver.total_calls),
+            .unique_ordinals = @intCast(self.import_resolver.total_calls),
+            .code_cache_bytes = @intCast(self.memory_forwarder.summary().allocations *| 4096),
+            .call_count = self.jit_commit_count,
+            .thread_id = self.active_guest_thread,
+            .reason = "heartbeat",
+        });
+        self.macho_log.emit(.{
+            .kind = .heartbeat,
+            .step = steps,
+            .thread_id = self.active_guest_thread,
+            .guest_addr = self.regs.rip,
+            .runnable = @intCast(self.pthreads.activeCount()),
+            .blocked = @intCast(self.pthreads.blocked_threads),
+            .condvar_waits = self.pthreads.collapsed_waits,
+            .import_calls = self.import_resolver.total_calls,
+            .reason = "heartbeat",
+            .symbol = if (hb_symbol) |resolved| resolved.name else "",
+        });
+    }
+
+    /// Try to find real queued work for a parked cooperative context, and
+    /// terminate with a precise invariant failure if there is none.
+    ///
+    /// Returns false when the caller must stop; the register file after the
+    /// scheduler has parked its owner is the last saved context, not executable
+    /// work, and interpreting it would manufacture millions of meaningless
+    /// steps rather than reporting the deadlock.
+    noinline fn recoverZeroActiveGuestThread(self: *MachOState) bool {
+        const started_idle = self.pendingIdleCallbackCount() != 0 and
+            self.startNextIdleCallback("zero-active run guard", true);
+        if (started_idle or self.resumeSuspendedGuestThread()) return true;
+        self.scheduler_log.emit(.{
+            .kind = .deadlock,
+            .step = self.executed_steps,
+            .thread = 0,
+            .runnable = self.pthreads.activeCount(),
+            .blocked = self.pthreads.blocked_threads,
+            .reason = "zero_active_guest_thread",
+        });
+        machoCapturePrint(
+            "macho-processor: runtime invariant failure: no active or runnable guest thread; refusing stale-register execution rip=0x{x} suspended={d} blocked={d} pending_gtk={d}\n",
+            .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pendingIdleCallbackCount() },
+        );
+        self.faulted = true;
+        self.exit_code = 125;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+        self.terminated = true;
+        return false;
+    }
+
+    noinline fn reportConciseProgress(self: *MachOState, steps: u64) void {
+        var progress_buffer: [256]u8 = undefined;
+        const progress = std.fmt.bufPrint(
+            &progress_buffer,
+            "Translated instructions: {d} (activity only, not application progress; runnable={d} blocked={d} condvar_waits={d} quiescence_recoveries={d})\n",
+            .{
+                steps,
+                self.pthreads.activeCount(),
+                self.pthreads.blocked_threads,
+                self.pthreads.collapsed_waits,
+                self.cooperative_quiescence_recoveries,
+            },
+        ) catch "";
+        _ = hostWriteFdAll(1, progress);
+        self.scheduler_log.emit(.{
+            .kind = .runnable_count,
+            .step = steps,
+            .thread = self.active_guest_thread,
+            .runnable = self.pthreads.activeCount(),
+            .blocked = self.pthreads.blocked_threads,
+            .reason = "progress_checkpoint",
+        });
     }
 
     pub fn run(self: *MachOState) void {
@@ -4033,28 +4421,7 @@ pub const MachOState = struct {
             // work. Try real queued work once, then stop with a precise
             // invariant failure instead of manufacturing millions of steps.
             if (self.cooperative_ui_context != null and self.active_guest_thread == 0) {
-                const started_idle = self.pendingIdleCallbackCount() != 0 and
-                    self.startNextIdleCallback("zero-active run guard", true);
-                const resumed_worker = !started_idle and self.resumeSuspendedGuestThread();
-                if (!started_idle and !resumed_worker) {
-                    self.scheduler_log.emit(.{
-                        .kind = .deadlock,
-                        .step = steps,
-                        .thread = 0,
-                        .runnable = self.pthreads.activeCount(),
-                        .blocked = self.pthreads.blocked_threads,
-                        .reason = "zero_active_guest_thread",
-                    });
-                    machoCapturePrint(
-                        "macho-processor: runtime invariant failure: no active or runnable guest thread; refusing stale-register execution rip=0x{x} suspended={d} blocked={d} pending_gtk={d}\n",
-                        .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pendingIdleCallbackCount() },
-                    );
-                    self.faulted = true;
-                    self.exit_code = 125;
-                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
-                    self.terminated = true;
-                    break;
-                }
+                if (!self.recoverZeroActiveGuestThread()) break;
             }
 
             // Update scheduler step
@@ -4067,168 +4434,16 @@ pub const MachOState = struct {
             next_progress_report -|= 1;
             if (next_progress_report == 0) {
                 next_progress_report = PROGRESS_REPORT_INTERVAL;
-                const symbol = self.metadata.nearestSymbol(self.regs.rip);
-                const heap_summary = self.memory_forwarder.summary();
-                const snapshot: startup_observer.Snapshot = .{
-                    .step = steps,
-                    .rip = self.regs.rip,
-                    .symbol = if (symbol) |resolved| resolved.name else "<unknown>",
-                    .symbol_offset = if (symbol) |resolved| resolved.offset else 0,
-                    .heap_next = self.heap_next,
-                    .import_calls = self.import_resolver.total_calls,
-                    .fs_open = self.fs_forwarder.open_count,
-                    .fs_read = self.fs_forwarder.read_count,
-                    .fs_write = self.fs_forwarder.write_count,
-                    .heap_allocations = heap_summary.allocations,
-                    .heap_live = heap_summary.live_allocations,
-                    .options_seen = self.launch_options.registrations_seen,
-                    .options_kept = self.launch_options.registrations_kept,
-                    .options_skipped = self.launch_options.registrations_skipped,
-                    .logging_lines = self.logging.emitted_lines,
-                    .pthread_created = self.pthreads.created_threads,
-                    .pthread_waits_collapsed = self.pthreads.collapsed_waits,
-                    .diagnostic_text_runs = self.diagnostic_text.accelerations,
-                    .diagnostic_text_lines = self.diagnostic_text.lines_retained,
-                    .pthread_blocked = self.pthreads.blocked_threads,
-                    .thread_id = self.active_guest_thread,
-                };
-                if (self.startup.enabled) {
-                    self.startup.checkpoint(snapshot);
-                } else {
-                    const entry = &self.step_trace_entries[self.step_trace_index];
-                    entry.step = steps;
-                    entry.rip = self.regs.rip;
-                    self.step_trace_index +|= 1;
-                    if (self.step_trace_index == 5) {
-                        self.step_trace_index = 0;
-                        self.step_trace_filled = true;
-                    }
-                }
+                self.reportProgressCheckpoint(steps);
             }
             next_heartbeat -|= 1;
             if (next_heartbeat == 0) {
                 next_heartbeat = HEARTBEAT_INTERVAL;
-                // Emitted here rather than only at exit: a run killed by the
-                // harness timeout still has to say where the graphics frontier
-                // stopped, and the exit path never runs in that case.
-                self.logGraphicsFrontier(false);
-                const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
-                const heartbeat_snapshot: startup_observer.Snapshot = .{
-                    .step = steps,
-                    .rip = self.regs.rip,
-                    .symbol = if (hb_symbol) |resolved| resolved.name else "<unknown>",
-                    .symbol_offset = if (hb_symbol) |resolved| resolved.offset else 0,
-                    .heap_next = self.heap_next,
-                    .import_calls = self.import_resolver.total_calls,
-                    .fs_open = self.fs_forwarder.open_count,
-                    .fs_read = self.fs_forwarder.read_count,
-                    .fs_write = self.fs_forwarder.write_count,
-                    .heap_allocations = 0,
-                    .heap_live = 0,
-                    .options_seen = self.launch_options.registrations_seen,
-                    .options_kept = self.launch_options.registrations_kept,
-                    .options_skipped = self.launch_options.registrations_skipped,
-                    .logging_lines = self.logging.emitted_lines,
-                    .pthread_created = self.pthreads.created_threads,
-                    .pthread_waits_collapsed = self.pthreads.collapsed_waits,
-                    .pthread_blocked = self.pthreads.blocked_threads,
-                    .thread_id = self.active_guest_thread,
-                    .execution_fingerprint = self.executionFingerprint(),
-                };
-                self.startup.heartbeat(heartbeat_snapshot);
-                self.emitRuntimeSummaryHeartbeat(heartbeat_snapshot);
-                if (self.startup.takeStallDiagnostic()) self.logStalledInstructionDetails();
-                self.pthreads.diagnoseStuck(steps, self.regs.rip, self.guest_time.now());
-                self.pumpNativeWindowEvents();
-                self.logCooperativeHeartbeat();
-                self.pthreads.profileThreadStates(&self.wait_profiler, steps, self.guest_time.now());
-                if (hb_symbol) |resolved| {
-                    if (std.mem.indexOf(u8, resolved.name, "CommitExecutableRange") != null) {
-                        self.jit_commit_count +|= 1;
-                        self.jit_log.emit(.{
-                            .kind = .code_cache_allocated,
-                            .step = steps,
-                            .guest_addr = @intCast(self.regs.rip & 0xFFFFFFFF),
-                            .host_addr = self.regs.rip,
-                            .size = 4096,
-                            .total_functions = @intCast(self.import_resolver.total_calls),
-                            .unique_ordinals = @intCast(self.import_resolver.total_calls),
-                            .call_count = self.jit_commit_count,
-                            .thread_id = self.active_guest_thread,
-                            .reason = "commit",
-                        });
-                    }
-                    if (std.mem.indexOf(u8, resolved.name, "GetProcAddressByOrdinal") != null) {
-                        self.jit_export_count +|= 1;
-                        if (self.jit_export_count % 100 == 0) {
-                            self.macho_log.emit(.{
-                                .kind = .import_resolution,
-                                .step = steps,
-                                .thread_id = self.active_guest_thread,
-                                .import_calls = self.import_resolver.total_calls,
-                                .reason = "GetProcAddressByOrdinal",
-                            });
-                        }
-                        if (self.jit_export_count % 10 == 0) {
-                            self.jit_log.emit(.{
-                                .kind = .host_to_guest_call,
-                                .step = steps,
-                                .guest_addr = @intCast(self.regs.rip & 0xFFFFFFFF),
-                                .call_count = self.jit_export_count,
-                                .total_functions = @intCast(self.import_resolver.total_calls),
-                                .unique_ordinals = @intCast(self.import_resolver.total_calls),
-                                .thread_id = self.active_guest_thread,
-                                .reason = "export_resolution",
-                            });
-                        }
-                    }
-                }
-                self.jit_log.emit(.{
-                    .kind = .monitor_snapshot,
-                    .step = steps,
-                    .total_functions = @intCast(self.import_resolver.total_calls),
-                    .unique_ordinals = @intCast(self.import_resolver.total_calls),
-                    .code_cache_bytes = @intCast(self.memory_forwarder.summary().allocations *| 4096),
-                    .call_count = self.jit_commit_count,
-                    .thread_id = self.active_guest_thread,
-                    .reason = "heartbeat",
-                });
-                self.macho_log.emit(.{
-                    .kind = .heartbeat,
-                    .step = steps,
-                    .thread_id = self.active_guest_thread,
-                    .guest_addr = self.regs.rip,
-                    .runnable = @intCast(self.pthreads.activeCount()),
-                    .blocked = @intCast(self.pthreads.blocked_threads),
-                    .condvar_waits = self.pthreads.collapsed_waits,
-                    .import_calls = self.import_resolver.total_calls,
-                    .reason = "heartbeat",
-                    .symbol = if (hb_symbol) |resolved| resolved.name else "",
-                });
+                self.reportHeartbeat(steps);
             }
             if (self.concise_output and steps >= next_concise_report) {
                 next_concise_report +%= 100_000_000;
-                var progress_buffer: [256]u8 = undefined;
-                const progress = std.fmt.bufPrint(
-                    &progress_buffer,
-                    "Translated instructions: {d} (activity only, not application progress; runnable={d} blocked={d} condvar_waits={d} quiescence_recoveries={d})\n",
-                    .{
-                        steps,
-                        self.pthreads.activeCount(),
-                        self.pthreads.blocked_threads,
-                        self.pthreads.collapsed_waits,
-                        self.cooperative_quiescence_recoveries,
-                    },
-                ) catch "";
-                _ = hostWriteFdAll(1, progress);
-                self.scheduler_log.emit(.{
-                    .kind = .runnable_count,
-                    .step = steps,
-                    .thread = self.active_guest_thread,
-                    .runnable = self.pthreads.activeCount(),
-                    .blocked = self.pthreads.blocked_threads,
-                    .reason = "progress_checkpoint",
-                });
+                self.reportConciseProgress(steps);
             }
             if (!self.step()) break;
             self.maybeYieldActiveGuestThreadForQuantum();
@@ -4238,6 +4453,17 @@ pub const MachOState = struct {
                 self.logMemoryInitializationProgress(steps);
             }
         }
+        self.finishRun(steps);
+    }
+
+    /// Everything `run` does after its loop ends: reason normalisation, exit
+    /// diagnostics, and the two process-exit event records.
+    ///
+    /// F1 (throughput audit): runs exactly once per process, and was inlined
+    /// into `run` alongside the loop body. Extracting it (with the three
+    /// periodic reporters above) took `run` from 99,272 bytes to a loop that
+    /// fits alongside the rest of the interpreter in L1I.
+    noinline fn finishRun(self: *MachOState, steps: u64) void {
         if (self.mem_init_started and !self.faulted) {
             machoCapturePrint(
                 "macho-processor: memory initialization completed: step={d} page_entry(runs/bytes)={d}/{d} heap=0x{x}\n",
@@ -4300,6 +4526,12 @@ pub const MachOState = struct {
 
     fn logDecodeCacheSummary(self: *const MachOState) void {
         proc_diag.logDecodeCacheSummary(self);
+    }
+
+    /// Mutable, unlike the summaries below it: the sampler has to retain the
+    /// previous reading in order to report a delta.
+    fn logPerformanceHeartbeat(self: *MachOState) void {
+        proc_diag.logPerformanceHeartbeat(self);
     }
 
     fn logPerformanceAccelerationSummary(self: *const MachOState) void {
@@ -4635,6 +4867,45 @@ pub const MachOState = struct {
 
     pub fn executeVexSqrtScalarF64(self: *MachOState, d: DecodedInsn) void {
         execution_helpers.executeVexSqrtScalarF64(self, d);
+    }
+
+    /// A comparison whose predicate this interpreter does not model must not
+    /// silently write a mask: the guest would branch on it and nothing would
+    /// record that the branch was decided by a guess.
+    pub fn reportUnsupportedComparePredicate(self: *MachOState, d: DecodedInsn, executed: bool) void {
+        if (executed) return;
+        machoCapturePrint(
+            "macho-processor: unsupported SIMD compare predicate: op={s} imm=0x{x} rip=0x{x}; the comparison was not performed rather than performed with a guessed relation\n",
+            .{ @tagName(d.op), d.imm, self.regs.rip },
+        );
+        self.faulted = true;
+        self.exit_code = 127;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unimplemented_instruction);
+        self.terminated = true;
+    }
+
+    pub fn executeVexReciprocalPacked(self: *MachOState, d: DecodedInsn, comptime square_root: bool) void {
+        execution_helpers.executeVexReciprocalPacked(self, d, square_root);
+    }
+
+    pub fn executeVexReciprocalScalar(self: *MachOState, d: DecodedInsn, comptime square_root: bool) void {
+        execution_helpers.executeVexReciprocalScalar(self, d, square_root);
+    }
+
+    pub fn executeVexConvertPacked(
+        self: *MachOState,
+        d: DecodedInsn,
+        comptime direction: @TypeOf(.enum_literal),
+    ) void {
+        execution_helpers.executeVexConvertPacked(self, d, direction);
+    }
+
+    pub fn executeVexComparePacked(self: *MachOState, d: DecodedInsn, comptime double: bool) bool {
+        return execution_helpers.executeVexComparePacked(self, d, double);
+    }
+
+    pub fn executeVexCompareScalar(self: *MachOState, d: DecodedInsn, comptime double: bool) bool {
+        return execution_helpers.executeVexCompareScalar(self, d, double);
     }
 
     pub fn executeVexSqrtPackedF32(self: *MachOState, d: DecodedInsn) void {
@@ -5160,6 +5431,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     if (!initializers_ok) {
         state.import_resolver.logSummary();
         state.foreign_objects.logSummary();
+        state.sdl.logSummary();
         state.native_window.logSummary();
         state.dynamic_forwarder.logSummary();
         state.fs_forwarder.logSummary();
@@ -5239,6 +5511,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.logPerformanceAccelerationSummary();
     state.import_resolver.logSummary();
     state.foreign_objects.logSummary();
+    state.sdl.logSummary();
     state.native_window.logSummary();
     state.dynamic_forwarder.logSummary();
     state.fs_forwarder.logSummary();
@@ -5248,6 +5521,17 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.backend_diagnostics.logSummary();
     state.xenia_pipeline.logSummary(state.executed_steps);
     state.xenia_gpu_handoff.logSummary(state.executed_steps);
+    // The run is over, so "still unclassified" has stopped meaning "not yet"
+    // and started meaning "the pipeline never advanced past it". Sealing before
+    // the frontier report is what turns the ledger from a permanent blocker
+    // into a verdict the report can carry.
+    const newly_implicated = state.anomalies.seal();
+    if (newly_implicated != 0) {
+        machoCapturePrint(
+            "macho-processor: anomaly ledger sealed at step={d}: {d} record(s) become IMPLICATED because no pipeline milestone was reached after them. The last structural progress was at step={d}; these are the anomalies the run did not get past\n",
+            .{ state.executed_steps, newly_implicated, state.anomalies.last_advance_step },
+        );
+    }
     state.logGraphicsFrontier(true);
     state.pthreads.logSummary();
     state.logCooperativeSchedulerSummary();
@@ -5433,9 +5717,17 @@ test "function-exit epilogue bytes detect Xenia dead tail-dispatch epilogue" {
     // the null `jmp rax` at 0xa0059876 (the CALL_POSSIBLE_RETURN path).
     const epilogue: []const u8 = &.{ 0x48, 0x83, 0xC4, 0x68, 0xFF, 0x4E, 0xEC, 0xC3 };
     try std.testing.expect(memory_access.isFunctionExitEpilogueBytes(epilogue));
-    // imm32 teardown with no profiler decrement: 48 81 C4 + imm32 is 8 bytes,
-    // so the ret byte must follow at index 8.
-    try std.testing.expect(memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x81, 0xC4, 0x68, 0x01, 0x00, 0x00, 0x00, 0xC3 }));
+    // imm32 teardown with no profiler decrement. `48 81 C4` is REX.W, opcode
+    // and ModRM — three bytes — so with a four-byte immediate the `ret` sits at
+    // index 7, not 8. The recognizer was corrected from 8 to 7 (see the comment
+    // on `isFunctionExitEpilogue`, where an offset of 8 skipped past the `ret`
+    // and made every large-frame epilogue unrecognisable); this assertion kept
+    // the pre-fix arithmetic and a padding byte to match it, and never ran to
+    // say so.
+    try std.testing.expect(memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x81, 0xC4, 0x68, 0x01, 0x00, 0x00, 0xC3 }));
+    // And the padded form the old arithmetic expected is correctly rejected:
+    // the byte at the `ret` position is a zero.
+    try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x81, 0xC4, 0x68, 0x01, 0x00, 0x00, 0x00, 0xC3 }));
     // Truncated buffers (length guards before byte reads) must not panic.
     try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x83, 0xC4, 0x68, 0xFF }));
     try std.testing.expect(!memory_access.isFunctionExitEpilogueBytes(&.{ 0x48, 0x81, 0xC4 }));
