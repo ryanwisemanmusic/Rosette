@@ -504,6 +504,7 @@ pub const Op = enum(u16) {
     vphsubd,
     vphsubsw,
     vpshufd,
+    vshufps,
     vpmuludq,
     vpblendw,
     vpunpckhbw,
@@ -667,7 +668,9 @@ pub const Op = enum(u16) {
     vhsubps,
     vhsubpd,
     vrcpps,
+    vrcpss,
     vrsqrtps,
+    vrsqrtss,
     // AVX2 FMA (VEX.0F38 map: 132/213/231 format)
     vfmadd132ps,
     vfmadd132pd,

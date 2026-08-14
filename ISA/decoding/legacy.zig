@@ -98,13 +98,16 @@ const decodeTwoByte = twobyte.decodeTwoByte;
 const decodeThreeByte = twobyte.decodeThreeByte;
 const decodeSseBytes = twobyte.decodeSseBytes;
 
-pub fn registerOperandValue(regs: *const Regs, operand: RegisterOperand, size: OperandSize) u64 {
+// F2 (throughput audit): `inline` so a register operand costs an indexed load
+// at the call site rather than a call frame around one. `execute` reads or
+// writes a register several times per interpreted instruction.
+pub inline fn registerOperandValue(regs: *const Regs, operand: RegisterOperand, size: OperandSize) u64 {
     if (!operand.high8) return regVal(regs, operand.id, size);
     std.debug.assert(size == .bits8);
     return (regVal(regs, operand.id, .bits16) >> 8) & 0xFF;
 }
 
-pub fn setRegisterOperand(regs: *Regs, operand: RegisterOperand, size: OperandSize, value: u64) void {
+pub inline fn setRegisterOperand(regs: *Regs, operand: RegisterOperand, size: OperandSize, value: u64) void {
     if (!operand.high8) {
         setReg(regs, operand.id, size, value);
         return;

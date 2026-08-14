@@ -268,6 +268,69 @@ test "RIP relative address resolution uses the end of the instruction" {
     try std.testing.expectEqual(@as(u64, 0x1003), resolveMemoryAddress(&regs, memory, 0x1007, .bits64, .long64, true));
 }
 
+test "a SIB with no base register is an absolute displacement, not RIP relative" {
+    // `movbe eax, [rax*4 + 0x2000]` — 0F 38 F0 /r with SIB mod=00 base=101.
+    // The base==101 escape means "no base, disp32 follows"; only a *non-SIB*
+    // mod=00 rm=101 is RIP-relative. Conflating them shifted every scaled
+    // table read by the address of the instruction doing the reading.
+    var decoded = DecodedInsn{};
+    var pos: usize = 0;
+    const bytes = [_]u8{ 0x04, 0x85, 0x00, 0x20, 0x00, 0x00 };
+    const rm = readModRM(&decoded, &bytes, &pos, false, false, false, .bits32);
+
+    try std.testing.expect(!decoded.rip_relative);
+    try std.testing.expect(!decoded.sib_has_base);
+    try std.testing.expect(decoded.sib_has_index);
+    try std.testing.expectEqual(RegId.al_ax_eax_rax, decoded.sib_index_reg);
+    try std.testing.expectEqual(@as(u2, 2), decoded.sib_scale);
+    try std.testing.expectEqual(@as(u64, 0x2000), rm.addr);
+
+    // Resolved against a register file, the address is the table entry and
+    // owes nothing to the instruction pointer.
+    var regs = Regs{};
+    regs.rax = 3;
+    const address = resolveMemoryAddress(&regs, .{
+        .displacement = rm.addr,
+        .has_index = decoded.sib_has_index,
+        .index_reg = decoded.sib_index_reg,
+        .scale = decoded.sib_scale,
+        .has_base = decoded.sib_has_base,
+        .base_reg = decoded.sib_base_reg,
+        .rip_relative = decoded.rip_relative,
+        .segment = decoded.segment,
+    }, 0x40_0000, .bits64, .long64, true);
+    try std.testing.expectEqual(@as(u64, 0x2000 + 3 * 4), address);
+}
+
+test "a non-SIB mod=00 rm=101 is still RIP relative" {
+    // The form the fix must not disturb: `lea rax, [rip+0x10]`.
+    var decoded = DecodedInsn{};
+    var pos: usize = 0;
+    const bytes = [_]u8{ 0x05, 0x10, 0x00, 0x00, 0x00 };
+    const rm = readModRM(&decoded, &bytes, &pos, false, false, false, .bits64);
+
+    try std.testing.expect(decoded.rip_relative);
+    try std.testing.expect(!decoded.sib_has_base);
+    try std.testing.expect(!decoded.sib_has_index);
+    try std.testing.expectEqual(@as(u64, 0x10), rm.addr);
+}
+
+test "a SIB that does have a base register keeps it" {
+    // `[rbx + rcx*8 + 0x20]`, mod=01 — the ordinary case, unchanged.
+    var decoded = DecodedInsn{};
+    var pos: usize = 0;
+    const bytes = [_]u8{ 0x44, 0xCB, 0x20 };
+    const rm = readModRM(&decoded, &bytes, &pos, false, false, false, .bits64);
+
+    try std.testing.expect(!decoded.rip_relative);
+    try std.testing.expect(decoded.sib_has_base);
+    try std.testing.expectEqual(RegId.bl_bx_ebx_rbx, decoded.sib_base_reg);
+    try std.testing.expect(decoded.sib_has_index);
+    try std.testing.expectEqual(RegId.cl_cx_ecx_rcx, decoded.sib_index_reg);
+    try std.testing.expectEqual(@as(u2, 3), decoded.sib_scale);
+    try std.testing.expectEqual(@as(u64, 0x20), rm.addr);
+}
+
 pub fn hasModRM(byte: u8) bool {
     _ = byte;
     return true;
@@ -331,9 +394,15 @@ pub fn readModRM(d: *DecodedInsn, bytes: []const u8, pos: *usize, rex_r: bool, r
             d.sib_scale = @as(u2, @intCast(scale));
         }
 
-        if (mod == 0 and base_num == 5) {
-            d.rip_relative = true;
-        } else {
+        // SIB with mod==0 and base==101 encodes "no base register, disp32
+        // follows". It is **not** RIP-relative: RIP-relative addressing is
+        // only ever `mod==0, rm==101` with no SIB byte at all, which the
+        // non-SIB path below handles. Setting `rip_relative` here made every
+        // `[index*scale + disp32]` and `[disp32]` form resolve to
+        // `next_instruction + disp + index*scale`, so a vectorised table read
+        // through a two-byte opcode landed a whole instruction pointer away
+        // from its table.
+        if (!(mod == 0 and base_num == 5)) {
             d.sib_has_base = true;
             d.sib_base_reg = mapReg(base_num, rex_b);
         }

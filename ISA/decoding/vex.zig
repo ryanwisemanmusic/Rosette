@@ -400,7 +400,7 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
         0x52 => {
             // VRSQRTPS (VEX.0F 52 /r) — no 0x66/PD form
             return .{
-                .op = .vrsqrtps,
+                .op = if (vex.has_f3_prefix) .vrsqrtss else .vrsqrtps,
                 .size = .bits64,
                 .len = @intCast(pos),
                 .xmm_dst = modrm_decoded.dst_xmm,
@@ -413,7 +413,7 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
         0x53 => {
             // VRCPPS (VEX.0F 53 /r) — no 0x66/PD form
             return .{
-                .op = .vrcpps,
+                .op = if (vex.has_f3_prefix) .vrcpss else .vrcpps,
                 .size = .bits64,
                 .len = @intCast(pos),
                 .xmm_dst = modrm_decoded.dst_xmm,
@@ -464,7 +464,7 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
         0x5B => {
             // VCVTDQ2PS (VEX.0F 5B) / VCVTPS2DQ (VEX.66.0F 5B)
             // VCVTQQ2PS (VEX.F3.0F 5B)
-            const op_sel = arith(vex, .{ .vcvtdq2ps, .vcvtdq2ps, .vcvtps2dq, .vcvtdq2ps });
+            const op_sel = arith(vex, .{ .vcvttps2dq, .vcvtdq2ps, .vcvtps2dq, .vcvtdq2ps });
             return decodeVexReturn(vex, pos, op_sel, modrm_decoded);
         },
         0x5C => {
@@ -590,6 +590,31 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
                 .xmm_dst = modrm_decoded.dst_xmm,
                 .xmm_src = modrm_decoded.src_xmm,
                 .imm = imm,
+                .is_reg_form = modrm_decoded.is_reg_form,
+                .addr = modrm_decoded.addr,
+                .vector_256 = vex.l,
+            };
+        },
+        0xC6 => {
+            // VSHUFPS (VEX.NDS.0F.WIG C6 /r ib). Each 128-bit lane takes
+            // its low two dwords from VEX.vvvv and its high two dwords from
+            // ModR/M.r/m. The instruction has no mandatory prefix.
+            if (vex.has_66_prefix or vex.has_f2_prefix or vex.has_f3_prefix or
+                pos >= bytes.len)
+            {
+                return null;
+            }
+            const imm = bytes[pos];
+            pos += 1;
+            return .{
+                .op = .vshufps,
+                .size = .bits64,
+                .len = @intCast(pos),
+                .xmm_dst = modrm_decoded.dst_xmm,
+                .xmm_src = vex.vvvv,
+                .xmm_src2 = modrm_decoded.src_xmm,
+                .imm = imm,
+                .uses_imm = true,
                 .is_reg_form = modrm_decoded.is_reg_form,
                 .addr = modrm_decoded.addr,
                 .vector_256 = vex.l,
@@ -1000,6 +1025,30 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
+    // VSHUFPS: VEX.NDS.128/256.0F.WIG C6 /r ib. Unlike VPSHUFD, this is a
+    // true three-source encoding: VEX.vvvv supplies SRC1 and ModR/M.r/m
+    // supplies SRC2. No mandatory prefix is permitted.
+    if (opcode == 0xC6 and prefix == 0) {
+        var decoded = DecodedInsn{ .op = .vshufps, .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if ((opcode == 0x12 or opcode == 0x13 or opcode == 0x16 or opcode == 0x17) and
         !vector_256 and (prefix == 0 or prefix == 1))
     {
@@ -1067,6 +1116,95 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     // Scalar forms merge the upper 96/64 bits from VEX.vvvv. Packed forms
     // have a single r/m source, but retaining vvvv here keeps the decoded
     // shape uniform and makes malformed/reserved encodings diagnosable.
+    // VCMPPS/VCMPPD/VCMPSS/VCMPSD: VEX.0F C2 /r ib. Three operands plus a
+    // comparison predicate in the immediate. Xenia's backend emits these for
+    // every float comparison that produces a mask rather than flags, so a
+    // missing arm here is a SIGILL in the middle of generated code — and that
+    // SIGILL cascades: the emulator's own exception handler looks up a guest
+    // function for a host PC inside its JIT cache, finds none, and dereferences
+    // the null, so the crash it reports is nowhere near the cause.
+    // VCVTDQ2PS / VCVTPS2DQ / VCVTTPS2DQ: VEX.0F 5B /r. Two operands; the
+    // prefix chooses the direction and, for F3, truncation instead of the
+    // current rounding mode. Xenia emits the truncating form for float-to-int
+    // conversion, which is the one that was missing.
+    // VRCPPS/VRCPSS (0F 53) and VRSQRTPS/VRSQRTSS (0F 52): approximate
+    // reciprocal and reciprocal square root. No prefix is the packed form
+    // (two operands); F3 is the scalar form, which is three-operand — the
+    // upper lanes of the destination come from VEX.vvvv, not from the source.
+    if ((opcode == 0x52 or opcode == 0x53) and (prefix == 0 or prefix == 2)) {
+        const scalar = prefix == 2;
+        if (scalar and vector_256) return .{};
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        if (scalar) decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = if (opcode == 0x53)
+            (if (scalar) .vrcpss else .vrcpps)
+        else
+            (if (scalar) .vrsqrtss else .vrsqrtps);
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode == 0x5B and prefix != 3) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (prefix) {
+            0 => .vcvtdq2ps,
+            1 => .vcvtps2dq,
+            2 => .vcvttps2dq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode == 0xC2) {
+        if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
+
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 3;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.op = switch (prefix) {
+            0 => .vcmpps,
+            1 => .vcmppd,
+            2 => .vcmpss,
+            3 => .vcmpsd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
     if (opcode == 0x51) {
         if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
 
@@ -1374,28 +1512,14 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    // VPSHUFB: VEX.NDS.128.66.0F.WIG 00 /r ib
-    if (opcode == 0x00 and prefix == 1) {
-        var decoded = DecodedInsn{ .vector_256 = vector_256 };
-        var pos = start_pos + 3;
-        const is_mem = bytes[pos] < 0xC0;
-        const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
-        decoded.xmm_dst = @intFromEnum(rm.reg);
-        decoded.xmm_src = @truncate((~vex >> 3) & 0x0F);
-        decoded.is_reg_form = !is_mem;
-        if (is_mem) {
-            decoded.addr = rm.addr;
-        } else {
-            decoded.xmm_src2 = @intCast(rm.addr);
-        }
-        // Immediate byte for shuffle control
-        if (pos >= bytes.len) return .{};
-        decoded.imm = bytes[pos];
-        pos += 1;
-        decoded.op = .vpshufb;
-        decoded.len = @intCast(pos);
-        return decoded;
-    }
+    // VPSHUFB is VEX.128.66.0F38.WIG 00 /r, and the *0F38* map is the whole
+    // point: a two-byte VEX prefix has no map field, so it can only ever
+    // encode the 0F map and cannot express this instruction at all. Decoding
+    // `C5 <c> 00` as VPSHUFB claimed an encoding that does not exist, turning
+    // a byte sequence that is not an instruction into a vector shuffle — and
+    // it consumed an immediate the real instruction does not have, so it also
+    // reported the wrong length. The three-byte path decodes the genuine
+    // encoding; nothing belongs here.
 
     // VPSHUFD: VEX.NDS.LIG.66.0F.WIG 70 /r ib (already handled above, keeping for reference)
 
@@ -1644,6 +1768,278 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     const rex_w = (vex_control & 0x80) != 0;
     const vector_256 = (vex_control & 0x04) != 0;
     const prefix = vex_control & 0x03;
+
+    // VUCOMISS/VUCOMISD (VEX.LIG.0F.WIG 2E) and VCOMISS/VCOMISD (…2F).
+    //
+    // The two-byte VEX form of these was already decoded; the three-byte form
+    // was not, and the three-byte form is exactly the one a register above
+    // xmm7 forces. Xenia's backend emits `vucomisd xmm8, xmm8; setp bl; test
+    // bl, bl; jne …` as its NaN check, which encodes as `C4 41 79 2E C0` — a
+    // three-byte VEX purely because REX.B is needed — so every float
+    // comparison the JIT allocated into a high register decoded as invalid.
+    //
+    // Which of the four this is comes from the prefix, not the opcode: no
+    // prefix is the single-precision form, 66 the double. Opcode 2F is the
+    // ordered compare, which differs from 2E only in raising an invalid-
+    // operation exception on a quiet NaN. Rosette does not raise guest FP
+    // exceptions and both set the same flags from the same comparison, so 2F
+    // is decoded as its unordered counterpart rather than given a distinct
+    // opcode that would behave identically.
+    if (opcode_map == 1 and (opcode == 0x2E or opcode == 0x2F) and
+        (prefix == 0 or prefix == 1) and (vex_control & 0x78) == 0x78)
+    {
+        var decoded = DecodedInsn{};
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_src = @intFromEnum(rm.reg);
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = if (prefix == 0) .vucomiss else .vucomisd;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VZEROUPPER: VEX.128.0F.WIG 77. No operands, so the whole instruction is
+    // the prefix and the opcode.
+    if (opcode_map == 1 and opcode == 0x77 and prefix == 0 and
+        !vector_256 and (vex_control & 0x78) == 0x78)
+    {
+        return .{ .op = .vzeroupper, .len = @intCast(start_pos + 4) };
+    }
+
+    // The three-operand integer forms: VEX.NDS.128.66.0F <op> /r, destination
+    // in ModRM.reg, first source in VEX.vvvv, second in ModRM.r/m.
+    if (opcode_map == 1 and prefix == 1 and switch (opcode) {
+        0x60, 0x61, 0x68, 0x69, 0x6A => true,
+        else => false,
+    }) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x60 => .vpunpcklbw,
+            0x61 => .vpunpcklwd,
+            0x68 => .vpunpckhbw,
+            0x69 => .vpunpckhwd,
+            0x6A => .vpunpckhdq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPSHUFD: VEX.128.66.0F.WIG 70 /r ib. Two operands plus a shuffle control
+    // byte; VEX.vvvv is unused.
+    if (opcode_map == 1 and opcode == 0x70 and prefix == 1) {
+        var decoded = DecodedInsn{ .op = .vpshufd, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @intCast(rm.addr);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) decoded.addr = rm.addr;
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VSHUFPS: VEX.NDS.128/256.0F.WIG C6 /r ib. The three-byte form is
+    // semantically identical to the two-byte form; it is selected when X/B/W
+    // extension bits or an explicit 0F map are required.
+    if (opcode_map == 1 and opcode == 0xC6 and prefix == 0) {
+        var decoded = DecodedInsn{ .op = .vshufps, .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPINSRW: VEX.128.66.0F.W0 C4 /r ib. ModRM.r/m is the destination XMM,
+    // ModRM.reg the general-purpose source, VEX.vvvv the merge source.
+    if (opcode_map == 1 and opcode == 0xC4 and prefix == 1 and !vector_256) {
+        var decoded = DecodedInsn{ .op = .vpinsrw, .size = .bits16 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits32);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.xmm_dst = decoded.xmm_src;
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_dst = @intCast(rm.addr);
+            decoded.xmm_src2 = @intFromEnum(rm.reg);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPMOVMSKB: VEX.128.66.0F.WIG D7 /r. Destination is a general-purpose
+    // register, so `dst_reg` rather than `xmm_dst` carries it.
+    if (opcode_map == 1 and opcode == 0xD7 and prefix == 1 and (vex_control & 0x78) == 0x78) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.dst_reg = rm.reg;
+        decoded.xmm_src = @intCast(rm.addr);
+        decoded.op = if (vector_256) .vpmovmskb_ymm else .vpmovmskb;
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VCMPPS/VCMPPD/VCMPSS/VCMPSD, three-byte form. Same instruction, the
+    // encoding a register above xmm7 forces.
+    // Immediate-count packed shifts, three-byte form: VEX.128.66.0F 71/72/73
+    // /2 /3 /6 /7 ib. These are *group* opcodes — ModRM.reg selects the
+    // instruction rather than naming a register — and VEX.vvvv is the
+    // destination with ModRM.r/m the source, which is why a source above xmm7
+    // needs REX.B and therefore this encoding.
+    if (opcode_map == 1 and prefix == 1 and
+        (opcode == 0x71 or opcode == 0x72 or opcode == 0x73))
+    {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        const group = @intFromEnum(rm.reg) & 0x07;
+        if (group != 2 and group != 3 and group != 6 and group != 7) return .{};
+        decoded.xmm_dst = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        decoded.uses_imm = true;
+        pos += 1;
+        decoded.op = switch (opcode) {
+            0x71 => if (group == 2) .vpsrlw else .vpsllw,
+            0x72 => if (group == 2) .vpsrld else .vpslld,
+            0x73 => switch (group) {
+                2 => .vpsrlq,
+                3 => .vpsrldq,
+                6 => .vpsllq,
+                7 => .vpslldq,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VCVTDQ2PS / VCVTPS2DQ / VCVTTPS2DQ, three-byte form — the encoding a
+    // source register above xmm7 forces.
+    // VRCPPS/VRCPSS and VRSQRTPS/VRSQRTSS, three-byte form.
+    if (opcode_map == 1 and (opcode == 0x52 or opcode == 0x53) and
+        (prefix == 0 or prefix == 2))
+    {
+        const scalar = prefix == 2;
+        if (scalar and vector_256) return .{};
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        if (scalar) decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = if (opcode == 0x53)
+            (if (scalar) .vrcpss else .vrcpps)
+        else
+            (if (scalar) .vrsqrtss else .vrsqrtps);
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and opcode == 0x5B and prefix != 3) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (prefix) {
+            0 => .vcvtdq2ps,
+            1 => .vcvtps2dq,
+            2 => .vcvttps2dq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    if (opcode_map == 1 and opcode == 0xC2) {
+        if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
+
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_memory = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_memory;
+        if (is_memory) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        if (pos >= bytes.len) return .{};
+        decoded.imm = bytes[pos];
+        pos += 1;
+        decoded.op = switch (prefix) {
+            0 => .vcmpps,
+            1 => .vcmppd,
+            2 => .vcmpss,
+            3 => .vcmpsd,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
 
     if (opcode_map == 1 and opcode == 0x51) {
         if (vector_256 and (prefix == 2 or prefix == 3)) return .{};
