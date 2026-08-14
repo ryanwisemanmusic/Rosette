@@ -256,7 +256,12 @@ pub const Manager = struct {
     }
 
     /// Whether an address falls inside the range this forwarder allocates from.
-    fn withinArena(self: *const Manager, address: u64) bool {
+    ///
+    /// Two comparisons, and public because it is the cheap gate that keeps
+    /// interior-address questions off addresses that are plainly not heap at
+    /// all — a global, a static, a stack slot. Callers on a per-access path
+    /// should ask this before anything that costs more.
+    pub fn withinArena(self: *const Manager, address: u64) bool {
         return self.highest_allocated != 0 and
             address >= self.lowest_allocated and address < self.highest_allocated;
     }
