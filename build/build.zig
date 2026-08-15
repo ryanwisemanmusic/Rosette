@@ -1235,6 +1235,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // Rooted here so its rules are executed rather than merely compiled.
+        // This module decides whether Rosette rewrites the dispatch pointer of
+        // a live guest object; the conditions under which it says yes are
+        // exactly the kind that must be tested, and as a dependency-only
+        // module none of its tests had ever run.
+        const vtable_test = b.addTest(.{ .root_module = vtable_mod });
+        check_step.dependOn(&b.addRunArtifact(vtable_test).step);
         const guard_rollback_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/guard-rollback/root.zig"),
             .target = target,
@@ -1516,6 +1523,7 @@ pub fn build(b: *std.Build) void {
         // Guest bootstrap observation and the host execution API share one GPU
         // module so neither can mistake synthetic host progress for guest work.
         process_core_mod.addImport("gpu", gpu_mod);
+        process_core_mod.addImport("device_tree", device_tree_mod);
         process_core_mod.addImport("preflight", preflight_mod);
         // Rooted so these run rather than merely compile. Until this target
         // existed the module's tests only ever type-checked as part of the
@@ -1620,6 +1628,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("process_core", process_core_mod);
         macho_processor_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_mod.addImport("gpu", gpu_mod);
+        macho_processor_mod.addImport("device_tree", device_tree_mod);
         macho_processor_mod.addImport("preflight", preflight_mod);
         macho_processor_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
@@ -1664,6 +1673,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("process_core", process_core_mod);
         macho_processor_test_mod.addImport("dispatch_recovery", dispatch_recovery_mod);
         macho_processor_test_mod.addImport("gpu", gpu_mod);
+        macho_processor_test_mod.addImport("device_tree", device_tree_mod);
         macho_processor_test_mod.addImport("preflight", preflight_mod);
         macho_processor_test_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
@@ -1683,7 +1693,12 @@ pub fn build(b: *std.Build) void {
             "Compile the focused Mach-O processor and decoder regression suite",
         );
         macho_processor_check.dependOn(&macho_processor_test.step);
-        check_step.dependOn(&macho_processor_test.step);
+        // Run them, not merely compile them. `check_step` depended on the
+        // compile step, so the Mach-O processor's decoder and interpreter
+        // regressions — the suite that guards exactly the hot-path changes most
+        // likely to break something silently — had never executed under
+        // `zig build check`.
+        check_step.dependOn(&b.addRunArtifact(macho_processor_test).step);
     }
 
     // Aggregate Win32 ABI handshake suite
