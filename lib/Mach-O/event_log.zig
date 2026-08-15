@@ -23,9 +23,33 @@ pub fn resetThreadFds() void {
     thread_primitive_fd = -1;
 }
 
+/// F15 (throughput audit): format into a thread-local stack buffer instead of
+/// allocating.
+///
+/// `std.heap.page_allocator` on Darwin is `mmap`/`munmap`, so every diagnostic
+/// line cost a syscall pair before it wrote anything. That is not a throughput
+/// problem at the ~20K lines a normal run emits, but it is the reason this
+/// function is expensive to *call*: its inlined expansion (allocPrint + Writer
+/// + free) is what grew `readMemVal` to 16 KB and `run` to 99 KB, since a
+/// thousand call sites each carried a copy. Making the body cheap and small is
+/// what lets diagnostics live near the code they describe without the hot path
+/// paying for them.
+///
+/// A line longer than the buffer is truncated with a marker rather than
+/// dropped: losing the tail of a diagnostic is recoverable, losing the fact
+/// that it fired is not.
+var capture_buffer: [8192]u8 = undefined;
+
+fn formatCapture(buffer: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.bufPrint(buffer, fmt, args) catch blk: {
+        const marker = " <truncated>\n";
+        @memcpy(buffer[buffer.len - marker.len ..], marker);
+        break :blk buffer;
+    };
+}
+
 pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
-    const text = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
-    defer std.heap.page_allocator.free(text);
+    const text = formatCapture(&capture_buffer, fmt, args);
 
     // Scheduler tables have their own complete log. Do not print them to
     // stderr because the route wrapper captures stderr in rosette-runtime.log.
@@ -49,8 +73,7 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn primitiveCapturePrint(comptime fmt: []const u8, args: anytype) void {
-    const text = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
-    defer std.heap.page_allocator.free(text);
+    const text = formatCapture(&capture_buffer, fmt, args);
 
     // Always write to stderr first so diagnostics survive a crash
     std.debug.print("{s}", .{text});

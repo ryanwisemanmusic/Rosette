@@ -852,10 +852,22 @@ pub const MachOState = struct {
     guest_files: [GUEST_FILE_MAX]GuestFile = [_]GuestFile{GuestFile{}} ** GUEST_FILE_MAX,
     bound_import_thunks: []BoundImportThunk = &.{},
     decode_cache: []DecodeCacheEntry,
+    /// Faulting instructions retried after a guest SIGSEGV handler resolved
+    /// the page's protection. See `signal_handling.protectionFaultResolved`.
+    guest_protection_retries: u64 = 0,
     decode_cache_hits: u64 = 0,
     decode_cache_misses: u64 = 0,
+    /// A miss that filled a way nothing had occupied — the first execution of
+    /// newly emitted code. Irreducible: there is nothing to cache yet.
+    decode_cache_compulsory_misses: u64 = 0,
+    /// A miss that evicted a live decode. This is the addressable kind.
+    decode_cache_conflict_misses: u64 = 0,
     decode_cache_stale_rejections: u64 = 0,
     code_generation: u64 = 1,
+    /// Which guest pages may hold a cached decode. See
+    /// `types.DecodeCachePageSet`: heap-allocated rather than inline so its
+    /// 128 KiB does not sit between `regs` and the other per-step fields.
+    decode_cache_pages: *types.DecodeCachePageSet,
     /// Previous heartbeat's reading of the acceleration counters. See
     /// `types.PerformanceSample`: the counters are sampled per heartbeat so a
     /// timed-out run still reports its throughput, and reported as deltas so
@@ -940,6 +952,8 @@ pub const MachOState = struct {
         const initializer_count = metadata.initializer_addresses.len;
         const decode_cache = try allocator.alloc(DecodeCacheEntry, DECODE_CACHE_ENTRY_COUNT);
         @memset(decode_cache, .{});
+        const decode_cache_pages = try allocator.create(types.DecodeCachePageSet);
+        decode_cache_pages.* = .{};
         const page_permissions = try allocator.alloc(u8, @intCast(final_mem_size / PAGE_SIZE));
         @memset(page_permissions, PAGE_READ | PAGE_WRITE);
         var result = MachOState{
@@ -972,6 +986,7 @@ pub const MachOState = struct {
             .vtable_stack_registry = vt.StackRegistry.init(allocator),
             .guard_rollback = guard_rollback_lib.GuardRollback.init(allocator),
             .decode_cache = decode_cache,
+            .decode_cache_pages = decode_cache_pages,
             .mapped_min = mapped_min,
             .image_end = image_end,
             .executable_min = executable_min,
@@ -1239,6 +1254,7 @@ pub const MachOState = struct {
         self.allocator.free(self.page_permissions);
         self.initializer_memory.deinit();
         self.allocator.free(self.decode_cache);
+        self.allocator.destroy(self.decode_cache_pages);
         if (self.special_rip_table.len != 0) self.allocator.free(self.special_rip_table);
         if (self.guest_log_mirror_fd >= 0) _ = std.c.close(self.guest_log_mirror_fd);
         self.metadata.deinit();
@@ -1671,7 +1687,10 @@ pub const MachOState = struct {
     pub const readMem128 = memory_access.readMem128;
     pub const writeMem128 = memory_access.writeMem128;
     pub const guestMemory = memory_access.guestMemory;
-    const noteGuestWrite = memory_access.noteGuestWrite;
+    /// F3: bulk import routes (memcpy/memset/bzero/strcpy) write guest memory
+    /// directly through `guestMemory`, so they must announce the write for
+    /// decode-cache invalidation exactly as a scalar store does.
+    pub const noteGuestWrite = memory_access.noteGuestWrite;
     pub const guestMemoryConst = memory_access.guestMemoryConst;
     pub const guestAlloc = memory_access.guestAlloc;
     pub const registerSyntheticRegion = memory_access.registerSyntheticRegion;
@@ -2278,7 +2297,12 @@ pub const MachOState = struct {
         return null;
     }
 
-    pub fn logControlFlow(self: *const MachOState, kind: []const u8, from_rip: u64, to_rip: u64, decoded_len: u64, return_addr: ?u64) void {
+    /// F13 (throughput audit): `inline` so the gate is a compare at the call
+    /// site. This is reached on every taken conditional jump and every call,
+    /// and each of the 12 call sites in `execute` had to materialise a string
+    /// constant and set up a six-argument call frame before the function could
+    /// decide it had nothing to do.
+    pub inline fn logControlFlow(self: *const MachOState, kind: []const u8, from_rip: u64, to_rip: u64, decoded_len: u64, return_addr: ?u64) void {
         if (!self.verbose_trace) return;
         if (return_addr) |ret_addr| {
             log.info("cf({s}): rip=0x{x} -> 0x{x} len={d} ret=0x{x} rsp=0x{x}", .{ kind, from_rip, to_rip, decoded_len, ret_addr, self.regs.rsp });
@@ -3127,8 +3151,13 @@ pub const MachOState = struct {
             .bits32 => .bits32,
             .bits64 => .bits64,
         };
-        const access: GuestAccess = if (direction == .register_to_memory and op != .cmp and op != .test_bits) .write else .read;
-        if (!self.ensureGuestAccess(d.addr, bytesForSize(size), access, @tagName(op))) return;
+        // F6 (throughput audit): no `ensureGuestAccess` pre-check here. It did a
+        // sparse probe plus a `translateGuest`, and `readMemVal`/`writeMemVal`
+        // below immediately repeat both — so every `add reg,[mem]`,
+        // `cmp [mem],reg` and friend translated its address twice. The
+        // accessors already terminate on an inaccessible address, through the
+        // same `terminateForGuestAccess`, with a better instruction label than
+        // `@tagName(op)` gave.
         const reg = if (direction == .memory_to_register) d.dst_reg else d.src_reg;
         const reg_high8 = if (direction == .memory_to_register) d.dst_high8 else d.src_high8;
         const memory_value = self.readMemVal(d.addr, size);
@@ -3161,10 +3190,8 @@ pub const MachOState = struct {
             .bits32 => .bits32,
             .bits64 => .bits64,
         };
-        if (memory) {
-            const access: GuestAccess = if (op == .cmp or op == .test_bits) .read else .write;
-            if (!self.ensureGuestAccess(d.addr, bytesForSize(size), access, @tagName(op))) return;
-        }
+        // F6: same removal as `executeHighwayMemoryBinary` — `readMemVal` and
+        // `writeMemVal` perform and report the translation themselves.
         const lhs = if (memory) self.readMemVal(d.addr, size) else self.regOperandVal(d.dst_reg, size, d.dst_high8);
         const evaluated = x64_decoder.highway.evaluate(op, width, lhs, d.imm, self.regs.rflags);
         self.regs.rflags = evaluated.rflags;
@@ -3472,12 +3499,24 @@ pub const MachOState = struct {
         // 0xA0000000) lives in sparse mappings rather than self.mem. Fetch
         // from the executable sparse view first so mprotect metadata remains
         // authoritative and reservation-backed JIT pages are decodable.
+        // F12 (throughput audit): one descending probe, not sixteen.
+        //
+        // This used to call `executableBytesConst` with count = 16, 15, 14 …
+        // until one succeeded, and each of those calls re-ran `isExecutable`
+        // *and* the page-cache probe internally — three page-cache lookups per
+        // iteration for a question already answered. The common case cost 3
+        // probes instead of 1; near the end of a mapping it degraded to ~48.
+        //
+        // Halving instead of decrementing bounds the tail at 5 probes while
+        // keeping the same result: the longest prefix, up to 16 bytes, that the
+        // executable mapping can supply. A shorter slice is always safe — the
+        // decoder rejects a truncated instruction rather than misreading one.
         if (self.sparse_memory.isExecutable(address, 1)) {
             var count: u64 = 16;
-            while (count != 0) : (count -= 1) {
+            while (count > 1) : (count /= 2) {
                 if (self.sparse_memory.executableBytesConst(address, count)) |bytes| return bytes;
             }
-            return null;
+            return self.sparse_memory.executableBytesConst(address, 1);
         }
 
         const offset = self.addrToOffset(address) orelse return null;
@@ -3638,10 +3677,34 @@ pub const MachOState = struct {
             decoded.segment == .fs or decoded.segment == .gs;
     }
 
+    /// Exact LRU for a two-way set: the way just used becomes the survivor and
+    /// the other becomes the eviction candidate. Written only when it changes,
+    /// so a repeatedly hit entry stores nothing on the hot path.
+    inline fn noteDecodeCacheUse(ways: []DecodeCacheEntry, used: *DecodeCacheEntry) void {
+        if (used.recently_used) return;
+        for (ways) |*way| way.recently_used = false;
+        used.recently_used = true;
+    }
+
     fn decodeWithLiveOperands(self: *MachOState) ?DecodedInsn {
-        const fetch_address = self.regs.rip +% x64_decoder.segmentBase(&self.regs, .cs, .long64);
-        const cache_index = constants.decodeCacheIndex(fetch_address);
-        const entry = &self.decode_cache[cache_index];
+        // F17 (throughput audit): CS has no base in long mode — `segmentBase`
+        // returns 0 for every segment but FS and GS (see addressing.zig). The
+        // call was two compares and a load per instruction to add zero.
+        const fetch_address = self.regs.rip;
+        // Set-associative lookup. Direct-mapped, two hot instructions whose
+        // addresses hash together evicted each other on every execution and
+        // never recovered — a permanent conflict miss for code that is
+        // otherwise perfectly cacheable. Two ways at the same total size fixes
+        // the pair case, which is the common one.
+        const set_base = constants.decodeCacheSetBase(fetch_address);
+        const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
+        var entry: *DecodeCacheEntry = &ways[0];
+        for (ways) |*candidate| {
+            if (candidate.rip == fetch_address) {
+                entry = candidate;
+                break;
+            }
+        }
         // P0-2 (perf audit): generation-keyed fast path. Every executable
         // write bumps self.code_generation (noteGuestWrite) and precisely
         // clears overlapping entries, so a matching generation proves no
@@ -3653,6 +3716,7 @@ pub const MachOState = struct {
         // takes the fast path again.
         if (entry.rip == fetch_address and entry.code_generation == self.code_generation) {
             self.decode_cache_hits +|= 1;
+            noteDecodeCacheUse(ways, entry);
             var decoded = entry.decoded;
             if (addressNeedsLiveRegisters(decoded)) {
                 const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
@@ -3688,6 +3752,7 @@ pub const MachOState = struct {
             false;
         if (entry.rip == fetch_address and cached_bytes_match) {
             self.decode_cache_hits +|= 1;
+            noteDecodeCacheUse(ways, entry);
             entry.code_generation = self.code_generation;
             var decoded = entry.decoded;
             if (addressNeedsLiveRegisters(decoded)) {
@@ -3713,6 +3778,26 @@ pub const MachOState = struct {
             entry.* = .{};
         }
         self.decode_cache_misses +|= 1;
+        // Which kind of miss this is, because the two have different remedies
+        // and only one of them is fixable. A compulsory miss fills a way that
+        // was never occupied — the first execution of code that has just been
+        // emitted, which no cache can avoid. A conflict miss evicts a live
+        // decode, which is capacity the cache could have kept.
+        entry = &ways[0];
+        var victim_is_empty = false;
+        for (ways) |*candidate| {
+            if (candidate.rip == std.math.maxInt(u64)) {
+                entry = candidate;
+                victim_is_empty = true;
+                break;
+            }
+            if (!candidate.recently_used) entry = candidate;
+        }
+        if (victim_is_empty) {
+            self.decode_cache_compulsory_misses +|= 1;
+        } else {
+            self.decode_cache_conflict_misses +|= 1;
+        }
         const bytes = fetched_bytes orelse self.executableInstructionBytesAt(fetch_address) orelse return null;
         var decoded = decodeInsn(bytes);
         if (decoded.op == .invalid and self.sparse_memory.containsMapped(fetch_address, 1)) {
@@ -3720,6 +3805,21 @@ pub const MachOState = struct {
         }
         const prefixes = x64_decoder.decodeLegacyPrefixes(bytes);
         decoded.has_0x67 = prefixes.address_size_override;
+        // F5 (throughput audit): resolve LOCK here, once, instead of in
+        // `execute` on every instruction.
+        //
+        // `execute` used to re-read the byte at RIP through `guestMemoryConst`
+        // — a full guest address translation, sparse probe included — purely to
+        // test for 0xF0, on every interpreted instruction. The prefix scan
+        // above already has the answer and the result is cached with the rest
+        // of the decode.
+        //
+        // It is also more correct. The old test looked only at `bytes[0]`, so a
+        // LOCK that followed a segment or operand-size override, or that sat
+        // before a REX byte, was missed. `decodeLegacyPrefixes` walks the whole
+        // prefix run. `or` rather than `=` because several decode paths already
+        // set `lock` themselves.
+        decoded.lock = decoded.lock or prefixes.lock;
         const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
         const base_register: ?RegId = if (decoded.sib_has_base) decoded.sib_base_reg else null;
         decoded.segment = x64_decoder.selectSegment(.explicit_data, base_register, prefixes.segment_override);
@@ -3747,6 +3847,12 @@ pub const MachOState = struct {
             .displacement = raw_displacement,
             .instruction_byte_count = instruction_byte_count,
         };
+        // F4: this page now holds a cached decode, so a later store into it has
+        // to run the invalidation walk. Noted for the instruction's whole
+        // extent, because a store to its last byte must still find it.
+        noteDecodeCacheUse(ways, entry);
+        self.decode_cache_pages.note(fetch_address);
+        self.decode_cache_pages.note(fetch_address +| (@as(u64, instruction_byte_count) -| 1));
         @memcpy(
             entry.instruction_bytes[0..instruction_byte_count],
             bytes[0..instruction_byte_count],
@@ -4078,8 +4184,18 @@ pub const MachOState = struct {
         scheduling.finishActiveGuestThread(self);
     }
 
+    /// Queue a GTK signal handler (more than one argument, unlike a
+    /// `GSourceFunc`). Used by the modelled `gtk_widget_queue_draw`.
+    pub fn scheduleSignalCallback(self: *MachOState, function: u64, arg0: u64, arg1: u64, arg2: u64, tag: []const u8) u64 {
+        return scheduling.scheduleSignalCallback(self, function, arg0, arg1, arg2, tag);
+    }
+
     pub fn scheduleIdleCallback(self: *MachOState, function: u64, data: u64, tag: []const u8) u64 {
         return scheduling.scheduleIdleCallback(self, function, data, tag);
+    }
+
+    pub fn isIdleCallbackPending(self: *const MachOState, source: u64) bool {
+        return scheduling.isIdleCallbackPending(self, source);
     }
 
     pub fn pendingIdleCallbackCount(self: *const MachOState) usize {

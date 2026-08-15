@@ -26,6 +26,7 @@ const DARWIN_SIGACTION_SIZE = constants.DARWIN_SIGACTION_SIZE;
 const GUEST_SIGNAL_ACTION_COUNT = constants.GUEST_SIGNAL_ACTION_COUNT;
 const TOML_CODEPOINT_STRIDE = constants.TOML_CODEPOINT_STRIDE;
 const GUEST_SIGILL = constants.GUEST_SIGILL;
+const GUEST_SIGSEGV = constants.GUEST_SIGSEGV;
 const PROFILE_ENCRYPTED_ACCOUNT_BYTES = constants.PROFILE_ENCRYPTED_ACCOUNT_BYTES;
 const SA_SIGINFO = constants.SA_SIGINFO;
 
@@ -127,6 +128,15 @@ pub fn signalFailureResult() u64 {
     return @bitCast(@as(i64, -1));
 }
 
+/// Whether a returning signal handler advanced past the fault on its own.
+///
+/// Note what this deliberately does *not* decide: a SIGSEGV handler that
+/// returns with RIP unchanged is reported here as "no progress", and the
+/// caller then asks the memory system whether the protection actually changed
+/// before retrying (see `signal_handling.protectionFaultResolved`). Retrying
+/// cannot be decided from the register file alone — the whole point of the
+/// write-watch pattern is that RIP is unchanged *and* the retry will now
+/// succeed.
 pub fn signalHandlerMadeProgress(frame: GuestSignalFrame, resume_rip: u64, fault_bytes: []const u8) bool {
     if (resume_rip != frame.fault_rip) return true;
     if (frame.signal != GUEST_SIGILL) return false;
@@ -272,6 +282,29 @@ pub fn resolveGuestSignalReturn(frame: GuestSignalFrame, resume_rip: u64, fault_
     if (frame.signal != GUEST_SIGILL or fault_bytes.len < 2) return null;
     if (fault_bytes[0] != 0x0F or fault_bytes[1] != 0x0B) return null;
     return frame.fault_rip +% frame.instruction_len;
+}
+
+test "a SIGSEGV handler returning with RIP unchanged is not progress on its own" {
+    // The write-watch protocol: handler un-protects the page and returns
+    // without moving RIP, expecting a retry. This function reports "no
+    // progress" so the caller consults the memory system; it must not claim
+    // progress from the register file alone, and must not resolve the fault.
+    const frame = GuestSignalFrame{ .signal = GUEST_SIGSEGV, .fault_rip = 0x1000, .instruction_len = 7 };
+    try std.testing.expect(!signalHandlerMadeProgress(frame, 0x1000, &.{}));
+    try std.testing.expectEqual(@as(?u64, null), resolveGuestSignalReturn(frame, 0x1000, &.{}));
+    // A handler that did move RIP has resolved it by itself.
+    try std.testing.expect(signalHandlerMadeProgress(frame, 0x1007, &.{}));
+    try std.testing.expectEqual(@as(?u64, 0x1007), resolveGuestSignalReturn(frame, 0x1007, &.{}));
+}
+
+test "a SIGILL handler returning onto UD2 never retries" {
+    // Retrying an illegal instruction spins forever, so the UD2 case skips the
+    // faulting instruction instead. This is the asymmetry with SIGSEGV that
+    // makes one shared \"made progress\" rule wrong for both.
+    const frame = GuestSignalFrame{ .signal = GUEST_SIGILL, .fault_rip = 0x2000, .instruction_len = 2 };
+    const ud2 = [_]u8{ 0x0F, 0x0B };
+    try std.testing.expect(!signalHandlerMadeProgress(frame, 0x2000, &ud2));
+    try std.testing.expectEqual(@as(?u64, 0x2002), resolveGuestSignalReturn(frame, 0x2000, &ud2));
 }
 
 pub fn readDarwinSigaction(bytes: []const u8) ?GuestSignalAction {

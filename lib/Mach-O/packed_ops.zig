@@ -17,6 +17,109 @@ pub fn multiplyUnsignedEvenDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
     return result;
 }
 
+/// Computes the signed maximum independently for each packed dword lane.
+/// The bit pattern is preserved from the selected operand, including at the
+/// signed boundary where unsigned comparison would choose the wrong value.
+/// Packed integer minimum/maximum across the SSE4.1 family
+/// (`VPMINSB/SD/UW/UD`, `VPMAXSB/SD/UW/UD`).
+///
+/// One kernel rather than eight, because the only things that vary are the lane
+/// width, whether the comparison is signed, and which side wins. `maxSignedDwords`
+/// predates this and is kept: it is the arm `VPMAXSD` already used and its own
+/// test pins the signed-vs-unsigned distinction that makes this family easy to
+/// get wrong.
+pub const MinMaxKind = struct {
+    lane_bits: u8,
+    signed: bool,
+    take_max: bool,
+};
+
+pub fn packedMinMax(lhs: [16]u8, rhs: [16]u8, kind: MinMaxKind) [16]u8 {
+    var result: [16]u8 = undefined;
+    switch (kind.lane_bits) {
+        8 => for (0..16) |lane| {
+            const a = lhs[lane];
+            const b = rhs[lane];
+            const wins = if (kind.signed)
+                (@as(i8, @bitCast(a)) > @as(i8, @bitCast(b))) == kind.take_max
+            else
+                (a > b) == kind.take_max;
+            result[lane] = if (wins) a else b;
+        },
+        16 => for (0..8) |lane| {
+            const offset = lane * 2;
+            const a = std.mem.readInt(u16, lhs[offset..][0..2], .little);
+            const b = std.mem.readInt(u16, rhs[offset..][0..2], .little);
+            const wins = if (kind.signed)
+                (@as(i16, @bitCast(a)) > @as(i16, @bitCast(b))) == kind.take_max
+            else
+                (a > b) == kind.take_max;
+            std.mem.writeInt(u16, result[offset..][0..2], if (wins) a else b, .little);
+        },
+        32 => for (0..4) |lane| {
+            const offset = lane * 4;
+            const a = std.mem.readInt(u32, lhs[offset..][0..4], .little);
+            const b = std.mem.readInt(u32, rhs[offset..][0..4], .little);
+            const wins = if (kind.signed)
+                (@as(i32, @bitCast(a)) > @as(i32, @bitCast(b))) == kind.take_max
+            else
+                (a > b) == kind.take_max;
+            std.mem.writeInt(u32, result[offset..][0..4], if (wins) a else b, .little);
+        },
+        else => unreachable,
+    }
+    return result;
+}
+
+test "packed min/max separates signed from unsigned comparison" {
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    // -1 vs 1: signed says 1 is larger, unsigned says 0xFFFFFFFF is.
+    std.mem.writeInt(u32, lhs[0..4], @bitCast(@as(i32, -1)), .little);
+    std.mem.writeInt(u32, rhs[0..4], 1, .little);
+
+    const smax = packedMinMax(lhs, rhs, .{ .lane_bits = 32, .signed = true, .take_max = true });
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, smax[0..4], .little));
+    const smin = packedMinMax(lhs, rhs, .{ .lane_bits = 32, .signed = true, .take_max = false });
+    try std.testing.expectEqual(@as(i32, -1), @as(i32, @bitCast(std.mem.readInt(u32, smin[0..4], .little))));
+    const umax = packedMinMax(lhs, rhs, .{ .lane_bits = 32, .signed = false, .take_max = true });
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), std.mem.readInt(u32, umax[0..4], .little));
+    const umin = packedMinMax(lhs, rhs, .{ .lane_bits = 32, .signed = false, .take_max = false });
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, umin[0..4], .little));
+
+    // The pre-existing VPMAXSD kernel must agree with the generic one.
+    try std.testing.expectEqualSlices(u8, &maxSignedDwords(lhs, rhs), &smax);
+}
+
+pub fn maxSignedDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        const left: i32 = @bitCast(std.mem.readInt(u32, lhs[offset..][0..4], .little));
+        const right: i32 = @bitCast(std.mem.readInt(u32, rhs[offset..][0..4], .little));
+        std.mem.writeInt(u32, result[offset..][0..4], @bitCast(if (left > right) left else right), .little);
+    }
+    return result;
+}
+
+test "signed packed dword maximum compares as i32 rather than u32" {
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    const left_values = [_]i32{ -1, 1, std.math.minInt(i32), 7 };
+    const right_values = [_]i32{ 1, -2, std.math.maxInt(i32), 7 };
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        std.mem.writeInt(u32, lhs[offset..][0..4], @bitCast(left_values[lane]), .little);
+        std.mem.writeInt(u32, rhs[offset..][0..4], @bitCast(right_values[lane]), .little);
+    }
+
+    const result = maxSignedDwords(lhs, rhs);
+    const expected = [_]i32{ 1, 1, std.math.maxInt(i32), 7 };
+    for (0..4) |lane| {
+        try std.testing.expectEqual(expected[lane], @as(i32, @bitCast(std.mem.readInt(u32, result[lane * 4 ..][0..4], .little))));
+    }
+}
+
 /// Shuffles 32-bit dword lanes according to a control byte.
 /// Each pair of bits in the control byte selects a source lane (0-3)
 /// for the corresponding destination lane.
@@ -174,6 +277,49 @@ pub fn shiftPackedElements(source: [16]u8, lane_bits: u8, count: u64, left: bool
         else => unreachable,
     }
     return result;
+}
+
+/// Packed arithmetic (sign-propagating) right shift: PSRAW / PSRAD.
+///
+/// Two things separate this from `shiftPackedElements` and both are easy to get
+/// wrong. The shift is on the *signed* lane, so vacated bits take the sign bit
+/// rather than zero; and an out-of-range count does **not** produce zero, it
+/// saturates — every lane becomes all-zeros or all-ones according to its own
+/// sign. The logical form returns zero there, which is why sharing one helper
+/// between them would be wrong rather than merely imprecise.
+pub fn arithmeticShiftPackedElements(source: [16]u8, lane_bits: u8, count: u64) [16]u8 {
+    var result = [_]u8{0} ** 16;
+    switch (lane_bits) {
+        16 => for (0..8) |lane| {
+            const offset = lane * 2;
+            const value: i16 = @bitCast(std.mem.readInt(u16, source[offset..][0..2], .little));
+            const amount: u4 = if (count >= 16) 15 else @intCast(count);
+            std.mem.writeInt(u16, result[offset..][0..2], @bitCast(value >> amount), .little);
+        },
+        32 => for (0..4) |lane| {
+            const offset = lane * 4;
+            const value: i32 = @bitCast(std.mem.readInt(u32, source[offset..][0..4], .little));
+            const amount: u5 = if (count >= 32) 31 else @intCast(count);
+            std.mem.writeInt(u32, result[offset..][0..4], @bitCast(value >> amount), .little);
+        },
+        else => unreachable,
+    }
+    return result;
+}
+
+test "arithmetic packed shift propagates sign and saturates out-of-range counts" {
+    var source = [_]u8{0} ** 16;
+    // lane0 = -8 (0xFFF8), lane1 = +8
+    std.mem.writeInt(u16, source[0..2], @bitCast(@as(i16, -8)), .little);
+    std.mem.writeInt(u16, source[2..4], 8, .little);
+    const shifted = arithmeticShiftPackedElements(source, 16, 2);
+    try std.testing.expectEqual(@as(i16, -2), @as(i16, @bitCast(std.mem.readInt(u16, shifted[0..2], .little))));
+    try std.testing.expectEqual(@as(i16, 2), @as(i16, @bitCast(std.mem.readInt(u16, shifted[2..4], .little))));
+    // An out-of-range count saturates to the sign, where the logical form zeroes.
+    const saturated = arithmeticShiftPackedElements(source, 16, 99);
+    try std.testing.expectEqual(@as(i16, -1), @as(i16, @bitCast(std.mem.readInt(u16, saturated[0..2], .little))));
+    try std.testing.expectEqual(@as(i16, 0), @as(i16, @bitCast(std.mem.readInt(u16, saturated[2..4], .little))));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &shiftPackedElements(source, 16, 99, false));
 }
 
 /// Performs a byte-wise logical shift on the entire 16-byte vector.

@@ -260,6 +260,9 @@ pub const DecodeCacheEntry = struct {
     /// guard against a missed JIT publication or an alternate write route.
     instruction_bytes: [15]u8 = [_]u8{0} ** 15,
     instruction_byte_count: u8 = 0,
+    /// Which way of the set survives the next eviction. Exact LRU for two
+    /// ways; see `MachOState.noteDecodeCacheUse`.
+    recently_used: bool = false,
     /// Raw displacement from `decodeInsn`, before base/index/rip-relative
     /// resolution.  Used on cache hit to re-resolve the operand address
     /// from current register state without double-counting the base
@@ -267,6 +270,71 @@ pub const DecodeCacheEntry = struct {
     /// is fed back through `resolveMemoryAddress` as `displacement`).
     displacement: u64 = 0,
 };
+
+/// Which 4 KiB pages may have a decode-cache entry in them.
+///
+/// F4 (throughput audit): `noteGuestWrite` must invalidate any cached decode
+/// whose bytes a store touched. An x86 instruction is at most 15 bytes, so a
+/// 1-byte store has 15 possible starts, and probing them meant 15 multiplicative
+/// hashes into a ~5.8 MB table — 15 uncorrelated cache misses — for *every*
+/// byte Xenia's JIT emits.
+///
+/// The asymmetry this exploits: the emitter writes a code page many times
+/// before anything executes from it, and writes plenty of pages nothing ever
+/// executes from. A page with no cached decode cannot invalidate anything, and
+/// that is answerable with one bit.
+///
+/// Direction matters for soundness. A set bit means "an entry may exist in this
+/// page" and is set when an entry is populated; a clear bit means no entry was
+/// ever populated there since the last reset, so nothing can need clearing.
+/// Hash collisions in the decode cache can only evict entries, never move one
+/// into a page whose bit is clear. Bits are therefore never cleared except by a
+/// full flush, which clears the whole table with them.
+pub const DecodeCachePageSet = struct {
+    /// 4 GiB of guest address space at 4 KiB granularity = 1 Mi pages = 128 KiB
+    /// of bitmap. Addresses above that (synthetic thunk space) fold onto the
+    /// same bits, which is safe: folding can only make the answer "maybe",
+    /// never "no".
+    const page_count: usize = 1 << 20;
+    const word_count: usize = page_count / 64;
+
+    words: [word_count]u64 = [_]u64{0} ** word_count,
+
+    inline fn pageIndex(address: u64) usize {
+        return @intCast((address >> 12) & (page_count - 1));
+    }
+
+    pub inline fn note(self: *DecodeCachePageSet, address: u64) void {
+        const page = pageIndex(address);
+        self.words[page / 64] |= @as(u64, 1) << @truncate(page % 64);
+    }
+
+    /// Whether any page spanned by `[first, last]` may hold a cached decode.
+    /// The range is at most 15 bytes wide, so it covers one page or two.
+    pub inline fn anyCoveringRange(self: *const DecodeCachePageSet, first: u64, last: u64) bool {
+        const first_page = pageIndex(first);
+        if ((self.words[first_page / 64] >> @truncate(first_page % 64)) & 1 != 0) return true;
+        const last_page = pageIndex(last);
+        if (last_page == first_page) return false;
+        return (self.words[last_page / 64] >> @truncate(last_page % 64)) & 1 != 0;
+    }
+
+    pub fn reset(self: *DecodeCachePageSet) void {
+        @memset(&self.words, 0);
+    }
+};
+
+test "decode-cache page set answers per page and never under-reports a noted page" {
+    var set = DecodeCachePageSet{};
+    try std.testing.expect(!set.anyCoveringRange(0xA000_0000, 0xA000_000F));
+    set.note(0xA000_0800);
+    try std.testing.expect(set.anyCoveringRange(0xA000_0000, 0xA000_000F));
+    // A write straddling a page boundary must consult both pages.
+    try std.testing.expect(!set.anyCoveringRange(0xA000_1000, 0xA000_100F));
+    try std.testing.expect(set.anyCoveringRange(0x9FFF_FFF9, 0xA000_0007));
+    set.reset();
+    try std.testing.expect(!set.anyCoveringRange(0xA000_0000, 0xA000_000F));
+}
 
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
 pub const HEARTBEAT_INTERVAL: u64 = 25_000_000;
@@ -291,6 +359,8 @@ pub const PerformanceSample = struct {
     decode_cache_hits: u64 = 0,
     decode_cache_misses: u64 = 0,
     decode_cache_stale_rejections: u64 = 0,
+    decode_cache_compulsory_misses: u64 = 0,
+    decode_cache_conflict_misses: u64 = 0,
     code_generation: u64 = 0,
     import_route_cache_hits: u64 = 0,
     import_route_cache_misses: u64 = 0,
@@ -510,12 +580,40 @@ pub const IdleCallback = struct {
     source_id: u64 = 0,
     function: u64 = 0,
     data: u64 = 0,
+    /// Second and third integer arguments, for queued callbacks that are not
+    /// `GSourceFunc`. A GTK signal handler is invoked as
+    /// `handler(instance, detail..., user_data)`, so the queue has to carry
+    /// more than the single `gpointer` an idle source takes.
+    ///
+    /// `extra_arguments` gates them deliberately. A `GSourceFunc` reads only
+    /// its first argument, so writing rsi/rdx for one is ABI-legal but it is
+    /// still a change to the register state the dispatcher restores from the
+    /// cooperative UI context — and applying that to every pre-existing idle
+    /// source in order to serve a new one is a wider blast radius than the new
+    /// feature needs. Ordinary sources keep the exact dispatch they had.
+    arg1: u64 = 0,
+    arg2: u64 = 0,
+    extra_arguments: bool = false,
     active: bool = false,
     tag: []const u8 = "",
     scheduled_step: u64 = 0,
     scheduling_thread: u64 = 0,
     scheduling_rip: u64 = 0,
 };
+
+test "only signal handlers request the extra argument registers" {
+    // A `GSourceFunc` reads one argument. Leaving rsi/rdx alone for it keeps
+    // the dispatch byte-identical to the restored cooperative UI context, so
+    // adding signal-handler support cannot perturb the idle sources that pump
+    // the guest's main loop.
+    const idle = IdleCallback{ .function = 0x1000, .data = 0x20 };
+    try std.testing.expect(!idle.extra_arguments);
+    try std.testing.expectEqual(@as(u64, 0), idle.arg1);
+    try std.testing.expectEqual(@as(u64, 0), idle.arg2);
+
+    const handler = IdleCallback{ .function = 0x1000, .data = 0x20, .arg1 = 0, .arg2 = 0x30, .extra_arguments = true };
+    try std.testing.expect(handler.extra_arguments);
+}
 
 pub const IdleDispatchBlock = enum {
     ready,

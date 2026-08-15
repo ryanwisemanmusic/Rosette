@@ -868,6 +868,33 @@ test "decode and execute the XXH3 packed integer VEX cluster" {
     try std.testing.expectEqual(std.mem.readInt(u64, rhs[0..8], .little), std.mem.readInt(u64, interleaved[8..16], .little));
 }
 
+test "decode and execute the reported VPMAXSD instruction" {
+    // C4 E2 71 3D CA = VPMAXSD xmm1, xmm1, xmm2.
+    const decoded = decodeInsn(&[_]u8{ 0xC4, 0xE2, 0x71, 0x3D, 0xCA });
+    try std.testing.expectEqual(Op.vpmaxsd, decoded.op);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src);
+    try std.testing.expectEqual(@as(u8, 2), decoded.xmm_src2);
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expect(!decoded.vector_256);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+
+    var lhs = [_]u8{0} ** 16;
+    var rhs = [_]u8{0} ** 16;
+    const left_values = [_]i32{ -1, 4, std.math.minInt(i32), 9 };
+    const right_values = [_]i32{ 1, -4, std.math.maxInt(i32), 9 };
+    for (0..4) |lane| {
+        const offset = lane * 4;
+        std.mem.writeInt(u32, lhs[offset..][0..4], @bitCast(left_values[lane]), .little);
+        std.mem.writeInt(u32, rhs[offset..][0..4], @bitCast(right_values[lane]), .little);
+    }
+    const result = packed_ops.maxSignedDwords(lhs, rhs);
+    const expected = [_]i32{ 1, 4, std.math.maxInt(i32), 9 };
+    for (0..4) |lane| {
+        try std.testing.expectEqual(expected[lane], @as(i32, @bitCast(std.mem.readInt(u32, result[lane * 4 ..][0..4], .little))));
+    }
+}
+
 test "decode VEX signed integer scalar conversions" {
     const failing_memory = decodeInsn(&[_]u8{ 0xC5, 0xFA, 0x2A, 0x45, 0xE8 });
     try std.testing.expectEqual(Op.vcvtsi2ss_xmm_mem, failing_memory.op);

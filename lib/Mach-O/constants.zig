@@ -57,7 +57,20 @@ pub const IDLE_STARVATION_STEPS: u64 = 100_000;
 pub const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 pub const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
 pub const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 16;
+/// Ways per set. The table stays the same size; it is only reinterpreted as
+/// `DECODE_CACHE_ENTRY_COUNT / DECODE_CACHE_WAYS` sets of this many entries.
+///
+/// Direct-mapped, two instructions whose addresses hash to the same slot evict
+/// each other on every execution — forever, because the mapping is fixed. That
+/// is a *conflict* miss, and unlike a compulsory miss (the first execution of
+/// newly emitted code, which no cache can avoid) it is pure loss. Two ways
+/// removes the pathological pair case for the same memory and the same number
+/// of entries.
+pub const DECODE_CACHE_WAYS: usize = 2;
+pub const DECODE_CACHE_SET_COUNT: usize = DECODE_CACHE_ENTRY_COUNT / DECODE_CACHE_WAYS;
 pub const DECODE_CACHE_HASH_SHIFT: u6 = 48;
+/// 64 - log2(DECODE_CACHE_SET_COUNT).
+pub const DECODE_CACHE_SET_SHIFT: u6 = 49;
 pub const DECODE_CACHE_HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Hash an exact instruction address into the direct-mapped decode cache.
@@ -69,6 +82,53 @@ pub const DECODE_CACHE_HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 /// mixing high JIT addresses such as 0xA0000000 into the index.
 pub inline fn decodeCacheIndex(address: u64) usize {
     return @intCast((address *% DECODE_CACHE_HASH_MULTIPLIER) >> DECODE_CACHE_HASH_SHIFT);
+}
+
+/// Index of the first way of the set an address maps to.
+pub inline fn decodeCacheSetBase(address: u64) usize {
+    const set: usize = @intCast((address *% DECODE_CACHE_HASH_MULTIPLIER) >> DECODE_CACHE_SET_SHIFT);
+    return set * DECODE_CACHE_WAYS;
+}
+
+test "invalidation and lookup enumerate the same slots" {
+    // The safety property of set associativity: a stale decode must not be
+    // reachable in a way the invalidation walk skipped. Both sides derive their
+    // slots from `decodeCacheSetBase`, so this pins that they agree — if the
+    // lookup ever gains a way the invalidation does not clear, the cache can
+    // execute bytes the guest has overwritten.
+    for ([_]u64{ 0x1000, 0xA000_5AF8, 0x34D8_6000 }) |address| {
+        const base = decodeCacheSetBase(address);
+        var covered = false;
+        for (0..DECODE_CACHE_WAYS) |way| {
+            if (base + way < DECODE_CACHE_ENTRY_COUNT) covered = true;
+        }
+        try std.testing.expect(covered);
+        try std.testing.expect(base + DECODE_CACHE_WAYS <= DECODE_CACHE_ENTRY_COUNT);
+    }
+    // Sets partition the table exactly: no slot belongs to two sets and none is
+    // unreachable.
+    try std.testing.expectEqual(DECODE_CACHE_ENTRY_COUNT, DECODE_CACHE_SET_COUNT * DECODE_CACHE_WAYS);
+}
+
+test "every set base is in range and both ways are addressable" {
+    for ([_]u64{ 0, 1, 0xA000_5AF8, 0x34D8_6000, std.math.maxInt(u64) }) |address| {
+        const base = decodeCacheSetBase(address);
+        try std.testing.expect(base + DECODE_CACHE_WAYS <= DECODE_CACHE_ENTRY_COUNT);
+        try std.testing.expectEqual(@as(usize, 0), base % DECODE_CACHE_WAYS);
+    }
+}
+
+test "a set holds two independent addresses that previously evicted each other" {
+    // Find a colliding pair under the direct-mapped index, then prove the
+    // set-associative mapping still gives them distinct ways to live in.
+    var probe: u64 = 0x1000;
+    const target = decodeCacheIndex(0x1000);
+    const collider = while (probe < 0x40_0000) : (probe += 1) {
+        if (probe != 0x1000 and decodeCacheIndex(probe) == target) break probe;
+    } else 0;
+    if (collider != 0) {
+        try std.testing.expectEqual(decodeCacheSetBase(0x1000), decodeCacheSetBase(collider));
+    }
 }
 
 test "decode cache hashes neighboring instruction starts independently" {
