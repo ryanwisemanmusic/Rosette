@@ -1438,6 +1438,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
     // Variable-count packed logical shifts. The count is the low 64 bits of
     // the third XMM/m128 operand and applies to every element.
     if ((opcode == 0xD1 or opcode == 0xD2 or opcode == 0xD3 or
+        opcode == 0xE1 or opcode == 0xE2 or
         opcode == 0xF1 or opcode == 0xF2 or opcode == 0xF3) and prefix == 1)
     {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
@@ -1456,6 +1457,8 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             0xD1 => .vpsrlw,
             0xD2 => .vpsrld,
             0xD3 => .vpsrlq,
+            0xE1 => .vpsraw,
+            0xE2 => .vpsrad,
             0xF1 => .vpsllw,
             0xF2 => .vpslld,
             0xF3 => .vpsllq,
@@ -1531,7 +1534,13 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         const is_mem = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, false, false, .bits64);
         const group = (@intFromEnum(rm.reg) & 0x07);
-        if (group != 2 and group != 3 and group != 6 and group != 7) return .{};
+        // Group 4 is PSRAW/PSRAD. It was not merely rejected here: the opcode
+        // table below mapped everything that was not group 2 to the *left*
+        // shift, so admitting group 4 without fixing that would have decoded an
+        // arithmetic right shift as a logical left shift. Both halves move
+        // together. 0x73 (quadword) has no arithmetic form in AVX/AVX2.
+        if (group != 2 and group != 3 and group != 4 and group != 6 and group != 7) return .{};
+        if (group == 4 and opcode == 0x73) return .{};
         decoded.xmm_dst = @truncate((~vex >> 3) & 0x0F);
         decoded.is_reg_form = !is_mem;
         if (is_mem) {
@@ -1544,8 +1553,16 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         decoded.uses_imm = true;
         pos += 1;
         decoded.op = switch (opcode) {
-            0x71 => if (group == 2) .vpsrlw else .vpsllw,
-            0x72 => if (group == 2) .vpsrld else .vpslld,
+            0x71 => switch (group) {
+                2 => .vpsrlw,
+                4 => .vpsraw,
+                else => .vpsllw,
+            },
+            0x72 => switch (group) {
+                2 => .vpsrld,
+                4 => .vpsrad,
+                else => .vpslld,
+            },
             0x73 => switch (group) {
                 2 => .vpsrlq,
                 3 => .vpsrldq,
@@ -1934,7 +1951,13 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         const is_mem = bytes[pos] < 0xC0;
         const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
         const group = @intFromEnum(rm.reg) & 0x07;
-        if (group != 2 and group != 3 and group != 6 and group != 7) return .{};
+        // Group 4 is PSRAW/PSRAD. It was not merely rejected here: the opcode
+        // table below mapped everything that was not group 2 to the *left*
+        // shift, so admitting group 4 without fixing that would have decoded an
+        // arithmetic right shift as a logical left shift. Both halves move
+        // together. 0x73 (quadword) has no arithmetic form in AVX/AVX2.
+        if (group != 2 and group != 3 and group != 4 and group != 6 and group != 7) return .{};
+        if (group == 4 and opcode == 0x73) return .{};
         decoded.xmm_dst = @truncate((~vex_control >> 3) & 0x0F);
         decoded.is_reg_form = !is_mem;
         if (is_mem) {
@@ -1947,8 +1970,16 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         decoded.uses_imm = true;
         pos += 1;
         decoded.op = switch (opcode) {
-            0x71 => if (group == 2) .vpsrlw else .vpsllw,
-            0x72 => if (group == 2) .vpsrld else .vpslld,
+            0x71 => switch (group) {
+                2 => .vpsrlw,
+                4 => .vpsraw,
+                else => .vpsllw,
+            },
+            0x72 => switch (group) {
+                2 => .vpsrld,
+                4 => .vpsrad,
+                else => .vpslld,
+            },
             0x73 => switch (group) {
                 2 => .vpsrlq,
                 3 => .vpsrldq,
@@ -2248,6 +2279,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
 
     if (opcode_map == 1 and
         (opcode == 0xD1 or opcode == 0xD2 or opcode == 0xD3 or
+            opcode == 0xE1 or opcode == 0xE2 or
             opcode == 0xF1 or opcode == 0xF2 or opcode == 0xF3) and prefix == 1)
     {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
@@ -2266,6 +2298,8 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0xD1 => .vpsrlw,
             0xD2 => .vpsrld,
             0xD3 => .vpsrlq,
+            0xE1 => .vpsraw,
+            0xE2 => .vpsrad,
             0xF1 => .vpsllw,
             0xF2 => .vpslld,
             0xF3 => .vpsllq,
@@ -2506,6 +2540,45 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
         decoded.op = switch (opcode) {
             0x29 => .vpcmpeqq,
             0x37 => .vpcmpgtq,
+            else => unreachable,
+        };
+        decoded.len = @intCast(pos);
+        return decoded;
+    }
+
+    // VPMAXSD: VEX.NDS.128/256.66.0F38.W0 3D /r. This is the AVX/AVX2
+    // instruction emitted by Xenia at the reported fault address. The generic
+    // VEX decoder knows the 0F38 opcode, but the legacy dispatch path reaches
+    // this low-level decoder directly, so it must be covered here as well.
+    // Packed integer min/max, VEX.128/256.66.0F38.WIG 38..3F /r.
+    //
+    // Only 0x3D (VPMAXSD) was decoded here. The other seven had `Op` members and
+    // a complete table in `decodeVexMap38` — which `decodeVex3` never calls, so
+    // production never saw it. That is the same shape as the earlier C5/C4 gap:
+    // a second opcode table that looks like coverage and is not reachable.
+    // `VPMINSD` (0x39) is what Xenia's shader translator raised SIGILL on.
+    if (opcode_map == 2 and opcode >= 0x38 and opcode <= 0x3F and prefix == 1 and !rex_w) {
+        var decoded = DecodedInsn{ .vector_256 = vector_256 };
+        var pos = start_pos + 4;
+        const is_mem = bytes[pos] < 0xC0;
+        const rm = readModRM(&decoded, bytes, &pos, rex_r, rex_x, rex_b, .bits64);
+        decoded.xmm_dst = @intFromEnum(rm.reg);
+        decoded.xmm_src = @truncate((~vex_control >> 3) & 0x0F);
+        decoded.is_reg_form = !is_mem;
+        if (is_mem) {
+            decoded.addr = rm.addr;
+        } else {
+            decoded.xmm_src2 = @intCast(rm.addr);
+        }
+        decoded.op = switch (opcode) {
+            0x38 => .vpminsb,
+            0x39 => .vpminsd,
+            0x3A => .vpminuw,
+            0x3B => .vpminud,
+            0x3C => .vpmaxsb,
+            0x3D => .vpmaxsd,
+            0x3E => .vpmaxuw,
+            0x3F => .vpmaxud,
             else => unreachable,
         };
         decoded.len = @intCast(pos);

@@ -82,6 +82,88 @@ test "the two-byte and three-byte VEX forms decode the same 0F opcodes" {
     try std.testing.expectEqual(@as(usize, 0), gaps);
 }
 
+test "three-byte VEX decodes the reported VPMAXSD instruction" {
+    const bytes = [_]u8{ 0xC4, 0xE2, 0x71, 0x3D, 0xCA };
+    const decoded = vex.decodeVex3(&bytes, 0);
+    try std.testing.expectEqual(types.Op.vpmaxsd, decoded.op);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_dst);
+    try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src); // VEX.vvvv
+    try std.testing.expectEqual(@as(u8, 2), decoded.xmm_src2); // ModRM.rm
+    try std.testing.expect(decoded.is_reg_form);
+    try std.testing.expect(!decoded.vector_256);
+    try std.testing.expectEqual(@as(u8, 5), decoded.len);
+
+    // Exercise the dispatch route used by the processor, not only the VEX
+    // helper itself.
+    const dispatched = legacy.decodeLegacyInstruction(&bytes, .long64);
+    try std.testing.expectEqual(types.Op.vpmaxsd, dispatched.op);
+}
+
+test "VEX packed arithmetic shifts decode in both the C5 and C4 forms" {
+    // Regression: `C5 F1 E2 CC` (VPSRAD xmm1, xmm1, xmm4) raised SIGILL inside
+    // Xenia's shader translator. E1/E2 were absent from *both* VEX opcode
+    // tables, which is why the C5-vs-C4 symmetry test above did not catch it:
+    // it proves the two paths agree, and they agreed on being wrong. Coverage
+    // of a specific encoding needs a test that names the encoding.
+    const two_byte = vex.decodeVex2(&[_]u8{ 0xC5, 0xF1, 0xE2, 0xCC }, 0);
+    try std.testing.expectEqual(types.Op.vpsrad, two_byte.op);
+    try std.testing.expectEqual(@as(u8, 1), two_byte.xmm_dst); // ModRM.reg
+    try std.testing.expectEqual(@as(u8, 1), two_byte.xmm_src); // VEX.vvvv
+    try std.testing.expectEqual(@as(u8, 4), two_byte.xmm_src2); // ModRM.rm = count
+    try std.testing.expect(two_byte.is_reg_form);
+
+    // Same operation through the three-byte form.
+    const three_byte = vex.decodeVex3(&[_]u8{ 0xC4, 0xE1, 0x71, 0xE2, 0xCC }, 0);
+    try std.testing.expectEqual(types.Op.vpsrad, three_byte.op);
+    try std.testing.expectEqual(types.Op.vpsraw, vex.decodeVex2(&[_]u8{ 0xC5, 0xF1, 0xE1, 0xCC }, 0).op);
+    try std.testing.expectEqual(types.Op.vpsraw, vex.decodeVex3(&[_]u8{ 0xC4, 0xE1, 0x71, 0xE1, 0xCC }, 0).op);
+}
+
+test "VEX immediate shift group 4 is arithmetic, not a left shift" {
+    // The immediate form was worse than missing: group 4 fell into an `else`
+    // that produced the *left* logical shift, so `vpsraw $3, xmm, xmm` executed
+    // as `vpsllw`. A wrong answer, silently, rather than a refused decode.
+    const sraw = vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0x71, 0xE2, 0x03 }, 0);
+    try std.testing.expectEqual(types.Op.vpsraw, sraw.op);
+    try std.testing.expectEqual(@as(u64, 3), sraw.imm);
+    try std.testing.expect(sraw.uses_imm);
+
+    const srad = vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0x72, 0xE2, 0x02 }, 0);
+    try std.testing.expectEqual(types.Op.vpsrad, srad.op);
+
+    // The neighbouring groups must keep their previous meanings.
+    try std.testing.expectEqual(types.Op.vpsrlw, vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0x71, 0xD2, 0x03 }, 0).op);
+    try std.testing.expectEqual(types.Op.vpsllw, vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0x71, 0xF2, 0x03 }, 0).op);
+    // There is no packed arithmetic quadword shift below AVX-512; group 4 of
+    // 0x73 must stay refused rather than aliasing onto vpsllq.
+    try std.testing.expectEqual(types.Op.invalid, vex.decodeVex2(&[_]u8{ 0xC5, 0xE9, 0x73, 0xE2, 0x03 }, 0).op);
+}
+
+test "VEX packed min/max decodes through the production three-byte path" {
+    // Regression: `C4 E2 71 39 CA` (VPMINSD xmm1, xmm1, xmm2) raised SIGILL in
+    // Xenia's shader translator. All eight of 0F38 38..3F had `Op` members and
+    // a complete table in `decodeVexMap38` — but `decodeVex3` is what
+    // `legacy.zig` calls for a C4 prefix, and it named only 0x3D. A second
+    // opcode table that the production path never consults looks exactly like
+    // coverage, which is why this test exercises `decodeVex3` specifically.
+    const crash = vex.decodeVex3(&[_]u8{ 0xC4, 0xE2, 0x71, 0x39, 0xCA }, 0);
+    try std.testing.expectEqual(types.Op.vpminsd, crash.op);
+    try std.testing.expectEqual(@as(u8, 1), crash.xmm_dst); // ModRM.reg
+    try std.testing.expectEqual(@as(u8, 1), crash.xmm_src); // VEX.vvvv
+    try std.testing.expectEqual(@as(u8, 2), crash.xmm_src2); // ModRM.rm
+    try std.testing.expect(crash.is_reg_form);
+
+    const expected = [_]types.Op{
+        .vpminsb, .vpminsd, .vpminuw, .vpminud,
+        .vpmaxsb, .vpmaxsd, .vpmaxuw, .vpmaxud,
+    };
+    for (expected, 0..) |want, index| {
+        const opcode: u8 = @intCast(0x38 + index);
+        const decoded = vex.decodeVex3(&[_]u8{ 0xC4, 0xE2, 0x71, opcode, 0xCA }, 0);
+        try std.testing.expectEqual(want, decoded.op);
+    }
+}
+
 test "every decoder family analyzes cleanly (refAllDecls)" {
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(prefix);

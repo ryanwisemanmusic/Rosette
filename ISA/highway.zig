@@ -382,22 +382,73 @@ fn logical(width: Width, wide: u64) IntegerResult {
     return .{ .dest = value, .flags = flags };
 }
 
+/// F10 (throughput audit): fold the six flag decisions into two masks and one
+/// read-modify-write, with no branches.
+///
+/// This ran on every `add`/`sub`/`cmp`/`test`/`and`/`or`/`xor` — and each of
+/// the six flags was a separate `switch` over a four-state enum against a
+/// separate mask, so an instruction whose result is usually consumed by the
+/// very next `jcc` paid six unpredictable branches to encode flags most of
+/// which are never read.
+///
+/// Semantics are unchanged, including the deliberate treatment of `.undefined`
+/// as "leave alone": the architecture permits any value, and preserving the
+/// previous one is what the runtime already did. Keeping that identical is the
+/// point — this is a representation change, not a semantic one.
 fn applyFlags(initial: u32, flags: Flags) u32 {
-    var result = initial;
-    applyFlag(&result, 1 << 0, flags.cf);
-    applyFlag(&result, 1 << 2, flags.pf);
-    applyFlag(&result, 1 << 4, flags.af);
-    applyFlag(&result, 1 << 6, flags.zf);
-    applyFlag(&result, 1 << 7, flags.sf);
-    applyFlag(&result, 1 << 11, flags.of);
-    return result;
+    var affected: u32 = 0;
+    var values: u32 = 0;
+    inline for (.{
+        .{ flags.cf, @as(u32, 1) << 0 },
+        .{ flags.pf, @as(u32, 1) << 2 },
+        .{ flags.af, @as(u32, 1) << 4 },
+        .{ flags.zf, @as(u32, 1) << 6 },
+        .{ flags.sf, @as(u32, 1) << 7 },
+        .{ flags.of, @as(u32, 1) << 11 },
+    }) |entry| {
+        const value: FlagValue = entry[0];
+        const mask: u32 = entry[1];
+        // `0 -% bit` is 0x00000000 or 0xFFFFFFFF, so each term is a masked
+        // select rather than a branch.
+        const writes: u32 = @intFromBool(value == .set or value == .clear);
+        const sets: u32 = @intFromBool(value == .set);
+        affected |= mask & (0 -% writes);
+        values |= mask & (0 -% sets);
+    }
+    return (initial & ~affected) | values;
 }
 
-fn applyFlag(rflags: *u32, mask: u32, value: FlagValue) void {
-    switch (value) {
-        .set => rflags.* |= mask,
-        .clear => rflags.* &= ~mask,
-        .preserve, .undefined => {},
+test "branchless flag folding matches the per-flag switch it replaced" {
+    // The predecessor, kept here as the oracle.
+    const reference = struct {
+        fn applyFlag(rflags: *u32, mask: u32, value: FlagValue) void {
+            switch (value) {
+                .set => rflags.* |= mask,
+                .clear => rflags.* &= ~mask,
+                .preserve, .undefined => {},
+            }
+        }
+        fn apply(initial: u32, flags: Flags) u32 {
+            var result = initial;
+            applyFlag(&result, 1 << 0, flags.cf);
+            applyFlag(&result, 1 << 2, flags.pf);
+            applyFlag(&result, 1 << 4, flags.af);
+            applyFlag(&result, 1 << 6, flags.zf);
+            applyFlag(&result, 1 << 7, flags.sf);
+            applyFlag(&result, 1 << 11, flags.of);
+            return result;
+        }
+    };
+    const states = [_]FlagValue{ .clear, .set, .preserve, .undefined };
+    // Exhaustive over all 4^6 flag combinations, against several seed words
+    // including ones with unrelated control flags set.
+    for ([_]u32{ 0, 0xFFFF_FFFF, 0x0002, (1 << 9) | (1 << 10), 0x0A55 }) |seed| {
+        for (states) |cf| for (states) |pf| for (states) |af| {
+            for (states) |zf| for (states) |sf| for (states) |of| {
+                const flags = Flags{ .cf = cf, .pf = pf, .af = af, .zf = zf, .sf = sf, .of = of };
+                try std.testing.expectEqual(reference.apply(seed, flags), applyFlags(seed, flags));
+            };
+        };
     }
 }
 

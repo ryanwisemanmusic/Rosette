@@ -522,6 +522,11 @@ pub const Op = enum(u16) {
     vpsrlq,
     vpsrlw,
     vpsrldq,
+    // Arithmetic (sign-propagating) packed shifts. There is no `vpsraq` in
+    // AVX/AVX2 — a 64-bit arithmetic packed shift first appears in AVX-512 —
+    // so the pair below is the complete AVX family.
+    vpsraw,
+    vpsrad,
     vpsubb,
     vpsubd,
     vpsubq,
