@@ -103,6 +103,8 @@ pub fn History(comptime Entry: type) type {
         sequence: u64 = 0,
         evictions: u64 = 0,
         policy: Policy = .generated_code_only,
+        /// See `findSlot`. `slots.len` (an out-of-range value) means "no memo".
+        last_slot_index: usize = std.math.maxInt(usize),
         recorded: u64 = 0,
         skipped: u64 = 0,
 
@@ -133,9 +135,28 @@ pub fn History(comptime Entry: type) type {
             self.storage = &.{};
         }
 
+        /// F11 (throughput audit): one-entry memo in front of the slot scan.
+        ///
+        /// `record` runs per instruction under the `generated_code_only`
+        /// policy, and every call walked all 24 slots looking for the active
+        /// thread. Guest threads switch cooperatively and rarely, so the last
+        /// answer is almost always still the right one — and this becomes a
+        /// per-step cost the moment generated code stops being 2% of the run,
+        /// which is exactly what a working title would do.
+        ///
+        /// The memo stores an index, and is validated against the slot's own
+        /// `thread` before use, so a slot that was reassigned (eviction) can
+        /// never be returned for the wrong thread.
         fn findSlot(self: *Self, thread: u64) ?*Slot {
-            for (self.slots) |*slot| {
-                if (slot.thread == thread) return slot;
+            if (self.last_slot_index < self.slots.len) {
+                const cached = &self.slots[self.last_slot_index];
+                if (cached.thread == thread) return cached;
+            }
+            for (self.slots, 0..) |*slot, index| {
+                if (slot.thread == thread) {
+                    self.last_slot_index = index;
+                    return slot;
+                }
             }
             return null;
         }
@@ -166,6 +187,7 @@ pub fn History(comptime Entry: type) type {
             if (victim.thread != unassigned) self.evictions +|= 1;
             victim.thread = thread;
             victim.ring.reset();
+            self.last_slot_index = (@intFromPtr(victim) - @intFromPtr(self.slots.ptr)) / @sizeOf(Slot);
             return victim;
         }
 
