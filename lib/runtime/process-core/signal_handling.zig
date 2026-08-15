@@ -34,6 +34,8 @@ const SA_SIGINFO = constants.SA_SIGINFO;
 
 const GuestSignalFrame = @import("macho_core").types.GuestSignalFrame;
 const GuestAccess = @import("macho_core").types.GuestAccess;
+const memory_access = @import("memory_access.zig");
+const recovery_ledger = @import("ownership").ledger;
 
 pub fn handleSigaction(self: anytype) u64 {
     const signal_index = guestSignalIndex(self.regs.rdi) orelse return signalFailureResult();
@@ -176,6 +178,27 @@ pub fn ensureGuestSignalFrameStorage(self: anytype, frame: *GuestSignalFrame) bo
     return true;
 }
 
+/// Whether the access that raised this SIGSEGV would now be permitted.
+///
+/// This is the only thing that authorises retrying the faulting instruction:
+/// the guest's handler must have actually changed the protection. Asking the
+/// memory system directly — rather than trusting that a handler ran — means an
+/// unresolved fault still terminates, and means the answer stays correct for
+/// any guest that uses the write-watch pattern rather than for one we
+/// recognised.
+fn protectionFaultResolved(self: anytype, frame: GuestSignalFrame) bool {
+    const access = frame.fault_access orelse return false;
+    if (frame.fault_width == 0) return false;
+    const width: u64 = frame.fault_width;
+    if (self.sparse_memory.bytesConst(frame.fault_address, width) != null) {
+        // Readable now; a write additionally needs the writable view.
+        if (access != .write) return true;
+        return self.sparse_memory.bytes(frame.fault_address, width, true) != null;
+    }
+    if (access == .execute) return self.sparse_memory.isExecutable(frame.fault_address, width);
+    return memory_access.translateGuest(self, frame.fault_address, width, access) != null;
+}
+
 pub fn finishGuestSignalReturn(self: anytype) bool {
     if (self.signal_frame_count == 0) {
         self.faulted = true;
@@ -201,6 +224,31 @@ pub fn finishGuestSignalReturn(self: anytype) bool {
         return false;
     }
     const fault_bytes = self.guestMemoryConst(frame.fault_rip, frame.instruction_len) orelse &.{};
+    // A SIGSEGV handler that returns with RIP unchanged is not necessarily
+    // stuck: for a *protection* fault that is the whole protocol. The
+    // write-watch pattern — protect a page read-only, catch the write,
+    // un-protect it, return — deliberately leaves RIP on the faulting
+    // instruction and expects it to be retried. Treating "RIP unchanged" as
+    // failure terminated the run at precisely the moment the guest was handling
+    // the fault correctly.
+    //
+    // The predicate is behavioural, not a guess about who the guest is: retry
+    // only when the access that faulted would *now* succeed. If the handler
+    // left the protection as it was, nothing changed and the original
+    // termination stands, so this cannot spin on an unhandled fault.
+    if (frame.signal == GUEST_SIGSEGV and self.regs.rip == frame.fault_rip) {
+        if (protectionFaultResolved(self, frame)) {
+            self.guest_protection_retries +|= 1;
+            if (recovery_ledger.throttled(self.guest_protection_retries)) {
+                machoCapturePrint(
+                    "macho-processor: guest SIGSEGV handler resolved a protection fault #{d}: rip=0x{x} address=0x{x} bytes={d} access={s}; the handler changed the page's protection and returned without moving RIP, so the faulting instruction is retried — this is the write-watch protocol, not a stalled handler\n",
+                    .{ self.guest_protection_retries, frame.fault_rip, frame.fault_address, frame.fault_width, if (frame.fault_access) |access| @tagName(access) else "unknown" },
+                );
+            }
+            self.terminal_memory_failure = null;
+            return true;
+        }
+    }
     const resume_rip = resolveGuestSignalReturn(frame, self.regs.rip, fault_bytes) orelse {
         if (frame.signal == GUEST_SIGSEGV) {
             machoCapturePrint(

@@ -277,20 +277,34 @@ pub fn ms(self: anytype) memory_mod.MemoryState {
     };
 }
 
+/// F6 (throughput audit): the sparse mapping is consulted first and
+/// `translateGuest` only when it misses.
+///
+/// These used to pass `translateGuest(...)` as an argument, which Zig evaluates
+/// before the call — while the callee checks the sparse mapping first and only
+/// looks at the offset if that missed. So a sparse-backed read paid for a full
+/// contiguous-image translation it discarded, and a contiguous read paid for a
+/// sparse probe it did not need. Both directions paid for the path not taken,
+/// on every access.
+inline fn linearOffset(self: anytype, vaddr: u64, comptime count: u64) ?u64 {
+    if (self.sparse_memory.bytesConst(vaddr, count) != null) return null;
+    return translateGuest(self, vaddr, count, .read);
+}
+
 pub fn read8(self: anytype, vaddr: u64) u8 {
-    return memory_mod.read8(&ms(self), vaddr, translateGuest(self, vaddr, 1, .read));
+    return memory_mod.read8(&ms(self), vaddr, linearOffset(self, vaddr, 1));
 }
 
 pub fn read16(self: anytype, vaddr: u64) u16 {
-    return memory_mod.read16(&ms(self), vaddr, translateGuest(self, vaddr, 2, .read));
+    return memory_mod.read16(&ms(self), vaddr, linearOffset(self, vaddr, 2));
 }
 
 pub fn read32(self: anytype, vaddr: u64) u32 {
-    return memory_mod.read32(&ms(self), vaddr, translateGuest(self, vaddr, 4, .read));
+    return memory_mod.read32(&ms(self), vaddr, linearOffset(self, vaddr, 4));
 }
 
 pub fn read64(self: anytype, vaddr: u64) u64 {
-    return memory_mod.read64(&ms(self), vaddr, translateGuest(self, vaddr, 8, .read));
+    return memory_mod.read64(&ms(self), vaddr, linearOffset(self, vaddr, 8));
 }
 
 pub fn write8(self: anytype, vaddr: u64, val: u8) void {
@@ -462,14 +476,19 @@ pub fn write64(self: anytype, vaddr: u64, val: u64) void {
     }
 }
 
+/// F6 (throughput audit): no `ensureGuestAccess` pre-check.
+///
+/// `push` is the second instruction of nearly every function and `call`
+/// performs one too, so this pair is among the hottest paths in the runtime.
+/// The pre-check probed the sparse mappings and ran `translateGuest`, and then
+/// `write64`/`read64` did both again — two full translations for one stack
+/// slot. Both accessors already fault correctly on an inaccessible stack.
 pub fn push(self: anytype, val: u64) void {
     self.regs.rsp -|= 8;
-    if (!ensureGuestAccess(self, self.regs.rsp, 8, .write, "stack_push")) return;
     write64(self, self.regs.rsp, val);
 }
 
 pub fn pop(self: anytype) u64 {
-    if (!ensureGuestAccess(self, self.regs.rsp, 8, .read, "stack_pop")) return 0;
     const val = read64(self, self.regs.rsp);
     self.regs.rsp +|= 8;
     return val;
@@ -3548,7 +3567,7 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     _ = State;
     if (sparse_storage) |storage| {
         var value = readSized(storage, size);
-        if (size == .bits64 and vtableRecoveryWanted(self, value)) {
+        if (size == .bits64 and vtableRecoveryWanted(self, effective_address, value)) {
             if (recoverLiveAllocationVtable(self, effective_address, value)) |recovered| {
                 if (self.sparse_memory.bytes(effective_address, @sizeOf(u64), true)) |mutable| {
                     std.mem.writeInt(u64, mutable[0..8], recovered, .little);
@@ -3563,7 +3582,7 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     const offset = off orelse return 0;
     if (offset + bytes > self.mem.len) return 0;
     var value = readSized(self.mem[@intCast(offset)..], size);
-    if (size == .bits64 and vtableRecoveryWanted(self, value)) {
+    if (size == .bits64 and vtableRecoveryWanted(self, effective_address, value)) {
         if (recoverLiveAllocationVtable(self, effective_address, value)) |recovered| {
             std.mem.writeInt(u64, self.mem[@intCast(offset)..][0..8], recovered, .little);
             value = recovered;
@@ -3587,8 +3606,23 @@ fn readSized(storage: []const u8, size: Size) u64 {
 /// Mirrors the first line of `recoverLiveAllocationVtable`. Asking it here
 /// turns the common 64-bit load — a pointer, a count, anything at or above
 /// 0x1000 — from "indirect call that returns null" into one compare.
-inline fn vtableRecoveryWanted(self: anytype, value: u64) bool {
-    return value < 0x1000 or self.vtable_tracker.policy.repair_nonzero_corruption;
+inline fn vtableRecoveryWanted(self: anytype, address: u64, value: u64) bool {
+    if (value >= 0x1000 and !self.vtable_tracker.policy.repair_nonzero_corruption) return false;
+    // F7 (throughput audit): the value test alone was the wrong gate. Its
+    // comment reasoned that "a pointer, a count, anything at or above 0x1000"
+    // is the common case — but values *below* 0x1000 are the most common thing
+    // a program loads: zero, null, booleans, small counts, enum tags, loop
+    // indices. So the supposedly rare path ran constantly, and its first act
+    // was two `AutoHashMap` probes (a Wyhash plus a random probe into a table
+    // that grows with the heap) on an address that in almost every case had
+    // never had a vptr written to it.
+    //
+    // A tracked vptr lives either in a live heap allocation or in the modelled
+    // stack registry. Both answer "definitely not here" in two comparisons.
+    // This is the same range-gate-before-lookup shape already used by
+    // `withinArena` and `execution_tracepoints.Set.mightMatch`.
+    return self.memory_forwarder.withinArena(address) or
+        self.vtable_stack_registry.mightContain(address);
 }
 
 /// Whether the memory-access ring can possibly want this access.
@@ -5060,9 +5094,6 @@ pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
     // cheap case.
     if (!touches_image_code and !self.sparse_memory.isExecutable(address, count)) return;
 
-    self.code_generation +%= 1;
-    if (self.code_generation == 0) self.code_generation = 1;
-
     // Xenia emits and patches translated x64 in a sparse RWX code cache
     // (normally 0xA0000000..0xAFFFFFFF). Invalidate only cached instructions
     // whose bytes overlap the write. A global generation flush on every JIT
@@ -5073,22 +5104,50 @@ pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
     const last_candidate = end - 1;
     const candidate_count = last_candidate - first_candidate + 1;
     if (candidate_count >= @as(u64, @intCast(self.decode_cache.len))) {
+        // F3: the *only* place the generation moves. A wholesale flush cannot
+        // name which entries it invalidated, so every surviving entry has to
+        // re-prove itself by byte comparison — which is exactly what a
+        // generation mismatch asks for.
+        self.code_generation +%= 1;
+        if (self.code_generation == 0) self.code_generation = 1;
         @memset(self.decode_cache, .{});
+        self.decode_cache_pages.reset();
         return;
     }
+    // F4: a code-cache page is written far more often than it is executed
+    // from. One bit test rejects the 15-candidate walk below for every write
+    // to a page that has never had a decode cached in it — which is most of
+    // what the JIT emitter does. The bit is set in `decodeWithLiveOperands`
+    // when an entry is populated, so a set bit means "an entry may exist
+    // here", never the reverse.
+    if (!self.decode_cache_pages.anyCoveringRange(first_candidate, last_candidate)) return;
+
     // Any x86 instruction overlapping this write must begin between
     // address-14 and end-1. Probe exact candidate starts with the same hash as
     // decodeWithLiveOperands; this preserves precise invalidation without reverting to a
     // global cache flush for each small Xenia JIT patch.
+    //
+    // F3: this walk is precise — it clears exactly the entries whose bytes the
+    // write touched — so the global `code_generation` bump that used to
+    // accompany it was pure redundancy with a large cost. It invalidated the
+    // fast path of every *unrelated* entry in the program, and Xbyak emits one
+    // byte at a time, so during code generation essentially every instruction
+    // fetch fell through to the byte-comparison path. The bump now happens
+    // only where precision is actually lost (the flush above).
     var candidate = first_candidate;
     while (candidate <= last_candidate) : (candidate += 1) {
-        const cache_index = constants.decodeCacheIndex(candidate);
-        const entry = &self.decode_cache[cache_index];
-        if (entry.rip == std.math.maxInt(u64)) continue;
-        const instruction_length = @max(@as(u64, entry.decoded.len), 1);
-        const instruction_end = entry.rip +| instruction_length;
-        if (entry.rip < end and instruction_end > address) {
-            entry.* = .{};
+        // Every way of the set, not one slot: the cache is set-associative, and
+        // an invalidation that clears only one way leaves a stale decode
+        // reachable in the other. That is the failure this loop exists to
+        // prevent, so it has to enumerate exactly what the lookup enumerates.
+        const set_base = constants.decodeCacheSetBase(candidate);
+        for (self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS]) |*entry| {
+            if (entry.rip == std.math.maxInt(u64)) continue;
+            const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+            const instruction_end = entry.rip +| instruction_length;
+            if (entry.rip < end and instruction_end > address) {
+                entry.* = .{};
+            }
         }
     }
 }
@@ -5627,14 +5686,14 @@ test "guestCString reads sparse-backed strings outside the primary image" {
     // `manager.bytes` needs mutable storage; a const binding here is why this
     // test stopped compiling the moment the module gained a test target.
     var setup = try sparseCStringTestState(std.testing.allocator);
-    defer setup.manager.deinit();
+    defer setup.state.sparse_memory.deinit();
     defer setup.firewall.deinit();
     defer std.testing.allocator.free(setup.state.mem);
     defer std.testing.allocator.free(setup.state.page_permissions);
     const state = &setup.state;
 
     const base: u64 = 0x8000_0000;
-    const bytes = setup.manager.bytes(base, 16, true) orelse return error.TestUnexpectedResult;
+    const bytes = setup.state.sparse_memory.bytes(base, 16, true) orelse return error.TestUnexpectedResult;
     @memcpy(bytes[0..11], "hello world");
     bytes[11] = 0;
 
@@ -5656,7 +5715,7 @@ test "guestCString resolves a sparse string that ends at the mapping boundary" {
     // `manager.bytes` needs mutable storage; a const binding here is why this
     // test stopped compiling the moment the module gained a test target.
     var setup = try sparseCStringTestState(std.testing.allocator);
-    defer setup.manager.deinit();
+    defer setup.state.sparse_memory.deinit();
     defer setup.firewall.deinit();
     defer std.testing.allocator.free(setup.state.mem);
     defer std.testing.allocator.free(setup.state.page_permissions);
@@ -5667,7 +5726,7 @@ test "guestCString resolves a sparse string that ends at the mapping boundary" {
     // mapping. The geometric probe overshoots the mapping and the bisect must
     // recover the exact readable span to find the terminator.
     const tail = base + sparse_virtual_memory.PAGE_64K - 500;
-    const tail_bytes = setup.manager.bytes(tail, 500, true) orelse return error.TestUnexpectedResult;
+    const tail_bytes = setup.state.sparse_memory.bytes(tail, 500, true) orelse return error.TestUnexpectedResult;
     for (0..499) |index| tail_bytes[index] = 'a';
     tail_bytes[499] = 0;
 
@@ -5678,7 +5737,7 @@ test "guestCString resolves a sparse string that ends at the mapping boundary" {
 
     // A non-terminated read that outgrows max_len rejects like the primary
     // image path does.
-    const untruncated = setup.manager.bytes(tail, 500, true) orelse return error.TestUnexpectedResult;
+    const untruncated = setup.state.sparse_memory.bytes(tail, 500, true) orelse return error.TestUnexpectedResult;
     untruncated[0] = 'b';
     try std.testing.expect(guestCString(state, tail, 32) == null);
 }

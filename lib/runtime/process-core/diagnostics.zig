@@ -86,6 +86,8 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
         .decode_cache_hits = self.decode_cache_hits,
         .decode_cache_misses = self.decode_cache_misses,
         .decode_cache_stale_rejections = self.decode_cache_stale_rejections,
+        .decode_cache_compulsory_misses = self.decode_cache_compulsory_misses,
+        .decode_cache_conflict_misses = self.decode_cache_conflict_misses,
         .code_generation = self.code_generation,
         .import_route_cache_hits = self.import_route_cache_hits,
         .import_route_cache_misses = self.import_route_cache_misses,
@@ -103,6 +105,13 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
     const decode_hits = self.decode_cache_hits -| previous.decode_cache_hits;
     const decode_misses = self.decode_cache_misses -| previous.decode_cache_misses;
     const decode_stale = self.decode_cache_stale_rejections -| previous.decode_cache_stale_rejections;
+    // Split the misses, because only one half is addressable. A compulsory
+    // miss is the first execution of newly emitted code — there is nothing to
+    // cache yet, so a 100% hit rate is not a reachable target while the guest
+    // is still translating. A conflict miss evicted a live decode and is the
+    // number worth driving down.
+    const decode_compulsory = self.decode_cache_compulsory_misses -| previous.decode_cache_compulsory_misses;
+    const decode_conflict = self.decode_cache_conflict_misses -| previous.decode_cache_conflict_misses;
     const decode_total = decode_hits + decode_misses;
     const decode_hit_rate = percentage(decode_hits, decode_total);
 
@@ -124,7 +133,7 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
 
     machoCapturePrint(
         "macho-processor: perf heartbeat: step={d} interval(steps/ms)={d}/{d} {d}steps/s" ++
-            " decode(hits/misses/stale)={d}/{d}/{d} hit_rate={d}% code_generation_bumps={d}" ++
+            " decode(hits/misses/stale)={d}/{d}/{d} hit_rate={d}% miss(compulsory/conflict)={d}/{d} code_generation_bumps={d}" ++
             " import(effective/slow/miss/fallback)={d}/{d}/{d}/{d} of {d} cleo_hits={d}\n",
         .{
             self.executed_steps,
@@ -135,6 +144,8 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
             decode_misses,
             decode_stale,
             decode_hit_rate,
+            decode_compulsory,
+            decode_conflict,
             generation_delta,
             import_effective,
             import_slow_hits,

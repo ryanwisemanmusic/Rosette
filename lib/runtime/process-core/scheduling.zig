@@ -547,6 +547,23 @@ pub fn finishActiveGuestThread(self: anytype) void {
     self.restoreMainLoopCaller("all cooperative guest threads returned");
 }
 
+/// Queue a GTK signal handler, which unlike a `GSourceFunc` takes more than one
+/// argument. Same queue, same cooperative dispatch, same accounting — only the
+/// argument list differs.
+pub fn scheduleSignalCallback(self: anytype, function: u64, arg0: u64, arg1: u64, arg2: u64, tag: []const u8) u64 {
+    const source = scheduleIdleCallback(self, function, arg0, tag);
+    if (source == 0) return 0;
+    for (&self.idle_callbacks) |*entry| {
+        if (entry.active and entry.source_id == source) {
+            entry.arg1 = arg1;
+            entry.arg2 = arg2;
+            entry.extra_arguments = true;
+            return source;
+        }
+    }
+    return source;
+}
+
 pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []const u8) u64 {
     if (function == 0 or !self.isExecutableAddress(function)) {
         machoCapturePrint(
@@ -596,6 +613,20 @@ pub fn updateCachedPendingIdle(self: anytype, delta: i32) void {
             self.cached_pending_idle -= 1;
         }
     }
+}
+
+/// Whether `source` is still queued and undispatched.
+///
+/// Used to coalesce repeated emissions of the same signal: GTK marks a widget
+/// dirty and paints it once, so a second `queue_draw` before the first is
+/// serviced must not add a second callback. Without this the queue fills with
+/// duplicate paints and starves the sources that pump the guest's main loop.
+pub fn isIdleCallbackPending(self: anytype, source: u64) bool {
+    if (source == 0) return false;
+    for (&self.idle_callbacks) |*entry| {
+        if (entry.active and entry.source_id == source) return true;
+    }
+    return false;
 }
 
 pub fn pendingIdleCallbackCount(self: anytype) usize {
@@ -648,6 +679,9 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         const source = entry.source_id;
         const function = entry.function;
         const data = entry.data;
+        const arg1 = entry.arg1;
+        const arg2 = entry.arg2;
+        const extra_arguments = entry.extra_arguments;
         const tag = entry.tag;
         const scheduled_step = entry.scheduled_step;
         const scheduling_thread = entry.scheduling_thread;
@@ -660,6 +694,10 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         self.x87 = context.x87;
         self.regs.rip = function;
         self.regs.rdi = data;
+        if (extra_arguments) {
+            self.regs.rsi = arg1;
+            self.regs.rdx = arg2;
+        }
         self.regs.rsp = alignDown(context.regs.rsp, 16);
         self.push(GUEST_THREAD_RETURN_SENTINEL);
         self.active_guest_thread = IDLE_CALLBACK_HANDLE_BASE + source;

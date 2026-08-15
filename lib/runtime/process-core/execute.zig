@@ -59,13 +59,16 @@ const permutePackedDoubles = decoder.permutePackedDoubles;
 const PackedIntegerOperation = packed_ops.PackedIntegerOperation;
 const packedIntegerBinary = packed_ops.packedIntegerBinary;
 const multiplyUnsignedEvenDwords = packed_ops.multiplyUnsignedEvenDwords;
+const maxSignedDwords = packed_ops.maxSignedDwords;
 const shufflePackedDwords = packed_ops.shufflePackedDwords;
 const shufflePackedSingles = packed_ops.shufflePackedSingles;
 const unpackLowQwords = packed_ops.unpackLowQwords;
 const blendPackedWords = packed_ops.blendPackedWords;
 const blendPackedElements = packed_ops.blendPackedElements;
 const shiftPackedBytes = packed_ops.shiftPackedBytes;
+const packedMinMax = packed_ops.packedMinMax;
 const shiftPackedElements = packed_ops.shiftPackedElements;
+const arithmeticShiftPackedElements = packed_ops.arithmeticShiftPackedElements;
 const threeOperandImulResult = utils.threeOperandImulResult;
 const maskForSize = execution_helpers.maskForSize;
 const signExtend = execution_helpers.signExtend;
@@ -105,10 +108,24 @@ fn packedIntegerLaneBits(op: Op) u8 {
     };
 }
 
+fn packedMinMaxKind(op: Op) packed_ops.MinMaxKind {
+    return switch (op) {
+        .vpminsb => .{ .lane_bits = 8, .signed = true, .take_max = false },
+        .vpmaxsb => .{ .lane_bits = 8, .signed = true, .take_max = true },
+        .vpminuw => .{ .lane_bits = 16, .signed = false, .take_max = false },
+        .vpmaxuw => .{ .lane_bits = 16, .signed = false, .take_max = true },
+        .vpminsd => .{ .lane_bits = 32, .signed = true, .take_max = false },
+        .vpmaxsd => .{ .lane_bits = 32, .signed = true, .take_max = true },
+        .vpminud => .{ .lane_bits = 32, .signed = false, .take_max = false },
+        .vpmaxud => .{ .lane_bits = 32, .signed = false, .take_max = true },
+        else => unreachable,
+    };
+}
+
 fn packedShiftLaneBits(op: Op) u8 {
     return switch (op) {
-        .vpsllw, .vpsrlw => 16,
-        .vpslld, .vpsrld => 32,
+        .vpsllw, .vpsrlw, .vpsraw => 16,
+        .vpslld, .vpsrld, .vpsrad => 32,
         .vpsllq, .vpsrlq => 64,
         else => unreachable,
     };
@@ -129,13 +146,49 @@ const cleo_meta_by_op = blk: {
     break :blk result;
 };
 
+/// F8 (throughput audit): the CLEO gate, as a bitset.
+///
+/// `cleo_meta_by_op` is `[715]?InstructionMeta`, and `InstructionMeta` carries
+/// four slices plus two `usize` — roughly 96 bytes, so about 67 KB of table.
+/// Indexing it by opcode on *every* interpreted instruction, purely to test
+/// whether the optional was present, meant a near-random access into a table
+/// larger than L1D, competing with the register file, the decode-cache entry
+/// and the guest memory being accessed.
+///
+/// 715 bits is 96 bytes: two cache lines, permanently resident. The metadata
+/// table is still there and still indexed — but only after this says there is
+/// something to find.
+///
+/// The supportedness test folds in here too. `isInstructionSupported` was
+/// evaluated at runtime on every hit against `cleo_runtime_features`, which is
+/// a compile-time constant, so the answer was always knowable at compile time.
+const cleo_supported_bits = blk: {
+    @setEvalBranchQuota(1_000_000);
+    const fields = @typeInfo(Op).@"enum".fields;
+    const word_count = (fields.len + 63) / 64;
+    var bits: [word_count]u64 = .{0} ** word_count;
+    for (fields) |field| {
+        if (cleo_meta_by_op[field.value]) |meta| {
+            if (cleo_routing.CleoRouter.isInstructionSupported(meta, cleo_runtime_features)) {
+                bits[field.value / 64] |= @as(u64, 1) << @truncate(field.value % 64);
+            }
+        }
+    }
+    break :blk bits;
+};
+
+inline fn cleoHandles(op: Op) bool {
+    const index = @intFromEnum(op);
+    return (cleo_supported_bits[index / 64] >> @truncate(index % 64)) & 1 != 0;
+}
+
 pub fn execute(self: anytype, initial_d: DecodedInsn) void {
     // CLEO supports a small subset of DecodedInsn operations. The former path
     // linearly scanned all 424 CLEO metadata records for every scalar guest
     // instruction. Resolve names once at compile time, then make the common
     // scalar path a single indexed null check.
-    if (cleo_meta_by_op[@intFromEnum(initial_d.op)]) |meta| {
-        if (cleo_routing.CleoRouter.isInstructionSupported(meta, cleo_runtime_features)) {
+    if (cleoHandles(initial_d.op)) {
+        if (cleo_meta_by_op[@intFromEnum(initial_d.op)]) |meta| {
             self.cleo_dispatch_hits +|= 1;
             const result_wide: ?cleo_routing.wide.Wide(128) = ternary: {
                 const is_fma = switch (meta.operation) {
@@ -203,10 +256,9 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
         }
     }
     var d = initial_d;
-    // Detect LOCK prefix (0xF0) from raw instruction bytes at RIP.
-    if (self.guestMemoryConst(self.regs.rip, 1)) |bytes| {
-        if (bytes[0] == 0xF0) d.lock = true;
-    }
+    // F5: `d.lock` is resolved at decode time (see `decodeWithLiveOperands`)
+    // and cached, so the LOCK prefix costs nothing here. This used to re-read
+    // guest memory at RIP on every interpreted instruction to rediscover it.
     if (d.lock) {
         // Acquire barrier: all prior loads/stores complete before the
         // LOCK-prefixed RMW executes (x86 LOCK# acquire semantic).
@@ -2225,7 +2277,7 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
-        .vpslld, .vpsllq, .vpsllw, .vpslldq, .vpsrld, .vpsrlq, .vpsrlw, .vpsrldq => {
+        .vpslld, .vpsllq, .vpsllw, .vpslldq, .vpsrld, .vpsrlq, .vpsrlw, .vpsrldq, .vpsraw, .vpsrad => {
             const source_low = if (d.uses_imm and !d.is_reg_form) self.readMem128(d.addr) else self.xmm[d.xmm_src];
             const count = if (d.uses_imm)
                 d.imm
@@ -2234,8 +2286,11 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 break :blk std.mem.readInt(u64, count_source[0..8], .little);
             };
             const left = d.op == .vpsllw or d.op == .vpslld or d.op == .vpsllq or d.op == .vpslldq;
+            const arithmetic = d.op == .vpsraw or d.op == .vpsrad;
             if (d.op == .vpslldq or d.op == .vpsrldq) {
                 self.xmm[d.xmm_dst] = shiftPackedBytes(source_low, count, left);
+            } else if (arithmetic) {
+                self.xmm[d.xmm_dst] = arithmeticShiftPackedElements(source_low, packedShiftLaneBits(d.op), count);
             } else {
                 self.xmm[d.xmm_dst] = shiftPackedElements(source_low, packedShiftLaneBits(d.op), count, left);
             }
@@ -2243,9 +2298,22 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 const source_high = if (d.uses_imm and !d.is_reg_form) self.readMem128(d.addr + 16) else self.ymm_hi[d.xmm_src];
                 if (d.op == .vpslldq or d.op == .vpsrldq) {
                     self.ymm_hi[d.xmm_dst] = shiftPackedBytes(source_high, count, left);
+                } else if (arithmetic) {
+                    self.ymm_hi[d.xmm_dst] = arithmeticShiftPackedElements(source_high, packedShiftLaneBits(d.op), count);
                 } else {
                     self.ymm_hi[d.xmm_dst] = shiftPackedElements(source_high, packedShiftLaneBits(d.op), count, left);
                 }
+            } else {
+                @memset(&self.ymm_hi[d.xmm_dst], 0);
+            }
+        },
+        .vpminsb, .vpminsd, .vpminuw, .vpminud, .vpmaxsb, .vpmaxsd, .vpmaxuw, .vpmaxud => {
+            const kind = packedMinMaxKind(d.op);
+            const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+            self.xmm[d.xmm_dst] = packedMinMax(self.xmm[d.xmm_src], rhs_low, kind);
+            if (d.vector_256) {
+                const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                self.ymm_hi[d.xmm_dst] = packedMinMax(self.ymm_hi[d.xmm_src], rhs_high, kind);
             } else {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
