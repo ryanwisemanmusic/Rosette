@@ -31,6 +31,19 @@ pub const StackRegistry = struct {
     allocator: std.mem.Allocator,
     records: std.AutoHashMap(u64, StackRecord),
     next_generation: u64 = 1,
+    /// F7 (throughput audit): watermarks over every registered address, so the
+    /// read path can reject an address in two comparisons instead of hashing.
+    ///
+    /// `recoverLiveAllocationVtable` is entered for every 64-bit load whose
+    /// value is below 0x1000 — zero, null, small counts, booleans, enum tags,
+    /// which is a large share of all loads — and its first act was two
+    /// `AutoHashMap` probes. Modelled objects are few and clustered, so a range
+    /// test rejects essentially every address that was never registered.
+    ///
+    /// Deliberately never narrowed on removal: the range may only grow, so it
+    /// can over-approximate but never wrongly exclude a live record.
+    lowest_registered: u64 = std.math.maxInt(u64),
+    highest_registered: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) StackRegistry {
         return .{
@@ -58,6 +71,15 @@ pub const StackRegistry = struct {
             .generation = generation,
             .established_by = provenance,
         }) catch return;
+        if (address < self.lowest_registered) self.lowest_registered = address;
+        if (address >= self.highest_registered) self.highest_registered = address +| 1;
+    }
+
+    /// Whether `address` could possibly have a modelled record. Two comparisons,
+    /// no hash. A false answer is authoritative; a true answer still needs the
+    /// map lookup.
+    pub inline fn mightContain(self: *const StackRegistry, address: u64) bool {
+        return address >= self.lowest_registered and address < self.highest_registered;
     }
 
     /// Look up a registered address.  Returns the trusted vptr or null.
