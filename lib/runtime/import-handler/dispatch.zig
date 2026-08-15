@@ -147,6 +147,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         if (count != 0) {
             const buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
             const mutation = self.captureMemoryMutation(dst, count);
+            self.noteGuestWrite(dst, count);
             @memset(buf, val);
             self.commitMemoryMutation(mutation, .bulk_fill);
         }
@@ -163,6 +164,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         if (count != 0) {
             const buf = self.guestMemory(dst, count) orelse return .{ .unsupported = 0 };
             const mutation = self.captureMemoryMutation(dst, count);
+            self.noteGuestWrite(dst, count);
             @memset(buf, 0);
             self.commitMemoryMutation(mutation, .bulk_fill);
         }
@@ -665,6 +667,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if (std.mem.eql(u8, name, "_strcpy")) {
         const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const destination = self.guestMemory(self.regs.rdi, source.len + 1) orelse return .{ .unsupported = 0 };
+        self.noteGuestWrite(self.regs.rdi, source.len + 1);
         @memcpy(destination[0..source.len], source);
         destination[source.len] = 0;
         return .{ .handled = self.regs.rdi };
@@ -2151,6 +2154,12 @@ pub fn handleGuestMemoryCopy(self: anytype, name: []const u8) ImportHandlerResul
     const destination = self.guestMemory(destination_address, count);
     if (source != null and destination != null) {
         const mutation = self.captureMemoryMutation(destination_address, count);
+        // A guest memcpy can publish executable bytes (a code-cache copy, a
+        // relocation applied in bulk). Invalidate the decode cache over the
+        // whole destination, exactly as a scalar store does — see
+        // `noteGuestWrite`. Without this the bulk routes were the one way to
+        // change instruction bytes without telling the decode cache.
+        self.noteGuestWrite(destination_address, count);
         if (destination_address > source_address and destination_address - source_address < count) {
             std.mem.copyBackwards(u8, destination.?, source.?);
         } else {
