@@ -2726,6 +2726,8 @@ pub const ElfState = struct {
             .vpsrlq,
             .vpsrlw,
             .vpsrldq,
+            .vpsraw,
+            .vpsrad,
             .vpsubb,
             .vpsubd,
             .vpsubq,
