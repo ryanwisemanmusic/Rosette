@@ -147,8 +147,18 @@ pub const Manager = struct {
     // R1 (perf audit): page-granular sparse classification cache (see the
     // PAGE_CACHE_* constants above). Bumped on every mapping/activation
     // mutation so a single bump invalidates all entries at once.
-    page_cache: [PAGE_CACHE_ENTRIES]PageCacheEntry = [_]PageCacheEntry{.{}} ** PAGE_CACHE_ENTRIES,
+    //
+    // F9 (throughput audit): behind a pointer rather than inline. At 4096
+    // entries it is ~128 KB, and `Manager` is a by-value field of `MachOState`,
+    // so inline it physically separated `regs` (declared early) from
+    // `executable_min`, `decode_cache` and `page_permissions` (declared after
+    // it) by more than a hundred kilobytes — in a struct every interpreted step
+    // touches at both ends. Lazily created so a `Manager` in a test or a
+    // diagnostic path costs nothing until it is used.
+    page_cache: ?*PageCache = null,
     page_cache_generation: u64 = 1,
+
+    pub const PageCache = [PAGE_CACHE_ENTRIES]PageCacheEntry;
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{ .allocator = allocator };
@@ -160,6 +170,19 @@ pub const Manager = struct {
         }
         self.mappings.deinit(self.allocator);
         self.activations.deinit(self.allocator);
+        if (self.page_cache) |cache| self.allocator.destroy(cache);
+        self.page_cache = null;
+    }
+
+    /// The page cache, created on first use. Returns null only if allocation
+    /// fails, in which case every probe falls back to the exact linear scan —
+    /// slower, never wrong.
+    fn pageCache(self: *Manager) ?*PageCache {
+        if (self.page_cache) |cache| return cache;
+        const cache = self.allocator.create(PageCache) catch return null;
+        cache.* = [_]PageCacheEntry{.{}} ** PAGE_CACHE_ENTRIES;
+        self.page_cache = cache;
+        return cache;
     }
 
     pub fn mapFile(self: *Manager, guest_base: u64, length: u64, prot_raw: u32, flags_raw: u32, host_fd: std.posix.fd_t, offset: u64) bool {
@@ -727,8 +750,8 @@ pub const Manager = struct {
         return @intCast((page *% PAGE_CACHE_HASH_MULTIPLIER) >> PAGE_CACHE_HASH_SHIFT);
     }
 
-    fn pageCacheFill(self: *Manager, page: u64) void {
-        const slot = &self.page_cache[pageCacheIndex(page)];
+    fn pageCacheFill(self: *Manager, cache: *PageCache, page: u64) void {
+        const slot = &cache[pageCacheIndex(page)];
         slot.* = .{ .tag = page + 1, .generation = self.page_cache_generation, .state = .none };
         const page_start = page << 12;
         const page_end = page_start +| PAGE_4K;
@@ -791,9 +814,10 @@ pub const Manager = struct {
     }
 
     fn pageCacheProbe(self: *Manager, page: u64) PageCacheResult {
-        const slot = &self.page_cache[pageCacheIndex(page)];
+        const cache = self.pageCache() orelse return .partial;
+        const slot = &cache[pageCacheIndex(page)];
         if (slot.tag != page + 1 or slot.generation != self.page_cache_generation) {
-            self.pageCacheFill(page);
+            self.pageCacheFill(cache, page);
         }
         return switch (slot.state) {
             .none => .none,
