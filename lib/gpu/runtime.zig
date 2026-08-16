@@ -141,6 +141,17 @@ pub const Runtime = struct {
         self.installBackend(boundary.adapter(.{}, null));
     }
 
+    /// Record native work performed by a Rosette-owned backend adapter outside
+    /// the handle API itself. The Vulkan presenter predates the generic handle
+    /// surface and owns its swapchain directly, but its real queue submissions
+    /// and accepted presentation requests are still facts about this runtime's
+    /// host execution boundary. Observing them here keeps bridge health honest
+    /// without fabricating a guest frame or a guest GPU command.
+    pub fn observeBackendProgress(self: *Runtime, submitted: bool, presented: bool) void {
+        if (submitted) self.submissions +|= 1;
+        if (presented) self.presentations +|= 1;
+    }
+
     pub fn hardwareDescription(self: *const Runtime) ?*const device_tree.Tree {
         return if (self.hardware_tree_valid) &self.hardware_tree else null;
     }
@@ -699,6 +710,38 @@ test "shadow Vulkan boundary reports the first real missing capability" {
     try std.testing.expectEqual(api.Capability.physical_adapter, health.first_missing_execution_capability.?);
     try std.testing.expect(!health.readyForHostExecution());
     try std.testing.expect(health.advisory_only);
+}
+
+test "native presenter progress advances bridge health without guest provenance" {
+    var runtime = Runtime{};
+    runtime.installVulkanBoundary(.{
+        .instance_native = true,
+        .surface_native = true,
+        .physical_adapter_native = true,
+        .logical_device_native = true,
+        .graphics_queue_native = true,
+        .host_visible_memory_native = true,
+        .device_local_memory_native = true,
+        .guest_mapping_native = true,
+        .buffer_native = true,
+        .image_native = true,
+        .command_buffer_native = true,
+        .barriers_native = true,
+        .synchronization_native = true,
+        .swapchain_native = true,
+        .presentation_native = true,
+    });
+
+    runtime.observeBackendProgress(true, false);
+    var health = runtime.bridgeHealth();
+    try std.testing.expectEqual(BridgeHealthStage.command_execution, health.stage);
+    try std.testing.expect(health.authentic_submission_seen);
+    try std.testing.expect(!health.authentic_presentation_seen);
+
+    runtime.observeBackendProgress(false, true);
+    health = runtime.bridgeHealth();
+    try std.testing.expectEqual(BridgeHealthStage.presentation, health.stage);
+    try std.testing.expect(health.authentic_presentation_seen);
 }
 
 test "Rosette handles contain backend resources and reject stale use" {
