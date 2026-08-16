@@ -18,11 +18,13 @@ pub const TerminationReason = enum(u8) {
     initializer_transaction_failure = 14,
     system_policy_rejected = 15,
     unhandled_guest_signal = 16,
+    host_termination_signal = 17,
 };
 
 pub const StopOwner = enum {
     guest_application,
     rosette_runtime,
+    host_lifecycle,
     indeterminate,
 };
 
@@ -251,6 +253,11 @@ pub const ExitReport = struct {
     memory_access_failure: ?MemoryAccessFailure = null,
     semantic_fault: ?SemanticFault = null,
     recent_memory_accesses: []const MemoryAccessEvent = &.{},
+    /// Identity of the context that faulted, pinned at the fault. Every block
+    /// that shows history is relative to this, so blocks whose evidence comes
+    /// from elsewhere can say so instead of reading as the fault's own history.
+    fault_thread: u64 = 0,
+    fault_step: u64 = 0,
     runtime_context: ?RuntimeContext = null,
     unresolved_import_calls: u64 = 0,
     attribution: ?Attribution = null,
@@ -352,6 +359,34 @@ pub fn logExitReport(report: ExitReport) void {
 
     if (report.recent_memory_accesses.len > 0) {
         std.debug.print("  \x1b[33mrecent scalar memory accesses (oldest first):\x1b[0m\n", .{});
+        // This ring is process-wide, so "recent" is recent for the process, not
+        // necessarily for the fault. State the relationship rather than letting
+        // another thread's entries — possibly billions of steps old — read as
+        // the faulting thread's immediate history.
+        if (report.fault_thread != 0) {
+            var same_thread: usize = 0;
+            var newest_step: u64 = 0;
+            for (report.recent_memory_accesses) |event| {
+                if (event.thread_handle == report.fault_thread) same_thread += 1;
+                if (event.step > newest_step) newest_step = event.step;
+            }
+            const age = if (report.fault_step > newest_step) report.fault_step - newest_step else 0;
+            std.debug.print(
+                "    provenance: fault_thread=0x{x} fault_step={d} entries={d} from_fault_thread={d} newest_entry_step={d} newest_is_older_by={d} steps{s}\n",
+                .{
+                    report.fault_thread,
+                    report.fault_step,
+                    report.recent_memory_accesses.len,
+                    same_thread,
+                    newest_step,
+                    age,
+                    if (same_thread == 0)
+                        "; NONE of these entries belong to the faulting thread, so this block cannot explain this fault"
+                    else
+                        "",
+                },
+            );
+        }
         for (report.recent_memory_accesses, 0..) |event, i| {
             std.debug.print(
                 "    [{d:>2}] thread=0x{x} epoch={d} step={d} rip=0x{x} op={s} {s} addr=0x{x} bytes={d} value=0x{x} backed={} near_null={}\n",
@@ -548,10 +583,22 @@ pub fn reasonLabel(reason: TerminationReason) []const u8 {
         .initializer_transaction_failure => "initializer transaction could not begin, commit, or roll back",
         .system_policy_rejected => "system boundary policy rejected the guest operation",
         .unhandled_guest_signal => "guest signal handler did not resolve the fault",
+        .host_termination_signal => "host lifecycle termination signal received",
     };
 }
 
 pub fn attribute(input: AttributionInput) Attribution {
+    // A host signal is the terminal event even if unresolved imports exist.
+    // There is no guest result to invalidate in this case: the supervisor or
+    // user ended a still-live run before it could produce one.
+    if (input.reason == .host_termination_signal) {
+        return .{
+            .owner = .host_lifecycle,
+            .authority = .diagnostic_only,
+            .evidence = "The host process received a lifecycle signal while guest execution was still active; no Rosette terminal fault preceded it.",
+            .next_action = "Inspect the supervisor run limit or user/terminal shutdown request; do not debug the terminal guest RIP as a crash site.",
+        };
+    }
     if (input.unresolved_import_calls != 0) {
         return .{
             .owner = .rosette_runtime,
@@ -646,6 +693,7 @@ pub fn attribute(input: AttributionInput) Attribution {
             .evidence = "The guest SIGILL handler returned while the faulting UD2 and instruction pointer were unchanged.",
             .next_action = "Inspect why the guest rejected this UD2 as a managed breakpoint; the decoder successfully executed the signal path.",
         },
+        .host_termination_signal => unreachable,
         .unknown => .{
             .owner = .indeterminate,
             .authority = .diagnostic_only,
@@ -669,6 +717,7 @@ pub fn ownerLabel(owner: StopOwner) []const u8 {
     return switch (owner) {
         .guest_application => "guest application",
         .rosette_runtime => "Rosette runtime",
+        .host_lifecycle => "host lifecycle / supervisor",
         .indeterminate => "indeterminate",
     };
 }
@@ -722,6 +771,17 @@ test "clean guest exit is authoritative" {
     const result = attribute(.{ .reason = .exit_syscall, .faulted = false });
     try std.testing.expectEqual(StopOwner.guest_application, result.owner);
     try std.testing.expectEqual(ResultAuthority.authoritative, result.authority);
+}
+
+test "host termination remains supervisor-owned even with unresolved imports" {
+    const result = attribute(.{
+        .reason = .host_termination_signal,
+        .faulted = false,
+        .unresolved_import_calls = 17,
+    });
+    try std.testing.expectEqual(StopOwner.host_lifecycle, result.owner);
+    try std.testing.expectEqual(ResultAuthority.diagnostic_only, result.authority);
+    try std.testing.expectEqualStrings("host lifecycle termination signal received", reasonLabel(.host_termination_signal));
 }
 
 test "unresolved dependency overrides an apparent guest exit" {
