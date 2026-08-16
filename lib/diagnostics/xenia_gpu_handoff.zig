@@ -23,7 +23,13 @@ pub const Phase = enum(u8) {
     critical_section_owner_known,
     critical_section_released,
     waiter_resumed,
-    swap,
+    guest_vdswap_entered,
+    guest_swap_packet_encoded,
+    guest_vdswap_completed,
+    guest_swap_published,
+    authentic_swap_consumed,
+    authentic_refresh_succeeded,
+    authentic_native_presented,
 };
 
 pub const Observation = struct {
@@ -55,7 +61,13 @@ pub const Ledger = struct {
     critical_section_waits: u64 = 0,
     critical_section_releases: u64 = 0,
     critical_section_resumes: u64 = 0,
-    swaps: u64 = 0,
+    guest_vdswap_calls: u64 = 0,
+    guest_vdswap_completions: u64 = 0,
+    guest_swap_packet_encodes: u64 = 0,
+    guest_swap_publications: u64 = 0,
+    authentic_swap_consumptions: u64 = 0,
+    authentic_refreshes: u64 = 0,
+    authentic_native_presents: u64 = 0,
     last_completion_address: u32 = 0,
     last_completion_requested: u32 = 0,
     last_completion_physical: u32 = 0,
@@ -173,9 +185,50 @@ pub const Ledger = struct {
             observed = true;
         }
 
-        if (contains(line, "VdSwap(")) {
-            self.swaps +|= 1;
-            self.advance(.swap, step);
+        if (contains(line, "VDSWAP PATH: stage=entered") or contains(line, "] d> VdSwap(")) {
+            self.guest_vdswap_calls +|= 1;
+            self.advance(.guest_vdswap_entered, step);
+            observed = true;
+        }
+
+        if (contains(line, "VDSWAP PATH: stage=packet_encoded")) {
+            self.guest_swap_packet_encodes +|= 1;
+            self.advance(.guest_swap_packet_encoded, step);
+            observed = true;
+        }
+
+        if (contains(line, "VDSWAP PATH: stage=completed")) {
+            self.guest_vdswap_completions +|= 1;
+            self.advance(.guest_vdswap_completed, step);
+            observed = true;
+        }
+
+        if (contains(line, "VDSWAP PATH: stage=packet_published")) {
+            self.guest_swap_publications +|= 1;
+            self.advance(.guest_swap_published, step);
+            observed = true;
+        }
+
+        if (contains(line, "PM4 AUTHENTIC MILESTONE:") and contains(line, "PM4_XE_SWAP")) {
+            // Consumption of a guest-origin packet is stronger proof than a
+            // producer-side publication log, so fill both facts exactly once.
+            if (self.guest_swap_publications == 0) self.guest_swap_publications = 1;
+            self.authentic_swap_consumptions +|= 1;
+            self.advance(.authentic_swap_consumed, step);
+            observed = true;
+        }
+
+        if ((parseUnsignedField(line, "authentic_swaps=") orelse 0) != 0 and
+            (parseUnsignedField(line, "refresh=") orelse 0) != 0)
+        {
+            self.authentic_refreshes +|= 1;
+            self.advance(.authentic_refresh_succeeded, step);
+            observed = true;
+        }
+
+        if (contains(line, "authority=native") and contains(line, "provenance=AUTHENTIC")) {
+            self.authentic_native_presents +|= 1;
+            self.advance(.authentic_native_presented, step);
             observed = true;
         }
 
@@ -191,8 +244,26 @@ pub const Ledger = struct {
     }
 
     pub fn verdict(self: *const Ledger) []const u8 {
-        if (self.swaps != 0) {
-            return "guest reached VdSwap; any remaining blank output is downstream of authentic command publication";
+        if (self.authentic_native_presents != 0) {
+            return "an authentic guest-derived frame reached native presentation";
+        }
+        if (self.authentic_refreshes != 0) {
+            return "authentic XE_SWAP reached guest-output refresh; native presentation is the next unproven transition";
+        }
+        if (self.authentic_swap_consumptions != 0) {
+            return "the command processor consumed authentic PM4_XE_SWAP; inspect IssueSwap and guest-output refresh";
+        }
+        if (self.guest_swap_publications != 0) {
+            return "the guest published PM4_XE_SWAP, but command-processor consumption is unproven";
+        }
+        if (self.guest_vdswap_completions != 0) {
+            return "VdSwap returned after encoding, but the caller-owned command buffer was not authentically published";
+        }
+        if (self.guest_swap_packet_encodes != 0) {
+            return "VdSwap encoded PM4_XE_SWAP, but export completion and caller publication are unproven";
+        }
+        if (self.guest_vdswap_calls != 0) {
+            return "guest entered VdSwap, but PM4_XE_SWAP encoding has not been observed";
         }
         if (self.critical_section_resumes != 0) {
             return "the GPU critical-section waiter resumed; inspect the next guest producer transition and write-pointer publication";
@@ -236,7 +307,7 @@ pub const Ledger = struct {
     pub fn logSummary(self: *const Ledger, current_step: u64) void {
         if (self.phase == .none and self.callback_completions == 0) return;
         machoCapturePrint(
-            "macho-processor: Xenia GPU handoff summary: phase={s} wptr={d} pm4={d} shader_packets={d} shader_commits={d} callbacks={d} contentions={d} waits={d} releases={d} resumes={d} swaps={d} last_progress_step={d} idle_steps={d}; {s}\n",
+            "macho-processor: Xenia GPU handoff summary: phase={s} wptr={d} pm4={d} shader_packets={d} shader_commits={d} callbacks={d} contentions={d} waits={d} releases={d} resumes={d} vdswap(entry/encoded/completed)={d}/{d}/{d} guest_swap(published/consumed/refresh/native_present)={d}/{d}/{d}/{d} last_progress_step={d} idle_steps={d}; {s}\n",
             .{
                 @tagName(self.phase),
                 self.ring_write_pointer_updates,
@@ -248,7 +319,13 @@ pub const Ledger = struct {
                 self.critical_section_waits,
                 self.critical_section_releases,
                 self.critical_section_resumes,
-                self.swaps,
+                self.guest_vdswap_calls,
+                self.guest_swap_packet_encodes,
+                self.guest_vdswap_completions,
+                self.guest_swap_publications,
+                self.authentic_swap_consumptions,
+                self.authentic_refreshes,
+                self.authentic_native_presents,
                 self.last_progress_step,
                 current_step -| self.last_progress_step,
                 self.verdict(),
@@ -281,7 +358,16 @@ pub const Ledger = struct {
                     self.diagnostic_probe_id,
                     @tagName(self.diagnostic_probe_phase),
                     self.diagnostic_probe_transitions,
-                    if (self.swaps != 0) "guest VdSwap observed" else "guest swap publication missing",
+                    if (self.authentic_swap_consumptions != 0)
+                        "authentic PM4_XE_SWAP consumed"
+                    else if (self.guest_swap_publications != 0)
+                        "guest PM4_XE_SWAP published"
+                    else if (self.guest_vdswap_completions != 0)
+                        "VdSwap completed; caller publication missing"
+                    else if (self.guest_vdswap_calls != 0)
+                        "VdSwap entered; packet encoding missing"
+                    else
+                        "guest VdSwap entry missing",
                 },
             );
         }
@@ -378,9 +464,14 @@ test "GPU handoff advances through release resume and swap" {
     _ = ledger.observeLine("GPU CRITICAL SECTION: wait begin cs=FFCAB000 current=3002A018 owner=3005C018", 10).?;
     _ = ledger.observeLine("GPU CRITICAL SECTION: released waiter cs=FFCAB000 owner=3005C018", 20).?;
     _ = ledger.observeLine("GPU CRITICAL SECTION: wait resumed cs=FFCAB000 current=3002A018 result=00000000", 30).?;
-    _ = ledger.observeLine("VdSwap(70100000)", 40).?;
-    try std.testing.expectEqual(Phase.swap, ledger.phase);
-    try std.testing.expectEqual(@as(u64, 1), ledger.swaps);
+    _ = ledger.observeLine("[xenia] i> VDSWAP PATH: stage=entered call=1", 40).?;
+    _ = ledger.observeLine("[xenia] i> VDSWAP PATH: stage=packet_encoded storage=external_command_buffer", 50).?;
+    _ = ledger.observeLine("[xenia] i> VDSWAP PATH: stage=completed call=1", 60).?;
+    try std.testing.expectEqual(Phase.guest_vdswap_completed, ledger.phase);
+    try std.testing.expectEqual(@as(u64, 1), ledger.guest_vdswap_calls);
+    try std.testing.expectEqual(@as(u64, 1), ledger.guest_swap_packet_encodes);
+    try std.testing.expectEqual(@as(u64, 1), ledger.guest_vdswap_completions);
+    try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "caller-owned") != null);
 }
 
 test "GPU handoff retains authentic frontier separately from forced presentation" {
@@ -392,7 +483,31 @@ test "GPU handoff retains authentic frontier separately from forced presentation
     try std.testing.expectEqual(Phase.ring_published, ledger.phase);
     try std.testing.expectEqual(DiagnosticProbePhase.refresh_succeeded, ledger.diagnostic_probe_phase);
     try std.testing.expectEqual(@as(u64, 1), ledger.diagnostic_probe_id);
-    try std.testing.expectEqual(@as(u64, 0), ledger.swaps);
+    try std.testing.expectEqual(@as(u64, 0), ledger.guest_vdswap_calls);
+    try std.testing.expectEqual(@as(u64, 0), ledger.authentic_swap_consumptions);
+}
+
+test "GPU handoff never promotes a diagnostic refresh to authentic" {
+    var ledger = Ledger{};
+    _ = ledger.observeLine("GPU FALLBACK PROBE: transition probe_id=1 observing -> queued provenance=DIAGNOSTIC_ONLY authentic_swaps=0 refresh=0/0", 10).?;
+    _ = ledger.observeLine("GPU FALLBACK PROBE: transition probe_id=1 queued -> refresh_succeeded provenance=DIAGNOSTIC_ONLY authentic_swaps=0 refresh=1/1", 20).?;
+
+    try std.testing.expectEqual(Phase.none, ledger.phase);
+    try std.testing.expectEqual(@as(u64, 0), ledger.authentic_refreshes);
+    try std.testing.expectEqual(DiagnosticProbePhase.refresh_succeeded, ledger.diagnostic_probe_phase);
+}
+
+test "GPU handoff proves authentic publication consumption refresh and present separately" {
+    var ledger = Ledger{};
+    _ = ledger.observeLine("PM4 AUTHENTIC MILESTONE: first guest-published PM4_XE_SWAP consumed", 10).?;
+    _ = ledger.observeLine("GPU STARTUP ORDER: authentic_swaps=1 refresh=1/1", 20).?;
+    _ = ledger.observeLine("presentation authority=native provenance=AUTHENTIC", 30).?;
+
+    try std.testing.expectEqual(Phase.authentic_native_presented, ledger.phase);
+    try std.testing.expectEqual(@as(u64, 1), ledger.guest_swap_publications);
+    try std.testing.expectEqual(@as(u64, 1), ledger.authentic_swap_consumptions);
+    try std.testing.expectEqual(@as(u64, 1), ledger.authentic_refreshes);
+    try std.testing.expectEqual(@as(u64, 1), ledger.authentic_native_presents);
 }
 
 test "GPU critical-section acquisition transition recovers owner history" {
