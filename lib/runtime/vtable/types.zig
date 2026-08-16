@@ -3,7 +3,7 @@ const std = @import("std");
 /// Recovery is deliberately separated from observation.  The tracker may
 /// learn about vptrs in either mode, but only the second mode may propose a
 /// repair, and only when a low value is about to be consumed from the exact
-/// base of a still-live allocation.
+/// tracked slot of a still-live allocation (including secondary base slots).
 pub const RecoveryMode = enum {
     observe_only,
     repair_trusted_low_read,
@@ -17,6 +17,15 @@ pub const Policy = struct {
     /// arbitrary heap pointer with a very distant vtable symbol.
     max_symbol_offset: u64 = 0x1000,
     require_mapped_header: bool = true,
+    require_plausible_offset_to_top: bool = true,
+    require_plausible_typeinfo: bool = true,
+    require_plausible_first_slot: bool = true,
+
+    /// An Itanium address point is preceded by a signed offset-to-top.  Xenia
+    /// subobjects are small host objects; an offset larger than this is much
+    /// more likely to be ordinary data accidentally associated with a nearby
+    /// `_ZTV` symbol than a legitimate secondary base.
+    max_offset_to_top: u64 = 0x10_0000,
 
     /// When `true`, the tracker may also propose recovery when a value at a
     /// tracked allocation base is read as non-zero (>= 0x1000) but is NOT a
@@ -40,7 +49,19 @@ pub const Policy = struct {
 ///
 /// It is a bound rather than a search because the alternative on either side is
 /// work proportional to the heap, on a path taken by ordinary guest writes.
-pub const max_subobject_slots: usize = 8;
+pub const max_subobject_slots: usize = 32;
+
+/// Source shape for a vptr mutation.  Keeping this in the vtable library means
+/// ownership diagnostics don't depend on the generic memory-provenance
+/// implementation (and therefore cannot accidentally inherit its optional
+/// diagnostics gate).
+pub const MutationKind = enum {
+    scalar,
+    partial_scalar,
+    bulk_fill,
+    bulk_copy,
+    host_repair,
+};
 
 pub const Provenance = struct {
     writer_rip: u64 = 0,
@@ -55,6 +76,7 @@ pub const Provenance = struct {
     /// freed, and refusing to restore a vptr into storage that has since been
     /// handed to a different object.
     owner_base: u64 = 0,
+    mutation_kind: MutationKind = .scalar,
 };
 
 pub const IdentityRejection = enum {
@@ -66,6 +88,9 @@ pub const IdentityRejection = enum {
     symbol_offset_too_large,
     unaligned_symbol_offset,
     unmapped_header,
+    implausible_offset_to_top,
+    implausible_typeinfo,
+    implausible_first_slot,
 };
 
 /// Evidence is assembled by the Mach-O integration, while the policy decision
@@ -75,6 +100,7 @@ pub const IdentityEvidence = struct {
     symbol_name: ?[]const u8 = null,
     symbol_offset: u64 = std.math.maxInt(u64),
     header_mapped: bool = false,
+    offset_to_top_plausible: bool = false,
     typeinfo_plausible: bool = false,
     first_slot_plausible: bool = false,
 
@@ -91,6 +117,15 @@ pub const IdentityEvidence = struct {
         if (self.symbol_offset > policy.max_symbol_offset) return .symbol_offset_too_large;
         if ((self.symbol_offset & 7) != 0) return .unaligned_symbol_offset;
         if (policy.require_mapped_header and !self.header_mapped) return .unmapped_header;
+        if (policy.require_plausible_offset_to_top and !self.offset_to_top_plausible) {
+            return .implausible_offset_to_top;
+        }
+        if (policy.require_plausible_typeinfo and !self.typeinfo_plausible) {
+            return .implausible_typeinfo;
+        }
+        if (policy.require_plausible_first_slot and !self.first_slot_plausible) {
+            return .implausible_first_slot;
+        }
         return null;
     }
 
@@ -149,6 +184,27 @@ pub const Recovery = struct {
     prior_recoveries: u64,
 };
 
+pub const max_mutation_slots: usize = 256;
+
+pub const MutationSlot = struct {
+    address: u64,
+    value: u64,
+    generation: u64,
+};
+
+/// Bounded before-image of trusted vptr slots touched by one scalar or range
+/// mutation.  Small writes examine every overlapping pointer slot.  Large
+/// writes walk only the already-tracked vptr set, so clearing a multi-megabyte
+/// object arena remains proportional to live polymorphic objects rather than
+/// the byte count.
+pub const MutationCapture = struct {
+    address: u64,
+    length: u64,
+    slots: [max_mutation_slots]MutationSlot = undefined,
+    count: usize = 0,
+    truncated: bool = false,
+};
+
 /// Categories used by the generic memory-provenance diagnostics.  These are
 /// intentionally not vtable identity and must never authorize a vptr repair.
 pub const SuspiciousValueType = enum {
@@ -188,6 +244,9 @@ test "vtable identity requires a bounded Itanium address point" {
         .symbol_name = "__ZTVN2xe7ExampleE",
         .symbol_offset = 0x50,
         .header_mapped = true,
+        .offset_to_top_plausible = true,
+        .typeinfo_plausible = true,
+        .first_slot_plausible = true,
     }).isTrusted(policy));
 
     // The exact false-positive shape from the regression: an ordinary heap
@@ -197,6 +256,9 @@ test "vtable identity requires a bounded Itanium address point" {
         .symbol_name = "__ZTVN2xe7ExampleE",
         .symbol_offset = 0x26501ff,
         .header_mapped = true,
+        .offset_to_top_plausible = true,
+        .typeinfo_plausible = true,
+        .first_slot_plausible = true,
     }).isTrusted(policy));
     try std.testing.expectEqual(
         IdentityRejection.symbol_offset_too_large,
@@ -205,6 +267,9 @@ test "vtable identity requires a bounded Itanium address point" {
             .symbol_name = "__ZTVN2xe7ExampleE",
             .symbol_offset = 0x26501ff,
             .header_mapped = true,
+            .offset_to_top_plausible = true,
+            .typeinfo_plausible = true,
+            .first_slot_plausible = true,
         }).rejection(policy).?,
     );
     try std.testing.expect(!(IdentityEvidence{
@@ -212,13 +277,42 @@ test "vtable identity requires a bounded Itanium address point" {
         .symbol_name = "__ZNSt3__16vectorIiEE",
         .symbol_offset = 0x20,
         .header_mapped = true,
+        .offset_to_top_plausible = true,
+        .typeinfo_plausible = true,
+        .first_slot_plausible = true,
     }).isTrusted(policy));
     try std.testing.expect(!(IdentityEvidence{
         .value = 0x1950b08,
         .symbol_name = "__ZTVN2xe7ExampleE",
         .symbol_offset = 8,
         .header_mapped = true,
+        .offset_to_top_plausible = true,
+        .typeinfo_plausible = true,
+        .first_slot_plausible = true,
     }).isTrusted(policy));
+}
+
+test "vtable identity validates the complete Itanium dispatch head" {
+    const base = IdentityEvidence{
+        .value = 0x1950b28,
+        .symbol_name = "__ZTVN2xe7ExampleE",
+        .symbol_offset = 0x50,
+        .header_mapped = true,
+        .offset_to_top_plausible = true,
+        .typeinfo_plausible = true,
+        .first_slot_plausible = true,
+    };
+    try std.testing.expect(base.isTrusted(.{}));
+
+    var bad = base;
+    bad.offset_to_top_plausible = false;
+    try std.testing.expectEqual(IdentityRejection.implausible_offset_to_top, bad.rejection(.{}).?);
+    bad = base;
+    bad.typeinfo_plausible = false;
+    try std.testing.expectEqual(IdentityRejection.implausible_typeinfo, bad.rejection(.{}).?);
+    bad = base;
+    bad.first_slot_plausible = false;
+    try std.testing.expectEqual(IdentityRejection.implausible_first_slot, bad.rejection(.{}).?);
 }
 
 test "Itanium vtable symbol marker is anchored" {

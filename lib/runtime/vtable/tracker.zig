@@ -2,9 +2,24 @@ const std = @import("std");
 const types = @import("types.zig");
 
 pub const VtableTracker = struct {
+    const filter_word_count: usize = 2048;
+    const filter_bit_count: u64 = filter_word_count * 64;
+    const page_filter_word_count: usize = 1024;
+    const page_filter_bit_count: u64 = page_filter_word_count * 64;
+
     allocator: std.mem.Allocator,
     policy: types.Policy,
     records: std.AutoHashMap(u64, types.AllocationRecord),
+    /// Append-only Bloom filter for exact vptr slot addresses.  Ordinary
+    /// stores can ask whether a slot could have trusted history without a hash
+    /// table lookup.  Bits intentionally survive retirement: stale positives
+    /// cost one lookup, while clearing a bit could create a false negative for
+    /// a colliding live object and miss a correctness-bearing clear.
+    slot_filter: [filter_word_count]u64 = [_]u64{0} ** filter_word_count,
+    /// First-level direct-mapped page filter. This makes byte-at-a-time JIT
+    /// emission (Xbyak is a dominant Xenia workload) one shift, mask and bit
+    /// test instead of paying the two slot hashes for every emitted byte.
+    page_filter: [page_filter_word_count]u64 = [_]u64{0} ** page_filter_word_count,
     next_generation: u64 = 1,
 
     // Compatibility-facing metric names used by existing diagnostics.
@@ -25,6 +40,10 @@ pub const VtableTracker = struct {
         [_]u64{0} ** std.meta.fields(types.IdentityRejection).len,
     low_clears_observed: u64 = 0,
     retired_records: u64 = 0,
+    range_mutations: u64 = 0,
+    truncated_range_mutations: u64 = 0,
+    atomic_mutation_rollbacks: u64 = 0,
+    atomic_qwords_restored: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) VtableTracker {
         return initWithPolicy(allocator, .{});
@@ -122,6 +141,7 @@ pub const VtableTracker = struct {
             .last_observed_value = evidence.value,
             .owner_base = if (provenance.owner_base != 0) provenance.owner_base else address,
         }) catch return .{ .disposition = .ignored_non_vtable };
+        self.noteTrackedAddress(address);
         self.trusted_establishments +|= 1;
         return .{
             .disposition = .established,
@@ -257,6 +277,63 @@ pub const VtableTracker = struct {
         return self.records.contains(address);
     }
 
+    /// Cheap, no-false-negative prefilter for hot memory-write paths.  A true
+    /// answer is only a candidate and must still be confirmed in `records`.
+    pub fn mightContain(self: *const VtableTracker, address: u64) bool {
+        if ((address & 7) != 0) return false;
+        if (!self.pageMightContain(address)) return false;
+        const positions = filterPositions(address);
+        return filterContains(self, positions.first) and filterContains(self, positions.second);
+    }
+
+    /// Capture trusted vptrs overlapped by an arbitrary write.  This is always
+    /// available—unlike the generic provenance trace—because delaying vptr
+    /// discovery until the later virtual read loses the actual writer.
+    pub fn captureMutation(
+        self: *const VtableTracker,
+        state: anytype,
+        address: u64,
+        length: u64,
+    ) types.MutationCapture {
+        var capture = types.MutationCapture{ .address = address, .length = length };
+        if (length == 0 or self.records.count() == 0) return capture;
+
+        const end = std.math.add(u64, address, length) catch std.math.maxInt(u64);
+        const first_slot = address & ~@as(u64, 7);
+        const last_slot = (end -| 1) & ~@as(u64, 7);
+        const slot_count = ((last_slot -| first_slot) / 8) + 1;
+
+        if (slot_count <= types.max_mutation_slots) {
+            if (!self.pageMightContain(first_slot) and !self.pageMightContain(last_slot)) {
+                return capture;
+            }
+            var slot = first_slot;
+            while (slot <= last_slot) : (slot +|= 8) {
+                if (self.mightContain(slot)) captureSlot(self, state, &capture, slot);
+                if (slot == last_slot) break;
+            }
+            return capture;
+        }
+
+        var iterator = self.records.iterator();
+        while (iterator.next()) |entry| {
+            const slot = entry.key_ptr.*;
+            if (slot +| 8 <= address or slot >= end) continue;
+            if (capture.count == types.max_mutation_slots) {
+                capture.truncated = true;
+                break;
+            }
+            const value = readSlot(state, slot) orelse continue;
+            capture.slots[capture.count] = .{
+                .address = slot,
+                .value = value,
+                .generation = entry.value_ptr.generation,
+            };
+            capture.count += 1;
+        }
+        return capture;
+    }
+
     /// Look up the full allocation record for an address.
     /// Returns null if no trusted vtable history exists at this address.
     /// This is a public query method for the ownership diagnostics library.
@@ -271,7 +348,79 @@ pub const VtableTracker = struct {
     pub fn rejectionCount(self: *const VtableTracker, reason: types.IdentityRejection) u64 {
         return self.rejection_counts[@intFromEnum(reason)];
     }
+
+    fn noteTrackedAddress(self: *VtableTracker, address: u64) void {
+        const page_position = pageFilterPosition(address);
+        const page_word: usize = @intCast(page_position / 64);
+        const page_bit: u6 = @intCast(page_position % 64);
+        self.page_filter[page_word] |= @as(u64, 1) << page_bit;
+        const positions = filterPositions(address);
+        filterInsert(self, positions.first);
+        filterInsert(self, positions.second);
+    }
+
+    fn filterInsert(self: *VtableTracker, position: u64) void {
+        const word: usize = @intCast(position / 64);
+        const bit: u6 = @intCast(position % 64);
+        self.slot_filter[word] |= @as(u64, 1) << bit;
+    }
+
+    fn filterContains(self: *const VtableTracker, position: u64) bool {
+        const word: usize = @intCast(position / 64);
+        const bit: u6 = @intCast(position % 64);
+        return (self.slot_filter[word] & (@as(u64, 1) << bit)) != 0;
+    }
+
+    fn pageMightContain(self: *const VtableTracker, address: u64) bool {
+        const position = pageFilterPosition(address);
+        const word: usize = @intCast(position / 64);
+        const bit: u6 = @intCast(position % 64);
+        return (self.page_filter[word] & (@as(u64, 1) << bit)) != 0;
+    }
 };
+
+fn pageFilterPosition(address: u64) u64 {
+    return (address >> 12) & (VtableTracker.page_filter_bit_count - 1);
+}
+
+fn filterPositions(address: u64) struct { first: u64, second: u64 } {
+    var mixed = address >> 3;
+    mixed ^= mixed >> 33;
+    mixed *%= 0xff51afd7ed558ccd;
+    mixed ^= mixed >> 33;
+    const first = mixed % VtableTracker.filter_bit_count;
+    mixed *%= 0xc4ceb9fe1a85ec53;
+    mixed ^= mixed >> 29;
+    return .{
+        .first = first,
+        .second = mixed % VtableTracker.filter_bit_count,
+    };
+}
+
+fn captureSlot(
+    tracker: *const VtableTracker,
+    state: anytype,
+    capture: *types.MutationCapture,
+    address: u64,
+) void {
+    if (capture.count == types.max_mutation_slots) {
+        capture.truncated = true;
+        return;
+    }
+    const record = tracker.records.get(address) orelse return;
+    const value = readSlot(state, address) orelse return;
+    capture.slots[capture.count] = .{
+        .address = address,
+        .value = value,
+        .generation = record.generation,
+    };
+    capture.count += 1;
+}
+
+fn readSlot(state: anytype, address: u64) ?u64 {
+    const bytes = state.guestMemoryConst(address, 8) orelse return null;
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
 
 fn trustedEvidence(value: u64, offset: u64) types.IdentityEvidence {
     return .{
@@ -279,9 +428,53 @@ fn trustedEvidence(value: u64, offset: u64) types.IdentityEvidence {
         .symbol_name = "__ZTVN4test6ObjectE",
         .symbol_offset = offset,
         .header_mapped = true,
+        .offset_to_top_plausible = true,
         .typeinfo_plausible = true,
         .first_slot_plausible = true,
     };
+}
+
+test "tracked-slot Bloom filter has no false negative across retirement" {
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    try std.testing.expect(!tracker.mightContain(0x4000));
+    _ = tracker.observeWrite(0x4000, trustedEvidence(0x1950b28, 0x50), .{});
+    try std.testing.expect(tracker.mightContain(0x4000));
+    try std.testing.expect(tracker.hasTrustedHistory(0x4000));
+
+    try std.testing.expect(tracker.retireAddress(0x4000));
+    try std.testing.expect(tracker.mightContain(0x4000));
+    try std.testing.expect(!tracker.hasTrustedHistory(0x4000));
+}
+
+test "partial mutation capture finds an overlapping trusted vptr" {
+    const FakeMemory = struct {
+        const base: u64 = 0x4000;
+        bytes: [64]u8 = [_]u8{0} ** 64,
+
+        pub fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            if (address < base or length > self.bytes.len) return null;
+            const offset = address - base;
+            if (offset > self.bytes.len or length > self.bytes.len - offset) return null;
+            return self.bytes[@intCast(offset)..][0..@intCast(length)];
+        }
+    };
+
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+    const established = tracker.observeWrite(0x4000, trustedEvidence(0x1950b28, 0x50), .{});
+
+    var memory = FakeMemory{};
+    std.mem.writeInt(u64, memory.bytes[0..8], 0x1950b28, .little);
+    const capture = tracker.captureMutation(&memory, 0x4003, 1);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u64, 0x4000), capture.slots[0].address);
+    try std.testing.expectEqual(@as(u64, 0x1950b28), capture.slots[0].value);
+    try std.testing.expectEqual(established.generation, capture.slots[0].generation);
+
+    const unrelated = tracker.captureMutation(&memory, 0x4020, 1);
+    try std.testing.expectEqual(@as(usize, 0), unrelated.count);
 }
 
 test "ordinary allocation pointers are never protected as vtables" {
