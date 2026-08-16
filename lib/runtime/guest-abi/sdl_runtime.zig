@@ -6,8 +6,11 @@
 //! The audio device is a clocked null sink. It invokes the guest's real SDL
 //! callback at the requested cadence, so Xenia drains its own audio queue and
 //! releases its own semaphore, but it never claims that audio reached native
-//! hardware. A future CoreAudio backend can replace the sink without changing
-//! the guest ABI or its ownership rules.
+//! hardware. Each callback owns a dedicated guest stack, matching SDL's
+//! separate audio-thread contract and preventing a suspended audio callback
+//! from pinning or overwriting the GTK/UI callback stack. A future CoreAudio
+//! backend can replace the sink without changing the guest ABI or its
+//! ownership rules.
 
 const std = @import("std");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
@@ -18,6 +21,7 @@ pub const audio_callback_handle_base: u64 = 0xFFFF_F910_0000_0000;
 const max_audio_devices = 8;
 const max_event_watches = 16;
 const audio_spec_size = 32;
+const audio_callback_stack_size: u32 = 256 * 1024;
 const audio_f32_lsb: u16 = 0x8120;
 const sdl_init_audio: u32 = 0x0000_0010;
 const sdl_mix_max_volume: u32 = 128;
@@ -74,6 +78,8 @@ const AudioDevice = struct {
     spec: AudioSpec = std.mem.zeroes(AudioSpec),
     stream_address: u64 = 0,
     stream_size: u32 = 0,
+    callback_stack_address: u64 = 0,
+    callback_stack_size: u32 = 0,
     next_callback_ns: u64 = 0,
     callback_dispatches: u64 = 0,
     callback_completions: u64 = 0,
@@ -330,6 +336,10 @@ pub const Runtime = struct {
                 device.stream_address
             else
                 state.guestAlloc(spec.size, 16) orelse return self.rejectAudioOpen("Rosette could not allocate the SDL audio callback buffer");
+            const callback_stack_address = if (device.callback_stack_address != 0 and device.callback_stack_size >= audio_callback_stack_size)
+                device.callback_stack_address
+            else
+                state.guestAlloc(audio_callback_stack_size, 16) orelse return self.rejectAudioOpen("Rosette could not allocate the SDL audio callback stack");
             const generation = if (device.generation == 0) 1 else device.generation;
             const device_id = encodeDeviceId(slot, generation);
             device.* = .{
@@ -341,6 +351,8 @@ pub const Runtime = struct {
                 .spec = spec,
                 .stream_address = stream_address,
                 .stream_size = spec.size,
+                .callback_stack_address = callback_stack_address,
+                .callback_stack_size = audio_callback_stack_size,
             };
             if (state.regs.rcx != 0) {
                 const obtained = state.guestMemory(state.regs.rcx, audio_spec_size) orelse {
@@ -353,8 +365,8 @@ pub const Runtime = struct {
             self.last_error[0] = 0;
             self.audio_open_successes +|= 1;
             machoCapturePrint(
-                "macho-processor: SDL2 virtual audio opened: device={d} generation={d} backend=clocked_null_sink frequency={d} channels={d} samples={d} bytes={d} callback=0x{x} userdata=0x{x}; queue timing and guest callback are real, audible host output is not yet implemented\n",
-                .{ device_id, generation, spec.frequency, spec.channels, spec.samples, spec.size, spec.callback, spec.userdata },
+                "macho-processor: SDL2 virtual audio opened: device={d} generation={d} backend=clocked_null_sink frequency={d} channels={d} samples={d} bytes={d} callback=0x{x} userdata=0x{x} callback_stack=0x{x}..0x{x}; queue timing and guest callback are real, audible host output is not yet implemented\n",
+                .{ device_id, generation, spec.frequency, spec.channels, spec.samples, spec.size, spec.callback, spec.userdata, callback_stack_address, callback_stack_address + audio_callback_stack_size },
             );
             return device_id;
         }
@@ -399,9 +411,20 @@ pub const Runtime = struct {
         return handle >= audio_callback_handle_base and handle < audio_callback_handle_base + max_audio_devices;
     }
 
+    /// Whether an audio callback is still in flight on its dedicated stack.
+    pub fn audioCallbackInFlight(self: *const Runtime) bool {
+        return self.active_callback_slot != null;
+    }
+
+    /// Handle of the in-flight audio callback, or 0 when none owns the stack.
+    pub fn audioCallbackHandle(self: *const Runtime) u64 {
+        const slot = self.active_callback_slot orelse return 0;
+        return audio_callback_handle_base + slot;
+    }
+
     pub fn dispatchDueAudioCallback(self: *Runtime, state: anytype, return_sentinel: u64) bool {
         if (self.active_callback_slot != null or state.cooperative_ui_context == null or
-            state.active_guest_thread == 0 or state.active_idle_source != 0 or
+            state.active_guest_thread == 0 or
             state.isSyntheticCallbackHandle(state.active_guest_thread)) return false;
 
         const now = state.guest_time.now();
@@ -422,13 +445,18 @@ pub const Runtime = struct {
             state.xmm = context.xmm;
             state.ymm_hi = context.ymm_hi;
             state.x87 = context.x87;
+            // This is a new synthetic guest callback context. It inherits the
+            // process-wide dispositions, but never the interrupted worker's
+            // active signal-handler stack.
+            state.resetActiveGuestSignalState();
             state.regs.rip = device.spec.callback;
             state.regs.rdi = device.spec.userdata;
             state.regs.rsi = device.stream_address;
             state.regs.rdx = device.spec.size;
-            state.regs.rsp = context.regs.rsp & ~@as(u64, 0xF);
+            state.regs.rsp = (device.callback_stack_address + device.callback_stack_size) & ~@as(u64, 0xF);
             state.push(return_sentinel);
             state.active_guest_thread = audio_callback_handle_base + slot;
+            state.noteSyntheticStackEntry(state.active_guest_thread);
             self.active_callback_slot = slot;
             device.callback_dispatches +|= 1;
             self.audio_callbacks_dispatched +|= 1;
@@ -502,8 +530,8 @@ pub const Runtime = struct {
         for (self.devices) |device| active_devices += @intFromBool(device.active);
         for (self.event_watches) |watch| active_watches += @intFromBool(watch.active);
         machoCapturePrint(
-            "macho-processor: SDL2 guest ABI: version={d}.{d}.{d} calls={d} subsystems(init/quit/mask)={d}/{d}/0x{x} audio(open/ok/reject/close/subsystem_close/invalid)={d}/{d}/{d}/{d}/{d}/{d} devices={d} callbacks(dispatch/complete/fail)={d}/{d}/{d} event_watches(add/remove/active/pumps)={d}/{d}/{d}/{d} hints={d} rejected={d} mappings={d}; backend=clocked_null_sink (guest timing and ownership active, native audible output unavailable)\n",
-            .{ compatibility_version[0], compatibility_version[1], compatibility_version[2], self.calls, self.subsystem_initializations, self.subsystem_quits, self.initialized_mask, self.audio_open_attempts, self.audio_open_successes, self.audio_open_rejections, self.audio_close_requests, self.audio_subsystem_closes, self.audio_invalid_handles, active_devices, self.audio_callbacks_dispatched, self.audio_callbacks_completed, self.audio_callback_dispatch_failures, self.event_watch_adds, self.event_watch_removes, active_watches, self.event_pumps, self.hint_updates, self.hint_rejections, self.mapping_updates },
+            "macho-processor: SDL2 guest ABI: version={d}.{d}.{d} calls={d} subsystems(init/quit/mask)={d}/{d}/0x{x} audio(open/ok/reject/close/subsystem_close/invalid)={d}/{d}/{d}/{d}/{d}/{d} devices={d} callbacks(dispatch/complete/fail/inflight_handle)={d}/{d}/{d}/0x{x} event_watches(add/remove/active/pumps)={d}/{d}/{d}/{d} hints={d} rejected={d} mappings={d}; backend=clocked_null_sink (guest timing and ownership active, native audible output unavailable)\n",
+            .{ compatibility_version[0], compatibility_version[1], compatibility_version[2], self.calls, self.subsystem_initializations, self.subsystem_quits, self.initialized_mask, self.audio_open_attempts, self.audio_open_successes, self.audio_open_rejections, self.audio_close_requests, self.audio_subsystem_closes, self.audio_invalid_handles, active_devices, self.audio_callbacks_dispatched, self.audio_callbacks_completed, self.audio_callback_dispatch_failures, self.audioCallbackHandle(), self.event_watch_adds, self.event_watch_removes, active_watches, self.event_pumps, self.hint_updates, self.hint_rejections, self.mapping_updates },
         );
     }
 };
@@ -532,12 +560,60 @@ const TestState = struct {
         rdx: u64 = 0,
         rcx: u64 = 0,
         r8: u64 = 0,
+        rip: u64 = 0,
+        rsp: u64 = 0,
+    };
+
+    const CooperativeContext = struct {
+        regs: Registers = .{},
+        xmm: u64 = 0,
+        ymm_hi: u64 = 0,
+        x87: u64 = 0,
     };
 
     regs: Registers = .{},
-    memory: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024),
+    memory: [384 * 1024]u8 = [_]u8{0} ** (384 * 1024),
     alloc_cursor: u64 = 2048,
     guest_time: TestGuestTime = .{},
+    xmm: u64 = 0,
+    ymm_hi: u64 = 0,
+    x87: u64 = 0,
+    cooperative_ui_context: ?CooperativeContext = null,
+    active_guest_thread: u64 = 0,
+    active_idle_source: u64 = 0,
+    cooperative_thread_switches: u64 = 0,
+    saved_threads: u64 = 0,
+    pushed: u64 = 0,
+    synthetic_stack_entry_rsp: u64 = 0,
+    synthetic_stack_entry_handle: u64 = 0,
+    synthetic_stack_dispatches: u64 = 0,
+
+    fn saveActiveGuestThread(self: *TestState, reason: []const u8) bool {
+        _ = reason;
+        self.saved_threads += 1;
+        self.active_guest_thread = 0;
+        return true;
+    }
+
+    fn push(self: *TestState, value: u64) void {
+        self.regs.rsp -= 8;
+        self.pushed = value;
+    }
+
+    fn resetActiveGuestSignalState(self: *TestState) void {
+        _ = self;
+    }
+
+    fn isSyntheticCallbackHandle(self: *const TestState, handle: u64) bool {
+        _ = self;
+        return handle >= audio_callback_handle_base;
+    }
+
+    fn noteSyntheticStackEntry(self: *TestState, handle: u64) void {
+        self.synthetic_stack_entry_rsp = self.regs.rsp;
+        self.synthetic_stack_entry_handle = handle;
+        self.synthetic_stack_dispatches += 1;
+    }
 
     fn guestMemory(self: *TestState, address: u64, length: u64) ?[]u8 {
         const start: usize = @intCast(address);
@@ -649,6 +725,72 @@ test "SDL audio open requires subsystem ownership and final quit retires devices
     try std.testing.expectEqual(@as(u32, 0), runtime.initialized_mask & sdl_init_audio);
     try std.testing.expectEqual(@as(u64, 1), runtime.audio_subsystem_closes);
     try std.testing.expect(runtime.deviceForId(@truncate(device_id)) == null);
+}
+
+test "an audio callback owns a dedicated stack until its return sentinel" {
+    var runtime = Runtime{};
+    var state = TestState{};
+    state.regs.rdi = sdl_init_audio;
+    _ = runtime.dispatch(&state, "SDL_InitSubSystem").?;
+
+    const desired_address = 64;
+    const desired = AudioSpec{
+        .frequency = 48000,
+        .format = audio_f32_lsb,
+        .channels = 2,
+        .silence = 0,
+        .samples = 128,
+        .padding = 0,
+        .size = 0,
+        .callback = 0x400,
+        .userdata = 0x1234,
+    };
+    desired.write(state.memory[desired_address .. desired_address + audio_spec_size]);
+    state.regs.rdx = desired_address;
+    state.regs.rcx = 0;
+    const opened = runtime.dispatch(&state, "_SDL_OpenAudioDevice").?.handled;
+    try std.testing.expect(opened != 0);
+    state.regs.rdi = opened;
+    state.regs.rsi = 0;
+    _ = runtime.dispatch(&state, "SDL_PauseAudioDevice").?;
+
+    try std.testing.expect(!runtime.audioCallbackInFlight());
+    try std.testing.expectEqual(@as(u64, 0), runtime.audioCallbackHandle());
+
+    state.cooperative_ui_context = .{ .regs = .{ .rsp = 0x1000 } };
+    state.active_guest_thread = 0x7FFF_2000;
+    // A suspended GTK callback may retain its own UI stack while the ordinary
+    // worker dispatches audio on the device's independent stack.
+    state.active_idle_source = 7;
+    const sentinel: u64 = 0xDEAD_BEEF;
+    try std.testing.expect(runtime.dispatchDueAudioCallback(&state, sentinel));
+
+    // Entered on its dedicated audio stack, with the sentinel pushed and the
+    // entry window recorded for crash attribution.
+    try std.testing.expectEqual(sentinel, state.pushed);
+    try std.testing.expectEqual(
+        runtime.devices[0].callback_stack_address + runtime.devices[0].callback_stack_size - 8,
+        state.regs.rsp,
+    );
+    try std.testing.expectEqual(state.active_guest_thread, state.synthetic_stack_entry_handle);
+    try std.testing.expectEqual(@as(u64, 1), state.synthetic_stack_dispatches);
+
+    // Ownership spans dispatch to sentinel. A suspension clears the active
+    // context but must not release the audio device: its frames are still live
+    // on its dedicated stack.
+    try std.testing.expect(runtime.audioCallbackInFlight());
+    try std.testing.expectEqual(state.synthetic_stack_entry_handle, runtime.audioCallbackHandle());
+    _ = state.saveActiveGuestThread("suspended mid-callback");
+    try std.testing.expectEqual(@as(u64, 0), state.active_guest_thread);
+    try std.testing.expect(runtime.audioCallbackInFlight());
+
+    // A second dispatch is refused while the first still owns the stack.
+    try std.testing.expect(!runtime.dispatchDueAudioCallback(&state, sentinel));
+    try std.testing.expectEqual(@as(u64, 1), state.synthetic_stack_dispatches);
+
+    try std.testing.expect(runtime.finishAudioCallback(runtime.audioCallbackHandle()));
+    try std.testing.expect(!runtime.audioCallbackInFlight());
+    try std.testing.expectEqual(@as(u64, 0), runtime.audioCallbackHandle());
 }
 
 test "SDL hint success requires two complete guest strings" {

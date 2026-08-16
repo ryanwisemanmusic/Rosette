@@ -459,6 +459,7 @@ test "queue_draw reaches the connected draw handler" {
     // is why the connection has to be retained and the emission delivered.
     const State = struct {
         memory: [1024]u8 = [_]u8{0} ** 1024,
+        next: u64 = 64,
         regs: struct {
             rdi: u64 = 0,
             rsi: u64 = 0,
@@ -469,6 +470,23 @@ test "queue_draw reaches the connected draw handler" {
         scheduled_args: [3]u64 = .{ 0, 0, 0 },
         schedule_calls: u64 = 0,
         pending_source: u64 = 0,
+
+        fn guestAlloc(self: *@This(), size: u64, alignment: u64) ?u64 {
+            const address = std.mem.alignForward(u64, self.next, alignment);
+            if (address + size > self.memory.len) return null;
+            self.next = address + size;
+            return address;
+        }
+        fn guestMemory(self: *@This(), address: u64, size: u64) ?[]u8 {
+            if (address + size > self.memory.len) return null;
+            return self.memory[@intCast(address)..@intCast(address + size)];
+        }
+        fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.memory[@intCast(address)..][0..4], value, .little);
+        }
+        fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.memory[@intCast(address)..][0..8], value, .little);
+        }
 
         fn guestCString(self: *@This(), address: u64, maximum: usize) ?[]const u8 {
             if (address >= self.memory.len) return null;
@@ -547,6 +565,7 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
             rdi: u64 = 0,
             rsi: u64 = 0,
             rdx: u64 = 0,
+            rcx: u64 = 0,
         } = .{},
 
         fn guestAlloc(self: *@This(), size: u64, alignment: u64) ?u64 {
@@ -564,6 +583,20 @@ test "foreign UI constructors return dereferenceable typed guest objects" {
             const bytes = self.memory[@intCast(address)..@min(self.memory.len, @as(usize, @intCast(address)) + maximum)];
             const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
             return bytes[0..end];
+        }
+        fn scheduleSignalCallback(self: *@This(), function: u64, a0: u64, a1: u64, a2: u64, tag: []const u8) u64 {
+            _ = self;
+            _ = function;
+            _ = a0;
+            _ = a1;
+            _ = a2;
+            _ = tag;
+            return 0;
+        }
+        fn isIdleCallbackPending(self: *@This(), source: u64) bool {
+            _ = self;
+            _ = source;
+            return false;
         }
         fn write32(self: *@This(), address: u64, value: u32) void {
             std.mem.writeInt(u32, self.memory[@intCast(address)..][0..4], value, .little);
