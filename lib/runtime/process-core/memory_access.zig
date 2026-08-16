@@ -2162,6 +2162,40 @@ fn reportDispatchCoverage(self: anytype, block_start: u64) void {
 /// a protection fault is about the page, not about the pointer.
 const near_null_effective_limit: u64 = 0x10000;
 
+fn protectionFaultGuestEffective(
+    mapping_effective: u64,
+    base_is_anchor: bool,
+    index_value: u64,
+    index_scale_log2: u2,
+    displacement: u64,
+    address_is_32_bit: bool,
+) u64 {
+    if (!base_is_anchor) return mapping_effective;
+    var effective = displacement +% (index_value << index_scale_log2);
+    if (address_is_32_bit) effective = @as(u32, @truncate(effective));
+    return effective;
+}
+
+test "protection fault near-null classification uses translated guest pointer" {
+    // A write-watch activation starts at the protected page, making the host
+    // mapping-relative offset small. The translated index remains the actual
+    // guest pointer and must keep this out of near-null diagnostics.
+    try std.testing.expectEqual(
+        @as(u64, 0xA510_C1C0),
+        protectionFaultGuestEffective(0x1C0, true, 0xA510_C1C0, 0, 0, false),
+    );
+    // The genuine fault from the same run carried guest pointer 1 and still
+    // belongs to the causality path.
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        protectionFaultGuestEffective(1, true, 1, 0, 0, false),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0x1C0),
+        protectionFaultGuestEffective(0x1C0, false, 0xA510_C1C0, 0, 0, false),
+    );
+}
+
 /// What produced the address a protection fault refused.
 ///
 /// The fault site knew the address and the instruction *name* and nothing else,
@@ -2238,16 +2272,32 @@ fn reportProtectionFaultOperands(self: anytype, address: u64, bytes: u8, access:
     // offset for every one of them, which is how this reporter silently skipped
     // the exact faults it was written for.
     const origin = self.sparse_memory.containingMappingBase(address) orelse self.mem_base;
-    const effective = address -| origin;
+    const mapping_effective = address -| origin;
+    const decoded = decodeStatic(self, self.regs.rip) orelse return;
+    const base_value = if (decoded.sib_has_base) self.regVal(decoded.sib_base_reg, .bits64) else 0;
+    const base_is_anchor = decoded.sib_has_base and decoded.sib_has_index and
+        !isGuestMappedValue(self, base_value) and
+        self.sparse_memory.containingMappingBase(base_value) == base_value;
+    const index_value = if (decoded.sib_has_index) self.regVal(decoded.sib_index_reg, .bits64) else 0;
+
+    // Xenia's translated guest accesses are emitted as
+    // `[guest_membase + guest_address]`. A narrow sparse activation may start
+    // at the protected guest page, so `address - activation_base` can be 0x1c0
+    // even though the guest pointer is the perfectly valid 0xA510C1C0. Calling
+    // that near-null sent the causality machinery after a healthy JIT store.
+    // Once the base is proven to be the mapping anchor, the index (plus the
+    // instruction displacement) is the guest-visible pointer that must be
+    // tested. For ordinary address forms, retain the mapping-relative value.
+    const effective = protectionFaultGuestEffective(
+        mapping_effective,
+        base_is_anchor,
+        index_value,
+        decoded.sib_scale,
+        decoded.addr,
+        decoded.has_0x67,
+    );
     if (effective > near_null_effective_limit) return;
 
-    const decoded = decodeStatic(self, self.regs.rip) orelse {
-        machoCapturePrint(
-            "macho-processor: near-null protection fault: rip=0x{x} address=0x{x} guest_effective=0x{x} bytes={d} access={s}; the faulting instruction could not be decoded, so no operand evidence is available\n",
-            .{ self.regs.rip, address, effective, bytes, @tagName(access) },
-        );
-        return;
-    };
     machoCapturePrint(
         "macho-processor: near-null protection fault: rip=0x{x} address=0x{x} guest_effective=0x{x} bytes={d} access={s} op={s} len={d} has_0x67={} base({s})=0x{x} index({s},scale={d})=0x{x} displacement=0x{x} rip_relative={} symbol={s}; the page is protected deliberately, so the pointer is the finding, not the page\n",
         .{
@@ -2260,10 +2310,10 @@ fn reportProtectionFaultOperands(self: anytype, address: u64, bytes: u8, access:
             decoded.len,
             decoded.has_0x67,
             if (decoded.sib_has_base) @tagName(decoded.sib_base_reg) else "<none>",
-            if (decoded.sib_has_base) self.regVal(decoded.sib_base_reg, .bits64) else 0,
+            base_value,
             if (decoded.sib_has_index) @tagName(decoded.sib_index_reg) else "<none>",
             @as(u8, 1) << decoded.sib_scale,
-            if (decoded.sib_has_index) self.regVal(decoded.sib_index_reg, .bits64) else 0,
+            index_value,
             decoded.addr,
             decoded.rip_relative,
             self.metadata.symbolLabel(self.regs.rip),
@@ -2285,10 +2335,6 @@ fn reportProtectionFaultOperands(self: anytype, address: u64, bytes: u8, access:
     // A base that is not a plausible guest value and does not vary is the
     // membase or an equivalent anchor; when an index is present alongside it,
     // the index is the causal operand.
-    const base_value = if (decoded.sib_has_base) self.regVal(decoded.sib_base_reg, .bits64) else 0;
-    const base_is_anchor = decoded.sib_has_base and decoded.sib_has_index and
-        !isGuestMappedValue(self, base_value) and
-        self.sparse_memory.containingMappingBase(base_value) == base_value;
     const causal: ?x64_decoder.RegId = if (base_is_anchor)
         decoded.sib_index_reg
     else if (decoded.sib_has_base)
@@ -3646,8 +3692,6 @@ inline fn memoryTraceWanted(self: anytype) bool {
 /// allocation, and putting that on a path taken by ordinary guest writes costs
 /// more as the run gets longer. A class whose secondary base sits beyond this
 /// is simply not tracked, which is the behaviour that already existed.
-const max_subobject_probe_slots: usize = 8;
-
 /// The base of the live allocation owning `address`, in bounded time.
 ///
 /// `memory_forwarder.allocationSize` answers in O(1) but only at an exact base,
@@ -3661,7 +3705,9 @@ const max_subobject_probe_slots: usize = 8;
 /// The first base found going backwards is the only candidate: anything before
 /// it belongs to a different block, so a base that does not cover `address`
 /// means `address` is not in a tracked allocation rather than "keep looking".
-fn owningAllocationBase(self: anytype, address: u64) ?struct { base: u64, size: u64 } {
+const LiveAllocation = struct { base: u64, size: u64 };
+
+fn owningAllocationBase(self: anytype, address: u64) ?LiveAllocation {
     // The overwhelming majority of tracked slots: a primary vptr at the
     // object's own base. One hash lookup, which is exactly what this cost
     // before secondary bases were tracked at all.
@@ -3674,12 +3720,24 @@ fn owningAllocationBase(self: anytype, address: u64) ?struct { base: u64, size: 
 
     var probe = address;
     var steps: usize = 0;
-    while (steps < max_subobject_probe_slots and probe >= 8) : (steps += 1) {
+    while (steps < vt.max_subobject_slots and probe >= 8) : (steps += 1) {
         probe -= 8;
         const size = self.memory_forwarder.allocationSize(probe) orelse continue;
         return if (address - probe < size) .{ .base = probe, .size = size } else null;
     }
     return null;
+}
+
+/// Resolve liveness from an existing vptr record without rediscovering the
+/// owner by walking backwards. This also handles secondary bases at any offset
+/// already admitted by the tracker and prevents a future probe-bound change
+/// from invalidating previously established ownership.
+fn liveOwnerForTrackedVptr(self: anytype, address: u64) ?LiveAllocation {
+    const record = self.vtable_tracker.lookupRecord(address) orelse return null;
+    const base = if (record.owner_base != 0) record.owner_base else address;
+    const size = self.memory_forwarder.allocationSize(base) orelse return null;
+    if (address < base or address - base >= size) return null;
+    return .{ .base = base, .size = size };
 }
 
 pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u64) ?u64 {
@@ -3704,11 +3762,7 @@ pub fn recoverLiveAllocationVtable(self: anytype, address: u64, current_value: u
     // different class could have the previous occupant's vtable written into
     // what is now an ordinary data member — silently, and with no fault
     // anywhere to report it. That would be worse than the null being repaired.
-    const within_live_allocation = has_heap_history and blk: {
-        const live = owningAllocationBase(self, address) orelse break :blk false;
-        const record = self.vtable_tracker.lookupRecord(address) orelse break :blk false;
-        break :blk record.owner_base == 0 or record.owner_base == live.base;
-    };
+    const within_live_allocation = has_heap_history and liveOwnerForTrackedVptr(self, address) != null;
 
     // Phase 1: low-read recovery (value < 0x1000, e.g. cleared to 0 or small sentinel)
     if (has_heap_history) {
@@ -3790,7 +3844,7 @@ noinline fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recov
     // Which subobject this vptr belongs to. A repair at a non-zero offset is a
     // secondary base's vptr, and reading the log without that offset makes two
     // repairs on one object look like two unrelated objects.
-    const allocation = owningAllocationBase(self, address);
+    const allocation = liveOwnerForTrackedVptr(self, address) orelse owningAllocationBase(self, address);
     const object_base = if (allocation) |live| live.base else address;
     machoCapturePrint(
         "macho-processor: trusted vtable {s} recovery: object=0x{x} subobject_offset={d} slot={s} generation={d} allocation_size={d} observed=0x{x} restored=0x{x} vtable={s}+0x{x} established_by=0x{x}@{d} last_write=0x{x}@{d} prior_recoveries={d} thread=0x{x}\n",
@@ -3813,12 +3867,26 @@ noinline fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recov
             self.active_guest_thread,
         },
     );
+    if (observed < 0x1000) {
+        machoCapturePrint(
+            "macho-processor: VTABLE OWNERSHIP FRONTIER: first_invalid=tracked_vptr_storage_divergence slot=0x{x} expected=0x{x} observed=0x{x} generation={d} owner_base=0x{x} last_tracked_writer=0x{x}@{d}; the live object's bytes no longer match the last accepted vptr transition. Recovery is authorised by exact slot identity plus live-allocation ownership, but the missing producer remains a bypassing bulk/native write or alias-coherence defect and must be correlated with the next ownership failure\n",
+            .{
+                address,
+                recovery.value,
+                observed,
+                recovery.generation,
+                object_base,
+                recovery.last_write.writer_rip,
+                recovery.last_write.writer_step,
+            },
+        );
+    }
     return recovery.value;
 }
 
 pub fn logLiveVtableGuardSummary(self: anytype) void {
     machoCapturePrint(
-        "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} guard_tracked={d} memory_writes={d} range_mutations={d} truncated_range_mutations={d}; recovery requires a tracked vptr slot inside a live allocation and strict mapped Itanium ZTV evidence — the slot may be a secondary base's vptr at a non-zero offset, not only the object's primary\n",
+        "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} vptr_range_mutations={d} vptr_truncated_ranges={d} atomic_rollbacks={d} atomic_qwords_restored={d} guard_tracked={d} memory_writes={d} provenance_range_mutations={d} provenance_truncated_ranges={d}; recovery requires a tracked vptr slot inside a live allocation and a complete mapped Itanium ZTV dispatch head (offset-to-top, RTTI, and first slot) — the slot may be a secondary base's vptr at a non-zero offset, not only the object's primary\n",
         .{
             self.vtable_tracker.live_vtable_guard_checks,
             self.vtable_tracker.live_vtable_guard_recoveries,
@@ -3830,6 +3898,10 @@ pub fn logLiveVtableGuardSummary(self: anytype) void {
             self.vtable_tracker.low_clears_observed,
             self.vtable_tracker.retired_records,
             self.vtable_tracker.heap_corruption_detections,
+            self.vtable_tracker.range_mutations,
+            self.vtable_tracker.truncated_range_mutations,
+            self.vtable_tracker.atomic_mutation_rollbacks,
+            self.vtable_tracker.atomic_qwords_restored,
             self.guard_rollback.count(),
             self.memory_writes.entries.count(),
             self.memory_writes.range_mutations,
@@ -3852,6 +3924,13 @@ pub fn vtableIdentityEvidence(self: anytype, value: u64) vt.IdentityEvidence {
     if (value < 16) return evidence;
     const table = guestMemoryConst(self, value - 16, 24) orelse return evidence;
     evidence.header_mapped = true;
+    const offset_to_top = std.mem.readInt(i64, table[0..8], .little);
+    const offset_bound: i64 = @intCast(@min(
+        self.vtable_tracker.policy.max_offset_to_top,
+        @as(u64, std.math.maxInt(i64)),
+    ));
+    evidence.offset_to_top_plausible =
+        offset_to_top >= -offset_bound and offset_to_top <= offset_bound;
     const typeinfo = std.mem.readInt(u64, table[8..16], .little);
     evidence.typeinfo_plausible =
         typeinfo == 0 or guestMemoryConst(self, typeinfo, 1) != null;
@@ -3864,6 +3943,29 @@ pub fn vtableIdentityEvidence(self: anytype, value: u64) vt.IdentityEvidence {
 /// Record only validated vptr identities.  Generic write provenance remains
 /// in memory_writes and cannot authorize vptr recovery.
 pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) void {
+    recordAllocationWriteKind(self, addr, size, val, .scalar, addr, 8);
+}
+
+fn writeTrackedSlotDirect(self: anytype, address: u64, value: u64) bool {
+    if (self.sparse_memory.bytes(address, 8, true)) |storage| {
+        std.mem.writeInt(u64, storage[0..8], value, .little);
+        return true;
+    }
+    const off = translateGuest(self, address, 8, .write) orelse return false;
+    if (off + 8 > self.mem.len) return false;
+    std.mem.writeInt(u64, self.mem[off..][0..8], value, .little);
+    return true;
+}
+
+fn recordAllocationWriteKind(
+    self: anytype,
+    addr: u64,
+    size: Size,
+    val: u64,
+    mutation_kind: vt.MutationKind,
+    mutation_address: u64,
+    mutation_length: u64,
+) void {
     if (size != .bits64) return;
     if (addr < 0x1000 or (addr & 7) != 0) return;
 
@@ -3877,16 +3979,19 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
     // ordinary integers, heap/stack pointers and JIT addresses before either
     // an allocation-map lookup or a symbol lookup.
     //
-    // Full diagnostics still observes clears and arbitrary replacements so it
-    // can name the writer and protect immediately at write time. In the normal
-    // path, only trusted vtable establishments/transitions are retained; a
-    // later low read is repaired exclusively from that authentic history.
-    if (!shouldObserveVtableWrite(
+    // Once a slot has trusted history, clears and replacements are a
+    // correctness concern in every run, not optional write diagnostics.  The
+    // Bloom filter keeps the normal-store cost bounded to two bit tests, and a
+    // real hash lookup confirms positives before any ownership/symbol work.
+    const plausible_vtable = shouldObserveVtableWrite(
         self.write_diagnostics_armed,
         val,
         self.mapped_min,
         self.image_end,
-    )) return;
+    );
+    const tracked_slot = self.vtable_tracker.mightContain(addr) and
+        self.vtable_tracker.hasTrustedHistory(addr);
+    if (!plausible_vtable and !tracked_slot) return;
 
     // Destination ownership is cheaper and more selective than symbol/section
     // classification. Prove this write lands in a live allocation before asking
@@ -3903,9 +4008,13 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
     // above has already rejected everything whose value is not an image
     // pointer, so this lookup is only reached by the rare write that plausibly
     // stores a vtable.
-    const owner = owningAllocationBase(self, addr) orelse return;
+    const owner = if (tracked_slot)
+        (liveOwnerForTrackedVptr(self, addr) orelse return)
+    else
+        (owningAllocationBase(self, addr) orelse return);
     const evidence = vtableIdentityEvidence(self, val);
-    if (!self.write_diagnostics_armed and !evidence.isTrusted(self.vtable_tracker.policy)) return;
+    if (!self.write_diagnostics_armed and !tracked_slot and
+        !evidence.isTrusted(self.vtable_tracker.policy)) return;
     const result = self.vtable_tracker.observeWrite(
         addr,
         evidence,
@@ -3914,6 +4023,7 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
             .writer_step = self.executed_steps,
             .writer_thread = self.active_guest_thread,
             .owner_base = owner.base,
+            .mutation_kind = mutation_kind,
         },
     );
     const transition_count = self.vtable_tracker.trusted_transitions;
@@ -3965,7 +4075,7 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
         const writer_name = self.metadata.symbolLabel(self.regs.rip);
         const writer_off = if (writer_symbol) |s| s.offset else 0;
         machoCapturePrint(
-            "macho-processor: vtable cleared: object=0x{x} gen={d} vtable=0x{x}({s}+0x{x}) writer=0x{x} {s}+0x{x} step={d} thread=0x{x}\n",
+            "macho-processor: vtable cleared: object=0x{x} gen={d} vtable=0x{x}({s}+0x{x}) writer=0x{x} {s}+0x{x} step={d} thread=0x{x} mutation={s} range=[0x{x},+0x{x})\n",
             .{
                 addr,
                 result.generation,
@@ -3977,6 +4087,9 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
                 writer_off,
                 self.executed_steps,
                 self.active_guest_thread,
+                @tagName(mutation_kind),
+                mutation_address,
+                mutation_length,
             },
         );
     }
@@ -3990,30 +4103,29 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
     if (result.disposition == .trusted_value_cleared and
         result.previous_vptr >= 0x1000)
     {
-        if (self.sparse_memory.bytes(addr, 8, true)) |storage| {
-            std.mem.writeInt(u64, storage[0..8], result.previous_vptr, .little);
-        } else {
-            const off = translateGuest(self, addr, 8, .write) orelse return;
-            if (off + 8 <= self.mem.len) {
-                std.mem.writeInt(u64, self.mem[off..][0..8], result.previous_vptr, .little);
-            }
-        }
+        if (!writeTrackedSlotDirect(self, addr, result.previous_vptr)) return;
         self.vtable_tracker.live_vtable_write_protections +|= 1;
         const vtable_symbol = self.metadata.nearestSymbol(result.previous_vptr);
         const prot_writer_symbol = self.metadata.nearestSymbol(self.regs.rip);
         machoCapturePrint(
-            "macho-processor: vptr write-protection: object=0x{x} gen={d} vtable=0x{x}({s}+0x{x}) restored_by=0x{x} {s}+0x{x} step={d} thread=0x{x}\n",
+            "macho-processor: VTABLE MUTATION CONTRACT: first_invalid=trusted_vptr_overwrite slot=0x{x} owner_base=0x{x} subobject_offset=0x{x} generation={d} expected=0x{x}({s}+0x{x}) observed=0x{x} writer=0x{x} {s}+0x{x} step={d} thread=0x{x} mutation={s} range=[0x{x},+0x{x}) action=restore_trusted_vptr\n",
             .{
                 addr,
+                owner.base,
+                addr - owner.base,
                 result.generation,
                 result.previous_vptr,
                 self.metadata.symbolLabel(result.previous_vptr),
                 if (vtable_symbol) |s| s.offset else 0,
+                val,
                 self.regs.rip,
                 self.metadata.symbolLabel(self.regs.rip),
                 if (prot_writer_symbol) |s| s.offset else 0,
                 self.executed_steps,
                 self.active_guest_thread,
+                @tagName(mutation_kind),
+                mutation_address,
+                mutation_length,
             },
         );
     }
@@ -4411,29 +4523,37 @@ pub fn noteRingBufferWrite(self: anytype, address: u64, size: Size, value: u64) 
     );
 }
 
+pub const MemoryMutationCapture = struct {
+    provenance: memory_write_provenance.MutationCapture,
+    vtables: vt.MutationCapture,
+};
+
 pub fn captureMemoryMutation(
     self: anytype,
     address: u64,
     length: u64,
-) memory_write_provenance.MutationCapture {
+) MemoryMutationCapture {
+    const vtables = self.vtable_tracker.captureMutation(self, address, length);
     // R3 (N4): the before-image capture re-reads every overlapping pointer
     // slot (a full memory probe per store). It is fault-time diagnostics; when
     // write diagnostics are unarmed (the default fast path) return an empty
-    // capture so stores pay nothing for it. commitMemoryMutation applies the
-    // matching gate.
-    if (!provenanceWanted(self, address)) return .{ .address = address, .length = length };
-    return self.memory_writes.captureMutation(self, address, length);
+    // provenance capture so stores pay nothing for it. Vptr capture is a
+    // separate correctness contract and uses its Bloom prefilter even when
+    // generic provenance is disabled.
+    const provenance = if (provenanceWanted(self, address) or vtables.count != 0)
+        self.memory_writes.captureMutation(self, address, length)
+    else
+        memory_write_provenance.MutationCapture{ .address = address, .length = length };
+    return .{ .provenance = provenance, .vtables = vtables };
 }
 
 pub fn commitMemoryMutation(
     self: anytype,
-    capture: memory_write_provenance.MutationCapture,
+    capture: MemoryMutationCapture,
     kind: memory_write_provenance.WriteKind,
 ) void {
     // R3 (N4): matching gate to captureMemoryMutation. When unarmed the
     // capture is empty and the re-read/compare/record work is skipped.
-    if (capture.count == 0) return;
-    if (!provenanceWanted(self, capture.address)) return;
     // The writer recorded below is `regs.rip` — the *faulting guest*
     // instruction — even when the write came from a Rosette repair rather than
     // from the guest. Reclassify while a repair is in flight so consumers can
@@ -4443,15 +4563,93 @@ pub fn commitMemoryMutation(
             (if (self.host_repair_in_flight) .host_repair else kind)
         else
             kind;
-    self.memory_writes.commitMutation(
-        self.allocator,
-        self,
-        capture,
-        self.regs.rip,
-        self.executed_steps,
-        self.active_guest_thread,
-        attributed_kind,
-    );
+    if (capture.provenance.count != 0 and provenanceWanted(self, capture.provenance.address)) {
+        self.memory_writes.commitMutation(
+            self.allocator,
+            self,
+            capture.provenance,
+            self.regs.rip,
+            self.executed_steps,
+            self.active_guest_thread,
+            attributed_kind,
+        );
+    }
+
+    if (capture.vtables.count != 0) self.vtable_tracker.range_mutations +|= 1;
+    if (capture.vtables.truncated) {
+        self.vtable_tracker.truncated_range_mutations +|= 1;
+        if (recovery_ledger.throttled(self.vtable_tracker.truncated_range_mutations)) {
+            machoCapturePrint(
+                "macho-processor: VTABLE MUTATION CONTRACT: coverage=truncated range=[0x{x},+0x{x}) retained_slots={d} tracked_slots={d} writer=0x{x} step={d} thread=0x{x}; no conclusion or repair is claimed for omitted vptr slots\n",
+                .{
+                    capture.vtables.address,
+                    capture.vtables.length,
+                    capture.vtables.count,
+                    self.vtable_tracker.trackedAllocationCount(),
+                    self.regs.rip,
+                    self.executed_steps,
+                    self.active_guest_thread,
+                },
+            );
+        }
+    }
+
+    const vtable_kind: vt.MutationKind = switch (attributed_kind) {
+        .scalar => .scalar,
+        .partial_scalar => .partial_scalar,
+        .bulk_fill => .bulk_fill,
+        .bulk_copy => .bulk_copy,
+        .host_repair => .host_repair,
+    };
+    for (capture.vtables.slots[0..capture.vtables.count]) |slot| {
+        const current_record = self.vtable_tracker.lookupRecord(slot.address) orelse continue;
+        if (current_record.generation != slot.generation) continue;
+        const bytes = guestMemoryConst(self, slot.address, 8) orelse continue;
+        const value = std.mem.readInt(u64, bytes[0..8], .little);
+        if (value == slot.value) continue;
+        const protections_before = self.vtable_tracker.live_vtable_write_protections;
+        recordAllocationWriteKind(
+            self,
+            slot.address,
+            .bits64,
+            value,
+            vtable_kind,
+            capture.vtables.address,
+            capture.vtables.length,
+        );
+        if (self.vtable_tracker.live_vtable_write_protections == protections_before) continue;
+
+        // A memset/memcpy/partial store that invalidates a live vptr is one
+        // atomic mutation contract, not an isolated eight-byte accident. The
+        // same write may have cleared XObject's KernelState* (the immediately
+        // following field in the observed Xbdm casualty), so restoring only
+        // the vptr merely postpones the ownership crash. Roll back every
+        // captured slot from this mutation that belongs to the same live
+        // allocation. This is bounded by MutationCapture and is activated only
+        // after exact vptr identity proves the whole mutation invalid.
+        const owner = liveOwnerForTrackedVptr(self, slot.address) orelse continue;
+        var restored_qwords: u64 = 0;
+        for (capture.provenance.slots[0..capture.provenance.count]) |before| {
+            if (before.address < owner.base or before.address - owner.base >= owner.size) continue;
+            if (!writeTrackedSlotDirect(self, before.address, before.value)) continue;
+            restored_qwords +|= 1;
+        }
+        self.vtable_tracker.atomic_mutation_rollbacks +|= 1;
+        self.vtable_tracker.atomic_qwords_restored +|= restored_qwords;
+        machoCapturePrint(
+            "macho-processor: VTABLE MUTATION CONTRACT: action=rollback_invalid_atomic_mutation owner_base=0x{x} owner_size=0x{x} vptr_slot=0x{x} mutation={s} range=[0x{x},+0x{x}) restored_qword_chunks={d} capture_truncated={}; adjacent ownership and lifetime fields were restored from the same before-image because the mutation had already violated the live type identity\n",
+            .{
+                owner.base,
+                owner.size,
+                slot.address,
+                @tagName(vtable_kind),
+                capture.vtables.address,
+                capture.vtables.length,
+                restored_qwords,
+                capture.provenance.truncated or capture.vtables.truncated,
+            },
+        );
+    }
 }
 
 /// Perform a guest-memory write that Rosette originates as part of a fault
@@ -4662,6 +4860,10 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
                 "macho-processor: mapped guest protection fault routed to SIGSEGV handler: rip=0x{x} address=0x{x} bytes={d} access={s} instruction={s}\n",
                 .{ self.regs.rip, address, bytes, @tagName(access), instruction },
             );
+            // This fault has a real consumer and is no longer the process's
+            // active diagnostic transaction. Retaining its pinned thread here
+            // would make a later fatal near-null walk the handled fault's tape.
+            near_null_causality.clearFaultContext(self);
             return;
         }
     }

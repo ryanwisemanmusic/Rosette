@@ -49,6 +49,14 @@ pub fn handleSigaction(self: anytype) u64 {
         const input = self.guestMemoryConst(self.regs.rsi, DARWIN_SIGACTION_SIZE) orelse return signalFailureResult();
         self.signal_actions[signal_index] = readDarwinSigaction(input) orelse return signalFailureResult();
     }
+    if (self.regs.rdi == GUEST_SIGSEGV) {
+        const action = self.signal_actions[signal_index];
+        // Sparse write-watch pages are expected to fault and be repaired by
+        // the guest's SIGSEGV handler. Keep the memory classifier synchronized
+        // with the real process-wide disposition so it doesn't diagnose that
+        // protocol as an unhandled permission violation.
+        self.sparse_memory.guest_fault_handler_installed = action.handler > 1;
+    }
     if (self.verbose_trace) {
         const action = self.signal_actions[signal_index];
         machoCapturePrint(
@@ -111,9 +119,13 @@ pub fn deliverGuestSignal(
     writeDarwinMcontext(mcontext_bytes, self.regs, trap_number, error_code, fault_address);
     writeDarwinUcontext(ucontext_bytes, frame.mcontext);
 
-    if (action.flags & SA_RESETHAND != 0) self.signal_actions[signal_index] = .{};
+    if (action.flags & SA_RESETHAND != 0) {
+        self.signal_actions[signal_index] = .{};
+        if (signal == GUEST_SIGSEGV) self.sparse_memory.guest_fault_handler_installed = false;
+    }
     frame.signal = signal;
     frame.instruction_len = instruction_len;
+    frame.owner_thread = self.active_guest_thread;
     frame.fault_rip = fault_rip;
     frame.fault_address = fault_address;
     frame.fault_access = fault_access;
@@ -166,7 +178,7 @@ pub fn deliverGuestSignal(
 
 pub fn signalIsActive(self: anytype, signal: u8) bool {
     for (self.signal_frames[0..self.signal_frame_count]) |frame| {
-        if (frame.signal == signal) return true;
+        if (frame.owner_thread == self.active_guest_thread and frame.signal == signal) return true;
     }
     return false;
 }
@@ -209,6 +221,17 @@ pub fn finishGuestSignalReturn(self: anytype) bool {
     }
     self.signal_frame_count -= 1;
     const frame = self.signal_frames[self.signal_frame_count];
+    if (frame.owner_thread != self.active_guest_thread) {
+        machoCapturePrint(
+            "macho-processor: guest signal return ownership violation: signal={d} frame_thread=0x{x} active_thread=0x{x}; refusing to restore another guest thread's machine context\n",
+            .{ frame.signal, frame.owner_thread, self.active_guest_thread },
+        );
+        self.faulted = true;
+        self.terminated = true;
+        self.exit_code = 127;
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
+        return false;
+    }
     const bytes = self.guestMemoryConst(frame.mcontext, DARWIN_MCONTEXT_SIZE) orelse {
         self.faulted = true;
         self.terminated = true;

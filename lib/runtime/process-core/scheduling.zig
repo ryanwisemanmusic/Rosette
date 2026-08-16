@@ -12,6 +12,7 @@ const pthread_runtime = @import("pthread").pthread_runtime;
 
 // Types referenced explicitly in parameter/return types or function bodies
 const SuspendedGuestThread = @import("macho_core").types.SuspendedGuestThread;
+const GuestSignalState = @import("macho_core").types.GuestSignalState;
 const IdleQueueSnapshot = @import("macho_core").types.IdleQueueSnapshot;
 const IdleDispatchBlock = @import("macho_core").types.IdleDispatchBlock;
 const RunnableSuspendedSnapshot = @import("macho_core").types.RunnableSuspendedSnapshot;
@@ -29,6 +30,25 @@ const IDLE_CALLBACK_HANDLE_BASE = @import("macho_core").types.IDLE_CALLBACK_HAND
 // Utility functions
 const alignDown = @import("macho_core").utils.alignDown;
 
+fn captureActiveGuestSignalState(self: anytype) GuestSignalState {
+    return .{
+        .frames = self.signal_frames,
+        .count = @min(self.signal_frame_count, self.signal_frames.len),
+    };
+}
+
+fn restoreActiveGuestSignalState(self: anytype, state: GuestSignalState) void {
+    self.signal_frames = state.frames;
+    self.signal_frame_count = @min(state.count, state.frames.len);
+}
+
+/// Starts a synthetic or newly-created guest context with no inherited signal
+/// nesting. Signal dispositions remain process-wide in `signal_actions`; only
+/// the in-flight handler frames are thread-local.
+pub fn resetActiveGuestSignalState(self: anytype) void {
+    restoreActiveGuestSignalState(self, .{});
+}
+
 pub fn beginCooperativeMainLoop(self: anytype) bool {
     if (self.cooperative_ui_context != null) return false;
     const deferred = self.pthreads.takeNewestDeferred() orelse return false;
@@ -37,6 +57,7 @@ pub fn beginCooperativeMainLoop(self: anytype) bool {
         .xmm = self.xmm,
         .ymm_hi = self.ymm_hi,
         .x87 = self.x87,
+        .signal_state = captureActiveGuestSignalState(self),
     };
     self.foreign_objects.main_loop_entries +|= 1;
     self.foreign_objects.main_loop_depth +|= 1;
@@ -68,6 +89,7 @@ pub fn startDeferredGuestThread(self: anytype, deferred: pthread_runtime.Deferre
     self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
     self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
     self.x87 = .{};
+    resetActiveGuestSignalState(self);
     self.coop_bootstrap_active = true;
     self.coop_bootstrap_index = 0;
     self.regs.rip = deferred.start_routine;
@@ -98,6 +120,7 @@ pub fn saveActiveGuestThread(self: anytype, reason: []const u8) bool {
         .xmm = self.xmm,
         .ymm_hi = self.ymm_hi,
         .x87 = self.x87,
+        .signal_state = captureActiveGuestSignalState(self),
     };
     self.suspended_guest_thread_count += 1;
     self.pthreads.markContextSuspended(self.active_guest_thread);
@@ -115,6 +138,7 @@ pub fn saveActiveGuestThread(self: anytype, reason: []const u8) bool {
     }
 
     self.active_guest_thread = 0;
+    resetActiveGuestSignalState(self);
     return true;
 }
 
@@ -122,6 +146,7 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
     _ = self.guest_time.advanceForExecution(self.executed_steps);
     if (self.suspended_guest_thread_count == 0) return false;
     const completed_handoff_thread = self.ui_handoff.completionResumeHandle();
+    const completed_handoff_step = self.ui_handoff.completed_step;
     var attempts = self.suspended_guest_thread_count;
     while (attempts > 0) : (attempts -= 1) {
         var selected_index: usize = 0;
@@ -130,10 +155,6 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
                 for (self.suspended_guest_threads[0..self.suspended_guest_thread_count], 0..) |candidate, index| {
                     if (candidate.handle != completed_handoff_thread) continue;
                     selected_index = index;
-                    machoCapturePrint(
-                        "scheduler: UI handoff completion-affinity resume: generation={d} scheduling_thread=0x{x} skipped_fifo_entries={d} callback_completed_step={d} step={d}\n",
-                        .{ self.ui_handoff.generation, candidate.handle, index, self.ui_handoff.completed_step, self.executed_steps },
-                    );
                     break;
                 }
             } else if (self.ui_handoff.shouldPreferCallback(self.executed_steps, COOPERATIVE_THREAD_QUANTUM_STEPS)) {
@@ -184,6 +205,7 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
             self.cooperative_preserved_register_resumes +|= 1;
         }
         self.active_guest_thread = context.handle;
+        restoreActiveGuestSignalState(self, context.signal_state);
         self.pthreads.markRunning(context.handle);
         self.cooperative_thread_switches +|= 1;
         self.scheduler_log.emit(.{
@@ -201,10 +223,13 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
                 .{ resume_count, context.handle, context.reason, context.suspended_step, self.regs.rip, self.regs.rsp, saved_rax, self.regs.rax, if (resume_decision.?.rax_override != null) "wait_result_override" else "preserve_all_registers" },
             );
         }
+        // A thread that is executing again can collect completions again, so a
+        // previous abandonment must not follow it forever.
+        self.ui_handoff.noteThreadResumed(context.handle);
         if (context.handle == completed_handoff_thread and self.ui_handoff.completionResumed(context.handle, self.executed_steps)) {
             machoCapturePrint(
-                "scheduler: UI handoff dependency resolved: resumed scheduling_thread=0x{x} after callback cleanup; FIFO fallback remains available for unrelated workers\n",
-                .{context.handle},
+                "scheduler: UI handoff dependency resolved: generation={d} scheduling_thread=0x{x} callback_completed_step={d} resumed_step={d}; queued callbacks may now dispatch\n",
+                .{ self.ui_handoff.generation, context.handle, completed_handoff_step, self.executed_steps },
             );
             self.logThreadTable("UI handoff scheduling thread resumed");
         } else if (self.ui_handoff.ownsCallbackHandle(context.handle)) {
@@ -255,7 +280,8 @@ fn recoverQuiescentGuestThread(self: anytype, reason: []const u8, waiter: u64) b
         return self.resumeSuspendedGuestThread();
     }
 
-    const preferred = if (self.ui_handoff.isActive()) self.ui_handoff.scheduling_thread else 0;
+    const completion_thread = self.ui_handoff.completionResumeHandle();
+    const preferred = if (completion_thread != 0) completion_thread else if (self.ui_handoff.isActive()) self.ui_handoff.scheduling_thread else 0;
     if (self.pthreads.wakeOldestCondvarForQuiescence(preferred, self.executed_steps)) |woken| {
         self.cooperative_quiescence_recoveries +|= 1;
         const advanced_now = self.guest_time.advanceForQuiescence();
@@ -380,6 +406,26 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
             }
         }
         self.cached_suspended_runnable = self.refreshSuspendedRunnableCache();
+        // A completion dependency is honoured by resuming its scheduling
+        // thread, which only `resumeSuspendedGuestThread` can do. When that
+        // thread has parked on something this callback did not satisfy it is
+        // simply skipped there, and nothing else ever clears the dependency —
+        // so the idle queue stays pinned for the rest of the run. Give the
+        // dependency the same bounded lifetime the stall diagnostics assume.
+        if (self.ui_handoff.hasCompletionDependency()) {
+            const completed_step = self.ui_handoff.completed_step;
+            const abandoned = self.ui_handoff.releaseStalledCompletion(self.executed_steps, IDLE_STARVATION_STEPS);
+            if (abandoned != 0) {
+                const release = self.ui_handoff.completions_abandoned;
+                if (release <= 8 or release % 100 == 0) {
+                    machoCapturePrint(
+                        "scheduler: UI handoff completion abandoned: release={d} generation={d} scheduling_thread=0x{x} completed_step={d} held_for={d} idle_pending={d} suspended={d} blocked={d}; that thread never became resumable, so the idle queue is returned to the scheduler instead of being held for it\n",
+                        .{ release, self.ui_handoff.generation, abandoned, completed_step, self.executed_steps -| completed_step, self.pendingIdleCallbackCount(), self.suspended_guest_thread_count, self.pthreads.blocked_threads },
+                    );
+                    self.logThreadTable("UI handoff completion abandoned");
+                }
+            }
+        }
         // SDL audio is a callback producer, not an import return-value shim.
         // Keep its deadline check on the existing bounded scheduler cadence
         // so audio support adds no work to the per-instruction hot path.
@@ -439,6 +485,12 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
         .pending_idle = pending_idle,
         .callback_inflight = idle_callback_inflight,
         .idle_callback_running = idle_callback_running,
+        // `startNextIdleCallback` refuses while a completed handoff still owes
+        // its scheduling thread a resume. Without telling the chooser,
+        // this boundary keeps electing idle work that cannot start: the yield
+        // falls through to an ordinary rotation, the queue is unchanged, and
+        // the same election repeats at every boundary for the rest of the run.
+        .idle_dispatch_blocked = self.ui_handoff.hasCompletionDependency(),
         .deferred_threads = self.pthreads.deferred_threads,
         .suspended_threads = suspended_runnable,
     });
@@ -456,11 +508,30 @@ pub fn maybeYieldActiveGuestThreadForQuantum(self: anytype) void {
             }
             return;
         }
+        // The yield switched contexts, but that is not the same as having
+        // started a callback: it also succeeds by rotating to an ordinary
+        // worker when dispatch was refused. Reporting those as wakes counted
+        // scheduler decisions as UI progress and, because nothing about the
+        // queue changed, emitted one line per boundary with no bound at all.
+        if (self.active_idle_source == 0) {
+            self.idle_wakes_without_dispatch +|= 1;
+            if (self.idle_wakes_without_dispatch <= 8 or self.idle_wakes_without_dispatch % 1000 == 0) {
+                machoCapturePrint(
+                    "macho-processor: GTK idle wake rotated without dispatch: wake={d} from_thread=0x{x} to_thread=0x{x} block={s} pending={d}\n",
+                    .{ self.idle_wakes_without_dispatch, scheduling_thread, self.active_guest_thread, @tagName(self.gtkIdleDispatchBlock()), self.pendingIdleCallbackCount() },
+                );
+            }
+            return;
+        }
         self.idle_wakeups +|= 1;
-        machoCapturePrint(
-            "macho-processor: GTK idle wake dispatched: wake={d} from_thread=0x{x} source={d} pending={d}\n",
-            .{ self.idle_wakeups, scheduling_thread, self.active_idle_source, self.pendingIdleCallbackCount() },
-        );
+        // Every dispatch is already reported in full by `GTK idle dispatch
+        // start`, so this line only needs to stay legible at scale.
+        if (self.idle_wakeups <= 8 or self.idle_wakeups % 100 == 0) {
+            machoCapturePrint(
+                "macho-processor: GTK idle wake dispatched: wake={d} from_thread=0x{x} source={d} pending={d}\n",
+                .{ self.idle_wakeups, scheduling_thread, self.active_idle_source, self.pendingIdleCallbackCount() },
+            );
+        }
         return;
     }
     if (work != .deferred_thread and work != .suspended_thread) return;
@@ -493,6 +564,8 @@ pub fn finishActiveGuestThread(self: anytype) void {
         if (self.sdl.finishAudioCallback(self.active_guest_thread)) {
             self.cooperative_thread_returns +|= 1;
             self.active_guest_thread = 0;
+            resetActiveGuestSignalState(self);
+            clearSyntheticStackEntry(self);
         } else if (self.isIdleCallbackHandle(self.active_guest_thread)) {
             const source = self.active_idle_source;
             const callback = self.active_idle_callback;
@@ -505,15 +578,38 @@ pub fn finishActiveGuestThread(self: anytype) void {
             );
             self.logThreadTable("GTK idle callback completed");
             self.active_guest_thread = 0;
+            resetActiveGuestSignalState(self);
             self.active_idle_source = 0;
             self.active_idle_callback = 0;
             self.active_idle_started_step = 0;
+            clearSyntheticStackEntry(self);
         } else {
             self.pthreads.markCompleted(self.active_guest_thread);
             self.cooperative_thread_returns +|= 1;
             machoCapturePrint("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
             self.active_guest_thread = 0;
+            resetActiveGuestSignalState(self);
         }
+    }
+    // Callback completion is a rendezvous, not an ordinary FIFO boundary.
+    // Return ownership to the thread that requested the handoff before a new
+    // callback or deferred worker is allowed to overwrite the tracker.
+    if (self.ui_handoff.hasCompletionDependency()) {
+        if (self.resumeSuspendedGuestThread()) return;
+        if (recoverQuiescentGuestThread(
+            self,
+            "UI handoff callback completed before scheduling thread became runnable",
+            self.ui_handoff.completionResumeHandle(),
+        )) return;
+
+        self.cooperative_starvation_warnings +|= 1;
+        if (self.cooperative_starvation_warnings <= 8 or self.cooperative_starvation_warnings % 1000 == 0) {
+            machoCapturePrint(
+                "scheduler: UI HANDOFF COMPLETION BLOCKED: generation={d} scheduling_thread=0x{x} completed_step={d} suspended={d} blocked={d} deferred={d} idle_pending={d} warning={d}; preserving the completed generation instead of dispatching across it\n",
+                .{ self.ui_handoff.generation, self.ui_handoff.completionResumeHandle(), self.ui_handoff.completed_step, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pthreads.deferred_threads, self.pendingIdleCallbackCount(), self.cooperative_starvation_warnings },
+            );
+        }
+        return;
     }
     if (self.startNextIdleCallback("idle-return", false)) return;
     if (self.pthreads.takeNewestDeferred()) |next| {
@@ -576,6 +672,7 @@ pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []cons
         if (entry.active) continue;
         const source = self.gtk_idle_next_source;
         self.gtk_idle_next_source +|= 1;
+        const scheduling_owner = self.ui_handoff.schedulingOwner(self.active_guest_thread, self.regs.rip);
         entry.* = .{
             .source_id = source,
             .function = function,
@@ -583,15 +680,15 @@ pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []cons
             .active = true,
             .tag = tag,
             .scheduled_step = self.executed_steps,
-            .scheduling_thread = self.active_guest_thread,
-            .scheduling_rip = self.regs.rip,
+            .scheduling_thread = scheduling_owner.thread,
+            .scheduling_rip = scheduling_owner.rip,
         };
         self.idle_scheduled +|= 1;
         updateCachedPendingIdle(self, 1);
-        _ = self.ui_handoff.queueIfIdle(source, function, self.active_guest_thread, self.regs.rip, self.executed_steps);
+        _ = self.ui_handoff.queueIfIdle(source, function, scheduling_owner.thread, scheduling_owner.rip, self.executed_steps);
         machoCapturePrint(
             "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
-            .{ source, function, data, tag, self.executed_steps, self.active_guest_thread, self.regs.rip, self.cooperative_ui_context != null, self.cached_pending_idle },
+            .{ source, function, data, tag, self.executed_steps, scheduling_owner.thread, scheduling_owner.rip, self.cooperative_ui_context != null, self.cached_pending_idle },
         );
         self.logThreadTable("GTK idle scheduled");
         return source;
@@ -641,11 +738,47 @@ pub fn idleQueueSnapshot(self: anytype) IdleQueueSnapshot {
     return idleQueueSnapshotFor(&self.idle_callbacks);
 }
 
+/// Whether a GTK callback still owns the shared UI callback stack.
+///
+/// SDL audio callbacks deliberately do not participate here: SDL executes
+/// them on an audio thread, and Rosette gives each virtual audio device a
+/// dedicated guest stack. Serialising that independent stack behind GTK was a
+/// false dependency that could keep later UI work deferred for the rest of a
+/// long Xenia run.
+pub fn syntheticCallbackStackBusy(self: anytype) bool {
+    return self.active_idle_source != 0;
+}
+
+/// Handle of the callback that owns the shared UI callback stack, or 0.
+/// Derived from the dispatch state rather than stored, so it cannot drift out
+/// of agreement with `syntheticCallbackStackBusy`.
+pub fn syntheticCallbackStackOwner(self: anytype) u64 {
+    if (self.active_idle_source != 0) return IDLE_CALLBACK_HANDLE_BASE + self.active_idle_source;
+    return 0;
+}
+
+/// Record the stack window a synthetic callback was entered on, so a later bad
+/// return inside it can be attributed rather than reported as an unexplained
+/// invalid target. Call after `rsp` and `active_guest_thread` are set.
+pub fn noteSyntheticStackEntry(self: anytype, handle: u64) void {
+    self.synthetic_stack_entry_rsp = self.regs.rsp;
+    self.synthetic_stack_entry_handle = handle;
+    self.synthetic_stack_dispatches +|= 1;
+}
+
+pub fn clearSyntheticStackEntry(self: anytype) void {
+    self.synthetic_stack_entry_rsp = 0;
+    self.synthetic_stack_entry_handle = 0;
+}
+
 pub fn idleDispatchBlock(self: anytype) IdleDispatchBlock {
     if (self.cooperative_ui_context == null) return .no_ui_context;
     if (self.active_guest_thread == 0) return .no_active_guest_thread;
     if (self.active_idle_source != 0) return .callback_already_running;
     if (self.suspended_guest_thread_count >= self.suspended_guest_threads.len) return .suspended_queue_full;
+    // Mirrors the refusal in `startNextIdleCallback`, so the reported block
+    // and the actual dispatch decision cannot disagree.
+    if (self.ui_handoff.hasCompletionDependency()) return .completion_handoff_pending;
     return .ready;
 }
 
@@ -663,6 +796,24 @@ pub fn removeIdleSource(self: anytype, source: u64) bool {
 
 pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_saved: bool) bool {
     self.pumpNativeWindowEvents();
+    // A completed handoff still owns the cooperative execution boundary until
+    // its scheduling thread resumes. The callback remains queued and will be
+    // dispatched after `completionResumed` resets the tracker.
+    if (self.ui_handoff.hasCompletionDependency()) return false;
+    // The shared UI callback stack has one owner at a time. Checking here
+    // rather than at each caller is deliberate: this is reached from the wait
+    // yield, the thread-return boundary, two import handlers and the zero-active
+    // run guard, and only the wait yield checked anything at all.
+    if (self.syntheticCallbackStackBusy()) {
+        self.idle_stack_owner_deferrals +|= 1;
+        if (self.idle_stack_owner_deferrals <= 4 or self.idle_stack_owner_deferrals % 1000 == 0) {
+            machoCapturePrint(
+                "macho-processor: GTK idle deferred, callback stack in use: deferral={d} reason={s} owner=0x{x} active_idle_source={d} pending={d}; the owning callback is suspended, not finished, so its frames are still live\n",
+                .{ self.idle_stack_owner_deferrals, reason, self.syntheticCallbackStackOwner(), self.active_idle_source, self.pendingIdleCallbackCount() },
+            );
+        }
+        return false;
+    }
     const context = self.cooperative_ui_context orelse return false;
     for (&self.idle_callbacks) |*entry| {
         if (!entry.active) continue;
@@ -692,6 +843,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         self.xmm = context.xmm;
         self.ymm_hi = context.ymm_hi;
         self.x87 = context.x87;
+        resetActiveGuestSignalState(self);
         self.regs.rip = function;
         self.regs.rdi = data;
         if (extra_arguments) {
@@ -701,6 +853,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         self.regs.rsp = alignDown(context.regs.rsp, 16);
         self.push(GUEST_THREAD_RETURN_SENTINEL);
         self.active_guest_thread = IDLE_CALLBACK_HANDLE_BASE + source;
+        noteSyntheticStackEntry(self, self.active_guest_thread);
         self.active_idle_source = source;
         self.active_idle_callback = function;
         self.active_idle_started_step = self.executed_steps;
@@ -772,6 +925,34 @@ pub fn contextContainsHandle(self: anytype, handle: u64) bool {
         if (context.handle == handle) return true;
     }
     return false;
+}
+
+/// Emit the exact scheduler location of an in-flight SDL callback. This turns
+/// a dispatch/completion mismatch into one of three actionable states: active,
+/// safely suspended with a resumable context, or orphaned ownership with no
+/// context capable of reaching the return sentinel.
+pub fn logAudioCallbackSchedulerState(self: anytype) void {
+    const handle = self.sdl.audioCallbackHandle();
+    if (handle == 0) return;
+    if (self.active_guest_thread == handle) {
+        machoCapturePrint(
+            "macho-processor: SDL2 audio callback scheduler state: handle=0x{x} state=active rip=0x{x} rsp=0x{x}; dedicated_stack=YES\n",
+            .{ handle, self.regs.rip, self.regs.rsp },
+        );
+        return;
+    }
+    for (self.suspended_guest_threads[0..self.suspended_guest_thread_count]) |context| {
+        if (context.handle != handle) continue;
+        machoCapturePrint(
+            "macho-processor: SDL2 audio callback scheduler state: handle=0x{x} state=suspended rip=0x{x} rsp=0x{x} reason={s} age_steps={d}; dedicated_stack=YES\n",
+            .{ handle, context.regs.rip, context.regs.rsp, context.reason, self.executed_steps -| context.suspended_step },
+        );
+        return;
+    }
+    machoCapturePrint(
+        "macho-processor: SDL2 audio callback scheduler state: handle=0x{x} state=ORPHANED active=0x{x} suspended_contexts={d}; the device still claims an in-flight callback but no execution context can reach its return sentinel\n",
+        .{ handle, self.active_guest_thread, self.suspended_guest_thread_count },
+    );
 }
 
 pub fn runnableSuspendedSnapshot(self: anytype) RunnableSuspendedSnapshot {
@@ -877,6 +1058,7 @@ pub fn restoreMainLoopCaller(self: anytype, reason: []const u8) void {
     self.xmm = context.xmm;
     self.ymm_hi = context.ymm_hi;
     self.x87 = context.x87;
+    restoreActiveGuestSignalState(self, context.signal_state);
     self.cooperative_ui_context = null;
     self.active_guest_thread = 0;
     self.active_idle_source = 0;
@@ -900,9 +1082,10 @@ pub fn restoreMainLoopCaller(self: anytype, reason: []const u8) void {
 pub fn logCooperativeSchedulerSummary(self: anytype) void {
     if (self.cooperative_thread_switches == 0 and self.cooperative_wait_yields == 0) return;
     machoCapturePrint(
-        "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}\n",
-        .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.idle_scheduled, self.idle_started, self.idle_completed, self.idle_removed, self.pendingIdleCallbackCount(), self.idle_wakeups, self.idle_dispatch_failures, self.idle_starvation_warnings },
+        "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/rotated_without_dispatch/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} ui_handoff_completions_abandoned={d}\n",
+        .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.idle_scheduled, self.idle_started, self.idle_completed, self.idle_removed, self.pendingIdleCallbackCount(), self.idle_wakeups, self.idle_wakes_without_dispatch, self.idle_dispatch_failures, self.idle_starvation_warnings, self.ui_handoff.completions_abandoned },
     );
+    self.logAudioCallbackSchedulerState();
 }
 
 pub fn logCooperativeHeartbeat(self: anytype) void {
@@ -911,6 +1094,33 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
     const idle_age = if (idle.pending != 0) self.executed_steps -| idle.oldest_scheduled_step else 0;
     const suspended = self.runnableSuspendedSnapshot();
     const suspended_age = if (suspended.oldest_handle != 0) self.executed_steps -| suspended.oldest_step else 0;
+    if (suspended.oldest_handle == 0) {
+        self.runnable_candidate_handle = 0;
+        self.runnable_candidate_suspended_step = 0;
+        self.runnable_candidate_first_observed_step = 0;
+        self.runnable_candidate_observations = 0;
+    } else if (!sameRunnableEpisode(
+        self.runnable_candidate_handle,
+        self.runnable_candidate_suspended_step,
+        suspended.oldest_handle,
+        suspended.oldest_step,
+    )) {
+        // A handle may yield, run, and yield again between heartbeats. That is
+        // a new suspension episode, not continuous starvation of the old one.
+        // Pairing the handle with its queue timestamp prevents a hot worker
+        // that is successfully scheduled every quantum from accumulating a
+        // fictitious multi-billion-step runnable age.
+        self.runnable_candidate_handle = suspended.oldest_handle;
+        self.runnable_candidate_suspended_step = suspended.oldest_step;
+        self.runnable_candidate_first_observed_step = self.executed_steps;
+        self.runnable_candidate_observations = 1;
+    } else {
+        self.runnable_candidate_observations +|= 1;
+    }
+    const observed_runnable_age = if (self.runnable_candidate_observations >= 2)
+        self.executed_steps -| self.runnable_candidate_first_observed_step
+    else
+        0;
     const dispatch_block = self.gtkIdleDispatchBlock();
     {
         const idx = self.coop_heartbeat_index;
@@ -960,15 +1170,15 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
             self.ui_handoff_filled = true;
         }
     }
-    if (suspended.runnable != 0 and suspended_age >= IDLE_STARVATION_STEPS and
+    if (suspended.runnable != 0 and observed_runnable_age >= IDLE_STARVATION_STEPS and
         self.executed_steps -| self.last_cooperative_starvation_step >= IDLE_STARVATION_STEPS)
     {
         self.last_cooperative_starvation_step = self.executed_steps;
         self.cooperative_starvation_warnings +|= 1;
         const oldest_symbol = self.metadata.nearestSymbol(suspended.oldest_rip);
         machoCapturePrint(
-            "scheduler: RUNNABLE CONTEXT STARVATION: warning={d} handle=0x{x} rip=0x{x} {s}+0x{x} age={d} reason={s} active=0x{x} runnable/blocked={d}/{d}; round-robin quantum rotation should cap this near {d} steps\n",
-            .{ self.cooperative_starvation_warnings, suspended.oldest_handle, suspended.oldest_rip, if (oldest_symbol) |resolved| resolved.name else "<unknown>", if (oldest_symbol) |resolved| resolved.offset else 0, suspended_age, suspended.oldest_reason, self.active_guest_thread, suspended.runnable, suspended.blocked, COOPERATIVE_THREAD_QUANTUM_STEPS * @as(u64, @intCast(suspended.runnable + 1)) },
+            "scheduler: RUNNABLE CONTEXT STARVATION: warning={d} handle=0x{x} rip=0x{x} {s}+0x{x} observed_runnable_for={d} context_suspended_for={d} observations={d} reason={s} active=0x{x} runnable/blocked={d}/{d}; round-robin quantum rotation should cap continuous eligibility near {d} steps\n",
+            .{ self.cooperative_starvation_warnings, suspended.oldest_handle, suspended.oldest_rip, if (oldest_symbol) |resolved| resolved.name else "<unknown>", if (oldest_symbol) |resolved| resolved.offset else 0, observed_runnable_age, suspended_age, self.runnable_candidate_observations, suspended.oldest_reason, self.active_guest_thread, suspended.runnable, suspended.blocked, COOPERATIVE_THREAD_QUANTUM_STEPS * @as(u64, @intCast(suspended.runnable + 1)) },
         );
         self.logThreadTable("runnable context starvation");
     }
@@ -980,6 +1190,17 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
         );
     }
     self.ui_handoff.diagnose(self.executed_steps, IDLE_STARVATION_STEPS, self.active_guest_thread, self.regs.rip, self.suspended_guest_thread_count);
+}
+
+pub fn sameRunnableEpisode(candidate_handle: u64, candidate_suspended_step: u64, observed_handle: u64, observed_suspended_step: u64) bool {
+    return candidate_handle == observed_handle and
+        candidate_suspended_step == observed_suspended_step;
+}
+
+test "starvation identity includes the suspension episode" {
+    try std.testing.expect(sameRunnableEpisode(0x7FFF_2000, 100, 0x7FFF_2000, 100));
+    try std.testing.expect(!sameRunnableEpisode(0x7FFF_2000, 100, 0x7FFF_2000, 20_000));
+    try std.testing.expect(!sameRunnableEpisode(0x7FFF_2000, 100, 0x7FFF_20E0, 100));
 }
 
 pub fn dumpCoopHeartbeatTrace(self: anytype) void {

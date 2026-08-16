@@ -386,6 +386,35 @@ pub fn logCrashDiagnostics(self: anytype, context: ControlTransferContext) void 
         .{ thread_handle, thread_id, thread_role, self.regs.rip, self.regs.rsp, self.regs.rbp },
     );
 
+    // A synthetic callback runs on the cooperative UI context's stack, which
+    // every synthetic callback shares. Naming that window turns "a return
+    // picked an invalid address" into a statement about which stack the frames
+    // were on and how deep the callback had gone, which is what distinguishes
+    // guest stack corruption from Rosette entering a callback over live frames.
+    if (self.isSyntheticCallbackHandle(thread_handle)) {
+        const entry_rsp = self.synthetic_stack_entry_rsp;
+        const owner_matches = self.synthetic_stack_entry_handle == thread_handle;
+        machoCapturePrint(
+            "macho-processor:   synthetic callback stack: owner=0x{x} entry_handle=0x{x} owner_matches={} entry_rsp=0x{x} depth_bytes={d} dispatches={d} idle_source={d} deferrals={d}\n",
+            .{
+                self.syntheticCallbackStackOwner(),
+                self.synthetic_stack_entry_handle,
+                owner_matches,
+                entry_rsp,
+                if (entry_rsp >= self.regs.rsp) entry_rsp - self.regs.rsp else 0,
+                self.synthetic_stack_dispatches,
+                self.active_idle_source,
+                self.idle_stack_owner_deferrals,
+            },
+        );
+        if (!owner_matches) {
+            machoCapturePrint(
+                "macho-processor:   synthetic callback stack: SHARED-STACK VIOLATION — the faulting callback is not the one that last claimed this stack, so another synthetic callback was entered over its live frames. Any invalid return address here is that overwrite, not guest stack corruption\n",
+                .{},
+            );
+        }
+    }
+
     machoCapturePrint(
         "macho-processor:   regs: rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n" ++ "macho-processor:         rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n" ++ "macho-processor:         r8=0x{x}  r9=0x{x}  r10=0x{x} r11=0x{x}\n" ++ "macho-processor:         r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n" ++ "macho-processor:         rip=0x{x} rflags=0x{x}\n",
         .{

@@ -14,6 +14,7 @@ const machoCapturePrint = macho_log.machoCapturePrint;
 const primitiveCapturePrint = macho_log.primitiveCapturePrint;
 const constants = @import("macho_core").constants;
 const TraceEntry = @import("macho_core").types.TraceEntry;
+const near_null_causality = @import("near_null_causality.zig");
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
 const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
 const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;
@@ -73,8 +74,9 @@ fn logGuestWindowContract(self: anytype) void {
 /// state and hides the transition between them, which is the thing worth
 /// seeing.
 ///
-/// Cost: one clock read and ~10 loads per HEARTBEAT_INTERVAL (25M) steps. That
-/// is 4e-8 of a step's budget — this measures the hot path without joining it.
+/// Cost: one clock read and ~10 loads per HEARTBEAT_INTERVAL (100M) steps.
+/// That is 1e-8 of a step's budget — this measures the hot path without
+/// joining it.
 pub fn logPerformanceHeartbeat(self: anytype) void {
     const startup_observer = @import("diagnostics").startup_observer;
     const now = startup_observer.monotonicNanoseconds();
@@ -872,6 +874,10 @@ pub fn logExitDiagnostics(self: anytype) void {
         memory_trace_buf[i] = self.memory_trace_entries[index];
     }
     report.recent_memory_accesses = memory_trace_buf[0..memory_trace_count];
+    if (self.fault_context_pinned) {
+        report.fault_thread = self.fault_context_thread;
+        report.fault_step = self.fault_context_step;
+    }
 
     const import_trace_count: usize = if (self.import_trace_filled) IMPORT_TRACE_BUFFER_LEN else self.import_trace_index;
     if (import_trace_count > 0) {
@@ -905,7 +911,14 @@ pub fn logExitDiagnostics(self: anytype) void {
     // that had to agree, with nothing enforcing it.
     if (terminal_trace_count > 0) {
         var raw_buf: [constants.TRACE_PER_THREAD_LEN]TraceEntry = undefined;
-        const copied = self.execution_history.copyRecentInto(self.active_guest_thread, &raw_buf);
+        // The pinned faulting context, not the live one. This block prints
+        // during teardown, by which point the cooperative scheduler may have
+        // moved `active_guest_thread`; copying the active thread's tape then
+        // showed one thread's instructions under another thread's fault.
+        const copied = self.execution_history.copyRecentInto(
+            near_null_causality.faultContextThread(self),
+            &raw_buf,
+        );
         var trace_buf: [constants.TRACE_PER_THREAD_LEN]exit_diagnostics.TraceEntry = undefined;
         for (raw_buf[0..copied], 0..) |entry, i| {
             trace_buf[i] = .{

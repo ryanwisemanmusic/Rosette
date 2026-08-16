@@ -65,6 +65,7 @@ pub fn commitInitializerTransaction(self: anytype) bool {
 }
 
 pub fn runOneInitializer(self: anytype, launch_regs: Regs, index: usize, is_retry: bool) InitializerRunOutcome {
+    if (self.consumeHostTerminationRequest()) return .failed;
     const address = self.metadata.initializer_addresses[index];
     const nearest_symbol = self.metadata.nearestSymbol(address);
     const symbol_name = if (nearest_symbol) |symbol| symbol.name else "<unknown>";
@@ -145,9 +146,15 @@ pub fn runOneInitializer(self: anytype, launch_regs: Regs, index: usize, is_retr
     self.regs.rip = address;
 
     var steps: u64 = 0;
+    var next_host_termination_poll: u64 = 500_000;
     while (!self.terminated and !self.initializer_abort_requested and
         self.regs.rip != INITIALIZER_RETURN_SENTINEL and steps < INITIALIZER_STEP_LIMIT) : (steps +|= 1)
     {
+        next_host_termination_poll -|= 1;
+        if (next_host_termination_poll == 0) {
+            next_host_termination_poll = 500_000;
+            if (self.consumeHostTerminationRequest()) break;
+        }
         if (!self.step()) break;
     }
     if (self.initializer_abort_requested) {

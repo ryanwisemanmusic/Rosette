@@ -11,6 +11,7 @@ pub const diagnostics = @import("diagnostics.zig");
 pub const execute = @import("execute.zig");
 pub const generated_endian_contract = @import("generated_endian_contract.zig");
 pub const guest_log = @import("guest_log.zig");
+pub const host_termination = @import("host_termination.zig");
 pub const initializers = @import("initializers.zig");
 pub const native_window = @import("native_window.zig");
 pub const scheduling = @import("scheduling.zig");
@@ -22,5 +23,6 @@ pub const syscalls = @import("syscalls.zig");
 // the processor build and none of them was ever executed, which is the failure
 // mode where a test file's presence is mistaken for its coverage.
 test {
+    _ = host_termination;
     _ = memory_access;
 }
