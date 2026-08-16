@@ -14,6 +14,21 @@ fn pageOwnedMmapLength(requested_length: u64) ?u64 {
     return padded & ~(page_size - 1);
 }
 
+/// The x86-64 guest uses 4 KiB pages even when Darwin backs sparse mappings
+/// with larger VM pages. Positioned I/O must cross guest mapping boundaries
+/// without requiring adjacent mappings to also be adjacent in host memory.
+const guest_io_page_size: u64 = 4096;
+
+fn guestIoChunkLength(address: u64, remaining: u64) u64 {
+    const bytes_to_boundary = guest_io_page_size - (address & (guest_io_page_size - 1));
+    return @min(remaining, bytes_to_boundary);
+}
+
+fn positionedOffset(base: i64, transferred: u64) ?i64 {
+    const signed_transferred = std.math.cast(i64, transferred) orelse return null;
+    return std.math.add(i64, base, signed_transferred) catch null;
+}
+
 extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: std.c.mode_t) c_int;
 extern "c" fn shm_unlink(name: [*:0]const u8) c_int;
 extern "c" fn socket(domain: c_int, socket_type: c_int, protocol: c_int) c_int;
@@ -34,6 +49,8 @@ pub const Forwarder = struct {
     short_positioned_reads: u64 = 0,
     failed_positioned_reads: u64 = 0,
     failed_positioned_writes: u64 = 0,
+    segmented_positioned_reads: u64 = 0,
+    segmented_positioned_writes: u64 = 0,
     close_count: u64 = 0,
     mmap_count: u64 = 0,
     shm_open_count: u64 = 0,
@@ -224,28 +241,76 @@ pub const Forwarder = struct {
 
     pub fn pread(self: *Forwarder, state: anytype) i64 {
         self.read_count += 1;
+        const offset: i64 = @bitCast(state.regs.rcx);
         const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse {
-            self.reportPositionedFailure("pread", state.regs.rdi, null, 0, state.regs.rdx, .BADF);
+            self.reportPositionedFailure("pread", state.regs.rdi, null, state.regs.rsi, null, offset, state.regs.rdx, .BADF, "descriptor_lookup");
             return @bitCast(self.fail(state, .BADF));
         };
-        const bytes = state.guestMemory(state.regs.rsi, state.regs.rdx) orelse {
-            self.reportPositionedFailure("pread", state.regs.rdi, host_fd, 0, state.regs.rdx, .FAULT);
-            return @bitCast(self.fail(state, .FAULT));
-        };
-        const offset: i64 = @bitCast(state.regs.rcx);
-        while (true) {
-            const rc = std.c.pread(host_fd, bytes.ptr, bytes.len, offset);
-            if (rc >= 0) {
-                reportShortPositionedRead(self, state.regs.rdi, host_fd, offset, bytes.len, rc);
-                return @intCast(rc);
+        if (state.guestMemory(state.regs.rsi, state.regs.rdx)) |bytes| {
+            while (true) {
+                const rc = std.c.pread(host_fd, bytes.ptr, bytes.len, offset);
+                if (rc >= 0) {
+                    reportShortPositionedRead(self, state.regs.rdi, host_fd, offset, bytes.len, rc);
+                    return @intCast(rc);
+                }
+                const err = std.c.errno(rc);
+                if (err != .INTR and err != .AGAIN) {
+                    self.failed_positioned_reads +|= 1;
+                    self.reportPositionedFailure("pread", state.regs.rdi, host_fd, state.regs.rsi, @intFromPtr(bytes.ptr), offset, bytes.len, err, "host_syscall");
+                    return @bitCast(self.fail(state, err));
+                }
             }
-            const err = std.c.errno(rc);
-            if (err != .INTR and err != .AGAIN) {
+        }
+
+        // A guest range may be valid page-by-page while crossing adjacent
+        // sparse activations. `guestMemory` intentionally refuses to pretend
+        // those separate host mappings are one contiguous slice. Preserve
+        // POSIX pread semantics by issuing guest-page-bounded operations.
+        self.segmented_positioned_reads +|= 1;
+        var total: u64 = 0;
+        while (total < state.regs.rdx) {
+            const guest_address = std.math.add(u64, state.regs.rsi, total) catch {
                 self.failed_positioned_reads +|= 1;
-                self.reportPositionedFailure("pread", state.regs.rdi, host_fd, offset, bytes.len, err);
+                self.reportPositionedFailure("pread", state.regs.rdi, host_fd, state.regs.rsi, null, offset, state.regs.rdx, .FAULT, "guest_address_overflow");
+                if (total != 0) return @intCast(total);
+                return @bitCast(self.fail(state, .FAULT));
+            };
+            const chunk = guestIoChunkLength(guest_address, state.regs.rdx - total);
+            const chunk_offset = positionedOffset(offset, total) orelse {
+                self.failed_positioned_reads +|= 1;
+                self.reportPositionedFailure("pread", state.regs.rdi, host_fd, guest_address, null, offset, chunk, .INVAL, "offset_overflow");
+                if (total != 0) return @intCast(total);
+                return @bitCast(self.fail(state, .INVAL));
+            };
+            const bytes = state.guestMemory(guest_address, chunk) orelse {
+                self.failed_positioned_reads +|= 1;
+                self.reportPositionedFailure("pread", state.regs.rdi, host_fd, guest_address, null, chunk_offset, chunk, .FAULT, "guest_buffer_translation");
+                if (total != 0) return @intCast(total);
+                return @bitCast(self.fail(state, .FAULT));
+            };
+            while (true) {
+                const rc = std.c.pread(host_fd, bytes.ptr, bytes.len, chunk_offset);
+                if (rc >= 0) {
+                    total += @intCast(rc);
+                    if (rc != @as(isize, @intCast(bytes.len))) {
+                        reportShortPositionedRead(self, state.regs.rdi, host_fd, offset, @intCast(state.regs.rdx), @intCast(total));
+                        return @intCast(total);
+                    }
+                    break;
+                }
+                const err = std.c.errno(rc);
+                if (err == .INTR or err == .AGAIN) continue;
+                self.failed_positioned_reads +|= 1;
+                self.reportPositionedFailure("pread", state.regs.rdi, host_fd, guest_address, @intFromPtr(bytes.ptr), chunk_offset, bytes.len, err, "segmented_host_syscall");
+                if (total != 0) return @intCast(total);
                 return @bitCast(self.fail(state, err));
             }
         }
+        machoCapturePrint(
+            "macho-processor: fs pread segmented: guest_fd={d} guest_buffer=0x{x} offset={d} requested={d} returned={d}; adjacent guest mappings were transferred without requiring false host contiguity\n",
+            .{ state.regs.rdi, state.regs.rsi, offset, state.regs.rdx, total },
+        );
+        return @intCast(total);
     }
 
     /// Report a positioned read that returned fewer bytes than asked for, and
@@ -352,25 +417,66 @@ pub const Forwarder = struct {
 
     pub fn pwrite(self: *Forwarder, state: anytype) i64 {
         self.write_count += 1;
+        const offset: i64 = @bitCast(state.regs.rcx);
         const host_fd = self.fd_manager.hostFd(state.regs.rdi) orelse {
-            self.reportPositionedFailure("pwrite", state.regs.rdi, null, 0, state.regs.rdx, .BADF);
+            self.reportPositionedFailure("pwrite", state.regs.rdi, null, state.regs.rsi, null, offset, state.regs.rdx, .BADF, "descriptor_lookup");
             return @bitCast(self.fail(state, .BADF));
         };
-        const bytes = state.guestMemoryConst(state.regs.rsi, state.regs.rdx) orelse {
-            self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, 0, state.regs.rdx, .FAULT);
-            return @bitCast(self.fail(state, .FAULT));
-        };
-        const offset: i64 = @bitCast(state.regs.rcx);
-        while (true) {
-            const rc = std.c.pwrite(host_fd, bytes.ptr, bytes.len, offset);
-            if (rc >= 0) return @intCast(rc);
-            const err = std.c.errno(rc);
-            if (err != .INTR and err != .AGAIN) {
+        if (state.guestMemoryConst(state.regs.rsi, state.regs.rdx)) |bytes| {
+            while (true) {
+                const rc = std.c.pwrite(host_fd, bytes.ptr, bytes.len, offset);
+                if (rc >= 0) return @intCast(rc);
+                const err = std.c.errno(rc);
+                if (err != .INTR and err != .AGAIN) {
+                    self.failed_positioned_writes +|= 1;
+                    self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, state.regs.rsi, @intFromPtr(bytes.ptr), offset, bytes.len, err, "host_syscall");
+                    return @bitCast(self.fail(state, err));
+                }
+            }
+        }
+
+        self.segmented_positioned_writes +|= 1;
+        var total: u64 = 0;
+        while (total < state.regs.rdx) {
+            const guest_address = std.math.add(u64, state.regs.rsi, total) catch {
                 self.failed_positioned_writes +|= 1;
-                self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, offset, bytes.len, err);
+                self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, state.regs.rsi, null, offset, state.regs.rdx, .FAULT, "guest_address_overflow");
+                if (total != 0) return @intCast(total);
+                return @bitCast(self.fail(state, .FAULT));
+            };
+            const chunk = guestIoChunkLength(guest_address, state.regs.rdx - total);
+            const chunk_offset = positionedOffset(offset, total) orelse {
+                self.failed_positioned_writes +|= 1;
+                self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, guest_address, null, offset, chunk, .INVAL, "offset_overflow");
+                if (total != 0) return @intCast(total);
+                return @bitCast(self.fail(state, .INVAL));
+            };
+            const bytes = state.guestMemoryConst(guest_address, chunk) orelse {
+                self.failed_positioned_writes +|= 1;
+                self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, guest_address, null, chunk_offset, chunk, .FAULT, "guest_buffer_translation");
+                if (total != 0) return @intCast(total);
+                return @bitCast(self.fail(state, .FAULT));
+            };
+            while (true) {
+                const rc = std.c.pwrite(host_fd, bytes.ptr, bytes.len, chunk_offset);
+                if (rc >= 0) {
+                    total += @intCast(rc);
+                    if (rc != @as(isize, @intCast(bytes.len))) return @intCast(total);
+                    break;
+                }
+                const err = std.c.errno(rc);
+                if (err == .INTR or err == .AGAIN) continue;
+                self.failed_positioned_writes +|= 1;
+                self.reportPositionedFailure("pwrite", state.regs.rdi, host_fd, guest_address, @intFromPtr(bytes.ptr), chunk_offset, bytes.len, err, "segmented_host_syscall");
+                if (total != 0) return @intCast(total);
                 return @bitCast(self.fail(state, err));
             }
         }
+        machoCapturePrint(
+            "macho-processor: fs pwrite segmented: guest_fd={d} guest_buffer=0x{x} offset={d} requested={d} returned={d}; adjacent guest mappings were transferred without requiring false host contiguity\n",
+            .{ state.regs.rdi, state.regs.rsi, offset, state.regs.rdx, total },
+        );
+        return @intCast(total);
     }
 
     fn reportPositionedFailure(
@@ -378,9 +484,12 @@ pub const Forwarder = struct {
         operation: []const u8,
         guest_fd: u64,
         host_fd: ?c_int,
+        guest_buffer: u64,
+        host_buffer: ?u64,
         offset: i64,
         requested: u64,
         err: std.c.E,
+        failure_stage: []const u8,
     ) void {
         _ = self;
         var file_size: i64 = -1;
@@ -391,17 +500,22 @@ pub const Forwarder = struct {
             if (host_is_live) file_size = @intCast(status.size);
         }
         machoCapturePrint(
-            "macho-processor: fs {s} FAILED: guest_fd={d} host_fd={any} offset={d} requested={d} errno={s} descriptor_live={} file_size={d}; {s}\n",
+            "macho-processor: fs {s} FAILED: stage={s} guest_fd={d} host_fd={any} guest_buffer=0x{x} host_buffer={any} offset={d} requested={d} errno={s} descriptor_live={} file_size={d}; {s}\n",
             .{
                 operation,
+                failure_stage,
                 guest_fd,
                 host_fd,
+                guest_buffer,
+                host_buffer,
                 offset,
                 requested,
                 @tagName(err),
                 host_is_live,
                 file_size,
-                if (err == .BADF)
+                if (std.mem.eql(u8, failure_stage, "guest_buffer_translation"))
+                    "the descriptor and file offset are valid, but the requested guest range is not writable/readable as one page-bounded segment; inspect the exact guest buffer mapping and permission"
+                else if (err == .BADF)
                     "the virtual descriptor is missing or its host descriptor was closed; inspect fdopen/fclose/close ownership and generation"
                 else
                     "the host rejected positioned I/O; this is an I/O failure, not an end-of-file result",
@@ -1183,7 +1297,7 @@ pub const Forwarder = struct {
 
     pub fn logSummary(self: *const Forwarder) void {
         machoCapturePrint(
-            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} shm_open={d} shm_fallback={d} ftruncate={d} access={d} pread(short/failed)={d}/{d} pwrite_failed={d} errno_updates={d} last_errno={d}\n",
+            "macho-processor: fs io forwarding: open={d} read={d} write={d} close={d} seek={d} stat={d} readdir={d} mmap={d} shm_open={d} shm_fallback={d} ftruncate={d} access={d} pread(short/failed/segmented)={d}/{d}/{d} pwrite(failed/segmented)={d}/{d} errno_updates={d} last_errno={d}\n",
             .{
                 self.open_count,
                 self.read_count,
@@ -1199,7 +1313,9 @@ pub const Forwarder = struct {
                 self.access_count,
                 self.short_positioned_reads,
                 self.failed_positioned_reads,
+                self.segmented_positioned_reads,
                 self.failed_positioned_writes,
+                self.segmented_positioned_writes,
                 self.errno_updates,
                 self.last_errno,
             },
@@ -1300,6 +1416,57 @@ test "positioned IO reports missing virtual descriptors as EBADF" {
     state.guest_errno = 0;
     try std.testing.expectEqual(@as(i64, -1), forwarder.pwrite(&state));
     try std.testing.expectEqual(@as(c_int, @intFromEnum(std.c.E.BADF)), state.guest_errno);
+}
+
+test "positioned IO crosses non-contiguous guest page mappings" {
+    const TestState = struct {
+        regs: struct { rdi: u64 = 0, rsi: u64 = 257, rdx: u64 = 8192, rcx: u64 = 0 } = .{},
+        memory: [9000]u8 = [_]u8{0} ** 9000,
+        guest_errno: c_int = 0,
+
+        fn setGuestErrno(self: *@This(), value: c_int) void {
+            self.guest_errno = value;
+        }
+
+        fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+            // Model sparse memory where each guest page has independent host
+            // backing. Every page is valid, but no cross-page host slice is.
+            if (length > guestIoChunkLength(address, length)) return null;
+            const start = std.math.cast(usize, address) orelse return null;
+            const len = std.math.cast(usize, length) orelse return null;
+            const end = std.math.add(usize, start, len) catch return null;
+            if (end > self.memory.len) return null;
+            return self.memory[start..end];
+        }
+
+        fn guestMemoryConst(self: *@This(), address: u64, length: u64) ?[]const u8 {
+            return self.guestMemory(address, length);
+        }
+    };
+
+    var forwarder = Forwarder.init(std.testing.allocator);
+    defer forwarder.deinit();
+    const host_fd = forwarder.createTempBackedSharedMemory("positioned-io-segments") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.ftruncate(host_fd, 8192));
+    const guest_fd = forwarder.fd_manager.register(host_fd, .file) orelse return error.TestUnexpectedResult;
+
+    var state = TestState{};
+    state.regs.rdi = guest_fd;
+    for (state.memory[state.regs.rsi .. state.regs.rsi + state.regs.rdx], 0..) |*byte, index| {
+        byte.* = @truncate(index *% 37);
+    }
+    try std.testing.expectEqual(@as(i64, 8192), forwarder.pwrite(&state));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.segmented_positioned_writes);
+
+    var host_copy: [8192]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, host_copy.len), std.c.pread(host_fd, &host_copy, host_copy.len, 0));
+    try std.testing.expectEqualSlices(u8, state.memory[state.regs.rsi .. state.regs.rsi + state.regs.rdx], &host_copy);
+
+    @memset(state.memory[state.regs.rsi .. state.regs.rsi + state.regs.rdx], 0);
+    try std.testing.expectEqual(@as(i64, 8192), forwarder.pread(&state));
+    try std.testing.expectEqual(@as(u64, 1), forwarder.segmented_positioned_reads);
+    try std.testing.expectEqualSlices(u8, &host_copy, state.memory[state.regs.rsi .. state.regs.rsi + state.regs.rdx]);
+    try std.testing.expectEqual(@as(c_int, 0), state.guest_errno);
 }
 
 fn isMacOSMetadataEntry(name: []const u8) bool {
