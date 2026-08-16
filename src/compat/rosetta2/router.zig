@@ -229,10 +229,17 @@ fn fallbackAfterRosetteMachOFailure(
     if (decision.backend != .rosette_macho) return null;
     if (!isMachOProcessorFailureStatus(exit_code)) {
         if (signalNameFromExitCode(exit_code)) |signal_name| {
-            std.debug.print(
-                "rosette-router: Rosette Mach-O backend ended with signal-style status={d} ({s}); this may be a host backing/runtime fault, not an authoritative guest exit; Apple fallback suppressed by policy\n",
-                .{ exit_code, signal_name },
-            );
+            if (isLifecycleSignalExitCode(exit_code)) {
+                std.debug.print(
+                    "rosette-router: Rosette Mach-O backend received host lifecycle {s} (status={d}); this is an external/user/supervisor stop, not a guest, decoder, memory, control-flow, or GPU crash; Apple fallback suppressed by policy\n",
+                    .{ signal_name, exit_code },
+                );
+            } else {
+                std.debug.print(
+                    "rosette-router: Rosette Mach-O backend ended with fatal signal status={d} ({s}); inspect the backend's terminal diagnostics; this is not an authoritative guest exit and Apple fallback is suppressed by policy\n",
+                    .{ exit_code, signal_name },
+                );
+            }
         } else {
             std.debug.print(
                 "rosette-router: authoritative guest exit from Rosette Mach-O backend: status={d}; Apple fallback suppressed\n",
@@ -276,10 +283,28 @@ fn signalNameFromExitCode(exit_code: u8) ?[]const u8 {
     };
 }
 
+fn isLifecycleSignalExitCode(exit_code: u8) bool {
+    if (exit_code < 128) return false;
+    return switch (exit_code - 128) {
+        1, 2, 3, 15 => true, // SIGHUP, SIGINT, SIGQUIT, SIGTERM.
+        else => false,
+    };
+}
+
 test "signal-style Mach-O backend exits identify SIGBUS" {
     try std.testing.expectEqualStrings("SIGBUS", signalNameFromExitCode(138).?);
     try std.testing.expectEqualStrings("SIGILL", signalNameFromExitCode(132).?);
     try std.testing.expect(signalNameFromExitCode(127) == null);
+}
+
+test "router separates lifecycle stops from fatal signals" {
+    try std.testing.expect(isLifecycleSignalExitCode(129));
+    try std.testing.expect(isLifecycleSignalExitCode(130));
+    try std.testing.expect(isLifecycleSignalExitCode(131));
+    try std.testing.expect(isLifecycleSignalExitCode(143));
+    try std.testing.expect(!isLifecycleSignalExitCode(137));
+    try std.testing.expect(!isLifecycleSignalExitCode(139));
+    try std.testing.expect(!isLifecycleSignalExitCode(0));
 }
 
 fn allowsFallbackAfterRosetteFailure(policy: Policy) bool {
