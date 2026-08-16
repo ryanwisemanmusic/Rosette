@@ -1049,6 +1049,7 @@ pub const Forwarder = struct {
                         .producer = descriptor.producer,
                         .guest_swap_observed = descriptor.guest_swap_observed,
                     } });
+                    self.observeNativePresenterReport(report);
                     self.frame_inbox.release(report.presented and report.source_copied);
                     if (report.presented and report.source_copied) {
                         const frames = self.native_presenter.ledger.host_frames_presented +
@@ -1110,6 +1111,7 @@ pub const Forwarder = struct {
             const report = self.native_presenter.present(.{
                 .clear = .{ 0.05, 0.08 + phase * 0.3, 0.16 + (1.0 - phase) * 0.4, 1.0 },
             });
+            self.observeNativePresenterReport(report);
             const frames = self.native_presenter.ledger.diagnostic_frames_presented;
             if (frames <= 8 or frames % 120 == 0 or !report.presented) {
                 machoCapturePrint(
@@ -1144,6 +1146,22 @@ pub const Forwarder = struct {
             .present_accepted = presented,
         });
         return presented;
+    }
+
+    /// Fold real native presenter progress back into the backend-neutral
+    /// handshake. `ready` is established before the first queue submission, so
+    /// the initial handshake correctly lacks presentation. Once the driver has
+    /// actually accepted a present request, leaving that early snapshot in
+    /// place makes later diagnostics claim the proven path is still missing.
+    /// This updates host-boundary facts only; it never marks a guest swap,
+    /// publishes a ring pointer, or changes frame provenance.
+    fn observeNativePresenterReport(self: *Forwarder, report: anytype) void {
+        self.gpu_runtime.observeBackendProgress(report.submitted, report.presented);
+        const live_boundary = self.native_presenter.boundary();
+        const advertised = self.gpu_runtime.adapter.description.provided;
+        if (live_boundary.presentation_native and !advertised.contains(.presentation)) {
+            self.negotiateRosetteGpuBoundary("native_presentation_observed");
+        }
     }
 
     fn negotiateRosetteGpuBoundary(self: *Forwarder, reason: []const u8) void {
@@ -1724,6 +1742,7 @@ pub const Forwarder = struct {
             .producer = .xenia_host,
             .guest_swap_observed = guest_swap_observed,
         } });
+        self.observeNativePresenterReport(report);
         return report.classification;
     }
 
