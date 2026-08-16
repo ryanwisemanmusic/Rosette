@@ -86,6 +86,7 @@ const syscalls = @import("process_core").syscalls;
 const native_window = @import("process_core").native_window;
 const scheduling = @import("process_core").scheduling;
 const guest_log = @import("process_core").guest_log;
+const host_termination = @import("process_core").host_termination;
 const guest_fs = @import("guest_fs.zig");
 const proc_diag = @import("process_core").diagnostics;
 const thunk_handler = @import("macho_core").thunk_handler;
@@ -238,6 +239,7 @@ const TOML_CODEPOINT_COUNT_OFFSET = constants.TOML_CODEPOINT_COUNT_OFFSET;
 const TOML_UTF8_READER_MIN_SIZE = constants.TOML_UTF8_READER_MIN_SIZE;
 const PROGRESS_REPORT_INTERVAL = constants.PROGRESS_REPORT_INTERVAL;
 const HEARTBEAT_INTERVAL = constants.HEARTBEAT_INTERVAL;
+const CONCISE_PROGRESS_INTERVAL = constants.CONCISE_PROGRESS_INTERVAL;
 
 const types = @import("macho_core").types;
 const TomlAsciiBlock = types.TomlAsciiBlock;
@@ -372,6 +374,7 @@ pub const MachOState = struct {
     exit_code: u64 = 0,
     faulted: bool = false,
     termination_reason: u8 = @intFromEnum(exit_diagnostics.TerminationReason.unknown),
+    host_termination_signal: u8 = 0,
     data: []const u8,
     segments: []const MachSegment,
     metadata: macho_metadata.Metadata,
@@ -473,6 +476,14 @@ pub const MachOState = struct {
     opaque_destructor_quarantines: u64 = 0,
     cooperative_starvation_warnings: u64 = 0,
     last_cooperative_starvation_step: u64 = 0,
+    // A context's suspended_step predates the wait notification that may make
+    // it runnable, so it is only an upper bound on runnable age. Require the
+    // same eligible context at consecutive heartbeats before calling the state
+    // starvation; these fields track that directly observed interval.
+    runnable_candidate_handle: u64 = 0,
+    runnable_candidate_suspended_step: u64 = 0,
+    runnable_candidate_first_observed_step: u64 = 0,
+    runnable_candidate_observations: u64 = 0,
     ui_callback_retained_quanta: u64 = 0,
     cooperative_quantum_steps: u64 = 0,
     // P0-1: throttled cooperative-scheduler queue scans (see
@@ -513,6 +524,28 @@ pub const MachOState = struct {
     idle_completed: u64 = 0,
     idle_removed: u64 = 0,
     idle_wakeups: u64 = 0,
+    /// Boundaries that elected idle work, switched context, and started no
+    /// callback. A non-zero count means the chooser and the dispatch rule
+    /// disagreed about whether the queue could run.
+    idle_wakes_without_dispatch: u64 = 0,
+    /// Idle dispatches refused because another synthetic callback still owned
+    /// the shared UI callback stack.
+    idle_stack_owner_deferrals: u64 = 0,
+    /// `rsp` at which the current synthetic callback was entered, and the
+    /// handle that entered it. Kept so a bad return inside a callback can be
+    /// attributed to the shared callback stack instead of reported as an
+    /// unexplained invalid target.
+    synthetic_stack_entry_rsp: u64 = 0,
+    synthetic_stack_entry_handle: u64 = 0,
+    synthetic_stack_dispatches: u64 = 0,
+    /// Identity of the context that faulted, fixed at the first fault reporter
+    /// and read by every later block of the crash report. Without it each block
+    /// re-read `active_guest_thread` at its own moment and the report could name
+    /// two different threads for one fault.
+    fault_context_pinned: bool = false,
+    fault_context_thread: u64 = 0,
+    fault_context_step: u64 = 0,
+    fault_context_history_epoch: u64 = 0,
     idle_dispatch_failures: u64 = 0,
     idle_starvation_warnings: u64 = 0,
     active_idle_source: u64 = 0,
@@ -772,6 +805,10 @@ pub const MachOState = struct {
     // register set a billion steps earlier. Heap-backed, because per-thread
     // capacity times slot count is far too large to carry by value.
     execution_history: ExecutionHistory,
+    /// Generated-only history is discontinuous while native Mach-O code runs.
+    /// The epoch makes that omitted interval explicit to post-fault walkers.
+    execution_history_epoch: u64 = 0,
+    execution_history_filter_active: bool = false,
     trace_range_start: ?u64 = null,
     trace_range_end: ?u64 = null,
     last_trace_rip: u64 = 0,
@@ -2799,6 +2836,10 @@ pub const MachOState = struct {
         return signal_handling.signalIsActive(self, signal);
     }
 
+    pub fn resetActiveGuestSignalState(self: *MachOState) void {
+        scheduling.resetActiveGuestSignalState(self);
+    }
+
     pub fn ensureGuestSignalFrameStorage(self: *MachOState, frame: *GuestSignalFrame) bool {
         return signal_handling.ensureGuestSignalFrameStorage(self, frame);
     }
@@ -3033,6 +3074,7 @@ pub const MachOState = struct {
     fn recordTrace(self: *MachOState, decoded: DecodedInsn) void {
         self.execution_history.record(self.active_guest_thread, .{
             .thread_handle = self.active_guest_thread,
+            .history_epoch = self.execution_history_epoch,
             .rip = self.regs.rip,
             .op = decoded.op,
             .len = decoded.len,
@@ -4080,13 +4122,24 @@ pub const MachOState = struct {
         // and deep where it is consulted. Two range compares, no page lookup.
         switch (self.execution_history.policy) {
             .disabled => {},
-            .all => self.recordTrace(decoded),
+            .all => {
+                self.execution_history_filter_active = false;
+                self.recordTrace(decoded);
+            },
             .generated_code_only => {
                 const in_host_image = self.regs.rip >= self.executable_min and
                     self.regs.rip < self.executable_max;
                 if (in_host_image) {
+                    // One increment per contiguous omitted native interval,
+                    // not per instruction. Besides keeping the counter stable,
+                    // this makes the hot host-code path a predictable branch.
+                    if (!self.execution_history_filter_active) {
+                        self.execution_history_epoch +|= 1;
+                        self.execution_history_filter_active = true;
+                    }
                     self.execution_history.noteFiltered();
                 } else {
+                    self.execution_history_filter_active = false;
                     self.recordTrace(decoded);
                     self.seedProvenanceWatch(decoded);
                     self.noteGuestFieldAccess(decoded);
@@ -4222,6 +4275,21 @@ pub const MachOState = struct {
         return scheduling.isSyntheticCallbackHandle(self, handle);
     }
 
+    // GTK idle sources and SDL audio callbacks share one stack — the
+    // cooperative UI context's. Entering a second one while the first is only
+    // suspended writes over its live frames.
+    pub fn syntheticCallbackStackBusy(self: *const MachOState) bool {
+        return scheduling.syntheticCallbackStackBusy(self);
+    }
+
+    pub fn syntheticCallbackStackOwner(self: *const MachOState) u64 {
+        return scheduling.syntheticCallbackStackOwner(self);
+    }
+
+    pub fn noteSyntheticStackEntry(self: *MachOState, handle: u64) void {
+        scheduling.noteSyntheticStackEntry(self, handle);
+    }
+
     pub fn isIdleCallbackHandle(self: *const MachOState, handle: u64) bool {
         return scheduling.isIdleCallbackHandle(self, handle);
     }
@@ -4243,6 +4311,10 @@ pub const MachOState = struct {
 
     pub fn contextContainsHandle(self: *const MachOState, handle: u64) bool {
         return scheduling.contextContainsHandle(self, handle);
+    }
+
+    pub fn logAudioCallbackSchedulerState(self: *const MachOState) void {
+        scheduling.logAudioCallbackSchedulerState(self);
     }
 
     pub fn runnableSuspendedSnapshot(self: *const MachOState) RunnableSuspendedSnapshot {
@@ -4298,8 +4370,8 @@ pub const MachOState = struct {
     }
 
     // F1 (throughput audit): the three periodic report bodies below used to be
-    // inlined directly into `run`'s loop body. Each fires once per 500K, 25M or
-    // 100M steps; together they compiled to ~96 KB of the loop's 99 KB, and
+    // inlined directly into `run`'s loop body. Each fires once per 500K, 100M
+    // or 250M steps; together they compiled to ~96 KB of the loop's 99 KB, and
     // that code shares instruction-cache lines with the ~60 instructions that
     // actually run every step. The interpreter's hot closure measured 189 KB
     // against a 128-192 KB L1I, so the loop could not stay resident.
@@ -4509,13 +4581,14 @@ pub const MachOState = struct {
         // once per iteration and fires (then resets) at exactly the step the
         // old modulo would have matched — including the step-0 heartbeat
         // (`0 % HEARTBEAT_INTERVAL == 0` fires on the first iteration) and
-        // excluding 0 for the `steps != 0`-guarded reports. The concise 100M
+        // excluding 0 for the `steps != 0`-guarded reports. The concise
         // progress report instead uses a boundary comparison (steps >= next
-        // boundary) so checkpoints land on exact multiples of 100,000,000 — a
-        // decrement-then-fire counter would fire at steps == N*100M - 1.
+        // boundary) so checkpoints land on exact multiples of
+        // CONCISE_PROGRESS_INTERVAL — a decrement-then-fire counter would fire
+        // at steps == N*interval - 1.
         var next_progress_report: u64 = PROGRESS_REPORT_INTERVAL;
         var next_heartbeat: u64 = 0;
-        var next_concise_report: u64 = 100_000_000;
+        var next_concise_report: u64 = CONCISE_PROGRESS_INTERVAL;
         var next_memory_init_report: u64 = 1_000_000;
         machoCapturePrint(
             "macho-processor: CMPXCHG contract active — 0F B0 executes at byte width, flags use ACC-DEST, and assertion-triggered CAS repair paths are absent.\n",
@@ -4551,6 +4624,7 @@ pub const MachOState = struct {
             if (next_progress_report == 0) {
                 next_progress_report = PROGRESS_REPORT_INTERVAL;
                 self.reportProgressCheckpoint(steps);
+                if (self.consumeHostTerminationRequest()) break;
             }
             next_heartbeat -|= 1;
             if (next_heartbeat == 0) {
@@ -4558,7 +4632,7 @@ pub const MachOState = struct {
                 self.reportHeartbeat(steps);
             }
             if (self.concise_output and steps >= next_concise_report) {
-                next_concise_report +%= 100_000_000;
+                next_concise_report +%= CONCISE_PROGRESS_INTERVAL;
                 self.reportConciseProgress(steps);
             }
             if (!self.step()) break;
@@ -4614,7 +4688,9 @@ pub const MachOState = struct {
             );
             self.termination_reason = @intFromEnum(normalized_reason);
         }
-        if (self.terminated and (self.exit_code != 0 or self.unresolved_import_count != 0)) {
+        if (self.termination_reason == @intFromEnum(exit_diagnostics.TerminationReason.host_termination_signal)) {
+            self.logHostTerminationSnapshot(steps);
+        } else if (self.terminated and (self.exit_code != 0 or self.unresolved_import_count != 0)) {
             self.logExitDiagnostics();
         }
         self.jit_log.emit(.{
@@ -4638,6 +4714,55 @@ pub const MachOState = struct {
             .exit_code = @as(i32, @intCast(self.exit_code & 0xFFFFFFFF)),
             .reason = @tagName(recorded_reason),
         });
+    }
+
+    /// Converts the async-signal-safe host request into normal interpreter
+    /// state. Called only at existing 500K-step checkpoints, avoiding another
+    /// load/branch in the per-instruction hot path.
+    pub fn consumeHostTerminationRequest(self: *MachOState) bool {
+        const request = host_termination.take() orelse return false;
+        const supervisor = host_termination.supervisorContext();
+        self.host_termination_signal = request.number;
+        self.exit_code = request.exitCode();
+        self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.host_termination_signal);
+        self.terminated = true;
+        self.faulted = false;
+        machoCapturePrint(
+            "macho-processor: HOST TERMINATION REQUEST signal={d}({s}) owner={s} configured_timeout_seconds={d} step={d} rip=0x{x}; guest execution was live and no decoder, memory, control-flow, or GPU fault caused this stop\n",
+            .{
+                request.number,
+                request.name(),
+                if (supervisor.name.len != 0) supervisor.name else "unidentified host/user",
+                supervisor.timeout_seconds,
+                self.executed_steps,
+                self.regs.rip,
+            },
+        );
+        return true;
+    }
+
+    noinline fn logHostTerminationSnapshot(self: *MachOState, steps: u64) void {
+        const request = host_termination.Request{ .number = self.host_termination_signal };
+        const supervisor = host_termination.supervisorContext();
+        machoCapturePrint(
+            "macho-processor: HOST TERMINATION SNAPSHOT signal={d}({s}) owner={s} configured_timeout_seconds={d} step={d} phase={s} rip=0x{x} active_thread=0x{x} blocked_threads={d} suspended_contexts={d} faulted={} terminal_memory_failure={} terminal_control_transfer={}; classification=INTENTIONAL_OR_EXTERNAL_STOP_NOT_CRASH\n",
+            .{
+                request.number,
+                request.name(),
+                if (supervisor.name.len != 0) supervisor.name else "unidentified host/user",
+                supervisor.timeout_seconds,
+                steps,
+                @tagName(self.startup.phase),
+                self.regs.rip,
+                self.active_guest_thread,
+                self.pthreads.blocked_threads,
+                self.suspended_guest_thread_count,
+                self.faulted,
+                self.terminal_memory_failure != null,
+                self.terminal_control_transfer != null,
+            },
+        );
+        macho_log.checkPointSync();
     }
 
     fn logDecodeCacheSummary(self: *const MachOState) void {
@@ -5381,6 +5506,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
 
     var state = try MachOState.init(io, allocator, slice);
     defer state.deinit();
+    var host_termination_scope = host_termination.Scope.install();
+    defer host_termination_scope.deinit();
     state.concise_output = output.concise;
     state.diagnostic_output_fd = output.diagnosticsFd();
     state.summary_output_fd = output.summaryFd();
@@ -5545,6 +5672,15 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     const initializers_ok = state.runInitializers();
     state.initializer_resolver.logSummary();
     if (!initializers_ok) {
+        if (state.host_termination_signal != 0) {
+            state.logHostTerminationSnapshot(state.executed_steps);
+            machoCapturePrint(
+                "macho-processor: graceful host-termination diagnostics complete during initializer phase; returning signal-compatible status={d}\n",
+                .{state.exit_code},
+            );
+            macho_log.checkPointSync();
+            return state.exit_code;
+        }
         state.import_resolver.logSummary();
         state.foreign_objects.logSummary();
         state.sdl.logSummary();
@@ -5623,6 +5759,20 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             state.suspended_guest_thread_count,
         },
     );
+    if (state.host_termination_signal != 0) {
+        // A host-requested stop is precisely when the live scheduler and
+        // callback ownership state is most valuable. Do not bypass these
+        // compact summaries merely because the guest did not return normally.
+        state.sdl.logSummary();
+        state.pthreads.logSummary();
+        state.logCooperativeSchedulerSummary();
+        machoCapturePrint(
+            "macho-processor: graceful host-termination diagnostics complete; returning signal-compatible status={d} without classifying the live guest RIP as a crash\n",
+            .{state.exit_code},
+        );
+        macho_log.checkPointSync();
+        return state.exit_code;
+    }
     state.logDecodeCacheSummary();
     state.logPerformanceAccelerationSummary();
     state.import_resolver.logSummary();
@@ -5922,6 +6072,106 @@ test "Mach-O PAGEZERO is excluded from guest memory" {
     try std.testing.expectEqual(@as(?u64, 0x4000), mappedOffset(0, 0x2000_0000, 0x4000, 0x4000));
     try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0xffff_ffff_ffff_ffe8));
     try std.testing.expectEqual(@as(?u64, null), mappedOffset(0, 0x2000_0000, 0x4000, 0x800));
+}
+
+test "the faulting context is pinned once and survives later scheduling" {
+    const near_null_causality = @import("process_core").near_null_causality;
+    var state = struct {
+        active_guest_thread: u64 = 0,
+        executed_steps: u64 = 0,
+        fault_context_pinned: bool = false,
+        fault_context_thread: u64 = 0,
+        fault_context_step: u64 = 0,
+        execution_history_epoch: u64 = 0,
+        fault_context_history_epoch: u64 = 0,
+    }{};
+
+    // Before any fault, reporters see the live context.
+    state.active_guest_thread = 0x7FFF_20E0;
+    state.executed_steps = 100;
+    state.execution_history_epoch = 4;
+    try std.testing.expectEqual(@as(u64, 0x7FFF_20E0), near_null_causality.faultContextThread(&state));
+
+    // The fault fixes the identity.
+    near_null_causality.pinFaultContext(&state);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_20E0), state.fault_context_thread);
+    try std.testing.expectEqual(@as(u64, 100), state.fault_context_step);
+    try std.testing.expectEqual(@as(u64, 4), state.fault_context_history_epoch);
+
+    // Teardown may run the cooperative scheduler, moving the active context.
+    // Every later block must still report the thread that actually faulted —
+    // this disagreement is what let one crash report name two threads for one
+    // fault, and made the causality chain walk a tape that was not the
+    // faulting thread's.
+    state.active_guest_thread = 0x7FFF_2080;
+    state.executed_steps = 4_755_591_826;
+    state.execution_history_epoch = 9;
+    near_null_causality.pinFaultContext(&state);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_20E0), near_null_causality.faultContextThread(&state));
+    try std.testing.expectEqual(@as(u64, 0x7FFF_20E0), state.fault_context_thread);
+    try std.testing.expectEqual(@as(u64, 100), state.fault_context_step);
+    try std.testing.expectEqual(@as(u64, 4), state.fault_context_history_epoch);
+
+    // A handled guest fault closes the transaction. The next fault must pin
+    // its own context and continuity epoch rather than inherit this one.
+    near_null_causality.clearFaultContext(&state);
+    try std.testing.expect(!state.fault_context_pinned);
+    state.active_guest_thread = 0x7FFF_2080;
+    state.executed_steps = 200;
+    state.execution_history_epoch = 9;
+    near_null_causality.pinFaultContext(&state);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2080), state.fault_context_thread);
+    try std.testing.expectEqual(@as(u64, 200), state.fault_context_step);
+    try std.testing.expectEqual(@as(u64, 9), state.fault_context_history_epoch);
+}
+
+test "SDL audio callback stack is independent from the shared UI stack" {
+    const FakeSdl = struct {
+        in_flight: bool = false,
+        handle: u64 = 0,
+        pub fn audioCallbackInFlight(self: *const @This()) bool {
+            return self.in_flight;
+        }
+        pub fn audioCallbackHandle(self: *const @This()) u64 {
+            return if (self.in_flight) self.handle else 0;
+        }
+    };
+    const FakeState = struct {
+        active_idle_source: u64 = 0,
+        sdl: FakeSdl = .{},
+    };
+
+    var state = FakeState{};
+    try std.testing.expect(!scheduling.syntheticCallbackStackBusy(&state));
+    try std.testing.expectEqual(@as(u64, 0), scheduling.syntheticCallbackStackOwner(&state));
+
+    // A GTK idle source holds the stack, and keeps holding it while suspended:
+    // `active_idle_source` is not cleared by a suspension, only by the return.
+    state.active_idle_source = 20;
+    try std.testing.expect(scheduling.syntheticCallbackStackBusy(&state));
+    try std.testing.expectEqual(
+        types.IDLE_CALLBACK_HANDLE_BASE + 20,
+        scheduling.syntheticCallbackStackOwner(&state),
+    );
+
+    // SDL runs audio callbacks on another thread. Rosette mirrors that with a
+    // dedicated guest stack, so an in-flight audio callback must not claim or
+    // pin the GTK stack.
+    state.active_idle_source = 0;
+    state.sdl = .{ .in_flight = true, .handle = 0xFFFF_F910_0000_0000 };
+    try std.testing.expect(!scheduling.syntheticCallbackStackBusy(&state));
+    try std.testing.expectEqual(@as(u64, 0), scheduling.syntheticCallbackStackOwner(&state));
+
+    // The scheduler must also stop electing idle work it cannot dispatch,
+    // otherwise the refusal turns into an unbounded rotation.
+    try std.testing.expectEqual(scheduler.CooperativeWork.suspended_thread, scheduler.chooseCooperativeWork(.{
+        .pending_idle = 1,
+        .idle_dispatch_blocked = true,
+        .suspended_threads = 1,
+    }));
+
+    state.sdl = .{};
+    try std.testing.expect(!scheduling.syntheticCallbackStackBusy(&state));
 }
 
 test "cooperative idle wake preempts a running worker after all pthreads have started" {

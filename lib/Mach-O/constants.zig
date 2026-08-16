@@ -34,7 +34,11 @@ pub const MEMORY_TRACE_BUFFER_LEN: usize = 64;
 /// production runs where ROSETTE_MACHO_MEMORY_TRACE is not set.
 pub const ENDIAN_EVIDENCE_BUFFER_LEN: usize = 16;
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
-pub const HEARTBEAT_INTERVAL: u64 = 25_000_000;
+pub const HEARTBEAT_INTERVAL: u64 = 100_000_000;
+/// Cadence of the concise "Translated instructions" line. Kept separate from
+/// HEARTBEAT_INTERVAL: that line is a coarse liveness signal for someone
+/// watching a long run, not a per-phase performance sample.
+pub const CONCISE_PROGRESS_INTERVAL: u64 = 250_000_000;
 pub const UNSUPPORTED_RUNTIME_EXIT_CODE: u64 = 125;
 pub const GUEST_FILE_BASE: u64 = 0xFFFF_FF10_0000_0000;
 pub const GUEST_FILE_MAX: usize = 32;

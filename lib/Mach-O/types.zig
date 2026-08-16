@@ -47,6 +47,11 @@ pub const MachSegment = macho.MachSegment;
 
 pub const TraceEntry = struct {
     thread_handle: u64 = 0,
+    /// Generation of the retained-history continuity window. Generated-code
+    /// history deliberately omits native Mach-O instructions; this value
+    /// changes whenever execution enters such an omitted region so a causal
+    /// walk cannot pretend the entries on either side were adjacent.
+    history_epoch: u64 = 0,
     rip: u64 = 0,
     op: Op = .invalid,
     len: u8 = 0,
@@ -337,7 +342,9 @@ test "decode-cache page set answers per page and never under-reports a noted pag
 }
 
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
-pub const HEARTBEAT_INTERVAL: u64 = 25_000_000;
+// Unreferenced duplicate of `constants.HEARTBEAT_INTERVAL`, which is the one
+// the run loop reads. Kept in step so it cannot be mistaken for the live value.
+pub const HEARTBEAT_INTERVAL: u64 = 100_000_000;
 
 /// Previous-heartbeat readings of the acceleration counters, so the heartbeat
 /// can report **deltas** rather than run-cumulative totals.
@@ -547,6 +554,11 @@ pub const CooperativeUiContext = struct {
     xmm: [16][16]u8,
     ymm_hi: [16][16]u8,
     x87: X87State,
+    /// Signal handlers are guest-thread execution state, just like the
+    /// register file. Keeping them in the UI snapshot prevents a worker that
+    /// is parked inside a handler from making the signal look recursively
+    /// active when the cooperative scheduler runs another guest thread.
+    signal_state: GuestSignalState = .{},
     thread: u64 = 0,
     caller: u64 = 0,
 };
@@ -621,6 +633,15 @@ pub const IdleDispatchBlock = enum {
     no_active_guest_thread,
     callback_already_running,
     suspended_queue_full,
+    /// Another synthetic callback still owns the shared UI callback stack.
+    /// Entering a second one would write its frames over the first one's live
+    /// frames — see `syntheticCallbackStackBusy`.
+    synthetic_callback_stack_busy,
+    /// A completed handoff still owes its scheduling thread a resume. The
+    /// queue is non-empty and no callback is running, so every other field
+    /// reads "ready" — without this variant the starvation diagnostic reports
+    /// a queue that nothing is blocking while dispatch keeps refusing.
+    completion_handoff_pending,
 };
 
 pub const IdleQueueSnapshot = struct {
@@ -668,6 +689,9 @@ pub const SuspendedGuestThread = struct {
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     x87: X87State = .{},
+    /// POSIX signal nesting belongs to this guest thread, not to the one host
+    /// interpreter thread on which all cooperative contexts happen to run.
+    signal_state: GuestSignalState = .{},
 };
 
 pub const GuestSignalAction = struct {
@@ -683,6 +707,7 @@ pub const timerQueueStateName = guest_assertion_recovery.timerQueueStateName;
 pub const GuestSignalFrame = struct {
     signal: u8 = 0,
     instruction_len: u8 = 0,
+    owner_thread: u64 = 0,
     fault_rip: u64 = 0,
     fault_address: u64 = 0,
     fault_access: ?GuestAccess = null,
@@ -693,6 +718,46 @@ pub const GuestSignalFrame = struct {
     ucontext: u64 = 0,
     assertion_class: GuestAssertionClass = .none,
 };
+
+/// The complete signal nesting state of one cooperatively scheduled guest
+/// thread. This is a value snapshot so moving a context between the active
+/// registers and the suspended queue cannot share or alias another thread's
+/// handler stack.
+pub const GuestSignalState = struct {
+    frames: [constants.GUEST_SIGNAL_FRAME_DEPTH]GuestSignalFrame =
+        [_]GuestSignalFrame{.{}} ** constants.GUEST_SIGNAL_FRAME_DEPTH,
+    count: usize = 0,
+
+    pub fn isActive(self: *const GuestSignalState, owner_thread: u64, signal: u8) bool {
+        const bounded_count = @min(self.count, self.frames.len);
+        for (self.frames[0..bounded_count]) |frame| {
+            if (frame.owner_thread == owner_thread and frame.signal == signal) return true;
+        }
+        return false;
+    }
+};
+
+test "guest signal state is isolated by cooperative thread" {
+    var first = GuestSignalState{};
+    first.frames[0] = .{ .signal = 11, .owner_thread = 0x100 };
+    first.count = 1;
+
+    var second = GuestSignalState{};
+    second.frames[0] = .{ .signal = 4, .owner_thread = 0x200 };
+    second.count = 1;
+
+    try std.testing.expect(first.isActive(0x100, 11));
+    try std.testing.expect(!first.isActive(0x200, 11));
+    try std.testing.expect(!second.isActive(0x100, 11));
+
+    // A scheduler snapshot is a value copy. Mutating the active copy must not
+    // retire or overwrite the parked thread's signal frame.
+    var restored = first;
+    restored.frames[0] = .{};
+    restored.count = 0;
+    try std.testing.expect(first.isActive(0x100, 11));
+    try std.testing.expect(!restored.isActive(0x100, 11));
+}
 
 pub const ProfileAccountStage = enum {
     idle,
