@@ -13,6 +13,13 @@ pub const Inputs = struct {
     callback_inflight: bool = false,
     /// The in-flight callback is the context executing right now.
     idle_callback_running: bool = false,
+    /// Dispatch would be refused even though the queue is non-empty and no
+    /// callback is in flight (for example while a completed handoff still owes
+    /// its scheduling thread a resume). Choosing `gtk_idle` here yields without
+    /// starting a callback, and because the queue is unchanged the same choice
+    /// repeats at every boundary — a rotation that makes no progress and
+    /// crowds out the ordinary thread quantum.
+    idle_dispatch_blocked: bool = false,
     deferred_threads: u64 = 0,
     suspended_threads: usize = 0,
     /// Estimated work duration for each category (steps). 0 = unknown.
@@ -34,7 +41,7 @@ pub fn choose(inputs: Inputs) Work {
     if (inputs.idle_callback_running) return .none;
 
     const work_items: [3]struct { Work, bool, u64 } = .{
-        .{ .gtk_idle, inputs.pending_idle != 0 and !inputs.callback_inflight, inputs.estimated_gtk_idle_duration },
+        .{ .gtk_idle, inputs.pending_idle != 0 and !inputs.callback_inflight and !inputs.idle_dispatch_blocked, inputs.estimated_gtk_idle_duration },
         .{ .deferred_thread, inputs.deferred_threads != 0, inputs.estimated_deferred_duration },
         .{ .suspended_thread, inputs.suspended_threads != 0, inputs.estimated_suspended_duration },
     };
@@ -63,6 +70,24 @@ test "active UI callback remains non-preemptible" {
         .deferred_threads = 2,
         .suspended_threads = 4,
     }));
+}
+
+test "a blocked idle queue rotates threads instead of re-choosing idle work" {
+    // Same inputs, with and without the dispatch block: the queue is pending
+    // and nothing is in flight, so only the block distinguishes them.
+    try std.testing.expectEqual(Work.gtk_idle, choose(.{ .pending_idle = 2, .suspended_threads = 2 }));
+    try std.testing.expectEqual(Work.suspended_thread, choose(.{
+        .pending_idle = 2,
+        .idle_dispatch_blocked = true,
+        .suspended_threads = 2,
+    }));
+    try std.testing.expectEqual(Work.deferred_thread, choose(.{
+        .pending_idle = 2,
+        .idle_dispatch_blocked = true,
+        .deferred_threads = 1,
+        .suspended_threads = 2,
+    }));
+    try std.testing.expectEqual(Work.none, choose(.{ .pending_idle = 2, .idle_dispatch_blocked = true }));
 }
 
 test "suspended UI callback does not freeze runnable workers" {

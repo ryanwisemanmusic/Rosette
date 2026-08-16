@@ -16,11 +16,17 @@ pub const Health = enum {
     callback_stalled,
     worker_stalled,
     completed,
+    completion_stalled,
 };
 
 pub const CallbackQuantumAction = enum {
     retain,
     rendezvous_worker,
+};
+
+pub const SchedulingOwner = struct {
+    thread: u64,
+    rip: u64,
 };
 
 /// Tracks one UI-thread handoff across cooperative guest-thread switches.
@@ -46,6 +52,14 @@ pub const UiHandoffTracker = struct {
     last_diagnostic_step: u64 = 0,
     worker_rip: u64 = 0,
     callback_rip: u64 = 0,
+    /// Scheduling thread of the most recently abandoned completion, remembered
+    /// until that thread is seen running again. A thread that failed to collect
+    /// one completion is not waiting for callbacks at all, so granting it the
+    /// next completion's dependency would re-stall the queue on the same dead
+    /// end once per callback for the rest of the run. Survives every reset for
+    /// exactly that reason.
+    abandoned_thread: u64 = 0,
+    completions_abandoned: u64 = 0,
 
     pub fn queued(self: *UiHandoffTracker, source_id: u64, callback: u64, scheduling_thread: u64, scheduling_rip: u64, step: u64) void {
         const next_generation = self.generation +| 1;
@@ -58,6 +72,8 @@ pub const UiHandoffTracker = struct {
             .scheduling_rip = scheduling_rip,
             .queued_step = step,
             .last_progress_step = step,
+            .abandoned_thread = self.abandoned_thread,
+            .completions_abandoned = self.completions_abandoned,
         };
     }
 
@@ -67,7 +83,7 @@ pub const UiHandoffTracker = struct {
     /// the scheduler lose ownership of the running callback and stop donating
     /// quanta to runnable workers.
     pub fn queueIfIdle(self: *UiHandoffTracker, source_id: u64, callback: u64, scheduling_thread: u64, scheduling_rip: u64, step: u64) bool {
-        if (self.isActive()) return false;
+        if (!self.acceptsNewHandoff()) return false;
         self.queued(source_id, callback, scheduling_thread, scheduling_rip, step);
         return true;
     }
@@ -171,8 +187,34 @@ pub const UiHandoffTracker = struct {
     }
 
     pub fn reset(self: *UiHandoffTracker) void {
-        const generation = self.generation;
-        self.* = .{ .generation = generation };
+        self.* = .{
+            .generation = self.generation,
+            .abandoned_thread = self.abandoned_thread,
+            .completions_abandoned = self.completions_abandoned,
+        };
+    }
+
+    /// Record that `handle` is executing again. A thread that has resumed is
+    /// once more a legitimate completion target, whatever happened to an
+    /// earlier handoff it scheduled.
+    pub fn noteThreadResumed(self: *UiHandoffTracker, handle: u64) void {
+        if (handle != 0 and handle == self.abandoned_thread) self.abandoned_thread = 0;
+    }
+
+    /// Whether the tracker may adopt a newly queued source as its generation.
+    ///
+    /// `.completed` is normally not idle: the callback is gone, but ownership
+    /// has not returned to the guest thread that scheduled it yet, and
+    /// replacing the generation there would lose that dependency and let an
+    /// unrelated callback run across the scheduling thread's atomic
+    /// continuation. Once the dependency is gone — resolved or abandoned — the
+    /// tracker owes nothing and a new handoff is free to take it over.
+    fn acceptsNewHandoff(self: *const UiHandoffTracker) bool {
+        return switch (self.phase) {
+            .idle => true,
+            .completed => !self.hasCompletionDependency(),
+            .queued, .callback_running, .callback_suspended, .worker_running => false,
+        };
     }
 
     pub fn isActive(self: *const UiHandoffTracker) bool {
@@ -184,6 +226,18 @@ pub const UiHandoffTracker = struct {
 
     pub fn ownsCallbackHandle(self: *const UiHandoffTracker, handle: u64) bool {
         return self.callback_handle != 0 and self.callback_handle == handle;
+    }
+
+    /// A callback may queue more UI work while it is running. The synthetic
+    /// callback handle cannot own that child handoff because it disappears at
+    /// callback return. Carry forward the original guest owner instead, so a
+    /// child callback can never leave completion affinity pointing at a dead
+    /// synthetic context.
+    pub fn schedulingOwner(self: *const UiHandoffTracker, current_thread: u64, current_rip: u64) SchedulingOwner {
+        if (self.ownsCallbackHandle(current_thread)) {
+            return .{ .thread = self.scheduling_thread, .rip = self.scheduling_rip };
+        }
+        return .{ .thread = current_thread, .rip = current_rip };
     }
 
     /// Update the last-progress timestamp without changing any other
@@ -222,20 +276,60 @@ pub const UiHandoffTracker = struct {
     /// frozen across the entire callback and violate its atomic invariants.
     pub fn completionResumeHandle(self: *const UiHandoffTracker) u64 {
         if (self.phase != .completed) return 0;
+        if (self.scheduling_thread == self.abandoned_thread) return 0;
         return self.scheduling_thread;
+    }
+
+    pub fn hasCompletionDependency(self: *const UiHandoffTracker) bool {
+        return self.completionResumeHandle() != 0;
     }
 
     pub fn completionResumed(self: *UiHandoffTracker, handle: u64, step: u64) bool {
         if (handle == 0 or handle != self.completionResumeHandle()) return false;
-        const generation = self.generation;
-        self.* = .{ .generation = generation, .last_progress_step = step };
+        self.* = .{
+            .generation = self.generation,
+            .last_progress_step = step,
+            .abandoned_thread = self.abandoned_thread,
+            .completions_abandoned = self.completions_abandoned,
+        };
         return true;
+    }
+
+    /// Abandon a completion dependency whose scheduling thread has stopped
+    /// being able to satisfy it, and report the handle that was abandoned
+    /// (0 when nothing was released).
+    ///
+    /// The dependency exists so that a synchronous handoff returns to its
+    /// requester before another callback runs. That is only a liveness-safe
+    /// rule while the requester is still waiting for *this* callback. A thread
+    /// that used the deferred (fire-and-forget) form has no such wait: it can
+    /// park on an unrelated long-lived object immediately after queueing, and
+    /// then it never becomes resumable again. Holding every later callback
+    /// behind it cannot help it — the queued callbacks are the only producers
+    /// left — so the queue would stay pinned for the rest of the run.
+    ///
+    /// The bound is the same no-progress threshold the stall diagnostics use,
+    /// which is many scheduler quanta: a requester that is genuinely waiting on
+    /// the callback resumes long before this, so the ordering guarantee is
+    /// unchanged for every handoff that can still be honoured. The abandoned
+    /// thread is then remembered, so the wait is paid once rather than once per
+    /// queued callback — see `abandoned_thread`.
+    pub fn releaseStalledCompletion(self: *UiHandoffTracker, current_step: u64, stall_steps: u64) u64 {
+        if (self.health(current_step, stall_steps) != .completion_stalled) return 0;
+        const abandoned = self.scheduling_thread;
+        self.* = .{
+            .generation = self.generation,
+            .last_progress_step = current_step,
+            .abandoned_thread = abandoned,
+            .completions_abandoned = self.completions_abandoned +| 1,
+        };
+        return abandoned;
     }
 
     pub fn health(self: *const UiHandoffTracker, current_step: u64, stall_steps: u64) Health {
         return switch (self.phase) {
             .idle => .idle,
-            .completed => .completed,
+            .completed => if (self.hasCompletionDependency() and current_step -| self.last_progress_step >= stall_steps) .completion_stalled else .completed,
             .queued => if (current_step -| self.last_progress_step >= stall_steps) .queued_stalled else .progressing,
             .callback_running, .callback_suspended => if (current_step -| self.last_progress_step >= stall_steps) .callback_stalled else .progressing,
             .worker_running => if (current_step -| self.last_progress_step >= stall_steps) .worker_stalled else .progressing,
@@ -307,10 +401,100 @@ test "completed UI handoff returns to its scheduling thread exactly once" {
     tracker.completed(30);
 
     try std.testing.expectEqual(@as(u64, 0x7FFF_2020), tracker.completionResumeHandle());
+    try std.testing.expect(tracker.hasCompletionDependency());
+    try std.testing.expect(!tracker.queueIfIdle(2, 0x4321, 0x7FFF_2030, 0x8765, 35));
+    try std.testing.expectEqual(Health.completion_stalled, tracker.health(140, 100));
     try std.testing.expect(!tracker.completionResumed(0x7FFF_2000, 40));
     try std.testing.expect(tracker.completionResumed(0x7FFF_2020, 50));
     try std.testing.expectEqual(@as(u64, 0), tracker.completionResumeHandle());
+    try std.testing.expect(!tracker.hasCompletionDependency());
     try std.testing.expectEqual(@as(u64, 1), tracker.generation);
+}
+
+test "a completion dependency its scheduling thread cannot satisfy is released" {
+    var tracker = UiHandoffTracker{};
+    tracker.queued(1, 0x1234, 0x7FFF_2020, 0x5678, 10);
+    tracker.callbackStarted(0xFFFF_F900_0000_0001, 0x5678, 20);
+    tracker.completed(30);
+
+    // Still inside the bound: the dependency is preserved, so a queued
+    // callback cannot run across the scheduling thread's continuation.
+    try std.testing.expectEqual(@as(u64, 0), tracker.releaseStalledCompletion(120, 100));
+    try std.testing.expect(tracker.hasCompletionDependency());
+    try std.testing.expect(!tracker.queueIfIdle(2, 0x4321, 0x7FFF_2030, 0x8765, 120));
+
+    // Past it: the scheduling thread never came back, so the idle queue is
+    // handed back to the scheduler instead of staying pinned forever.
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2020), tracker.releaseStalledCompletion(130, 100));
+    try std.testing.expect(!tracker.hasCompletionDependency());
+    try std.testing.expectEqual(Phase.idle, tracker.phase);
+    try std.testing.expectEqual(@as(u64, 1), tracker.generation);
+    try std.testing.expect(tracker.queueIfIdle(2, 0x4321, 0x7FFF_2030, 0x8765, 140));
+
+    // Releasing is one-shot: nothing is left to abandon afterwards.
+    try std.testing.expectEqual(@as(u64, 0), tracker.releaseStalledCompletion(1000, 100));
+    try std.testing.expectEqual(@as(u64, 1), tracker.completions_abandoned);
+}
+
+test "an abandoned scheduling thread does not re-stall the queue once per callback" {
+    var tracker = UiHandoffTracker{};
+    tracker.queued(1, 0x1234, 0x7FFF_2020, 0x5678, 10);
+    tracker.callbackStarted(0xFFFF_F900_0000_0001, 0x5678, 20);
+    tracker.completed(30);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2020), tracker.releaseStalledCompletion(130, 100));
+
+    // The next callback was queued by the same parked thread. Its completion
+    // must not pin the queue again — that thread already showed it is not
+    // waiting on callbacks, so the stall would repeat for every one of them.
+    tracker.queued(2, 0x4321, 0x7FFF_2020, 0x8765, 140);
+    tracker.callbackStarted(0xFFFF_F900_0000_0002, 0x8765, 150);
+    tracker.completed(160);
+    try std.testing.expect(!tracker.hasCompletionDependency());
+    try std.testing.expectEqual(Health.completed, tracker.health(10_000, 100));
+    try std.testing.expect(tracker.queueIfIdle(3, 0x9999, 0x7FFF_2030, 0x1111, 170));
+
+    // An unrelated thread is unaffected by the abandonment.
+    tracker.callbackStarted(0xFFFF_F900_0000_0003, 0x1111, 180);
+    tracker.completed(190);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2030), tracker.completionResumeHandle());
+    try std.testing.expect(tracker.completionResumed(0x7FFF_2030, 200));
+
+    // Once the abandoned thread runs again it is a valid target once more.
+    tracker.noteThreadResumed(0x7FFF_2020);
+    tracker.queued(4, 0x4321, 0x7FFF_2020, 0x8765, 210);
+    tracker.callbackStarted(0xFFFF_F900_0000_0004, 0x8765, 220);
+    tracker.completed(230);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2020), tracker.completionResumeHandle());
+}
+
+test "a resumed handoff is never eligible for stalled release" {
+    var tracker = UiHandoffTracker{};
+    tracker.queued(1, 0x1234, 0x7FFF_2020, 0x5678, 10);
+    tracker.callbackStarted(0xFFFF_F900_0000_0001, 0x5678, 20);
+    tracker.completed(30);
+    try std.testing.expect(tracker.completionResumed(0x7FFF_2020, 40));
+    try std.testing.expectEqual(@as(u64, 0), tracker.releaseStalledCompletion(1_000_000, 100));
+
+    // A callback that is merely slow keeps its handoff: only the completed
+    // phase carries a dependency to abandon.
+    tracker.queued(2, 0x4321, 0x7FFF_2030, 0x8765, 50);
+    tracker.callbackStarted(0xFFFF_F900_0000_0002, 0x8765, 60);
+    try std.testing.expectEqual(@as(u64, 0), tracker.releaseStalledCompletion(1_000_000, 100));
+    try std.testing.expectEqual(Phase.callback_running, tracker.phase);
+}
+
+test "UI callbacks pass child handoffs back to the original guest owner" {
+    var tracker = UiHandoffTracker{};
+    tracker.queued(1, 0x1234, 0x7FFF_2020, 0x5678, 10);
+    tracker.callbackStarted(0xFFFF_F900_0000_0001, 0x1234, 20);
+
+    const nested = tracker.schedulingOwner(0xFFFF_F900_0000_0001, 0x9999);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2020), nested.thread);
+    try std.testing.expectEqual(@as(u64, 0x5678), nested.rip);
+
+    const ordinary = tracker.schedulingOwner(0x7FFF_2040, 0xABCD);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2040), ordinary.thread);
+    try std.testing.expectEqual(@as(u64, 0xABCD), ordinary.rip);
 }
 
 test "registerProgress updates last_progress_step without state change" {
@@ -358,6 +542,8 @@ test "queued callback does not replace active handoff generation" {
     try std.testing.expectEqual(CallbackQuantumAction.rendezvous_worker, tracker.callbackQuantumAction(0, 1));
 
     tracker.completed(40);
+    try std.testing.expect(!tracker.queueIfIdle(5, 0x5000, 0x7FFF_2010, 0x2222, 30));
+    try std.testing.expect(tracker.completionResumed(0x7FFF_2000, 45));
     tracker.beginDispatch(5, 0x5000, 0x7FFF_2010, 0x2222, 30, 0xFFFF_F900_0000_0005, 0x5000, 50);
     try std.testing.expectEqual(@as(u64, 2), tracker.generation);
     try std.testing.expectEqual(@as(u64, 5), tracker.source_id);
