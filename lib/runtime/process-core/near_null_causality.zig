@@ -87,6 +87,12 @@ pub fn faultContextThread(self: anytype) u64 {
 
 pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     pinFaultContext(self);
+    // Forward-looking signatures collected before the fault: which imports
+    // were dispatched with near-null receivers, from where, and how often.
+    if (@hasField(@TypeOf(self.*), "near_null_predictor")) {
+        self.near_null_predictor.dump(self, "terminal_near_null");
+        self.near_null_predictor.dumpRecent(self);
+    }
     const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse return;
     const decoded = decodeInsn(bytes);
     const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;

@@ -75,6 +75,9 @@ fn importCallerAddress(self: anytype) u64 {
 }
 
 pub fn handleImportImpl(self: anytype, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
+    // Forward-looking near-null signature: one compare per dispatch, and a
+    // rare branch only when the receiver is below the near-null threshold.
+    self.near_null_predictor.note(self, imported.name);
     if (self.tryPrimitiveDispatch(imported)) |result| {
         self.import_handler.primitive_dispatch_hits +|= 1;
         return result;
@@ -242,6 +245,23 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             return .{ .handled = 0 };
         }
     }
+    // The libc++ stream family dispatches BEFORE the local-definition redirect.
+    // Template members such as operator<<(ostream&, function-pointer) and
+    // std::endl are emitted as weak local copies inside the guest image, so the
+    // redirect would hand control to native libc++ code that dereferences the
+    // guest ostream — the near-null casualty vector (Xbyak's undefined-label
+    // print crashed exactly there). The bridge must own these symbols; it
+    // returns null for anything it does not recognize, so the redirect below
+    // still runs for every other symbol.
+    if (self.libcxx_streams.dispatch(self, &self.fs_forwarder, name)) |resolution| {
+        self.resolving_import_route = .libcxx_stream;
+        self.import_provider_override = .libcpp_stream;
+        self.import_confidence_override = .modeled;
+        return switch (resolution) {
+            .handled => |value| .{ .handled = value },
+            .handled_void => .handled_void,
+        };
+    }
     if (self.metadata.definedSymbolAddress(name)) |target| {
         if (target != imported.stub_address and self.isExecutableAddress(target)) {
             self.regs.rip = target;
@@ -255,15 +275,6 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
     }
     if (dispatchLibcppLocale(self, name)) |resolution| return resolution;
-    if (self.libcxx_streams.dispatch(self, &self.fs_forwarder, name)) |resolution| {
-        self.resolving_import_route = .libcxx_stream;
-        self.import_provider_override = .libcpp_stream;
-        self.import_confidence_override = .modeled;
-        return switch (resolution) {
-            .handled => |value| .{ .handled = value },
-            .handled_void => .handled_void,
-        };
-    }
     if (self.foreign_objects.dispatch(self, name)) |resolution| {
         self.resolving_import_route = .foreign_object;
         self.import_confidence_override = .modeled;

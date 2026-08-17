@@ -6,6 +6,7 @@ pub const compat_handlers = @import("compat_handlers.zig");
 pub const bounded_dispatch_fst = @import("bounded_dispatch_fst.zig");
 pub const memory_access = @import("memory_access.zig");
 pub const near_null_causality = @import("near_null_causality.zig");
+pub const near_null_predictor = @import("near_null_predictor.zig");
 pub const crash_diag = @import("crash_diag.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const execute = @import("execute.zig");
@@ -25,4 +26,5 @@ pub const syscalls = @import("syscalls.zig");
 test {
     _ = host_termination;
     _ = memory_access;
+    _ = near_null_predictor;
 }

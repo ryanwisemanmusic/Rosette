@@ -51,6 +51,7 @@ const execution_tracepoints = @import("diagnostics").execution_tracepoints;
 const anomaly_ledger = @import("diagnostics").anomaly_ledger;
 const notifier_liveness = @import("scheduler").notifier_liveness;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
+const near_null_predictor = @import("process_core").near_null_predictor;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
 const memory_mod = @import("memory");
@@ -546,6 +547,10 @@ pub const MachOState = struct {
     fault_context_pinned: bool = false,
     fault_context_thread: u64 = 0,
     fault_context_step: u64 = 0,
+    /// Forward-looking near-null receiver signatures collected at import
+    /// dispatch, dumped when a terminal casualty is confirmed. See
+    /// `near_null_predictor.zig` for the cost model (one compare per import).
+    near_null_predictor: near_null_predictor.Predictor = .{},
     /// Thread carrying a C++ exception that Itanium phase one could not match
     /// to a handler, and the thrown type. Read when the thread returns, so an
     /// exception-terminated thread is distinguishable from a clean exit.
@@ -742,6 +747,16 @@ pub const MachOState = struct {
     critical_section_watch_base: u64 = 0,
     critical_section_watch_host_virtual: u64 = 0,
     critical_section_watch_host_physical: u64 = 0,
+    /// Xenia's `virtual_membase_` is the mapping base itself, so code that
+    /// computes `membase + guest_address` reaches a *different host page* than
+    /// `TranslateVirtual` (which adds the macOS 4 KiB E000-heap bias). The run
+    /// that first diagnosed the zeroed VdHSIOCalibrationLock recorded the
+    /// -1 initializer through the biased alias and lost the zeroing store
+    /// entirely: it landed on this third, unwatched page. The watch now covers
+    /// all three views and the integrity checkpoint reads all three, so an
+    /// alias mismatch inside the fork is visible as a state disagreement
+    /// instead of a NOT_RETAINED dead end.
+    critical_section_watch_host_unbiased: u64 = 0,
     critical_section_initial_image: [guest_critical_section.size_bytes]u8 =
         [_]u8{0} ** guest_critical_section.size_bytes,
     critical_section_initial_valid: bool = false,
@@ -1351,6 +1366,7 @@ pub const MachOState = struct {
         var capstone_callback_bindings: usize = 0;
         var bridged_abi_data_bindings: usize = 0;
         var deferred_abi_data_bindings: usize = 0;
+        var standard_stream_bindings: usize = 0;
         var local_image_data_bindings: usize = 0;
         var preserved_weak_data_bindings: usize = 0;
         var stack_guard_address: u64 = 0;
@@ -1373,6 +1389,29 @@ pub const MachOState = struct {
                 if (self.guestMemory(binding.address, @sizeOf(u64)) == null) continue;
                 self.write64(binding.address, stack_guard_address);
                 applied += 1;
+                continue;
+            }
+            if (standardCppStreamKind(binding.name)) |kind| {
+                // std::cin/cout/cerr/clog are data symbols exported from
+                // libc++. A plain dyld binding would have fallen through the
+                // callable/ABI-data checks and left the slot zeroed, so
+                // `std::cerr << ...` handed a null ostream to native libc++
+                // code (the Xbyak near-null casualty). Bind the slot to a
+                // fully modeled synthetic stream instead: every stream
+                // operator that reaches native libc++ runs against valid
+                // state, and every import the bridge intercepts dispatches
+                // against the same object.
+                const ostream = self.libcxx_streams.ensureStandardStream(self, kind) orelse {
+                    machoCapturePrint(
+                        "macho-processor: standard C++ stream construction failed for {s}\n",
+                        .{binding.name},
+                    );
+                    continue;
+                };
+                if (self.guestMemory(binding.address, @sizeOf(u64)) == null) continue;
+                self.write64(binding.address, ostream);
+                applied += 1;
+                standard_stream_bindings += 1;
                 continue;
             }
             const section = self.metadata.sectionAtAddress(binding.address) orelse continue;
@@ -1540,8 +1579,8 @@ pub const MachOState = struct {
         }
 
         machoCapturePrint(
-            "macho-processor: applied {d} dyld data binding(s), including {d} local-image pointer(s), {d} validated prebound weak pointer(s), {d} callable GOT pointer(s), {d} writable function pointer(s), and {d}/5 Capstone runtime callback(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d} guest_materialized={d} host_resolved={d}\n",
-            .{ applied, local_image_data_bindings, preserved_weak_data_bindings, callable_got_bindings, writable_callable_bindings, capstone_callback_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings, self.vtt_resolver.synthetic_count, self.vtt_resolver.resolved_count },
+            "macho-processor: applied {d} dyld data binding(s), including {d} local-image pointer(s), {d} validated prebound weak pointer(s), {d} callable GOT pointer(s), {d} writable function pointer(s), and {d}/5 Capstone runtime callback(s); created {d} synthetic import thunk(s); ABI data bridged={d} deferred={d} guest_materialized={d} host_resolved={d} standard_cpp_streams={d}\n",
+            .{ applied, local_image_data_bindings, preserved_weak_data_bindings, callable_got_bindings, writable_callable_bindings, capstone_callback_bindings, self.bound_import_thunks.len, bridged_abi_data_bindings, deferred_abi_data_bindings, self.vtt_resolver.synthetic_count, self.vtt_resolver.resolved_count, standard_stream_bindings },
         );
     }
 
@@ -1670,6 +1709,19 @@ pub const MachOState = struct {
             if (std.mem.startsWith(u8, symbol_name, prefix)) return true;
         }
         return false;
+    }
+
+    /// Map a libc++ standard stream data symbol to its modeled stream kind.
+    /// libc++ exports these as `_ZNSt3__14cerrE` (namespace std, 4-char name,
+    /// data) — the Mach-O external form adds one leading underscore. Verified
+    /// against the Xenia fork's undefined-symbol table: `__ZNSt3__14cerrE`,
+    /// `__ZNSt3__14clogE`, `__ZNSt3__14coutE`.
+    fn standardCppStreamKind(symbol_name: []const u8) ?libcpp_stream_bridge.StandardStreamKind {
+        if (std.mem.eql(u8, symbol_name, "__ZNSt3__14cinE")) return .cin;
+        if (std.mem.eql(u8, symbol_name, "__ZNSt3__14coutE")) return .cout;
+        if (std.mem.eql(u8, symbol_name, "__ZNSt3__14cerrE")) return .cerr;
+        if (std.mem.eql(u8, symbol_name, "__ZNSt3__14clogE")) return .clog;
+        return null;
     }
 
     fn isBridgedLibcppDataSymbol(symbol_name: []const u8) bool {

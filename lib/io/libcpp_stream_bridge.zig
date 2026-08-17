@@ -3,6 +3,20 @@ const compat_runtime = @import("macho_compat_runtime");
 const cxx_object_model = @import("cxx_abi").cxx_object_model;
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 
+/// Standard C++ streams constructed on demand when the Mach-O bindings for
+/// __ZSt4cin/cout/cerr/clog are resolved. Indexed by `StandardStreamKind`.
+pub const StandardStreamKind = enum(u8) {
+    cin,
+    cout,
+    cerr,
+    clog,
+};
+
+/// One contiguous guest allocation per standard stream: basic_ostream at +0,
+/// the synthetic basic_filebuf at +64.
+pub const STANDARD_STREAM_BLOCK_SIZE: u64 = 128;
+const STANDARD_STREAM_FILEBUF_OFFSET: u64 = 64;
+
 const MAX_STREAMS = 256; // was 64 — raised for IO-5
 const PATCH_TOML_TRACE_CAPACITY = 128;
 const MAX_REASONABLE_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB safety cap (was 1MB — raised for IO-3)
@@ -74,6 +88,9 @@ const Stream = struct {
     string_backed: bool = false,
     numeric_base: u8 = 10,
     synthetic_proc_maps: bool = false,
+    /// Standard streams (std::cin/cout/cerr/clog) map to host fds 0/1/2 and
+    /// are never position-tracked or closed by the bridge.
+    is_standard: bool = false,
 };
 
 const PatchTomlOp = struct {
@@ -276,6 +293,11 @@ pub const Bridge = struct {
     proc_maps_length: usize = 0,
     proc_maps_storage: [PROC_SELF_MAPS_CAPACITY]u8 = [_]u8{0} ** PROC_SELF_MAPS_CAPACITY,
     last_logged_stringstream_object: u64 = 0,
+    /// Guest addresses of the modeled std::cin/cout/cerr/clog ostream objects,
+    /// populated once per kind on first binding and reused by every slot that
+    /// references the same stream.
+    standard_ostreams: [std.enums.values(StandardStreamKind).len]u64 = [_]u64{0} ** std.enums.values(StandardStreamKind).len,
+    standard_stream_bindings: u64 = 0,
 
     pub fn deinit(self: *Bridge) void {
         for (&self.streams) |*stream| closeStream(stream);
@@ -379,6 +401,20 @@ pub const Bridge = struct {
         if (isPointerInsertion(name)) return .{ .handled = self.insertPointer(state, state.regs.rdi, state.regs.rsi) };
         if (isCStringInsertion(name)) return .{ .handled = self.insertCString(state, state.regs.rdi, state.regs.rsi) };
         if (isIntegerInsertion(name)) return .{ .handled = self.insertInteger(state, state.regs.rdi, state.regs.rsi, isSignedIntegerInsertion(name)) };
+        if (isDoubleInsertion(name)) return .{ .handled = self.insertDouble(state, state.regs.rdi, state.regs.rsi) };
+        if (isOstreamManipulatorInsertion(name)) {
+            // operator<<(ostream&, ostream&(*)(ostream&)) and the ios_base
+            // variant. The native libc++ bodies tail-call the manipulator with
+            // `this` = the ostream; running them natively against a synthetic
+            // (or near-null) stream is the near-null casualty vector seen in
+            // Xbyak's undefined-label print. Resolve the pointer and apply the
+            // effect here instead.
+            return .{ .handled = self.insertManipulatorPointer(state, state.regs.rdi, state.regs.rsi) };
+        }
+        if (isStreamManipulator(name)) {
+            // Direct calls to std::endl / std::flush / std::ends.
+            return .{ .handled = self.applyManipulator(state, state.regs.rdi, name) };
+        }
         if (isStringbufStr(name)) return if (self.stringbufToString(state, state.regs.rsi, state.regs.rdi)) .{ .handled = state.regs.rdi } else null;
         if (isStringStreamStr(name)) return if (self.streamObjectToString(state, state.regs.rsi, state.regs.rdi)) .{ .handled = state.regs.rdi } else null;
 
@@ -563,6 +599,9 @@ pub const Bridge = struct {
             isPointerInsertion(name) or
             isCStringInsertion(name) or
             isIntegerInsertion(name) or
+            isDoubleInsertion(name) or
+            isOstreamManipulatorInsertion(name) or
+            isStreamManipulator(name) or
             isStringbufStr(name) or
             isStringStreamStr(name) or
             isIfstreamDefaultConstructor(name) or
@@ -683,6 +722,80 @@ pub const Bridge = struct {
         return true;
     }
 
+    /// Return the guest ostream address for a standard C++ stream, constructing
+    /// it once per kind. The object is fully modeled (ostream vptr, rdbuf,
+    /// locale, synthetic streambuf virtuals) so both dispatch routes are safe:
+    /// imports intercepted by the bridge, and native libc++ template copies
+    /// that run against the object (e.g. std::endl calling widen()/put()/flush()
+    /// through the synthetic locale and streambuf vtables).
+    pub fn ensureStandardStream(self: *Bridge, state: anytype, kind: StandardStreamKind) ?u64 {
+        const index = @intFromEnum(kind);
+        if (self.standard_ostreams[index] != 0) return self.standard_ostreams[index];
+        const fd: i32 = switch (kind) {
+            .cin => 0,
+            .cout => 1,
+            .cerr, .clog => 2,
+        };
+        const ostream = self.constructStandardStream(state, fd) orelse return null;
+        self.standard_ostreams[index] = ostream;
+        if (self.standard_stream_bindings < 4) {
+            machoCapturePrint(
+                "macho-processor: modeled standard C++ stream kind={s} fd={d} ostream=0x{x} filebuf=0x{x}\n",
+                .{ @tagName(kind), fd, ostream, ostream + STANDARD_STREAM_FILEBUF_OFFSET },
+            );
+        }
+        return ostream;
+    }
+
+    fn constructStandardStream(self: *Bridge, state: anytype, fd: i32) ?u64 {
+        if (fd < 0 or fd > 2) return null;
+        const block = state.guestAlloc(STANDARD_STREAM_BLOCK_SIZE, 16) orelse return null;
+        const filebuf = block + STANDARD_STREAM_FILEBUF_OFFSET;
+        if (!self.constructFilebuf(state, filebuf)) return null;
+        if (!self.constructOstream(state, block, filebuf)) return null;
+        const stream = self.ensure(filebuf) orelse return null;
+        self.setOwnership(stream, block, 0, 0);
+        stream.fd = fd;
+        stream.is_standard = true;
+        stream.tracked_pos = 0;
+        return block;
+    }
+
+    /// Direct std::endl / std::flush / std::ends import.
+    pub fn applyManipulator(self: *Bridge, state: anytype, ostream: u64, name: []const u8) u64 {
+        if (manipulatorAppend(name)) |text| {
+            _ = self.appendToOstream(state, ostream, text);
+        }
+        // flush() is a no-op: modeled writes are unbuffered, so there is no
+        // model state to synchronize.
+        return ostream;
+    }
+
+    /// operator<<(ostream&, function-pointer) — resolve the manipulator the
+    /// pointer refers to (import stub or local libc++ copy) and apply it
+    /// without executing the native body.
+    pub fn insertManipulatorPointer(self: *Bridge, state: anytype, ostream: u64, pointer: u64) u64 {
+        var resolved: []const u8 = "";
+        if (@hasField(@TypeOf(state.*), "metadata")) {
+            if (state.metadata.importAtStub(pointer)) |imported| {
+                resolved = imported.name;
+            } else if (state.metadata.nearestSymbol(pointer)) |symbol| {
+                resolved = symbol.name;
+            }
+        }
+        if (manipulatorAppend(resolved)) |text| {
+            _ = self.appendToOstream(state, ostream, text);
+            return ostream;
+        }
+        if (manipulatorNumericBase(resolved)) |base| {
+            if (self.findOwned(ostream)) |stream| stream.numeric_base = base;
+            return ostream;
+        }
+        // Unknown manipulator: skip the call rather than run native code
+        // against the modeled stream.
+        return ostream;
+    }
+
     pub fn constructFilebuf(self: *Bridge, state: anytype, object: u64) bool {
         if (!self.object_model.initializeStreambufBase(state, object)) {
             self.rejected +|= 1;
@@ -752,6 +865,14 @@ pub const Bridge = struct {
     fn insertPointer(self: *Bridge, state: anytype, ostream: u64, value: u64) u64 {
         var buffer: [32]u8 = undefined;
         const rendered = std.fmt.bufPrint(&buffer, "0x{x}", .{value}) catch return ostream;
+        _ = self.appendToOstream(state, ostream, rendered);
+        return ostream;
+    }
+
+    fn insertDouble(self: *Bridge, state: anytype, ostream: u64, bits: u64) u64 {
+        var buffer: [64]u8 = undefined;
+        const value: f64 = @bitCast(bits);
+        const rendered = std.fmt.bufPrint(&buffer, "{d}", .{value}) catch return ostream;
         _ = self.appendToOstream(state, ostream, rendered);
         return ostream;
     }
@@ -858,6 +979,18 @@ pub const Bridge = struct {
 
     fn writeBytes(self: *Bridge, state: anytype, stream: *Stream, bytes: []const u8) usize {
         self.modeled_streambuf_writes +|= 1;
+        if (stream.fd >= 0 and stream.is_standard) {
+            // Standard streams back pipes, ttys and files, so position-based
+            // pwrite() is invalid (ESPIPE). write(2) works everywhere, and the
+            // guest log mirror captures the text when the run redirects it.
+            const written = self.writeStandardBytes(state, stream, bytes);
+            if (written < bytes.len) {
+                stream.failed = true;
+                self.noteState(state, stream, cxx_object_model.BADBIT | cxx_object_model.FAILBIT);
+                self.modeled_streambuf_short_writes +|= 1;
+            }
+            return written;
+        }
         if (stream.fd >= 0) {
             const result = std.c.pwrite(stream.fd, bytes.ptr, bytes.len, @intCast(stream.tracked_pos));
             if (result < 0) {
@@ -908,6 +1041,25 @@ pub const Bridge = struct {
         if (written < bytes.len) {
             stream.string_truncated = true;
             self.modeled_streambuf_short_writes +|= 1;
+        }
+        return written;
+    }
+
+    fn writeStandardBytes(self: *Bridge, state: anytype, stream: *Stream, bytes: []const u8) usize {
+        _ = self;
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const result = std.c.write(stream.fd, bytes.ptr + written, bytes.len - written);
+            if (result < 0) break;
+            if (result == 0) break;
+            written += @intCast(result);
+        }
+        if (written != 0 and
+            @hasField(@TypeOf(state.*), "guest_log_mirror_fd") and
+            state.guest_log_mirror_fd >= 0 and
+            state.guest_log_mirror_fd != stream.fd)
+        {
+            _ = std.c.write(state.guest_log_mirror_fd, bytes.ptr, written);
         }
         return written;
     }
@@ -2106,6 +2258,12 @@ pub const Bridge = struct {
 };
 
 fn closeStream(stream: *Stream) void {
+    if (stream.is_standard) {
+        // Never close host stdio; also keep the standard flag so a later
+        // reuse of the slot cannot be mistaken for a seekable file.
+        stream.fd = -1;
+        return;
+    }
     if (stream.fd >= 0) _ = std.c.close(stream.fd);
     stream.fd = -1;
     stream.synthetic_proc_maps = false;
@@ -2299,6 +2457,48 @@ fn isSignedIntegerInsertion(name: []const u8) bool {
     return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEi") or
         std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEl") or
         std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEx");
+}
+
+/// basic_ostream::operator<<(double). Imported by the Xenia fork and currently
+/// unhandled; render it so a floating-point print cannot fall through to an
+/// unresolved import.
+fn isDoubleInsertion(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEd");
+}
+
+/// basic_ostream::operator<<(ostream&(*)(ostream&)) / (ios_base&(*)(ios_base&)).
+/// Mangled member forms contain `ls` plus a function-pointer parameter that
+/// returns a reference to the stream (`PFRS`) or to ios_base (`PFRNS`).
+fn isOstreamManipulatorInsertion(name: []const u8) bool {
+    if (std.mem.indexOf(u8, name, "basic_ostream") == null) return false;
+    if (std.mem.indexOf(u8, name, "ls") == null) return false;
+    return std.mem.indexOf(u8, name, "PFRS") != null or std.mem.indexOf(u8, name, "PFRNS") != null;
+}
+
+/// The std::endl / std::flush / std::ends manipulator functions themselves.
+/// Length-prefixed mangling: `_ZNSt3__14endl...`, `_ZNSt3__15flush...`,
+/// `_ZNSt3__14ends...` — the digit prefix is the identifier length.
+fn isStreamManipulator(name: []const u8) bool {
+    if (std.mem.indexOf(u8, name, "basic_ostream") == null) return false;
+    return std.mem.indexOf(u8, name, "4endl") != null or
+        std.mem.indexOf(u8, name, "5flush") != null or
+        std.mem.indexOf(u8, name, "4ends") != null;
+}
+
+/// Classify a manipulator symbol name into a character to append, or null for
+/// flush-only manipulators. std::endl appends '\n', std::ends appends the null
+/// terminator, std::flush has no model state to flush (writes are unbuffered).
+fn manipulatorAppend(name: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, name, "4endl") != null) return "\n";
+    if (std.mem.indexOf(u8, name, "4ends") != null) return "\x00";
+    return null;
+}
+
+fn manipulatorNumericBase(name: []const u8) ?u8 {
+    if (std.mem.indexOf(u8, name, "3dec") != null) return 10;
+    if (std.mem.indexOf(u8, name, "3hex") != null) return 16;
+    if (std.mem.indexOf(u8, name, "3oct") != null) return 8;
+    return null;
 }
 
 fn isStringbufStr(name: []const u8) bool {
@@ -2521,6 +2721,83 @@ test "stream bridge recognizes constructor and destructor ABI aliases" {
     try std.testing.expect(Bridge.recognizesSymbol("__ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE7rdstateB7v160006Ev"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE8pubimbueB7v160006ERKNS_6localeE"));
     try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE5imbueERKNS_6localeE"));
+}
+
+test "stream bridge recognizes std manipulators and function-pointer insertions" {
+    const endl = normalizeSymbol("__ZNSt3__14endlB7v160006IcNS_11char_traitsIcEEEERNS_13basic_ostreamIT_T0_EES7_");
+    const flush = normalizeSymbol("__ZNSt3__15flushB7v160006IcNS_11char_traitsIcEEEERNS_13basic_ostreamIT_T0_EES7_");
+    const ends = normalizeSymbol("__ZNSt3__14endsB7v160006IcNS_11char_traitsIcEEEERNS_13basic_ostreamIT_T0_EES7_");
+    const pf_insert = normalizeSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsB7v160006EPFRS3_S4_E");
+    const ios_pf_insert = normalizeSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsB7v160006EPFRNS_8ios_baseES5_E");
+    const int_insert = normalizeSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEi");
+
+    try std.testing.expect(isStreamManipulator(endl));
+    try std.testing.expect(isStreamManipulator(flush));
+    try std.testing.expect(isStreamManipulator(ends));
+    try std.testing.expect(!isStreamManipulator(int_insert));
+    try std.testing.expect(isOstreamManipulatorInsertion(pf_insert));
+    try std.testing.expect(isOstreamManipulatorInsertion(ios_pf_insert));
+    try std.testing.expect(!isOstreamManipulatorInsertion(int_insert));
+    try std.testing.expectEqualStrings("\n", manipulatorAppend(endl).?);
+    try std.testing.expect(manipulatorAppend(flush) == null);
+    try std.testing.expectEqual(@as(?u8, 16), manipulatorNumericBase("__ZNSt3__13hexB7v160006ERNS_8ios_baseE"));
+    try std.testing.expectEqual(@as(?u8, 8), manipulatorNumericBase("__ZNSt3__13octB7v160006ERNS_8ios_baseE"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__14endlB7v160006IcNS_11char_traitsIcEEEERNS_13basic_ostreamIT_T0_EES7_"));
+    try std.testing.expect(Bridge.recognizesSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsB7v160006EPFRS3_S4_E"));
+}
+
+test "standard stream construction models cerr over a tracked fd-2 filebuf" {
+    const TestState = struct {
+        alloc_next: u64 = 0x1_0000,
+        mem: [256 * 1024]u8 = [_]u8{0} ** (256 * 1024),
+
+        pub fn guestAlloc(self: *@This(), length: u64, alignment: u64) ?u64 {
+            _ = alignment;
+            const address = self.alloc_next;
+            self.alloc_next += length;
+            if (address + length > self.mem.len) return null;
+            return address;
+        }
+
+        pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+            if (address + length > self.mem.len) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        pub fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            if (address + length > self.mem.len) return null;
+            return self.mem[@intCast(address)..@intCast(address + length)];
+        }
+
+        pub fn read64(self: *const @This(), address: u64) u64 {
+            return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
+        }
+
+        pub fn write32(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.mem[@intCast(address)..][0..4], value, .little);
+        }
+
+        pub fn write8(self: *@This(), address: u64, value: u8) void {
+            self.mem[@intCast(address)] = value;
+        }
+
+        pub fn write64(self: *@This(), address: u64, value: u64) void {
+            std.mem.writeInt(u64, self.mem[@intCast(address)..][0..8], value, .little);
+        }
+    };
+
+    var bridge = Bridge{};
+    defer bridge.deinit();
+    var state = TestState{};
+    const ostream = bridge.ensureStandardStream(&state, .cerr).?;
+    try std.testing.expectEqual(ostream, bridge.ensureStandardStream(&state, .cerr).?);
+    try std.testing.expectEqual(@as(u64, 0), bridge.standard_ostreams[@intFromEnum(StandardStreamKind.cin)]);
+    const filebuf = state.read64(ostream + cxx_object_model.stream_layout.rdbuf_offset);
+    try std.testing.expect(filebuf != 0);
+    try std.testing.expect(bridge.findOwned(ostream) != null);
+    const stream = bridge.find(filebuf).?;
+    try std.testing.expect(stream.is_standard);
+    try std.testing.expectEqual(@as(i32, 2), stream.fd);
 }
 
 test "stream bridge forwards guest file operations through typed host calls" {

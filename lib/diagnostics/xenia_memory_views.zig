@@ -71,6 +71,18 @@ pub const Model = struct {
         return address;
     }
 
+    /// The host address code that computes `virtual_membase_ + guest_address`
+    /// reaches. Xenia's `virtual_membase_` is the mapping base itself (no
+    /// bias), so on macOS this is a *different host page* than
+    /// `virtualHostAddress` for the E000 physical-4K window, which applies the
+    /// 4 KiB bias. The guest's own stores — e.g. a title's inline critical
+    /// section spin on an exported lock — use exactly this form, and a watch
+    /// armed only on the biased alias misses them.
+    pub fn primaryUnbiasedHostAddress(self: *const Model, guest_address: u64) ?u64 {
+        if (!self.ready() or guest_address > std.math.maxInt(u32)) return null;
+        return std.math.add(u64, self.mapping_base, guest_address) catch null;
+    }
+
     /// Equivalent to Xenia `Memory::TranslatePhysical`.
     pub fn physicalHostAddress(self: *const Model, physical_address: u64) ?u64 {
         if (!self.ready()) return null;
@@ -118,6 +130,26 @@ test "translates observed VdHSIO virtual and physical aliases" {
     try std.testing.expectEqual(
         @as(?u64, 0x46D53C000),
         model.physicalAliasHostAddress(0xFFCAB000),
+    );
+}
+
+test "the E000 window has a distinct unbiased membase page" {
+    var model: Model = .{};
+    _ = model.observeFixedFileView(0x34D890000, primary_view_length, 0, false);
+    const biased = model.virtualHostAddress(0xFFCAB000).?;
+    const unbiased = model.primaryUnbiasedHostAddress(0xFFCAB000).?;
+    // TranslateVirtual adds the 4 KiB bias; membase-relative code does not,
+    // and the two are 4 KiB apart — a different watch page. This is exactly
+    // the split that let the zeroing store of VdHSIOCalibrationLock escape
+    // provenance: it was watching the biased page while the guest wrote the
+    // unbiased one.
+    try std.testing.expectEqual(biased - 0x1000, unbiased);
+    try std.testing.expect((biased & ~@as(u64, 0xFFF)) != (unbiased & ~@as(u64, 0xFFF)));
+    // Ordinary virtual addresses outside the E000 window have no bias, so the
+    // two forms agree there.
+    try std.testing.expectEqual(
+        model.virtualHostAddress(0x30002000).?,
+        model.primaryUnbiasedHostAddress(0x30002000).?,
     );
 }
 
