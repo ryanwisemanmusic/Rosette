@@ -21,6 +21,11 @@ const Size = x64_decoder.OperandSize;
 const TraceEntry = macho_core.types.TraceEntry;
 const decodeInsn = macho_core.decoder.decodeInsn;
 
+/// Matches the predictor's NEAR_NULL_LIMIT convention (0x1000): effective
+/// addresses below this bound dereference the zero page or a tiny tag-like
+/// address.
+const NATIVE_NEAR_NULL_LIMIT: u64 = 0x1000;
+
 const Transition = struct {
     instruction_address: u64,
     trace_ordinal: usize,
@@ -92,6 +97,11 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     if (@hasField(@TypeOf(self.*), "near_null_predictor")) {
         self.near_null_predictor.dump(self, "terminal_near_null");
         self.near_null_predictor.dumpRecent(self);
+        // Object-header clobbers observed before the fault (vptr repaired,
+        // other header slots left zero). A casualty whose callee read one of
+        // these objects' zeroed fields is produced by the matching clobber
+        // event, not by the terminal instruction.
+        self.near_null_predictor.dumpClobber(self);
     }
     const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse return;
     const decoded = decodeInsn(bytes);
@@ -204,6 +214,19 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
         );
     } else {
         reportByteOrderSurvey(self);
+        // A *derived* near-null deref in native code (e.g. `mov [0x190], rcx`
+        // with a tiny base register) is the same class of fault as a null
+        // receiver, but the classifier above only walks frames when base==0
+        // AND rdi==0, so the caller chain was never captured for it. Walk it
+        // for any native near-null effective address: the frame chain is the
+        // fault-local ownership record and costs nothing on the hot path.
+        if (contract.domain == .host_native and effective_address < NATIVE_NEAR_NULL_LIMIT) {
+            machoCapturePrint(
+                "macho-processor: NEAR-NULL DERIVED RECEIVER: domain=host_native effective=0x{x} base=0x{x} callee={s}; the base register itself holds a tiny derived value — walking the caller chain to find who supplied it\n",
+                .{ effective_address, base_value, terminal_symbol },
+            );
+            dumpFaultLocalNativeFrames(self);
+        }
     }
 
     const src_value = switch (decoded.op) {

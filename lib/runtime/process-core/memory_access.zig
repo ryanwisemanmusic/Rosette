@@ -3880,8 +3880,53 @@ noinline fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recov
                 recovery.last_write.writer_step,
             },
         );
+        // New unique predictor case: the vptr reading low means a bypassing
+        // bulk/native write zeroed this object's header, and only the vptr
+        // slot is being repaired. Scan the header region for every *other*
+        // zeroed pointer slot and predict the casualty they will produce —
+        // the next native member call that reads one of those fields (e.g. an
+        // ownership pointer at +0x8) will carry a null receiver. This fires
+        // before the fault: the first vptr re-read after the clobber precedes
+        // the member call that dereferences the field.
+        reportObjectHeaderClobber(self, object_base, recovery);
     }
     return recovery.value;
+}
+
+/// Scan the header region of a live tracked object whose vptr was just
+/// observed reading low, and feed every other zeroed pointer slot to the
+/// near-null predictor as an `object_header_clobber` event. Only slots that
+/// read as exactly zero are listed — a legitimate null field would be noise,
+/// but the vptr being zero is proof a bulk write ran through this region, so
+/// the co-zeroed slots are the fields the next member call will dereference
+/// as null.
+fn reportObjectHeaderClobber(self: anytype, object_base: u64, recovery: vt.Recovery) void {
+    if (!@hasField(@TypeOf(self.*), "near_null_predictor")) return;
+    const allocation_size = self.memory_forwarder.allocationSize(object_base) orelse return;
+    const scan_len: usize = @intCast(@min(allocation_size, 64));
+    const bytes = guestMemoryConst(self, object_base, scan_len) orelse return;
+    var zeroed: [8]u64 = undefined;
+    var count: usize = 0;
+    var off: usize = 0;
+    while (off + 8 <= scan_len) : (off += 8) {
+        const value = std.mem.readInt(u64, bytes[off..][0..8], .little);
+        if (value == 0) {
+            if (count < zeroed.len) {
+                zeroed[count] = off;
+                count += 1;
+            }
+        }
+    }
+    if (count == 0) return;
+    const type_symbol = self.metadata.symbolLabel(recovery.value);
+    self.near_null_predictor.noteObjectHeaderClobber(
+        self,
+        object_base,
+        type_symbol,
+        allocation_size,
+        zeroed[0..count],
+        recovery.last_write.writer_step,
+    );
 }
 
 pub fn logLiveVtableGuardSummary(self: anytype) void {
@@ -3908,6 +3953,111 @@ pub fn logLiveVtableGuardSummary(self: anytype) void {
             self.memory_writes.truncated_range_mutations,
         },
     );
+}
+
+/// Decide what a vtable clobber means from block identity alone.
+///
+/// Separated from the reporting so the reasoning is testable without a machine
+/// state: this is the sentence a reader will act on, and it is the part that
+/// can be wrong in a way no compiler catches.
+pub fn clobberVerdict(has_base: bool, base_block: ?u64, target_block: ?u64) []const u8 {
+    if (!has_base) {
+        return "no base register in the address expression; the target was formed from a displacement or index alone";
+    }
+    if (base_block == null and target_block == null) {
+        return "neither the writer's base pointer nor the byte it wrote belongs to a tracked live allocation; both are outside the forwarded arena";
+    }
+    if (base_block == null) {
+        return "WRITER POINTER IS NOT A LIVE ALLOCATION: the base register does not point inside any tracked block, so it is stale or garbage. The defect is whatever produced this pointer, not the allocator";
+    }
+    if (target_block == null) {
+        return "the writer's base is a live allocation but the byte it wrote is outside every tracked block: the write ran past the end of its own buffer";
+    }
+    if (base_block.? == target_block.?) {
+        return "ALLOCATOR OVERLAP: the writer's base and the clobbered byte are the SAME live allocation, so a live object occupies memory the runtime handed to this writer. Investigate allocation reuse, not the writer";
+    }
+    return "WRITER ESCAPED ITS BLOCK: the base register points into one live allocation and the write landed in a different one. The write crossed a block boundary — check the length or index that carried it there";
+}
+
+/// Explain a vtable clobber by asking where the *writer* thought it was writing.
+///
+/// Naming the writing function is not a diagnosis. `fmt::detail::to_pointer`
+/// legitimately writes into a formatting buffer; the question is why that
+/// buffer's address landed on a live object's vtable slot. There are exactly
+/// two ways that happens, and they need opposite repairs:
+///
+///   * The writer's own pointer is wrong. Its base register points into a
+///     *different* allocation than the byte it wrote, so it walked out of its
+///     buffer, or was handed a stale/garbage pointer. The defect is upstream of
+///     the write, in whatever produced that pointer.
+///   * The writer's pointer is right and the allocator is wrong. Base and
+///     target belong to the same allocation — which means the runtime handed
+///     that allocation out while a live object still occupied it, and the two
+///     objects overlap.
+///
+/// One line decides which. Without it the report names a function and leaves
+/// the reader to guess, which is how a corrupted-buffer bug and an overlapping
+/// -allocation bug become indistinguishable.
+///
+/// Diagnostic-only: reached solely from the clobber path, which is already
+/// throttled, and `containingAllocation` scans allocations linearly.
+pub fn reportClobberWriterProvenance(self: anytype, target: u64) void {
+    const target_allocation = self.memory_forwarder.containingAllocation(target);
+
+    const bytes = self.guestMemoryConst(self.regs.rip, 16) orelse {
+        machoCapturePrint(
+            "macho-processor: vtable clobber provenance: target=0x{x} writer_rip=0x{x} decode=unavailable; the writing instruction's bytes are unreadable, so the address expression cannot be recovered\n",
+            .{ target, self.regs.rip },
+        );
+        return;
+    };
+    const decoded = decodeInsn(bytes);
+    const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
+    const base_value = if (decoded.sib_has_base)
+        x64_decoder.regVal(&self.regs, decoded.sib_base_reg, address_size)
+    else
+        0;
+    const base_allocation = if (decoded.sib_has_base)
+        self.memory_forwarder.containingAllocation(base_value)
+    else
+        null;
+
+    // The verdict. Same allocation on both sides means the writer was inside
+    // its own block and the block overlapped a live object.
+    const verdict = clobberVerdict(
+        decoded.sib_has_base,
+        if (base_allocation) |block| block.base else null,
+        if (target_allocation) |block| block.base else null,
+    );
+
+    machoCapturePrint(
+        "macho-processor: vtable clobber provenance: target=0x{x} writer_rip=0x{x} op={s} base({s})=0x{x} index({s},scale={d}) disp=0x{x} target_block={s} base_block={s} verdict={s}\n",
+        .{
+            target,
+            self.regs.rip,
+            @tagName(decoded.op),
+            if (decoded.sib_has_base) @tagName(decoded.sib_base_reg) else "<none>",
+            base_value,
+            if (decoded.sib_has_index) @tagName(decoded.sib_index_reg) else "<none>",
+            @as(u8, 1) << decoded.sib_scale,
+            decoded.addr,
+            if (target_allocation != null) "live" else "<untracked>",
+            if (base_allocation != null) "live" else "<untracked>",
+            verdict,
+        },
+    );
+    if (target_allocation) |block| {
+        machoCapturePrint(
+            "macho-processor: vtable clobber provenance:   target block base=0x{x} size={d} offset=0x{x}\n",
+            .{ block.base, block.size, block.offset },
+        );
+    }
+    if (base_allocation) |block| {
+        machoCapturePrint(
+            "macho-processor: vtable clobber provenance:   writer block base=0x{x} size={d} offset=0x{x} bytes_to_end={d}\n",
+            .{ block.base, block.size, block.offset, block.size - block.offset },
+        );
+    }
 }
 
 pub fn hasLiveAllocationVtableHistory(self: anytype, address: u64) bool {
@@ -4092,6 +4242,7 @@ fn recordAllocationWriteKind(
                 mutation_length,
             },
         );
+        reportClobberWriterProvenance(self, addr);
     }
 
     // Write-side vptr protection: when a zero/small-value write clears a
@@ -6001,4 +6152,49 @@ test "an unwarmed memo matches nothing" {
     // as executable before anything has been looked up.
     try std.testing.expect(!cachedSectionExecutable(&host, 0));
     try std.testing.expect(!cachedSectionExecutable(&host, 1));
+}
+
+// The verdict is the sentence a reader acts on. Getting it backwards sends the
+// investigation at the allocator when the writer's pointer was stale, or at the
+// writer when the runtime handed out memory that was still in use.
+test "a vtable clobber verdict separates a bad writer pointer from allocator overlap" {
+    const a: u64 = 0x1000;
+    const b: u64 = 0x2000;
+
+    // Writer inside its own block, and that block also holds the live object:
+    // the allocator handed out occupied memory.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        clobberVerdict(true, a, a),
+        "ALLOCATOR OVERLAP",
+    ));
+
+    // Writer's base in one block, write landed in another: it walked out.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        clobberVerdict(true, a, b),
+        "WRITER ESCAPED ITS BLOCK",
+    ));
+
+    // Base register points at nothing tracked: the pointer itself is the bug.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        clobberVerdict(true, null, a),
+        "WRITER POINTER IS NOT A LIVE ALLOCATION",
+    ));
+
+    // These two are findings, not accusations, and must not claim either bug.
+    const past_end = clobberVerdict(true, a, null);
+    try std.testing.expect(std.mem.indexOf(u8, past_end, "past the end") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_end, "ALLOCATOR OVERLAP") == null);
+
+    const neither = clobberVerdict(true, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, neither, "outside the forwarded arena") != null);
+    try std.testing.expect(std.mem.indexOf(u8, neither, "WRITER ESCAPED") == null);
+
+    // No base register: the address came from a displacement or index, so
+    // neither conclusion is available and the report must not invent one.
+    const no_base = clobberVerdict(false, a, a);
+    try std.testing.expect(std.mem.indexOf(u8, no_base, "no base register") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_base, "ALLOCATOR OVERLAP") == null);
 }

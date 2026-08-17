@@ -9,6 +9,20 @@
 //! most recent near-null dispatches, so a casualty report can show the
 //! behaviors that fed into it.
 //!
+//! Noise control — a near-null *first argument* is not always a receiver:
+//!   * Allocators (`operator new`/`delete`, malloc family) take a size or a
+//!     pointer that is legal to delete when null; they never dereference it.
+//!   * Syscalls take file descriptors / clock ids / addresses that are legal
+//!     to be 0 (`mmap(NULL)` requests any mapping; `pthread_threadid_np(NULL)`
+//!     means the calling thread).
+//! Those symbols are filtered out entirely so the retained signatures are
+//! receiver-shaped: a near-null rdi on a call that will dereference it.
+//!
+//! The caller is the saved return address at dispatch (the guest call site
+//! that entered the import thunk), resolved to a symbol when the address lies
+//! inside the image, and always printed as a raw address so unattributable
+//! callers (JIT code, dylibs) remain solvable offline.
+//!
 //! Logging is throttled: one `NEAR NULL PREDICTOR:` line on first sight, then
 //! at most a few more per signature (receiver change or doubling thresholds),
 //! so a hot near-null loop cannot flood the log. `dump` is called only from
@@ -23,6 +37,10 @@ const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 pub const NEAR_NULL_LIMIT: u64 = 0x1000;
 pub const SIGNATURE_CAPACITY: usize = 32;
 pub const RECENT_CAPACITY: usize = 16;
+/// Bounded history of object-header clobbers — one event per tracked object
+/// whose vptr was observed reading low. Each is a distinct object/address, so
+/// the ring is inherently throttled; a hot clobber loop can still only hold 8.
+pub const CLOBBER_CAPACITY: usize = 8;
 /// Cap per-signature emissions so a recurring signature cannot spam the log.
 pub const MAX_EMISSIONS_PER_SIGNATURE: u32 = 4;
 
@@ -47,21 +65,57 @@ const Recent = struct {
     step: u64 = 0,
 };
 
+/// A tracked C++ object whose header was zeroed by a bypassing bulk/native
+/// write. The vtable tracker observed the vptr slot reading low and repaired
+/// it; every other zeroed pointer slot in the header was *not* repaired and is
+/// the predicted near-null: the next native member call that reads one of
+/// those fields (e.g. an ownership pointer at +0x8) will carry a null
+/// receiver and fault. Fires at the first vptr re-read after the clobber,
+/// which precedes the member call that dereferences the field.
+const ClobberEvent = struct {
+    valid: bool = false,
+    object_base: u64 = 0,
+    /// Vtable symbol (the object's type), e.g. `__ZTVN2xe6kernel10UserModuleE`.
+    type_symbol: []const u8 = "",
+    allocation_size: u64 = 0,
+    /// Bit i set => the 8-byte slot at object_base + i*8 read as zero.
+    zeroed_mask: u64 = 0,
+    step: u64 = 0,
+    /// Last write the vtable tracker accepted on this slot before the clobber
+    /// (usually the constructor) — the clobber happened inside this window.
+    last_write_step: u64 = 0,
+};
+
 pub const Predictor = struct {
     signatures: [SIGNATURE_CAPACITY]Signature = [_]Signature{.{}} ** SIGNATURE_CAPACITY,
     recent: [RECENT_CAPACITY]Recent = [_]Recent{.{}} ** RECENT_CAPACITY,
     recent_index: usize = 0,
     recent_filled: bool = false,
     near_null_dispatches: u64 = 0,
+    benign_skipped: u64 = 0,
     distinct_signatures: u32 = 0,
     emissions: u64 = 0,
+    clobber: [CLOBBER_CAPACITY]ClobberEvent = [_]ClobberEvent{.{}} ** CLOBBER_CAPACITY,
+    clobber_index: usize = 0,
+    clobber_filled: bool = false,
+    clobber_events: u64 = 0,
 
     /// Hot path — one compare for the overwhelming majority of dispatches.
-    /// Only near-null receivers resolve the caller and touch the table.
+    /// Only near-null receivers on receiver-shaped imports resolve the caller
+    /// and touch the table.
     pub fn note(self: *Predictor, state: anytype, symbol: []const u8) void {
         const receiver = state.regs.rdi;
         if (receiver >= NEAR_NULL_LIMIT) return;
         self.near_null_dispatches +|= 1;
+        // Two different reasons a near-null rdi here predicts nothing: the
+        // argument is not a pointer at all, or it is a pointer whose null value
+        // is the documented request for a default. Either way retaining it
+        // spends a signature slot on a correct call and teaches the reader to
+        // distrust the tool.
+        if (isBenignSmallIntArgImport(symbol) or isDocumentedNullSentinelImport(symbol)) {
+            self.benign_skipped +|= 1;
+            return;
+        }
 
         const caller = importCallerAddress(state);
         const signature = self.findOrInsert(symbol, caller) orelse return;
@@ -92,12 +146,12 @@ pub const Predictor = struct {
         for (&self.signatures) |*signature| {
             if (!signature.valid) continue;
             retained += 1;
-            const caller_symbol = resolveSymbolName(state, signature.caller);
+            const caller_label = resolveCallerLabel(state, signature.caller);
             machoCapturePrint(
                 "NEAR NULL PREDICTOR: signature symbol={s} caller={s} receiver=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d}\n",
                 .{
                     signature.symbol,
-                    caller_symbol,
+                    caller_label,
                     signature.receiver,
                     signature.count,
                     signature.first_seen_step,
@@ -107,12 +161,13 @@ pub const Predictor = struct {
             );
         }
         machoCapturePrint(
-            "NEAR NULL PREDICTOR: dump reason={s} distinct={d} retained={d} near_null_dispatches={d} recent_window={d} emissions={d}\n",
+            "NEAR NULL PREDICTOR: dump reason={s} distinct={d} retained={d} near_null_dispatches={d} benign_skipped={d} recent_window={d} emissions={d}\n",
             .{
                 reason,
                 self.distinct_signatures,
                 retained,
                 self.near_null_dispatches,
+                self.benign_skipped,
                 self.recentCount(),
                 self.emissions,
             },
@@ -129,21 +184,128 @@ pub const Predictor = struct {
         );
         for (0..count) |ordinal| {
             const recent = self.recentChronological(ordinal) orelse continue;
-            const caller_symbol = resolveSymbolName(state, recent.caller);
+            const caller_label = resolveCallerLabel(state, recent.caller);
             machoCapturePrint(
                 "  [{d}] symbol={s} caller={s} receiver=0x{x} step={d}\n",
-                .{ ordinal, recent.symbol, caller_symbol, recent.receiver, recent.step },
+                .{ ordinal, recent.symbol, caller_label, recent.receiver, recent.step },
             );
         }
     }
 
+    /// A tracked object's vptr was observed reading low and repaired by the
+    /// vtable tracker. Scan results arrive as the zeroed slot offsets (bytes,
+    /// ascending, including 0 for the vptr). Record the event and predict the
+    /// casualty it produces: the next member call reading a zeroed header
+    /// field carries a null receiver.
+    pub fn noteObjectHeaderClobber(
+        self: *Predictor,
+        state: anytype,
+        object_base: u64,
+        type_symbol: []const u8,
+        allocation_size: u64,
+        zeroed_slots_bytes: []const u64,
+        last_write_step: u64,
+    ) void {
+        var mask: u64 = 0;
+        for (zeroed_slots_bytes) |off| {
+            if (off % 8 != 0) continue;
+            const slot: u6 = @intCast(@min(off / 8, 63));
+            mask |= @as(u64, 1) << slot;
+        }
+        self.clobber[self.clobber_index] = .{
+            .valid = true,
+            .object_base = object_base,
+            .type_symbol = type_symbol,
+            .allocation_size = allocation_size,
+            .zeroed_mask = mask,
+            .step = state.executed_steps,
+            .last_write_step = last_write_step,
+        };
+        self.clobber_index += 1;
+        if (self.clobber_index == CLOBBER_CAPACITY) {
+            self.clobber_index = 0;
+            self.clobber_filled = true;
+        }
+        self.clobber_events +|= 1;
+
+        // The zeroed-slot list is short and the event is rare, so building a
+        // small string is fine. Slot 0 is the vptr — labelled restored, since
+        // the tracker wrote the trusted value back over it.
+        var slots_buf: [128]u8 = undefined;
+        var slots_len: usize = 0;
+        const head = "+0x0[vptr->restored]";
+        @memcpy(slots_buf[0..head.len], head);
+        slots_len = head.len;
+        for (zeroed_slots_bytes) |off| {
+            if (off == 0) continue;
+            const part = std.fmt.bufPrint(slots_buf[slots_len..], ",+0x{x}", .{off}) catch break;
+            slots_len += part.len;
+        }
+        machoCapturePrint(
+            "NEAR NULL PREDICTOR: object_header_clobber object=0x{x} type={s} allocation_size={d} zeroed_slots={s} clobber_window=[{d}..{d}] writer=bypassing bulk/native write (not intercepted by vtable write tracking); predicted=the next native member call reading a zeroed header field will carry a null receiver — the lowest non-vptr zeroed offset is the prime suspect\n",
+            .{
+                object_base,
+                type_symbol,
+                allocation_size,
+                slots_buf[0..slots_len],
+                last_write_step,
+                state.executed_steps,
+            },
+        );
+    }
+
+    /// Recent object-header clobbers, oldest first. Called from the terminal
+    /// near-null dump so a casualty whose callee read one of these objects'
+    /// zeroed fields is correlated with its producer.
+    pub fn dumpClobber(self: *Predictor, state: anytype) void {
+        const count = self.clobberCount();
+        if (count == 0) return;
+        machoCapturePrint(
+            "NEAR NULL PREDICTOR: object-header clobber history ({d}):\n",
+            .{count},
+        );
+        for (0..count) |ordinal| {
+            const event = self.clobberChronological(ordinal) orelse continue;
+            machoCapturePrint(
+                "  [{d}] object=0x{x} type={s} allocation_size={d} zeroed_mask=0x{x} clobber_step={d} age_steps={d} window=[{d}..{d}]\n",
+                .{
+                    ordinal,
+                    event.object_base,
+                    event.type_symbol,
+                    event.allocation_size,
+                    event.zeroed_mask,
+                    event.step,
+                    state.executed_steps -| event.step,
+                    event.last_write_step,
+                    event.step,
+                },
+            );
+        }
+        machoCapturePrint(
+            "NEAR NULL PREDICTOR: if the terminal casualty's callee read one of these objects' zeroed header fields, the matching clobber event above is its producer — hunt the bypassing bulk write inside that window\n",
+            .{},
+        );
+    }
+
+    fn clobberCount(self: *const Predictor) usize {
+        return if (self.clobber_filled) CLOBBER_CAPACITY else self.clobber_index;
+    }
+
+    fn clobberChronological(self: *const Predictor, ordinal: usize) ?ClobberEvent {
+        const count = self.clobberCount();
+        if (ordinal >= count) return null;
+        const start: usize = if (self.clobber_filled) self.clobber_index else 0;
+        const event = self.clobber[(start + ordinal) % CLOBBER_CAPACITY];
+        return if (event.valid) event else null;
+    }
+
     fn emitSignature(self: *Predictor, state: anytype, signature: *const Signature, first_sight: bool) void {
         self.emissions +|= 1;
-        const caller_symbol = resolveSymbolName(state, signature.caller);
+        const caller_label = resolveCallerLabel(state, signature.caller);
         const kind: []const u8 = if (first_sight) "first_sight" else "recurrence";
         machoCapturePrint(
             "NEAR NULL PREDICTOR: {s} symbol={s} caller={s} rdi=0x{x} count={d} step={d} threshold=0x{x}\n",
-            .{ kind, signature.symbol, caller_symbol, signature.receiver, signature.count, signature.last_seen_step, NEAR_NULL_LIMIT },
+            .{ kind, signature.symbol, caller_label, signature.receiver, signature.count, signature.last_seen_step, NEAR_NULL_LIMIT },
         );
     }
 
@@ -176,19 +338,27 @@ pub const Predictor = struct {
             self.distinct_signatures +|= 1;
             return &self.signatures[slot];
         }
-        // Table full of distinct signatures: evict the least recently seen so
-        // the newest behavior always has a home. O(capacity) only on a full
-        // table during a near-null dispatch — negligible.
-        var oldest_index: usize = 0;
-        var oldest_seen: u64 = std.math.maxInt(u64);
+        // Table full of distinct signatures. Evict the *least important*
+        // signature — lowest hit count, oldest step as a tiebreak — so a
+        // hot recurring behavior is never displaced by a one-off. (Evicting
+        // by step alone thrashes when `executed_steps` is 0 during early
+        // init, which is what made the old predictor print the same
+        // `first_sight` over and over.)
+        var victim: ?usize = null;
+        var victim_count: u32 = std.math.maxInt(u32);
+        var victim_step: u64 = std.math.maxInt(u64);
         for (&self.signatures, 0..) |*signature, i| {
             if (!signature.valid) continue;
-            if (signature.last_seen_step < oldest_seen) {
-                oldest_seen = signature.last_seen_step;
-                oldest_index = i;
+            const better_count = signature.count < victim_count;
+            const same_count = signature.count == victim_count and signature.last_seen_step < victim_step;
+            if (better_count or same_count) {
+                victim = i;
+                victim_count = signature.count;
+                victim_step = signature.last_seen_step;
             }
         }
-        self.signatures[oldest_index] = .{
+        const slot = victim orelse return null;
+        self.signatures[slot] = .{
             .valid = true,
             .symbol_hash = hash,
             .symbol = symbol,
@@ -199,7 +369,7 @@ pub const Predictor = struct {
             .first_seen_step = 0,
             .last_seen_step = 0,
         };
-        return &self.signatures[oldest_index];
+        return &self.signatures[slot];
     }
 
     fn pushRecent(self: *Predictor, symbol: []const u8, caller: u64, receiver: u64, step: u64) void {
@@ -234,19 +404,212 @@ pub const Predictor = struct {
     }
 };
 
+/// The guest call site that entered the import thunk: the saved return
+/// address at `[rsp]`. The native stack is *not* guest memory, so a
+/// `guestMemoryConst` gate (as the first version used) always failed and every
+/// caller collapsed to the thunk address — read the stack directly, exactly
+/// like the proven `handleImport` path.
 fn importCallerAddress(state: anytype) u64 {
-    if (state.regs.rsp == 0 or state.guestMemoryConst(state.regs.rsp, @sizeOf(u64)) == null) {
-        return state.regs.rip;
-    }
-    return state.read64(state.regs.rsp);
+    if (state.regs.rsp == 0) return state.regs.rip;
+    const caller = state.read64(state.regs.rsp);
+    return if (caller != 0) caller else state.regs.rip;
 }
 
-fn resolveSymbolName(state: anytype, address: u64) []const u8 {
-    if (address == 0) return "<null>";
-    if (@hasDecl(@TypeOf(state.*), "metadata")) {
-        if (state.metadata.nearestSymbol(address)) |symbol| return symbol.name;
+/// Format `name@0xADDR` when the address resolves inside the image, else
+/// `0xADDR<unknown>`. The raw address is always present so an unattributable
+/// caller (JIT code, dylib) is still solvable offline.
+fn resolveCallerLabel(state: anytype, caller: u64) []const u8 {
+    if (caller == 0) return "0x0<null>";
+    var buffer: [160]u8 = undefined;
+    const name: []const u8 = if (@hasDecl(@TypeOf(state.*), "metadata"))
+        if (state.metadata.nearestSymbol(caller)) |symbol| symbol.name else ""
+    else
+        "";
+    if (name.len == 0) {
+        return std.fmt.bufPrint(&buffer, "0x{x}<unknown>", .{caller}) catch "0x0<unknown>";
     }
-    return "<unknown>";
+    return std.fmt.bufPrint(&buffer, "{s}@0x{x}", .{ name, caller }) catch "0x0<unknown>";
+}
+
+/// Symbols whose first argument is a *pointer* for which null is the documented
+/// way to ask for a default, not a mistake.
+///
+/// Kept separate from the scalar list on purpose. These genuinely take a
+/// pointer in rdi, so the shape check cannot dismiss them — what dismisses them
+/// is the API contract, and a reader deciding whether to add a symbol needs to
+/// know which of the two questions they are answering. Mixing them into one bag
+/// invites adding a real receiver because "the other entries looked similar".
+fn isDocumentedNullSentinelImport(name: []const u8) bool {
+    const exact = [_][]const u8{
+        // SDL_OpenAudioDevice(NULL, ...) requests the default output device.
+        // Passing a device name is the *unusual* call; null is the norm.
+        "_SDL_OpenAudioDevice",
+        // SDL_AudioInit(NULL) / SDL_VideoInit(NULL) select the default driver.
+        "_SDL_AudioInit",
+        "_SDL_VideoInit",
+        // SDL_GetHint / SDL_SetHint with a null name is a documented no-op
+        // returning null, not a dereference.
+        "_SDL_GetHintBoolean",
+    };
+    for (exact) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+/// Symbols whose first argument is a small integer / size / fd / clock id /
+/// legal-null pointer rather than a receiver that will be dereferenced.
+/// A near-null rdi on these can never produce a near-null casualty, so they
+/// are skipped to keep the retained signatures receiver-shaped.
+fn isBenignSmallIntArgImport(name: []const u8) bool {
+    const exact = [_][]const u8{
+        // C++ allocation / deallocation — size arg, or a pointer that the
+        // standard permits to be null (`delete nullptr` is a no-op).
+        "__Znwm", // operator new(unsigned long)
+        "__Znam", // operator new[](unsigned long)
+        "__ZnwmRKSt9nothrow_t",
+        "__ZnamRKSt9nothrow_t",
+        "__ZdlPv", // operator delete(void*)
+        "__ZdaPv", // operator delete[](void*)
+        "__ZdlPvm", // sized operator delete
+        "__ZdaPvm",
+        "_malloc",
+        "_calloc",
+        "_realloc",
+        "_free",
+        // fd / dirfd / clockid first args — integers, never dereferenced.
+        "_write",
+        "_read",
+        "_pwrite",
+        "_pread",
+        "_close",
+        "_open",
+        "_openat",
+        "_fcntl",
+        "_fstat",
+        "_fstatat",
+        "_ftruncate",
+        "_lseek",
+        "_dup",
+        "_dup2",
+        "_dirfd",
+        "_opendir",
+        "_closedir",
+        "_readdir",
+        "_fsync",
+        "_fchmod",
+        "_fchown",
+        "_flock",
+        // mmap(NULL) requests any mapping; munmap/madvise of 0 is a no-op.
+        "_mmap",
+        "_munmap",
+        "_madvise",
+        "_mlock",
+        "_munlock",
+        "_msync",
+        // clockid first arg.
+        "_clock_gettime",
+        "_clock_getres",
+        "_clock_settime",
+        "_nanosleep",
+        // pthread_threadid_np(NULL) means the calling thread.
+        "_pthread_threadid_np",
+        // Takes no meaningful first arg.
+        "___error",
+        // Size arg (hash table growth).
+        "__ZNSt3__112__next_primeEm",
+        // Exception object size.
+        "___cxa_allocate_exception",
+        // Signal number (SIGILL=4, SIGSEGV=0xb, ...).
+        "_sigaction",
+        // GtkOrientation / GtkWindowType / GType enums.
+        "_gtk_box_new",
+        "_gtk_window_new",
+        "_gtk_window_get_type",
+        "_gtk_container_get_type",
+        // No-argument accessors; rdi is register-allocation garbage.
+        "_pthread_self",
+        "_objc_autoreleasePoolPush",
+        // nl_item / sysconf name / socket domain / SDL log priority enums.
+        "_nl_langinfo",
+        "_sysconf",
+        "_socket",
+        "_SDL_LogSetAllPriority",
+        // ffs(x) — the first arg is the integer value being scanned.
+        "_ffs",
+        // time(NULL) is the standard call form and never dereferences.
+        "_time",
+        // pthread_key_t is an opaque index, not a pointer.
+        "_pthread_setspecific",
+        // fd first arg.
+        "_fdopen",
+        // CCOperation enum (0=encrypt, 1=decrypt).
+        "_CCCrypt",
+        // Aligned operator new/delete — size / align, never dereferenced.
+        "__ZnwmSt11align_val_t",
+        "__ZnamSt11align_val_t",
+        "__ZnwmSt11align_val_tRKSt9nothrow_t",
+        "__ZnamSt11align_val_tRKSt9nothrow_t",
+        "__ZdlPvSt11align_val_t",
+        "__ZdaPvSt11align_val_t",
+        // asctime(NULL) is tolerated by the Darwin libc path (returns without
+        // dereferencing), and the observed single dispatch never produced a
+        // casualty across a 2.9B-step run — first arg is not a receiver here.
+        "_asctime",
+        // <stdlib.h> integer functions. `abs(0)` is the single most misleading
+        // prediction the tool can make: rdi is the value being operated on, so
+        // a "near-null receiver" here is just a small number, and small numbers
+        // are what these take.
+        "_abs",
+        "_labs",
+        "_llabs",
+        "_exit",
+        "__exit",
+        "_srand",
+        "_srandom",
+        // Integer seconds / microseconds / fd.
+        "_sleep",
+        "_usleep",
+        "_alarm",
+        "_isatty",
+        // SDL: scalar first argument. SDL_AudioDeviceID, an SDL_INIT_* mask, or
+        // a device/joystick index — all integers, none dereferenced. A device
+        // id of 0x101 or a subsystem mask of 0x10 is a correct call, not a
+        // near-null receiver.
+        "_SDL_Init",
+        "_SDL_InitSubSystem",
+        "_SDL_QuitSubSystem",
+        "_SDL_WasInit",
+        "_SDL_PauseAudioDevice",
+        "_SDL_CloseAudioDevice",
+        "_SDL_LockAudioDevice",
+        "_SDL_UnlockAudioDevice",
+        "_SDL_GetAudioDeviceStatus",
+        "_SDL_ClearQueuedAudio",
+        "_SDL_GetQueuedAudioSize",
+        "_SDL_GetAudioDeviceName",
+        "_SDL_GetAudioDriver",
+        "_SDL_IsGameController",
+        "_SDL_GameControllerOpen",
+        "_SDL_JoystickOpen",
+        "_SDL_JoystickNameForIndex",
+        "_SDL_Delay",
+    };
+    for (exact) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    // std::chrono::{steady,system,high_resolution}_clock::now() — static,
+    // zero-argument; the observed rdi is register-allocation garbage, never a
+    // receiver. Mangled form ends `3nowEv` (now() taking no args).
+    if (std.mem.endsWith(u8, name, "3nowEv")) return true;
+    // Darwin symbol-suffix variants: `_fstatat$INODE64`, `_fstat$INODE64$UNIX2003`.
+    if (std.mem.indexOf(u8, name, "$INODE64")) |at| {
+        const base = name[0..at];
+        for (exact) |candidate| {
+            if (std.mem.eql(u8, base, candidate)) return true;
+        }
+    }
+    return false;
 }
 
 test "predictor records first sight and recurrence separately" {
@@ -260,9 +623,10 @@ test "predictor records first sight and recurrence separately" {
         executed_steps: u64 = 0,
 
         fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            _ = self;
             _ = address;
             _ = length;
-            return self.mem[0..1];
+            return null;
         }
 
         fn read64(self: *const @This(), address: u64) u64 {
@@ -306,13 +670,15 @@ test "predictor records first sight and recurrence separately" {
     try std.testing.expectEqual(@as(u32, 2), predictor.distinct_signatures);
 }
 
-test "predictor records when rsp is unavailable" {
+test "predictor reads the real caller off the native stack even when guestMemoryConst declines it" {
+    // The first predictor version gated the caller read on guestMemoryConst,
+    // which the native stack fails — every caller collapsed to `<unknown>`.
     var predictor = Predictor{};
     const TestState = struct {
         regs: struct {
             rdi: u64 = 0,
             rip: u64 = 0x1000,
-            rsp: u64 = 0,
+            rsp: u64 = 0x70000000,
         } = .{},
         executed_steps: u64 = 0,
 
@@ -326,12 +692,258 @@ test "predictor records when rsp is unavailable" {
         fn read64(self: *const @This(), address: u64) u64 {
             _ = self;
             _ = address;
-            return 0;
+            return 0x2cc511;
         }
     };
     var state = TestState{};
-    // rsp = 0 -> caller falls back to rip; still recorded.
-    predictor.note(&state, "_ZNK5Xbyak12LabelManager23hasUndefinedLabel_inner...");
+    predictor.note(&state, "_ZStls...EPKc");
+    const signature = predictor.findOrInsert("_ZStls...EPKc", 0x2cc511).?;
+    try std.testing.expectEqual(@as(u32, 1), signature.count);
+    try std.testing.expectEqual(@as(u64, 0x2cc511), signature.caller);
+}
+
+test "predictor skips benign small-int-arg imports but counts them" {
+    var predictor = Predictor{};
+    const TestState = struct {
+        regs: struct {
+            rdi: u64 = 0,
+            rip: u64 = 0x1000,
+            rsp: u64 = 0x8000,
+        } = .{},
+        executed_steps: u64 = 0,
+
+        fn read64(self: *const @This(), address: u64) u64 {
+            _ = self;
+            _ = address;
+            return 0x2000;
+        }
+    };
+    var state = TestState{};
+    state.executed_steps = 10;
+
+    // operator new with a tiny size: near-null rdi but never a receiver.
+    predictor.note(&state, "__Znwm");
     try std.testing.expectEqual(@as(u64, 1), predictor.near_null_dispatches);
+    try std.testing.expectEqual(@as(u64, 1), predictor.benign_skipped);
+    try std.testing.expectEqual(@as(u32, 0), predictor.distinct_signatures);
+
+    // fd-arg syscall with a suffix variant.
+    predictor.note(&state, "_fstatat$INODE64");
+    try std.testing.expectEqual(@as(u64, 2), predictor.near_null_dispatches);
+    try std.testing.expectEqual(@as(u64, 2), predictor.benign_skipped);
+    try std.testing.expectEqual(@as(u32, 0), predictor.distinct_signatures);
+
+    // The run's actual retained set: aligned operator new (size), signal
+    // numbers, GTK enums, ffs value, CCCrypt operation, time(NULL).
+    predictor.note(&state, "__ZnwmSt11align_val_t");
+    predictor.note(&state, "_sigaction");
+    predictor.note(&state, "_gtk_box_new");
+    predictor.note(&state, "_ffs");
+    predictor.note(&state, "_CCCrypt");
+    predictor.note(&state, "_time");
+    try std.testing.expectEqual(@as(u64, 8), predictor.near_null_dispatches);
+    try std.testing.expectEqual(@as(u64, 8), predictor.benign_skipped);
+    try std.testing.expectEqual(@as(u32, 0), predictor.distinct_signatures);
+
+    // This run's retained pair: steady_clock::now() (zero-arg static, rdi is
+    // register garbage) and asctime(NULL) (Darwin tolerates, never a casualty).
+    predictor.note(&state, "__ZNSt3__16chrono12steady_clock3nowEv");
+    predictor.note(&state, "__ZNSt3__16chrono11system_clock3nowEv");
+    predictor.note(&state, "_asctime");
+    try std.testing.expectEqual(@as(u64, 11), predictor.near_null_dispatches);
+    try std.testing.expectEqual(@as(u64, 11), predictor.benign_skipped);
+    try std.testing.expectEqual(@as(u32, 0), predictor.distinct_signatures);
+
+    // A receiver-shaped import is still recorded.
+    predictor.note(&state, "_ZStls...EPKc");
+    try std.testing.expectEqual(@as(u64, 12), predictor.near_null_dispatches);
     try std.testing.expectEqual(@as(u32, 1), predictor.distinct_signatures);
+}
+
+test "predictor full-table eviction prefers the least-used signature" {
+    var predictor = Predictor{};
+    const TestState = struct {
+        regs: struct {
+            rdi: u64 = 0,
+            rip: u64 = 0x1000,
+            rsp: u64 = 0x8000,
+        } = .{},
+        executed_steps: u64 = 0,
+
+        fn read64(self: *const @This(), address: u64) u64 {
+            _ = self;
+            _ = address;
+            return 0x2000;
+        }
+    };
+    var state = TestState{};
+    state.executed_steps = 10;
+
+    // Fill the table with distinct signatures.
+    var i: usize = 0;
+    while (i < SIGNATURE_CAPACITY) : (i += 1) {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "sym_{d}", .{i}) catch unreachable;
+        predictor.note(&state, name);
+        state.executed_steps += 1;
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(SIGNATURE_CAPACITY)), predictor.distinct_signatures);
+
+    // Make the first signature hot by re-hitting it several times.
+    var j: usize = 0;
+    while (j < 8) : (j += 1) {
+        predictor.note(&state, "sym_0");
+        state.executed_steps += 1;
+    }
+    const hot = predictor.findOrInsert("sym_0", 0x2000).?;
+    try std.testing.expectEqual(@as(u32, 9), hot.count);
+
+    // Inserting one more distinct signature evicts the least-used entry, and
+    // the hot one survives.
+    predictor.note(&state, "sym_extra");
+    try std.testing.expectEqual(@as(u32, @intCast(SIGNATURE_CAPACITY)), predictor.distinct_signatures);
+    try std.testing.expectEqual(@as(u32, 9), predictor.findOrInsert("sym_0", 0x2000).?.count);
+}
+
+test "predictor records object-header clobbers and builds the zeroed-slot mask" {
+    var predictor = Predictor{};
+    const TestState = struct {
+        executed_steps: u64 = 0,
+    };
+    var state = TestState{};
+    state.executed_steps = 1_000_000;
+
+    // The UserModule casualty shape from the run: header zeroed through +0x10
+    // by a bypassing bulk write, vptr restored by the tracker.
+    const zeroed = [_]u64{ 0, 0x8, 0x10 };
+    predictor.noteObjectHeaderClobber(
+        &state,
+        0x17202dd0,
+        "__ZTVN2xe6kernel10UserModuleE",
+        224,
+        &zeroed,
+        69_975_627,
+    );
+    try std.testing.expectEqual(@as(u64, 1), predictor.clobber_events);
+    try std.testing.expectEqual(@as(usize, 1), predictor.clobberCount());
+    const event = predictor.clobberChronological(0).?;
+    try std.testing.expectEqual(@as(u64, 0x17202dd0), event.object_base);
+    // Bits 0, 1, 2 set (slots at +0x0, +0x8, +0x10).
+    try std.testing.expectEqual(@as(u64, 0b111), event.zeroed_mask);
+    try std.testing.expectEqual(@as(u64, 1_000_000), event.step);
+    try std.testing.expectEqual(@as(u64, 69_975_627), event.last_write_step);
+
+    // A second clobber on a different object is recorded as a separate event.
+    state.executed_steps = 2_000_000;
+    const zeroed2 = [_]u64{ 0, 0x8 };
+    predictor.noteObjectHeaderClobber(&state, 0x18000000, "__ZTVN2xe3cpu9XexModuleE", 512, &zeroed2, 1_900_000);
+    try std.testing.expectEqual(@as(u64, 2), predictor.clobber_events);
+    try std.testing.expectEqual(@as(usize, 2), predictor.clobberCount());
+    try std.testing.expectEqual(@as(u64, 0b11), predictor.clobberChronological(1).?.zeroed_mask);
+
+    // Ring wrap: more events than capacity keep only the most recent.
+    var i: usize = 0;
+    while (i < CLOBBER_CAPACITY + 2) : (i += 1) {
+        state.executed_steps += 1;
+        const z = [_]u64{0};
+        predictor.noteObjectHeaderClobber(&state, 0x2000_0000 + i, "type", 64, &z, 0);
+    }
+    try std.testing.expectEqual(@as(usize, CLOBBER_CAPACITY), predictor.clobberCount());
+}
+
+// Every signature one observed run retained was a correct call. A predictor
+// whose whole retained set is false positives is worse than silence: it trains
+// the reader to skip its output, and the one real prediction arrives inside
+// noise that has already been learned to ignore.
+test "correct calls with a small first argument are not retained as predictions" {
+    const TestState = struct {
+        regs: struct { rdi: u64 = 0, rip: u64 = 0x1000, rsp: u64 = 0x7000_0000 } = .{},
+        executed_steps: u64 = 0,
+        fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            _ = self;
+            _ = address;
+            _ = length;
+            return null;
+        }
+        fn read64(self: *const @This(), address: u64) u64 {
+            _ = self;
+            _ = address;
+            return 0x30908b;
+        }
+    };
+
+    // Exactly the retained set from the observed run, with its observed rdi.
+    const observed = [_]struct { symbol: []const u8, rdi: u64 }{
+        .{ .symbol = "_abs", .rdi = 0x1 }, // abs(1)
+        .{ .symbol = "_abs", .rdi = 0x60 }, // abs(96)
+        .{ .symbol = "_abs", .rdi = 0x0 }, // abs(0)
+        .{ .symbol = "_abs", .rdi = 0x50 }, // abs(80)
+        .{ .symbol = "_abs", .rdi = 0x3 }, // abs(3)
+        .{ .symbol = "_SDL_InitSubSystem", .rdi = 0x10 }, // SDL_INIT_AUDIO
+        .{ .symbol = "_SDL_OpenAudioDevice", .rdi = 0x0 }, // NULL = default device
+        .{ .symbol = "_SDL_PauseAudioDevice", .rdi = 0x101 }, // device id 257
+    };
+
+    var predictor = Predictor{};
+    var state = TestState{};
+    for (observed) |call| {
+        state.regs.rdi = call.rdi;
+        predictor.note(&state, call.symbol);
+    }
+
+    // Counted, so the accounting still adds up, but nothing retained.
+    try std.testing.expectEqual(@as(u64, observed.len), predictor.near_null_dispatches);
+    try std.testing.expectEqual(@as(u64, observed.len), predictor.benign_skipped);
+    try std.testing.expectEqual(@as(u32, 0), predictor.distinct_signatures);
+    try std.testing.expectEqual(@as(usize, 0), predictor.recent_index);
+    try std.testing.expect(!predictor.recent_filled);
+}
+
+// The suppression must be narrow. An SDL entry point that really does take a
+// pointer receiver has to keep predicting, or widening the list would quietly
+// blind the tool to the class of bug it exists for.
+test "a genuine null receiver is still retained after the benign lists grow" {
+    const TestState = struct {
+        regs: struct { rdi: u64 = 0, rip: u64 = 0x1000, rsp: u64 = 0x7000_0000 } = .{},
+        executed_steps: u64 = 0,
+        fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            _ = self;
+            _ = address;
+            _ = length;
+            return null;
+        }
+        fn read64(self: *const @This(), address: u64) u64 {
+            _ = self;
+            _ = address;
+            return 0x4444;
+        }
+    };
+    var predictor = Predictor{};
+    var state = TestState{};
+
+    // Takes SDL_AudioSpec*/SDL_Surface* — null here is a real defect.
+    state.regs.rdi = 0;
+    predictor.note(&state, "_SDL_FreeSurface");
+    predictor.note(&state, "_SDL_GameControllerName");
+    // A C++ member function is always receiver-shaped.
+    predictor.note(&state, "__ZNK2xe6kernel11KernelState6memoryEv");
+
+    try std.testing.expectEqual(@as(u64, 3), predictor.near_null_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), predictor.benign_skipped);
+    try std.testing.expectEqual(@as(u32, 3), predictor.distinct_signatures);
+}
+
+test "the two benign reasons stay separate and neither swallows the other" {
+    // Scalar-argument list: not a pointer at all.
+    try std.testing.expect(isBenignSmallIntArgImport("_abs"));
+    try std.testing.expect(isBenignSmallIntArgImport("_SDL_PauseAudioDevice"));
+    try std.testing.expect(!isDocumentedNullSentinelImport("_abs"));
+
+    // Sentinel list: a real pointer whose null value is the documented default.
+    try std.testing.expect(isDocumentedNullSentinelImport("_SDL_OpenAudioDevice"));
+    try std.testing.expect(!isBenignSmallIntArgImport("_SDL_OpenAudioDevice"));
+
+    // Neither list may claim a receiver-shaped symbol.
+    try std.testing.expect(!isBenignSmallIntArgImport("_SDL_FreeSurface"));
+    try std.testing.expect(!isDocumentedNullSentinelImport("_SDL_FreeSurface"));
 }
