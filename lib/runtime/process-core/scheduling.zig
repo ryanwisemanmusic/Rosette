@@ -586,7 +586,21 @@ pub fn finishActiveGuestThread(self: anytype) void {
         } else {
             self.pthreads.markCompleted(self.active_guest_thread);
             self.cooperative_thread_returns +|= 1;
-            machoCapturePrint("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
+            if (self.unhandled_cxx_thread == self.active_guest_thread) {
+                const type_symbol = self.metadata.nearestSymbol(self.unhandled_cxx_type_info);
+                machoCapturePrint(
+                    "macho-processor: cooperative guest thread returned AFTER AN UNMATCHED C++ EXCEPTION: handle=0x{x} type={s} main_thread={}; phase one found no compatible handler, so this thread unwound to a catch-all and ended. A thread that ends this way did not finish its work — read this as a termination, not a clean exit\n",
+                    .{
+                        self.active_guest_thread,
+                        if (type_symbol) |symbol| symbol.name else "<unknown>",
+                        self.active_guest_thread == self.pthreads.main_thread_handle,
+                    },
+                );
+                self.unhandled_cxx_thread = 0;
+                self.unhandled_cxx_type_info = 0;
+            } else {
+                machoCapturePrint("macho-processor: cooperative guest thread returned: handle=0x{x}\n", .{self.active_guest_thread});
+            }
             self.active_guest_thread = 0;
             resetActiveGuestSignalState(self);
         }

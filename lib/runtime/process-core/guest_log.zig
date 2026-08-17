@@ -10,6 +10,7 @@ const gpu = @import("gpu");
 const machoCapturePrint = macho_log.machoCapturePrint;
 const startup_observer = @import("diagnostics").startup_observer;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
+const guest_module_map = @import("diagnostics").guest_module_map;
 const preflight_lib = @import("preflight");
 const constants = @import("macho_core").constants;
 const utils = @import("macho_core").utils;
@@ -176,6 +177,7 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
         if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.summary_output_fd, "\n");
     }
 
+    observeGuestModuleImages(self, message);
     if (std.mem.startsWith(u8, message, "HostPathDevice::ResolvePath(User_")) {
         const storage_root = self.fs_forwarder.storageRoot();
         machoCapturePrint(
@@ -229,9 +231,94 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
                 writeMirroredLine(self, prefix, message);
             },
         }
+        // A cycle is not a run, so the collapser above correctly leaves it
+        // alone. Report it anyway: a guest rotating through the same handful of
+        // lines forever is a livelock, and it is indistinguishable from healthy
+        // activity if nobody counts the rotations.
+        if (self.guest_log_cycles.observe(message)) |cycle| {
+            machoCapturePrint(
+                "macho-processor: guest log cycle: the guest has repeated a {d}-line cycle {d} times with no new content (report {d}, step {d}). Interleaved lines never collapse, so the mirror keeps growing while the run makes no progress — treat this as a livelock until something outside the cycle appears\n",
+                .{ cycle.period, cycle.iterations, self.guest_log_cycles.reports, self.executed_steps },
+            );
+        }
     }
     self.guest_log_line_count +|= 1;
     return true;
+}
+
+/// Learn where the guest's module images live, and what each completed load
+/// transaction returned.
+///
+/// Same justification as the GPU-bootstrap observer below: the guest's own
+/// kernel tracing is the only place these events are visible without
+/// instrumenting the host program, and an image the guest mapped leaves no
+/// other trace Rosette can see. Both facts are parsed off lines the guest
+/// already emits; nothing here changes what the guest does.
+///
+/// Missing a line costs an attribution, never a wrong one — the map answers
+/// "no image covers this" for anything it did not observe, which is the honest
+/// answer rather than a guess.
+fn observeGuestModuleImages(self: anytype, message: []const u8) void {
+    // "...ReadImage post-decode transition path='<path>' patch=NO base=<hex> image_size=<hex>"
+    if (std.mem.indexOf(u8, message, "ReadImage post-decode transition")) |_| {
+        const path = guest_module_map.between(message, "path='", "'") orelse return;
+        const base = guest_module_map.hexAfter(message, " base=") orelse return;
+        const size = guest_module_map.hexAfter(message, " image_size=") orelse return;
+        self.guest_modules.noteImage(guest_module_map.leafName(path), base, size);
+        return;
+    }
+    // Any guest line reporting a faulting guest program counter. Attribution is
+    // the difference between "the title's own code misbehaved" and "the title
+    // branched somewhere no image was ever placed", and the address alone says
+    // neither.
+    if (guest_module_map.hexAfter(message, "guest_pc=")) |guest_pc| {
+        describeGuestAddress(self, guest_pc);
+        return;
+    }
+    // The ordinary XexLoadImage trace is emitted at function entry, so the
+    // value inside its out-parameter parentheses is the caller's PRE-CALL
+    // value. Only this explicit post-call line is an authoritative result.
+    if (std.mem.startsWith(u8, message, "XEX MODULE LOAD RESULT:")) {
+        const path = guest_module_map.between(message, "name='", "'") orelse return;
+        const status_value = guest_module_map.hexAfter(message, " status=") orelse return;
+        const handle = guest_module_map.hexAfter(message, " hmodule=") orelse return;
+        const status: u32 = @intCast(status_value);
+        const name = guest_module_map.leafName(path);
+        if (name.len == 0) return;
+        self.guest_modules.noteLoadResult(name, status, handle);
+        if (status == 0 and handle != 0) return;
+        self.guest_module_failed_loads +|= 1;
+        if (self.guest_module_failed_loads <= 8 or self.guest_module_failed_loads % 64 == 0) {
+            machoCapturePrint(
+                "macho-processor: guest module load failed: name={s} path='{s}' status=0x{x:0>8} handle=0x{x:0>8} failure={d} step={d}; this is an authoritative post-call result, not the old value of the out parameter\n",
+                .{ name, path, status, handle, self.guest_module_failed_loads, self.executed_steps },
+            );
+        }
+        return;
+    }
+}
+
+/// Name the module image containing a guest address, for fault reporting.
+pub fn describeGuestAddress(self: anytype, address: u64) void {
+    if (!self.guest_modules.active()) return;
+    if (self.guest_modules.attribute(address)) |found| {
+        machoCapturePrint(
+            "macho-processor: guest address attribution: address=0x{x} module={s} base=0x{x} offset=0x{x} size=0x{x} failed_loads={d} last_status=0x{x:0>8} last_handle=0x{x}{s}\n",
+            .{
+                address,    found.name,         found.base,        found.offset,
+                found.size, found.loads_failed, found.last_status, found.last_handle,
+                if (found.loads_failed != 0)
+                    "; a load of THIS image returned no handle, so the guest is executing in an image it was told it did not have"
+                else
+                    "",
+            },
+        );
+        return;
+    }
+    machoCapturePrint(
+        "macho-processor: guest address attribution: address=0x{x} module=<none> images_known={d} failed_load_transactions={d}; no image the guest mapped covers this address, so this is not a fault inside guest code — it is a branch to somewhere no code was ever placed\n",
+        .{ address, self.guest_modules.count, self.guest_modules.failed_loads },
+    );
 }
 
 /// Write one mirrored guest line, adding the newline the guest may have omitted.
