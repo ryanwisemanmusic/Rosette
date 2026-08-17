@@ -109,6 +109,111 @@ pub const Collapser = struct {
     }
 };
 
+/// A guest stuck in a loop that logs more than one distinct line.
+pub const Cycle = struct {
+    /// Distinct lines in the repeating unit.
+    period: usize,
+    /// Confirmed repetitions of that unit.
+    iterations: u64,
+};
+
+/// Names a guest that is repeating a *cycle* of lines rather than one line.
+///
+/// `Collapser` deliberately only collapses consecutive duplicates, because
+/// interleaving is usually the interesting part. That leaves the commonest
+/// stuck-guest shape unreported: a handshake between two contexts emits a fixed
+/// rotation of several different lines, forever. No line ever equals the one
+/// before it, so nothing collapses, the mirror grows without bound, and the
+/// reader has to notice the pattern by eye — which is exactly the failure that
+/// looks like "no indication of a problem" while the run makes no progress.
+///
+/// This detector never suppresses. Suppressing would destroy the interleaving
+/// the collapser is careful to preserve. It only *reports*: the guest has
+/// repeated an N-line cycle M times. A cycle repeating thousands of times with
+/// no new content is a livelock, and saying so is the whole job.
+///
+/// Comparison is by hash of the same prefix `Collapser` compares, so the two
+/// agree on what "the same line" means.
+pub const CycleDetector = struct {
+    /// Ring depth. The longest detectable period is half of it: confirming a
+    /// period needs two consecutive copies of the unit.
+    pub const window: usize = 32;
+    pub const max_period: usize = window / 2;
+
+    /// Repetitions before the first report, then the reporting stride. Bounded
+    /// on purpose: a detector that reports a livelock once per line is itself
+    /// the flood it exists to describe.
+    pub const first_report: u64 = 8;
+    pub const report_stride: u64 = 512;
+
+    hashes: [window]u64 = [_]u64{0} ** window,
+    observed: u64 = 0,
+    period: usize = 0,
+    iterations: u64 = 0,
+
+    reports: u64 = 0,
+    longest_period: usize = 0,
+    most_iterations: u64 = 0,
+
+    fn at(self: *const CycleDetector, back: usize) u64 {
+        // `back` = 0 is the most recent line.
+        const index = (self.observed -% (back + 1)) % window;
+        return self.hashes[@intCast(index)];
+    }
+
+    fn repeatsWithPeriod(self: *const CycleDetector, period: usize) bool {
+        if (self.observed < 2 * period) return false;
+        var i: usize = 0;
+        while (i < period) : (i += 1) {
+            if (self.at(i) != self.at(i + period)) return false;
+        }
+        return true;
+    }
+
+    /// Observe one line. Returns a cycle when a reporting threshold is crossed.
+    pub fn observe(self: *CycleDetector, line: []const u8) ?Cycle {
+        const compared = line[0..@min(line.len, max_compared)];
+        self.hashes[@intCast(self.observed % window)] = std.hash.Wyhash.hash(0, compared);
+        self.observed +%= 1;
+
+        // An established period continues as long as the line matches the one
+        // one period back. Re-verifying the whole unit every line would cost
+        // more and decide the same thing.
+        if (self.period != 0) {
+            if (self.observed > self.period and self.at(0) == self.at(self.period)) {
+                self.iterations +|= 1;
+                if (self.iterations > self.most_iterations) self.most_iterations = self.iterations;
+                const due = self.iterations == first_report or
+                    (self.iterations > first_report and
+                        (self.iterations - first_report) % report_stride == 0);
+                if (!due) return null;
+                self.reports +|= 1;
+                return .{ .period = self.period, .iterations = self.iterations };
+            }
+            self.period = 0;
+            self.iterations = 0;
+        }
+
+        // Look for the shortest period first: a 2-line handshake repeated four
+        // times also satisfies period 4, and the shortest one is the honest
+        // description of the loop.
+        var period: usize = 2;
+        while (period <= max_period) : (period += 1) {
+            if (!self.repeatsWithPeriod(period)) continue;
+            self.period = period;
+            self.iterations = 1;
+            if (period > self.longest_period) self.longest_period = period;
+            if (self.iterations > self.most_iterations) self.most_iterations = self.iterations;
+            return null;
+        }
+        return null;
+    }
+
+    pub fn active(self: *const CycleDetector) bool {
+        return self.reports != 0;
+    }
+};
+
 test "the first occurrence is always emitted and repeats are suppressed" {
     var collapser = Collapser{};
     try std.testing.expectEqual(Action.emit, collapser.observe("same"));
@@ -191,4 +296,79 @@ test "an empty line is handled like any other" {
         .emit_after_run => |repeats| try std.testing.expectEqual(@as(u64, 1), repeats),
         else => return error.TestFailed,
     }
+}
+
+// The shape that made a run look healthy while it made no progress: a
+// four-line rotation between two guest contexts, repeated indefinitely. No
+// line ever equals the one before it, so `Collapser` correctly stays silent —
+// and nothing else said anything at all.
+test "a repeating cycle of distinct lines is reported, not collapsed" {
+    var collapser = Collapser{};
+    var detector = CycleDetector{};
+    const cycle = [_][]const u8{
+        "xeKeSetEvent: ptr=827CEC38 handle=F800015C",
+        "KeReleaseSemaphore(827CEC14, 1, 1, 0)",
+        "KeWaitForSingleObject result=00000000",
+        "xeKeSetEvent: ptr=827CEC28 handle=F8000160",
+    };
+
+    var reported: ?Cycle = null;
+    var emitted: usize = 0;
+    for (0..40) |i| {
+        const line = cycle[i % cycle.len];
+        // The collapser must never suppress any of these: they interleave.
+        try std.testing.expectEqual(Action.emit, collapser.observe(line));
+        emitted += 1;
+        if (detector.observe(line)) |found| reported = found;
+    }
+    try std.testing.expectEqual(@as(u64, 0), collapser.suppressed);
+    try std.testing.expectEqual(@as(usize, 40), emitted);
+
+    const found = reported orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 4), found.period);
+    try std.testing.expectEqual(CycleDetector.first_report, found.iterations);
+    try std.testing.expect(detector.active());
+}
+
+test "a cycle detector reports the shortest honest period" {
+    var detector = CycleDetector{};
+    var reported: ?Cycle = null;
+    // A two-line handshake also satisfies period 4, 6, 8 ... describing it as
+    // anything but 2 would overstate the size of the loop.
+    for (0..30) |i| {
+        const line: []const u8 = if (i % 2 == 0) "ping" else "pong";
+        if (detector.observe(line)) |found| reported = found;
+    }
+    const found = reported orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 2), found.period);
+}
+
+test "progress breaks a cycle and nothing is reported" {
+    var detector = CycleDetector{};
+    var buffer: [64]u8 = undefined;
+    // A guest that is actually advancing emits new content; the counter in the
+    // line makes every line distinct, which is what forward progress looks
+    // like from here.
+    for (0..200) |i| {
+        const line = std.fmt.bufPrint(&buffer, "step {d} completed", .{i}) catch unreachable;
+        try std.testing.expectEqual(@as(?Cycle, null), detector.observe(line));
+    }
+    try std.testing.expect(!detector.active());
+    try std.testing.expectEqual(@as(u64, 0), detector.reports);
+}
+
+test "a cycle that stops is not credited with later repetitions" {
+    var detector = CycleDetector{};
+    for (0..24) |i| {
+        _ = detector.observe(if (i % 3 == 0) "a" else if (i % 3 == 1) "b" else "c");
+    }
+    try std.testing.expectEqual(@as(usize, 3), detector.period);
+    const during = detector.iterations;
+    try std.testing.expect(during > 0);
+
+    _ = detector.observe("something genuinely new");
+    try std.testing.expectEqual(@as(usize, 0), detector.period);
+    try std.testing.expectEqual(@as(u64, 0), detector.iterations);
+    // The high-water mark survives, so the run summary can still report it.
+    try std.testing.expectEqual(during, detector.most_iterations);
 }

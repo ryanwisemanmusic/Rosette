@@ -10,6 +10,7 @@
 
 pub const diagnostic_throttle = @import("diagnostic_throttle.zig");
 pub const log_repetition = @import("log_repetition.zig");
+pub const guest_module_map = @import("guest_module_map.zig");
 pub const diagnostic_text_accelerator = @import("diagnostic_text_accelerator.zig");
 pub const semantic_fault_classifier = @import("semantic_fault_classifier.zig");
 pub const zero_adjudication = @import("zero_adjudication.zig");

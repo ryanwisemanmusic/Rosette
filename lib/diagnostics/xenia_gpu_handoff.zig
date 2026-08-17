@@ -85,6 +85,11 @@ pub const Ledger = struct {
     diagnostic_probe_phase: DiagnosticProbePhase = .none,
     diagnostic_probe_id: u64 = 0,
     diagnostic_probe_transitions: u64 = 0,
+    unresolved_extern_calls: u64 = 0,
+    last_unresolved_extern_address: u32 = 0,
+    guest_execution_faults: u64 = 0,
+    last_guest_pc: u32 = 0,
+    last_guest_fault_address: u64 = 0,
 
     pub fn observeLine(self: *Ledger, line: []const u8, step: u64) ?Observation {
         const previous = self.phase;
@@ -96,7 +101,10 @@ pub const Ledger = struct {
             observed = true;
         }
 
-        if (contains(line, "CP - PM4_")) {
+        if (contains(line, "CP - PM4_") or
+            contains(line, "PM4 AUTHENTIC MILESTONE: first guest-published command batch consumed") or
+            contains(line, "RING BUFFER: first authentic PM4 packet consumed"))
+        {
             self.pm4_packets +|= 1;
             self.advance(.pm4_consumed, step);
             observed = true;
@@ -109,6 +117,12 @@ pub const Ledger = struct {
         }
 
         if (contains(line, "GPU COMPLETION: EVENT_WRITE_SHD committed")) {
+            // A committed EVENT_WRITE_SHD proves both decoding and execution.
+            // Compact packet logging may intentionally omit the verbose
+            // decoder line, so preserve the stronger evidence without making
+            // the ledger look as though the prerequisite never happened.
+            if (self.pm4_packets == 0) self.pm4_packets = 1;
+            if (self.shader_completion_packets == 0) self.shader_completion_packets = 1;
             self.shader_completion_commits +|= 1;
             self.last_completion_address = parseHexField(line, "address=") orelse 0;
             self.last_completion_requested = parseHexField(line, "requested=") orelse 0;
@@ -239,6 +253,19 @@ pub const Ledger = struct {
             observed = true;
         }
 
+        if (contains(line, "undefined extern call:")) {
+            self.unresolved_extern_calls +|= 1;
+            self.last_unresolved_extern_address = parseHexField(line, "address=") orelse 0;
+            observed = true;
+        }
+
+        if (contains(line, "GUEST FAULT FRONTIER:")) {
+            self.guest_execution_faults +|= 1;
+            self.last_guest_pc = parseHexField(line, "guest_pc=") orelse 0;
+            self.last_guest_fault_address = parseHexField64(line, "fault_address=") orelse 0;
+            observed = true;
+        }
+
         if (!observed) return null;
         return .{ .previous = previous, .current = self.phase, .advanced = previous != self.phase };
     }
@@ -264,6 +291,12 @@ pub const Ledger = struct {
         }
         if (self.guest_vdswap_calls != 0) {
             return "guest entered VdSwap, but PM4_XE_SWAP encoding has not been observed";
+        }
+        if (self.guest_execution_faults != 0) {
+            if (self.unresolved_extern_calls != 0) {
+                return "the authentic guest GPU producer was halted by a guest fault after unresolved import thunks; repair the import binding before diagnosing the downstream swap path";
+            }
+            return "the authentic guest GPU producer was halted by a guest execution fault before VdSwap";
         }
         if (self.critical_section_resumes != 0) {
             return "the GPU critical-section waiter resumed; inspect the next guest producer transition and write-pointer publication";
@@ -307,7 +340,7 @@ pub const Ledger = struct {
     pub fn logSummary(self: *const Ledger, current_step: u64) void {
         if (self.phase == .none and self.callback_completions == 0) return;
         machoCapturePrint(
-            "macho-processor: Xenia GPU handoff summary: phase={s} wptr={d} pm4={d} shader_packets={d} shader_commits={d} callbacks={d} contentions={d} waits={d} releases={d} resumes={d} vdswap(entry/encoded/completed)={d}/{d}/{d} guest_swap(published/consumed/refresh/native_present)={d}/{d}/{d}/{d} last_progress_step={d} idle_steps={d}; {s}\n",
+            "macho-processor: Xenia GPU handoff summary: phase={s} wptr={d} pm4={d} shader_packets={d} shader_commits={d} callbacks={d} contentions={d} waits={d} releases={d} resumes={d} vdswap(entry/encoded/completed)={d}/{d}/{d} guest_swap(published/consumed/refresh/native_present)={d}/{d}/{d}/{d} producer_faults(extern/guest)={d}/{d} last_progress_step={d} idle_steps={d}; {s}\n",
             .{
                 @tagName(self.phase),
                 self.ring_write_pointer_updates,
@@ -326,6 +359,8 @@ pub const Ledger = struct {
                 self.authentic_swap_consumptions,
                 self.authentic_refreshes,
                 self.authentic_native_presents,
+                self.unresolved_extern_calls,
+                self.guest_execution_faults,
                 self.last_progress_step,
                 current_step -| self.last_progress_step,
                 self.verdict(),
@@ -371,6 +406,17 @@ pub const Ledger = struct {
                 },
             );
         }
+        if (self.guest_execution_faults != 0) {
+            machoCapturePrint(
+                "macho-processor: Xenia GPU producer halt: guest_pc=0x{x:0>8} fault_address=0x{x} unresolved_externs={d} last_extern=0x{x:0>8}; this is upstream of guest VdSwap and no swap fallback may count as authentic progress\n",
+                .{
+                    self.last_guest_pc,
+                    self.last_guest_fault_address,
+                    self.unresolved_extern_calls,
+                    self.last_unresolved_extern_address,
+                },
+            );
+        }
     }
 
     fn advance(self: *Ledger, next: Phase, step: u64) void {
@@ -392,6 +438,16 @@ fn parseHexField(line: []const u8, marker: []const u8) ?u32 {
     while (length < text.len and std.ascii.isHex(text[length])) : (length += 1) {}
     if (length == 0) return null;
     return std.fmt.parseInt(u32, text[0..length], 16) catch null;
+}
+
+fn parseHexField64(line: []const u8, marker: []const u8) ?u64 {
+    const marker_index = std.mem.indexOf(u8, line, marker) orelse return null;
+    var text = line[marker_index + marker.len ..];
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) text = text[2..];
+    var length: usize = 0;
+    while (length < text.len and std.ascii.isHex(text[length])) : (length += 1) {}
+    if (length == 0) return null;
+    return std.fmt.parseInt(u64, text[0..length], 16) catch null;
 }
 
 fn parseSignedField(line: []const u8, marker: []const u8) ?i32 {
@@ -519,4 +575,27 @@ test "GPU critical-section acquisition transition recovers owner history" {
     try std.testing.expectEqual(@as(u64, 1), ledger.critical_section_acquisitions);
     try std.testing.expectEqual(@as(u64, 1), ledger.critical_section_history_dumps);
     try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "bounded transition history") != null);
+}
+
+test "GPU handoff accepts compact authentic PM4 and inferred shader packet evidence" {
+    var ledger = Ledger{};
+    _ = ledger.observeLine("PM4 AUTHENTIC MILESTONE: first guest-published command batch consumed dwords=22 provenance=guest_wptr", 10).?;
+    _ = ledger.observeLine("GPU COMPLETION: EVENT_WRITE_SHD committed address=1FC9A000 requested=00000003 physical=00000003 alias=00000003 alias_valid=YES alias_match=YES", 20).?;
+
+    try std.testing.expectEqual(Phase.shader_completion_committed, ledger.phase);
+    try std.testing.expectEqual(@as(u64, 1), ledger.pm4_packets);
+    try std.testing.expectEqual(@as(u64, 1), ledger.shader_completion_packets);
+    try std.testing.expectEqual(@as(u64, 1), ledger.shader_completion_commits);
+}
+
+test "GPU handoff names an unresolved import as the producer halt upstream of VdSwap" {
+    var ledger = Ledger{};
+    _ = ledger.observeLine("undefined extern call: address=8A0A7C1C name= export=<none> ordinal=0x000", 10).?;
+    _ = ledger.observeLine("GUEST FAULT FRONTIER: guest_pc=89415B00 fault_address=34D841A40 thread=6", 20).?;
+
+    try std.testing.expectEqual(@as(u64, 1), ledger.unresolved_extern_calls);
+    try std.testing.expectEqual(@as(u32, 0x8A0A_7C1C), ledger.last_unresolved_extern_address);
+    try std.testing.expectEqual(@as(u32, 0x8941_5B00), ledger.last_guest_pc);
+    try std.testing.expectEqual(@as(u64, 0x34D84_1A40), ledger.last_guest_fault_address);
+    try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "import binding") != null);
 }
