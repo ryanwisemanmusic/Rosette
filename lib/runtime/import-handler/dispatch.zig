@@ -1187,6 +1187,34 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 });
             }
         }
+        // Throw-site machine state. A throw says a condition was detected; it
+        // does not say whether the condition was real. Deciding that needs the
+        // operands the throwing frame was working from — for a range-decode
+        // throw, whether the iterator and end pointers were actually degenerate
+        // or merely reported so. Without this the type name and call stack are
+        // the whole record, and both are identical for a genuine throw and for
+        // one produced by a mismodelled operand.
+        //
+        // Unconditional because a throw is rare by construction: this is not on
+        // any hot path, and the state is unrecoverable once phase two rewrites
+        // the register file to enter a landing pad.
+        machoCapturePrint(
+            "macho-processor: C++ exception throw-site state: thread=0x{x} rip=0x{x} rsp=0x{x} rbp=0x{x} rdi=0x{x} rsi=0x{x} rdx=0x{x} rcx=0x{x} r8=0x{x} r9=0x{x} rax=0x{x} rbx=0x{x}\n",
+            .{
+                self.active_guest_thread,
+                self.regs.rip,
+                self.regs.rsp,
+                self.regs.rbp,
+                self.regs.rdi,
+                self.regs.rsi,
+                self.regs.rdx,
+                self.regs.rcx,
+                self.regs.r8,
+                self.regs.r9,
+                self.regs.rax,
+                self.regs.rbx,
+            },
+        );
         if (self.cxxExceptionMessage(thrown.object_address)) |message| {
             exception_message = message;
             machoCapturePrint("macho-processor: C++ exception message: {s}\n", .{message});
@@ -1219,6 +1247,16 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 "macho-processor: SPIRV-Cross dummy-module probe recognized: object=0x{x} missing_entry_point=true verification_frame=true handler=0x{x} phase_two_installed=true; awaiting expected catch completion\n",
                 .{ thrown.object_address, if (inspection.handler) |handler| handler.landing_pad else 0 },
             );
+        }
+        // An exception phase one could not match is the interesting case even
+        // when phase two installs cleanups and the run continues: the frames
+        // unwind, some catch-all consumes it, and the thread quietly ends. The
+        // only trace left was an ordinary "guest thread returned" line, which
+        // is what a clean exit produces too. Remember it against the thread so
+        // the return can say what actually happened.
+        if (inspection.handler == null) {
+            self.unhandled_cxx_thread = self.active_guest_thread;
+            self.unhandled_cxx_type_info = thrown.type_info_address;
         }
         if (phase_two_installed) {
             self.last_unwind_inspection = inspection;
