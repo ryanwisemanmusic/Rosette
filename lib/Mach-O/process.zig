@@ -21,6 +21,7 @@ const smart_stub_generator = @import("dyld").smart_stub_generator;
 const cxx_exception_diagnostics = @import("cxx_abi").cxx_exception_diagnostics;
 const spirv_cross_diagnostics = @import("diagnostics").spirv_cross_diagnostics;
 const log_repetition = @import("diagnostics").log_repetition;
+const guest_module_map = @import("diagnostics").guest_module_map;
 const fs_io_forwarder = @import("io").fs_io_forwarder;
 const memory_management_forwarder = @import("memory").memory_management_forwarder;
 const sparse_virtual_memory = @import("memory").sparse_virtual_memory;
@@ -545,6 +546,11 @@ pub const MachOState = struct {
     fault_context_pinned: bool = false,
     fault_context_thread: u64 = 0,
     fault_context_step: u64 = 0,
+    /// Thread carrying a C++ exception that Itanium phase one could not match
+    /// to a handler, and the thrown type. Read when the thread returns, so an
+    /// exception-terminated thread is distinguishable from a clean exit.
+    unhandled_cxx_thread: u64 = 0,
+    unhandled_cxx_type_info: u64 = 0,
     fault_context_history_epoch: u64 = 0,
     idle_dispatch_failures: u64 = 0,
     idle_starvation_warnings: u64 = 0,
@@ -565,6 +571,9 @@ pub const MachOState = struct {
     /// unusable because of it has adopted that defect as its own — and with a
     /// workload whose source is unavailable there is no other remedy.
     guest_log_repetition: log_repetition.Collapser = .{},
+    guest_log_cycles: log_repetition.CycleDetector = .{},
+    guest_modules: guest_module_map.Map = .{},
+    guest_module_failed_loads: u64 = 0,
     guest_log_line_count: u64 = 0,
     guest_stdio_write_count: u64 = 0,
     guest_stdout_byte_count: u64 = 0,
@@ -5826,6 +5835,35 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
                 state.guest_log_repetition.truncated_comparisons,
             },
         );
+    }
+    if (state.guest_log_cycles.active()) {
+        macho_log.machoCapturePrint(
+            "macho-processor: guest log cycles: reports={d} longest_period={d} most_iterations={d} still_cycling={} final_period={d}; a run that ends inside a cycle ended in a livelock, not at a conclusion\n",
+            .{
+                state.guest_log_cycles.reports,
+                state.guest_log_cycles.longest_period,
+                state.guest_log_cycles.most_iterations,
+                state.guest_log_cycles.period != 0,
+                state.guest_log_cycles.period,
+            },
+        );
+    }
+    if (state.guest_modules.active()) {
+        macho_log.machoCapturePrint(
+            "macho-processor: guest module map: images={d} overflowed={d} failed_load_transactions={d}; only explicit post-call status/handle results are counted, never pre-call out-parameter values\n",
+            .{
+                state.guest_modules.count,
+                state.guest_modules.overflowed,
+                state.guest_modules.failed_loads,
+            },
+        );
+        for (state.guest_modules.modules[0..state.guest_modules.count]) |*module| {
+            if (!module.active) continue;
+            macho_log.machoCapturePrint(
+                "macho-processor:   module {s} base=0x{x} size=0x{x} loads(ok/failed)={d}/{d} last_handle=0x{x}\n",
+                .{ module.nameSlice(), module.base, module.size, module.loads_succeeded, module.loads_failed, module.last_handle },
+            );
+        }
     }
     if (state.guest_log_line_count != 0) {
         macho_log.machoCapturePrint(
