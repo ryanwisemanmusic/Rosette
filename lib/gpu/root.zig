@@ -24,6 +24,18 @@
 //! then report progress that did not happen.
 
 pub const bootstrap = @import("bootstrap.zig");
+pub const contract = @import("contract.zig");
+pub const kernel_surface = @import("kernel_surface.zig");
+pub const import_binding = @import("import_binding.zig");
+pub const kernel_variables = @import("kernel_variables.zig");
+pub const pm4 = @import("pm4.zig");
+pub const preinitialization = @import("preinitialization.zig");
+pub const ring_payload = @import("ring_payload.zig");
+pub const ring_scan = @import("ring_scan.zig");
+pub const ring_view = @import("ring_view.zig");
+pub const submission_provenance = @import("submission_provenance.zig");
+pub const swap_substitution = @import("swap_substitution.zig");
+pub const xenos_texture = @import("xenos_texture.zig");
 pub const refresh_liveness = @import("refresh_liveness.zig");
 pub const forwarding = @import("forwarding.zig");
 pub const provenance = @import("provenance.zig");
@@ -36,6 +48,31 @@ pub const handles = @import("handles.zig");
 pub const hardware_description = @import("hardware_description.zig");
 pub const runtime = @import("runtime.zig");
 pub const vulkan = @import("vulkan/root.zig");
+
+pub const ContractClause = contract.Clause;
+pub const ContractOwner = contract.Owner;
+pub const ContractLedger = contract.Ledger;
+pub const KernelSurface = kernel_surface.Surface;
+pub const ImportBindingLedger = import_binding.Ledger;
+pub const KernelVariable = kernel_variables.Variable;
+pub const KernelVariableSurface = kernel_variables.Surface;
+pub const Pm4Header = pm4.Header;
+pub const PreinitElement = preinitialization.Element;
+pub const PreinitLedger = preinitialization.Ledger;
+pub const PreinitOwner = preinitialization.Owner;
+pub const Pm4SwapDescription = pm4.SwapDescription;
+pub const Pm4FetchConstant = pm4.FetchConstant;
+pub const RingScanSummary = ring_scan.Summary;
+pub const RingPayloadDigest = ring_payload.Digest;
+pub const SubmissionProvenance = submission_provenance.Ledger;
+pub const SubmissionFinding = submission_provenance.Finding;
+pub const RingProjection = ring_view.Projection;
+pub const RingSurvey = ring_view.Survey;
+pub const SubstitutionTier = swap_substitution.Tier;
+pub const SubstitutionEvidence = swap_substitution.Evidence;
+pub const SubstitutionLedger = swap_substitution.Ledger;
+pub const XenosSurface = xenos_texture.Surface;
+pub const KernelExport = kernel_surface.Export;
 
 pub const Step = bootstrap.Step;
 pub const Contract = bootstrap.Contract;
@@ -73,6 +110,18 @@ pub const Handle = handles.Handle;
 
 test {
     _ = bootstrap;
+    _ = contract;
+    _ = kernel_surface;
+    _ = import_binding;
+    _ = kernel_variables;
+    _ = pm4;
+    _ = preinitialization;
+    _ = ring_payload;
+    _ = ring_scan;
+    _ = ring_view;
+    _ = submission_provenance;
+    _ = swap_substitution;
+    _ = xenos_texture;
     _ = refresh_liveness;
     _ = forwarding;
     _ = provenance;
