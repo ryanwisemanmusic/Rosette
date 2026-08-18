@@ -19,6 +19,7 @@ pub const x64_backend_diagnostics = @import("x64_backend_diagnostics.zig");
 pub const xenia_pipeline_contracts = @import("xenia_pipeline_contracts.zig");
 pub const xenia_pipeline = @import("xenia_pipeline.zig");
 pub const xenia_gpu_handoff = @import("xenia_gpu_handoff.zig");
+pub const guest_wait_liveness = @import("guest_wait_liveness.zig");
 pub const xenia_memory_views = @import("xenia_memory_views.zig");
 pub const guest_critical_section = @import("guest_critical_section.zig");
 pub const event_identity = @import("event_identity.zig");
@@ -44,6 +45,7 @@ test {
     _ = xenia_pipeline_contracts;
     _ = xenia_pipeline;
     _ = xenia_gpu_handoff;
+    _ = guest_wait_liveness;
     _ = xenia_memory_views;
     _ = guest_critical_section;
     _ = event_identity;
