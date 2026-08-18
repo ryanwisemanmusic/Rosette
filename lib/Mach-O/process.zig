@@ -46,12 +46,14 @@ const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const xenia_pipeline = @import("diagnostics").xenia_pipeline;
 const xenia_gpu_handoff = @import("diagnostics").xenia_gpu_handoff;
 const xenia_memory_views = @import("diagnostics").xenia_memory_views;
+const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
 const event_identity = @import("diagnostics").event_identity;
 const execution_tracepoints = @import("diagnostics").execution_tracepoints;
 const anomaly_ledger = @import("diagnostics").anomaly_ledger;
 const notifier_liveness = @import("scheduler").notifier_liveness;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
 const near_null_predictor = @import("process_core").near_null_predictor;
+const livelock_predictor = @import("process_core").livelock_predictor;
 const vtable_clobber_predictor = @import("process_core").vtable_clobber_predictor;
 const import_binding_predictor = @import("process_core").import_binding_predictor;
 const swap_health = @import("process_core").swap_health;
@@ -554,6 +556,17 @@ pub const MachOState = struct {
     /// dispatch, dumped when a terminal casualty is confirmed. See
     /// `near_null_predictor.zig` for the cost model (one compare per import).
     near_null_predictor: near_null_predictor.Predictor = .{},
+    /// Guest wait-cycle signatures observed through the mirrored guest log
+    /// (KeWaitForSingleObject/KeSetEvent/KeReleaseSemaphore). A signature
+    /// whose count grows while the ring write pointer is stalled is a
+    /// livelock prediction — the guest is parked on an object nobody will
+    /// ever signal. See `livelock_predictor.zig`; reached only from the
+    /// guest-log bridge, never from the instruction stream.
+    livelock_predictor: livelock_predictor.Predictor = .{},
+    /// Object of the most recent `KeWaitForSingleObject` detail line, so the
+    /// predictor can pair the following `result=` line with an object even
+    /// against a pre-instrumentation binary that omitted it.
+    livelock_pending_wait_object: u64 = 0,
     /// Judges every write-time vptr restore before Rosette performs it. The
     /// restore is a store into guest memory, and a tracked slot that turns out
     /// to be live stack scratch makes that store the defect rather than the
@@ -746,6 +759,88 @@ pub const MachOState = struct {
     /// did — which is what sends a no-frame investigation past the producer and
     /// into the command processor.
     gpu_ring_publication: gpu.RingPublication = .{},
+    /// The preconditions a frame needs, each with an owner. Fed from evidence
+    /// the other GPU subsystems already hold; its job is to say which unmet
+    /// clause is Rosette's to supply and which must not be supplied at all.
+    /// See `lib/gpu/contract.zig`.
+    graphics_contract: gpu.ContractLedger = .{},
+    /// The GPU-facing kernel exports a title reads before it will present, and
+    /// whether anything supplied them. See `lib/gpu/kernel_surface.zig`: the
+    /// ladder can only see calls, and an unpopulated *variable* export stops a
+    /// title without ever producing one.
+    gpu_kernel_surface: gpu.KernelSurface = .{},
+    gpu_kernel_surface_addresses: gpu.kernel_surface.AddressTable = .{},
+    /// The same exports, read the way the title reads them: slot first, then
+    /// the storage the slot points at. See `lib/gpu/kernel_variables.zig`. The
+    /// surface above treats the slot's contents as the value, which cannot tell
+    /// a healthy pointer from the loader's unimplemented sentinel and cannot
+    /// tell a variable the *kernel* failed to write from one the *title* has
+    /// not written yet. Those have opposite owners.
+    gpu_kernel_variables: gpu.KernelVariableSurface = .{},
+    /// Whether the harness stood in for a step the title never took, and at
+    /// which tier. See `lib/gpu/swap_substitution.zig`. Kept separate from
+    /// every authentic counter in the subsystem, permanently: a frame the
+    /// harness caused must never be summable with one the title caused.
+    gpu_swap_substitution: gpu.SubstitutionLedger = .{},
+    /// The front buffer the most recent swap packet named, if the ring has ever
+    /// held one. This is the only place a console-side frame's address, extent
+    /// and format are all stated at once, so it is what a harness present path
+    /// has to read.
+    gpu_frontbuffer: ?gpu.Pm4SwapDescription = null,
+    gpu_ring_scan_reports: u64 = 0,
+    /// Whether a draw packet has ever been found in ring memory. Latched: a
+    /// drained ring holds an empty span, so a title that rendered a frame and
+    /// had it consumed is indistinguishable through the pointers alone from one
+    /// that never drew, and those are opposite findings.
+    gpu_ring_draws_seen: bool = false,
+    gpu_ring_draws_last_count: u32 = 0,
+    /// The emulator's own applied-update counter for the ring write pointer,
+    /// parsed from its `wptr_updates(total=...)` report. Independent of the
+    /// `REGISTER WRITE` line Rosette's tracker reads, and in the observed run
+    /// the two disagree: one says two writes, the other says zero.
+    gpu_xenia_wptr_updates: u64 = 0,
+    gpu_xenia_wptr_counter_seen: bool = false,
+    gpu_frontbuffer_offered: bool = false,
+    /// Kernel-owned variables the harness supplied, and the ones it tried to
+    /// supply and could not. Counted separately: a provisioning step that
+    /// silently did nothing would make the report claim platform state exists
+    /// when the title will read whatever was already there.
+    gpu_kernel_variable_writes: u64 = 0,
+    gpu_kernel_variable_write_failures: u64 = 0,
+    /// What had to be true before the title's display bring-up, and whether it
+    /// became true in the right order. See `lib/gpu/preinitialization.zig`. The
+    /// graphics contract answers "which precondition is unmet"; this answers
+    /// "were they established in the order the title reads them", which a
+    /// ladder cannot, because by the end of a run everything is present and the
+    /// title is still wedged on a decision it made before they were.
+    gpu_preinitialization: gpu.PreinitLedger = .{},
+    /// Which of the independent observers of the ring write pointer believe it
+    /// moved, and whether they agree. See `lib/gpu/submission_provenance.zig`.
+    /// Rosette's own tracker is fed by parsing a line the emulator printed; the
+    /// emulator's applied-update counter and the register aperture are separate
+    /// and stronger. When they disagree, `published()` is a claim about text.
+    gpu_submission_provenance: gpu.SubmissionProvenance = .{},
+    /// What the emulator's own callback-missing probe reported about each
+    /// graphics import. See `lib/gpu/import_binding.zig`: the probe firing
+    /// looks like a binding failure and in the observed run reported every
+    /// import correctly bound, which points at the callback state machine
+    /// rather than at the loader.
+    gpu_import_binding: gpu.ImportBindingLedger = .{},
+    /// Non-zero dwords found in ring memory. The only direct evidence that a
+    /// producer wrote anything, independent of every pointer counter.
+    gpu_ring_nonzero_dwords: u32 = 0,
+    /// Whether the guest's waits block and are released, or are satisfied on
+    /// arrival and never block. See `lib/diagnostics/guest_wait_liveness.zig`.
+    /// `result=00000000` is returned by both, and only the ratio separates a
+    /// working handshake from a spin that looks like a stall in whichever
+    /// subsystem the loop belongs to.
+    guest_wait_liveness: guest_wait_liveness.Ledger = .{},
+    /// Guest `KeSetEvent` calls that found their event already signalled,
+    /// against the total observed. A wait that does not consume its signal
+    /// never blocks, and every producer/consumer handshake above it free-runs
+    /// — which reads as a GPU stall and is not one.
+    guest_event_sets: u64 = 0,
+    guest_event_sets_already_signalled: u64 = 0,
     /// Guest traffic to the Xenos memory-mapped register aperture. The pages
     /// behind it are unreadable by design, so every register access the title
     /// performs arrives as a protection fault and nowhere else — which makes
@@ -2154,6 +2249,897 @@ pub const MachOState = struct {
     /// the wrapper killed the process on a timeout and every summary was
     /// written from the exit path. A diagnostic that only survives a clean
     /// shutdown is unavailable in exactly the runs that need it, so this is
+    /// Refresh the graphics contract from evidence the other subsystems hold,
+    /// then report it.
+    ///
+    /// The ledger is derived rather than maintained: every fact here already
+    /// exists somewhere, and the value is the join plus the owner. Keeping it
+    /// derived means it cannot drift out of agreement with the subsystem that
+    /// actually knows — a second copy of the truth is how two reports in one
+    /// run end up contradicting each other.
+    pub fn refreshGraphicsContract(self: *MachOState) void {
+        const ledger = &self.graphics_contract;
+        const tracepoints = &self.execution_tracepoints;
+        const at = self.executed_steps;
+
+        // Harness-owned platform surface. Rosette supplies these, so they are
+        // recorded through `satisfy` — which the ledger permits only because
+        // Rosette owns them. On Windows the equivalent state exists before the
+        // title runs; here it exists because the harness made it.
+        if (self.native_window.layer_attachments != 0) {
+            _ = ledger.satisfy(.native_window_surface, at);
+        }
+        if (self.native_window.surface_bindings != 0) {
+            _ = ledger.satisfy(.native_presenter_bound, at);
+            // A bound surface is the evidence the backend instance and the
+            // adapter were negotiated: neither a VkSurfaceKHR nor a CAMetalLayer
+            // can be produced without them.
+            _ = ledger.satisfy(.backend_instance_negotiated, at);
+            _ = ledger.satisfy(.physical_adapter_negotiated, at);
+        }
+        // Either presentation path proves the capability. Keying this on the
+        // Metal diagnostic counter alone made a run whose presenter came up
+        // through Vulkan report presentation as outstanding harness work while
+        // frames were on the window — the report then sent a reader to write
+        // code that already existed, which is worse than reporting nothing.
+        if (self.native_window.diagnostic_frames_presented != 0 or
+            self.dynamic_forwarder.nativePresenterFramesPresented() != 0 or
+            self.dynamic_forwarder.nativePresenterStage().isReady())
+        {
+            _ = ledger.satisfy(.presentation_capability_negotiated, at);
+        }
+        // Event handshake activity proves the guest's wait primitives are being
+        // driven. Deliberately keyed on call volume and not on `was_signalled`,
+        // which is a compile-time constant in the emulator and proves nothing.
+        // Keyed on whether waits actually block, not on whether sets happen.
+        // A run where every wait is satisfied on arrival has sets in abundance
+        // and consumes nothing, which is the exact failure this clause exists
+        // to catch — so counting sets satisfied it in precisely the case it was
+        // written to detect.
+        if (self.guest_wait_liveness.aggregateVerdict().healthy() and
+            self.guest_wait_liveness.total_waits >= guest_wait_liveness.minimum_sample)
+        {
+            _ = ledger.satisfy(.wait_primitives_consume_signals, at);
+        }
+
+        // Emulator-owned bring-up, observed only.
+        if (self.gpu_bootstrap.seen(.initialize_engines)) ledger.observe(.gpu_engines_initialised, at);
+        if (self.gpu_bootstrap.seen(.graphics_interrupt_callback)) ledger.observe(.interrupt_callback_registered, at);
+        if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch)) ledger.observe(.interrupt_callback_dispatched, at);
+        if (self.gpu_bootstrap.seen(.ring_buffer)) ledger.observe(.ring_buffer_initialised, at);
+
+        // Title-owned behaviour, observed only. `satisfy` would refuse these
+        // anyway; observing is the only way they can ever be met.
+        const publication = &self.gpu_ring_publication;
+        if (publication.published()) ledger.observe(.guest_ring_payload_published, at);
+        if (publication.advances != 0) ledger.observe(.guest_write_pointer_advanced, at);
+        if (self.gpu_bootstrap.seen(.pm4_packet_consumed)) ledger.observe(.guest_pm4_consumed, at);
+        if (tracepoints.roleEntered(.swap)) ledger.observe(.guest_swap_entered, at);
+        if (self.guest_vdswap_packet_encoded) ledger.observe(.swap_packet_encoded, at);
+        if (tracepoints.roleEntered(.xe_swap_decode)) ledger.observe(.swap_consumed_by_command_processor, at);
+        if (tracepoints.roleEntered(.presenter)) ledger.observe(.presenter_output_refreshed, at);
+    }
+
+    /// The kernel surface: what a title reads before it will present, and
+    /// whether anything supplied it.
+    ///
+    /// Printed with the contract because the two answer different halves of the
+    /// same question. The contract says which precondition is unmet and who
+    /// owns it; the surface says whether the unmet one is unmet because a
+    /// *value* is missing — the case a call-counting ladder cannot see at all.
+    pub fn logKernelSurface(self: *MachOState) void {
+        const surface = &self.gpu_kernel_surface;
+        const finding = surface.finding();
+        machoCapturePrint(
+            "macho-processor: KERNEL SURFACE: imported={d} usable={d} unpopulated_imported={d} blocking={s} step={d}; {s}\n",
+            .{
+                finding.imported_count,
+                finding.usable_count,
+                finding.unpopulated_imported,
+                if (finding.blocking) |which| which.name() else "<none>",
+                self.executed_steps,
+                if (finding.blocking) |which|
+                    which.guidance()
+                else
+                    "every required kernel export the title imported holds a usable value; an absent frame is not explained by this surface",
+            },
+        );
+        inline for (@typeInfo(gpu.KernelExport).@"enum".fields) |field| {
+            const which: gpu.KernelExport = @enumFromInt(field.value);
+            if (surface.imported(which) or which.isVariable()) machoCapturePrint(
+                "  export 0x{x:0>3} {s: <12} {s: <9} {s}{s}\n",
+                .{
+                    which.ordinal(),
+                    surface.population(which).label(),
+                    if (which.isVariable()) "variable" else "function",
+                    which.name(),
+                    if (surface.imported(which)) "" else " (not imported by this title)",
+                },
+            );
+        }
+        var pending: [gpu.kernel_surface.export_count]gpu.KernelExport = undefined;
+        const work = surface.harnessPopulationWork(&pending);
+        for (work) |which| {
+            machoCapturePrint(
+                "macho-processor: KERNEL SURFACE: harness population outstanding: {s} ({d} bytes at 0x{x}) — {s}\n",
+                .{ which.name(), which.byteSize(), self.gpu_kernel_surface_addresses.lookup(which.ordinal()) orelse 0, which.guidance() },
+            );
+        }
+        if (work.len == 0) return;
+        machoCapturePrint(
+            "macho-processor: KERNEL SURFACE: populating a kernel *variable* is supplying platform state the real kernel already wrote, which is a legitimate harness action. Entering a kernel *function* on the title's behalf is not, and is refused by the contract's owner rule\n",
+            .{},
+        );
+    }
+
+    /// What the two dereferences behind each kernel variable actually found.
+    ///
+    /// Printed next to the export surface rather than replacing it, because the
+    /// two answer different questions: that one says whether the title imported
+    /// the export at all, this one says what a reader of it would get. The
+    /// column that matters is `writer`: a zero the *title* was supposed to
+    /// write is progress information, and a zero the *kernel* was supposed to
+    /// write is harness work.
+    /// One big-endian dword out of the emulated console's virtual address
+    /// space. Null when the address space is not modelled yet or the page is
+    /// not readable — which are different from a dword that reads zero, and the
+    /// caller has to be able to tell them apart.
+    pub fn readConsoleDword(self: *MachOState, console_address: u32) ?u32 {
+        if (console_address == 0) return null;
+        const host = self.xenia_memory_views.virtualHostAddress(console_address) orelse return null;
+        const bytes = self.guestMemoryConst(host, 4) orelse return null;
+        return std.mem.readInt(u32, bytes[0..4], .big);
+    }
+
+    /// Write one big-endian dword into the console's virtual address space.
+    ///
+    /// The only mutation this subsystem performs on console memory, and it is
+    /// gated by the owner rule before it is ever called. Returns whether the
+    /// write landed, because a provisioning step that silently did nothing is
+    /// worse than one that did not run: the report would say the platform state
+    /// was supplied.
+    pub fn writeConsoleDword(self: *MachOState, console_address: u32, value: u32) bool {
+        if (console_address == 0) return false;
+        const host = self.xenia_memory_views.virtualHostAddress(console_address) orelse return false;
+        const bytes = self.guestMemory(host, 4) orelse return false;
+        std.mem.writeInt(u32, bytes[0..4], value, .big);
+        return true;
+    }
+
+    /// Read every kernel variable slot whose address is known, then supply the
+    /// kernel-owned ones the emulator left empty.
+    ///
+    /// This exists because the emulator's own per-ordinal report is the only
+    /// thing that used to trigger a read, and that report **omits** the two
+    /// variables the kernel is responsible for. `VdGpuClockInMHz` and
+    /// `VdHSIOCalibrationLock` were therefore never looked at once in a run:
+    /// they were reported `unresolved`, which reads as "nothing to see" and is
+    /// actually "nobody looked". The slot addresses come from the export table
+    /// dump, which lists every import whether or not the emulator narrates it,
+    /// so the measurement never depended on the emulator's cooperation.
+    ///
+    /// Provisioning is deliberately narrow. A variable the *title* writes is
+    /// never touched: a device pointer invented here points at nothing, and the
+    /// crash lands three subsystems from the invention. A variable the *kernel*
+    /// writes is platform state the real console established before the title
+    /// ran, and supplying it is the entire job of a harness.
+    pub fn refreshKernelVariables(self: *MachOState) void {
+        const surface = &self.gpu_kernel_variables;
+        inline for (.{
+            gpu.KernelVariable.global_device,    gpu.KernelVariable.global_xam_device,
+            gpu.KernelVariable.gpu_clock_in_mhz, gpu.KernelVariable.hsio_calibration_lock,
+        }) |which| {
+            const slot_address = self.gpu_kernel_surface_addresses.lookup(which.ordinal()) orelse 0;
+            if (slot_address != 0) {
+                surface.observeImport(which, true, slot_address);
+                if (self.readConsoleDword(slot_address)) |slot_value| {
+                    surface.observeSlot(which, slot_value);
+                    if (gpu.kernel_variables.plausiblePointer(slot_value) and
+                        !gpu.kernel_variables.isUnimplementedSentinel(slot_value, which.ordinal()))
+                    {
+                        if (self.readConsoleDword(slot_value)) |storage| {
+                            surface.observeStorage(which, storage);
+                        }
+                    }
+                }
+            }
+            self.provisionKernelVariable(which);
+        }
+    }
+
+    /// Supply one kernel-owned variable, if the owner rule allows it and the
+    /// storage is reachable.
+    fn provisionKernelVariable(self: *MachOState, which: gpu.KernelVariable) void {
+        switch (self.gpu_kernel_variables.writeDecision(which)) {
+            .allowed => |value| {
+                const slot_value = self.gpu_kernel_variables.entry(which).slot_value;
+                if (!self.writeConsoleDword(slot_value, value)) {
+                    self.gpu_kernel_variable_write_failures +|= 1;
+                    machoCapturePrint(
+                        "macho-processor: KERNEL VARIABLES: could not write {s} = 0x{x} at console 0x{x:0>8}; the storage the slot points at is not writable from here, so the platform state stays unsupplied and the title will read whatever is there\n",
+                        .{ which.name(), value, slot_value },
+                    );
+                    return;
+                }
+                _ = self.gpu_kernel_variables.noteHarnessWrite(which);
+                self.gpu_kernel_variable_writes +|= 1;
+                machoCapturePrint(
+                    "macho-processor: KERNEL VARIABLES: supplied {s} = 0x{x} at console 0x{x:0>8} (harness write #{d}). This is platform state the real kernel established before the title ran; the title owns nothing here and nothing about its behaviour has been fabricated — {s}\n",
+                    .{ which.name(), value, slot_value, self.gpu_kernel_variable_writes, which.meaning() },
+                );
+            },
+            else => {},
+        }
+    }
+
+    pub fn logKernelVariables(self: *MachOState) void {
+        self.refreshKernelVariables();
+        const surface = &self.gpu_kernel_variables;
+        const finding = surface.finding();
+        machoCapturePrint(
+            "macho-processor: KERNEL VARIABLES: imported={d} usable={d} blocking={s} harness_writable_outstanding={d} harness_writes={d} write_failures={d} step={d}; {s}\n",
+            .{
+                finding.imported_count,
+                finding.usable_count,
+                if (finding.blocking) |which| which.name() else "<none>",
+                finding.harness_writable_outstanding,
+                self.gpu_kernel_variable_writes,
+                self.gpu_kernel_variable_write_failures,
+                self.executed_steps,
+                if (finding.blocking) |which|
+                    which.meaning()
+                else
+                    "no kernel variable the title imported is broken in a way the emulator caused. A variable reading zero because the title has not written it yet is reported below and is not a defect",
+            },
+        );
+        inline for (.{
+            gpu.KernelVariable.global_device,     gpu.KernelVariable.global_xam_device,
+            gpu.KernelVariable.gpu_clock_in_mhz,  gpu.KernelVariable.hsio_calibration_lock,
+        }) |which| {
+            const record = surface.entry(which);
+            machoCapturePrint(
+                "  variable 0x{x:0>3} {s: <20} {s: <13} writer={s: <6} slot=0x{x:0>8} -> 0x{x:0>8} storage=0x{x:0>8} bytes={d} harness_writes={d}\n",
+                .{
+                    which.ordinal(),
+                    which.name(),
+                    record.state.label(),
+                    @tagName(which.writer()),
+                    record.slot_address,
+                    record.slot_value,
+                    record.storage_value,
+                    which.storageBytes(),
+                    record.harness_writes,
+                },
+            );
+        }
+        inline for (.{
+            gpu.KernelVariable.global_device,     gpu.KernelVariable.global_xam_device,
+            gpu.KernelVariable.gpu_clock_in_mhz,  gpu.KernelVariable.hsio_calibration_lock,
+        }) |which| {
+            if (surface.entry(which).imported) {
+                switch (surface.writeDecision(which)) {
+                    .allowed => |value| machoCapturePrint(
+                        "macho-processor: KERNEL VARIABLES: harness may supply {s} = 0x{x} — {s}\n",
+                        .{ which.name(), value, which.meaning() },
+                    ),
+                    else => |refusal| if (surface.entry(which).state == .storage_zero) machoCapturePrint(
+                        "macho-processor: KERNEL VARIABLES: {s} reads zero and the harness will not write it: {s}\n",
+                        .{ which.name(), refusal.label() },
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Join every subsystem's evidence into the pre-initialisation ledger.
+    ///
+    /// Derived rather than maintained, like the graphics contract: each fact
+    /// already exists somewhere, and the value here is the ordering check that
+    /// no individual subsystem can perform because none of them sees the
+    /// others' timing.
+    pub fn refreshPreinitialization(self: *MachOState) void {
+        const ledger = &self.gpu_preinitialization;
+        const at = self.executed_steps;
+        const variables = &self.gpu_kernel_variables;
+
+        if (self.xenia_memory_views.ready()) ledger.observe(.memory_view_base_discovered, at);
+
+        // Bound means the dereference lands somewhere, not that the storage
+        // holds a value. Those are different failures with different owners,
+        // and collapsing them is what made an unwritten clock look like an
+        // unbound slot.
+        var any_slot_bound = false;
+        var every_slot_bound = true;
+        inline for (.{
+            gpu.KernelVariable.global_device,    gpu.KernelVariable.gpu_clock_in_mhz,
+            gpu.KernelVariable.hsio_calibration_lock,
+        }) |which| {
+            const record = variables.entry(which);
+            if (record.imported) {
+                if (gpu.kernel_variables.plausiblePointer(record.slot_value)) {
+                    any_slot_bound = true;
+                } else {
+                    every_slot_bound = false;
+                }
+            }
+        }
+        if (any_slot_bound and every_slot_bound) ledger.observe(.kernel_variable_slots_bound, at);
+
+        inline for (.{
+            .{ gpu.KernelVariable.gpu_clock_in_mhz, gpu.PreinitElement.gpu_clock_published },
+            .{ gpu.KernelVariable.hsio_calibration_lock, gpu.PreinitElement.hsio_lock_initialised },
+        }) |pair| {
+            const record = variables.entry(pair[0]);
+            if (record.state == .populated) {
+                if (record.harness_writes != 0) {
+                    _ = ledger.supply(pair[1], at);
+                } else {
+                    ledger.observe(pair[1], at);
+                }
+            }
+        }
+
+        if (self.gpu_register_aperture.total_reads + self.gpu_register_aperture.total_writes != 0) {
+            ledger.observe(.register_aperture_reachable, at);
+        }
+        if (self.gpu_bootstrap.seen(.initialize_engines)) ledger.observe(.engines_initialised, at);
+        if (self.gpu_bootstrap.seen(.graphics_interrupt_callback)) ledger.observe(.interrupt_callback_registered, at);
+        if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch)) ledger.observe(.interrupt_callback_dispatched, at);
+        if (self.gpu_ring_watch_base != 0) ledger.observe(.ring_geometry_established, at);
+        if (self.execution_tracepoints.roleEntered(.command_processor)) ledger.observe(.command_processor_running, at);
+        if (variables.entry(.global_device).state == .populated) ledger.observe(.title_device_created, at);
+        // Written means dwords exist, not that any of them was a draw. Keying
+        // this on draws reported an ordering inversion in the observed run —
+        // 'write pointer advanced' before 'payload written' — that was an
+        // artifact of this mapping rather than anything the title did.
+        if (self.gpu_ring_nonzero_dwords != 0) ledger.observe(.ring_payload_written, at);
+        if (self.gpu_ring_publication.advances != 0) ledger.observe(.write_pointer_advanced, at);
+    }
+
+    /// Whether the guest's waits are waits or a spin wearing a wait's name.
+    pub fn logGuestWaitLiveness(self: *MachOState) void {
+        const ledger = &self.guest_wait_liveness;
+        machoCapturePrint(
+            "macho-processor: GUEST WAIT LIVENESS: waits={d} signalled={d} timed_out={d} immediate={d}% aggregate={s} objects={d} unattributed={d} untracked={d} step={d}; {s}\n",
+            .{
+                ledger.total_waits,
+                ledger.total_signalled,
+                ledger.total_timed_out,
+                ledger.aggregateImmediatePercent(),
+                ledger.aggregateVerdict().label(),
+                ledger.count,
+                ledger.unattributed_waits,
+                ledger.untracked_waits,
+                self.executed_steps,
+                ledger.verdict(),
+            },
+        );
+        for (ledger.objects[0..ledger.count]) |object| {
+            machoCapturePrint(
+                "  wait object handle=0x{x:0>8} waits={d} signalled={d} timed_out={d} immediate={d}% sets={d} sets_already_signalled={d} verdict={s}\n",
+                .{
+                    object.handle,
+                    object.waits,
+                    object.signalled,
+                    object.timed_out,
+                    object.immediateRatioPercent(),
+                    object.sets,
+                    object.sets_already_signalled,
+                    object.verdict().label(),
+                },
+            );
+        }
+        if (ledger.worst()) |object| machoCapturePrint(
+            "macho-processor: GUEST WAIT LIVENESS: worst object handle=0x{x:0>8} verdict={s} — {s}\n",
+            .{ object.handle, object.verdict().label(), object.verdict().meaning() },
+        );
+    }
+
+    /// The pre-initialisation ledger, printed with owners and ordering.
+    pub fn logPreinitialization(self: *MachOState) void {
+        self.refreshPreinitialization();
+        const ledger = &self.gpu_preinitialization;
+        const gap = ledger.firstGap();
+        machoCapturePrint(
+            "macho-processor: GPU PRE-INITIALIZATION: established={d}/{d} first_gap={s} owner={s} inversions={d} (dropped={d}) refused_supplies={d} step={d}; {s}\n",
+            .{
+                ledger.establishedCount(),
+                gpu.preinitialization.element_count,
+                if (gap) |element| element.label() else "<none>",
+                if (gap) |element| element.owner().label() else "-",
+                ledger.inversion_count,
+                ledger.inversions_dropped,
+                ledger.refused_supplies,
+                self.executed_steps,
+                ledger.verdict(),
+            },
+        );
+        inline for (@typeInfo(gpu.PreinitElement).@"enum".fields) |field| {
+            const element: gpu.PreinitElement = @enumFromInt(field.value);
+            const entry = ledger.entries[field.value];
+            machoCapturePrint(
+                "  preinit {s: <12} {s: <12} {s: <44} step={d} observations={d}{s}{s}\n",
+                .{
+                    element.owner().label(),
+                    ledger.state(element).label(),
+                    element.label(),
+                    entry.step,
+                    entry.observations,
+                    if (entry.state.present()) "" else " — ",
+                    if (entry.state.present()) "" else element.consequence(),
+                },
+            );
+        }
+        var index: u32 = 0;
+        while (index < ledger.inversion_count) : (index += 1) {
+            const inversion = ledger.inversions[index];
+            machoCapturePrint(
+                "macho-processor: GPU PRE-INITIALIZATION: ORDERING INVERSION #{d}: '{s}' became true at step {d} while '{s}' was still absent. Whatever the title read at that moment it read too early, and nothing re-reads it — {s}\n",
+                .{
+                    index + 1,
+                    inversion.element.label(),
+                    inversion.step,
+                    inversion.prerequisite.label(),
+                    inversion.prerequisite.consequence(),
+                },
+            );
+        }
+        var pending: [gpu.preinitialization.element_count]gpu.PreinitElement = undefined;
+        for (ledger.outstandingPlatformWork(&pending)) |element| {
+            machoCapturePrint(
+                "macho-processor: GPU PRE-INITIALIZATION: platform work outstanding: {s} — {s}\n",
+                .{ element.label(), element.consequence() },
+            );
+        }
+    }
+
+    /// Read every projection of the guest's ring buffer and say what is in it.
+    ///
+    /// Every other counter in this subsystem describes the ring second-hand: a
+    /// dword count, a pointer pair, a swap tally. None of them can distinguish
+    /// a title that set state and stopped from one that drew a frame and never
+    /// presented it, and those have different owners and different next steps.
+    /// The ring is ordinary memory here, so the direct answer was available and
+    /// simply never read.
+    ///
+    /// Read through all three aliases rather than one. The console's physical
+    /// page is mapped into this process more than once, and the emulator's
+    /// 4 KiB heap bias puts two of those mappings on different host pages — so
+    /// "the producer published twenty-five dwords" and "the ring is eight
+    /// thousand dwords of zeros" can both be true at once, of different host
+    /// addresses. A single-address read cannot tell that apart from a producer
+    /// that wrote nothing, and those are opposite bugs.
+    pub fn logRingContents(self: *MachOState) void {
+        if (self.gpu_ring_watch_base == 0 or self.gpu_ring_watch_size == 0) {
+            machoCapturePrint(
+                "macho-processor: RING CONTENTS: the ring's base and size have not been observed yet, so there is nothing to read. This is upstream of every packet question: VdInitializeRingBuffer has not run, or its arguments were not seen\n",
+                .{},
+            );
+            return;
+        }
+        const ring_dwords: u32 = @intCast(@min(self.gpu_ring_watch_size / 4, std.math.maxInt(u32)));
+        const virtual_alias: u32 = if (self.gpu_ring_watch_base >= 0x1000)
+            @intCast(0xE000_0000 + self.gpu_ring_watch_base - 0x1000)
+        else
+            0;
+        const unbiased = if (virtual_alias != 0)
+            self.xenia_memory_views.primaryUnbiasedHostAddress(virtual_alias) orelse 0
+        else
+            0;
+
+        var survey = gpu.ring_view.Survey{};
+        survey.record(gpu.ring_view.examine(
+            .physical,
+            self.gpu_ring_watch_host_physical,
+            self.guestMemoryConst(self.gpu_ring_watch_host_physical, self.gpu_ring_watch_size),
+            ring_dwords,
+        ));
+        survey.record(gpu.ring_view.examine(
+            .virtual_biased,
+            self.gpu_ring_watch_host_virtual,
+            self.guestMemoryConst(self.gpu_ring_watch_host_virtual, self.gpu_ring_watch_size),
+            ring_dwords,
+        ));
+        survey.record(gpu.ring_view.examine(
+            .virtual_unbiased,
+            unbiased,
+            self.guestMemoryConst(unbiased, self.gpu_ring_watch_size),
+            ring_dwords,
+        ));
+
+        const publication = &self.gpu_ring_publication;
+        const published = publication.advances != 0;
+        self.gpu_ring_scan_reports +|= 1;
+        machoCapturePrint(
+            "macho-processor: RING CONTENTS: base=0x{x} dwords={d} size=0x{x} projections(readable/written)={d}/{d} aliases_disagree={s}; {s}\n",
+            .{
+                self.gpu_ring_watch_base,
+                ring_dwords,
+                self.gpu_ring_watch_size,
+                survey.readableCount(),
+                survey.writtenCount(),
+                if (survey.aliasesDisagree()) "YES" else "NO",
+                survey.verdict(published),
+            },
+        );
+        for (survey.readings) |reading| {
+            machoCapturePrint(
+                "  projection {s: <16} host=0x{x:0>9} readable={s: <3} nonzero_dwords={d: <6} packets={d: <5} draws={d: <4} swap={s}; {s}\n",
+                .{
+                    reading.projection.label(),
+                    reading.address,
+                    if (reading.readable) "YES" else "NO",
+                    reading.nonzero_dwords,
+                    reading.packets,
+                    reading.draws,
+                    if (reading.swap != null) "YES" else "NO",
+                    reading.projection.meaning(),
+                },
+            );
+        }
+
+        // The span the pointers describe, read out of whichever projection
+        // actually holds data. The pointers are frequently zero here because
+        // the emulator reports them through a path this process does not see;
+        // an empty span is therefore not evidence, and the whole-ring walk
+        // above is what the verdict is built on.
+        const geometry = publication.geometry orelse gpu.RingGeometry{};
+        const span: u32 = if (geometry.write_pointer >= geometry.read_pointer)
+            geometry.write_pointer - geometry.read_pointer
+        else
+            ring_dwords - (geometry.read_pointer - geometry.write_pointer);
+        if (survey.best()) |chosen| {
+            if (self.guestMemoryConst(chosen.address, self.gpu_ring_watch_size)) |bytes| {
+                const summary = gpu.ring_scan.scan(bytes, geometry.read_pointer, span, ring_dwords);
+                machoCapturePrint(
+                    "  outstanding span: projection={s} read={d} write={d} span={d} examined={d} walked={d} packets={d} draws={d} swaps={d} truncated={s} desync={s}; {s}\n",
+                    .{
+                        chosen.projection.label(), geometry.read_pointer,
+                        geometry.write_pointer,    span,
+                        summary.dwords_examined,   summary.dwords_scanned,
+                        summary.packets,           summary.draw_packets,
+                        summary.swap_packets,
+                        if (summary.truncated) "YES" else "NO",
+                        if (summary.desynchronised) "YES" else "NO",
+                        summary.verdict(),
+                    },
+                );
+            }
+        }
+
+        if (survey.best()) |chosen| {
+            if (chosen.draws != 0) self.gpu_ring_draws_seen = true;
+            self.gpu_ring_draws_last_count = chosen.draws;
+            self.gpu_ring_nonzero_dwords = chosen.nonzero_dwords;
+            self.logRingPayload(chosen);
+        }
+        self.logSubmissionProvenance();
+        machoCapturePrint(
+            "  whole-ring draw search: draws={d} ever_seen={s}; the outstanding span is what the pointers describe, and a batch the command processor already drained is still in the ring. Absence here is weak evidence and presence is strong\n",
+            .{ self.gpu_ring_draws_last_count, if (self.gpu_ring_draws_seen) "YES" else "NO" },
+        );
+
+        // The pointers describe what is outstanding. A swap the command
+        // processor already drained is still in the ring, and "was one ever
+        // written" is a different and more useful question than "is one
+        // waiting" — a yes here with a zero swap counter upstream means the
+        // packet was written and not decoded, which is a completely different
+        // defect from one that was never written.
+        const found: ?gpu.Pm4SwapDescription = if (survey.best()) |chosen| chosen.swap else null;
+        if (found) |swap| {
+            if (self.gpu_frontbuffer == null) machoCapturePrint(
+                "macho-processor: RING CONTENTS: a swap packet is present in ring memory: frontbuffer=0x{x:0>8} extent={d}x{d} plausible={s}. The title did write a present request into the ring at some point in this run, whatever the swap counters say\n",
+                .{ swap.frontbuffer_physical_address, swap.width, swap.height, if (swap.plausible()) "YES" else "NO" },
+            );
+            if (swap.plausible()) {
+                self.gpu_frontbuffer = swap;
+                self.offerGuestFrontBuffer(swap, if (survey.best()) |chosen| chosen.fetch else null);
+            }
+        } else {
+            machoCapturePrint(
+                "macho-processor: RING CONTENTS: no XE_SWAP packet exists in any readable projection of the ring, drained or outstanding. The title has never written a present request, so the absence is the producer's and not the command processor's\n",
+                .{},
+            );
+        }
+    }
+
+    /// Print the dwords the producer actually wrote.
+    ///
+    /// Seventeen non-zero dwords in eight thousand is a very specific fact, and
+    /// every summary built on top of it loses the only part that matters. No
+    /// counter in the subsystem can say what the producer submitted; this can,
+    /// and the batch is small enough to read.
+    fn logRingPayload(self: *MachOState, chosen: gpu.ring_view.Reading) void {
+        const bytes = self.guestMemoryConst(chosen.address, self.gpu_ring_watch_size) orelse return;
+        const ring_dwords: u32 = @intCast(@min(self.gpu_ring_watch_size / 4, std.math.maxInt(u32)));
+        // Bounded like every other checkpoint walk. A ring configured at the
+        // emulator's largest size is half a million dwords, and this runs on a
+        // heartbeat in a ReleaseFast build where nothing else caps it.
+        const written = gpu.ring_payload.digest(bytes, ring_dwords, gpu.ring_scan.max_search_dwords);
+        machoCapturePrint(
+            "macho-processor: RING PAYLOAD: projection={s} nonzero_dwords={d} runs={d} (dropped={d}) real_packets={d} draws={d} swaps={d} scanned={d}; {s}\n",
+            .{
+                chosen.projection.label(),
+                written.nonzero_dwords,
+                written.run_count,
+                written.runs_dropped,
+                written.real_packets,
+                written.draws,
+                written.swaps,
+                written.scanned_dwords,
+                written.verdict(),
+            },
+        );
+        var run_index: u32 = 0;
+        while (run_index < written.run_count) : (run_index += 1) {
+            const region = written.runs[run_index];
+            var dwords: [gpu.ring_payload.max_dump_dwords]u32 = undefined;
+            const count = gpu.ring_payload.dumpRun(bytes, ring_dwords, region, &dwords);
+            const header = region.first_header orelse gpu.Pm4Header{ .raw = 0, .kind = .type2, .count = 0 };
+            machoCapturePrint(
+                "  run #{d} start_dword={d} length={d} frames_cleanly={s} first_packet={s} opcode={s} declared_dwords={d}\n",
+                .{
+                    run_index + 1,
+                    region.start,
+                    region.length,
+                    if (region.frames_cleanly) "YES" else "NO",
+                    @tagName(header.kind),
+                    if (header.kind == .type3) header.opcode.label() else "-",
+                    header.totalDwords(),
+                },
+            );
+            var at: u32 = 0;
+            while (at < count) : (at += 8) {
+                const end = @min(at + 8, count);
+                var line: [160]u8 = undefined;
+                var used: usize = 0;
+                var column = at;
+                while (column < end) : (column += 1) {
+                    const piece = std.fmt.bufPrint(line[used..], "{x:0>8} ", .{dwords[column]}) catch break;
+                    used += piece.len;
+                }
+                machoCapturePrint("    +{d: <5} {s}\n", .{ region.start + at, line[0..used] });
+            }
+        }
+    }
+
+    /// What the emulator's callback-missing probe actually found.
+    pub fn logImportBinding(self: *MachOState) void {
+        const ledger = &self.gpu_import_binding;
+        machoCapturePrint(
+            "macho-processor: IMPORT BINDING: probed={d} bound={d} worst={s} probes={d} untracked={d} step={d}; {s}\n",
+            .{
+                ledger.count,
+                ledger.boundCount(),
+                ledger.worst().label(),
+                ledger.total_probes,
+                ledger.untracked_probes,
+                self.executed_steps,
+                ledger.verdict(),
+            },
+        );
+        for (ledger.entries[0..ledger.count]) |entry| {
+            machoCapturePrint(
+                "  import 0x{x:0>3} {s: <17} slot=0x{x:0>8} -> 0x{x:0>8} thunk=0x{x:0>8} words={x:0>8}/{x:0>8} export_stub={s} probes={d}\n",
+                .{
+                    entry.ordinal,
+                    entry.binding.label(),
+                    entry.slot_address,
+                    entry.slot_word,
+                    entry.thunk_address,
+                    entry.thunk_word0,
+                    entry.thunk_word1,
+                    if (gpu.import_binding.isExportThunk(entry.thunk_word0, entry.thunk_word1)) "YES" else "NO",
+                    entry.probes,
+                },
+            );
+        }
+    }
+
+    /// Which observers believe the write pointer moved, and whether they agree.
+    fn logSubmissionProvenance(self: *MachOState) void {
+        const ledger = &self.gpu_submission_provenance;
+        // Rosette's tracker is fed by parsing a line the emulator printed, so
+        // it is recorded as the log-line source and never as a stronger one.
+        ledger.record(.emulator_log_line, true, self.gpu_ring_publication.writes);
+        ledger.record(.emulator_counter, self.gpu_xenia_wptr_counter_seen, self.gpu_xenia_wptr_updates);
+        ledger.record(
+            .guest_register_store,
+            true,
+            self.gpu_register_aperture.total_writes,
+        );
+        ledger.record(.ring_memory_contents, self.gpu_ring_watch_base != 0, self.gpu_ring_nonzero_dwords);
+
+        const finding = ledger.finding();
+        machoCapturePrint(
+            "macho-processor: SUBMISSION PROVENANCE: finding={s} strongest_pointer_evidence={s} active_observers={d} undermines_publication={s} step={d}; {s}\n",
+            .{
+                finding.label(),
+                if (ledger.strongestPointerEvidence()) |source| source.label() else "<none>",
+                ledger.activeCount(),
+                if (finding.undermines_publication()) "YES" else "NO",
+                self.executed_steps,
+                finding.meaning(),
+            },
+        );
+        inline for (.{
+            gpu.submission_provenance.Source.emulator_log_line,
+            gpu.submission_provenance.Source.emulator_counter,
+            gpu.submission_provenance.Source.guest_register_store,
+            gpu.submission_provenance.Source.ring_memory_contents,
+        }) |source| {
+            const observation = ledger.get(source);
+            machoCapturePrint(
+                "  observer {s: <22} active={s: <3} events={d: <8} {s}\n",
+                .{
+                    source.label(),
+                    if (observation.active) "YES" else "NO",
+                    observation.events,
+                    source.strength(),
+                },
+            );
+        }
+    }
+
+    /// Hand the console's own framebuffer to the presenter.
+    ///
+    /// Two translations stand between the swap packet and readable memory: the
+    /// address it carries is a console *physical* address, and the emulator
+    /// projects console physical memory into this process at a base it
+    /// discovered at startup. Both are already modelled, and doing the join
+    /// here keeps the presentation layer from having to know that an emulated
+    /// console's address space exists at all.
+    ///
+    /// The surface description comes from the fetch constant the swap was
+    /// written next to, not from a default. Tiling and byte order are the two
+    /// facts that turn a correct read into a sheared or colour-swapped picture,
+    /// and neither produces an error when wrong — so when the fetch constant is
+    /// absent this says so and assumes the common case out loud.
+    fn offerGuestFrontBuffer(
+        self: *MachOState,
+        swap: gpu.Pm4SwapDescription,
+        fetch: ?gpu.Pm4FetchConstant,
+    ) void {
+        const host = self.xenia_memory_views.physicalHostAddress(swap.frontbuffer_physical_address) orelse {
+            machoCapturePrint(
+                "macho-processor: GUEST FRONT BUFFER: console physical 0x{x:0>8} could not be translated; the emulator's memory view base has not been discovered, so its framebuffer is unreadable from here\n",
+                .{swap.frontbuffer_physical_address},
+            );
+            return;
+        };
+        const tiled = if (fetch) |constant| constant.tiled() else true;
+        const endian: gpu.xenos_texture.Endian = if (fetch) |constant|
+            @enumFromInt(constant.endianness())
+        else
+            .@"8in32";
+        self.dynamic_forwarder.noteGuestFrontBuffer(host, swap.width, swap.height, tiled, endian);
+        if (!self.gpu_frontbuffer_offered) {
+            self.gpu_frontbuffer_offered = true;
+            machoCapturePrint(
+                "macho-processor: GUEST FRONT BUFFER: console physical 0x{x:0>8} -> 0x{x} extent={d}x{d} tiled={s} endian={s} fetch={s}; the presenter will convert and show these pixels ahead of any emulator Vulkan image, because they are the console's own framebuffer\n",
+                .{
+                    swap.frontbuffer_physical_address, host,
+                    swap.width,                        swap.height,
+                    if (tiled) "YES" else "NO",        endian.label(),
+                    if (fetch != null) "observed" else "ABSENT (tiling and byte order assumed; a wrong assumption here produces a sheared or colour-swapped picture, not an error)",
+                },
+            );
+        }
+    }
+
+
+    /// Whether the harness stood in for the title, and if not, what stopped it.
+    pub fn logSwapSubstitution(self: *MachOState) void {
+        const publication = &self.gpu_ring_publication;
+        const stalled = publication.last_advance_step != 0 and
+            self.executed_steps > publication.last_advance_step;
+        const evidence = gpu.SubstitutionEvidence{
+            .ring_published = publication.advances != 0,
+            .pm4_consumed = self.execution_tracepoints.roleEntered(.command_processor),
+            .draws_issued = self.gpu_ring_draws_seen,
+            .authentic_swap_seen = self.execution_tracepoints.roleEntered(.swap),
+            .steps_since_publish = if (stalled) self.executed_steps - publication.last_advance_step else 0,
+            .ring_geometry_known = self.gpu_ring_watch_base != 0,
+            .ring_drained = publication.drained_observations != 0,
+            .frontbuffer_known = self.gpu_frontbuffer != null,
+            .discovered_output_available = self.dynamic_forwarder.guestFrontBufferAvailable(),
+            // The one capability that does not exist yet. Stated as a fact the
+            // decision reads rather than baked into the decision, so closing it
+            // is one assignment instead of an edit to the policy.
+            .write_pointer_channel_available = false,
+        };
+        const decision = gpu.swap_substitution.decide(evidence, gpu.swap_substitution.default_quiet_steps);
+        self.gpu_swap_substitution.record(decision, self.executed_steps);
+
+        machoCapturePrint(
+            "macho-processor: SWAP SUBSTITUTION: tier={s} blocked_by={s} step={d} triggers={d} presented={d} packets={d} pointers={d} fabricated={s}; {s}\n",
+            .{
+                decision.tier.label(),
+                if (decision.blocked_by) |reason| @tagName(reason) else "-",
+                self.executed_steps,
+                self.gpu_swap_substitution.triggers,
+                self.gpu_swap_substitution.presented_discovered,
+                self.gpu_swap_substitution.packets_published,
+                self.gpu_swap_substitution.pointers_advanced,
+                if (self.gpu_swap_substitution.fabricatedAnything()) "YES" else "NO",
+                self.gpu_swap_substitution.verdict(),
+            },
+        );
+        machoCapturePrint(
+            "  evidence: published={s} consumed={s} drew={s} authentic_swap={s} quiet_steps={d} geometry={s} drained={s} frontbuffer={s} wptr_channel={s}\n",
+            .{
+                if (evidence.ring_published) "YES" else "NO",
+                if (evidence.pm4_consumed) "YES" else "NO",
+                if (evidence.draws_issued) "YES" else "NO",
+                if (evidence.authentic_swap_seen) "YES" else "NO",
+                evidence.steps_since_publish,
+                if (evidence.ring_geometry_known) "YES" else "NO",
+                if (evidence.ring_drained) "YES" else "NO",
+                if (evidence.frontbuffer_known) "YES" else "NO",
+                if (evidence.write_pointer_channel_available) "YES" else "NO",
+            },
+        );
+        if (decision.blocked_by) |reason| {
+            if (reason != .not_triggered) machoCapturePrint(
+                "macho-processor: SWAP SUBSTITUTION: blocked — {s}\n",
+                .{reason.label()},
+            );
+        }
+        if (decision.tier.fabricatesGuestBehaviour()) {
+            _ = self.graphics_contract.substitute(.guest_swap_entered, self.executed_steps);
+        }
+    }
+
+    /// The contract, printed as a ladder with owners.
+    ///
+    /// The owner column is the point. A frontier the harness owns is work
+    /// Rosette can do today; one the title owns is a question about the title,
+    /// and no amount of harness code will move it.
+    pub fn logGraphicsContract(self: *MachOState) void {
+        self.refreshGraphicsContract();
+        const ledger = &self.graphics_contract;
+        const frontier = ledger.frontier();
+        machoCapturePrint(
+            "macho-processor: GRAPHICS CONTRACT: met={d}/{d} frontier={s} owner={s} step={d} harness_refusals={d}; {s}\n",
+            .{
+                frontier.met_required,
+                frontier.required_total,
+                if (frontier.clause) |clause| clause.label() else "<complete>",
+                if (frontier.clause) |clause| clause.owner().label() else "-",
+                self.executed_steps,
+                ledger.refused_harness_satisfactions,
+                if (frontier.clause) |clause| clause.guidance() else "every required clause is met",
+            },
+        );
+        inline for (@typeInfo(gpu.ContractClause).@"enum".fields) |field| {
+            const clause: gpu.ContractClause = @enumFromInt(field.value);
+            machoCapturePrint(
+                "  clause {s: <8} {s: <12} {s}{s}\n",
+                .{
+                    ledger.state(clause).label(),
+                    clause.owner().label(),
+                    clause.label(),
+                    if (clause.required()) "" else " (optional)",
+                },
+            );
+        }
+        var pending: [gpu.contract.clause_count]gpu.ContractClause = undefined;
+        const outstanding = ledger.unmetHarnessClauses(&pending);
+        if (outstanding.len == 0) {
+            machoCapturePrint(
+                "macho-processor: GRAPHICS CONTRACT: no harness clause is outstanding — every precondition Rosette owns has been supplied, so the frontier above is not Rosette's to move\n",
+                .{},
+            );
+            return;
+        }
+        for (outstanding) |clause| {
+            machoCapturePrint(
+                "macho-processor: GRAPHICS CONTRACT: harness work outstanding: {s} — {s}\n",
+                .{ clause.label(), clause.guidance() },
+            );
+        }
+    }
+
     /// Why the frame boundary is not being reached, joined from the three
     /// subsystems that each hold one third of the answer.
     ///
@@ -2228,6 +3214,29 @@ pub const MachOState = struct {
         self.graphics_last_ring_published = ring_published;
         self.graphics_last_anomaly_count = self.anomalies.count;
 
+        // The ring is read whether or not the frontier moved.
+        //
+        // Everything else in this report is derived from state that only
+        // changes when the frontier does, so gating it on a transition costs
+        // nothing. The ring is the opposite: it is memory the guest writes at
+        // its own pace, and a run whose frontier has stopped moving is exactly
+        // the run where its contents are the only thing left that can change.
+        // The observed stall took its last transition at step 3.5B and then ran
+        // for another 2.8B steps; gated on transitions, nothing would have
+        // looked at the ring across the whole second half of the run and the
+        // front buffer a swap names would never have been found.
+        //
+        // Rate-limited rather than free-running: the scan walks the ring, and a
+        // diagnostic that runs on every checkpoint becomes the dominant cost
+        // and the dominant source of log traffic at the same time.
+        if (force or state_changed or self.graphics_summary_emissions % 16 == 0) {
+            self.logRingContents();
+            self.logPreinitialization();
+            self.logGuestWaitLiveness();
+            self.logImportBinding();
+            self.logSwapSubstitution();
+        }
+
         // Heartbeats already say that execution is alive. The complete report
         // includes every tracepoint and the full thread census, so emit it only
         // on an actual state transition or at shutdown. A compact unchanged
@@ -2270,6 +3279,9 @@ pub const MachOState = struct {
             },
         );
         self.logSwapHealth();
+        self.logGraphicsContract();
+        self.logKernelSurface();
+        self.logKernelVariables();
         for (tracepoints.entries[0..tracepoints.count]) |entry| {
             machoCapturePrint(
                 "  tracepoint role={s} hits={d} first_step={d} first_thread=0x{x} first_caller=0x{x} last_step={d} address=0x{x} symbol={s}\n",
@@ -2309,6 +3321,7 @@ pub const MachOState = struct {
             },
         );
         self.dynamic_forwarder.logGraphicsProvenance();
+        self.dynamic_forwarder.logGuestFrontBuffer();
         // A blocked count is an aggregate; the frontier needs to know which
         // resource the producer is parked on and for how long.
         self.pthreads.logThreadCensus(self.executed_steps, self.active_guest_thread);
@@ -5963,6 +6976,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
             },
         );
     }
+    // The wait-cycle predictor is the health checker for exactly the run the
+    // cycle detector just described: name the objects the guest was cycling on
+    // (wait/set/release, with counts and steps) so the loop is an address, not
+    // a description. Always dumped so a healthy run reads as "no signatures".
+    state.livelock_predictor.dump(&state, "exit");
+    state.livelock_predictor.dumpRecent(&state);
     if (state.guest_modules.active()) {
         macho_log.machoCapturePrint(
             "macho-processor: guest module map: images={d} overflowed={d} failed_load_transactions={d}; only explicit post-call status/handle results are counted, never pre-call out-parameter values\n",
