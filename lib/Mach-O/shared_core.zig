@@ -6,5 +6,6 @@ pub const execution_helpers = @import("execution_helpers.zig");
 pub const packed_ops = @import("packed_ops.zig");
 pub const macho = @import("macho.zig");
 pub const metadata = @import("metadata.zig");
+pub const symbolication = @import("symbolication.zig");
 pub const symbol_assembly_context = @import("symbol-context/symbol_assembly_context.zig");
 pub const thunk_handler = @import("thunk_handler.zig");

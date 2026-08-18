@@ -53,6 +53,55 @@ pub const Signal = enum { draw, other };
 
 const MAX_SIGNAL_HANDLERS = 32;
 
+/// Why a paint request produced no dispatch.
+///
+/// A request that does not become a draw is not automatically a defect — GTK
+/// coalescing is real and a presenter that asks twice before the first paint
+/// runs is behaving correctly. What separates the two is *which* of these
+/// applies and for how long, so the reason is carried rather than inferred.
+pub const DrawStall = enum {
+    /// A dispatch is already queued for this widget and has not run yet.
+    coalesced_on_pending_source,
+    /// Requests are arriving for a widget that has no retained `draw` handler.
+    /// Either the connect was dropped or the guest is painting a widget it
+    /// never connected.
+    no_handler_for_widget,
+    /// `gtk_widget_queue_draw(NULL)`.
+    null_widget,
+
+    pub fn label(self: DrawStall) []const u8 {
+        return switch (self) {
+            .coalesced_on_pending_source => "coalesced_on_pending_source",
+            .no_handler_for_widget => "no_handler_for_widget",
+            .null_widget => "null_widget",
+        };
+    }
+};
+
+/// Paint requests that may pile up behind one undelivered draw before Rosette
+/// reports it. Coalescing a handful is normal; sixty-four consecutive requests
+/// with no dispatch means the guest is asking and not being answered.
+pub const DRAW_STALL_FIRST_THRESHOLD: u64 = 64;
+pub const MAX_DRAW_STALL_EMISSIONS: u64 = 6;
+
+/// Backlog at which coalescing stops being obedience to GTK's model and starts
+/// being a lost paint.
+///
+/// Coalescing is keyed on whether the previously queued callback is still
+/// pending, and that question is answered by a source id from a bounded
+/// scheduler table. Any way that id stops meaning what it meant — the callback
+/// never completing, the id being reissued to something unrelated — turns the
+/// coalesce into a permanent one, and a permanently coalesced widget never
+/// paints again however many times the guest asks.
+///
+/// So the coalesce is bounded rather than trusted. Past this many consecutive
+/// undelivered requests Rosette queues one more draw regardless. Re-dispatching
+/// is the recoverable direction: the cost of an extra queued paint is one entry
+/// in the idle queue, and the cost of the alternative is a window that is never
+/// painted again. Deliberately far above the reporting threshold so the log
+/// names the stall before the runtime papers over it.
+pub const DRAW_COALESCE_ESCAPE_BACKLOG: u64 = 256;
+
 pub const Runtime = struct {
     types: [MAX_TYPES]TypeEntry = [_]TypeEntry{.{}} ** MAX_TYPES,
     objects: [MAX_OBJECTS]ObjectEntry = [_]ObjectEntry{.{}} ** MAX_OBJECTS,
@@ -73,6 +122,25 @@ pub const Runtime = struct {
     draw_requests: u64 = 0,
     draw_dispatches: u64 = 0,
     draw_coalesced: u64 = 0,
+    /// Requests Rosette answered with nothing at all: no retained `draw`
+    /// handler matched the widget. This used to be a bare `return` — the one
+    /// outcome with no counter and no log, which is how a guest can ask fifty
+    /// thousand times and leave no trace of having been refused.
+    draw_unmatched: u64 = 0,
+    /// `draw_requests` when a dispatch was last scheduled. The difference is
+    /// the backlog: how many paint requests are standing behind a draw that
+    /// has not been delivered.
+    draw_requests_at_last_dispatch: u64 = 0,
+    draw_stall_threshold: u64 = DRAW_STALL_FIRST_THRESHOLD,
+    draw_stall_emissions: u64 = 0,
+    /// Dispatches Rosette made because a coalesce had gone on too long. Each
+    /// one is a paint the guest asked for that the coalescing model would
+    /// otherwise have swallowed.
+    draw_coalesce_escapes: u64 = 0,
+    /// Widest backlog reached. Reported even when the emission cap is hit, so
+    /// the summary can state the size of the stall rather than that one
+    /// occurred.
+    draw_backlog_peak: u64 = 0,
 
     /// `gulong g_signal_connect_data(instance, detailed_signal, handler, data,
     /// destroy_notify, flags)` — System V: rdi, rsi, rdx, rcx, r8, r9.
@@ -126,7 +194,11 @@ pub const Runtime = struct {
     /// subsequent frame rather than one.
     fn requestDraw(self: *Runtime, state: anytype, widget: u64) void {
         self.draw_requests +|= 1;
-        if (widget == 0) return;
+        if (widget == 0) {
+            self.draw_unmatched +|= 1;
+            self.noteDrawStall(widget, .null_widget, 0);
+            return;
+        }
         for (&self.signal_handlers) |*entry| {
             if (!entry.active or entry.signal != .draw or entry.instance != widget) continue;
             // Coalesce, because that is what GTK does: the widget is marked
@@ -135,9 +207,29 @@ pub const Runtime = struct {
             // fills a bounded queue with duplicate paints and starves the
             // sources that pump the guest's main loop — the paint would arrive
             // by crowding out the thing that makes progress.
-            if (state.isIdleCallbackPending(entry.pending_source)) {
-                self.draw_coalesced +|= 1;
-                return;
+            if (entry.pending_source != 0) {
+                if (state.isIdleCallbackPending(entry.pending_source)) {
+                    const backlog = self.draw_requests -| self.draw_requests_at_last_dispatch;
+                    if (backlog < DRAW_COALESCE_ESCAPE_BACKLOG) {
+                        self.draw_coalesced +|= 1;
+                        self.noteDrawStall(widget, .coalesced_on_pending_source, entry.pending_source);
+                        return;
+                    }
+                    // The coalesce has outlived its justification. Queue anyway
+                    // and let the log say so, rather than answering the guest's
+                    // two-hundred-and-fifty-sixth request with silence.
+                    self.draw_coalesce_escapes +|= 1;
+                    machoCapturePrint(
+                        "macho-processor: GTK draw coalesce escape #{d}: widget=0x{x} stale_source={d} backlog={d} requests={d} dispatches={d}; the queued paint has not been serviced for {d} consecutive requests, so Rosette is dispatching another rather than coalescing this widget out of existence\n",
+                        .{ self.draw_coalesce_escapes, widget, entry.pending_source, backlog, self.draw_requests, self.draw_dispatches, backlog },
+                    );
+                }
+                // Either the dispatch this id stood for has run, or the escape
+                // above decided not to wait for it. Forget the id: source ids
+                // come from a bounded scheduler table, and holding a stale one
+                // is what lets an unrelated callback's id coalesce this
+                // widget's paints.
+                entry.pending_source = 0;
             }
             // GTK3: gboolean draw(GtkWidget *widget, cairo_t *cr, gpointer data).
             // The cairo context is null: Rosette has no cairo surface, and a
@@ -148,6 +240,8 @@ pub const Runtime = struct {
             if (source == 0) return;
             entry.pending_source = source;
             self.draw_dispatches +|= 1;
+            self.draw_requests_at_last_dispatch = self.draw_requests;
+            self.draw_stall_threshold = DRAW_STALL_FIRST_THRESHOLD;
             if (self.draw_dispatches <= 4) {
                 machoCapturePrint(
                     "macho-processor: GTK draw dispatch #{d}: widget=0x{x} handler=0x{x} data=0x{x} source={d} requests={d}\n",
@@ -156,6 +250,64 @@ pub const Runtime = struct {
             }
             return;
         }
+        self.draw_unmatched +|= 1;
+        self.noteDrawStall(widget, .no_handler_for_widget, 0);
+    }
+
+    /// PAINT REQUEST PREDICTOR — report a paint the guest asked for and Rosette
+    /// did not deliver, while the guest is still asking.
+    ///
+    /// A window that never repaints is diagnosed after the fact from an absence,
+    /// and an absence cannot name its own cause: "no frames appeared" is the
+    /// same sentence whether the guest never produced one, or produced them and
+    /// Rosette dropped the request that would have presented them. Those need
+    /// opposite investigations. The backlog distinguishes them directly — it is
+    /// non-zero only when the *guest* is asking, so it accuses Rosette and
+    /// nothing else, and it stays silent for a producer that has not run.
+    ///
+    /// Hot path cost is a subtract and a compare: `queue_draw` is called once
+    /// per frame the guest wants, which was forty-nine thousand times in the
+    /// run this was written for.
+    fn noteDrawStall(self: *Runtime, widget: u64, reason: DrawStall, pending_source: u64) void {
+        const backlog = self.draw_requests -| self.draw_requests_at_last_dispatch;
+        if (backlog > self.draw_backlog_peak) self.draw_backlog_peak = backlog;
+        if (backlog < self.draw_stall_threshold) return;
+        // Quadratic backoff: the first report arrives early enough to act on,
+        // and a guest that asks forever cannot fill the log.
+        self.draw_stall_threshold *|= 4;
+        if (self.draw_stall_emissions >= MAX_DRAW_STALL_EMISSIONS) return;
+        self.draw_stall_emissions +|= 1;
+        machoCapturePrint(
+            "PAINT REQUEST PREDICTOR: backlog={d} reason={s} widget=0x{x} pending_source={d} requests={d} dispatches={d} coalesced={d} unmatched={d} handlers={d}; the guest is still asking and Rosette is not delivering, so this is a forwarding failure on Rosette's side and not a producer that has not run. Predicted=a presenter that latches \"paint already requested\" until its handler runs will stop asking, and the window then never repaints regardless of whether the guest produces frames\n",
+            .{
+                backlog,
+                reason.label(),
+                widget,
+                pending_source,
+                self.draw_requests,
+                self.draw_dispatches,
+                self.draw_coalesced,
+                self.draw_unmatched,
+                self.drawHandlerCount(),
+            },
+        );
+        if (reason == .no_handler_for_widget) {
+            for (&self.signal_handlers) |*entry| {
+                if (!entry.active or entry.signal != .draw) continue;
+                machoCapturePrint(
+                    "PAINT REQUEST PREDICTOR:   retained draw handler instance=0x{x} callback=0x{x} data=0x{x}; the requested widget 0x{x} is not this one, so either the connect for it was dropped or the guest is painting a widget it never connected\n",
+                    .{ entry.instance, entry.callback, entry.data, widget },
+                );
+            }
+        }
+    }
+
+    fn drawHandlerCount(self: *const Runtime) usize {
+        var count: usize = 0;
+        for (&self.signal_handlers) |*entry| {
+            if (entry.active and entry.signal == .draw) count += 1;
+        }
+        return count;
     }
 
     pub fn dispatch(self: *Runtime, state: anytype, symbol: []const u8) ?Outcome {
@@ -278,6 +430,25 @@ pub const Runtime = struct {
         machoCapturePrint(
             "macho-processor: foreign object runtime: calls={d} types={d} objects={d} allocations={d} refs={d} mutations={d} rejected={d} main_loop(entries/bypasses/quits/depth)={d}/{d}/{d}/{d}\n",
             .{ self.calls, self.type_count, self.object_count, self.allocations, self.references, self.mutations, self.rejected, self.main_loop_entries, self.main_loop_bypasses, self.main_loop_quits, self.main_loop_depth },
+        );
+        // The paint ledger was collected and never printed, which made the one
+        // number that matters — how many of the guest's paint requests Rosette
+        // actually delivered — unavailable in every run that had it.
+        machoCapturePrint(
+            "macho-processor: foreign UI paint ledger: signal_connects={d} dropped={d} draw_handlers={d} requests={d} dispatches={d} coalesced={d} unmatched={d} coalesce_escapes={d} backlog(now/peak)={d}/{d} stall_reports={d}; requests are what the guest asked for and dispatches are what Rosette delivered. A large peak backlog is a Rosette forwarding failure; requests≈dispatches with no frames on screen puts the frontier in the guest's producer instead\n",
+            .{
+                self.signal_connects,
+                self.signal_connects_dropped,
+                self.drawHandlerCount(),
+                self.draw_requests,
+                self.draw_dispatches,
+                self.draw_coalesced,
+                self.draw_unmatched,
+                self.draw_coalesce_escapes,
+                self.draw_requests -| self.draw_requests_at_last_dispatch,
+                self.draw_backlog_peak,
+                self.draw_stall_emissions,
+            },
         );
     }
 
@@ -555,6 +726,154 @@ test "queue_draw reaches the connected draw handler" {
     state.regs = .{ .rdi = widget, .rsi = 16, .rdx = handler, .rcx = user_data };
     _ = runtime.dispatch(&state, "_g_signal_connect_data").?;
     try std.testing.expectEqual(@as(u64, 1), runtime.signal_connects_dropped);
+
+    // The request for the unconnected widget above was refused, and a refusal
+    // has to leave a number behind. A bare `return` is how a guest asks fifty
+    // thousand times and the run has nothing to say about it afterwards.
+    try std.testing.expectEqual(@as(u64, 1), runtime.draw_unmatched);
+}
+
+const PaintState = struct {
+    memory: [1024]u8 = [_]u8{0} ** 1024,
+    next: u64 = 64,
+    regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+    schedule_calls: u64 = 0,
+    pending_source: u64 = 0,
+    /// When set, every scheduled callback stays pending forever — the shape of
+    /// a draw whose source id has stopped tracking reality.
+    wedge_pending: bool = true,
+
+    fn guestAlloc(self: *@This(), size: u64, alignment: u64) ?u64 {
+        const address = std.mem.alignForward(u64, self.next, alignment);
+        if (address + size > self.memory.len) return null;
+        self.next = address + size;
+        return address;
+    }
+    fn guestMemory(self: *@This(), address: u64, size: u64) ?[]u8 {
+        if (address + size > self.memory.len) return null;
+        return self.memory[@intCast(address)..@intCast(address + size)];
+    }
+    fn write32(self: *@This(), address: u64, value: u32) void {
+        std.mem.writeInt(u32, self.memory[@intCast(address)..][0..4], value, .little);
+    }
+    fn write64(self: *@This(), address: u64, value: u64) void {
+        std.mem.writeInt(u64, self.memory[@intCast(address)..][0..8], value, .little);
+    }
+    fn guestCString(self: *@This(), address: u64, maximum: usize) ?[]const u8 {
+        if (address >= self.memory.len) return null;
+        const bytes = self.memory[@intCast(address)..@min(self.memory.len, @as(usize, @intCast(address)) + maximum)];
+        const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+        return bytes[0..end];
+    }
+    fn scheduleSignalCallback(self: *@This(), function: u64, a0: u64, a1: u64, a2: u64, tag: []const u8) u64 {
+        _ = .{ function, a0, a1, a2, tag };
+        self.schedule_calls += 1;
+        if (self.wedge_pending) self.pending_source = self.schedule_calls;
+        return self.schedule_calls;
+    }
+    fn isIdleCallbackPending(self: *@This(), source: u64) bool {
+        return source != 0 and source == self.pending_source;
+    }
+
+    fn connectDraw(self: *@This(), runtime: *Runtime, widget: u64) void {
+        @memcpy(self.memory[0..5], "draw\x00");
+        self.regs = .{ .rdi = widget, .rsi = 0, .rdx = 0xBBBB, .rcx = 0xCCCC };
+        _ = runtime.dispatch(self, "_g_signal_connect_data").?;
+    }
+    fn queueDraw(self: *@This(), runtime: *Runtime, widget: u64) void {
+        self.regs = .{ .rdi = widget };
+        _ = runtime.dispatch(self, "_gtk_widget_queue_draw").?;
+    }
+};
+
+// The run this was written for: 49,080 paint requests, one dispatch, and no
+// counter printed anywhere that could have said so. A backlog is the only
+// number that accuses Rosette specifically — it is non-zero only while the
+// guest is still asking — so it has to exist and it has to be bounded.
+test "an undelivered paint backlog is measured, reported and finally escaped" {
+    var runtime = Runtime{};
+    var state = PaintState{};
+    const widget: u64 = 0xAAAA;
+    state.connectDraw(&runtime, widget);
+
+    // The first request dispatches; its source then never completes.
+    state.queueDraw(&runtime, widget);
+    try std.testing.expectEqual(@as(u64, 1), runtime.draw_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_backlog_peak);
+
+    // Requests below the escape threshold coalesce, exactly as GTK does.
+    var i: usize = 0;
+    while (i < DRAW_COALESCE_ESCAPE_BACKLOG - 1) : (i += 1) state.queueDraw(&runtime, widget);
+    try std.testing.expectEqual(@as(u64, 1), runtime.draw_dispatches);
+    try std.testing.expectEqual(DRAW_COALESCE_ESCAPE_BACKLOG - 1, runtime.draw_coalesced);
+    try std.testing.expectEqual(DRAW_COALESCE_ESCAPE_BACKLOG - 1, runtime.draw_backlog_peak);
+    // And the stall was reported long before the escape fired.
+    try std.testing.expect(runtime.draw_stall_emissions > 0);
+
+    // The next one escapes: a coalesce this old is a lost paint, not obedience.
+    state.queueDraw(&runtime, widget);
+    try std.testing.expectEqual(@as(u64, 1), runtime.draw_coalesce_escapes);
+    try std.testing.expectEqual(@as(u64, 2), runtime.draw_dispatches);
+    // The dispatch resets the backlog, so the guest is being answered again.
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_requests -| runtime.draw_requests_at_last_dispatch);
+}
+
+test "a guest that asks forever cannot flood the log" {
+    var runtime = Runtime{};
+    var state = PaintState{};
+    const widget: u64 = 0xAAAA;
+    state.connectDraw(&runtime, widget);
+
+    var i: usize = 0;
+    while (i < 50_000) : (i += 1) state.queueDraw(&runtime, widget);
+    try std.testing.expect(runtime.draw_stall_emissions <= MAX_DRAW_STALL_EMISSIONS);
+    // Every request is accounted for under exactly one outcome.
+    try std.testing.expectEqual(
+        runtime.draw_requests,
+        runtime.draw_dispatches + runtime.draw_coalesced + runtime.draw_unmatched,
+    );
+    // And the window is still being painted, at a reduced rate rather than
+    // never: silence was the failure this replaces.
+    try std.testing.expect(runtime.draw_dispatches > 1);
+}
+
+test "a serviced paint releases its source without needing an escape" {
+    var runtime = Runtime{};
+    var state = PaintState{};
+    const widget: u64 = 0xAAAA;
+    state.connectDraw(&runtime, widget);
+
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        state.queueDraw(&runtime, widget);
+        // The scheduler runs the callback before the next request arrives.
+        state.pending_source = 0;
+    }
+    try std.testing.expectEqual(@as(u64, 32), runtime.draw_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_coalesced);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_coalesce_escapes);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_stall_emissions);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_backlog_peak);
+}
+
+test "requests for a widget nobody connected are counted, never coalesced away" {
+    var runtime = Runtime{};
+    var state = PaintState{};
+    state.connectDraw(&runtime, 0xAAAA);
+
+    var i: usize = 0;
+    while (i < 300) : (i += 1) state.queueDraw(&runtime, 0xDEAD);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_dispatches);
+    try std.testing.expectEqual(@as(u64, 300), runtime.draw_unmatched);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_coalesced);
+    // An unmatched widget is a different defect from a stalled one and must not
+    // be laundered into a dispatch by the escape hatch.
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_coalesce_escapes);
+    try std.testing.expect(runtime.draw_stall_emissions > 0);
+
+    // A null widget is its own outcome, not an unmatched handler lookup.
+    state.queueDraw(&runtime, 0);
+    try std.testing.expectEqual(@as(u64, 301), runtime.draw_unmatched);
 }
 
 test "foreign UI constructors return dereferenceable typed guest objects" {

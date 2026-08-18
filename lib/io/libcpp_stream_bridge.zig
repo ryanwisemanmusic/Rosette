@@ -366,7 +366,12 @@ pub const Bridge = struct {
         if (isBasicIosInit(name)) {
             const ios = state.regs.rdi;
             if (!self.object_model.initializeBasicIos(state, ios, state.regs.rsi)) return null;
-            if (@hasDecl(@TypeOf(state.*), "compat")) {
+            // `compat` is a *field* of the process state, so the presence test
+            // has to be `@hasField`. Written as `@hasDecl` it compiled, always
+            // evaluated false, and every locale initialisation in this file —
+            // all six of them — was silently skipped for the whole life of the
+            // code, leaving each constructed stream's locale slot zero.
+            if (@hasField(@TypeOf(state.*), "compat")) {
                 _ = state.compat.initLocale(state, ios + cxx_object_model.stream_layout.locale_offset, null);
             }
             return .handled_void;
@@ -420,14 +425,14 @@ pub const Bridge = struct {
 
         if (isIfstreamDefaultConstructor(name)) {
             if (!self.constructIfstream(state, state.regs.rdi)) return null;
-            if (@hasDecl(@TypeOf(state.*), "compat")) {
+            if (@hasField(@TypeOf(state.*), "compat")) {
                 _ = state.compat.initLocale(state, state.regs.rdi + BASIC_IOS_OFFSET_IN_IFSTREAM + cxx_object_model.stream_layout.locale_offset, null);
             }
             return .{ .handled = state.regs.rdi };
         }
         if (isIfstreamCStringConstructor(name)) {
             if (!self.constructIfstream(state, state.regs.rdi)) return null;
-            if (@hasDecl(@TypeOf(state.*), "compat")) {
+            if (@hasField(@TypeOf(state.*), "compat")) {
                 _ = state.compat.initLocale(state, state.regs.rdi + BASIC_IOS_OFFSET_IN_IFSTREAM + cxx_object_model.stream_layout.locale_offset, null);
             }
             _ = self.openCString(state, fs, state.regs.rdi + FILEBUF_OFFSET_IN_IFSTREAM, state.regs.rsi, state.regs.rdx);
@@ -435,7 +440,7 @@ pub const Bridge = struct {
         }
         if (isIfstreamFilesystemPathConstructor(name)) {
             if (!self.constructIfstream(state, state.regs.rdi)) return null;
-            if (@hasDecl(@TypeOf(state.*), "compat")) {
+            if (@hasField(@TypeOf(state.*), "compat")) {
                 _ = state.compat.initLocale(state, state.regs.rdi + BASIC_IOS_OFFSET_IN_IFSTREAM + cxx_object_model.stream_layout.locale_offset, null);
             }
             const view = compat_runtime.libcppStringView(state, state.regs.rsi) orelse return null;
@@ -715,7 +720,7 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         }
-        if (@hasDecl(@TypeOf(state.*), "compat")) {
+        if (@hasField(@TypeOf(state.*), "compat")) {
             _ = state.compat.initLocale(state, object + cxx_object_model.stream_layout.locale_offset, null);
         }
         self.constructors +|= 1;
@@ -1134,7 +1139,7 @@ pub const Bridge = struct {
             self.rejected +|= 1;
             return false;
         }
-        if (@hasDecl(@TypeOf(state.*), "compat")) {
+        if (@hasField(@TypeOf(state.*), "compat")) {
             _ = state.compat.initLocale(state, object + STRINGSTREAM_IOS_OFFSET + cxx_object_model.stream_layout.locale_offset, null);
         }
         const stream = self.ensure(streambuf) orelse {

@@ -15,6 +15,7 @@ const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 const byte_order = @import("byte_order");
 const memory_access = @import("memory_access.zig");
 const near_null_contract = @import("near_null_contract.zig");
+const near_null_predictor = @import("near_null_predictor.zig");
 
 const RegId = x64_decoder.RegId;
 const Size = x64_decoder.OperandSize;
@@ -92,6 +93,29 @@ pub fn faultContextThread(self: anytype) u64 {
 
 pub fn dumpTerminal(self: anytype, effective_address: u64) void {
     pinFaultContext(self);
+    // A native near-null casualty never passes through import dispatch, so
+    // the import-watching predictor would record nothing for it — this crash
+    // class (a C++ member call on a null `this`, or on a partially-zeroed
+    // object whose member offset became the receiver) is exactly the Xbyak
+    // LabelManager / KernelState `this` casualties. Record it into the
+    // predictor's signature table *before* the dump runs, so the terminal
+    // dump names the callee and caller with real symbols instead of reading
+    // `distinct=0 retained=0`. The caller is the return site at [rbp+8], the
+    // address the frame walk prints as frame[1].
+    if (@hasField(@TypeOf(self.*), "near_null_predictor") and
+        self.regs.rip >= self.executable_min and self.regs.rip < self.executable_max and
+        effective_address < NATIVE_NEAR_NULL_LIMIT)
+    {
+        const kind: near_null_predictor.NativeReceiverKind = if (self.regs.rdi == 0)
+            .null_this
+        else
+            .derived_member_offset;
+        const caller = if (self.regs.rbp != 0)
+            readFaultWord(self, self.regs.rbp +% 8) orelse 0
+        else
+            0;
+        self.near_null_predictor.noteNativeReceiver(self, self.regs.rip, caller, effective_address, kind);
+    }
     // Forward-looking signatures collected before the fault: which imports
     // were dispatched with near-null receivers, from where, and how often.
     if (@hasField(@TypeOf(self.*), "near_null_predictor")) {

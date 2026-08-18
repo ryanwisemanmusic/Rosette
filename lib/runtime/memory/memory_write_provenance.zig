@@ -8,6 +8,10 @@ pub const WriteKind = enum {
     partial_scalar,
     bulk_fill,
     bulk_copy,
+    /// One 128-bit guest store. A compiler-inlined `memset`/copy never reaches
+    /// the `memset`/`memcpy` import handlers, so this is the only kind that
+    /// names the vector unit as the writer.
+    vector_store,
     /// Written by Rosette itself while repairing a fault, not by the guest.
     ///
     /// Provenance records the *faulting guest RIP* as the writer, because that
@@ -421,4 +425,53 @@ test "bulk clear records an existing pointer casualty" {
     try std.testing.expectEqual(@as(u64, 0xA000), entry.previous_value);
     try std.testing.expectEqual(@as(u64, 0), entry.value);
     try std.testing.expectEqual(WriteKind.bulk_fill, entry.kind);
+}
+
+// A compiler-inlined zero fill never calls `memset`, so the ledger only ever
+// sees it as a run of sixteen-byte vector stores. Recording those under their
+// own kind is what separates "the guest called memset on this object" from "the
+// vector unit wrote over it", which are different bugs: the first names a
+// length or a destination, the second names an inlined loop.
+test "a vector store records the pointer casualties in its sixteen bytes" {
+    const TestState = struct {
+        memory: [32]u8 = [_]u8{0} ** 32,
+
+        fn guestMemoryConst(self: *@This(), address: u64, length: u64) ?[]const u8 {
+            const offset: usize = @intCast(address - 0x8000);
+            const count: usize = @intCast(length);
+            if (offset + count > self.memory.len) return null;
+            return self.memory[offset..][0..count];
+        }
+    };
+
+    var tracker: Tracker = .{};
+    defer tracker.deinit(std.testing.allocator);
+    var state = TestState{};
+    // A live object's vptr at +0x0 and the ownership pointer at +0x8 — the pair
+    // the near-null casualty is made of.
+    std.mem.writeInt(u64, state.memory[0..8], 0x1983888, .little);
+    std.mem.writeInt(u64, state.memory[8..16], 0x17a47660, .little);
+    tracker.record(std.testing.allocator, 0x8000, 0, 0x1983888, 1, 2, 3);
+    tracker.record(std.testing.allocator, 0x8008, 0, 0x17a47660, 1, 2, 3);
+
+    const capture = tracker.captureMutation(&state, 0x8000, 16);
+    @memset(state.memory[0..16], 0);
+    tracker.commitMutation(std.testing.allocator, &state, capture, 0x20fe9c, 1_891_981_829, 0x7fff20e0, .vector_store);
+
+    const vptr = tracker.lookup(0x8000).?;
+    try std.testing.expectEqual(@as(u64, 0x1983888), vptr.previous_value);
+    try std.testing.expectEqual(@as(u64, 0), vptr.value);
+    try std.testing.expectEqual(WriteKind.vector_store, vptr.kind);
+    try std.testing.expectEqual(@as(u64, 0x20fe9c), vptr.instruction_address);
+
+    // The field beside the vptr is the one the next member call dereferences,
+    // so its before-image has to survive too or the rollback has nothing to
+    // restore.
+    const owner = tracker.lookup(0x8008).?;
+    try std.testing.expectEqual(@as(u64, 0x17a47660), owner.previous_value);
+    try std.testing.expectEqual(@as(u64, 0), owner.value);
+    try std.testing.expectEqual(WriteKind.vector_store, owner.kind);
+
+    // A vector store is guest behaviour, not a Rosette repair.
+    try std.testing.expect(!isHostAuthored(vptr.kind));
 }

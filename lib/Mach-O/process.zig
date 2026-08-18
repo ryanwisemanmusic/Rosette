@@ -52,6 +52,9 @@ const anomaly_ledger = @import("diagnostics").anomaly_ledger;
 const notifier_liveness = @import("scheduler").notifier_liveness;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
 const near_null_predictor = @import("process_core").near_null_predictor;
+const vtable_clobber_predictor = @import("process_core").vtable_clobber_predictor;
+const import_binding_predictor = @import("process_core").import_binding_predictor;
+const swap_health = @import("process_core").swap_health;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const atomic_compare_exchange = @import("memory").atomic_compare_exchange;
 const memory_mod = @import("memory");
@@ -551,6 +554,17 @@ pub const MachOState = struct {
     /// dispatch, dumped when a terminal casualty is confirmed. See
     /// `near_null_predictor.zig` for the cost model (one compare per import).
     near_null_predictor: near_null_predictor.Predictor = .{},
+    /// Judges every write-time vptr restore before Rosette performs it. The
+    /// restore is a store into guest memory, and a tracked slot that turns out
+    /// to be live stack scratch makes that store the defect rather than the
+    /// repair. See `vtable_clobber_predictor.zig`; reached only from the
+    /// `trusted_value_cleared` branch, so it costs nothing per store.
+    vtable_clobber_predictor: vtable_clobber_predictor.Predictor = .{},
+    /// Judges the guest's own XEX import binding audit. The audit's finding
+    /// rests entirely on a thunk address it supplies, so an address no thunk
+    /// can have makes the finding evidence about the auditor rather than about
+    /// the import. See `import_binding_predictor.zig`.
+    import_binding_predictor: import_binding_predictor.Predictor = .{},
     /// Thread carrying a C++ exception that Itanium phase one could not match
     /// to a handler, and the thrown type. Read when the thread returns, so an
     /// exception-terminated thread is distinguishable from a clean exit.
@@ -2140,6 +2154,51 @@ pub const MachOState = struct {
     /// the wrapper killed the process on a timeout and every summary was
     /// written from the exit path. A diagnostic that only survives a clean
     /// shutdown is unavailable in exactly the runs that need it, so this is
+    /// Why the frame boundary is not being reached, joined from the three
+    /// subsystems that each hold one third of the answer.
+    ///
+    /// Printed with every frontier report because the frontier's own verdict
+    /// ("VdSwap never entered") is true for three different causes and names
+    /// none of them. Nothing here forces or synthesises a swap: a frame Rosette
+    /// manufactures is one the title did not draw, and it would retire the
+    /// signal that says the title is stuck.
+    pub fn logSwapHealth(self: *MachOState) void {
+        const publication = &self.gpu_ring_publication;
+        const swap_seen = self.execution_tracepoints.roleEntered(.swap) or
+            self.execution_tracepoints.roleEntered(.command_swap) or
+            self.execution_tracepoints.roleEntered(.xe_swap_decode);
+        const livelocked = if (comptime @hasField(MachOState, "guest_log_cycles"))
+            self.guest_log_cycles.active()
+        else
+            false;
+        const assessment = swap_health.assess(
+            publication.writes,
+            publication.advances,
+            publication.published(),
+            publication.stalledSteps(self.executed_steps),
+            livelocked,
+            swap_seen,
+        );
+        machoCapturePrint(
+            "macho-processor: SWAP HEALTH: blocker={s} producer={s} step={d} wptr(writes/advances/repeats)={d}/{d}/{d} published={s} last_advance_step={d} quiet_for={d} largest_span_dwords={d} guest_livelocked={s} swap_seen={s}; {s}\n",
+            .{
+                assessment.blocker.label(),
+                @tagName(assessment.producer),
+                self.executed_steps,
+                publication.writes,
+                publication.advances,
+                publication.repeats,
+                if (assessment.published) "YES" else "NO",
+                publication.last_advance_step,
+                assessment.stalled_steps orelse 0,
+                publication.largest_span_dwords,
+                if (assessment.guest_livelocked) "YES" else "NO",
+                if (assessment.swap_seen) "YES" else "NO",
+                assessment.blocker.guidance(),
+            },
+        );
+    }
+
     /// emitted periodically and again at exit.
     pub fn logGraphicsFrontier(self: *MachOState, force: bool) void {
         self.graphics_summary_emissions +|= 1;
@@ -2197,6 +2256,7 @@ pub const MachOState = struct {
                     if (ring_published) "YES" else "NO",
                 },
             );
+            self.logSwapHealth();
             return;
         }
         machoCapturePrint(
@@ -2209,6 +2269,7 @@ pub const MachOState = struct {
                 tracepoints.verdict(.swap),
             },
         );
+        self.logSwapHealth();
         for (tracepoints.entries[0..tracepoints.count]) |entry| {
             machoCapturePrint(
                 "  tracepoint role={s} hits={d} first_step={d} first_thread=0x{x} first_caller=0x{x} last_step={d} address=0x{x} symbol={s}\n",
@@ -5761,6 +5822,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.logCooperativeSchedulerSummary();
         state.memory_forwarder.logSummary();
         state.logLiveVtableGuardSummary();
+        state.import_binding_predictor.dump("exit");
         state.launch_options.logSummary();
         state.startup.logSummary();
         state.cxx_exceptions.logSummary();
@@ -5864,6 +5926,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.logCooperativeSchedulerSummary();
     state.memory_forwarder.logSummary();
     state.logLiveVtableGuardSummary();
+    state.import_binding_predictor.dump("exit");
     state.launch_options.logSummary();
     state.startup.logSummary();
     state.startup.timingSummary();

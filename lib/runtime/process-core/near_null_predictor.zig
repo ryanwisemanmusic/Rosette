@@ -9,6 +9,13 @@
 //! most recent near-null dispatches, so a casualty report can show the
 //! behaviors that fed into it.
 //!
+//! Native member-call casualties (a C++ method run with a null `this`, or on
+//! a partially-zeroed object whose member offset became the receiver) never
+//! pass through import dispatch, so `note` can never see them. The causality
+//! engine records those into the same signature table (`noteNativeReceiver`)
+//! before the terminal dump runs, so the dump names the faulting callee and
+//! caller with real symbols instead of reading empty.
+//!
 //! Noise control — a near-null *first argument* is not always a receiver:
 //!   * Allocators (`operator new`/`delete`, malloc family) take a size or a
 //!     pointer that is legal to delete when null; they never dereference it.
@@ -30,6 +37,7 @@
 
 const std = @import("std");
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
+const symbolication = @import("macho_core").symbolication;
 
 /// Receivers below this bound are "near null": dereferencing them faults on
 /// the zero page or a tiny tag-like address. Matches the existing 0x1000
@@ -44,6 +52,18 @@ pub const CLOBBER_CAPACITY: usize = 8;
 /// Cap per-signature emissions so a recurring signature cannot spam the log.
 pub const MAX_EMISSIONS_PER_SIGNATURE: u32 = 4;
 
+/// How a native (non-import) near-null casualty was shaped, recorded by the
+/// causality engine at the terminal fault.
+pub const NativeReceiverKind = enum {
+    /// A C++ member function ran with a null `this` (RDI == 0): the caller
+    /// passed a null object, or the object's ownership pointer was cleared.
+    null_this,
+    /// The base register itself holds a tiny derived value (e.g. 0x48): a
+    /// member offset into a partially-zeroed object, the same bypassing
+    /// bulk-writer family as `object_header_clobber`.
+    derived_member_offset,
+};
+
 const Signature = struct {
     valid: bool = false,
     symbol_hash: u64 = 0,
@@ -51,6 +71,10 @@ const Signature = struct {
     /// lifetime, so no copying is needed.
     symbol: []const u8 = "",
     caller: u64 = 0,
+    /// Non-zero for native (non-import) casualties: the faulting callee's
+    /// address, resolved to a symbol at print time. Imports leave this zero
+    /// and use `symbol` instead.
+    callee: u64 = 0,
     receiver: u64 = 0,
     count: u32 = 0,
     emissions: u32 = 0,
@@ -61,6 +85,8 @@ const Signature = struct {
 const Recent = struct {
     symbol: []const u8 = "",
     caller: u64 = 0,
+    /// Non-zero for native (non-import) casualties — see `Signature.callee`.
+    callee: u64 = 0,
     receiver: u64 = 0,
     step: u64 = 0,
 };
@@ -93,6 +119,10 @@ pub const Predictor = struct {
     recent_filled: bool = false,
     near_null_dispatches: u64 = 0,
     benign_skipped: u64 = 0,
+    /// Native (non-import) near-null casualties recorded by the causality
+    /// engine — the class of fault the import-watching `note` can never see
+    /// (a C++ member call on a null `this` or a partially-zeroed object).
+    native_receiver_events: u64 = 0,
     distinct_signatures: u32 = 0,
     emissions: u64 = 0,
     clobber: [CLOBBER_CAPACITY]ClobberEvent = [_]ClobberEvent{.{}} ** CLOBBER_CAPACITY,
@@ -119,7 +149,7 @@ pub const Predictor = struct {
 
         const caller = importCallerAddress(state);
         const signature = self.findOrInsert(symbol, caller) orelse return;
-        self.pushRecent(symbol, caller, receiver, state.executed_steps);
+        self.pushRecent(symbol, caller, 0, receiver, state.executed_steps);
 
         const step = state.executed_steps;
         const first_sight = signature.count == 0;
@@ -146,11 +176,13 @@ pub const Predictor = struct {
         for (&self.signatures) |*signature| {
             if (!signature.valid) continue;
             retained += 1;
-            const caller_label = resolveCallerLabel(state, signature.caller);
+            var caller_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+            var callee_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+            const caller_label = resolveCallerLabel(state, signature.caller, &caller_buf);
             machoCapturePrint(
                 "NEAR NULL PREDICTOR: signature symbol={s} caller={s} receiver=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d}\n",
                 .{
-                    signature.symbol,
+                    signatureLabel(state, signature, &callee_buf),
                     caller_label,
                     signature.receiver,
                     signature.count,
@@ -161,13 +193,14 @@ pub const Predictor = struct {
             );
         }
         machoCapturePrint(
-            "NEAR NULL PREDICTOR: dump reason={s} distinct={d} retained={d} near_null_dispatches={d} benign_skipped={d} recent_window={d} emissions={d}\n",
+            "NEAR NULL PREDICTOR: dump reason={s} distinct={d} retained={d} near_null_dispatches={d} benign_skipped={d} native_receivers={d} recent_window={d} emissions={d}\n",
             .{
                 reason,
                 self.distinct_signatures,
                 retained,
                 self.near_null_dispatches,
                 self.benign_skipped,
+                self.native_receiver_events,
                 self.recentCount(),
                 self.emissions,
             },
@@ -184,10 +217,16 @@ pub const Predictor = struct {
         );
         for (0..count) |ordinal| {
             const recent = self.recentChronological(ordinal) orelse continue;
-            const caller_label = resolveCallerLabel(state, recent.caller);
+            var caller_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+            var callee_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+            const caller_label = resolveCallerLabel(state, recent.caller, &caller_buf);
+            const display_symbol = if (recent.callee != 0)
+                resolveCallerLabel(state, recent.callee, &callee_buf)
+            else
+                recent.symbol;
             machoCapturePrint(
                 "  [{d}] symbol={s} caller={s} receiver=0x{x} step={d}\n",
-                .{ ordinal, recent.symbol, caller_label, recent.receiver, recent.step },
+                .{ ordinal, display_symbol, caller_label, recent.receiver, recent.step },
             );
         }
     }
@@ -242,7 +281,7 @@ pub const Predictor = struct {
             slots_len += part.len;
         }
         machoCapturePrint(
-            "NEAR NULL PREDICTOR: object_header_clobber object=0x{x} type={s} allocation_size={d} zeroed_slots={s} clobber_window=[{d}..{d}] writer=bypassing bulk/native write (not intercepted by vtable write tracking); predicted=the next native member call reading a zeroed header field will carry a null receiver — the lowest non-vptr zeroed offset is the prime suspect\n",
+            "NEAR NULL PREDICTOR: object_header_clobber object=0x{x} type={s} allocation_size={d} zeroed_slots={s} clobber_window=[{d}..{d}] writer=host-side write or alias-coherence defect (guest store widths are intercepted, so no guest instruction produced this unseen); predicted=the next native member call reading a zeroed header field will carry a null receiver — the lowest non-vptr zeroed offset is the prime suspect\n",
             .{
                 object_base,
                 type_symbol,
@@ -250,6 +289,79 @@ pub const Predictor = struct {
                 slots_buf[0..slots_len],
                 last_write_step,
                 state.executed_steps,
+            },
+        );
+    }
+
+    /// A native (non-import) near-null casualty — a C++ member call whose
+    /// receiver was null (`null_this`) or a tiny derived member offset
+    /// (`derived_member_offset`). These never pass through import dispatch, so
+    /// `note` can never see them; the causality engine records them here at
+    /// the terminal fault, *before* the dump runs, so the terminal dump names
+    /// the callee and caller with real symbols instead of reading empty. The
+    /// shared signature table means the same casualty recurring in a later run
+    /// (or a second casualty before exit) reports a growing count instead of
+    /// silence.
+    pub fn noteNativeReceiver(
+        self: *Predictor,
+        state: anytype,
+        callee_address: u64,
+        caller_address: u64,
+        effective: u64,
+        kind: NativeReceiverKind,
+    ) void {
+        self.native_receiver_events +|= 1;
+        const signature = self.findOrInsertNative(callee_address, caller_address) orelse return;
+        self.pushRecent("", caller_address, callee_address, effective, state.executed_steps);
+
+        const step = state.executed_steps;
+        const first_sight = signature.count == 0;
+        const receiver_changed = signature.receiver != effective;
+        signature.count +|= 1;
+        const doubling_threshold = (signature.count & (signature.count - 1)) == 0;
+        signature.receiver = effective;
+        signature.last_seen_step = step;
+        if (first_sight) signature.first_seen_step = step;
+
+        if (first_sight or
+            (receiver_changed and signature.emissions < MAX_EMISSIONS_PER_SIGNATURE) or
+            (doubling_threshold and signature.emissions < MAX_EMISSIONS_PER_SIGNATURE))
+        {
+            signature.emissions +|= 1;
+            self.emitNativeReceiver(state, signature, effective, kind);
+        }
+    }
+
+    fn emitNativeReceiver(
+        self: *Predictor,
+        state: anytype,
+        signature: *const Signature,
+        effective: u64,
+        kind: NativeReceiverKind,
+    ) void {
+        self.emissions +|= 1;
+        const kind_label: []const u8 = switch (kind) {
+            .null_this => "native_null_receiver",
+            .derived_member_offset => "native_derived_receiver",
+        };
+        const explanation: []const u8 = switch (kind) {
+            .null_this => "a native C++ member function ran with a null `this`; the caller above supplied the receiver — hunt the call that passed RDI=0 or the function that returned the object, and correlate with the object-header clobber history",
+            .derived_member_offset => "the base register is a member offset into a partially-zeroed object — the same bypassing bulk-writer family as object_header_clobber; the faulting object's region was zeroed, so hunt the bulk write inside the window preceding this step and correlate with the clobber history",
+        };
+        var callee_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+        var caller_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+        machoCapturePrint(
+            "NEAR NULL PREDICTOR: {s} effective=0x{x} member_offset=0x{x} callee={s} caller={s} count={d} step={d} threshold=0x{x}; {s}\n",
+            .{
+                kind_label,
+                effective,
+                effective,
+                resolveCallerLabel(state, signature.callee, &callee_buf),
+                resolveCallerLabel(state, signature.caller, &caller_buf),
+                signature.count,
+                signature.last_seen_step,
+                NEAR_NULL_LIMIT,
+                explanation,
             },
         );
     }
@@ -301,16 +413,25 @@ pub const Predictor = struct {
 
     fn emitSignature(self: *Predictor, state: anytype, signature: *const Signature, first_sight: bool) void {
         self.emissions +|= 1;
-        const caller_label = resolveCallerLabel(state, signature.caller);
+        var caller_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+        var callee_buf: [symbolication.LABEL_BUFFER_BYTES]u8 = undefined;
+        const caller_label = resolveCallerLabel(state, signature.caller, &caller_buf);
         const kind: []const u8 = if (first_sight) "first_sight" else "recurrence";
         machoCapturePrint(
             "NEAR NULL PREDICTOR: {s} symbol={s} caller={s} rdi=0x{x} count={d} step={d} threshold=0x{x}\n",
-            .{ kind, signature.symbol, caller_label, signature.receiver, signature.count, signature.last_seen_step, NEAR_NULL_LIMIT },
+            .{ kind, signatureLabel(state, signature, &callee_buf), caller_label, signature.receiver, signature.count, signature.last_seen_step, NEAR_NULL_LIMIT },
         );
     }
 
     fn findOrInsert(self: *Predictor, symbol: []const u8, caller: u64) ?*Signature {
-        const hash = hashSignature(symbol, caller);
+        return self.findOrInsertSlot(hashSignature(symbol, caller), symbol, caller, 0);
+    }
+
+    fn findOrInsertNative(self: *Predictor, callee: u64, caller: u64) ?*Signature {
+        return self.findOrInsertSlot(hashSignatureAddress(callee, caller), "", caller, callee);
+    }
+
+    fn findOrInsertSlot(self: *Predictor, hash: u64, symbol: []const u8, caller: u64, callee: u64) ?*Signature {
         var index: usize = @intCast(hash % SIGNATURE_CAPACITY);
         var first_empty: ?usize = null;
         var probes: usize = 0;
@@ -329,6 +450,7 @@ pub const Predictor = struct {
                 .symbol_hash = hash,
                 .symbol = symbol,
                 .caller = caller,
+                .callee = callee,
                 .receiver = 0,
                 .count = 0,
                 .emissions = 0,
@@ -363,6 +485,7 @@ pub const Predictor = struct {
             .symbol_hash = hash,
             .symbol = symbol,
             .caller = caller,
+            .callee = callee,
             .receiver = 0,
             .count = 0,
             .emissions = 0,
@@ -372,8 +495,8 @@ pub const Predictor = struct {
         return &self.signatures[slot];
     }
 
-    fn pushRecent(self: *Predictor, symbol: []const u8, caller: u64, receiver: u64, step: u64) void {
-        self.recent[self.recent_index] = .{ .symbol = symbol, .caller = caller, .receiver = receiver, .step = step };
+    fn pushRecent(self: *Predictor, symbol: []const u8, caller: u64, callee: u64, receiver: u64, step: u64) void {
+        self.recent[self.recent_index] = .{ .symbol = symbol, .caller = caller, .callee = callee, .receiver = receiver, .step = step };
         self.recent_index += 1;
         if (self.recent_index == RECENT_CAPACITY) {
             self.recent_index = 0;
@@ -402,6 +525,15 @@ pub const Predictor = struct {
         hash *%= 0x100_0000_01b3;
         return hash;
     }
+
+    fn hashSignatureAddress(callee: u64, caller: u64) u64 {
+        var hash: u64 = 0xcbf2_9ce4_8422_2325;
+        hash ^= callee;
+        hash *%= 0x100_0000_01b3;
+        hash ^= caller;
+        hash *%= 0x100_0000_01b3;
+        return hash;
+    }
 };
 
 /// The guest call site that entered the import thunk: the saved return
@@ -415,20 +547,32 @@ fn importCallerAddress(state: anytype) u64 {
     return if (caller != 0) caller else state.regs.rip;
 }
 
-/// Format `name@0xADDR` when the address resolves inside the image, else
-/// `0xADDR<unknown>`. The raw address is always present so an unattributable
-/// caller (JIT code, dylib) is still solvable offline.
-fn resolveCallerLabel(state: anytype, caller: u64) []const u8 {
-    if (caller == 0) return "0x0<null>";
-    var buffer: [160]u8 = undefined;
-    const name: []const u8 = if (@hasDecl(@TypeOf(state.*), "metadata"))
-        if (state.metadata.nearestSymbol(caller)) |symbol| symbol.name else ""
-    else
-        "";
-    if (name.len == 0) {
-        return std.fmt.bufPrint(&buffer, "0x{x}<unknown>", .{caller}) catch "0x0<unknown>";
-    }
-    return std.fmt.bufPrint(&buffer, "{s}@0x{x}", .{ name, caller }) catch "0x0<unknown>";
+/// The display name of a signature's callee: resolved from the stored callee
+/// address for native (non-import) casualties, else the import symbol slice.
+fn signatureLabel(state: anytype, signature: *const Signature, buffer: []u8) []const u8 {
+    if (signature.callee != 0) return resolveCallerLabel(state, signature.callee, buffer);
+    return signature.symbol;
+}
+
+/// Format a complete label for `caller`: `name+0xOFF@0xADDR` when a symbol
+/// covers it, and otherwise a label naming *why* it has no symbol — outside
+/// the image (generated code, heap, stack), inside the image with no covering
+/// symbol, or no symbol table at this call site. The raw address is always
+/// present so an unattributable caller stays solvable offline.
+///
+/// The label is written into the caller-owned `buffer` and is only valid until
+/// that buffer is reused — never call this twice and keep both results, since
+/// the second call overwrites the first's backing bytes. The buffer must be
+/// `symbolication.LABEL_BUFFER_BYTES`: the mangled names here run past two
+/// hundred characters, and a short buffer reports itself rather than
+/// truncating.
+fn resolveCallerLabel(state: anytype, caller: u64, buffer: []u8) []const u8 {
+    // Delegated to the one owner of address-to-name. The version that lived
+    // here tested `@hasDecl(@TypeOf(state.*), "metadata")`, and `metadata` is a
+    // *field* — `@hasDecl` sees declarations only, so the test was always false
+    // and every label this predictor printed read `<unknown>` while the frame
+    // walk in the same dump named the identical addresses.
+    return symbolication.describeState(state, caller, buffer);
 }
 
 /// Symbols whose first argument is a *pointer* for which null is the documented
@@ -946,4 +1090,59 @@ test "the two benign reasons stay separate and neither swallows the other" {
     // Neither list may claim a receiver-shaped symbol.
     try std.testing.expect(!isBenignSmallIntArgImport("_SDL_FreeSurface"));
     try std.testing.expect(!isDocumentedNullSentinelImport("_SDL_FreeSurface"));
+}
+
+// Native member-call casualties never pass through import dispatch, so the
+// import-watching `note` can never see them — the run's predictor dump read
+// `distinct=0 retained=0` while the terminal fault was a derived receiver. The
+// causality engine records them into the shared signature table, keyed by
+// (callee, caller), so the dump names the crash with real symbols instead of
+// silence.
+test "predictor records native receiver casualties with resolved callee symbols" {
+    const TestState = struct {
+        regs: struct { rdi: u64 = 0, rip: u64 = 0x1000, rsp: u64 = 0x8000, rbp: u64 = 0 } = .{},
+        executed_steps: u64 = 0,
+
+        fn read64(self: *const @This(), address: u64) u64 {
+            _ = self;
+            _ = address;
+            return 0x2000;
+        }
+    };
+
+    var predictor = Predictor{};
+    var state = TestState{};
+    state.executed_steps = 5_134_999_999;
+
+    // The Xbyak LabelManager casualty: std::__hash_table::begin() with
+    // this=0x48 — the `undefList` member offset into a partially-zeroed
+    // emitter whose stateList_ head was cleared by the bypassing bulk writer.
+    // callee=the terminal function, caller=frame[1]'s return site.
+    predictor.noteNativeReceiver(&state, 0xd84871, 0xd84745, 0x48, .derived_member_offset);
+    try std.testing.expectEqual(@as(u64, 1), predictor.native_receiver_events);
+    try std.testing.expectEqual(@as(u32, 1), predictor.distinct_signatures);
+    const signature = predictor.findOrInsertNative(0xd84871, 0xd84745).?;
+    try std.testing.expectEqual(@as(u32, 1), signature.count);
+    try std.testing.expectEqual(@as(u64, 0xd84871), signature.callee);
+    try std.testing.expectEqual(@as(u64, 0xd84745), signature.caller);
+    try std.testing.expectEqual(@as(u64, 0x48), signature.receiver);
+    try std.testing.expectEqual(@as(usize, 1), predictor.recentCount());
+
+    // Same callee+caller recurs -> the same signature accumulates a count.
+    state.executed_steps = 5_135_000_000;
+    predictor.noteNativeReceiver(&state, 0xd84871, 0xd84745, 0x48, .derived_member_offset);
+    try std.testing.expectEqual(@as(u32, 2), signature.count);
+    try std.testing.expectEqual(@as(u32, 1), predictor.distinct_signatures);
+
+    // A null-this native casualty (KernelState::memory with this=0) is a new
+    // distinct signature and keeps the effective address as its receiver.
+    predictor.noteNativeReceiver(&state, 0x20fe9c, 0x872099, 0x58, .null_this);
+    try std.testing.expectEqual(@as(u32, 2), predictor.distinct_signatures);
+    try std.testing.expectEqual(@as(u64, 0x58), predictor.findOrInsertNative(0x20fe9c, 0x872099).?.receiver);
+
+    // Import and native signatures share the table without colliding.
+    const import_signature = predictor.findOrInsert("_ZStls...EPKc", 0x2000).?;
+    try std.testing.expectEqual(@as(u32, 3), predictor.distinct_signatures);
+    try std.testing.expectEqual(@as(u64, 0), import_signature.callee);
+    try std.testing.expectEqual(@as(u64, 0xd84871), predictor.findOrInsertNative(0xd84871, 0xd84745).?.callee);
 }

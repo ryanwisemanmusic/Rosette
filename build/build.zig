@@ -1391,6 +1391,19 @@ pub fn build(b: *std.Build) void {
         macho_core_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         macho_core_mod.addImport("guest_abi", guest_abi_mod);
 
+        // Address-to-name, and the reason when there is no name. Rooted and run
+        // because the defect this module replaces was a resolver that compiled,
+        // type-checked and answered `<unknown>` for every address in the
+        // program: nothing but an executed test can catch a guard that is
+        // silently always false.
+        const macho_symbolication_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/Mach-O/symbolication.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const macho_symbolication_test = b.addTest(.{ .root_module = macho_symbolication_mod });
+        check_step.dependOn(&b.addRunArtifact(macho_symbolication_test).step);
+
         // `types.zig` owns `TraceEntry`, and `TraceEntry` now owns the mapping
         // from a decoder register id onto a snapshot field — the input to every
         // history-based causal walk in the runtime, and previously copied

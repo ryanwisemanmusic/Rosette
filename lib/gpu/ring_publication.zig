@@ -85,12 +85,37 @@ pub const Tracker = struct {
     largest_span_dwords: u32 = 0,
     /// Times geometry was reported with the pointers equal.
     drained_observations: u64 = 0,
+    /// Executed-step stamps for the first and most recent pointer change.
+    ///
+    /// `published()` is a latch: once the producer submits anything it stays
+    /// true for the rest of the run, which is correct for "did this ever
+    /// happen" and useless for "is it still happening". A title that publishes
+    /// one batch during initialization and then stops looks identical to one
+    /// that is submitting every frame, and those are opposite bugs. The stamps
+    /// are what let a reader tell a live producer from a latched one.
+    first_advance_step: u64 = 0,
+    last_advance_step: u64 = 0,
+    /// Step of the most recent write of any kind, changed value or not.
+    last_write_step: u64 = 0,
 
     pub fn observeWritePointer(self: *Tracker, value: u32) Outcome {
+        return self.observeWritePointerAt(value, 0);
+    }
+
+    /// Observe a write pointer value with the executed-step stamp attached.
+    /// `executed_steps` of zero means the caller has no clock, which keeps the
+    /// stamps at zero and makes `stalledSteps` return null rather than invent
+    /// an age.
+    pub fn observeWritePointerAt(self: *Tracker, value: u32, executed_steps: u64) Outcome {
         self.writes +|= 1;
+        if (executed_steps != 0) self.last_write_step = executed_steps;
         defer self.last_value = value;
         if (self.first_value == null) {
             self.first_value = value;
+            if (executed_steps != 0) {
+                self.first_advance_step = executed_steps;
+                self.last_advance_step = executed_steps;
+            }
             return .first_observation;
         }
         if (self.last_value.? == value) {
@@ -98,7 +123,21 @@ pub const Tracker = struct {
             return .repeated;
         }
         self.advances +|= 1;
+        if (executed_steps != 0) {
+            if (self.first_advance_step == 0) self.first_advance_step = executed_steps;
+            self.last_advance_step = executed_steps;
+        }
         return .advanced;
+    }
+
+    /// How long the producer has been quiet, in executed steps, or null when
+    /// it has never published or the caller kept no clock. Deliberately not a
+    /// boolean: what counts as "stalled" belongs to the reader, and a number
+    /// can be compared against the run's own scale.
+    pub fn stalledSteps(self: *const Tracker, executed_steps: u64) ?u64 {
+        if (self.last_advance_step == 0) return null;
+        if (executed_steps <= self.last_advance_step) return 0;
+        return executed_steps - self.last_advance_step;
     }
 
     pub fn observeGeometry(self: *Tracker, geometry: Geometry) void {

@@ -12,6 +12,7 @@ const startup_observer = @import("diagnostics").startup_observer;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
 const guest_module_map = @import("diagnostics").guest_module_map;
 const preflight_lib = @import("preflight");
+const import_binding_predictor = @import("import_binding_predictor.zig");
 const constants = @import("macho_core").constants;
 const utils = @import("macho_core").utils;
 
@@ -152,6 +153,7 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     observeXeniaPipelineGuestLog(self, message);
     observeGpuBootstrapGuestLog(self, message);
     observeXeniaGpuHandoffGuestLog(self, message);
+    observeImportBindingAudit(self, message);
     self.observeBackendGuestLog(message);
     const raw_char: u8 = @truncate(prefix_char_raw);
     const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
@@ -338,6 +340,22 @@ fn writeMirroredLine(self: anytype, prefix: []const u8, message: []const u8) voi
 /// export name is the observation; the ordering and preconditions live in
 /// `lib/gpu`, which is what turns "callback = 0" into "this step was never
 /// reachable, and here is the one that blocked it".
+/// Judge the guest's own XEX import binding audit rather than relaying it.
+///
+/// The audit reports a thunk address, and that address is the whole basis of
+/// its finding. When the address is one no thunk can have, the finding says
+/// nothing about the import — and a run that prints ten "kernel import failed
+/// to bind" warnings sends the reader after ten imports that are bound.
+///
+/// Reached only by lines that already matched the audit prefix, so the parse
+/// cost is paid twenty-one times in a twelve-billion-step run.
+pub fn observeImportBindingAudit(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "import_binding_predictor")) return;
+    const report = import_binding_predictor.parse(message) orelse return;
+    _ = self.import_binding_predictor.note(report, self.executed_steps);
+}
+
 pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "gpu_bootstrap")) return;
@@ -794,7 +812,7 @@ fn observeRingWritePointer(self: anytype, message: []const u8) void {
     const value = parseHexAfter(message, "CP_RB_WPTR = ") orelse
         parseHexAfter(message, "CP_RB_WPTR=") orelse return;
     const previous = self.gpu_ring_publication.last_value;
-    const outcome = self.gpu_ring_publication.observeWritePointer(value);
+    const outcome = self.gpu_ring_publication.observeWritePointerAt(value, self.executed_steps);
     const tracker = &self.gpu_ring_publication;
     machoCapturePrint(
         "macho-processor: gpu ring write pointer: old={s}0x{x} new=0x{x} outcome={s} writes={d} advances={d} repeats={d} span={s} published={s}\n",

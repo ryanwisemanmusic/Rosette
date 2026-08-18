@@ -3869,7 +3869,7 @@ noinline fn logAndReturnRecovery(self: anytype, address: u64, recovery: vt.Recov
     );
     if (observed < 0x1000) {
         machoCapturePrint(
-            "macho-processor: VTABLE OWNERSHIP FRONTIER: first_invalid=tracked_vptr_storage_divergence slot=0x{x} expected=0x{x} observed=0x{x} generation={d} owner_base=0x{x} last_tracked_writer=0x{x}@{d}; the live object's bytes no longer match the last accepted vptr transition. Recovery is authorised by exact slot identity plus live-allocation ownership, but the missing producer remains a bypassing bulk/native write or alias-coherence defect and must be correlated with the next ownership failure\n",
+            "macho-processor: VTABLE OWNERSHIP FRONTIER: first_invalid=tracked_vptr_storage_divergence slot=0x{x} expected=0x{x} observed=0x{x} generation={d} owner_base=0x{x} last_tracked_writer=0x{x}@{d}; the live object's bytes no longer match the last accepted vptr transition. Recovery is authorised by exact slot identity plus live-allocation ownership. Every *guest* store width now reports through the mutation contract, so a producer that reached here unseen is a host-side write — Rosette code that took a mutable range from guestMemory (mmap fill, file read, an import shim's output buffer) — or an alias-coherence defect. If the writer had been a guest store there would be a `mutation=` line naming it at the step it happened\n",
             .{
                 address,
                 recovery.value,
@@ -3930,6 +3930,11 @@ fn reportObjectHeaderClobber(self: anytype, object_base: u64, recovery: vt.Recov
 }
 
 pub fn logLiveVtableGuardSummary(self: anytype) void {
+    // Printed first: the counters below say how many restores happened, and
+    // that number is only readable next to how many were refused and why.
+    if (comptime @hasField(@TypeOf(self.*), "vtable_clobber_predictor")) {
+        self.vtable_clobber_predictor.dump("vtable_guard_summary");
+    }
     machoCapturePrint(
         "macho-processor: vtable runtime: low_reads_checked={d} recoveries={d} write_time_mutations={d} tracked_objects={d} establishments={d} transitions={d} rejected_candidates={d} low_clears={d} retired={d} heap_corruption_detections={d} vptr_range_mutations={d} vptr_truncated_ranges={d} atomic_rollbacks={d} atomic_qwords_restored={d} guard_tracked={d} memory_writes={d} provenance_range_mutations={d} provenance_truncated_ranges={d}; recovery requires a tracked vptr slot inside a live allocation and a complete mapped Itanium ZTV dispatch head (offset-to-top, RTTI, and first slot) — the slot may be a secondary base's vptr at a non-zero offset, not only the object's primary\n",
         .{
@@ -4096,6 +4101,39 @@ pub fn recordAllocationWrite(self: anytype, addr: u64, size: Size, val: u64) voi
     recordAllocationWriteKind(self, addr, size, val, .scalar, addr, 8);
 }
 
+/// Ask the clobber predictor whether this restore is a repair or a corruption.
+///
+/// Held out of line because the caller is on the store path and this is reached
+/// only from the `trusted_value_cleared` branch — twelve times in a
+/// three-billion-step run. A refusal also retires the record: once a slot is
+/// judged to be live scratch there is nothing to defend, and leaving the record
+/// in place would keep paying the Bloom hit and keep re-asking the same
+/// question every time the guest reuses that stack depth.
+noinline fn vtableClobberRestoreAllowed(
+    self: anytype,
+    address: u64,
+    owner_base: u64,
+    expected_vptr: u64,
+    observed: u64,
+) bool {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "vtable_clobber_predictor")) return true;
+    const verdict = self.vtable_clobber_predictor.assess(
+        address,
+        owner_base,
+        expected_vptr,
+        observed,
+        self.regs.rip,
+        self.regs.rsp,
+        self.regs.rbp,
+        self.executed_steps,
+        self.active_guest_thread,
+    );
+    if (!verdict.refused()) return true;
+    _ = self.vtable_tracker.retireAddress(address);
+    return false;
+}
+
 fn writeTrackedSlotDirect(self: anytype, address: u64, value: u64) bool {
     if (self.sparse_memory.bytes(address, 8, true)) |storage| {
         std.mem.writeInt(u64, storage[0..8], value, .little);
@@ -4254,6 +4292,13 @@ fn recordAllocationWriteKind(
     if (result.disposition == .trusted_value_cleared and
         result.previous_vptr >= 0x1000)
     {
+        // The restore is a store Rosette performs into guest memory, so it has
+        // to answer for itself. A tracked slot inside the writing thread's own
+        // frame is scratch the current call owns, not an object header, and
+        // writing a vtable pointer there hands the writer a pointer it will
+        // dereference. Judged here rather than at the read side because this
+        // is the only point that still has the writer's registers.
+        if (!vtableClobberRestoreAllowed(self, addr, owner.base, result.previous_vptr, val)) return;
         if (!writeTrackedSlotDirect(self, addr, result.previous_vptr)) return;
         self.vtable_tracker.live_vtable_write_protections +|= 1;
         const vtable_symbol = self.metadata.nearestSymbol(result.previous_vptr);
@@ -4750,6 +4795,7 @@ pub fn commitMemoryMutation(
         .partial_scalar => .partial_scalar,
         .bulk_fill => .bulk_fill,
         .bulk_copy => .bulk_copy,
+        .vector_store => .vector_store,
         .host_repair => .host_repair,
     };
     for (capture.vtables.slots[0..capture.vtables.count]) |slot| {
@@ -5404,19 +5450,41 @@ pub fn readMem128(self: anytype, addr: u64) [16]u8 {
     return value;
 }
 
+/// A 128-bit guest store is a *ranged* mutation and must answer to the same
+/// contract as `write8`/`write16`/`write32` and the bulk import handlers.
+///
+/// It did not, and that was a hole nothing else could cover. `write64` observes
+/// the exact slot it writes, the narrow scalar widths capture the qword they sit
+/// inside, and `memset`/`memcpy` capture the range the caller asked for — but a
+/// compiler-inlined zero fill emits `movaps`/`vmovdqu` stores directly and
+/// reaches none of those. Sixteen bytes of a live C++ object could therefore be
+/// replaced with no `observeWrite`, no write-time vptr restore, no provenance
+/// entry and no atomic rollback of the ownership fields beside the vptr. The
+/// damage surfaced only at the next virtual call, whose "last tracked writer"
+/// was still the constructor — in the observed casualty, 1.8 billion steps
+/// earlier — so the producer was unnameable by construction rather than by bad
+/// luck.
+///
+/// Cost is the same shape the narrow scalar writes already pay: for a sixteen
+/// byte range `captureMutation` is two page-filter bit tests before it looks at
+/// anything, and `commitMemoryMutation` walks zero slots when they miss.
 pub fn writeMem128(self: anytype, addr: u64, value: [16]u8) void {
     if (self.sparse_memory.bytes(addr, 16, true)) |storage| {
+        const mutation = captureMemoryMutation(self, addr, 16);
         noteGuestWrite(self, addr, 16);
         @memcpy(storage[0..16], value[0..]);
+        commitMemoryMutation(self, mutation, .vector_store);
         return;
     }
     const off = translateGuest(self, addr, 16, .write) orelse {
         terminateForGuestAccess(self, addr, 16, .write, "vector_write");
         return;
     };
+    const mutation = captureMemoryMutation(self, addr, 16);
     self.initializer_memory.capture(self.mem, @intCast(off), 16);
     noteGuestWrite(self, addr, 16);
     @memcpy(self.mem[off..][0..16], value[0..]);
+    commitMemoryMutation(self, mutation, .vector_store);
 }
 
 pub fn guestMemory(self: anytype, addr: u64, count: u64) ?[]u8 {

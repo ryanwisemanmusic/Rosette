@@ -60,6 +60,12 @@ pub const MutationKind = enum {
     partial_scalar,
     bulk_fill,
     bulk_copy,
+    /// A single 128-bit guest store (SSE/AVX `mov*ps`/`mov*dq*`). Distinct from
+    /// `bulk_fill` because no import handler is involved: a compiler-inlined
+    /// `memset`/copy emits these directly, so the writer is ordinary guest code
+    /// and the range is exactly sixteen bytes rather than a caller-supplied
+    /// length.
+    vector_store,
     host_repair,
 };
 

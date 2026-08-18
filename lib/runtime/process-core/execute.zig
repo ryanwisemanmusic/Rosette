@@ -501,7 +501,13 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 self.terminateForGuestAccess(d.addr, 10, .write, "fstp_mem80");
                 return;
             };
+            // Ten bytes span two pointer slots, so this is a ranged mutation
+            // and owes the same before-image as every other guest store width.
+            // Rare enough that the capture is free in practice, and leaving it
+            // out would put the one remaining hole back in the contract.
+            const mutation = self.captureMemoryMutation(d.addr, 10);
             if (self.x87.pop()) |value| writeExtendedFloat80(output, value) else @memset(output[0..10], 0);
+            self.commitMemoryMutation(mutation, .partial_scalar);
         },
         .fstp_mem32 => {
             if (self.x87.pop()) |value| {

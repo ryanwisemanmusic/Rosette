@@ -477,6 +477,54 @@ test "partial mutation capture finds an overlapping trusted vptr" {
     try std.testing.expectEqual(@as(usize, 0), unrelated.count);
 }
 
+// A 128-bit store is the one guest write width that used to reach memory
+// without asking this question. A compiler-inlined zero fill emits three of
+// them over a 48-byte header, and the object that motivated this had exactly
+// that shape: vptr and mount path gone, the byte at +0x30 untouched. The store
+// covers two pointer slots at once and need not start at the vptr, so both
+// geometries have to resolve.
+test "a sixteen-byte vector store captures every trusted vptr it covers" {
+    const FakeMemory = struct {
+        const base: u64 = 0x4000;
+        bytes: [64]u8 = [_]u8{0} ** 64,
+
+        pub fn guestMemoryConst(self: *const @This(), address: u64, length: u64) ?[]const u8 {
+            if (address < base or length > self.bytes.len) return null;
+            const offset = address - base;
+            if (offset > self.bytes.len or length > self.bytes.len - offset) return null;
+            return self.bytes[@intCast(offset)..][0..@intCast(length)];
+        }
+    };
+
+    var tracker = VtableTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+    // Multiple inheritance: a primary vptr at the base and a secondary eight
+    // bytes in. One vector store reaches both.
+    _ = tracker.observeWrite(0x4000, trustedEvidence(0x1950b28, 0x50), .{});
+    _ = tracker.observeWrite(0x4008, trustedEvidence(0x1950c40, 0x50), .{ .owner_base = 0x4000 });
+
+    var memory = FakeMemory{};
+    std.mem.writeInt(u64, memory.bytes[0..8], 0x1950b28, .little);
+    std.mem.writeInt(u64, memory.bytes[8..16], 0x1950c40, .little);
+
+    const covered = tracker.captureMutation(&memory, 0x4000, 16);
+    try std.testing.expectEqual(@as(usize, 2), covered.count);
+    try std.testing.expectEqual(@as(u64, 0x4000), covered.slots[0].address);
+    try std.testing.expectEqual(@as(u64, 0x1950b28), covered.slots[0].value);
+    try std.testing.expectEqual(@as(u64, 0x4008), covered.slots[1].address);
+    try std.testing.expectEqual(@as(u64, 0x1950c40), covered.slots[1].value);
+
+    // An unaligned store that straddles the secondary slot still finds it: the
+    // range is widened to slot boundaries before the filter is consulted.
+    const straddling = tracker.captureMutation(&memory, 0x400c, 16);
+    try std.testing.expectEqual(@as(usize, 1), straddling.count);
+    try std.testing.expectEqual(@as(u64, 0x4008), straddling.slots[0].address);
+
+    // And a store past the object claims nothing.
+    const beyond = tracker.captureMutation(&memory, 0x4020, 16);
+    try std.testing.expectEqual(@as(usize, 0), beyond.count);
+}
+
 test "ordinary allocation pointers are never protected as vtables" {
     var tracker = VtableTracker.init(std.testing.allocator);
     defer tracker.deinit();
