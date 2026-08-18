@@ -333,6 +333,36 @@ pub const Forwarder = struct {
     frame_inbox: rosette_gpu.FrameInbox = .{},
     frame_source_scans: u64 = 0,
     frame_source_discoveries: u64 = 0,
+    /// The console front buffer the guest's own swap packet named, translated
+    /// into an address this process can read. Supplied from outside because the
+    /// two address-space translations that produce it belong to the process
+    /// state, not to dyld.
+    ///
+    /// This is the only frame source that is the *console's* framebuffer rather
+    /// than a Vulkan image the emulator described. When the emulator's own GPU
+    /// work does not execute, every VkImage it allocates stays as empty as the
+    /// day it was mapped, and this is the one buffer that could still hold a
+    /// picture.
+    guest_frontbuffer_source: u64 = 0,
+    guest_frontbuffer_bytes: u64 = 0,
+    guest_frontbuffer_width: u32 = 0,
+    guest_frontbuffer_height: u32 = 0,
+    guest_frontbuffer_tiled: bool = true,
+    guest_frontbuffer_endian: rosette_gpu.xenos_texture.Endian = .@"8in32",
+    /// Converted pixels live in guest memory rather than in this struct: a
+    /// 4096-square surface is sixty-seven megabytes, and a buffer that large
+    /// inline would be paid for by every run whether or not a frame ever
+    /// arrives. Allocated once at the first conversion and reused.
+    guest_frontbuffer_scratch: u64 = 0,
+    guest_frontbuffer_scratch_bytes: u64 = 0,
+    guest_frontbuffer_conversions: u64 = 0,
+    guest_frontbuffer_conversion_failures: u64 = 0,
+    guest_frontbuffer_last_failure: ?rosette_gpu.xenos_texture.Failure = null,
+    /// Non-zero once a conversion produced pixels that were not all zero. The
+    /// distinction the whole path turns on: a mapped, addressable, entirely
+    /// empty front buffer is a GPU that never ran, and presenting it would put
+    /// a black window up and label it guest output.
+    guest_frontbuffer_nonzero_frames: u64 = 0,
     frame_source_absence_logged: ?rosette_gpu.FrameAbsence = null,
     vulkan_swapchain_image_handles: [4]u64 = [_]u64{0} ** 4,
     vulkan_swapchain_image_count: u32 = 0,
@@ -947,6 +977,11 @@ pub const Forwarder = struct {
     /// nothing, and the window keeps showing a frame labelled diagnostic.
     fn discoverGuestFrameSource(self: *Forwarder, state: anytype) void {
         self.frame_source_scans +|= 1;
+        // The console's own framebuffer outranks any Vulkan image the emulator
+        // described. When the emulator's GPU work does not execute, its images
+        // stay exactly as empty as they were mapped, and this is the only
+        // buffer that can hold a picture at all.
+        if (self.publishGuestFrontBuffer(state)) return;
         var best: ?*VulkanResource = null;
         var best_pixels: u64 = 0;
         var saw_image = false;
@@ -1746,6 +1781,122 @@ pub const Forwarder = struct {
         return report.classification;
     }
 
+    /// Point the harness at the console's own front buffer.
+    ///
+    /// `source` is already translated into an address this process can read;
+    /// doing that translation here would mean teaching dyld about the emulated
+    /// console's address space, which is two layers away from anything else in
+    /// this file.
+    pub fn noteGuestFrontBuffer(
+        self: *Forwarder,
+        source: u64,
+        width: u32,
+        height: u32,
+        tiled: bool,
+        endian: rosette_gpu.xenos_texture.Endian,
+    ) void {
+        const surface = rosette_gpu.XenosSurface{
+            .width = width,
+            .height = height,
+            .endian = endian,
+            .tiled = tiled,
+        };
+        if (!surface.presentable()) return;
+        self.guest_frontbuffer_source = source;
+        self.guest_frontbuffer_bytes = surface.requiredBytes();
+        self.guest_frontbuffer_width = width;
+        self.guest_frontbuffer_height = height;
+        self.guest_frontbuffer_tiled = tiled;
+        self.guest_frontbuffer_endian = endian;
+    }
+
+    /// Convert the console front buffer into pixels the presenter can copy, and
+    /// publish it.
+    ///
+    /// Returns false — and says why through the counters — rather than
+    /// presenting something wrong. The three ways this legitimately declines
+    /// are all worth telling apart: the buffer is not readable, the conversion
+    /// refused the surface, or the conversion succeeded and produced an image
+    /// that is entirely black. The last is the one that matters here, because
+    /// an allocated-but-never-rendered front buffer converts perfectly into
+    /// nothing, and a black window labelled "guest output" is a worse report
+    /// than no frame at all.
+    fn publishGuestFrontBuffer(self: *Forwarder, state: anytype) bool {
+        if (self.guest_frontbuffer_source == 0 or self.guest_frontbuffer_bytes == 0) return false;
+        const surface = rosette_gpu.XenosSurface{
+            .width = self.guest_frontbuffer_width,
+            .height = self.guest_frontbuffer_height,
+            .endian = self.guest_frontbuffer_endian,
+            .tiled = self.guest_frontbuffer_tiled,
+        };
+        const source = state.guestMemoryConst(self.guest_frontbuffer_source, self.guest_frontbuffer_bytes) orelse {
+            self.frame_inbox.noteUnusable(.source_unmapped);
+            return false;
+        };
+
+        const needed = @as(u64, surface.width) * surface.height * 4;
+        if (self.guest_frontbuffer_scratch == 0 or self.guest_frontbuffer_scratch_bytes < needed) {
+            self.guest_frontbuffer_scratch = state.guestAlloc(needed, 16) orelse return false;
+            self.guest_frontbuffer_scratch_bytes = needed;
+        }
+        const destination = state.guestMemory(self.guest_frontbuffer_scratch, needed) orelse return false;
+
+        if (rosette_gpu.xenos_texture.convertToBgra8(source, surface, destination)) |failure| {
+            self.guest_frontbuffer_conversion_failures +|= 1;
+            self.guest_frontbuffer_last_failure = failure;
+            self.frame_inbox.noteUnusable(switch (failure) {
+                .unsupported_format => .format_unsupported,
+                .implausible_extent => .malformed_descriptor,
+                .source_too_small, .destination_too_small => .source_truncated,
+            });
+            return false;
+        }
+        self.guest_frontbuffer_conversions +|= 1;
+
+        var written = false;
+        for (destination) |byte| {
+            if (byte != 0) {
+                written = true;
+                break;
+            }
+        }
+        if (!written) {
+            // Named precisely: the buffer exists, is mapped, converted cleanly,
+            // and holds no picture. That is a statement about the emulator's
+            // rendering, not about this path.
+            self.frame_inbox.noteUnusable(.never_published);
+            return false;
+        }
+        self.guest_frontbuffer_nonzero_frames +|= 1;
+
+        const serial = self.frame_inbox.publish(.{
+            .source_address = self.guest_frontbuffer_scratch,
+            .source_length = needed,
+            .width = surface.width,
+            .height = surface.height,
+            .format = self.native_presenter.surface_format.format,
+            .row_pitch_bytes = @as(u64, surface.width) * 4,
+            .orientation = .top_down,
+            .fit = .letterbox,
+            .producer = .xenia_host,
+            // Set by the swap observation, never by a frame having arrived.
+            .guest_swap_observed = false,
+        });
+        if (serial == 0) return false;
+        if (self.guest_frontbuffer_nonzero_frames == 1) {
+            machoCapturePrint(
+                "macho-processor: GUEST FRONT BUFFER PRESENTED: extent={d}x{d} tiled={s} endian={s} source=0x{x} bytes={d} serial={d}; these are the console's own pixels, converted from its framebuffer rather than from an emulator Vulkan image\n",
+                .{
+                    surface.width,          surface.height,
+                    if (surface.tiled) "YES" else "NO",
+                    surface.endian.label(), self.guest_frontbuffer_source,
+                    self.guest_frontbuffer_bytes, serial,
+                },
+            );
+        }
+        return true;
+    }
+
     /// Called when the guest's own bootstrap observes a `VdSwap`, so a frame
     /// discovered afterwards may be classified as guest output. Kept separate
     /// from frame delivery because a frame arriving is not a swap happening,
@@ -1764,6 +1915,22 @@ pub const Forwarder = struct {
 
     pub fn nativePresenterStage(self: *const Forwarder) rosette_gpu.NativePresenterStage {
         return self.native_presenter.stage;
+    }
+
+    /// Frames Rosette's own Vulkan presenter has put on the window, of any
+    /// class.
+    ///
+    /// The graphics contract needs this to decide whether presentation was ever
+    /// negotiated, and it was previously keyed on the *Metal* diagnostic path
+    /// alone. A run whose whole presentation stack came up through Vulkan
+    /// therefore reported `presentation capability negotiated` as outstanding
+    /// harness work while the presenter was on screen — which sends a reader to
+    /// write code that already exists.
+    pub fn nativePresenterFramesPresented(self: *const Forwarder) u64 {
+        const ledger = &self.native_presenter.ledger;
+        return ledger.diagnostic_frames_presented +|
+            ledger.host_frames_presented +|
+            ledger.guest_output_frames_presented;
     }
 
     pub fn virtualSleepCallCount(self: *const Forwarder) u64 {
@@ -1867,6 +2034,55 @@ pub const Forwarder = struct {
     /// made every graphics counter in that run unavailable precisely because
     /// the run was the interesting kind. A diagnostic that requires a clean
     /// shutdown is a diagnostic for the runs that did not need it.
+    /// Whether the harness holds a console framebuffer it could present. Read
+    /// by the substitution policy, which has to know the difference between "no
+    /// frame because nothing was found" and "no frame because the one that was
+    /// found held no picture".
+    pub fn guestFrontBufferAvailable(self: *const Forwarder) bool {
+        return self.guest_frontbuffer_nonzero_frames != 0;
+    }
+
+    /// What the console-framebuffer path has done, and where it stopped.
+    ///
+    /// Printed on its own line rather than folded into the Vulkan lifecycle,
+    /// because it answers a question none of those counters can: whether the
+    /// console's framebuffer holds a picture at all. A conversion that succeeds
+    /// and yields an entirely black image is the single most informative
+    /// outcome here — it says the memory is right and the rendering never
+    /// happened — and it is invisible in any counter that only tallies frames.
+    pub fn logGuestFrontBuffer(self: *const Forwarder) void {
+        if (self.guest_frontbuffer_source == 0) {
+            machoCapturePrint(
+                "macho-processor: GUEST FRONT BUFFER: never offered. No swap packet has named a front buffer, so the console's framebuffer address is unknown and nothing but a diagnostic frame can reach the window\n",
+                .{},
+            );
+            return;
+        }
+        machoCapturePrint(
+            "macho-processor: GUEST FRONT BUFFER: source=0x{x} bytes={d} extent={d}x{d} tiled={s} endian={s} conversions={d} failures={d} nonzero_frames={d} last_failure={s}; {s}\n",
+            .{
+                self.guest_frontbuffer_source,
+                self.guest_frontbuffer_bytes,
+                self.guest_frontbuffer_width,
+                self.guest_frontbuffer_height,
+                if (self.guest_frontbuffer_tiled) "YES" else "NO",
+                self.guest_frontbuffer_endian.label(),
+                self.guest_frontbuffer_conversions,
+                self.guest_frontbuffer_conversion_failures,
+                self.guest_frontbuffer_nonzero_frames,
+                if (self.guest_frontbuffer_last_failure) |failure| failure.label() else "-",
+                if (self.guest_frontbuffer_nonzero_frames != 0)
+                    "the console's framebuffer holds a picture and it is reaching the window"
+                else if (self.guest_frontbuffer_conversions != 0)
+                    "the console's framebuffer is readable and converts cleanly, and every pixel in it is zero. The memory is right and the rendering never happened: nothing wrote this buffer, which puts the frontier in the emulator's GPU execution and not in this path"
+                else if (self.guest_frontbuffer_conversion_failures != 0)
+                    "the console's framebuffer was found and could not be converted; the failure above names which of the surface's stated facts the memory does not support"
+                else
+                    "a front buffer address is known and no conversion has been attempted yet",
+            },
+        );
+    }
+
     pub fn logGraphicsProvenance(self: *const Forwarder) void {
         const presenter = &self.native_presenter;
         const presenter_ledger = &presenter.ledger;
