@@ -7,6 +7,7 @@ pub const bounded_dispatch_fst = @import("bounded_dispatch_fst.zig");
 pub const memory_access = @import("memory_access.zig");
 pub const near_null_causality = @import("near_null_causality.zig");
 pub const near_null_predictor = @import("near_null_predictor.zig");
+pub const livelock_predictor = @import("livelock_predictor.zig");
 pub const vtable_clobber_predictor = @import("vtable_clobber_predictor.zig");
 pub const import_binding_predictor = @import("import_binding_predictor.zig");
 pub const swap_health = @import("swap_health.zig");
@@ -30,6 +31,7 @@ test {
     _ = host_termination;
     _ = memory_access;
     _ = near_null_predictor;
+    _ = livelock_predictor;
     _ = vtable_clobber_predictor;
     _ = import_binding_predictor;
     _ = swap_health;

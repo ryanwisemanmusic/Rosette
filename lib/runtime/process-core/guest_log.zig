@@ -11,8 +11,11 @@ const machoCapturePrint = macho_log.machoCapturePrint;
 const startup_observer = @import("diagnostics").startup_observer;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
 const guest_module_map = @import("diagnostics").guest_module_map;
+const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
 const preflight_lib = @import("preflight");
 const import_binding_predictor = @import("import_binding_predictor.zig");
+const livelock_predictor = @import("livelock_predictor.zig");
+const swap_health = @import("swap_health.zig");
 const constants = @import("macho_core").constants;
 const utils = @import("macho_core").utils;
 
@@ -154,6 +157,12 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     observeGpuBootstrapGuestLog(self, message);
     observeXeniaGpuHandoffGuestLog(self, message);
     observeImportBindingAudit(self, message);
+    observeGuestEventSignal(self, message);
+    observeLivelockWaits(self, message);
+    observeKernelSurfaceAddress(self, message);
+    observeKernelSurfaceReport(self, message);
+    observeGuestWaitLiveness(self, message);
+    observeImportBindingProbe(self, message);
     self.observeBackendGuestLog(message);
     const raw_char: u8 = @truncate(prefix_char_raw);
     const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
@@ -354,6 +363,300 @@ pub fn observeImportBindingAudit(self: anytype, message: []const u8) void {
     if (comptime !@hasField(State, "import_binding_predictor")) return;
     const report = import_binding_predictor.parse(message) orelse return;
     _ = self.import_binding_predictor.note(report, self.executed_steps);
+}
+
+/// `was_signalled=` in the guest's event log is NOT a state.
+///
+/// `XEvent::Set` is `{ event_->Set(); return 1; }` — the field is the constant
+/// one, on every call, forever. An observer was built here that read a hundred
+/// percent `was_signalled=1` across 1742 sets as proof that waits never consume
+/// their signals, and concluded the pipeline was blocked on a synchronisation
+/// defect. It was reading a literal.
+///
+/// The counters below are kept because the *call volume* is still real evidence
+/// of handshake activity, but nothing may be concluded from the value. Left as
+/// a named refusal rather than deleted so the next reader does not rediscover
+/// the field and draw the same conclusion.
+pub fn observeGuestEventSignal(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_event_sets")) return;
+    const marker = "was_signalled=";
+    if (std.mem.indexOf(u8, message, marker) == null) return;
+    self.guest_event_sets +|= 1;
+}
+
+/// Feed the livelock predictor from the guest's own kernel tracing.
+///
+/// The predictor's contract is that the *caller* decides whether the ring is
+/// stalled; this observer is that caller. It recognises three operation
+/// families in the mirrored guest log — KeWaitForSingleObject (consumed and
+/// timed out), xeKeSetEvent, and KeReleaseSemaphore — extracts the object each
+/// one operated on, and passes the ring-stalled verdict along with it.
+///
+/// The wait result line carries the object only after the fork's
+/// instrumentation change; the detailed pre-wait line (`KeWaitForSingleObject
+/// tid=... guest_obj=...`) is remembered so the result line can be paired with
+/// an object even against a pre-change binary. Reached only from the guest-log
+/// bridge: one string compare per line when the line is not a wait.
+pub fn observeLivelockWaits(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "livelock_predictor")) return;
+    const operation = livelockOperation(self, message) orelse return;
+    self.livelock_predictor.note(self, operation.op, operation.object, livelockRingStalled(self));
+}
+
+const LivelockOperation = struct {
+    op: livelock_predictor.Operation,
+    object: u64,
+};
+
+fn livelockOperation(self: anytype, message: []const u8) ?LivelockOperation {
+    // Detailed pre-wait line: remember the object for the coming result line.
+    // The result line alone cannot name the object against a pre-change binary.
+    if (std.mem.indexOf(u8, message, "KeWaitForSingleObject tid=") != null) {
+        if (parseHexAfter(message, "guest_obj=")) |object| {
+            self.livelock_pending_wait_object = object;
+        } else if (parseHexAfter(message, "obj_ptr=")) |object| {
+            self.livelock_pending_wait_object = object;
+        }
+        return null;
+    }
+    // Wait result line: the wait actually happened (or timed out). STATUS_
+    // TIMEOUT is 0x102; a guest rotating through timeout waits is re-polling
+    // an object nobody will ever signal.
+    if (std.mem.indexOf(u8, message, "KeWaitForSingleObject result=") != null) {
+        const result = parseHexAfter(message, "result=") orelse return null;
+        const op: livelock_predictor.Operation = if (result == 0x102) .wait_timeout else .wait;
+        const object: u64 = blk: {
+            if (parseHexAfter(message, "guest_obj=")) |object_value| break :blk object_value;
+            if (parseHexAfter(message, "obj_ptr=")) |object_value| break :blk object_value;
+            break :blk self.livelock_pending_wait_object;
+        };
+        self.livelock_pending_wait_object = 0;
+        if (object == 0) return null;
+        return .{ .op = op, .object = object };
+    }
+    if (std.mem.indexOf(u8, message, "DEBUG: xeKeSetEvent: ptr=") != null) {
+        const object = parseHexAfter(message, "ptr=") orelse return null;
+        if (object == 0) return null;
+        return .{ .op = .set_event, .object = object };
+    }
+    // The generic `d>`-level export trace prints `KeReleaseSemaphore(<ptr>, ...)`
+    // on every call; the fork's own instrumentation prints the same shape at
+    // `i>` level with the object named. Either way the pointer is the first hex
+    // token after the open paren.
+    if (std.mem.indexOf(u8, message, "KeReleaseSemaphore(") != null) {
+        const object = firstHexAfterOpenParen(message, "KeReleaseSemaphore(") orelse return null;
+        if (object == 0) return null;
+        return .{ .op = .release_semaphore, .object = object };
+    }
+    return null;
+}
+
+/// Whether the ring write pointer is stalled, using the same bound as
+/// swap_health so the predictor and the frontier never disagree about what
+/// "stalled" means. Before the ring ever publishes, a wait cycle is only a
+/// livelock candidate once the run is well past the bootstrap window.
+fn livelockRingStalled(self: anytype) bool {
+    const publication = &self.gpu_ring_publication;
+    if (publication.advances == 0) {
+        return self.executed_steps > swap_health.STALL_STEPS;
+    }
+    const quiet = publication.stalledSteps(self.executed_steps) orelse return false;
+    return quiet >= swap_health.STALL_STEPS;
+}
+
+/// The first hex token after `name(` — the object pointer in the generic
+/// `Name(args)` export trace.
+fn firstHexAfterOpenParen(line: []const u8, name: []const u8) ?u64 {
+    const at = std.mem.indexOf(u8, line, name) orelse return null;
+    var text = line[at + name.len ..];
+    while (text.len != 0 and text[0] == ' ') text = text[1..];
+    var length: usize = 0;
+    while (length < text.len and std.ascii.isHex(text[length])) : (length += 1) {}
+    if (length == 0) return null;
+    return std.fmt.parseInt(u64, text[0..length], 16) catch null;
+}
+
+/// Join the emulator's own bootstrap-ordinal report into Rosette's model of
+/// the kernel surface.
+///
+/// The emulator already prints, per ordinal, whether the title imported it and
+/// whether anything touched it. What it does not do is ask the next question:
+/// for a *variable* export, is there a usable value at the address the title
+/// will read? Rosette can answer that, because it owns guest memory. Parsing
+/// the line the emulator already emits avoids a second, disagreeing source of
+/// truth about which ordinals the title imported.
+///
+/// Line shape:
+///   `RING BUFFER: bootstrap ordinal runtime ordinal=0x1BE name=VdGlobalDevice
+///    static_imported=YES ... vd_call_count=0 variable_export=YES
+///    runtime_activity=NO`
+pub fn observeKernelSurfaceReport(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_kernel_surface")) return;
+    if (std.mem.indexOf(u8, message, "bootstrap ordinal runtime ordinal=") == null) return;
+    const ordinal_value = parseHexAfter(message, "ordinal=") orelse return;
+    if (ordinal_value > std.math.maxInt(u16)) return;
+    const which = gpu.kernel_surface.Surface.fromOrdinal(@intCast(ordinal_value)) orelse return;
+
+    const imported = std.mem.indexOf(u8, message, "static_imported=YES") != null;
+    const activity = std.mem.indexOf(u8, message, "runtime_activity=YES") != null;
+    const calls = parseDecimalAfter(message, "vd_call_count=") orelse 0;
+    self.gpu_kernel_surface.observeBinding(which, imported, activity, calls);
+    if (!which.isVariable() or !imported) return;
+
+    // A variable export is only interesting if a reader would get something
+    // usable. Resolve the address from the emulator's export table dump if it
+    // has been seen, then read what the title would read.
+    const address = self.gpu_kernel_surface_addresses.lookup(which.ordinal()) orelse return;
+    self.gpu_kernel_surface.observeAddress(which, address);
+    // Xbox kernel variables are big-endian in guest memory.
+    const bytes = readGuestConsoleDword(self, address) orelse return;
+    self.gpu_kernel_surface.observeValue(which, bytes);
+    observeKernelVariableIndirection(self, which_ordinal_u16(ordinal_value), address, bytes);
+}
+
+fn which_ordinal_u16(value: u64) u16 {
+    return @intCast(value & 0xFFFF);
+}
+
+/// Read one big-endian dword out of the emulated console's virtual address
+/// space.
+///
+/// Two translations, both already modelled: the console address resolves to the
+/// address translated stores actually use, and that resolves to Rosette's own
+/// guest memory. Doing it here rather than at each call site is what keeps the
+/// byte order in one place — a console dword read natively is the mistake that
+/// turns every pointer into a plausible-looking wrong one.
+fn readGuestConsoleDword(self: anytype, console_address: u32) ?u32 {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "xenia_memory_views")) return null;
+    const host = self.xenia_memory_views.virtualHostAddress(console_address) orelse return null;
+    const bytes = self.guestMemoryConst(host, 4) orelse return null;
+    return std.mem.readInt(u32, bytes[0..4], .big);
+}
+
+/// Follow the second dereference behind a kernel variable import.
+///
+/// The import slot holds the *address of* the kernel's storage, not the value.
+/// Reading the slot and calling it the value cannot tell a healthy pointer from
+/// the loader's unimplemented sentinel — which is a large non-zero number and
+/// therefore reads as a populated variable. See `lib/gpu/kernel_variables.zig`.
+fn observeKernelVariableIndirection(self: anytype, ordinal: u16, slot_address: u32, slot_value: u32) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_kernel_variables")) return;
+    const which = gpu.kernel_variables.Variable.fromOrdinal(ordinal) orelse return;
+    self.gpu_kernel_variables.observeImport(which, true, slot_address);
+    self.gpu_kernel_variables.observeSlot(which, slot_value);
+    if (!gpu.kernel_variables.plausiblePointer(slot_value)) return;
+    if (gpu.kernel_variables.isUnimplementedSentinel(slot_value, ordinal)) return;
+    const storage = readGuestConsoleDword(self, slot_value) orelse return;
+    self.gpu_kernel_variables.observeStorage(which, storage);
+}
+
+/// Join the emulator's callback-missing import probe into the binding ledger.
+///
+/// The probe fires when the emulator decides a callback has gone missing, which
+/// makes it look like a report of a binding failure. It is not: it reports what
+/// the binding *is*, and in the observed run every field was healthy. Parsing it
+/// is what turns "the emulator is worried" into "the emulator is worried about
+/// something that is correct", which points at a completely different defect.
+pub fn observeImportBindingProbe(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_import_binding")) return;
+    if (std.mem.indexOf(u8, message, "callback-missing import probe") == null) return;
+    const ordinal = parseHexAfter(message, "ordinal=") orelse return;
+    if (ordinal > std.math.maxInt(u16)) return;
+    self.gpu_import_binding.observe(
+        @intCast(ordinal),
+        std.mem.indexOf(u8, message, "value_committed=YES") != null,
+        std.mem.indexOf(u8, message, "value_translated=YES") != null,
+        @truncate(parseHexAfter(message, "value_word=") orelse 0),
+        @truncate(parseHexAfter(message, "value_addr=") orelse 0),
+        std.mem.indexOf(u8, message, "thunk_translated=YES") != null,
+        @truncate(parseHexAfter(message, "thunk_addr=") orelse 0),
+        @truncate(parseHexAfter(message, "thunk_w0=") orelse 0),
+        @truncate(parseHexAfter(message, "thunk_w1=") orelse 0),
+    );
+}
+
+/// Join the emulator's wait and set logging into the wait-liveness ledger.
+///
+/// `KeWaitForSingleObject result=00000000` is the single most common line in a
+/// stalled run and the least informative one: it is returned both by a wait
+/// that blocked and was released, and by a wait that was satisfied on arrival
+/// and never blocked at all. The first is a working handshake; the second is a
+/// spin that looks like a stall in whichever subsystem it belongs to. Only the
+/// ratio separates them, so the ratio is what gets counted.
+///
+/// The emulator logs the result without the object's handle, so most waits
+/// arrive unattributed and the ledger says so rather than inventing an owner
+/// for them. Set lines do carry a handle and are recorded against it.
+pub fn observeGuestWaitLiveness(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "guest_wait_liveness")) return;
+    if (std.mem.indexOf(u8, message, "KeWaitForSingleObject result=")) |_| {
+        const code = parseHexAfter(message, "KeWaitForSingleObject result=") orelse return;
+        self.guest_wait_liveness.observeWait(
+            0,
+            guest_wait_liveness.WaitStatus.fromCode(@truncate(code)),
+        );
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "xeKeSetEvent:") != null) {
+        const handle = parseHexAfter(message, "handle=") orelse return;
+        const already = std.mem.indexOf(u8, message, "was_signalled=1") != null;
+        self.guest_wait_liveness.observeSet(@truncate(handle), already);
+    }
+}
+
+/// Capture `   V 820006B8          1BE ( 446)    VdGlobalDevice` from the
+/// emulator's export table dump: the only place the guest address of a
+/// variable export is stated.
+///
+/// The dump arrives as **one** log message several hundred lines long — the
+/// emulator builds the whole table into a single string and logs it once. A
+/// parser that tokenised the message got `Module` (the header's first word) and
+/// gave up, so every variable export stayed at address zero and the kernel
+/// surface reported `VdGlobalDevice UNPOPULATED` for a variable it had simply
+/// never looked at. That reads as a missing kernel write and sends the next
+/// hour into supplying one.
+///
+/// So the message is split first and each line examined. Cheap, because the
+/// leading-character test rejects a line in one comparison.
+pub fn observeKernelSurfaceAddress(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_kernel_surface_addresses")) return;
+    var lines = std.mem.splitScalar(u8, message, '\n');
+    while (lines.next()) |line| observeKernelSurfaceAddressLine(self, line);
+}
+
+fn observeKernelSurfaceAddressLine(self: anytype, line: []const u8) void {
+    var tokens = std.mem.tokenizeAny(u8, line, " \t\r");
+    const kind = tokens.next() orelse return;
+    if (kind.len != 1 or kind[0] != 'V') return;
+    const address_token = tokens.next() orelse return;
+    const address = std.fmt.parseInt(u32, address_token, 16) catch return;
+    const ordinal_token = tokens.next() orelse return;
+    const ordinal = std.fmt.parseInt(u16, ordinal_token, 16) catch return;
+    self.gpu_kernel_surface_addresses.record(ordinal, address);
+    if (comptime @hasField(@TypeOf(self.*), "gpu_kernel_variables")) {
+        if (gpu.kernel_variables.Variable.fromOrdinal(ordinal)) |which| {
+            // The dump lists every export the module has, imported or not, so
+            // the slot address is known here and whether the title imports it
+            // is settled separately by the emulator's own ordinal report.
+            self.gpu_kernel_variables.observeImport(which, true, address);
+        }
+    }
+}
+
+fn parseDecimalAfter(message: []const u8, key: []const u8) ?u64 {
+    const at = std.mem.indexOf(u8, message, key) orelse return null;
+    const rest = message[at + key.len ..];
+    const end = std.mem.indexOfNone(u8, rest, "0123456789") orelse rest.len;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
 }
 
 pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
@@ -797,13 +1100,33 @@ fn observeRingWritePointer(self: anytype, message: []const u8) void {
             .write_pointer = parseHexAfter(message, "write_ptr=") orelse 0,
         };
         const before = self.gpu_ring_publication.published();
-        self.gpu_ring_publication.observeGeometry(geometry);
+        // A bootstrap-incomplete snapshot reports every field as zero, and it
+        // is emitted repeatedly for the rest of the run. Letting it overwrite a
+        // real geometry made the outstanding span read as empty forever, which
+        // is indistinguishable from a drained ring.
+        const informative = geometry.base != 0 or geometry.size_bytes != 0 or
+            geometry.read_pointer != 0 or geometry.write_pointer != 0;
+        if (informative) self.gpu_ring_publication.observeGeometry(geometry);
         if (!before and self.gpu_ring_publication.published()) {
             machoCapturePrint(
                 "macho-processor: gpu ring publication: an outstanding span appeared: rb_base=0x{x} rb_size=0x{x} read_ptr=0x{x} write_ptr=0x{x} span_dwords={d} of {d}\n",
                 .{ geometry.base, geometry.size_bytes, geometry.read_pointer, geometry.write_pointer, geometry.spanDwords() orelse 0, geometry.sizeDwords() },
             );
             self.gpu_bootstrap.observe(.ring_write_pointer, self.executed_steps);
+        }
+    }
+
+    // The emulator's own applied-update counter, which is a different thing
+    // from the line below. The line is printed where it *decides* to update; the
+    // counter is incremented where it *applies* one. In the observed run the
+    // line fired twice and the counter stayed at zero, which means those are
+    // different code paths and nothing downstream should trust the line alone.
+    if (comptime @hasField(@TypeOf(self.*), "gpu_xenia_wptr_updates")) {
+        if (std.mem.indexOf(u8, message, "wptr_updates(total=") != null) {
+            if (parseDecimalAfter(message, "wptr_updates(total=")) |total| {
+                self.gpu_xenia_wptr_updates = @max(self.gpu_xenia_wptr_updates, total);
+                self.gpu_xenia_wptr_counter_seen = true;
+            }
         }
     }
 
