@@ -119,6 +119,111 @@ pub fn tiledOffset2D(x: u32, y: u32, pitch: u32, bytes_per_block_log2: u5) u32 {
     return @intCast(mixed);
 }
 
+/// Byte offset of a block within a tiled 3D surface (or array texture).
+///
+/// Xenos volume textures use 32×32×4 tiles.  This is the corresponding
+/// `GetTiledOffset3D` path from Xenia; it is intentionally kept separate from
+/// the 2D swizzle because the z coordinate participates in both the macro and
+/// micro address fields.
+pub fn tiledOffset3D(
+    x: u32,
+    y: u32,
+    z: u32,
+    pitch: u32,
+    height: u32,
+    bytes_per_block_log2: u5,
+) u32 {
+    const aligned_pitch = alignPitch(pitch);
+    const aligned_height = alignPitch(height);
+    const xi: i64 = @intCast(x);
+    const yi: i64 = @intCast(y);
+    const zi: i64 = @intCast(z);
+    const block_shift: u6 = @intCast(@as(u32, bytes_per_block_log2));
+    const volume_shift: u6 = block_shift + 6;
+
+    const macro_outer = ((yi >> 4) + (zi >> 2) * @as(i64, aligned_height >> 4)) *
+        @as(i64, aligned_pitch >> 5);
+    const macro = ((((xi >> 5) + macro_outer) << volume_shift) & 0x0FFFFFF) << 1;
+    const micro = (((xi & 7) + ((yi & 6) << 2)) << volume_shift) >> 6;
+    const offset_outer = ((yi >> 3) + (zi >> 2)) & 1;
+    const offset1 = offset_outer + ((((xi >> 3) + (offset_outer << 1)) & 3) << 1);
+    const offset2 = ((macro + (micro & ~@as(i64, 15))) << 1) + (micro & 15) +
+        ((zi & 3) << volume_shift) + ((yi & 1) << 4);
+
+    var address = (offset1 & 1) << 3;
+    address += (offset2 >> 6) & 7;
+    address <<= 3;
+    address += offset1 & ~@as(i64, 1);
+    address <<= 2;
+    address += offset2 & ~@as(i64, 511);
+    address <<= 3;
+    address += offset2 & 63;
+    return @intCast(address);
+}
+
+/// Exclusive byte bound for a tiled 2D extent. The bound is intentionally
+/// larger than the final texel's offset: Xenos addresses subregions in
+/// independently swizzled portions, so sizing from one pixel under-allocates
+/// many otherwise valid surfaces.
+pub fn tiledAddressUpperBound2D(
+    right: u32,
+    bottom: u32,
+    pitch: u32,
+    bytes_per_block_log2: u5,
+) u64 {
+    if (right == 0 or bottom == 0) return 0;
+    const origin = tiledOffset2D(
+        (right - 1) & ~@as(u32, tile_edge - 1),
+        (bottom - 1) & ~@as(u32, tile_edge - 1),
+        pitch,
+        bytes_per_block_log2,
+    );
+    const extent: u64 = switch (bytes_per_block_log2) {
+        0 => 0xA00,
+        1 => 0xC00,
+        else => @as(u64, 0x400) << bytes_per_block_log2,
+    };
+    return @as(u64, origin) + extent;
+}
+
+/// Exclusive byte bound for a tiled 3D extent. `right`, `bottom`, and `back`
+/// are expressed in blocks, matching `tiledOffset3D`'s coordinate units.
+pub fn tiledAddressUpperBound3D(
+    right: u32,
+    bottom: u32,
+    back: u32,
+    pitch: u32,
+    height: u32,
+    bytes_per_block_log2: u5,
+) u64 {
+    if (right == 0 or bottom == 0 or back == 0) return 0;
+
+    const origin = tiledOffset3D(
+        (right - 1) & ~@as(u32, tile_edge - 1),
+        (bottom - 1) & ~@as(u32, tile_edge - 1),
+        (back - 1) & ~@as(u32, 4 - 1),
+        pitch,
+        height,
+        bytes_per_block_log2,
+    );
+    const aligned_pitch = alignPitch(pitch);
+    const extent: u64 = switch (bytes_per_block_log2) {
+        0 => (@as(u64, aligned_pitch >> 6) << 12) + 0xC00 +
+            (@as(u64, aligned_pitch & (1 << 5)) << 5),
+        else => ((@as(u64, aligned_pitch) << 6) + 0x800) << bytes_per_block_log2,
+    };
+    return @as(u64, origin) + extent;
+}
+
+pub fn tiledSizeBytes3D(
+    width: u32,
+    height: u32,
+    depth: u32,
+    bytes_per_block_log2: u5,
+) u64 {
+    return tiledAddressUpperBound3D(width, height, depth, width, height, bytes_per_block_log2);
+}
+
 /// Bytes a tiled 32-bit surface of this size occupies. A converter that sizes
 /// the source by `width * height * 4` reads past the end of every tiled surface
 /// whose width is not a multiple of the tile edge.
@@ -275,6 +380,51 @@ test "the tiled address function is injective across a tile" {
     // Every block in the tile is the destination of exactly one pixel, so the
     // mapping is a permutation and no part of the picture is dropped.
     for (seen) |touched| try std.testing.expect(touched);
+}
+
+test "the 2D tiled upper bound covers every block in an unaligned extent" {
+    const right: u32 = 37;
+    const bottom: u32 = 35;
+    const upper = tiledAddressUpperBound2D(right, bottom, right, 2);
+    var y: u32 = 0;
+    while (y < bottom) : (y += 1) {
+        var x: u32 = 0;
+        while (x < right) : (x += 1) {
+            try std.testing.expect(@as(u64, tiledOffset2D(x, y, right, 2)) + 4 <= upper);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 0), tiledAddressUpperBound2D(0, bottom, right, 2));
+    try std.testing.expectEqual(@as(u64, 0), tiledAddressUpperBound2D(right, 0, right, 2));
+}
+
+test "the 3D tiled address function covers a 32x32x4 volume" {
+    const upper = tiledAddressUpperBound3D(32, 32, 4, 32, 32, 2);
+    try std.testing.expect(upper >= 32 * 32 * 4 * 4);
+
+    var seen = std.AutoHashMap(u32, void).init(std.testing.allocator);
+    defer seen.deinit();
+    var z: u32 = 0;
+    while (z < 4) : (z += 1) {
+        var y: u32 = 0;
+        while (y < 32) : (y += 1) {
+            var x: u32 = 0;
+            while (x < 32) : (x += 1) {
+                const offset = tiledOffset3D(x, y, z, 32, 32, 2);
+                try std.testing.expectEqual(@as(u32, 0), offset % 4);
+                try std.testing.expect(@as(u64, offset) + 4 <= upper);
+                const result = try seen.getOrPut(offset);
+                try std.testing.expect(!result.found_existing);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 32 * 32 * 4), seen.count());
+}
+
+test "3D tiled bounds include aligned depth and zero extents are empty" {
+    try std.testing.expectEqual(@as(u64, 0), tiledSizeBytes3D(0, 32, 4, 2));
+    try std.testing.expectEqual(@as(u64, 0), tiledSizeBytes3D(32, 0, 4, 2));
+    try std.testing.expectEqual(@as(u64, 0), tiledSizeBytes3D(32, 32, 0, 2));
+    try std.testing.expect(tiledSizeBytes3D(32, 32, 5, 2) >= tiledSizeBytes3D(32, 32, 4, 2));
 }
 
 test "no tiled address escapes the surface it belongs to" {

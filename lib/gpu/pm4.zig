@@ -71,19 +71,49 @@ pub const Type3Opcode = enum(u7) {
     me_init = 0x48,
     nop = 0x10,
     indirect_buffer = 0x3F,
+    indirect_buffer_pfd = 0x37,
+    wait_for_idle = 0x26,
     wait_reg_mem = 0x3C,
+    wait_reg_eq = 0x52,
+    wait_reg_gte = 0x53,
     reg_rmw = 0x21,
+    reg_to_mem = 0x3E,
+    mem_write = 0x3D,
+    mem_write_cntr = 0x4F,
     cond_write = 0x45,
     event_write = 0x46,
     event_write_shd = 0x58,
-    event_write_ext = 0x50,
+    event_write_cfl = 0x59,
+    event_write_ext = 0x5A,
+    event_write_zpd = 0x5B,
+    cond_exec = 0x44,
     draw_indx = 0x22,
+    draw_indx_bin = 0x34,
+    draw_indx_2_bin = 0x35,
     draw_indx_2 = 0x36,
+    viz_query = 0x23,
+    set_state = 0x25,
     set_constant = 0x2D,
     set_constant2 = 0x55,
+    load_alu_constant = 0x2F,
+    set_shader_constants = 0x56,
     im_load = 0x27,
     im_load_immediate = 0x2B,
     invalidate_state = 0x3B,
+    set_shader_bases = 0x4A,
+    set_bin_base_offset = 0x4B,
+    im_store = 0x2C,
+    load_constant_context = 0x2E,
+    wait_until_read = 0x5C,
+    wait_ib_pfd_complete = 0x5D,
+    interrupt = 0x54,
+    set_bin_mask = 0x50,
+    set_bin_select = 0x51,
+    context_update = 0x5E,
+    set_bin_mask_lo = 0x60,
+    set_bin_mask_hi = 0x61,
+    set_bin_select_lo = 0x62,
+    set_bin_select_hi = 0x63,
     /// Emulator-specific. The Xbox 360 kernel's `VdSwap` posts this to tell the
     /// command processor to present, and no real Xenos ever saw it. That is why
     /// a harness may write it: it is a message between two halves of the
@@ -96,19 +126,49 @@ pub const Type3Opcode = enum(u7) {
             .me_init => "ME_INIT",
             .nop => "NOP",
             .indirect_buffer => "INDIRECT_BUFFER",
+            .indirect_buffer_pfd => "INDIRECT_BUFFER_PFD",
+            .wait_for_idle => "WAIT_FOR_IDLE",
             .wait_reg_mem => "WAIT_REG_MEM",
+            .wait_reg_eq => "WAIT_REG_EQ",
+            .wait_reg_gte => "WAIT_REG_GTE",
             .reg_rmw => "REG_RMW",
+            .reg_to_mem => "REG_TO_MEM",
+            .mem_write => "MEM_WRITE",
+            .mem_write_cntr => "MEM_WRITE_CNTR",
             .cond_write => "COND_WRITE",
             .event_write => "EVENT_WRITE",
             .event_write_shd => "EVENT_WRITE_SHD",
+            .event_write_cfl => "EVENT_WRITE_CFL",
             .event_write_ext => "EVENT_WRITE_EXT",
+            .event_write_zpd => "EVENT_WRITE_ZPD",
+            .cond_exec => "COND_EXEC",
             .draw_indx => "DRAW_INDX",
+            .draw_indx_bin => "DRAW_INDX_BIN",
+            .draw_indx_2_bin => "DRAW_INDX_2_BIN",
             .draw_indx_2 => "DRAW_INDX_2",
+            .viz_query => "VIZ_QUERY",
+            .set_state => "SET_STATE",
             .set_constant => "SET_CONSTANT",
             .set_constant2 => "SET_CONSTANT2",
+            .load_alu_constant => "LOAD_ALU_CONSTANT",
+            .set_shader_constants => "SET_SHADER_CONSTANTS",
             .im_load => "IM_LOAD",
             .im_load_immediate => "IM_LOAD_IMMEDIATE",
             .invalidate_state => "INVALIDATE_STATE",
+            .set_shader_bases => "SET_SHADER_BASES",
+            .set_bin_base_offset => "SET_BIN_BASE_OFFSET",
+            .im_store => "IM_STORE",
+            .load_constant_context => "LOAD_CONSTANT_CONTEXT",
+            .wait_until_read => "WAIT_UNTIL_READ",
+            .wait_ib_pfd_complete => "WAIT_IB_PFD_COMPLETE",
+            .interrupt => "INTERRUPT",
+            .set_bin_mask => "SET_BIN_MASK",
+            .set_bin_select => "SET_BIN_SELECT",
+            .context_update => "CONTEXT_UPDATE",
+            .set_bin_mask_lo => "SET_BIN_MASK_LO",
+            .set_bin_mask_hi => "SET_BIN_MASK_HI",
+            .set_bin_select_lo => "SET_BIN_SELECT_LO",
+            .set_bin_select_hi => "SET_BIN_SELECT_HI",
             .xe_swap => "XE_SWAP",
             _ => "unnamed",
         };
@@ -160,6 +220,16 @@ pub fn packetType2() u32 {
     return @as(u32, 2) << 30;
 }
 
+/// A type-1 header carries two register indices in the header and two values
+/// in its payload.  Keeping the packing here prevents the executor from
+/// treating the first payload value as a register number.
+pub fn packetType1(register_one: u16, register_two: u16) ?u32 {
+    if (register_one > 0x7FF or register_two > 0x7FF) return null;
+    return (@as(u32, 1) << 30) |
+        (@as(u32, register_two) << 11) |
+        @as(u32, register_one);
+}
+
 /// A type-3 header: `tt cccccccccccccc ? ooooooo ??????? p`.
 pub fn packetType3(opcode: Type3Opcode, count: u16, predicated: bool) ?u32 {
     if (count == 0 or count > 0x4000) return null;
@@ -176,6 +246,8 @@ pub const Header = struct {
     count: u16,
     /// Type-0 only: the first register index written.
     register_index: u16 = 0,
+    /// Type-1 only: the second register index written.
+    register_index_2: u16 = 0,
     /// Type-0 only: whether every dword targets the same register.
     one_register: bool = false,
     /// Type-3 only.
@@ -204,7 +276,13 @@ pub fn decodeHeader(raw: u32) Header {
             .register_index = @intCast(raw & 0x7FFF),
             .one_register = (raw & (1 << 15)) != 0,
         },
-        .type1 => .{ .raw = raw, .kind = kind, .count = 2 },
+        .type1 => .{
+            .raw = raw,
+            .kind = kind,
+            .count = 2,
+            .register_index = @intCast(raw & 0x7FF),
+            .register_index_2 = @intCast((raw >> 11) & 0x7FF),
+        },
         // A type-2 dword carries no count at all. Reporting the bits that
         // happen to sit in the count field would make a filler dword look like
         // a 1..0x4000-dword packet to anything that did not switch on the type

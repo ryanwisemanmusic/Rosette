@@ -9,6 +9,9 @@
 //! allowed to be wrong only once.
 
 pub const abi = @import("abi.zig");
+pub const marshal = @import("marshal.zig");
+pub const tier_consistency = @import("tier_consistency.zig");
+pub const guest_state = @import("guest_state.zig");
 pub const selection = @import("selection.zig");
 pub const frame = @import("frame.zig");
 pub const presenter = @import("presenter.zig");
@@ -24,6 +27,9 @@ pub const Health = frame.Health;
 
 test {
     _ = abi;
+    _ = marshal;
+    _ = tier_consistency;
+    _ = guest_state;
     _ = selection;
     _ = frame;
     _ = presenter;

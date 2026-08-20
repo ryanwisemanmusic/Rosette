@@ -72,8 +72,11 @@ pub const Element = enum(u8) {
     /// The HSIO calibration lock is an initialised critical section rather than
     /// a zeroed one.
     hsio_lock_initialised,
-    /// The Xenos register aperture is reachable, so a title programming the GPU
-    /// through memory-mapped registers gets somewhere.
+    /// The Xenos register aperture is reachable: its pages are mapped and the
+    /// emulator has registered a handler for them, so a store that arrives is
+    /// dispatched rather than lost. Reachability, not usage — a title that
+    /// programs its GPU through kernel exports never stores here, and that says
+    /// nothing about whether it could.
     register_aperture_reachable,
     /// `VdInitializeEngines` ran.
     engines_initialised,
@@ -138,22 +141,20 @@ pub const Element = enum(u8) {
         };
     }
 
-    /// Whether this element must exist for a frame, or is merely informative.
+    /// Whether this element must exist for a frame.
     ///
-    /// The register aperture is the case that forced the distinction. A title
-    /// can program its GPU entirely through kernel exports — `VdInitializeEngines`,
-    /// `VdInitializeRingBuffer` — and never store to a memory-mapped register
-    /// in its life. Treating an untouched aperture as a missing precondition
-    /// made an emulator-owned element the frontier of a run whose title simply
-    /// took the other route, which sends a reader at the emulator for something
-    /// nobody was waiting on. It is still reported: an aperture with no traffic
-    /// is strong evidence about *how* the title programs the GPU, and that is
-    /// exactly what the submission-provenance question needs.
+    /// Every element is now required, because every element is now defined as
+    /// something that can actually be established. The register aperture was
+    /// briefly optional for the wrong reason: it was defined as "a guest store
+    /// reached the register file", which a title programming its GPU through
+    /// kernel exports never does, so it sat ABSENT forever and had to be
+    /// excluded from the frontier to stop it accusing the emulator. The element
+    /// is really about *reachability* — mapped pages with a registered handler
+    /// — which the emulator states directly and which is either true or a
+    /// genuine defect. Defined that way it is satisfiable, so it is required.
     pub fn required(self: Element) bool {
-        return switch (self) {
-            .register_aperture_reachable => false,
-            else => true,
-        };
+        _ = self;
+        return true;
     }
 
     pub fn label(self: Element) []const u8 {
@@ -162,7 +163,7 @@ pub const Element = enum(u8) {
             .kernel_variable_slots_bound => "kernel variable slots bound to storage",
             .gpu_clock_published => "VdGpuClockInMHz published",
             .hsio_lock_initialised => "VdHSIOCalibrationLock initialised",
-            .register_aperture_reachable => "Xenos register aperture reachable (informative)",
+            .register_aperture_reachable => "Xenos register aperture reachable",
             .engines_initialised => "VdInitializeEngines ran",
             .interrupt_callback_registered => "graphics interrupt callback registered",
             .interrupt_callback_dispatched => "graphics interrupt callback dispatched",
@@ -183,7 +184,7 @@ pub const Element = enum(u8) {
             .kernel_variable_slots_bound => "a title dereferencing an unbound slot reads through a null or fabricated pointer. On this platform that is a near-null read the title does not check, and the value it gets is whatever the fault path leaves behind",
             .gpu_clock_published => "timing arithmetic that scales by the clock divides by zero or scales to zero. A frame-pacing decision made against it can gate presentation permanently, because nothing re-reads the clock",
             .hsio_lock_initialised => "a critical section whose state word was never written reads as held by a thread that does not exist. A title taking it waits for an owner that will never release",
-            .register_aperture_reachable => "no guest store has reached the memory-mapped register file. Informative rather than blocking: a title that programs its GPU through kernel exports never touches it. Read alongside submission provenance — an untouched aperture means whatever moved the ring write pointer did not come from a guest register store",
+            .register_aperture_reachable => "the register aperture is not known to be reachable: no handler registration has been observed for it and no access has ever arrived. A store the title makes would be lost rather than dispatched, so any register programming it attempts goes nowhere. This is reachability, not usage — a title can be perfectly healthy and never store here",
             .engines_initialised => "the title has not begun graphics bring-up at all; everything below is a consequence",
             .interrupt_callback_registered => "the title will not be told about vblank, so any present loop driven by it never runs",
             .interrupt_callback_dispatched => "the callback is registered and never fires; a title waiting on it waits forever",
@@ -435,23 +436,39 @@ test "the actionable list is exactly the platform work the harness has not done"
     try std.testing.expectEqual(Element.kernel_variable_slots_bound, pending[0]);
 }
 
-// A title that programs its GPU through kernel exports never stores to a
-// memory-mapped register, so an untouched aperture is evidence about which
-// route it took and not a precondition anybody is waiting on.
-test "an informative element is reported and never becomes the frontier" {
+// The aperture element is about reachability, not usage. Defined as "a guest
+// store arrived" it could never be satisfied by a title that programs its GPU
+// through kernel exports, and it sat ABSENT accusing the emulator forever.
+test "the aperture is satisfied by reachability rather than by usage" {
     var ledger = Ledger{};
     inline for (.{
         Element.memory_view_base_discovered, Element.kernel_variable_slots_bound,
         Element.gpu_clock_published,         Element.hsio_lock_initialised,
     }) |element| ledger.observe(element, 1);
 
-    // The aperture is next in order and unestablished, and the gap skips it.
-    try std.testing.expect(!ledger.state(.register_aperture_reachable).present());
+    try std.testing.expectEqual(Element.register_aperture_reachable, ledger.firstGap().?);
+    try std.testing.expect(Element.register_aperture_reachable.required());
+
+    // A registered handler is the emulator stating the aperture is reachable,
+    // and no guest store is needed for it.
+    ledger.observe(.register_aperture_reachable, 2);
     try std.testing.expectEqual(Element.engines_initialised, ledger.firstGap().?);
-    try std.testing.expect(!Element.register_aperture_reachable.required());
-    // It still contributes to the established tally, so the report cannot
-    // quietly stop counting it.
-    try std.testing.expectEqual(@as(u32, 4), ledger.establishedCount());
+    try std.testing.expectEqual(@as(u32, 5), ledger.establishedCount());
+    try std.testing.expect(std.mem.indexOf(u8, Element.register_aperture_reachable.consequence(), "reachability, not usage") != null);
+}
+
+// The whole ladder must be reachable, or a report can never say the run is
+// clean and the operator learns to ignore the count.
+test "every element is required so the ladder can actually be completed" {
+    var ledger = Ledger{};
+    inline for (@typeInfo(Element).@"enum".fields) |field| {
+        const element: Element = @enumFromInt(field.value);
+        try std.testing.expect(element.required());
+        ledger.observe(element, field.value + 1);
+    }
+    try std.testing.expect(ledger.firstGap() == null);
+    try std.testing.expectEqual(@as(u32, element_count), ledger.establishedCount());
+    try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "not what is stopping this run") != null);
 }
 
 test "the verdict names the owner of the first gap so the next move is unambiguous" {
