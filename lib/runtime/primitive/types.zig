@@ -22,7 +22,24 @@ pub const Result = enum(u8) {
     handled_void,
     unsupported,
     fallback,
+    /// The primitive transferred control into the runtime's guest signal or
+    /// termination path; the import dispatcher must not perform a normal
+    /// return-address pop afterward.
+    control_transferred,
 };
+
+pub const RaiseResult = enum {
+    /// A guest-installed handler was entered and owns the eventual return.
+    delivered,
+    /// The signal's default action terminated the guest.
+    terminated,
+    /// The signal number was invalid or the runtime could not deliver it.
+    failed,
+};
+
+fn unavailableRaiseSignal(_: *anyopaque, _: u8) RaiseResult {
+    return .failed;
+}
 
 fn unavailablePthreadMachThreadId(_: *anyopaque, _: u64) u64 {
     return 0;
@@ -51,6 +68,11 @@ pub const PrimitiveContext = struct {
     /// and must follow the System V AMD64 ABI (caller must not be noreturn).
     /// Returns 0 if the call cannot be completed.
     callGuestFn: *const fn (ptr: *anyopaque, fn_address: u64, args: [6]u64) u64,
+
+    /// Deliver a guest `raise()` request without invoking the host signal API.
+    /// The runtime decides whether a guest handler receives it or the default
+    /// action terminates the emulated process.
+    raiseSignalFn: *const fn (ptr: *anyopaque, signal: u8) RaiseResult = unavailableRaiseSignal,
 
     /// Resolve a pthread handle to its Mach thread ID.
     /// Returns the mach_port_t for the given pthread handle, or 0 if unknown.
@@ -111,6 +133,10 @@ pub const PrimitiveContext = struct {
 
     pub fn callGuest(self: *const PrimitiveContext, fn_address: u64, args: [6]u64) u64 {
         return self.callGuestFn(self.ptr, fn_address, args);
+    }
+
+    pub fn raiseSignal(self: *const PrimitiveContext, signal: u8) RaiseResult {
+        return self.raiseSignalFn(self.ptr, signal);
     }
 
     pub fn pthreadMachThreadId(self: *const PrimitiveContext, handle: u64) u64 {

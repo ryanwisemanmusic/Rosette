@@ -694,6 +694,122 @@ pub fn stdTerminate(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     std.c.abort();
 }
 
+/// Implements Darwin libc `raise(int)` at the guest boundary.
+///
+/// Calling the host `raise()` here would signal Rosette itself and destroy the
+/// emulation process. The runtime callback instead applies the guest signal's
+/// installed handler or default action while preserving the import boundary's
+/// control-transfer semantics.
+pub fn raiseSignal(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const raw_signal = ctx.readArg(0);
+    const signal = std.math.cast(u8, raw_signal) orelse {
+        ctx.setResult(@bitCast(@as(i64, -1)));
+        return .handled;
+    };
+    if (signal == 0) {
+        ctx.setResult(@bitCast(@as(i64, -1)));
+        return .handled;
+    }
+
+    return switch (ctx.raiseSignal(signal)) {
+        .delivered => blk: {
+            ctx.setResult(0);
+            break :blk .handled;
+        },
+        .terminated => .control_transferred,
+        .failed => blk: {
+            ctx.setResult(@bitCast(@as(i64, -1)));
+            break :blk .handled;
+        },
+    };
+}
+
+test "handlers: raise routes through the guest signal callback" {
+    const TestState = struct {
+        signal: u8 = 0,
+        result: u64 = 0,
+
+        fn readArg(ptr: *anyopaque, index: u8) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (index == 0) self.signal else 0;
+        }
+        fn setResult(ptr: *anyopaque, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = value;
+        }
+        fn readGuest(_: *const anyopaque, _: u64, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn writeGuest(_: *anyopaque, _: u64, _: []const u8) ?void {
+            return null;
+        }
+        fn readCString(_: *const anyopaque, _: u64) ?[]const u8 {
+            return null;
+        }
+        fn callGuest(_: *anyopaque, _: u64, _: [6]u64) u64 {
+            return 0;
+        }
+        fn deliver(ptr: *anyopaque, signal: u8) types.RaiseResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.signal = signal;
+            return .delivered;
+        }
+    };
+
+    var state = TestState{ .signal = 15 };
+    const ctx = PrimitiveContext{
+        .ptr = &state,
+        .readArgFn = TestState.readArg,
+        .setResultFn = TestState.setResult,
+        .readGuestFn = TestState.readGuest,
+        .writeGuestFn = TestState.writeGuest,
+        .readCStringFn = TestState.readCString,
+        .callGuestFn = TestState.callGuest,
+        .raiseSignalFn = TestState.deliver,
+    };
+
+    try std.testing.expectEqual(Result.handled, raiseSignal(0, &ctx));
+    try std.testing.expectEqual(@as(u8, 15), state.signal);
+    try std.testing.expectEqual(@as(u64, 0), state.result);
+}
+
+test "handlers: raise reports the guest default action as a control transfer" {
+    const TestState = struct {
+        fn readArg(_: *anyopaque, _: u8) u64 {
+            return 15;
+        }
+        fn setResult(_: *anyopaque, _: u64) void {}
+        fn readGuest(_: *const anyopaque, _: u64, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn writeGuest(_: *anyopaque, _: u64, _: []const u8) ?void {
+            return null;
+        }
+        fn readCString(_: *const anyopaque, _: u64) ?[]const u8 {
+            return null;
+        }
+        fn callGuest(_: *anyopaque, _: u64, _: [6]u64) u64 {
+            return 0;
+        }
+        fn terminate(_: *anyopaque, _: u8) types.RaiseResult {
+            return .terminated;
+        }
+    };
+
+    var state: u8 = 0;
+    const ctx = PrimitiveContext{
+        .ptr = &state,
+        .readArgFn = TestState.readArg,
+        .setResultFn = TestState.setResult,
+        .readGuestFn = TestState.readGuest,
+        .writeGuestFn = TestState.writeGuest,
+        .readCStringFn = TestState.readCString,
+        .callGuestFn = TestState.callGuest,
+        .raiseSignalFn = TestState.terminate,
+    };
+    try std.testing.expectEqual(Result.control_transferred, raiseSignal(0, &ctx));
+}
+
 test "handlers: strlen reads cstring and returns length" {
     const TestState = struct {
         args: [6]u64 = .{0} ** 6,

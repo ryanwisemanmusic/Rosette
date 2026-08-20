@@ -53,6 +53,7 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "_vsnprintf", .handler = @import("printf_compat.zig").vsnprintf, .match_kind = .exact },
     .{ .name_pattern = "___memmove_chk", .handler = @import("memory_compat.zig").memmoveChk, .match_kind = .exact },
     .{ .name_pattern = "_sysctl", .handler = @import("darwin_compat.zig").sysctl, .match_kind = .exact },
+    .{ .name_pattern = "_raise", .handler = @import("handlers.zig").raiseSignal, .match_kind = .exact },
     .{ .name_pattern = "llabs", .handler = @import("handlers.zig").llabs },
     .{ .name_pattern = "strlen", .handler = @import("handlers.zig").strlen },
     .{ .name_pattern = "memcmp", .handler = @import("handlers.zig").memcmp },
@@ -91,6 +92,7 @@ test "registry: match symbol by pattern" {
     try std.testing.expect(reg.matchSymbol("__cxa_guard_acquire") != null);
     try std.testing.expect(reg.matchSymbol("_vsnprintf") != null);
     try std.testing.expect(reg.matchSymbol("_sysctl") != null);
+    try std.testing.expect(reg.matchSymbol("_raise") != null);
     try std.testing.expect(reg.matchSymbol("_sysctlbyname") == null);
     try std.testing.expect(reg.matchSymbol("_unknown_function") == null);
 }
