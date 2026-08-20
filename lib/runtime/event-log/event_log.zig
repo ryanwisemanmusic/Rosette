@@ -66,10 +66,29 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("{s}", .{text});
 
     if (thread_macho_fd >= 0) {
-        writeAll(thread_macho_fd, text);
-        if (text.len == 0 or text[text.len - 1] != '\n')
-            _ = c.write(thread_macho_fd, "\n", 1);
+        writeLineAtomic(thread_macho_fd, text);
     }
+}
+
+/// Write one diagnostic line as a single write syscall, adding the newline
+/// the format may have omitted. The runtime log is shared with the guest log
+/// mirror and with other threads' diagnostics, so a multi-part line would let
+/// another writer's bytes land inside it; one write keeps lines atomic on a
+/// regular file.
+fn writeLineAtomic(fd: i32, text: []const u8) void {
+    if (text.len == 0 or text[text.len - 1] == '\n') {
+        writeAll(fd, text);
+        return;
+    }
+    if (text.len + 1 <= 8192) {
+        var buffer: [8192]u8 = undefined;
+        @memcpy(buffer[0..text.len], text);
+        buffer[text.len] = '\n';
+        writeAll(fd, buffer[0 .. text.len + 1]);
+        return;
+    }
+    writeAll(fd, text);
+    _ = c.write(fd, "\n", 1);
 }
 
 pub fn primitiveCapturePrint(comptime fmt: []const u8, args: anytype) void {
@@ -79,9 +98,7 @@ pub fn primitiveCapturePrint(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("{s}", .{text});
 
     if (thread_primitive_fd >= 0) {
-        writeAll(thread_primitive_fd, text);
-        if (text.len == 0 or text[text.len - 1] != '\n')
-            _ = c.write(thread_primitive_fd, "\n", 1);
+        writeLineAtomic(thread_primitive_fd, text);
     }
 }
 
