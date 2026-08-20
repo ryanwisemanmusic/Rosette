@@ -16,6 +16,11 @@ pub const MAX_GUEST_SYMBOLS = 256;
 const GUEST_LIBRARY_HANDLE_BASE: u64 = 0xFFFF_FC00_0000_0000;
 pub const GUEST_SYMBOL_THUNK_BASE: u64 = 0xFFFF_FB00_0000_0000;
 const SYNTHETIC_PHYSICAL_DEVICE_HANDLE: u64 = 0xFFFF_F600_0000_0011;
+/// The one VkDebugUtilsMessengerEXT the bridge hands out.  It is a
+/// non-dispatchable handle the guest only ever passes back to
+/// vkDestroyDebugUtilsMessengerEXT, so a single distinguishable value is
+/// enough and makes a stray handle obvious in a log.
+const SYNTHETIC_DEBUG_MESSENGER_HANDLE: u64 = 0xFFFF_F600_0000_0021;
 
 extern fn dlopen(path: ?[*:0]const u8, mode: c_int) ?*anyopaque;
 extern fn dlsym(handle: *anyopaque, symbol: [*:0]const u8) ?*anyopaque;
@@ -176,6 +181,9 @@ const GuestSymbolKind = enum {
     update_descriptor_set_with_template,
     device_success,
     device_void,
+    create_debug_messenger,
+    destroy_debug_messenger,
+    debug_utils_success,
     @"opaque",
 };
 
@@ -271,15 +279,19 @@ const VulkanMemoryAllocation = struct {
 // Offsets into VkImageCreateInfo and VkBufferCreateInfo. Read from the guest's
 // own structures rather than guessed, because the extent and format they carry
 // are the only description of what the guest intends to draw into.
-const VK_IMAGE_CREATE_INFO_FORMAT_OFFSET: u64 = 24;
-const VK_IMAGE_CREATE_INFO_EXTENT_OFFSET: u64 = 28;
-const VK_IMAGE_CREATE_INFO_MIP_LEVELS_OFFSET: u64 = 40;
-const VK_IMAGE_CREATE_INFO_ARRAY_LAYERS_OFFSET: u64 = 44;
-const VK_IMAGE_CREATE_INFO_TILING_OFFSET: u64 = 52;
-const VK_IMAGE_CREATE_INFO_USAGE_OFFSET: u64 = 56;
+// Derived from the ABI declaration rather than restated. A guest structure
+// read at a hand-copied offset is wrong silently: the neighbouring field is
+// usually a plausible value, so the guest simply gets a different resource
+// than it asked for.
+const VK_IMAGE_CREATE_INFO_FORMAT_OFFSET: u64 = @offsetOf(abi.ImageCreateInfo, "format");
+const VK_IMAGE_CREATE_INFO_EXTENT_OFFSET: u64 = @offsetOf(abi.ImageCreateInfo, "extent");
+const VK_IMAGE_CREATE_INFO_MIP_LEVELS_OFFSET: u64 = @offsetOf(abi.ImageCreateInfo, "mip_levels");
+const VK_IMAGE_CREATE_INFO_ARRAY_LAYERS_OFFSET: u64 = @offsetOf(abi.ImageCreateInfo, "array_layers");
+const VK_IMAGE_CREATE_INFO_TILING_OFFSET: u64 = @offsetOf(abi.ImageCreateInfo, "tiling");
+const VK_IMAGE_CREATE_INFO_USAGE_OFFSET: u64 = @offsetOf(abi.ImageCreateInfo, "usage");
 const VK_IMAGE_CREATE_INFO_SIZE: u64 = 88;
-const VK_BUFFER_CREATE_INFO_SIZE_OFFSET: u64 = 24;
-const VK_BUFFER_CREATE_INFO_USAGE_OFFSET: u64 = 32;
+const VK_BUFFER_CREATE_INFO_SIZE_OFFSET: u64 = @offsetOf(abi.BufferCreateInfo, "size");
+const VK_BUFFER_CREATE_INFO_USAGE_OFFSET: u64 = @offsetOf(abi.BufferCreateInfo, "usage");
 const VK_BUFFER_CREATE_INFO_SIZE: u64 = 56;
 
 const VulkanCallTrace = struct {
@@ -315,6 +327,15 @@ const MAX_REAL_QUERY_POOLS = 256;
 const MAX_REAL_PIPELINE_CACHES = 32;
 const MAX_REAL_DESCRIPTOR_UPDATE_TEMPLATES = 128;
 const MAX_REAL_QUEUES = 64;
+/// Upper bound on the host device extension table.  The host reports 131 on
+/// an Apple M2 Max today; the bound only has to stay ahead of the driver, and
+/// a table that is too short is reported to the guest as truncation rather
+/// than silently trimmed.
+const MAX_HOST_DEVICE_EXTENSIONS = 256;
+/// How many memory types the modelled adapter advertises when no real
+/// physical device has been queried. Every memoryTypeBits mask the modelled
+/// tier hands the guest has to stay inside this count.
+const MODELLED_MEMORY_TYPE_COUNT: u32 = 1;
 const VulkanResourceKind = enum { image, buffer };
 
 /// Per-swapchain guest image state. Keeping this beside the handle map is
@@ -594,6 +615,18 @@ const RealVulkanState = struct {
     }} ** 64,
     host_instance_extension_count: u32 = 0,
     host_instance_extensions_known: bool = false,
+    /// The same table for the selected physical device.  MoltenVK reports
+    /// well over a hundred device extensions, and the guest asks for the
+    /// whole list in one call: a short table makes the second
+    /// vkEnumerateDeviceExtensionProperties return VK_INCOMPLETE, which the
+    /// guest reads as an outright failure to query the adapter rather than as
+    /// a truncated answer.  Size the table for the full host surface.
+    host_device_extensions: [MAX_HOST_DEVICE_EXTENSIONS]abi.ExtensionProperties = [_]abi.ExtensionProperties{.{
+        .extension_name = [_]u8{0} ** abi.MAX_EXTENSION_NAME_SIZE,
+        .spec_version = 0,
+    }} ** MAX_HOST_DEVICE_EXTENSIONS,
+    host_device_extension_count: u32 = 0,
+    host_device_extensions_known: bool = false,
     /// Physical device properties (raw bytes, up to 1024).
     physical_device_properties: [abi.physical_device_properties_bytes]u8 align(8) = [_]u8{0} ** abi.physical_device_properties_bytes,
     physical_device_features: [220]u8 align(4) = [_]u8{0} ** 220,
@@ -841,6 +874,79 @@ const VulkanResource = struct {
 const feature_chain_max = 7;
 const feature_chain_node_bytes = 256;
 
+/// A device extension Rosette enables on its own account, beyond whatever the
+/// guest negotiated, because the bridge resolves entry points through it.
+///
+/// The guest's device is negotiated at Vulkan 1.2, so every entry point that
+/// was promoted in 1.3 exists on this driver only under its KHR or EXT name
+/// and only while the providing extension is enabled. Enabling the extension
+/// without its feature would resolve the pointer and leave it illegal to
+/// call, so the feature is queried and enabled in the same step — a resolved
+/// pointer the bridge may not use is worse than a null one, because null is
+/// what its fallbacks test.
+const BridgeDeviceCapability = struct {
+    extension: []const u8,
+    /// sType of the feature structure that has to be enabled with it, or 0
+    /// when the extension has no feature structure.
+    feature_s_type: u32 = 0,
+    /// Byte size of that structure, including the 16-byte sType/pNext header.
+    feature_size: u16 = 0,
+    /// What the extension buys, for the log.
+    provides: []const u8,
+};
+
+const bridge_device_capabilities = [_]BridgeDeviceCapability{
+    .{
+        .extension = "VK_KHR_synchronization2",
+        .feature_s_type = abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+        .feature_size = @sizeOf(abi.PhysicalDeviceSynchronization2Features),
+        .provides = "vkQueueSubmit2KHR, vkCmdPipelineBarrier2KHR",
+    },
+    .{
+        .extension = "VK_KHR_dynamic_rendering",
+        .feature_s_type = abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+        .feature_size = @sizeOf(abi.PhysicalDeviceDynamicRenderingFeatures),
+        .provides = "vkCmdBeginRenderingKHR, vkCmdEndRenderingKHR",
+    },
+    .{
+        .extension = "VK_EXT_extended_dynamic_state",
+        .feature_s_type = abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+        .feature_size = @sizeOf(abi.PhysicalDeviceExtendedDynamicStateFeaturesEXT),
+        .provides = "vkCmdSetDepth/StencilTestEnableEXT and friends",
+    },
+    .{
+        .extension = "VK_EXT_extended_dynamic_state2",
+        .feature_s_type = abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
+        .feature_size = @sizeOf(abi.PhysicalDeviceExtendedDynamicState2FeaturesEXT),
+        .provides = "vkCmdSetPrimitiveRestartEnableEXT",
+    },
+    .{
+        .extension = "VK_KHR_push_descriptor",
+        .provides = "vkCmdPushDescriptorSetKHR",
+    },
+    // Listed even though MoltenVK does not implement it, so the log says why
+    // the conditional-rendering commands stay absent instead of leaving them
+    // unexplained beside entry points that were merely un-negotiated.
+    .{
+        .extension = "VK_EXT_conditional_rendering",
+        .feature_s_type = abi.STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+        .feature_size = @sizeOf(abi.PhysicalDeviceConditionalRenderingFeaturesEXT),
+        .provides = "vkCmdBegin/EndConditionalRenderingEXT",
+    },
+};
+
+/// Host-owned storage for the capability chain above. Nothing here is ever a
+/// guest pointer, so the whole chain can be handed straight to the loader.
+const BridgeCapabilityScratch = struct {
+    nodes: [bridge_device_capabilities.len][feature_chain_node_bytes]u8 align(8) =
+        [_][feature_chain_node_bytes]u8{[_]u8{0} ** feature_chain_node_bytes} ** bridge_device_capabilities.len,
+    /// Index into `bridge_device_capabilities` for each admitted node.
+    order: [bridge_device_capabilities.len]u8 = [_]u8{0} ** bridge_device_capabilities.len,
+    /// Which capabilities were admitted at all, feature-bearing or not.
+    admitted: [bridge_device_capabilities.len]bool = [_]bool{false} ** bridge_device_capabilities.len,
+    count: usize = 0,
+};
+
 /// The guest's Vulkan feature pNext chain contains host pointers only after
 /// it has been marshalled. Keep the scratch nodes in host-owned, aligned
 /// storage and never pass a guest pointer to the loader.
@@ -972,6 +1078,27 @@ fn featureChainNext(scratch: *FeatureChainScratch, index: usize) ?*anyopaque {
     return @ptrCast(&scratch.nodes[scratch.order[index + 1]]);
 }
 
+fn linkBridgeCapabilityChain(scratch: *BridgeCapabilityScratch) void {
+    for (0..scratch.count) |slot| {
+        const capability = bridge_device_capabilities[scratch.order[slot]];
+        const node = scratch.nodes[slot][0..capability.feature_size];
+        const next: u64 = if (slot + 1 < scratch.count) @intFromPtr(&scratch.nodes[slot + 1]) else 0;
+        std.mem.writeInt(u64, node[8..16], next, .little);
+    }
+}
+
+/// Put the bridge's own capability nodes in front of the guest's feature
+/// chain and return the head. Both halves are host-owned by this point, so
+/// the spliced chain can never hand the loader a guest address.
+fn spliceBridgeCapabilityChain(scratch: *BridgeCapabilityScratch, guest_p_next: ?*const anyopaque) ?*const anyopaque {
+    if (scratch.count == 0) return guest_p_next;
+    const last = scratch.count - 1;
+    const size = bridge_device_capabilities[scratch.order[last]].feature_size;
+    const tail = scratch.nodes[last][0..size];
+    std.mem.writeInt(u64, tail[8..16], if (guest_p_next) |pointer| @intFromPtr(pointer) else 0, .little);
+    return @ptrCast(&scratch.nodes[0]);
+}
+
 fn linkFeatureChain(scratch: *FeatureChainScratch) void {
     for (0..scratch.count) |index| {
         const kind = scratch.order[index];
@@ -1051,6 +1178,10 @@ pub const Forwarder = struct {
     // Phase 1: real Vulkan objects for the guest's rendering pipeline.
     // Separate from the native presenter; both coexist.
     real_vulkan: RealVulkanState = .{},
+    /// The modelled VK_EXT_debug_utils messenger the guest currently holds,
+    /// or zero. Kept so a destroy call can be checked against what was
+    /// actually issued.
+    debug_messenger_handle: u64 = 0,
     // Rosette's own presentation path, independent of the guest's modelled
     // Vulkan objects. The guest calling vkQueuePresentKHR is a request; this is
     // what actually reaches the display.
@@ -1449,6 +1580,36 @@ pub const Forwarder = struct {
                 }
                 state.regs.rax = 0;
             },
+            // vkCreateDebugUtilsMessengerEXT(instance, pCreateInfo,
+            // pAllocator, pMessenger): the output handle is rcx.  Publishing
+            // it matters even though the messenger does nothing — leaving the
+            // guest's VkDebugUtilsMessengerEXT untouched while returning
+            // VK_SUCCESS is how an uninitialised handle reaches
+            // vkDestroyDebugUtilsMessengerEXT at instance teardown.
+            .create_debug_messenger => {
+                if (state.regs.rcx == 0 or state.guestMemory(state.regs.rcx, 8) == null) {
+                    state.regs.rax = vkErrorInitializationFailed();
+                } else {
+                    state.write64(state.regs.rcx, SYNTHETIC_DEBUG_MESSENGER_HANDLE);
+                    self.debug_messenger_handle = SYNTHETIC_DEBUG_MESSENGER_HANDLE;
+                    machoCapturePrint(
+                        "macho-processor: Vulkan debug utils messenger modelled as a no-op: handle=0x{x}; guest callbacks stay in the guest\n",
+                        .{SYNTHETIC_DEBUG_MESSENGER_HANDLE},
+                    );
+                    state.regs.rax = 0;
+                }
+            },
+            .destroy_debug_messenger => {
+                if (state.regs.rsi != 0 and state.regs.rsi != SYNTHETIC_DEBUG_MESSENGER_HANDLE) {
+                    machoCapturePrint(
+                        "macho-processor: guest destroyed a debug utils messenger the bridge never issued: handle=0x{x}\n",
+                        .{state.regs.rsi},
+                    );
+                }
+                if (state.regs.rsi == SYNTHETIC_DEBUG_MESSENGER_HANDLE) self.debug_messenger_handle = 0;
+                state.regs.rax = 0;
+            },
+            .debug_utils_success => state.regs.rax = 0,
             // A non-null lookup remains useful for capability discovery,
             // but calling an untyped ARM64 function through x86 registers
             // is unsafe. Keep it contained until its Vulkan ABI signature
@@ -1474,7 +1635,14 @@ pub const Forwarder = struct {
             entry.kind != .enumerate_physical_devices and entry.kind != .enumerate_device_extensions and
             entry.kind != .destroy_instance)
         {
-            self.recordVulkanCall(state, entry.name[0..entry.name_length], @intCast(@as(i64, @bitCast(state.regs.rax))), state.regs.rdi, state.regs.rsi);
+            // VkResult is a signed 32-bit value returned in eax, so the
+            // negative codes arrive here zero-extended into rax.  Widening
+            // the whole 64-bit register and narrowing it to i32 therefore
+            // overflows on every Vulkan error the bridge reports: take the
+            // low word and reinterpret it, the way the C ABI defines the
+            // return.
+            const recorded_result: i32 = @bitCast(@as(u32, @truncate(state.regs.rax)));
+            self.recordVulkanCall(state, entry.name[0..entry.name_length], recorded_result, state.regs.rdi, state.regs.rsi);
         }
         return true;
     }
@@ -1509,33 +1677,21 @@ pub const Forwarder = struct {
         @memcpy(bytes, std.mem.asBytes(&properties));
     }
 
+    /// vkEnumerateDeviceExtensionProperties(physicalDevice, pLayerName,
+    /// pPropertyCount, pProperties): the layer name is rsi, the count is rdx
+    /// and the array is rcx.
+    ///
+    /// The guest sizes its array from the count this returns on the probe
+    /// call and then expects the second call to fill that array and report
+    /// VK_SUCCESS.  Answering the probe with the driver's full count and then
+    /// truncating the fill is not a partial answer to the guest, it is a
+    /// failure: Xenia treats anything other than VK_SUCCESS on the fill as an
+    /// unusable adapter and abandons device creation, which surfaces much
+    /// later as a null VkDevice inside its descriptor allocator.
     fn enumerateRealDeviceExtensions(self: *Forwarder, state: anytype) u64 {
-        const count_address = state.regs.rdx;
-        if (count_address == 0 or state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
-        const get_proc = self.real_vulkan.get_instance_proc_addr orelse return vkErrorInitializationFailed();
-        const address = get_proc(self.real_vulkan.instance orelse return vkErrorInitializationFailed(), "vkEnumerateDeviceExtensionProperties") orelse return vkErrorInitializationFailed();
-        const enumerate: abi.PfnEnumerateDeviceExtensionProperties = @ptrCast(@alignCast(address));
-        var count: u32 = 0;
-        const first = enumerate(self.real_vulkan.physical_device orelse return vkErrorInitializationFailed(), null, &count, null);
-        if (first != abi.SUCCESS) return @as(u32, @bitCast(first));
-        if (state.regs.rcx == 0) {
-            state.write32(count_address, count);
-            return 0;
-        }
-        const requested = state.read32(count_address);
-        const written: u32 = @min(@min(requested, count), 64);
-        var properties: [64]abi.ExtensionProperties = undefined;
-        var host_count = written;
-        const second = enumerate(self.real_vulkan.physical_device.?, null, &host_count, if (written == 0) null else &properties);
-        if (second != abi.SUCCESS and second != abi.INCOMPLETE) return @as(u32, @bitCast(second));
-        if (written != 0 and state.guestMemory(state.regs.rcx, @as(u64, written) * @sizeOf(abi.ExtensionProperties)) == null) return vkErrorInitializationFailed();
-        if (written != 0) {
-            const bytes = state.guestMemory(state.regs.rcx, @as(u64, written) * @sizeOf(abi.ExtensionProperties)).?;
-            const actual: usize = @intCast(@min(host_count, written));
-            @memcpy(bytes[0 .. actual * @sizeOf(abi.ExtensionProperties)], std.mem.sliceAsBytes(properties[0..actual]));
-        }
-        state.write32(count_address, @min(host_count, written));
-        return if (host_count < requested or second == abi.INCOMPLETE) abi.INCOMPLETE else 0;
+        if (!self.queryHostDeviceExtensions()) return enumerateDeviceExtensions(state);
+        if (state.regs.rsi != 0) return enumerateNoLayerExtensions(state, state.regs.rdx);
+        return writeExtensionPropertiesArray(state, state.regs.rdx, state.regs.rcx, self.hostDeviceExtensions());
     }
 
     fn collectFeatureChain(self: *Forwarder, state: anytype, guest_p_next: u64, scratch: *FeatureChainScratch, copy_guest: bool) bool {
@@ -3525,8 +3681,13 @@ pub const Forwarder = struct {
     /// is the honest answer: it constrains nothing and lets the caller apply
     /// its own preference.
     fn writeSyntheticMemoryRequirements(self: *Forwarder, state: anytype, output: u64, size: u64) u64 {
-        const type_count = self.real_vulkan.memoryTypeCount();
-        const bits: u32 = if (type_count == 0 or type_count >= 32)
+        // memoryTypeBits names indices into the memory types the guest was
+        // told about.  With no real adapter queried, that is the modelled
+        // heap, which advertises exactly one type — answering 0xFFFFFFFF there
+        // hands the guest a mask over thirty-one types it was never shown.
+        const real_type_count = self.real_vulkan.memoryTypeCount();
+        const type_count = if (real_type_count == 0) MODELLED_MEMORY_TYPE_COUNT else real_type_count;
+        const bits: u32 = if (type_count >= 32)
             0xFFFF_FFFF
         else
             (@as(u32, 1) << @intCast(type_count)) - 1;
@@ -4323,25 +4484,137 @@ pub const Forwarder = struct {
         return false;
     }
 
+    /// Cache the selected physical device's extension list.  This is the one
+    /// answer both the guest enumeration and our own vkCreateDevice
+    /// negotiation need, and querying it once keeps those two views of the
+    /// adapter from disagreeing.
+    fn queryHostDeviceExtensions(self: *Forwarder) bool {
+        if (self.real_vulkan.host_device_extensions_known) return true;
+        const get_proc = self.real_vulkan.get_instance_proc_addr orelse return false;
+        const instance = self.real_vulkan.instance orelse return false;
+        const physical_device = self.real_vulkan.physical_device orelse return false;
+        const address = get_proc(instance, "vkEnumerateDeviceExtensionProperties") orelse return false;
+        const enumerate: abi.PfnEnumerateDeviceExtensionProperties = @ptrCast(@alignCast(address));
+        var count: u32 = 0;
+        const first = enumerate(physical_device, null, &count, null);
+        if (first != abi.SUCCESS and first != abi.INCOMPLETE) return false;
+        const capacity: u32 = @intCast(self.real_vulkan.host_device_extensions.len);
+        if (count > capacity) {
+            machoCapturePrint(
+                "macho-processor: host reports {d} Vulkan device extensions but the bridge table holds {d}; the guest will see the first {d}\n",
+                .{ count, capacity, capacity },
+            );
+        }
+        var requested: u32 = @min(count, capacity);
+        if (requested != 0) {
+            const second = enumerate(physical_device, null, &requested, &self.real_vulkan.host_device_extensions);
+            // VK_INCOMPLETE here only means the table was shorter than the
+            // driver's list; the entries that were written are still valid.
+            if (second != abi.SUCCESS and second != abi.INCOMPLETE) return false;
+        }
+        self.real_vulkan.host_device_extension_count = @min(requested, capacity);
+        self.real_vulkan.host_device_extensions_known = true;
+        machoCapturePrint(
+            "macho-processor: host Vulkan device extensions cached: count={d}\n",
+            .{self.real_vulkan.host_device_extension_count},
+        );
+        return true;
+    }
+
+    /// Decide which of `bridge_device_capabilities` this host can actually
+    /// give us, and fill `scratch` with the feature nodes to enable.
+    ///
+    /// The device is negotiated at Vulkan 1.2, so the 1.3-promoted entry
+    /// points the bridge forwards through — vkQueueSubmit2, the barrier-2 and
+    /// dynamic-rendering commands, the extended dynamic state setters — exist
+    /// only under their KHR/EXT names and only while these extensions are on.
+    /// The guest never asks for them: it negotiated its own device against the
+    /// same 1.2 and does not know they exist. That makes them the bridge's to
+    /// request, not the guest's.
+    fn negotiateBridgeCapabilities(self: *Forwarder, scratch: *BridgeCapabilityScratch) void {
+        scratch.* = .{};
+        if (!self.queryHostDeviceExtensions()) return;
+        const get_proc = self.real_vulkan.get_instance_proc_addr orelse return;
+        const instance = self.real_vulkan.instance orelse return;
+        const physical_device = self.real_vulkan.physical_device orelse return;
+
+        // Admit only what the host lists, then ask the driver which members of
+        // each feature structure it actually supports.
+        inline for (bridge_device_capabilities, 0..) |capability, index| {
+            if (self.hostDeviceExtensionAvailable(capability.extension)) {
+                scratch.admitted[index] = true;
+                if (capability.feature_s_type != 0) {
+                    const node = scratch.nodes[scratch.count][0..capability.feature_size];
+                    @memset(node, 0);
+                    std.mem.writeInt(u32, node[0..4], capability.feature_s_type, .little);
+                    scratch.order[scratch.count] = index;
+                    scratch.count += 1;
+                }
+            }
+        }
+        if (scratch.count == 0) return;
+
+        const address = get_proc(instance, "vkGetPhysicalDeviceFeatures2") orelse {
+            // Without the query the support of each member is unknown, and
+            // enabling a member the driver does not have fails device
+            // creation. Drop the feature-bearing capabilities entirely.
+            scratch.* = .{};
+            return;
+        };
+        linkBridgeCapabilityChain(scratch);
+        const get_features: abi.PfnGetPhysicalDeviceFeatures2 = @ptrCast(@alignCast(address));
+        var root: abi.PhysicalDeviceFeatures2 = .{};
+        root.p_next = @ptrCast(&scratch.nodes[0]);
+        get_features(physical_device, &root);
+        // The driver has written VK_TRUE/VK_FALSE into every member. Handing
+        // the structures back to vkCreateDevice unchanged enables exactly what
+        // it reported and nothing else.
+        var kept: usize = 0;
+        for (0..scratch.count) |slot| {
+            const capability = bridge_device_capabilities[scratch.order[slot]];
+            const node = scratch.nodes[slot][0..capability.feature_size];
+            var any_supported = false;
+            var offset: usize = 16;
+            while (offset + 4 <= node.len) : (offset += 4) {
+                if (std.mem.readInt(u32, node[offset..][0..4], .little) != 0) any_supported = true;
+            }
+            if (any_supported) {
+                if (kept != slot) {
+                    @memcpy(&scratch.nodes[kept], &scratch.nodes[slot]);
+                    scratch.order[kept] = scratch.order[slot];
+                }
+                kept += 1;
+            } else {
+                // The extension exists but the feature it gates is off, so its
+                // entry points would resolve and then be illegal to call.
+                scratch.admitted[scratch.order[slot]] = false;
+            }
+        }
+        scratch.count = kept;
+        linkBridgeCapabilityChain(scratch);
+    }
+
+    fn hostDeviceExtensions(self: *const Forwarder) []const abi.ExtensionProperties {
+        if (!self.real_vulkan.host_device_extensions_known) return &.{};
+        return self.real_vulkan.host_device_extensions[0..self.real_vulkan.host_device_extension_count];
+    }
+
+    fn hostDeviceExtensionAvailable(self: *const Forwarder, name: []const u8) bool {
+        if (!self.real_vulkan.host_device_extensions_known) return true;
+        for (self.hostDeviceExtensions()) |*property| {
+            if (std.mem.eql(u8, property.name(), name)) return true;
+        }
+        return false;
+    }
+
     fn enumerateInstanceExtensions(self: *Forwarder, state: anytype, library_token: u64) u64 {
         const library = self.materializeVulkanLibraryForReal(library_token);
         if (library == null or !self.queryHostInstanceExtensions(library.?)) return enumerateInstanceExtensionsSynthetic(state);
-        const count_address = state.regs.rsi;
-        if (count_address == 0 or state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
-        const available = self.real_vulkan.host_instance_extensions[0..self.real_vulkan.host_instance_extension_count];
-        if (state.regs.rdx == 0) {
-            state.write32(count_address, @intCast(available.len));
-            return 0;
-        }
-        const requested = state.read32(count_address);
-        const written = @min(@min(requested, @as(u32, @intCast(available.len))), @as(u32, 64));
-        if (written != 0 and state.guestMemory(state.regs.rdx, @as(u64, written) * @sizeOf(abi.ExtensionProperties)) == null) return vkErrorInitializationFailed();
-        if (written != 0) {
-            const destination = state.guestMemory(state.regs.rdx, @as(u64, written) * @sizeOf(abi.ExtensionProperties)).?;
-            @memcpy(destination, std.mem.sliceAsBytes(available[0..written]));
-        }
-        state.write32(count_address, written);
-        return if (written < available.len) abi.INCOMPLETE else abi.SUCCESS;
+        // vkEnumerateInstanceExtensionProperties(pLayerName, pPropertyCount,
+        // pProperties): the layer name is rdi, so the count is rsi and the
+        // array is rdx.
+        if (state.regs.rdi != 0) return enumerateNoLayerExtensions(state, state.regs.rsi);
+        return writeExtensionPropertiesArray(state, state.regs.rsi, state.regs.rdx, self.real_vulkan.host_instance_extensions[0..self.real_vulkan.host_instance_extension_count]);
     }
 
     /// Ensure a real VkInstance exists for the guest's rendering pipeline.
@@ -4389,20 +4662,8 @@ pub const Forwarder = struct {
         }
         const app_info_addr = if (create_info_readable) state.read64(create_info + 24) else 0;
         var app_info: abi.ApplicationInfo = .{};
-        if (app_info_addr != 0 and state.guestMemoryConst(app_info_addr, @sizeOf(abi.ApplicationInfo)) != null) {
-            // VkApplicationInfo has pointer fields at 16 and 32; the scalar
-            // versions therefore live at 24, 40 and 48.  Reading +28 (the
-            // old bridge did this) folds four bytes of the engine name pointer
-            // into apiVersion and makes an otherwise valid instance request
-            // fail with an apparently unrelated version error.
-            app_info.application_version = state.read32(app_info_addr + 24);
-            app_info.engine_version = state.read32(app_info_addr + 40);
-            app_info.api_version = state.read32(app_info_addr + 48);
-            app_info.p_next = null;
-            // The synthetic loader advertises Vulkan 1.2.  Do not ask a
-            // MoltenVK loader for a newer core version simply because the
-            // guest's x86 headers were built against one.
-            if (app_info.api_version != 0) app_info.api_version = @min(app_info.api_version, abi.makeApiVersion(1, 2, 0));
+        if (readGuestApplicationInfo(state, app_info_addr)) |guest_app_info| {
+            app_info = guest_app_info;
             machoCapturePrint("macho-processor: ensureRealInstance: guest api_version=0x{x}\n", .{app_info.api_version});
         } else {
             machoCapturePrint("macho-processor: ensureRealInstance: no guest VkApplicationInfo, using defaults\n", .{});
@@ -4603,12 +4864,20 @@ pub const Forwarder = struct {
         };
         machoCapturePrint("macho-processor: ensureRealDevice: instance=0x{x} physical_device=0x{x}\n", .{ @intFromPtr(instance), @intFromPtr(phys_dev) });
         // Read the guest's VkDeviceCreateInfo.
-        // VkDeviceCreateInfo layout (64-bit):
-        //   +0:  sType (4)   +8:  pNext (8)
-        //   +16: flags (4)  +20: queueCreateInfoCount (4)
-        //   +24: pQueueCreateInfos (8)
-        //   +32: enabledExtensionCount (4) +40: ppEnabledExtensionNames (8)
-        //   +48: pEnabledFeatures (8)
+        //
+        // The layer arrays sit *between* the queue arrays and the extension
+        // arrays, so enabledExtensionCount is at +48 and pEnabledFeatures at
+        // +64 — not +32 and +48.  Reading the layer count as the extension
+        // count is silent: layers are always zero here, so the bridge simply
+        // forwards none of the guest's extensions and, because +48 then lands
+        // on that same count word, no features either.  The guest goes on
+        // believing it enabled both.  Take every offset from the ABI
+        // declaration, which is layout-asserted at compile time.
+        const device_create_info_extension_count_offset = @offsetOf(abi.DeviceCreateInfo, "enabled_extension_count");
+        const device_create_info_extension_names_offset = @offsetOf(abi.DeviceCreateInfo, "enabled_extension_names");
+        const device_create_info_features_offset = @offsetOf(abi.DeviceCreateInfo, "enabled_features");
+        const device_create_info_queue_count_offset = @offsetOf(abi.DeviceCreateInfo, "queue_create_info_count");
+        const device_create_info_queue_infos_offset = @offsetOf(abi.DeviceCreateInfo, "queue_create_infos");
         var queue_create_infos: [4]abi.DeviceQueueCreateInfo = undefined;
         var queue_count: u32 = 0;
         var priority_storage: [4][16]f32 = [_][16]f32{[_]f32{1.0} ** 16} ** 4;
@@ -4617,8 +4886,8 @@ pub const Forwarder = struct {
         else
             0;
         if (device_create_info_addr != 0 and state.guestMemoryConst(device_create_info_addr, 72) != null) {
-            const qci_count = state.read32(device_create_info_addr + 20); // queueCreateInfoCount
-            const qci_addr = state.read64(device_create_info_addr + 24); // pQueueCreateInfos
+            const qci_count = state.read32(device_create_info_addr + device_create_info_queue_count_offset);
+            const qci_addr = state.read64(device_create_info_addr + device_create_info_queue_infos_offset);
             machoCapturePrint("macho-processor: ensureRealDevice: VkDeviceCreateInfo qci_count={d} pQueueCreateInfos=0x{x}\n", .{ qci_count, qci_addr });
             const requested_count = @min(qci_count, 4);
             if (qci_addr != 0 and requested_count > 0) {
@@ -4694,10 +4963,22 @@ pub const Forwarder = struct {
             real_device_info.queue_create_infos = &queue_create_infos;
         }
         var requested_features: [220]u8 = undefined;
-        if (device_create_info_addr != 0 and state.read64(device_create_info_addr + 48) != 0 and state.guestMemoryConst(state.read64(device_create_info_addr + 48), requested_features.len) != null) {
-            @memcpy(&requested_features, state.guestMemoryConst(state.read64(device_create_info_addr + 48), requested_features.len).?);
+        const guest_features_addr = if (device_create_info_addr != 0) state.read64(device_create_info_addr + device_create_info_features_offset) else 0;
+        if (guest_features_addr != 0 and state.guestMemoryConst(guest_features_addr, requested_features.len) != null) {
+            @memcpy(&requested_features, state.guestMemoryConst(guest_features_addr, requested_features.len).?);
             for (&requested_features, self.real_vulkan.physical_device_features) |*requested, supported| requested.* &= supported;
             real_device_info.enabled_features = &requested_features;
+            var enabled_feature_count: usize = 0;
+            var offset: usize = 0;
+            while (offset + 4 <= requested_features.len) : (offset += 4) {
+                if (std.mem.readInt(u32, requested_features[offset..][0..4], .little) != 0) enabled_feature_count += 1;
+            }
+            machoCapturePrint(
+                "macho-processor: ensureRealDevice: guest VkPhysicalDeviceFeatures at 0x{x}: {d} enabled after masking against the host\n",
+                .{ guest_features_addr, enabled_feature_count },
+            );
+        } else if (device_create_info_addr != 0) {
+            machoCapturePrint("macho-processor: ensureRealDevice: guest supplied no readable pEnabledFeatures (0x{x}); the device is created with core features off\n", .{guest_features_addr});
         }
         var feature_chain: FeatureChainScratch = .{};
         if (guest_device_p_next != 0) {
@@ -4711,17 +4992,12 @@ pub const Forwarder = struct {
         // extension-name pointer through is unsafe for the same reason as a
         // guest array pointer anywhere else in Vulkan: it is an address in the
         // translated address space, not a host C string.
-        var available_extensions: [64]abi.ExtensionProperties = undefined;
-        var available_extension_count: u32 = 0;
-        var host_extensions_known = false;
-        if (get_proc(instance, "vkEnumerateDeviceExtensionProperties")) |address| {
-            const enumerate: abi.PfnEnumerateDeviceExtensionProperties = @ptrCast(@alignCast(address));
-            if (enumerate(phys_dev, null, &available_extension_count, null) == abi.SUCCESS) {
-                const requested_available = @min(available_extension_count, @as(u32, @intCast(available_extensions.len)));
-                available_extension_count = requested_available;
-                if (enumerate(phys_dev, null, &available_extension_count, &available_extensions) == abi.SUCCESS) host_extensions_known = true;
-            }
-        }
+        // Use the same cached device extension table the guest enumeration
+        // answers from.  A short local probe here silently disables the
+        // availability filter on any driver with a longer list than the probe
+        // buffer, which is exactly when the filter matters.
+        const host_extensions_known = self.queryHostDeviceExtensions();
+        const available_extensions = self.hostDeviceExtensions();
         var extension_storage: [32][256]u8 = [_][256]u8{[_]u8{0} ** 256} ** 32;
         var device_extension_names: [32][*:0]const u8 = undefined;
         var extension_count: usize = 0;
@@ -4750,23 +5026,69 @@ pub const Forwarder = struct {
                 count.* += 1;
             }
         }.add;
-        add_extension("VK_KHR_swapchain", host_extensions_known, available_extensions[0..available_extension_count], &extension_storage, &device_extension_names, &extension_count);
-        add_extension("VK_KHR_portability_subset", host_extensions_known, available_extensions[0..available_extension_count], &extension_storage, &device_extension_names, &extension_count);
-        add_extension("VK_KHR_maintenance1", host_extensions_known, available_extensions[0..available_extension_count], &extension_storage, &device_extension_names, &extension_count);
+        add_extension("VK_KHR_swapchain", host_extensions_known, available_extensions, &extension_storage, &device_extension_names, &extension_count);
+        add_extension("VK_KHR_portability_subset", host_extensions_known, available_extensions, &extension_storage, &device_extension_names, &extension_count);
+        add_extension("VK_KHR_maintenance1", host_extensions_known, available_extensions, &extension_storage, &device_extension_names, &extension_count);
         if (device_create_info_addr != 0) {
-            const guest_extension_count = @min(state.read32(device_create_info_addr + 32), @as(u32, 32));
-            const guest_extension_array = state.read64(device_create_info_addr + 40);
+            const requested_extension_count = state.read32(device_create_info_addr + device_create_info_extension_count_offset);
+            const guest_extension_count = @min(requested_extension_count, @as(u32, @intCast(device_extension_names.len)));
+            if (requested_extension_count > guest_extension_count) {
+                machoCapturePrint(
+                    "macho-processor: ensureRealDevice: guest requested {d} device extensions but the bridge negotiates at most {d}; the tail is not forwarded\n",
+                    .{ requested_extension_count, guest_extension_count },
+                );
+            }
+            const guest_extension_array = state.read64(device_create_info_addr + device_create_info_extension_names_offset);
             if (guest_extension_array != 0 and state.guestMemoryConst(guest_extension_array, @as(u64, guest_extension_count) * 8) != null) {
                 for (0..@as(usize, @intCast(guest_extension_count))) |index| {
                     const string_address = state.read64(guest_extension_array + @as(u64, @intCast(index)) * 8);
                     const string = state.guestCString(string_address, 255) orelse continue;
-                    add_extension(string, host_extensions_known, available_extensions[0..available_extension_count], &extension_storage, &device_extension_names, &extension_count);
+                    if (host_extensions_known and !self.hostDeviceExtensionAvailable(string)) {
+                        machoCapturePrint("macho-processor: ensureRealDevice: guest device extension unavailable on host, omitting {s}\n", .{string});
+                        continue;
+                    }
+                    add_extension(string, host_extensions_known, available_extensions, &extension_storage, &device_extension_names, &extension_count);
                 }
             }
         }
+        // Everything up to here is the guest's own device. What follows is
+        // the bridge's: extensions Rosette needs so the entry points it
+        // forwards through exist, negotiated against the host and enabled
+        // together with the features that make them legal to call. Adding
+        // them last keeps `guest_extension_boundary` an exact rollback point
+        // if the driver refuses the combination.
+        const guest_extension_boundary = extension_count;
+        var bridge_capabilities: BridgeCapabilityScratch = .{};
+        self.negotiateBridgeCapabilities(&bridge_capabilities);
+        inline for (bridge_device_capabilities, 0..) |capability, index| {
+            if (bridge_capabilities.admitted[index]) {
+                add_extension(capability.extension, host_extensions_known, available_extensions, &extension_storage, &device_extension_names, &extension_count);
+            }
+        }
+        // The bridge's feature nodes go in front of the guest's own chain so
+        // both reach the driver; the guest's chain is already host-owned by
+        // this point, so neither half can carry a guest pointer.
+        const guest_p_next_for_device = real_device_info.p_next;
+        real_device_info.p_next = spliceBridgeCapabilityChain(&bridge_capabilities, guest_p_next_for_device);
         real_device_info.enabled_extension_count = @intCast(extension_count);
         real_device_info.enabled_extension_names = if (extension_count == 0) null else &device_extension_names;
-        machoCapturePrint("macho-processor: ensureRealDevice: calling vkCreateDevice: queues={d} extensions={d} physical_device=0x{x}\n", .{ queue_count, extension_count, @intFromPtr(phys_dev) });
+        machoCapturePrint(
+            "macho-processor: ensureRealDevice: calling vkCreateDevice: queues={d} extensions={d} (guest={d} bridge={d}) physical_device=0x{x}\n",
+            .{ queue_count, extension_count, guest_extension_boundary, extension_count - guest_extension_boundary, @intFromPtr(phys_dev) },
+        );
+        inline for (bridge_device_capabilities, 0..) |capability, index| {
+            if (bridge_capabilities.admitted[index]) {
+                machoCapturePrint(
+                    "macho-processor: ensureRealDevice: bridge capability {s} enabled for {s}\n",
+                    .{ capability.extension, capability.provides },
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: ensureRealDevice: bridge capability {s} unavailable on this host; {s} stay absent\n",
+                    .{ capability.extension, capability.provides },
+                );
+            }
+        }
         for (0..queue_count) |i| {
             machoCapturePrint("macho-processor: ensureRealDevice:   queue[{d}]: family={d} count={d} priorities_ptr=0x{x}\n", .{ i, queue_create_infos[i].queue_family_index, queue_create_infos[i].queue_count, @intFromPtr(queue_create_infos[i].queue_priorities.?) });
         }
@@ -4776,7 +5098,23 @@ pub const Forwarder = struct {
             return vkErrorInitializationFailedSigned();
         }));
         var real_device: abi.Device = null;
-        const result = create_fn(phys_dev, &real_device_info, null, &real_device);
+        var result = create_fn(phys_dev, &real_device_info, null, &real_device);
+        if ((result != 0 or real_device == null) and extension_count != guest_extension_boundary) {
+            // Everything the bridge added is optional to the guest. If the
+            // driver refuses the combination, the guest's own device is still
+            // the thing that has to exist, so retry with exactly what the
+            // guest asked for rather than losing the GPU over an extra
+            // entry point.
+            machoCapturePrint(
+                "macho-processor: ensureRealDevice: vkCreateDevice refused the bridge capabilities (VkResult={d}); retrying with only what the guest requested\n",
+                .{result},
+            );
+            real_device_info.p_next = guest_p_next_for_device;
+            real_device_info.enabled_extension_count = @intCast(guest_extension_boundary);
+            real_device_info.enabled_extension_names = if (guest_extension_boundary == 0) null else &device_extension_names;
+            real_device = null;
+            result = create_fn(phys_dev, &real_device_info, null, &real_device);
+        }
         if (result != 0 or real_device == null) {
             machoCapturePrint(
                 "macho-processor: ensureRealDevice: vkCreateDevice FAILED: VkResult={d} physical_device=0x{x} device=0x{x}\n",
@@ -4849,163 +5187,235 @@ pub const Forwarder = struct {
             return;
         }));
         machoCapturePrint("macho-processor: ensureRealDeviceFnPtrs: vkGetDeviceProcAddr=0x{x}\n", .{@intFromPtr(dpa)});
+        // An entry point the device does not expose is not a failure. Most of
+        // this table is core in Vulkan 1.3 or lives in an extension the guest
+        // never enabled, and the negotiated device is 1.2: those absences are
+        // the expected shape of the device, and each one is a fallback the
+        // bridge already has. Collect them and report once, rather than
+        // printing twenty lines that read like a broken loader.
+        var resolved_count: u32 = 0;
+        var absent_names: [2048]u8 = undefined;
+        var absent_len: usize = 0;
+        var absent_count: u32 = 0;
         const resolveFn = struct {
-            fn r(dp: *const fn (abi.Device, [*:0]const u8) callconv(.c) ?*const anyopaque, dv: abi.Device, fn_ptr: anytype, name: [*:0]const u8) void {
+            fn r(
+                dp: *const fn (abi.Device, [*:0]const u8) callconv(.c) ?*const anyopaque,
+                dv: abi.Device,
+                fn_ptr: anytype,
+                name: [*:0]const u8,
+                resolved: *u32,
+                absent: *u32,
+                names: []u8,
+                names_len: *usize,
+            ) void {
                 if (dp(dv, name)) |addr| {
                     fn_ptr.* = @ptrCast(@alignCast(addr));
-                } else {
-                    machoCapturePrint("macho-processor: ensureRealDeviceFnPtrs: FAILED to resolve {s}\n", .{name});
+                    resolved.* += 1;
+                    return;
                 }
+                absent.* += 1;
+                const text = std.mem.sliceTo(name, 0);
+                const separator: usize = if (names_len.* == 0) 0 else 2;
+                if (names_len.* + separator + text.len > names.len) return;
+                if (separator != 0) {
+                    @memcpy(names[names_len.*..][0..2], ", ");
+                    names_len.* += 2;
+                }
+                @memcpy(names[names_len.*..][0..text.len], text);
+                names_len.* += text.len;
             }
         }.r;
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_device_queue, "vkGetDeviceQueue");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_semaphore_counter_value, "vkGetSemaphoreCounterValue");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.wait_semaphores, "vkWaitSemaphores");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.signal_semaphore, "vkSignalSemaphore");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_swapchain, "vkCreateSwapchainKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_swapchain, "vkDestroySwapchainKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_swapchain_images, "vkGetSwapchainImagesKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.acquire_next_image, "vkAcquireNextImageKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_present, "vkQueuePresentKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_command_pool, "vkCreateCommandPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_command_pool, "vkDestroyCommandPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.allocate_command_buffers, "vkAllocateCommandBuffers");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.free_command_buffers, "vkFreeCommandBuffers");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.begin_command_buffer, "vkBeginCommandBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.end_command_buffer, "vkEndCommandBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_command_buffer, "vkResetCommandBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_semaphore, "vkCreateSemaphore");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_semaphore, "vkDestroySemaphore");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_fence, "vkCreateFence");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_fence, "vkDestroyFence");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.wait_for_fences, "vkWaitForFences");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_fences, "vkResetFences");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_fence_status, "vkGetFenceStatus");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_query_pool, "vkCreateQueryPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_query_pool, "vkDestroyQueryPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_query_pool_results, "vkGetQueryPoolResults");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_query_pool, "vkResetQueryPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_command_pool, "vkResetCommandPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_submit, "vkQueueSubmit");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_submit2, "vkQueueSubmit2");
-        if (self.real_vulkan.fn_ptrs.queue_submit2 == null) resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_submit2, "vkQueueSubmit2KHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_bind_sparse, "vkQueueBindSparse");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_wait_idle, "vkQueueWaitIdle");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.device_wait_idle, "vkDeviceWaitIdle");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_buffer, "vkCreateBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_buffer, "vkDestroyBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_buffer_memory_requirements, "vkGetBufferMemoryRequirements");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_device_buffer_memory_requirements, "vkGetDeviceBufferMemoryRequirements");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.bind_buffer_memory, "vkBindBufferMemory");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_image, "vkCreateImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_image, "vkDestroyImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_image_memory_requirements, "vkGetImageMemoryRequirements");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_device_image_memory_requirements, "vkGetDeviceImageMemoryRequirements");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.bind_image_memory, "vkBindImageMemory");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.allocate_memory, "vkAllocateMemory");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.free_memory, "vkFreeMemory");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.map_memory, "vkMapMemory");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.unmap_memory, "vkUnmapMemory");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.flush_mapped_memory_ranges, "vkFlushMappedMemoryRanges");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.invalidate_mapped_memory_ranges, "vkInvalidateMappedMemoryRanges");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_device, "vkDestroyDevice");
+        // A promoted entry point exists under whichever spelling this device
+        // provides: the core name on a device new enough for it, otherwise the
+        // KHR or EXT name of the extension it came from. Trying the spellings
+        // in order and recording one absence for the whole group keeps the
+        // report about capabilities rather than about names — per-name
+        // accounting called an entry point absent even when its alias had just
+        // resolved.
+        const resolveAny = struct {
+            fn r(
+                dp: *const fn (abi.Device, [*:0]const u8) callconv(.c) ?*const anyopaque,
+                dv: abi.Device,
+                fn_ptr: anytype,
+                names: []const [*:0]const u8,
+                resolved: *u32,
+                absent: *u32,
+                absent_list: []u8,
+                absent_list_len: *usize,
+            ) void {
+                for (names) |name| {
+                    if (dp(dv, name)) |addr| {
+                        fn_ptr.* = @ptrCast(@alignCast(addr));
+                        resolved.* += 1;
+                        return;
+                    }
+                }
+                absent.* += 1;
+                const text = std.mem.sliceTo(names[0], 0);
+                const separator: usize = if (absent_list_len.* == 0) 0 else 2;
+                if (absent_list_len.* + separator + text.len > absent_list.len) return;
+                if (separator != 0) {
+                    @memcpy(absent_list[absent_list_len.*..][0..2], ", ");
+                    absent_list_len.* += 2;
+                }
+                @memcpy(absent_list[absent_list_len.*..][0..text.len], text);
+                absent_list_len.* += text.len;
+            }
+        }.r;
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_device_queue, "vkGetDeviceQueue", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_semaphore_counter_value, "vkGetSemaphoreCounterValue", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.wait_semaphores, "vkWaitSemaphores", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.signal_semaphore, "vkSignalSemaphore", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_swapchain, "vkCreateSwapchainKHR", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_swapchain, "vkDestroySwapchainKHR", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_swapchain_images, "vkGetSwapchainImagesKHR", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.acquire_next_image, "vkAcquireNextImageKHR", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_present, "vkQueuePresentKHR", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_command_pool, "vkCreateCommandPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_command_pool, "vkDestroyCommandPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.allocate_command_buffers, "vkAllocateCommandBuffers", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.free_command_buffers, "vkFreeCommandBuffers", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.begin_command_buffer, "vkBeginCommandBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.end_command_buffer, "vkEndCommandBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_command_buffer, "vkResetCommandBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_semaphore, "vkCreateSemaphore", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_semaphore, "vkDestroySemaphore", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_fence, "vkCreateFence", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_fence, "vkDestroyFence", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.wait_for_fences, "vkWaitForFences", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_fences, "vkResetFences", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_fence_status, "vkGetFenceStatus", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_query_pool, "vkCreateQueryPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_query_pool, "vkDestroyQueryPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_query_pool_results, "vkGetQueryPoolResults", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_query_pool, "vkResetQueryPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_command_pool, "vkResetCommandPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_submit, "vkQueueSubmit", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.queue_submit2, &.{ "vkQueueSubmit2", "vkQueueSubmit2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_bind_sparse, "vkQueueBindSparse", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.queue_wait_idle, "vkQueueWaitIdle", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.device_wait_idle, "vkDeviceWaitIdle", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_buffer, "vkCreateBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_buffer, "vkDestroyBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_buffer_memory_requirements, "vkGetBufferMemoryRequirements", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.get_device_buffer_memory_requirements, &.{ "vkGetDeviceBufferMemoryRequirements", "vkGetDeviceBufferMemoryRequirementsKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.bind_buffer_memory, "vkBindBufferMemory", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_image, "vkCreateImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_image, "vkDestroyImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_image_memory_requirements, "vkGetImageMemoryRequirements", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.get_device_image_memory_requirements, &.{ "vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.bind_image_memory, "vkBindImageMemory", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.allocate_memory, "vkAllocateMemory", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.free_memory, "vkFreeMemory", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.map_memory, "vkMapMemory", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.unmap_memory, "vkUnmapMemory", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.flush_mapped_memory_ranges, "vkFlushMappedMemoryRanges", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.invalidate_mapped_memory_ranges, "vkInvalidateMappedMemoryRanges", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_device, "vkDestroyDevice", &resolved_count, &absent_count, &absent_names, &absent_len);
         // Object creation/destruction function pointers
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_sampler, "vkCreateSampler");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_sampler, "vkDestroySampler");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_descriptor_set_layout, "vkCreateDescriptorSetLayout");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_descriptor_set_layout, "vkDestroyDescriptorSetLayout");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_pipeline_layout, "vkCreatePipelineLayout");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_pipeline_layout, "vkDestroyPipelineLayout");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_shader_module, "vkCreateShaderModule");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_shader_module, "vkDestroyShaderModule");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_render_pass, "vkCreateRenderPass");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_render_pass, "vkDestroyRenderPass");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_framebuffer, "vkCreateFramebuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_framebuffer, "vkDestroyFramebuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_graphics_pipelines, "vkCreateGraphicsPipelines");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_compute_pipelines, "vkCreateComputePipelines");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_pipeline_cache, "vkCreatePipelineCache");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_pipeline_cache_data, "vkGetPipelineCacheData");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_pipeline_cache, "vkDestroyPipelineCache");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_descriptor_update_template, "vkCreateDescriptorUpdateTemplate");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_descriptor_update_template, "vkDestroyDescriptorUpdateTemplate");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.update_descriptor_set_with_template, "vkUpdateDescriptorSetWithTemplate");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_pipeline, "vkDestroyPipeline");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_descriptor_pool, "vkCreateDescriptorPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_descriptor_pool, "vkDestroyDescriptorPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_descriptor_pool, "vkResetDescriptorPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.allocate_descriptor_sets, "vkAllocateDescriptorSets");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.free_descriptor_sets, "vkFreeDescriptorSets");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.update_descriptor_sets, "vkUpdateDescriptorSets");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_image_view, "vkCreateImageView");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_image_view, "vkDestroyImageView");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_buffer_view, "vkCreateBufferView");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_buffer_view, "vkDestroyBufferView");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_pipeline, "vkCmdBindPipeline");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_execute_commands, "vkCmdExecuteCommands");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_vertex_buffers, "vkCmdBindVertexBuffers");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_index_buffer, "vkCmdBindIndexBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_descriptor_sets, "vkCmdBindDescriptorSets");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_push_descriptor_set, "vkCmdPushDescriptorSetKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw, "vkCmdDraw");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indexed, "vkCmdDrawIndexed");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indirect, "vkCmdDrawIndirect");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect, "vkCmdDrawIndexedIndirect");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indirect_count, "vkCmdDrawIndirectCount");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect_count, "vkCmdDrawIndexedIndirectCount");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_dispatch, "vkCmdDispatch");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_dispatch_indirect, "vkCmdDispatchIndirect");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_dispatch_base, "vkCmdDispatchBase");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_viewport, "vkCmdSetViewport");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_scissor, "vkCmdSetScissor");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_blend_constants, "vkCmdSetBlendConstants");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_bias, "vkCmdSetDepthBias");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_bounds, "vkCmdSetDepthBounds");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_test_enable, "vkCmdSetDepthTestEnable");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_write_enable, "vkCmdSetDepthWriteEnable");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_compare_op, "vkCmdSetDepthCompareOp");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_test_enable, "vkCmdSetStencilTestEnable");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_op, "vkCmdSetStencilOp");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_primitive_restart_enable, "vkCmdSetPrimitiveRestartEnable");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_compare_mask, "vkCmdSetStencilCompareMask");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_write_mask, "vkCmdSetStencilWriteMask");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_reference, "vkCmdSetStencilReference");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_push_constants, "vkCmdPushConstants");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_render_pass, "vkCmdBeginRenderPass");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_next_subpass, "vkCmdNextSubpass");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_render_pass, "vkCmdEndRenderPass");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_render_pass2, "vkCmdBeginRenderPass2");
-        if (self.real_vulkan.fn_ptrs.cmd_begin_render_pass2 == null) resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_render_pass2, "vkCmdBeginRenderPass2KHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_next_subpass2, "vkCmdNextSubpass2");
-        if (self.real_vulkan.fn_ptrs.cmd_next_subpass2 == null) resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_next_subpass2, "vkCmdNextSubpass2KHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_render_pass2, "vkCmdEndRenderPass2");
-        if (self.real_vulkan.fn_ptrs.cmd_end_render_pass2 == null) resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_render_pass2, "vkCmdEndRenderPass2KHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering, "vkCmdBeginConditionalRenderingEXT");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_conditional_rendering, "vkCmdEndConditionalRenderingEXT");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_rendering, "vkCmdBeginRendering");
-        if (self.real_vulkan.fn_ptrs.cmd_begin_rendering == null) resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_rendering, "vkCmdBeginRenderingKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_rendering, "vkCmdEndRendering");
-        if (self.real_vulkan.fn_ptrs.cmd_end_rendering == null) resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_rendering, "vkCmdEndRenderingKHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_buffer, "vkCmdCopyBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_image, "vkCmdCopyImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_buffer_to_image, "vkCmdCopyBufferToImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_image_to_buffer, "vkCmdCopyImageToBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_blit_image, "vkCmdBlitImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_fill_buffer, "vkCmdFillBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_update_buffer, "vkCmdUpdateBuffer");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_resolve_image, "vkCmdResolveImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_clear_color_image, "vkCmdClearColorImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_clear_depth_stencil_image, "vkCmdClearDepthStencilImage");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_clear_attachments, "vkCmdClearAttachments");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_pipeline_barrier, "vkCmdPipelineBarrier");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_pipeline_barrier2, "vkCmdPipelineBarrier2");
-        if (self.real_vulkan.fn_ptrs.cmd_pipeline_barrier2 == null) resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_pipeline_barrier2, "vkCmdPipelineBarrier2KHR");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_query, "vkCmdBeginQuery");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_query, "vkCmdEndQuery");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_reset_query_pool, "vkCmdResetQueryPool");
-        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_query_pool_results, "vkCmdCopyQueryPoolResults");
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_sampler, "vkCreateSampler", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_sampler, "vkDestroySampler", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_descriptor_set_layout, "vkCreateDescriptorSetLayout", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_descriptor_set_layout, "vkDestroyDescriptorSetLayout", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_pipeline_layout, "vkCreatePipelineLayout", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_pipeline_layout, "vkDestroyPipelineLayout", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_shader_module, "vkCreateShaderModule", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_shader_module, "vkDestroyShaderModule", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_render_pass, "vkCreateRenderPass", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_render_pass, "vkDestroyRenderPass", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_framebuffer, "vkCreateFramebuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_framebuffer, "vkDestroyFramebuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_graphics_pipelines, "vkCreateGraphicsPipelines", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_compute_pipelines, "vkCreateComputePipelines", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_pipeline_cache, "vkCreatePipelineCache", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.get_pipeline_cache_data, "vkGetPipelineCacheData", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_pipeline_cache, "vkDestroyPipelineCache", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_descriptor_update_template, "vkCreateDescriptorUpdateTemplate", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_descriptor_update_template, "vkDestroyDescriptorUpdateTemplate", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.update_descriptor_set_with_template, "vkUpdateDescriptorSetWithTemplate", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_pipeline, "vkDestroyPipeline", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_descriptor_pool, "vkCreateDescriptorPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_descriptor_pool, "vkDestroyDescriptorPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.reset_descriptor_pool, "vkResetDescriptorPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.allocate_descriptor_sets, "vkAllocateDescriptorSets", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.free_descriptor_sets, "vkFreeDescriptorSets", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.update_descriptor_sets, "vkUpdateDescriptorSets", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_image_view, "vkCreateImageView", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_image_view, "vkDestroyImageView", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.create_buffer_view, "vkCreateBufferView", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.destroy_buffer_view, "vkDestroyBufferView", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_pipeline, "vkCmdBindPipeline", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_execute_commands, "vkCmdExecuteCommands", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_vertex_buffers, "vkCmdBindVertexBuffers", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_index_buffer, "vkCmdBindIndexBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_bind_descriptor_sets, "vkCmdBindDescriptorSets", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_push_descriptor_set, &.{ "vkCmdPushDescriptorSetKHR", "vkCmdPushDescriptorSet" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw, "vkCmdDraw", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indexed, "vkCmdDrawIndexed", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indirect, "vkCmdDrawIndirect", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect, "vkCmdDrawIndexedIndirect", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indirect_count, &.{ "vkCmdDrawIndirectCount", "vkCmdDrawIndirectCountKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect_count, &.{ "vkCmdDrawIndexedIndirectCount", "vkCmdDrawIndexedIndirectCountKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_dispatch, "vkCmdDispatch", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_dispatch_indirect, "vkCmdDispatchIndirect", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_dispatch_base, "vkCmdDispatchBase", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_viewport, "vkCmdSetViewport", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_scissor, "vkCmdSetScissor", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_blend_constants, "vkCmdSetBlendConstants", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_bias, "vkCmdSetDepthBias", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_bounds, "vkCmdSetDepthBounds", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_test_enable, &.{ "vkCmdSetDepthTestEnable", "vkCmdSetDepthTestEnableEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_write_enable, &.{ "vkCmdSetDepthWriteEnable", "vkCmdSetDepthWriteEnableEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_depth_compare_op, &.{ "vkCmdSetDepthCompareOp", "vkCmdSetDepthCompareOpEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_test_enable, &.{ "vkCmdSetStencilTestEnable", "vkCmdSetStencilTestEnableEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_op, &.{ "vkCmdSetStencilOp", "vkCmdSetStencilOpEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_primitive_restart_enable, &.{ "vkCmdSetPrimitiveRestartEnable", "vkCmdSetPrimitiveRestartEnableEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_compare_mask, "vkCmdSetStencilCompareMask", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_write_mask, "vkCmdSetStencilWriteMask", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_set_stencil_reference, "vkCmdSetStencilReference", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_push_constants, "vkCmdPushConstants", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_render_pass, "vkCmdBeginRenderPass", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_next_subpass, "vkCmdNextSubpass", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_render_pass, "vkCmdEndRenderPass", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_render_pass2, &.{ "vkCmdBeginRenderPass2", "vkCmdBeginRenderPass2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_next_subpass2, &.{ "vkCmdNextSubpass2", "vkCmdNextSubpass2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_render_pass2, &.{ "vkCmdEndRenderPass2", "vkCmdEndRenderPass2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering, &.{ "vkCmdBeginConditionalRenderingEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_conditional_rendering, &.{ "vkCmdEndConditionalRenderingEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_rendering, &.{ "vkCmdBeginRendering", "vkCmdBeginRenderingKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_rendering, &.{ "vkCmdEndRendering", "vkCmdEndRenderingKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_buffer, "vkCmdCopyBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_image, "vkCmdCopyImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_buffer_to_image, "vkCmdCopyBufferToImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_image_to_buffer, "vkCmdCopyImageToBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_blit_image, "vkCmdBlitImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_fill_buffer, "vkCmdFillBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_update_buffer, "vkCmdUpdateBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_resolve_image, "vkCmdResolveImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_clear_color_image, "vkCmdClearColorImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_clear_depth_stencil_image, "vkCmdClearDepthStencilImage", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_clear_attachments, "vkCmdClearAttachments", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_pipeline_barrier, "vkCmdPipelineBarrier", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_pipeline_barrier2, &.{ "vkCmdPipelineBarrier2", "vkCmdPipelineBarrier2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_query, "vkCmdBeginQuery", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_query, "vkCmdEndQuery", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_reset_query_pool, "vkCmdResetQueryPool", &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_query_pool_results, "vkCmdCopyQueryPoolResults", &resolved_count, &absent_count, &absent_names, &absent_len);
         self.real_vulkan.fn_ptrs.resolved = true;
-        machoCapturePrint("macho-processor: ensureRealDeviceFnPtrs: COMPLETE all device function pointers resolved\n", .{});
+        machoCapturePrint(
+            "macho-processor: ensureRealDeviceFnPtrs: COMPLETE resolved={d} absent={d}\n",
+            .{ resolved_count, absent_count },
+        );
+        if (absent_count != 0) {
+            machoCapturePrint(
+                "macho-processor: ensureRealDeviceFnPtrs: absent on this device: {s}\n",
+                .{absent_names[0..absent_len]},
+            );
+            machoCapturePrint(
+                "macho-processor: ensureRealDeviceFnPtrs: an absence here means no extension this host exposes provides the entry point under any spelling; everything the host could provide was negotiated at device creation\n",
+                .{},
+            );
+        }
     }
 
     fn noteRealVulkanResult(self: *Forwarder, result: abi.Result, operation: []const u8) void {
@@ -6781,11 +7191,137 @@ pub const Forwarder = struct {
         return true;
     }
 
-    fn createRealGraphicsPipeline(self: *Forwarder, state: anytype, cache: u64, guest_address: u64, real_output: *u64, result_output: *i32) bool {
-        const function = self.real_vulkan.fn_ptrs.create_graphics_pipelines orelse return false;
-        const real_cache = if (cache == 0) 0 else self.real_vulkan.realPipelineCache(cache) orelse return false;
+    /// Why a pipeline could not be handed to the driver. Every refusal names
+    /// its own clause: a pipeline that will not marshal stops the guest's
+    /// renderer outright, and "could not marshal" without a reason leaves the
+    /// next reader to re-derive twenty preconditions by hand.
+    const PipelineMarshalFailure = error{
+        DeviceEntryPointUnavailable,
+        UnknownPipelineCache,
+        CreateInfoUnreadable,
+        DynamicRenderingChainUnsupported,
+        DynamicRenderingFormatsUnreadable,
+        RenderPassSetWithDynamicRendering,
+        PipelineLayoutMissing,
+        UnknownPipelineLayout,
+        UnknownRenderPass,
+        UnknownBasePipeline,
+        StageCountOutOfRange,
+        StageArrayUnreadable,
+        StageChainUnsupported,
+        UnknownShaderModule,
+        StageEntryPointUnreadable,
+        SpecializationInfoUnreadable,
+        SpecializationMapOutOfRange,
+        SpecializationDataOutOfRange,
+        VertexInputUnreadable,
+        VertexInputCountsOutOfRange,
+        VertexBindingsUnreadable,
+        VertexAttributesUnreadable,
+        VertexDivisorChainUnsupported,
+        VertexDivisorsUnreadable,
+        InputAssemblyUnreadable,
+        TessellationUnreadable,
+        ViewportStateUnreadable,
+        ViewportCountsOutOfRange,
+        ViewportsUnreadable,
+        ScissorsUnreadable,
+        RasterizationUnreadable,
+        MultisampleUnreadable,
+        SampleMaskUnreadable,
+        DepthStencilUnreadable,
+        ColorBlendUnreadable,
+        ColorAttachmentCountOutOfRange,
+        ColorAttachmentsUnreadable,
+        DynamicStateUnreadable,
+        DynamicStateCountOutOfRange,
+        DynamicStatesUnreadable,
+    };
+
+    /// Marshal one optional guest array into host-owned storage.
+    ///
+    /// A null guest pointer stays null. Several Vulkan arrays are legally
+    /// absent while their count stays non-zero — `pViewports` and `pScissors`
+    /// under `VK_DYNAMIC_STATE_VIEWPORT`/`SCISSOR` are the ordinary case, and
+    /// it is the case every presenter hits — so treating a null pointer as
+    /// unmarshalable refuses pipelines the driver would have accepted.
+    fn marshalGuestArray(
+        comptime T: type,
+        state: anytype,
+        guest: ?[*]const T,
+        count: u32,
+        storage: []T,
+        comptime unreadable: PipelineMarshalFailure,
+    ) PipelineMarshalFailure!?[*]const T {
+        const address = guestPointerValue(T, guest);
+        if (address == 0 or count == 0) return null;
+        if (!copyGuestStructs(T, state, address, count, storage)) return unreadable;
+        return storage.ptr;
+    }
+
+    /// Host-owned storage for one shader stage's specialization constants.
+    /// The map and the data blob are both guest-owned, so both are copied.
+    const SpecializationScratch = struct {
+        info: abi.SpecializationInfo = .{},
+        entries: [32]abi.SpecializationMapEntry = undefined,
+        data: [256]u8 = undefined,
+    };
+
+    fn marshalSpecializationInfo(
+        state: anytype,
+        guest_address: u64,
+        scratch: *SpecializationScratch,
+    ) PipelineMarshalFailure!*const abi.SpecializationInfo {
+        if (!copyGuestValue(abi.SpecializationInfo, state, guest_address, &scratch.info)) return error.SpecializationInfoUnreadable;
+        if (scratch.info.map_entry_count > scratch.entries.len) return error.SpecializationMapOutOfRange;
+        if (scratch.info.data_size > scratch.data.len) return error.SpecializationDataOutOfRange;
+        scratch.info.map_entries = try marshalGuestArray(
+            abi.SpecializationMapEntry,
+            state,
+            scratch.info.map_entries,
+            scratch.info.map_entry_count,
+            &scratch.entries,
+            error.SpecializationInfoUnreadable,
+        );
+        const data_address = if (scratch.info.data) |pointer| @intFromPtr(pointer) else 0;
+        if (data_address == 0 or scratch.info.data_size == 0) {
+            scratch.info.data = null;
+            scratch.info.data_size = 0;
+        } else {
+            if (!copyGuestBytes(state, data_address, scratch.info.data_size, &scratch.data)) return error.SpecializationInfoUnreadable;
+            scratch.info.data = @ptrCast(&scratch.data);
+        }
+        return &scratch.info;
+    }
+
+    fn createRealGraphicsPipeline(
+        self: *Forwarder,
+        state: anytype,
+        cache: u64,
+        guest_address: u64,
+        real_output: *u64,
+        result_output: *i32,
+        reason: *[]const u8,
+    ) bool {
+        self.marshalRealGraphicsPipeline(state, cache, guest_address, real_output, result_output) catch |failure| {
+            reason.* = @errorName(failure);
+            return false;
+        };
+        return true;
+    }
+
+    fn marshalRealGraphicsPipeline(
+        self: *Forwarder,
+        state: anytype,
+        cache: u64,
+        guest_address: u64,
+        real_output: *u64,
+        result_output: *i32,
+    ) PipelineMarshalFailure!void {
+        const function = self.real_vulkan.fn_ptrs.create_graphics_pipelines orelse return error.DeviceEntryPointUnavailable;
+        const real_cache = if (cache == 0) 0 else self.real_vulkan.realPipelineCache(cache) orelse return error.UnknownPipelineCache;
         var root: abi.GraphicsPipelineCreateInfo = undefined;
-        if (!copyGuestValue(abi.GraphicsPipelineCreateInfo, state, guest_address, &root)) return false;
+        if (!copyGuestValue(abi.GraphicsPipelineCreateInfo, state, guest_address, &root)) return error.CreateInfoUnreadable;
         var pipeline_rendering: abi.PipelineRenderingCreateInfo = .{};
         var pipeline_rendering_formats: [8]u32 = undefined;
         if (root.p_next) |pointer| {
@@ -6794,37 +7330,42 @@ pub const Forwarder = struct {
                 pipeline_rendering.p_next != null or
                 pipeline_rendering.color_attachment_count > pipeline_rendering_formats.len)
             {
-                return false;
+                return error.DynamicRenderingChainUnsupported;
             }
-            const format_address = if (pipeline_rendering.color_attachment_formats) |formats| @intFromPtr(formats) else 0;
-            if (!copyGuestStructs(u32, state, format_address, pipeline_rendering.color_attachment_count, &pipeline_rendering_formats)) return false;
+            pipeline_rendering.color_attachment_formats = try marshalGuestArray(
+                u32,
+                state,
+                pipeline_rendering.color_attachment_formats,
+                pipeline_rendering.color_attachment_count,
+                &pipeline_rendering_formats,
+                error.DynamicRenderingFormatsUnreadable,
+            );
             pipeline_rendering.p_next = null;
-            pipeline_rendering.color_attachment_formats = if (pipeline_rendering.color_attachment_count == 0)
-                null
-            else
-                &pipeline_rendering_formats;
             root.p_next = &pipeline_rendering;
-            if (root.render_pass != 0) return false;
+            if (root.render_pass != 0) return error.RenderPassSetWithDynamicRendering;
         } else {
             root.p_next = null;
         }
-        if (root.layout == 0) return false;
-        root.layout = self.real_vulkan.realPipelineLayout(root.layout) orelse return false;
-        if (root.render_pass != 0) root.render_pass = self.real_vulkan.realRenderPass(root.render_pass) orelse return false;
-        if (root.base_pipeline_handle != 0) root.base_pipeline_handle = self.real_vulkan.realPipeline(root.base_pipeline_handle) orelse return false;
-        if (root.stage_count == 0 or root.stage_count > 8) return false;
+        if (root.layout == 0) return error.PipelineLayoutMissing;
+        root.layout = self.real_vulkan.realPipelineLayout(root.layout) orelse return error.UnknownPipelineLayout;
+        if (root.render_pass != 0) root.render_pass = self.real_vulkan.realRenderPass(root.render_pass) orelse return error.UnknownRenderPass;
+        if (root.base_pipeline_handle != 0) root.base_pipeline_handle = self.real_vulkan.realPipeline(root.base_pipeline_handle) orelse return error.UnknownBasePipeline;
 
         var stages: [8]abi.PipelineShaderStageCreateInfo = undefined;
+        if (root.stage_count == 0 or root.stage_count > stages.len) return error.StageCountOutOfRange;
         const stage_address = guestPointerValue(abi.PipelineShaderStageCreateInfo, root.stages);
-        if (!copyGuestStructs(abi.PipelineShaderStageCreateInfo, state, stage_address, root.stage_count, &stages)) return false;
+        if (!copyGuestStructs(abi.PipelineShaderStageCreateInfo, state, stage_address, root.stage_count, &stages)) return error.StageArrayUnreadable;
         var stage_names: [8][64]u8 = undefined;
+        var specializations: [8]SpecializationScratch = undefined;
         for (stages[0..@as(usize, @intCast(root.stage_count))], 0..) |*stage, index| {
-            if (stage.p_next != null or stage.specialization_info != null) return false;
-            stage.p_next = null;
-            stage.specialization_info = null;
-            stage.module = self.real_vulkan.realShaderModule(stage.module) orelse return false;
-            if (!copyPipelineName(state, if (stage.name) |pointer| @intFromPtr(pointer) else 0, &stage_names[index])) return false;
+            if (stage.p_next != null) return error.StageChainUnsupported;
+            stage.module = self.real_vulkan.realShaderModule(stage.module) orelse return error.UnknownShaderModule;
+            if (!copyPipelineName(state, if (stage.name) |pointer| @intFromPtr(pointer) else 0, &stage_names[index])) return error.StageEntryPointUnreadable;
             stage.name = @ptrCast(&stage_names[index]);
+            if (stage.specialization_info) |pointer| {
+                specializations[index] = .{};
+                stage.specialization_info = try marshalSpecializationInfo(state, @intFromPtr(pointer), &specializations[index]);
+            }
         }
         root.stages = &stages;
 
@@ -6834,45 +7375,57 @@ pub const Forwarder = struct {
         var vertex_divisor: abi.PipelineVertexInputDivisorStateCreateInfo = .{};
         var vertex_divisors: [32]abi.VertexInputBindingDivisorDescription = undefined;
         if (root.vertex_input_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineVertexInputStateCreateInfo, state, @intFromPtr(pointer), &vertex_input)) return false;
-            if (vertex_input.vertex_binding_description_count > bindings.len or vertex_input.vertex_attribute_description_count > attributes.len) return false;
-            const binding_address = guestPointerValue(abi.VertexInputBindingDescription, vertex_input.vertex_binding_descriptions);
-            const attribute_address = guestPointerValue(abi.VertexInputAttributeDescription, vertex_input.vertex_attribute_descriptions);
-            if (!copyGuestStructs(abi.VertexInputBindingDescription, state, binding_address, vertex_input.vertex_binding_description_count, &bindings)) return false;
-            if (!copyGuestStructs(abi.VertexInputAttributeDescription, state, attribute_address, vertex_input.vertex_attribute_description_count, &attributes)) return false;
+            if (!copyGuestValue(abi.PipelineVertexInputStateCreateInfo, state, @intFromPtr(pointer), &vertex_input)) return error.VertexInputUnreadable;
+            if (vertex_input.vertex_binding_description_count > bindings.len or vertex_input.vertex_attribute_description_count > attributes.len) return error.VertexInputCountsOutOfRange;
+            vertex_input.vertex_binding_descriptions = try marshalGuestArray(
+                abi.VertexInputBindingDescription,
+                state,
+                vertex_input.vertex_binding_descriptions,
+                vertex_input.vertex_binding_description_count,
+                &bindings,
+                error.VertexBindingsUnreadable,
+            );
+            vertex_input.vertex_attribute_descriptions = try marshalGuestArray(
+                abi.VertexInputAttributeDescription,
+                state,
+                vertex_input.vertex_attribute_descriptions,
+                vertex_input.vertex_attribute_description_count,
+                &attributes,
+                error.VertexAttributesUnreadable,
+            );
             if (vertex_input.p_next) |next_pointer| {
                 if (!copyGuestValue(abi.PipelineVertexInputDivisorStateCreateInfo, state, @intFromPtr(next_pointer), &vertex_divisor) or
                     vertex_divisor.s_type != abi.STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO or
                     vertex_divisor.p_next != null or
                     vertex_divisor.vertex_binding_divisor_count > vertex_divisors.len)
                 {
-                    return false;
+                    return error.VertexDivisorChainUnsupported;
                 }
-                const divisor_address = if (vertex_divisor.vertex_binding_divisors) |divisors| @intFromPtr(divisors) else 0;
-                if (!copyGuestStructs(abi.VertexInputBindingDivisorDescription, state, divisor_address, vertex_divisor.vertex_binding_divisor_count, &vertex_divisors)) return false;
+                vertex_divisor.vertex_binding_divisors = try marshalGuestArray(
+                    abi.VertexInputBindingDivisorDescription,
+                    state,
+                    vertex_divisor.vertex_binding_divisors,
+                    vertex_divisor.vertex_binding_divisor_count,
+                    &vertex_divisors,
+                    error.VertexDivisorsUnreadable,
+                );
                 vertex_divisor.p_next = null;
-                vertex_divisor.vertex_binding_divisors = if (vertex_divisor.vertex_binding_divisor_count == 0)
-                    null
-                else
-                    &vertex_divisors;
                 vertex_input.p_next = &vertex_divisor;
             } else {
                 vertex_input.p_next = null;
             }
-            vertex_input.vertex_binding_descriptions = if (vertex_input.vertex_binding_description_count == 0) null else &bindings;
-            vertex_input.vertex_attribute_descriptions = if (vertex_input.vertex_attribute_description_count == 0) null else &attributes;
             root.vertex_input_state = &vertex_input;
         }
 
         var input_assembly: abi.PipelineInputAssemblyStateCreateInfo = undefined;
         if (root.input_assembly_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineInputAssemblyStateCreateInfo, state, @intFromPtr(pointer), &input_assembly) or input_assembly.p_next != null) return false;
+            if (!copyGuestValue(abi.PipelineInputAssemblyStateCreateInfo, state, @intFromPtr(pointer), &input_assembly) or input_assembly.p_next != null) return error.InputAssemblyUnreadable;
             input_assembly.p_next = null;
             root.input_assembly_state = &input_assembly;
         }
         var tessellation: abi.PipelineTessellationStateCreateInfo = undefined;
         if (root.tessellation_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineTessellationStateCreateInfo, state, @intFromPtr(pointer), &tessellation) or tessellation.p_next != null) return false;
+            if (!copyGuestValue(abi.PipelineTessellationStateCreateInfo, state, @intFromPtr(pointer), &tessellation) or tessellation.p_next != null) return error.TessellationUnreadable;
             tessellation.p_next = null;
             root.tessellation_state = &tessellation;
         }
@@ -6881,19 +7434,20 @@ pub const Forwarder = struct {
         var viewports: [16]abi.Viewport = undefined;
         var scissors: [16]abi.Rect2D = undefined;
         if (root.viewport_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineViewportStateCreateInfo, state, @intFromPtr(pointer), &viewport_state)) return false;
-            if (viewport_state.p_next != null or viewport_state.viewport_count > viewports.len or viewport_state.scissor_count > scissors.len) return false;
-            if (!copyGuestStructs(abi.Viewport, state, guestPointerValue(abi.Viewport, viewport_state.viewports), viewport_state.viewport_count, &viewports)) return false;
-            if (!copyGuestStructs(abi.Rect2D, state, guestPointerValue(abi.Rect2D, viewport_state.scissors), viewport_state.scissor_count, &scissors)) return false;
+            if (!copyGuestValue(abi.PipelineViewportStateCreateInfo, state, @intFromPtr(pointer), &viewport_state) or viewport_state.p_next != null) return error.ViewportStateUnreadable;
+            if (viewport_state.viewport_count > viewports.len or viewport_state.scissor_count > scissors.len) return error.ViewportCountsOutOfRange;
+            // A dynamic viewport or scissor is declared by a non-zero count
+            // with a null array; keep the null rather than demanding an array
+            // the guest deliberately did not provide.
+            viewport_state.viewports = try marshalGuestArray(abi.Viewport, state, viewport_state.viewports, viewport_state.viewport_count, &viewports, error.ViewportsUnreadable);
+            viewport_state.scissors = try marshalGuestArray(abi.Rect2D, state, viewport_state.scissors, viewport_state.scissor_count, &scissors, error.ScissorsUnreadable);
             viewport_state.p_next = null;
-            viewport_state.viewports = if (viewport_state.viewport_count == 0) null else &viewports;
-            viewport_state.scissors = if (viewport_state.scissor_count == 0) null else &scissors;
             root.viewport_state = &viewport_state;
         }
 
         var rasterization: abi.PipelineRasterizationStateCreateInfo = undefined;
         if (root.rasterization_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineRasterizationStateCreateInfo, state, @intFromPtr(pointer), &rasterization) or rasterization.p_next != null) return false;
+            if (!copyGuestValue(abi.PipelineRasterizationStateCreateInfo, state, @intFromPtr(pointer), &rasterization) or rasterization.p_next != null) return error.RasterizationUnreadable;
             rasterization.p_next = null;
             root.rasterization_state = &rasterization;
         }
@@ -6901,12 +7455,11 @@ pub const Forwarder = struct {
         var multisample: abi.PipelineMultisampleStateCreateInfo = undefined;
         var sample_mask: [8]u32 = undefined;
         if (root.multisample_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineMultisampleStateCreateInfo, state, @intFromPtr(pointer), &multisample) or multisample.p_next != null) return false;
+            if (!copyGuestValue(abi.PipelineMultisampleStateCreateInfo, state, @intFromPtr(pointer), &multisample) or multisample.p_next != null) return error.MultisampleUnreadable;
             if (multisample.sample_mask != null) {
                 const sample_count = @min(multisample.rasterization_samples, @as(u32, 256));
                 const sample_word_count = @max(@as(u32, 1), (sample_count + 31) / 32);
-                if (!copyGuestStructs(u32, state, @intFromPtr(multisample.sample_mask.?), sample_word_count, &sample_mask)) return false;
-                multisample.sample_mask = &sample_mask;
+                multisample.sample_mask = try marshalGuestArray(u32, state, multisample.sample_mask, sample_word_count, &sample_mask, error.SampleMaskUnreadable);
             }
             multisample.p_next = null;
             root.multisample_state = &multisample;
@@ -6914,7 +7467,7 @@ pub const Forwarder = struct {
 
         var depth_stencil: abi.PipelineDepthStencilStateCreateInfo = undefined;
         if (root.depth_stencil_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineDepthStencilStateCreateInfo, state, @intFromPtr(pointer), &depth_stencil) or depth_stencil.p_next != null) return false;
+            if (!copyGuestValue(abi.PipelineDepthStencilStateCreateInfo, state, @intFromPtr(pointer), &depth_stencil) or depth_stencil.p_next != null) return error.DepthStencilUnreadable;
             depth_stencil.p_next = null;
             root.depth_stencil_state = &depth_stencil;
         }
@@ -6922,22 +7475,27 @@ pub const Forwarder = struct {
         var color_blend: abi.PipelineColorBlendStateCreateInfo = undefined;
         var color_attachments: [16]abi.PipelineColorBlendAttachmentState = undefined;
         if (root.color_blend_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineColorBlendStateCreateInfo, state, @intFromPtr(pointer), &color_blend)) return false;
-            if (color_blend.p_next != null or color_blend.attachment_count > color_attachments.len) return false;
-            if (!copyGuestStructs(abi.PipelineColorBlendAttachmentState, state, guestPointerValue(abi.PipelineColorBlendAttachmentState, color_blend.attachments), color_blend.attachment_count, &color_attachments)) return false;
+            if (!copyGuestValue(abi.PipelineColorBlendStateCreateInfo, state, @intFromPtr(pointer), &color_blend) or color_blend.p_next != null) return error.ColorBlendUnreadable;
+            if (color_blend.attachment_count > color_attachments.len) return error.ColorAttachmentCountOutOfRange;
+            color_blend.attachments = try marshalGuestArray(
+                abi.PipelineColorBlendAttachmentState,
+                state,
+                color_blend.attachments,
+                color_blend.attachment_count,
+                &color_attachments,
+                error.ColorAttachmentsUnreadable,
+            );
             color_blend.p_next = null;
-            color_blend.attachments = if (color_blend.attachment_count == 0) null else &color_attachments;
             root.color_blend_state = &color_blend;
         }
 
         var dynamic: abi.PipelineDynamicStateCreateInfo = undefined;
         var dynamic_states: [64]u32 = undefined;
         if (root.dynamic_state) |pointer| {
-            if (!copyGuestValue(abi.PipelineDynamicStateCreateInfo, state, @intFromPtr(pointer), &dynamic)) return false;
-            if (dynamic.p_next != null or dynamic.dynamic_state_count > dynamic_states.len) return false;
-            if (!copyGuestStructs(u32, state, guestPointerValue(u32, dynamic.dynamic_states), dynamic.dynamic_state_count, &dynamic_states)) return false;
+            if (!copyGuestValue(abi.PipelineDynamicStateCreateInfo, state, @intFromPtr(pointer), &dynamic) or dynamic.p_next != null) return error.DynamicStateUnreadable;
+            if (dynamic.dynamic_state_count > dynamic_states.len) return error.DynamicStateCountOutOfRange;
+            dynamic.dynamic_states = try marshalGuestArray(u32, state, dynamic.dynamic_states, dynamic.dynamic_state_count, &dynamic_states, error.DynamicStatesUnreadable);
             dynamic.p_next = null;
-            dynamic.dynamic_states = if (dynamic.dynamic_state_count == 0) null else &dynamic_states;
             root.dynamic_state = &dynamic;
         }
 
@@ -6945,29 +7503,54 @@ pub const Forwarder = struct {
         const result = function(self.real_vulkan.device.?, real_cache, 1, @ptrCast(&root), null, @ptrCast(&real_pipeline));
         result_output.* = result;
         real_output.* = real_pipeline;
+    }
+
+    fn createRealComputePipeline(
+        self: *Forwarder,
+        state: anytype,
+        cache: u64,
+        guest_address: u64,
+        real_output: *u64,
+        result_output: *i32,
+        reason: *[]const u8,
+    ) bool {
+        self.marshalRealComputePipeline(state, cache, guest_address, real_output, result_output) catch |failure| {
+            reason.* = @errorName(failure);
+            return false;
+        };
         return true;
     }
 
-    fn createRealComputePipeline(self: *Forwarder, state: anytype, cache: u64, guest_address: u64, real_output: *u64, result_output: *i32) bool {
-        const function = self.real_vulkan.fn_ptrs.create_compute_pipelines orelse return false;
-        const real_cache = if (cache == 0) 0 else self.real_vulkan.realPipelineCache(cache) orelse return false;
+    fn marshalRealComputePipeline(
+        self: *Forwarder,
+        state: anytype,
+        cache: u64,
+        guest_address: u64,
+        real_output: *u64,
+        result_output: *i32,
+    ) PipelineMarshalFailure!void {
+        const function = self.real_vulkan.fn_ptrs.create_compute_pipelines orelse return error.DeviceEntryPointUnavailable;
+        const real_cache = if (cache == 0) 0 else self.real_vulkan.realPipelineCache(cache) orelse return error.UnknownPipelineCache;
         var root: abi.ComputePipelineCreateInfo = undefined;
-        if (!copyGuestValue(abi.ComputePipelineCreateInfo, state, guest_address, &root)) return false;
-        if (root.p_next != null or root.stage.p_next != null or root.stage.specialization_info != null or root.layout == 0) return false;
+        if (!copyGuestValue(abi.ComputePipelineCreateInfo, state, guest_address, &root)) return error.CreateInfoUnreadable;
+        if (root.p_next != null or root.stage.p_next != null) return error.StageChainUnsupported;
+        if (root.layout == 0) return error.PipelineLayoutMissing;
         root.p_next = null;
         root.stage.p_next = null;
-        root.stage.specialization_info = null;
-        root.layout = self.real_vulkan.realPipelineLayout(root.layout) orelse return false;
-        root.stage.module = self.real_vulkan.realShaderModule(root.stage.module) orelse return false;
+        root.layout = self.real_vulkan.realPipelineLayout(root.layout) orelse return error.UnknownPipelineLayout;
+        root.stage.module = self.real_vulkan.realShaderModule(root.stage.module) orelse return error.UnknownShaderModule;
         var stage_name: [64]u8 = undefined;
-        if (!copyPipelineName(state, if (root.stage.name) |pointer| @intFromPtr(pointer) else 0, &stage_name)) return false;
+        if (!copyPipelineName(state, if (root.stage.name) |pointer| @intFromPtr(pointer) else 0, &stage_name)) return error.StageEntryPointUnreadable;
         root.stage.name = @ptrCast(&stage_name);
-        if (root.base_pipeline_handle != 0) root.base_pipeline_handle = self.real_vulkan.realPipeline(root.base_pipeline_handle) orelse return false;
+        var specialization: SpecializationScratch = .{};
+        if (root.stage.specialization_info) |pointer| {
+            root.stage.specialization_info = try marshalSpecializationInfo(state, @intFromPtr(pointer), &specialization);
+        }
+        if (root.base_pipeline_handle != 0) root.base_pipeline_handle = self.real_vulkan.realPipeline(root.base_pipeline_handle) orelse return error.UnknownBasePipeline;
         var real_pipeline: u64 = 0;
         const result = function(self.real_vulkan.device.?, real_cache, 1, @ptrCast(&root), null, @ptrCast(&real_pipeline));
         result_output.* = result;
         real_output.* = real_pipeline;
-        return true;
     }
 
     fn createMultipleVulkanObjects(self: *Forwarder, state: anytype, count: u64, output: u64, name: []const u8) u64 {
@@ -6981,10 +7564,11 @@ pub const Forwarder = struct {
                 const guest_info = state.regs.rcx + @as(u64, @intCast(index)) * info_size;
                 var real_pipeline: u64 = 0;
                 var result: i32 = 0;
+                var reason: []const u8 = "unknown";
                 const forwarded = if (std.mem.eql(u8, name, "vkCreateGraphicsPipelines"))
-                    self.createRealGraphicsPipeline(state, state.regs.rsi, guest_info, &real_pipeline, &result)
+                    self.createRealGraphicsPipeline(state, state.regs.rsi, guest_info, &real_pipeline, &result, &reason)
                 else
-                    self.createRealComputePipeline(state, state.regs.rsi, guest_info, &real_pipeline, &result);
+                    self.createRealComputePipeline(state, state.regs.rsi, guest_info, &real_pipeline, &result, &reason);
                 if (forwarded) {
                     self.noteRealVulkanResult(result, name);
                     if (result != abi.SUCCESS) return @as(u32, @bitCast(result));
@@ -7001,8 +7585,8 @@ pub const Forwarder = struct {
                     // silently discarded. Refuse the create instead so the
                     // guest sees the actual bridge limitation at this call.
                     machoCapturePrint(
-                        "macho-processor: REAL {s}: could not marshal pipeline index={d}; refusing synthetic fallback\n",
-                        .{ name, index },
+                        "macho-processor: REAL {s}: could not marshal pipeline index={d} ({s}); refusing synthetic fallback\n",
+                        .{ name, index, reason },
                     );
                     return vkErrorInitializationFailed();
                 }
@@ -7935,8 +8519,14 @@ fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
         std.mem.eql(u8, symbol, "vkGetImageMemoryRequirements2KHR")) return .get_memory_requirements2;
     if (std.mem.eql(u8, symbol, "vkGetBufferMemoryRequirements") or
         std.mem.eql(u8, symbol, "vkGetImageMemoryRequirements")) return .get_memory_requirements;
-    if (std.mem.eql(u8, symbol, "vkGetDeviceBufferMemoryRequirements")) return .get_device_buffer_memory_requirements;
-    if (std.mem.eql(u8, symbol, "vkGetDeviceImageMemoryRequirements")) return .get_device_image_memory_requirements;
+    // VK_KHR_maintenance4 was promoted in Vulkan 1.3.  A device negotiated at
+    // 1.2 loads the KHR-suffixed names, so classifying only the promoted
+    // spelling sends the guest's requirement queries down the unmodelled path,
+    // where they return zero and the guest sizes an allocation from it.
+    if (std.mem.eql(u8, symbol, "vkGetDeviceBufferMemoryRequirements") or
+        std.mem.eql(u8, symbol, "vkGetDeviceBufferMemoryRequirementsKHR")) return .get_device_buffer_memory_requirements;
+    if (std.mem.eql(u8, symbol, "vkGetDeviceImageMemoryRequirements") or
+        std.mem.eql(u8, symbol, "vkGetDeviceImageMemoryRequirementsKHR")) return .get_device_image_memory_requirements;
     if (std.mem.eql(u8, symbol, "vkCreatePipelineCache")) return .create_pipeline_cache;
     if (std.mem.eql(u8, symbol, "vkGetPipelineCacheData")) return .get_pipeline_cache_data;
     if (std.mem.eql(u8, symbol, "vkCreateDescriptorUpdateTemplate")) return .create_descriptor_update_template;
@@ -8002,6 +8592,16 @@ fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
         "vkFreeMemory",
     };
     for (destroy_objects) |name| if (std.mem.eql(u8, symbol, name)) return .destroy_device_object;
+    // VK_EXT_debug_utils is modelled, never forwarded.  Its create-info
+    // carries pfnUserCallback, a guest x86 function pointer: handing that to
+    // the host loader would have the driver call into translated code on a
+    // host thread.  The messenger is therefore a bridge-side no-op, and the
+    // guest is told so explicitly rather than through an unmodelled-proc
+    // return value that leaves its output handle untouched.
+    if (std.mem.eql(u8, symbol, "vkCreateDebugUtilsMessengerEXT")) return .create_debug_messenger;
+    if (std.mem.eql(u8, symbol, "vkDestroyDebugUtilsMessengerEXT")) return .destroy_debug_messenger;
+    if (std.mem.eql(u8, symbol, "vkSetDebugUtilsObjectNameEXT") or
+        std.mem.eql(u8, symbol, "vkSetDebugUtilsObjectTagEXT")) return .debug_utils_success;
     if (std.mem.eql(u8, symbol, "vkResetDescriptorPool")) return .reset_descriptor_pool;
     if (std.mem.eql(u8, symbol, "vkBindImageMemory")) return .bind_image_memory;
     if (std.mem.eql(u8, symbol, "vkBindBufferMemory")) return .bind_buffer_memory;
@@ -8019,25 +8619,60 @@ const extension_names = [_][]const u8{
     "VK_KHR_get_physical_device_properties2",
 };
 
-fn enumerateInstanceExtensionsSynthetic(state: anytype) u64 {
-    const count_address = state.regs.rsi;
-    if (state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
-    if (state.regs.rdx == 0) {
-        state.write32(count_address, extension_names.len);
-        return 0;
+/// The array half of every VkEnumerate*ExtensionProperties entry point.
+///
+/// `pPropertyCount` is an in/out parameter: null `pProperties` makes it a
+/// pure count query, and otherwise it carries the guest array's capacity in
+/// and the number of entries written out.  VK_INCOMPLETE is reserved for the
+/// case where the guest's array was genuinely too small for the list; a
+/// bridge-side limit that truncates a list the guest had room for is a bug,
+/// not a truncation the guest asked for.
+fn writeExtensionPropertiesArray(
+    state: anytype,
+    count_address: u64,
+    output_address: u64,
+    available: []const abi.ExtensionProperties,
+) u64 {
+    if (count_address == 0 or state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
+    const total: u32 = @intCast(available.len);
+    if (output_address == 0) {
+        state.write32(count_address, total);
+        return @as(u32, @bitCast(abi.SUCCESS));
     }
-    const requested = state.read32(count_address);
-    const written: u32 = @min(requested, extension_names.len);
-    const properties_size: u64 = 260;
-    const bytes = state.guestMemory(state.regs.rdx, @as(u64, written) * properties_size) orelse return vkErrorInitializationFailed();
-    @memset(bytes, 0);
-    for (extension_names[0..written], 0..) |name, index| {
-        const offset = index * @as(usize, @intCast(properties_size));
-        @memcpy(bytes[offset..][0..name.len], name);
-        std.mem.writeInt(u32, bytes[offset + 256 ..][0..4], 1, .little);
+    const capacity = state.read32(count_address);
+    const written: u32 = @min(capacity, total);
+    if (written != 0) {
+        const span = @as(u64, written) * @sizeOf(abi.ExtensionProperties);
+        const bytes = state.guestMemory(output_address, span) orelse return vkErrorInitializationFailed();
+        @memcpy(bytes[0..@intCast(span)], std.mem.sliceAsBytes(available[0..written]));
     }
     state.write32(count_address, written);
-    return if (written < extension_names.len) 5 else 0; // VK_INCOMPLETE / VK_SUCCESS
+    return @as(u32, @bitCast(if (written < total) abi.INCOMPLETE else abi.SUCCESS));
+}
+
+/// A non-null pLayerName asks for the extensions a specific layer adds.  The
+/// bridge enumerates no layers at all, so no layer name can be one the guest
+/// enabled, and the specification's answer for that is a hard error rather
+/// than an empty list — an empty list would claim the layer exists and simply
+/// contributes nothing.
+fn enumerateNoLayerExtensions(state: anytype, count_address: u64) u64 {
+    if (count_address != 0 and state.guestMemory(count_address, 4) != null) state.write32(count_address, 0);
+    return @as(u32, @bitCast(abi.ERROR_LAYER_NOT_PRESENT));
+}
+
+fn syntheticExtensionProperties(comptime names: []const []const u8) [names.len]abi.ExtensionProperties {
+    var table: [names.len]abi.ExtensionProperties = undefined;
+    for (names, 0..) |name, index| {
+        table[index] = .{ .extension_name = [_]u8{0} ** abi.MAX_EXTENSION_NAME_SIZE, .spec_version = 1 };
+        @memcpy(table[index].extension_name[0..name.len], name);
+    }
+    return table;
+}
+
+fn enumerateInstanceExtensionsSynthetic(state: anytype) u64 {
+    if (state.regs.rdi != 0) return enumerateNoLayerExtensions(state, state.regs.rsi);
+    const table = comptime syntheticExtensionProperties(&extension_names);
+    return writeExtensionPropertiesArray(state, state.regs.rsi, state.regs.rdx, &table);
 }
 
 fn enumerateEmpty(state: anytype, count_address: u64) u64 {
@@ -8059,23 +8694,9 @@ const device_extensions = [_][]const u8{
 };
 
 fn enumerateDeviceExtensions(state: anytype) u64 {
-    const count_address = state.regs.rdx;
-    if (state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
-    if (state.regs.rcx == 0) {
-        state.write32(count_address, device_extensions.len);
-        return 0;
-    }
-    const requested = state.read32(count_address);
-    const written: u32 = @min(requested, device_extensions.len);
-    const bytes = state.guestMemory(state.regs.rcx, @as(u64, written) * 260) orelse return vkErrorInitializationFailed();
-    @memset(bytes, 0);
-    for (device_extensions[0..written], 0..) |name, index| {
-        const offset = index * 260;
-        @memcpy(bytes[offset..][0..name.len], name);
-        std.mem.writeInt(u32, bytes[offset + 256 ..][0..4], 1, .little);
-    }
-    state.write32(count_address, written);
-    return if (written < device_extensions.len) 5 else 0;
+    if (state.regs.rsi != 0) return enumerateNoLayerExtensions(state, state.regs.rdx);
+    const table = comptime syntheticExtensionProperties(&device_extensions);
+    return writeExtensionPropertiesArray(state, state.regs.rdx, state.regs.rcx, &table);
 }
 
 fn writePhysicalDeviceFeatures(state: anytype, output: u64) void {
@@ -8259,7 +8880,7 @@ fn writePhysicalDeviceProperties(state: anytype, output: u64) void {
 fn writeMemoryProperties(state: anytype, output: u64) void {
     const bytes = state.guestMemory(output, 520) orelse return;
     @memset(bytes, 0);
-    std.mem.writeInt(u32, bytes[0..4], 1, .little);
+    std.mem.writeInt(u32, bytes[0..4], MODELLED_MEMORY_TYPE_COUNT, .little);
     std.mem.writeInt(u32, bytes[4..8], 0x0000_000F, .little); // device-local, visible, coherent, cached
     std.mem.writeInt(u32, bytes[8..12], 0, .little);
     std.mem.writeInt(u32, bytes[260..264], 1, .little);
@@ -8503,6 +9124,38 @@ fn presentDiagnosticMetalFrame(
     );
 }
 
+/// Read the guest's VkApplicationInfo scalars, or null when the structure is
+/// absent or not readable.
+///
+/// VkApplicationInfo has pointer fields at 16 and 32, so applicationVersion
+/// sits at 24 with four bytes of padding after it; engineVersion and
+/// apiVersion are then adjacent at 40 and 44, and the structure closes at 48
+/// with no tail padding.  Reading apiVersion at 28 folds in half of the
+/// engine-name pointer, and reading it at 48 lands past the end of the
+/// structure altogether.  Both mistakes are silent: the guest simply appears
+/// to have asked for Vulkan 1.0, and MoltenVK then reports a 1.0 physical
+/// device, which strips the guest of every core 1.1/1.2 entry point it was
+/// about to negotiate for.  The offsets come from the ABI declaration so the
+/// layout is asserted once at compile time rather than restated here.
+fn readGuestApplicationInfo(state: anytype, app_info_addr: u64) ?abi.ApplicationInfo {
+    if (app_info_addr == 0) return null;
+    if (state.guestMemoryConst(app_info_addr, @sizeOf(abi.ApplicationInfo)) == null) return null;
+    var app_info: abi.ApplicationInfo = .{};
+    app_info.application_version = state.read32(app_info_addr + @offsetOf(abi.ApplicationInfo, "application_version"));
+    app_info.engine_version = state.read32(app_info_addr + @offsetOf(abi.ApplicationInfo, "engine_version"));
+    app_info.api_version = state.read32(app_info_addr + @offsetOf(abi.ApplicationInfo, "api_version"));
+    // The name pointers and the pNext chain are guest addresses; the host
+    // loader must never see them.
+    app_info.application_name = null;
+    app_info.engine_name = null;
+    app_info.p_next = null;
+    // The synthetic loader advertises Vulkan 1.2.  Do not ask a MoltenVK
+    // loader for a newer core version simply because the guest's x86 headers
+    // were built against one.
+    if (app_info.api_version != 0) app_info.api_version = @min(app_info.api_version, abi.makeApiVersion(1, 2, 0));
+    return app_info;
+}
+
 fn vkErrorInitializationFailed() u64 {
     return @as(u32, @bitCast(@as(i32, -3)));
 }
@@ -8542,11 +9195,15 @@ test "Vulkan guest symbol classification covers surface bootstrap" {
     try std.testing.expectEqual(GuestSymbolKind.command, guestSymbolKind("vkCmdDrawIndexed"));
     try std.testing.expectEqual(GuestSymbolKind.update_descriptor_sets, guestSymbolKind("vkUpdateDescriptorSets"));
     try std.testing.expectEqual(GuestSymbolKind.update_descriptor_set_with_template, guestSymbolKind("vkUpdateDescriptorSetWithTemplate"));
-    try std.testing.expectEqual(GuestSymbolKind.device_success, guestSymbolKind("vkWaitForFences"));
+    try std.testing.expectEqual(GuestSymbolKind.wait_for_fences, guestSymbolKind("vkWaitForFences"));
     try std.testing.expectEqual(GuestSymbolKind.create_graphics_pipelines, guestSymbolKind("vkCreateGraphicsPipelines"));
     try std.testing.expectEqual(GuestSymbolKind.create_graphics_pipelines, guestSymbolKind("vkCreateComputePipelines"));
     try std.testing.expectEqual(GuestSymbolKind.allocate_command_buffers, guestSymbolKind("vkAllocateCommandBuffers"));
     try std.testing.expectEqual(GuestSymbolKind.destroy_device_object, guestSymbolKind("vkDestroyShaderModule"));
+    try std.testing.expectEqual(GuestSymbolKind.create_debug_messenger, guestSymbolKind("vkCreateDebugUtilsMessengerEXT"));
+    try std.testing.expectEqual(GuestSymbolKind.destroy_debug_messenger, guestSymbolKind("vkDestroyDebugUtilsMessengerEXT"));
+    try std.testing.expectEqual(GuestSymbolKind.debug_utils_success, guestSymbolKind("vkSetDebugUtilsObjectNameEXT"));
+    try std.testing.expectEqual(GuestSymbolKind.debug_utils_success, guestSymbolKind("vkSetDebugUtilsObjectTagEXT"));
 }
 
 test "Vulkan physical device properties model follows x64 C ABI alignment" {
@@ -8581,7 +9238,7 @@ test "native Vulkan device handles are published to guest output memory" {
 }
 
 test "Vulkan physical device enumeration exposes native handles when available" {
-    const native = physicalDeviceGuestHandle(@as(?abi.PhysicalDevice, @ptrFromInt(0x1234)));
+    const native = physicalDeviceGuestHandle(@as(abi.PhysicalDevice, @ptrFromInt(0x1234)));
     try std.testing.expectEqual(@as(u64, 0x1234), native.value);
     try std.testing.expect(!native.register_opaque);
 
@@ -8659,6 +9316,9 @@ const TestState = struct {
     monotonic_nanoseconds: u64 = 0,
     last_opaque_handle: u64 = 0,
     last_opaque_owner: []const u8 = "",
+    last_synthetic_thunk: u64 = 0,
+    last_synthetic_thunk_size: u64 = 0,
+    last_synthetic_thunk_owner: []const u8 = "",
     heap_next: u64 = 1024,
 
     pub fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
@@ -8669,6 +9329,14 @@ const TestState = struct {
     fn guestMemoryConst(self: *@This(), address: u64, length: u64) ?[]const u8 {
         if (address + length > self.mem.len) return null;
         return self.mem[@intCast(address)..@intCast(address + length)];
+    }
+
+    fn guestCString(self: *@This(), address: u64, maximum: usize) ?[]const u8 {
+        if (address >= self.mem.len) return null;
+        const start: usize = @intCast(address);
+        const available = self.mem[start..@min(self.mem.len, start + maximum)];
+        const length = std.mem.indexOfScalar(u8, available, 0) orelse return null;
+        return available[0..length];
     }
 
     fn read32(self: *@This(), address: u64) u32 {
@@ -8706,6 +9374,12 @@ const TestState = struct {
         self.last_opaque_owner = owner;
     }
 
+    pub fn registerSyntheticThunk(self: *@This(), address: u64, size: u64, owner: []const u8) void {
+        self.last_synthetic_thunk = address;
+        self.last_synthetic_thunk_size = size;
+        self.last_synthetic_thunk_owner = owner;
+    }
+
     pub fn nativeWindowWidth(_: *@This()) u32 {
         return 1280;
     }
@@ -8736,7 +9410,7 @@ test "Vulkan surface capabilities preserve native drawable extent and ABI layout
 test "modeled Vulkan objects register opaque pointer provenance" {
     var forwarder = Forwarder{};
     var state = TestState{};
-    try std.testing.expectEqual(@as(u64, 0), forwarder.createVulkanObject(&state, 8, "vkCreateBuffer"));
+    try std.testing.expectEqual(@as(u64, 0), forwarder.createVulkanObject(&state, 0, 8, "vkCreateBuffer"));
     try std.testing.expectEqual(state.read64(8), state.last_opaque_handle);
     try std.testing.expectEqualStrings("vkCreateBuffer", state.last_opaque_owner);
 }
@@ -8790,7 +9464,11 @@ test "modeled Vulkan memory uses allocationSize and reuses one mapping" {
     var state = TestState{};
     const allocate_info: u64 = 16;
     const allocate_output: u64 = 64;
-    state.write64(allocate_info + 8, 0x7FFF_FFFF); // pNext, never a size.
+    // VkMemoryAllocateInfo is {sType, padding, pNext, allocationSize,
+    // memoryTypeIndex}: allocationSize lives at +16, and a model that reads
+    // +8 gets pNext instead. Leave pNext null here so the size is the only
+    // thing under test.
+    state.write64(allocate_info + 8, 0);
     state.write64(allocate_info + 16, 4096);
 
     try std.testing.expectEqual(
@@ -8827,6 +9505,36 @@ test "modeled Vulkan memory uses allocationSize and reuses one mapping" {
     try std.testing.expectEqual(first_mapping + 256, state.read64(second_output));
     try std.testing.expectEqual(heap_after_first_map, state.heap_next);
     try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_memory_map_reuses);
+}
+
+test "modeled Vulkan memory refuses an allocate chain it cannot translate" {
+    var forwarder = Forwarder{};
+    var state = TestState{};
+    const allocate_info: u64 = 16;
+    const allocate_output: u64 = 64;
+    const chain: u64 = 512;
+    state.write64(allocate_info + 16, 4096);
+    state.write64(allocate_info + 8, chain);
+
+    // An unrecognised pNext node carries guest pointers and guest handles the
+    // bridge has no translation for. Refusing is the only honest answer;
+    // forwarding it would have the driver dereference a guest address.
+    state.write32(chain, 0xDEAD);
+    try std.testing.expectEqual(
+        @as(u64, @as(u32, @bitCast(abi.ERROR_FEATURE_NOT_PRESENT))),
+        forwarder.allocateVulkanMemory(&state, allocate_info, allocate_output),
+    );
+
+    // A dedicated-allocation node naming a resource the bridge never issued
+    // is equally untranslatable.
+    state.write32(chain, abi.STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    state.write64(chain + 8, 0);
+    state.write64(chain + 16, 0xFFFF_F500_0000_0001);
+    state.write64(chain + 24, 0);
+    try std.testing.expectEqual(
+        vkErrorInitializationFailed(),
+        forwarder.allocateVulkanMemory(&state, allocate_info, allocate_output),
+    );
 }
 
 test "mapped guest shadow is uploaded before native submission" {
@@ -9029,4 +9737,401 @@ test "Vulkan guest library remains virtual until native surface binding" {
     const proc = forwarder.lookupGuest(token, "vkGetInstanceProcAddr");
     try std.testing.expect(proc >= GUEST_SYMBOL_THUNK_BASE);
     try std.testing.expectEqual(@as(c_int, 0), forwarder.closeGuest(token));
+}
+
+/// A guest memory window wide enough for a full driver extension list. The
+/// shared TestState is deliberately small; the point of this one is that the
+/// list under test is larger than any window the bridge used to have.
+const WideGuestMemory = struct {
+    mem: []u8,
+    regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+
+    fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
+        if (address + length > self.mem.len) return null;
+        return self.mem[@intCast(address)..@intCast(address + length)];
+    }
+
+    fn guestMemoryConst(self: *@This(), address: u64, length: u64) ?[]const u8 {
+        return self.guestMemory(address, length);
+    }
+
+    fn read32(self: *@This(), address: u64) u32 {
+        return std.mem.readInt(u32, self.mem[@intCast(address)..][0..4], .little);
+    }
+
+    fn write32(self: *@This(), address: u64, value: u32) void {
+        std.mem.writeInt(u32, self.mem[@intCast(address)..][0..4], value, .little);
+    }
+};
+
+fn testExtensionProperty(name: []const u8, spec_version: u32) abi.ExtensionProperties {
+    var property: abi.ExtensionProperties = .{
+        .extension_name = [_]u8{0} ** abi.MAX_EXTENSION_NAME_SIZE,
+        .spec_version = spec_version,
+    };
+    @memcpy(property.extension_name[0..name.len], name);
+    return property;
+}
+
+test "extension enumeration reports VK_SUCCESS whenever the guest array held the whole list" {
+    // A MoltenVK-sized list: the driver on an Apple GPU reports well over a
+    // hundred device extensions, and the guest allocates for exactly that
+    // count before the second call.
+    const total = 131;
+    var available: [total]abi.ExtensionProperties = undefined;
+    for (&available, 0..) |*property, index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "VK_TEST_extension_{d}", .{index}) catch unreachable;
+        property.* = testExtensionProperty(name, @intCast(index + 1));
+    }
+
+    const count_address: u64 = 8;
+    const array_address: u64 = 64;
+    const span = array_address + total * @sizeOf(abi.ExtensionProperties);
+    const memory = try std.testing.allocator.alloc(u8, @intCast(span));
+    defer std.testing.allocator.free(memory);
+    @memset(memory, 0);
+    var state = WideGuestMemory{ .mem = memory };
+
+    // Probe call: null pProperties asks only for the count.
+    try std.testing.expectEqual(@as(u64, 0), writeExtensionPropertiesArray(&state, count_address, 0, &available));
+    try std.testing.expectEqual(@as(u32, total), state.read32(count_address));
+
+    // Fill call sized from that count. The guest had room for everything, so
+    // the answer is VK_SUCCESS — a bridge-side window that truncated here is
+    // read by the guest as an unusable adapter, not as a partial answer.
+    try std.testing.expectEqual(@as(u64, 0), writeExtensionPropertiesArray(&state, count_address, array_address, &available));
+    try std.testing.expectEqual(@as(u32, total), state.read32(count_address));
+    const first = @as(usize, @intCast(array_address));
+    const last = first + (total - 1) * @sizeOf(abi.ExtensionProperties);
+    try std.testing.expectEqualStrings("VK_TEST_extension_0", std.mem.sliceTo(memory[first..][0..abi.MAX_EXTENSION_NAME_SIZE], 0));
+    try std.testing.expectEqualStrings("VK_TEST_extension_130", std.mem.sliceTo(memory[last..][0..abi.MAX_EXTENSION_NAME_SIZE], 0));
+    try std.testing.expectEqual(@as(u32, total), std.mem.readInt(u32, memory[last + abi.MAX_EXTENSION_NAME_SIZE ..][0..4], .little));
+}
+
+test "extension enumeration reports VK_INCOMPLETE only for a short guest array" {
+    const available = [_]abi.ExtensionProperties{
+        testExtensionProperty("VK_KHR_swapchain", 70),
+        testExtensionProperty("VK_KHR_portability_subset", 1),
+        testExtensionProperty("VK_KHR_maintenance1", 2),
+    };
+    var state = TestState{};
+    const count_address: u64 = 8;
+    const array_address: u64 = 64;
+
+    state.write32(count_address, 2);
+    try std.testing.expectEqual(
+        @as(u64, @as(u32, @bitCast(abi.INCOMPLETE))),
+        writeExtensionPropertiesArray(&state, count_address, array_address, &available),
+    );
+    try std.testing.expectEqual(@as(u32, 2), state.read32(count_address));
+    try std.testing.expectEqualStrings("VK_KHR_swapchain", std.mem.sliceTo(state.mem[64..320], 0));
+    try std.testing.expectEqualStrings("VK_KHR_portability_subset", std.mem.sliceTo(state.mem[324..580], 0));
+    // The third entry was never written.
+    try std.testing.expectEqual(@as(u8, 0), state.mem[584]);
+
+    // A zero-capacity array is still a short array, not a count query.
+    state.write32(count_address, 0);
+    try std.testing.expectEqual(
+        @as(u64, @as(u32, @bitCast(abi.INCOMPLETE))),
+        writeExtensionPropertiesArray(&state, count_address, array_address, &available),
+    );
+    try std.testing.expectEqual(@as(u32, 0), state.read32(count_address));
+
+    // An unmapped count pointer is a hard failure, never a silent zero.
+    try std.testing.expectEqual(
+        vkErrorInitializationFailed(),
+        writeExtensionPropertiesArray(&state, state.mem.len + 8, 0, &available),
+    );
+}
+
+test "modeled device extension enumeration answers the guest's two-call protocol" {
+    var state = TestState{};
+    const count_address: u64 = 8;
+    const array_address: u64 = 64;
+
+    state.regs.rsi = 0;
+    state.regs.rdx = count_address;
+    state.regs.rcx = 0;
+    try std.testing.expectEqual(@as(u64, 0), enumerateDeviceExtensions(&state));
+    try std.testing.expectEqual(@as(u32, device_extensions.len), state.read32(count_address));
+
+    state.regs.rcx = array_address;
+    try std.testing.expectEqual(@as(u64, 0), enumerateDeviceExtensions(&state));
+    try std.testing.expectEqual(@as(u32, device_extensions.len), state.read32(count_address));
+    for (device_extensions, 0..) |name, index| {
+        const offset = @as(usize, @intCast(array_address)) + index * @sizeOf(abi.ExtensionProperties);
+        try std.testing.expectEqualStrings(name, std.mem.sliceTo(state.mem[offset..][0..256], 0));
+        try std.testing.expectEqual(@as(u32, 1), state.read32(@intCast(offset + 256)));
+    }
+}
+
+test "extension enumeration refuses a layer the bridge never enumerated" {
+    var state = TestState{};
+    const count_address: u64 = 8;
+    @memcpy(state.mem[1024..][0.."VK_LAYER_KHRONOS_validation".len], "VK_LAYER_KHRONOS_validation");
+
+    // The bridge enumerates no layers, so naming one cannot resolve. Reporting
+    // an empty list instead would claim the layer exists and simply adds
+    // nothing.
+    state.regs.rsi = 1024;
+    state.regs.rdx = count_address;
+    state.regs.rcx = 64;
+    state.write32(count_address, 4);
+    try std.testing.expectEqual(
+        @as(u64, @as(u32, @bitCast(abi.ERROR_LAYER_NOT_PRESENT))),
+        enumerateDeviceExtensions(&state),
+    );
+    try std.testing.expectEqual(@as(u32, 0), state.read32(count_address));
+
+    state.regs.rdi = 1024;
+    state.regs.rsi = count_address;
+    state.regs.rdx = 64;
+    state.write32(count_address, 4);
+    try std.testing.expectEqual(
+        @as(u64, @as(u32, @bitCast(abi.ERROR_LAYER_NOT_PRESENT))),
+        enumerateInstanceExtensionsSynthetic(&state),
+    );
+    try std.testing.expectEqual(@as(u32, 0), state.read32(count_address));
+}
+
+test "modeled instance extension enumeration matches the advertised list" {
+    var state = TestState{};
+    const count_address: u64 = 8;
+    state.regs.rdi = 0;
+    state.regs.rsi = count_address;
+    state.regs.rdx = 0;
+    try std.testing.expectEqual(@as(u64, 0), enumerateInstanceExtensionsSynthetic(&state));
+    try std.testing.expectEqual(@as(u32, extension_names.len), state.read32(count_address));
+
+    state.regs.rdx = 64;
+    try std.testing.expectEqual(@as(u64, 0), enumerateInstanceExtensionsSynthetic(&state));
+    try std.testing.expectEqual(@as(u32, extension_names.len), state.read32(count_address));
+    for (extension_names, 0..) |name, index| {
+        const offset = 64 + index * @sizeOf(abi.ExtensionProperties);
+        try std.testing.expectEqualStrings(name, std.mem.sliceTo(state.mem[offset..][0..256], 0));
+    }
+}
+
+test "guest VkApplicationInfo is read at the ABI's own field offsets" {
+    var state = TestState{};
+    const app_info_address: u64 = 64;
+    // Lay out a guest VkApplicationInfo by hand: sType, pNext,
+    // pApplicationName, applicationVersion, pEngineName, engineVersion,
+    // apiVersion.
+    state.write32(app_info_address, abi.STRUCTURE_TYPE_APPLICATION_INFO);
+    state.write64(app_info_address + 8, 0x1111_2222);
+    state.write64(app_info_address + 16, 0x3333_4444);
+    state.write32(app_info_address + 24, 7);
+    state.write64(app_info_address + 32, 0x5555_6666);
+    state.write32(app_info_address + 40, 9);
+    state.write32(app_info_address + 44, abi.makeApiVersion(1, 3, 0));
+    // Whatever follows the structure must not be mistaken for apiVersion.
+    state.write32(app_info_address + 48, 0xDEAD_BEEF);
+
+    const app_info = readGuestApplicationInfo(&state, app_info_address) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 7), app_info.application_version);
+    try std.testing.expectEqual(@as(u32, 9), app_info.engine_version);
+    // Clamped to the version the synthetic loader advertises, and emphatically
+    // not zero: a zero here makes the host loader build a Vulkan 1.0 instance,
+    // and MoltenVK then reports a 1.0 physical device.
+    try std.testing.expectEqual(abi.makeApiVersion(1, 2, 0), app_info.api_version);
+    try std.testing.expect(app_info.p_next == null);
+    try std.testing.expect(app_info.application_name == null);
+    try std.testing.expect(app_info.engine_name == null);
+
+    // A guest that genuinely asks for 1.0 keeps 1.0, and a missing or
+    // unreadable structure is reported as absent rather than as version zero.
+    state.write32(app_info_address + 44, abi.makeApiVersion(1, 0, 0));
+    const clamped = readGuestApplicationInfo(&state, app_info_address) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(abi.makeApiVersion(1, 0, 0), clamped.api_version);
+    try std.testing.expect(readGuestApplicationInfo(&state, 0) == null);
+    try std.testing.expect(readGuestApplicationInfo(&state, state.mem.len - 8) == null);
+}
+
+test "debug utils messenger is modeled and publishes a handle the guest can destroy" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    var state = TestState{};
+    const library = forwarder.openGuest("/tmp/libvulkan.1.dylib", RTLD_LAZY | RTLD_LOCAL);
+    const create = forwarder.lookupGuest(library, "vkCreateDebugUtilsMessengerEXT");
+    const destroy = forwarder.lookupGuest(library, "vkDestroyDebugUtilsMessengerEXT");
+    const set_name = forwarder.lookupGuest(library, "vkSetDebugUtilsObjectNameEXT");
+    try std.testing.expect(create != 0 and destroy != 0 and set_name != 0);
+
+    // vkCreateDebugUtilsMessengerEXT(instance, pCreateInfo, pAllocator,
+    // pMessenger): the guest's output handle is rcx. Returning VK_SUCCESS
+    // without writing it leaves the guest holding uninitialised memory that it
+    // will hand back at instance teardown.
+    state.regs.rdi = 0x1000;
+    state.regs.rsi = 0x2000;
+    state.regs.rdx = 0;
+    state.regs.rcx = 128;
+    state.write64(128, 0xA5A5_A5A5_A5A5_A5A5);
+    try std.testing.expect(forwarder.dispatchGuestSymbol(&state, create));
+    try std.testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try std.testing.expectEqual(SYNTHETIC_DEBUG_MESSENGER_HANDLE, state.read64(128));
+    try std.testing.expectEqual(SYNTHETIC_DEBUG_MESSENGER_HANDLE, forwarder.debug_messenger_handle);
+
+    state.regs.rdi = 0x1000;
+    state.regs.rsi = SYNTHETIC_DEBUG_MESSENGER_HANDLE;
+    try std.testing.expect(forwarder.dispatchGuestSymbol(&state, destroy));
+    try std.testing.expectEqual(@as(u64, 0), state.regs.rax);
+    try std.testing.expectEqual(@as(u64, 0), forwarder.debug_messenger_handle);
+
+    try std.testing.expect(forwarder.dispatchGuestSymbol(&state, set_name));
+    try std.testing.expectEqual(@as(u64, 0), state.regs.rax);
+
+    // An unwritable output pointer is a failure, not a silent success.
+    state.regs.rcx = 0;
+    try std.testing.expect(forwarder.dispatchGuestSymbol(&state, create));
+    try std.testing.expectEqual(vkErrorInitializationFailed(), state.regs.rax);
+}
+
+test "guest Vulkan create-info offsets match the ABI the bridge reads through" {
+    // ensureRealInstance and ensureRealDevice read these fields out of guest
+    // memory by offset. The layer arrays sit between the queue arrays and the
+    // extension arrays, so reading the extension count one field early lands
+    // on enabledLayerCount — always zero — and forwards neither the guest's
+    // extensions nor, one field further on, its features.
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(abi.DeviceCreateInfo, "enabled_extension_count"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(abi.DeviceCreateInfo, "enabled_extension_names"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(abi.DeviceCreateInfo, "enabled_features"));
+    try std.testing.expectEqual(@as(usize, 20), @offsetOf(abi.DeviceCreateInfo, "queue_create_info_count"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(abi.DeviceCreateInfo, "queue_create_infos"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(abi.InstanceCreateInfo, "application_info"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(abi.InstanceCreateInfo, "enabled_extension_count"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(abi.InstanceCreateInfo, "enabled_extension_names"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(abi.ApplicationInfo, "api_version"));
+}
+
+test "a dynamic viewport array is absent, not unmarshalable" {
+    var state = TestState{};
+    var viewports: [16]abi.Viewport = undefined;
+
+    // VK_DYNAMIC_STATE_VIEWPORT: viewportCount is 1 and pViewports is null.
+    // Refusing this refuses every presenter pipeline ever written.
+    const absent = try Forwarder.marshalGuestArray(abi.Viewport, &state, null, 1, &viewports, error.ViewportsUnreadable);
+    try std.testing.expect(absent == null);
+
+    // A zero count with a live pointer is also nothing to copy.
+    const empty = try Forwarder.marshalGuestArray(abi.Viewport, &state, @ptrFromInt(64), 0, &viewports, error.ViewportsUnreadable);
+    try std.testing.expect(empty == null);
+
+    // A live pointer with a live count is copied into host storage.
+    const address: u64 = 64;
+    state.write32(address, @bitCast(@as(f32, 4)));
+    state.write32(address + 4, @bitCast(@as(f32, 8)));
+    state.write32(address + 8, @bitCast(@as(f32, 1280)));
+    state.write32(address + 12, @bitCast(@as(f32, 720)));
+    const copied = try Forwarder.marshalGuestArray(abi.Viewport, &state, @ptrFromInt(address), 1, &viewports, error.ViewportsUnreadable);
+    try std.testing.expect(copied != null);
+    try std.testing.expectEqual(@as(f32, 1280), viewports[0].width);
+    try std.testing.expectEqual(@as(f32, 720), viewports[0].height);
+
+    // A pointer the guest cannot actually back is still a refusal, and it
+    // names itself.
+    try std.testing.expectError(
+        error.ViewportsUnreadable,
+        Forwarder.marshalGuestArray(abi.Viewport, &state, @ptrFromInt(state.mem.len - 4), 1, &viewports, error.ViewportsUnreadable),
+    );
+}
+
+test "specialization constants are copied out of guest memory before a stage is forwarded" {
+    var state = TestState{};
+    const info_address: u64 = 64;
+    const entries_address: u64 = 256;
+    const data_address: u64 = 512;
+
+    // VkSpecializationMapEntry { constantID, offset, size }, then the blob.
+    state.write32(entries_address, 7);
+    state.write32(entries_address + 4, 0);
+    state.write64(entries_address + 8, 4);
+    state.write32(data_address, 0xABCD1234);
+
+    state.write32(info_address, 1);
+    state.write64(info_address + 8, entries_address);
+    state.write64(info_address + 16, 4);
+    state.write64(info_address + 24, data_address);
+
+    var scratch: Forwarder.SpecializationScratch = .{};
+    const marshalled = try Forwarder.marshalSpecializationInfo(&state, info_address, &scratch);
+    try std.testing.expectEqual(@as(u32, 1), marshalled.map_entry_count);
+    try std.testing.expectEqual(@as(u32, 7), scratch.entries[0].constant_id);
+    try std.testing.expectEqual(@as(usize, 4), scratch.entries[0].size);
+    try std.testing.expectEqual(@as(usize, 4), marshalled.data_size);
+    // Both pointers must now be host-owned: the guest addresses they arrived
+    // as are meaningless to the driver.
+    try std.testing.expectEqual(@intFromPtr(&scratch.entries), @intFromPtr(marshalled.map_entries.?));
+    try std.testing.expectEqual(@intFromPtr(&scratch.data), @intFromPtr(marshalled.data.?));
+    try std.testing.expectEqual(@as(u32, 0xABCD1234), std.mem.readInt(u32, scratch.data[0..4], .little));
+
+    // A map larger than the bridge's storage is refused by name rather than
+    // silently truncated into a wrong pipeline.
+    state.write32(info_address, 64);
+    try std.testing.expectError(
+        error.SpecializationMapOutOfRange,
+        Forwarder.marshalSpecializationInfo(&state, info_address, &scratch),
+    );
+    state.write32(info_address, 1);
+    state.write64(info_address + 16, 4096);
+    try std.testing.expectError(
+        error.SpecializationDataOutOfRange,
+        Forwarder.marshalSpecializationInfo(&state, info_address, &scratch),
+    );
+}
+
+test "bridge capability table describes structures the ABI actually declares" {
+    // Each entry is written into a fixed-size scratch node and handed to the
+    // driver, so a size that disagrees with the declared structure would have
+    // the driver read past what was initialised.
+    for (bridge_device_capabilities) |capability| {
+        try std.testing.expect(capability.extension.len != 0);
+        try std.testing.expect(capability.provides.len != 0);
+        if (capability.feature_s_type == 0) {
+            try std.testing.expectEqual(@as(u16, 0), capability.feature_size);
+            continue;
+        }
+        // 16 bytes of sType/pNext header plus at least one VkBool32.
+        try std.testing.expect(capability.feature_size >= 24);
+        try std.testing.expect(capability.feature_size <= feature_chain_node_bytes);
+        try std.testing.expectEqual(@as(u16, 0), capability.feature_size % 8);
+    }
+    // The four the bridge negotiates on a MoltenVK host, by declared size.
+    try std.testing.expectEqual(@as(u16, 24), @sizeOf(abi.PhysicalDeviceSynchronization2Features));
+    try std.testing.expectEqual(@as(u16, 24), @sizeOf(abi.PhysicalDeviceDynamicRenderingFeatures));
+    try std.testing.expectEqual(@as(u16, 24), @sizeOf(abi.PhysicalDeviceExtendedDynamicStateFeaturesEXT));
+    try std.testing.expectEqual(@as(u16, 32), @sizeOf(abi.PhysicalDeviceExtendedDynamicState2FeaturesEXT));
+}
+
+test "the bridge capability chain links its nodes and then hands off to the guest's" {
+    var scratch: BridgeCapabilityScratch = .{};
+    scratch.count = 3;
+    for (0..3) |slot| scratch.order[slot] = @intCast(slot);
+    linkBridgeCapabilityChain(&scratch);
+
+    for (0..2) |slot| {
+        const size = bridge_device_capabilities[scratch.order[slot]].feature_size;
+        const next = std.mem.readInt(u64, scratch.nodes[slot][8..16], .little);
+        try std.testing.expectEqual(@intFromPtr(&scratch.nodes[slot + 1]), next);
+        try std.testing.expect(size >= 24);
+    }
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, scratch.nodes[2][8..16], .little));
+
+    // With no guest chain the bridge chain terminates; with one, the bridge
+    // tail points at it so both halves reach the driver.
+    const head = spliceBridgeCapabilityChain(&scratch, null);
+    try std.testing.expectEqual(@intFromPtr(&scratch.nodes[0]), @intFromPtr(head.?));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, scratch.nodes[2][8..16], .little));
+
+    var guest_node: [64]u8 align(8) = [_]u8{0} ** 64;
+    const spliced = spliceBridgeCapabilityChain(&scratch, @ptrCast(&guest_node));
+    try std.testing.expectEqual(@intFromPtr(&scratch.nodes[0]), @intFromPtr(spliced.?));
+    try std.testing.expectEqual(@intFromPtr(&guest_node), std.mem.readInt(u64, scratch.nodes[2][8..16], .little));
+
+    // An empty bridge chain must leave the guest's chain as the head rather
+    // than replacing it with an uninitialised node.
+    var empty: BridgeCapabilityScratch = .{};
+    try std.testing.expectEqual(@intFromPtr(&guest_node), @intFromPtr(spliceBridgeCapabilityChain(&empty, @ptrCast(&guest_node)).?));
+    try std.testing.expect(spliceBridgeCapabilityChain(&empty, null) == null);
 }

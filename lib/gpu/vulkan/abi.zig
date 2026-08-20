@@ -53,6 +53,7 @@ pub const ERROR_OUT_OF_DEVICE_MEMORY: Result = -2;
 pub const ERROR_INITIALIZATION_FAILED: Result = -3;
 pub const ERROR_DEVICE_LOST: Result = -4;
 pub const ERROR_MEMORY_MAP_FAILED: Result = -5;
+pub const ERROR_LAYER_NOT_PRESENT: Result = -6;
 pub const ERROR_EXTENSION_NOT_PRESENT: Result = -7;
 pub const ERROR_FEATURE_NOT_PRESENT: Result = -8;
 pub const ERROR_INCOMPATIBLE_DRIVER: Result = -9;
@@ -63,6 +64,11 @@ pub const SUBOPTIMAL_KHR: Result = 1_000_001_003;
 pub const ERROR_OUT_OF_DATE_KHR: Result = -1_000_001_004;
 
 pub const STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
+pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES: u32 = 1_000_044_003;
+pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES: u32 = 1_000_314_007;
+pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT: u32 = 1_000_267_000;
+pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT: u32 = 1_000_377_000;
+pub const STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT: u32 = 1_000_081_000;
 pub const STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
 pub const STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
 pub const STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
@@ -641,6 +647,61 @@ pub const PipelineCacheCreateInfo = extern struct {
     initial_data: ?*const anyopaque = null,
 };
 
+/// Feature structures for the device extensions Rosette enables on its own
+/// account so that the entry points it forwards through exist. Each is
+/// queried with vkGetPhysicalDeviceFeatures2 and then handed back unchanged to
+/// vkCreateDevice, so a member the driver reports unsupported stays off.
+pub const PhysicalDeviceSynchronization2Features = extern struct {
+    s_type: u32 = STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+    p_next: ?*const anyopaque = null,
+    synchronization2: u32 = 0,
+};
+
+pub const PhysicalDeviceDynamicRenderingFeatures = extern struct {
+    s_type: u32 = STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+    p_next: ?*const anyopaque = null,
+    dynamic_rendering: u32 = 0,
+};
+
+pub const PhysicalDeviceExtendedDynamicStateFeaturesEXT = extern struct {
+    s_type: u32 = STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+    p_next: ?*const anyopaque = null,
+    extended_dynamic_state: u32 = 0,
+};
+
+pub const PhysicalDeviceExtendedDynamicState2FeaturesEXT = extern struct {
+    s_type: u32 = STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
+    p_next: ?*const anyopaque = null,
+    extended_dynamic_state2: u32 = 0,
+    extended_dynamic_state2_logic_op: u32 = 0,
+    extended_dynamic_state2_patch_control_points: u32 = 0,
+};
+
+pub const PhysicalDeviceConditionalRenderingFeaturesEXT = extern struct {
+    s_type: u32 = STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+    p_next: ?*const anyopaque = null,
+    conditional_rendering: u32 = 0,
+    inherited_conditional_rendering: u32 = 0,
+};
+
+/// One specialization constant's location inside the blob a stage supplies.
+pub const SpecializationMapEntry = extern struct {
+    constant_id: u32 = 0,
+    offset: u32 = 0,
+    size: usize = 0,
+};
+
+/// Specialization constants are a guest-owned map plus a guest-owned data
+/// blob, so both have to be copied into host storage before a stage can be
+/// forwarded. Xenia uses them for the masked-sample transfer pipelines.
+pub const SpecializationInfo = extern struct {
+    map_entry_count: u32 = 0,
+    _padding: u32 = 0,
+    map_entries: ?[*]const SpecializationMapEntry = null,
+    data_size: usize = 0,
+    data: ?*const anyopaque = null,
+};
+
 pub const PipelineShaderStageCreateInfo = extern struct {
     s_type: u32 = 18,
     p_next: ?*const anyopaque = null,
@@ -648,7 +709,7 @@ pub const PipelineShaderStageCreateInfo = extern struct {
     stage: u32 = 0,
     module: u64 = null_handle,
     name: ?[*:0]const u8 = null,
-    specialization_info: ?*const anyopaque = null,
+    specialization_info: ?*const SpecializationInfo = null,
 };
 
 pub const VertexInputBindingDescription = extern struct {
@@ -1518,6 +1579,40 @@ comptime {
     std.debug.assert(@sizeOf(Offset3D) == 12);
     std.debug.assert(@sizeOf(MetalSurfaceCreateInfoEXT) == 32);
     std.debug.assert(@sizeOf(InstanceCreateInfo) == 64);
+    // VkApplicationInfo ends with three uint32 fields, but only two of them
+    // follow a pointer.  applicationVersion at 24 is padded up to the
+    // pEngineName pointer at 32; engineVersion at 40 and apiVersion at 44 are
+    // adjacent, so the struct closes at 48 with no tail padding.  Reading
+    // apiVersion at 48 lands outside the structure and silently yields a
+    // Vulkan 1.0 request.
+    std.debug.assert(@sizeOf(ApplicationInfo) == 48);
+    std.debug.assert(@offsetOf(ApplicationInfo, "application_version") == 24);
+    std.debug.assert(@offsetOf(ApplicationInfo, "engine_version") == 40);
+    std.debug.assert(@offsetOf(ApplicationInfo, "api_version") == 44);
+    // The layer arrays sit between the queue arrays and the extension arrays.
+    // Reading enabledExtensionCount at 32 lands on enabledLayerCount, which is
+    // zero in practice, so a wrong offset here forwards no extensions and no
+    // features while the guest believes it enabled both.
+    std.debug.assert(@sizeOf(DeviceCreateInfo) == 72);
+    std.debug.assert(@offsetOf(DeviceCreateInfo, "queue_create_info_count") == 20);
+    std.debug.assert(@offsetOf(DeviceCreateInfo, "queue_create_infos") == 24);
+    std.debug.assert(@offsetOf(DeviceCreateInfo, "enabled_extension_count") == 48);
+    std.debug.assert(@offsetOf(DeviceCreateInfo, "enabled_extension_names") == 56);
+    std.debug.assert(@offsetOf(DeviceCreateInfo, "enabled_features") == 64);
+    std.debug.assert(@offsetOf(InstanceCreateInfo, "application_info") == 24);
+    std.debug.assert(@offsetOf(InstanceCreateInfo, "enabled_extension_count") == 48);
+    std.debug.assert(@offsetOf(InstanceCreateInfo, "enabled_extension_names") == 56);
+    std.debug.assert(@sizeOf(SpecializationMapEntry) == 16);
+    std.debug.assert(@offsetOf(SpecializationMapEntry, "size") == 8);
+    std.debug.assert(@sizeOf(SpecializationInfo) == 32);
+    std.debug.assert(@offsetOf(SpecializationInfo, "map_entries") == 8);
+    std.debug.assert(@offsetOf(SpecializationInfo, "data_size") == 16);
+    std.debug.assert(@offsetOf(SpecializationInfo, "data") == 24);
+    std.debug.assert(@sizeOf(PhysicalDeviceSynchronization2Features) == 24);
+    std.debug.assert(@sizeOf(PhysicalDeviceDynamicRenderingFeatures) == 24);
+    std.debug.assert(@sizeOf(PhysicalDeviceExtendedDynamicStateFeaturesEXT) == 24);
+    std.debug.assert(@sizeOf(PhysicalDeviceExtendedDynamicState2FeaturesEXT) == 32);
+    std.debug.assert(@sizeOf(PhysicalDeviceConditionalRenderingFeaturesEXT) == 24);
     std.debug.assert(@sizeOf(Offset2D) == 8);
     std.debug.assert(@sizeOf(Rect2D) == 16);
     std.debug.assert(@sizeOf(Viewport) == 24);

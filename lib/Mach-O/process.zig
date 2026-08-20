@@ -102,6 +102,7 @@ const native_window = @import("process_core").native_window;
 const scheduling = @import("process_core").scheduling;
 const guest_log = @import("process_core").guest_log;
 const host_termination = @import("process_core").host_termination;
+const native_crash = @import("process_core").native_crash;
 const guest_fs = @import("guest_fs.zig");
 const proc_diag = @import("process_core").diagnostics;
 const thunk_handler = @import("macho_core").thunk_handler;
@@ -6768,6 +6769,18 @@ pub const MachOState = struct {
         if (self.startup.enabled) {
             self.startup.checkpoint(snapshot);
         } else {
+            // Feed the native crash handler: if the emulator's own host code
+            // faults a moment from now, the crash report says exactly where the
+            // guest was (step, rip, thread, symbol) rather than "the run was
+            // somewhere". The symbol is copied, not borrowed, because guest image
+            // memory is exactly what may have faulted.
+            native_crash.recordGuestProgress(
+                steps,
+                self.regs.rip,
+                self.active_guest_thread,
+                if (symbol) |resolved| resolved.name else "",
+            );
+
             const entry = &self.step_trace_entries[self.step_trace_index];
             entry.step = steps;
             entry.rip = self.regs.rip;
@@ -6785,6 +6798,12 @@ pub const MachOState = struct {
         // stopped, and the exit path never runs in that case.
         self.logGraphicsFrontier(false);
         const hb_symbol = self.metadata.nearestSymbol(self.regs.rip);
+        native_crash.recordGuestProgress(
+            steps,
+            self.regs.rip,
+            self.active_guest_thread,
+            if (hb_symbol) |resolved| resolved.name else "",
+        );
         const heartbeat_snapshot: startup_observer.Snapshot = .{
             .step = steps,
             .rip = self.regs.rip,
@@ -6935,6 +6954,7 @@ pub const MachOState = struct {
     }
 
     pub fn run(self: *MachOState) void {
+        native_crash.recordPhase("run");
         var steps: u64 = 0;
         // N5 (perf audit): replace the four per-instruction `steps % X`
         // modulo operations below with down-counters. Each counter decrements
@@ -7852,6 +7872,7 @@ const MachORunOptions = utils.MachORunOptions;
 const auditVexDecoder = utils.auditVexDecoder;
 
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
+    native_crash.recordPhase("load");
     var output = runtime_output.Controller.init(allocator);
     defer output.deinit();
     output.human("Loading Mach-O...\n", .{});
@@ -7876,6 +7897,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         const launch_line = std.fmt.bufPrint(&launch_buffer, "step=0 event=mach_o_launch path={s}\n", .{options.path}) catch "";
         _ = MachOState.hostWriteFdAll(state.summary_output_fd, launch_line);
     }
+    native_crash.recordPhase("logs-open");
     state.scheduler_log.open(allocator);
     state.pthreads.attachEventLog(&state.scheduler_log);
     state.jit_log.open(allocator);
@@ -8027,6 +8049,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     machoCapturePrint("ROSETTE: MachO state setup completed successfully\n", .{});
 
     state.startup.enter(.static_init, state.executed_steps);
+    native_crash.recordPhase("static_init");
     output.human("Initializing guest runtime...\n", .{});
     machoCapturePrint("macho-processor: running {d} pre-main initializer(s)\n", .{state.metadata.initializer_addresses.len});
     const initializers_ok = state.runInitializers();
@@ -8077,6 +8100,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     }
 
     state.startup.enter(.main_enter, state.executed_steps);
+    native_crash.recordPhase("main_enter");
     // R2 (N3 phase-arm): config parsing (cvar, toml patch files) completes
     // with the initializer phase. Deactivate the non-address patch-db probe so
     // the special-RIP gate drops its per-instruction state check; the fixed
@@ -8598,6 +8622,15 @@ test "cooperative idle diagnostics retain the oldest queued callback provenance"
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Install the native fault handler before anything else can fault: a
+    // crash in Rosette's own host code used to die with status 139 and no
+    // crash point, and the runtime log opens only inside loadAndRun. This
+    // handler writes a report (host regs, backtrace, last guest progress) to
+    // .rosette/rosette-crash.log and stderr, then re-raises so supervisors
+    // that key on the signal-compatible status keep working.
+    native_crash.install();
+    native_crash.recordPhase("main");
+
     const allocator = init.arena.allocator();
 
     if (environmentFlag("ROSETTE_MACHO_VERBOSE_STDOUT")) {

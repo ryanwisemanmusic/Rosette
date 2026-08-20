@@ -28,3 +28,24 @@ pub const smart_stub_generator = @import("smart_stub_generator.zig");
 pub const export_table_manager = @import("export_table_manager.zig");
 pub const export_table_lifecycle = @import("export_table_lifecycle.zig");
 pub const dynamic_export_registry = @import("dynamic_export_registry.zig");
+
+// Zig only discovers tests in files the compilation actually references, and
+// a `pub const x = @import("...")` alone is not a reference. Without this
+// block every test in this library compiled as somebody else's dependency and
+// then never ran — including the Vulkan loader bridge's, whose rules are
+// silent at runtime and only surface as a guest failure many calls later.
+test {
+    _ = event_log;
+    _ = pointer_firewall;
+    _ = memory_provenance;
+    _ = guest_memory_geometry;
+    _ = import_engine;
+    _ = abi_data_materializer;
+    _ = vtt_resolver;
+    _ = dynamic_library_forwarder;
+    _ = lazy_import_stub;
+    _ = smart_stub_generator;
+    _ = export_table_manager;
+    _ = export_table_lifecycle;
+    _ = dynamic_export_registry;
+}
