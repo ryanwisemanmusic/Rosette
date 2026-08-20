@@ -30,7 +30,7 @@ pub const PrimitiveDispatchCallbacks = struct {
 
     /// Call the matched handler with a slot and context pointer.
     /// Returns a u8 representing the result enum (0=handled, 1=handled_void,
-    /// 2=unsupported, 3=fallback).
+    /// 2=unsupported, 3=fallback, 4=control_transferred).
     callHandler: *const fn (ctx: *anyopaque, slot: u32, handler: *const anyopaque) u8,
 
     /// Read a guest register by ABI index (0=rdi, 1=rsi, 2=rdx, 3=rcx, 4=r8, 5=r9).
@@ -54,6 +54,7 @@ pub const PrimitiveLogCallbacks = struct {
 pub const PrimitiveOutcome = union(enum) {
     handled: u64,
     handled_void,
+    control_transferred,
     unhandled,
 };
 
@@ -110,6 +111,7 @@ pub const ImportHandler = struct {
             // like an unresolved primitive-library defect.
             2 => "declined_to_legacy",
             3 => "requested_legacy_fallback",
+            4 => "control_transferred",
             else => "unknown",
         };
 
@@ -130,6 +132,7 @@ pub const ImportHandler = struct {
             return switch (result_byte) {
                 0 => .{ .handled = cb.readResult(cb.ctx) },
                 1 => .handled_void,
+                4 => .control_transferred,
                 else => .unhandled,
             };
         if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
@@ -137,6 +140,7 @@ pub const ImportHandler = struct {
         return switch (result_byte) {
             0 => .{ .handled = cb.readResult(cb.ctx) },
             1 => .handled_void,
+            4 => .control_transferred,
             else => .unhandled,
         };
     }

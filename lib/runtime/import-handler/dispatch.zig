@@ -31,7 +31,6 @@ const log = std.log.scoped(.macho_import_dispatch);
 const ImportHandlerResult = types.ImportHandlerResult;
 const ImportRoute = types.ImportRoute;
 const ImportTraceEntry = types.ImportTraceEntry;
-const GuestAssertionClass = types.GuestAssertionClass;
 const classifyGuestAssertion = types.classifyGuestAssertion;
 const timerQueueStateName = types.timerQueueStateName;
 const idleQueueSnapshotFor = types.idleQueueSnapshotFor;
@@ -418,9 +417,16 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const return_address = if (self.guestMemoryConst(self.regs.rsp, 8) != null) self.read64(self.regs.rsp) else 0;
         const caller = if (return_address != 0) self.metadata.nearestSymbol(return_address) else null;
         const assertion_class = classifyGuestAssertion(function_name, expression);
-        self.last_guest_assertion_class = assertion_class;
-        self.last_guest_assertion_step = self.executed_steps;
-        self.last_guest_assertion_return = return_address;
+        // This is execution context, not a process-wide "last assertion".
+        // The scheduler snapshots it with the guest registers so a UD2 on a
+        // different thread cannot inherit this assertion's provenance.
+        self.last_guest_assertion = .{
+            .valid = true,
+            .class = assertion_class,
+            .step = self.executed_steps,
+            .return_address = return_address,
+            .thread = self.active_guest_thread,
+        };
         const backend_binding = x64_backend_diagnostics.Engine.classifyAssertion(file_name, self.regs.rdx, function_name);
         self.backend_diagnostics.noteAssertion(backend_binding, self.executed_steps, return_address);
         const assertion_symbol = if (caller) |symbol| return_address -| symbol.offset else return_address;
@@ -1089,6 +1095,9 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if (std.mem.eql(u8, name, "___cxa_begin_catch")) {
         const object_address = self.cxx_exceptions.beginCatch(self.regs.rdi);
         machoCapturePrint("macho-processor: __cxa_begin_catch object=0x{x}\n", .{object_address});
+        if (comptime @hasField(@TypeOf(self.*), "guest_exceptions")) {
+            self.guest_exceptions.noteCaught(self.executed_steps);
+        }
         return .{ .handled = object_address };
     }
     if (std.mem.eql(u8, name, "___cxa_end_catch")) {
@@ -1155,10 +1164,23 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 // the field directly avoids requiring a synthetic virtual
                 // `what()` call while the object is actively unwinding.
                 const error_code: i32 = @bitCast(self.read32(thrown.object_address + 8));
+                // The label errors are the ones that matter here and were the
+                // ones missing: code 11 is what a run reports when the emitter
+                // referenced a label it never bound, and it read as
+                // "unclassified" while being the most specific diagnosis
+                // available anywhere in the run.
                 const error_name: []const u8 = switch (error_code) {
+                    1 => "bad addressing",
+                    2 => "code is too big",
+                    3 => "bad scale",
+                    4 => "esp cannot be an index",
                     5 => "bad combination",
                     6 => "bad register size",
                     7 => "immediate is too big",
+                    8 => "bad align",
+                    9 => "label is redefined",
+                    10 => "label is too far",
+                    11 => "label is not found — the emitter referenced a label it never bound, so the function it was assembling cannot be finalized and is abandoned",
                     13 => "bad parameter",
                     17 => "memory size is not specified",
                     18 => "bad memory size",
@@ -1175,6 +1197,35 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             {
                 toml_parse_error = true;
             }
+        }
+        // Recorded here because this is the only place the type name, the
+        // emulator-specific error code and the throw site all exist at once.
+        // At the catch site the object is already being unwound and at the
+        // crash site none of it survives.
+        if (comptime @hasField(@TypeOf(self.*), "guest_exceptions")) {
+            var site_buffer: [96]u8 = undefined;
+            var site_text: []const u8 = "";
+            if (self.diagnosticSymbol(thrown.caller_address)) |throw_site| {
+                site_text = std.fmt.bufPrint(&site_buffer, "{s}+0x{x}", .{
+                    throw_site.symbol,
+                    throw_site.symbol_offset,
+                }) catch throw_site.symbol;
+            }
+            const reported_code: u32 = if (std.mem.eql(u8, exception_type_name, "N5Xbyak5ErrorE"))
+                self.read32(thrown.object_address + 8)
+            else
+                0;
+            const first_sight = self.guest_exceptions.noteThrow(
+                if (exception_type_name.len != 0) exception_type_name else "<unnamed>",
+                site_text,
+                reported_code,
+                0,
+                self.executed_steps,
+            );
+            if (first_sight) machoCapturePrint(
+                "macho-processor: GUEST EXCEPTION PREDICTOR: first_sight type={s} code={d} site={s} step={d}; a type thrown for the first time is a new behaviour. Whether it is a problem depends entirely on what happens after the catch, which the exception machinery cannot see\n",
+                .{ if (exception_type_name.len != 0) exception_type_name else "<unnamed>", reported_code, site_text, self.executed_steps },
+            );
         }
         if (self.metadata.nearestSymbol(thrown.type_info_address)) |symbol| {
             machoCapturePrint("macho-processor: C++ exception type: {s}+0x{x}\n", .{ symbol.name, symbol.offset });
@@ -1301,14 +1352,18 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
                 .{exception_header},
             );
         }
-        if (self.regs.rdi == 0 and self.last_guest_assertion_class == .breakpoint_untracked_thread) {
+        const signal_assertion = if (self.signal_frame_count != 0)
+            self.signal_frames[self.signal_frame_count - 1].assertion_context
+        else
+            self.last_guest_assertion;
+        if (self.regs.rdi == 0 and signal_assertion.class == .breakpoint_untracked_thread) {
             machoCapturePrint(
                 "macho-processor: breakpoint cleanup chain diagnosis: __Unwind_Resume received a null exception argument after Processor::OnThreadBreakpointHit asserted on an untracked modeled thread; no C++ throw object exists to resume, so exit 125 is secondary handler-cleanup termination\n",
                 .{},
             );
             machoCapturePrint(
                 "macho-processor: breakpoint cleanup chain origin: assertion_step={d} assertion_return=0x{x} active_thread=0x{x} signal_depth={d} deferred_threads={d} suspended_threads={d}\n",
-                .{ self.last_guest_assertion_step, self.last_guest_assertion_return, self.active_guest_thread, self.signal_frame_count, self.pthreads.deferred_threads, self.suspended_guest_thread_count },
+                .{ signal_assertion.step, signal_assertion.return_address, self.active_guest_thread, self.signal_frame_count, self.pthreads.deferred_threads, self.suspended_guest_thread_count },
             );
         }
         machoCapturePrint(
