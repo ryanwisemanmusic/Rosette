@@ -50,6 +50,19 @@ pub const Classification = struct {
 };
 
 pub fn classify(context: Context) Classification {
+    var result = classifyInner(context);
+    // The slot offset is a fact about the instruction, not about which class
+    // the fault fell into — `call [rax+0x30]` dispatched slot 0x30 whatever
+    // conclusion follows. Only the synthetic-vtable branches used to fill it
+    // in, so every other class reported `slot_offset=0x0` and a reader
+    // comparing it against the decoded instruction found them disagreeing.
+    if (result.virtual_slot_offset == 0) {
+        if (virtualSlotOffset(context)) |offset| result.virtual_slot_offset = offset;
+    }
+    return result;
+}
+
+fn classifyInner(context: Context) Classification {
     const slot_offset = virtualSlotOffset(context);
     const target_looks_ascii = looksLikeAsciiData(context.target_address);
     const synthetic_vtable_dispatch =
@@ -173,6 +186,29 @@ fn looksLikeAsciiData(value: u64) bool {
         printable += 1;
     }
     return printable >= 3;
+}
+
+// The offset is a fact about the instruction, not about the conclusion. The
+// observed crash decoded `call [rax+0x30]` and reported `slot_offset=0x0`,
+// because the class it landed in was not one of the two that filled the field.
+test "a slot offset survives every classification path" {
+    const context = Context{
+        .kind = "call_mem64",
+        .operand_address = 0x1b386da0,
+        .operand_mapped = true,
+        .target_address = 0x1b386f20,
+        .target_mapped = true,
+        .target_executable = false,
+        .object_address = 0x1b386c30,
+        .object_mapped = true,
+        .object_vptr = 0x1b386d70,
+    };
+    const result = classify(context);
+    try std.testing.expectEqual(@as(u64, 0x30), result.virtual_slot_offset);
+    // And an object with no vptr still reports nothing rather than a guess.
+    var without = context;
+    without.object_vptr = 0;
+    try std.testing.expectEqual(@as(u64, 0), classify(without).virtual_slot_offset);
 }
 
 test "synthetic streambuf slot containing a type name belongs to Rosette" {
