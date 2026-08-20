@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat_runtime = @import("macho_compat_runtime");
+const gpu = @import("gpu");
 const pointer_firewall = @import("pointer_firewall.zig");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
 
@@ -85,7 +86,17 @@ pub const ContractId = enum {
     libcxx_basic_ios_good,
     libcxx_basic_ios_fail,
     libcxx_basic_ios_eof,
+    xenia_vd_get_graphics_asic_id,
+    xenia_vd_get_system_command_buffer,
+    xenia_vd_initialize_engines,
+    xenia_vd_initialize_ring_buffer,
+    xenia_vd_persist_display,
+    xenia_vd_is_hsio_training_succeeded,
+    xenia_vd_enable_ring_buffer_rptr_writeback,
     xenia_vd_set_graphics_interrupt_callback,
+    xenia_vd_initialize_edram,
+    xenia_vd_retrain_edram,
+    xenia_vd_retrain_edram_worker,
 };
 
 pub const Contract = struct {
@@ -265,6 +276,86 @@ pub const xenia_vd_set_graphics_interrupt_callback = Contract{
     .effects = .{ .return_convention = .void, .writes_guest_memory = false },
 };
 
+pub const xenia_vd_get_graphics_asic_id = Contract{
+    .id = .xenia_vd_get_graphics_asic_id,
+    .canonical_symbol = "VdGetGraphicsAsicID",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .rax },
+};
+
+pub const xenia_vd_get_system_command_buffer = Contract{
+    .id = .xenia_vd_get_system_command_buffer,
+    .canonical_symbol = "VdGetSystemCommandBuffer",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void, .writes_guest_memory = true },
+};
+
+pub const xenia_vd_initialize_engines = Contract{
+    .id = .xenia_vd_initialize_engines,
+    .canonical_symbol = "VdInitializeEngines",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .rax, .writes_guest_memory = true },
+};
+
+pub const xenia_vd_initialize_ring_buffer = Contract{
+    .id = .xenia_vd_initialize_ring_buffer,
+    .canonical_symbol = "VdInitializeRingBuffer",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void },
+};
+
+pub const xenia_vd_persist_display = Contract{
+    .id = .xenia_vd_persist_display,
+    .canonical_symbol = "VdPersistDisplay",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .rax, .writes_guest_memory = true },
+};
+
+pub const xenia_vd_is_hsio_training_succeeded = Contract{
+    .id = .xenia_vd_is_hsio_training_succeeded,
+    .canonical_symbol = "VdIsHSIOTrainingSucceeded",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .rax },
+};
+
+pub const xenia_vd_enable_ring_buffer_rptr_writeback = Contract{
+    .id = .xenia_vd_enable_ring_buffer_rptr_writeback,
+    .canonical_symbol = "VdEnableRingBufferRPtrWriteBack",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .void },
+};
+
+pub const xenia_vd_initialize_edram = Contract{
+    .id = .xenia_vd_initialize_edram,
+    .canonical_symbol = "VdInitializeEDRAM",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .rax },
+};
+
+pub const xenia_vd_retrain_edram = Contract{
+    .id = .xenia_vd_retrain_edram,
+    .canonical_symbol = "VdRetrainEDRAM",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .rax },
+};
+
+pub const xenia_vd_retrain_edram_worker = Contract{
+    .id = .xenia_vd_retrain_edram_worker,
+    .canonical_symbol = "VdRetrainEDRAMWorker",
+    .domain = .graphics,
+    .confidence = .verified,
+    .effects = .{ .return_convention = .rax },
+};
+
 pub fn normalizeSymbol(symbol: []const u8) []const u8 {
     var normalized = symbol;
     if (normalized.len != 0 and normalized[0] == '_') normalized = normalized[1..];
@@ -349,9 +440,17 @@ pub fn contractFor(symbol: []const u8) ?Contract {
         if (std.mem.indexOf(u8, normalized, "4fail") != null) return basic_ios_fail;
         if (std.mem.indexOf(u8, normalized, "3eof") != null) return basic_ios_eof;
     }
-    if (std.mem.indexOf(u8, normalized, "VdSetGraphicsInterruptCallback") != null) {
-        return xenia_vd_set_graphics_interrupt_callback;
-    }
+    if (std.mem.indexOf(u8, normalized, "VdGetGraphicsAsicID") != null) return xenia_vd_get_graphics_asic_id;
+    if (std.mem.indexOf(u8, normalized, "VdGetSystemCommandBuffer") != null) return xenia_vd_get_system_command_buffer;
+    if (std.mem.indexOf(u8, normalized, "VdInitializeEngines") != null) return xenia_vd_initialize_engines;
+    if (std.mem.indexOf(u8, normalized, "VdInitializeRingBuffer") != null) return xenia_vd_initialize_ring_buffer;
+    if (std.mem.indexOf(u8, normalized, "VdPersistDisplay") != null) return xenia_vd_persist_display;
+    if (std.mem.indexOf(u8, normalized, "VdIsHSIOTrainingSucceeded") != null) return xenia_vd_is_hsio_training_succeeded;
+    if (std.mem.indexOf(u8, normalized, "VdEnableRingBufferRPtrWriteBack") != null) return xenia_vd_enable_ring_buffer_rptr_writeback;
+    if (std.mem.indexOf(u8, normalized, "VdSetGraphicsInterruptCallback") != null) return xenia_vd_set_graphics_interrupt_callback;
+    if (std.mem.indexOf(u8, normalized, "VdInitializeEDRAM") != null) return xenia_vd_initialize_edram;
+    if (std.mem.indexOf(u8, normalized, "VdRetrainEDRAMWorker") != null) return xenia_vd_retrain_edram_worker;
+    if (std.mem.indexOf(u8, normalized, "VdRetrainEDRAM") != null) return xenia_vd_retrain_edram;
     return null;
 }
 
@@ -442,8 +541,48 @@ pub fn dispatchContract(state: anytype, symbol: []const u8) ?ContractDispatch {
         .libcxx_basic_ios_fail,
         .libcxx_basic_ios_eof,
         => .failed,
+        .xenia_vd_get_graphics_asic_id => if (executeXeniaVdGetGraphicsAsicId(state))
+            .{ .handled = state.regs.rax }
+        else
+            .failed,
+        .xenia_vd_get_system_command_buffer => if (executeXeniaVdGetSystemCommandBuffer(state))
+            .handled_void
+        else
+            .failed,
+        .xenia_vd_initialize_engines => if (executeXeniaVdInitializeEngines(state))
+            .{ .handled = state.regs.rax }
+        else
+            .failed,
+        .xenia_vd_initialize_ring_buffer => if (executeXeniaVdInitializeRingBuffer(state))
+            .handled_void
+        else
+            .failed,
+        .xenia_vd_persist_display => if (executeXeniaVdPersistDisplay(state))
+            .{ .handled = state.regs.rax }
+        else
+            .failed,
+        .xenia_vd_is_hsio_training_succeeded => if (executeXeniaVdIsHsioTrainingSucceeded(state))
+            .{ .handled = state.regs.rax }
+        else
+            .failed,
+        .xenia_vd_enable_ring_buffer_rptr_writeback => if (executeXeniaVdEnableRingBufferRptrWriteback(state))
+            .handled_void
+        else
+            .failed,
         .xenia_vd_set_graphics_interrupt_callback => if (executeXeniaVdSetGraphicsInterruptCallback(state))
             .handled_void
+        else
+            .failed,
+        .xenia_vd_initialize_edram => if (executeXeniaVdInitializeEdram(state))
+            .{ .handled = state.regs.rax }
+        else
+            .failed,
+        .xenia_vd_retrain_edram => if (executeXeniaVdRetrainEdram(state))
+            .{ .handled = state.regs.rax }
+        else
+            .failed,
+        .xenia_vd_retrain_edram_worker => if (executeXeniaVdRetrainEdramWorker(state))
+            .{ .handled = state.regs.rax }
         else
             .failed,
     };
@@ -827,6 +966,181 @@ pub fn executeIsatty(state: anytype, fd: u64) bool {
     return true;
 }
 
+fn observeXeniaVd(state: anytype, which: gpu.KernelExport, step: gpu.Step) void {
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    if (@hasField(State, "gpu_kernel_surface")) {
+        state.gpu_kernel_surface.observeBinding(which, true, true, 1);
+    }
+    if (@hasField(State, "gpu_bootstrap") and @hasField(State, "executed_steps")) {
+        state.gpu_bootstrap.observe(step, state.executed_steps);
+    }
+}
+
+fn observeXeniaVdCallback(state: anytype, callback: u64, arg: u64) void {
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    if (@hasField(State, "gpu_interrupt_callback")) {
+        state.gpu_interrupt_callback = callback;
+        state.gpu_interrupt_callback_arg = arg;
+        state.gpu_interrupt_callback_registrations +|= 1;
+    }
+}
+
+pub fn executeXeniaVdGetGraphicsAsicId(state: anytype) bool {
+    state.regs.rax = 0x11;
+    observeXeniaVd(state, .vd_get_graphics_asic_id, .initialize_engines);
+    machoCapturePrint("macho-processor: VdGetGraphicsAsicID import handled: id=0x11\n", .{});
+    return true;
+}
+
+pub fn executeXeniaVdGetSystemCommandBuffer(state: anytype) bool {
+    if (state.regs.rdi == 0 or state.regs.rsi == 0 or
+        state.guestMemory(state.regs.rdi, 0x94) == null or
+        state.guestMemory(state.regs.rsi, 4) == null)
+    {
+        return false;
+    }
+    const command_buffer = state.guestMemory(state.regs.rdi, 0x94) orelse return false;
+
+    // Match xboxkrnl_video_mac.cc: the Mac backend owns a persistent system
+    // command buffer, defaults to 0x2000 bytes, and aligns the allocation to
+    // a page. The descriptor is cleared on every call, but the buffer itself
+    // survives retries so VdSwap sees the same guest address.
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    var system_buffer: u64 = 0;
+    var system_buffer_size: u64 = 0x2000;
+    if (comptime @hasField(State, "gpu_system_command_buffer") and
+        @hasField(State, "gpu_system_command_buffer_size"))
+    {
+        system_buffer = state.gpu_system_command_buffer;
+        system_buffer_size = state.gpu_system_command_buffer_size;
+        if (system_buffer == 0 or system_buffer_size < 0x2000) {
+            system_buffer = state.guestAlloc(0x2000, 4096) orelse return false;
+            system_buffer_size = 0x2000;
+            state.gpu_system_command_buffer = system_buffer;
+            state.gpu_system_command_buffer_size = system_buffer_size;
+        }
+    } else {
+        // Keep the helper usable by small import-engine test doubles and
+        // state adapters that predate the persistent-state fields.
+        system_buffer = state.guestAlloc(0x2000, 4096) orelse return false;
+    }
+    if (system_buffer > std.math.maxInt(u32) or
+        system_buffer_size > std.math.maxInt(u32))
+    {
+        return false;
+    }
+
+    // This is not merely cosmetic initialization.  Xenia's VdSwap path may
+    // inspect the whole 0x94-byte command-buffer descriptor after the import;
+    // leaving the caller's old bytes in place makes a valid buffer look
+    // usable while the rest of the descriptor carries stale guest state.
+    @memset(command_buffer, 0);
+    state.write32(state.regs.rdi, @truncate(system_buffer));
+    state.write32(state.regs.rsi, @truncate(system_buffer_size));
+    observeXeniaVd(state, .vd_get_system_command_buffer, .system_command_buffer);
+    machoCapturePrint(
+        "macho-processor: VdGetSystemCommandBuffer import handled: addr=0x{x} size=0x{x} persistent=YES\n",
+        .{ system_buffer, system_buffer_size },
+    );
+    return true;
+}
+
+pub fn executeXeniaVdInitializeEngines(state: anytype) bool {
+    const callback = state.regs.rsi;
+    const arg = state.regs.rdx;
+    state.regs.rax = 1;
+    observeXeniaVd(state, .vd_initialize_engines, .initialize_engines);
+    observeXeniaVdCallback(state, callback, arg);
+    machoCapturePrint(
+        "macho-processor: VdInitializeEngines import handled: callback=0x{x} arg=0x{x} result=1\n",
+        .{ callback, arg },
+    );
+    return true;
+}
+
+pub fn executeXeniaVdInitializeRingBuffer(state: anytype) bool {
+    const base = state.regs.rdi;
+    const size_log2 = state.regs.rsi;
+    if (base == 0 or size_log2 > 37) return false;
+    const size = @as(u64, 1) << @as(u6, @intCast(size_log2 + 3));
+    const State = @typeInfo(@TypeOf(state)).pointer.child;
+    if (@hasField(State, "gpu_ring_watch_base")) {
+        state.gpu_ring_watch_base = base;
+        state.gpu_ring_watch_size = size;
+    }
+    if (@hasField(State, "xenia_memory_views") and @hasField(State, "gpu_ring_watch_host_physical")) {
+        state.gpu_ring_watch_host_physical = state.xenia_memory_views.physicalHostAddress(base) orelse 0;
+        const virtual_alias = if (base >= 0x1000) 0xE000_0000 + base - 0x1000 else 0;
+        state.gpu_ring_watch_host_virtual = if (virtual_alias != 0)
+            state.xenia_memory_views.virtualHostAddress(virtual_alias) orelse 0
+        else
+            0;
+    }
+    if (@hasField(State, "provenance_watch") and @hasField(State, "gpu_ring_watch_host_physical")) {
+        if (state.gpu_ring_watch_host_physical != 0) _ = state.provenance_watch.watchPage(state.gpu_ring_watch_host_physical, .declared);
+        if (state.gpu_ring_watch_host_virtual != 0) _ = state.provenance_watch.watchPage(state.gpu_ring_watch_host_virtual, .declared);
+    }
+    observeXeniaVd(state, .vd_initialize_ring_buffer, .ring_buffer);
+    machoCapturePrint(
+        "macho-processor: VdInitializeRingBuffer import handled: base=0x{x} size=0x{x} size_log2={d}\n",
+        .{ base, size, size_log2 },
+    );
+    return true;
+}
+
+pub fn executeXeniaVdPersistDisplay(state: anytype) bool {
+    // Xenia's canonical shim gives the title a small no-access reservation to
+    // release later through MmFreePhysicalMemory.  The reservation is a guest
+    // object, not a host pointer and must therefore come from Rosette's guest
+    // allocator.  Preserve the success contract even when the optional output
+    // pointer is null, matching the Xbox export.
+    if (state.regs.rsi != 0) {
+        const persistent = state.guestAlloc(64, 32) orelse return false;
+        if (state.guestMemory(state.regs.rsi, 4) == null) return false;
+        state.write32(state.regs.rsi, @truncate(persistent));
+    }
+    state.regs.rax = 1;
+    observeXeniaVd(state, .vd_persist_display, .initialize_engines);
+    machoCapturePrint(
+        "macho-processor: VdPersistDisplay import handled: output=0x{x} result=1\n",
+        .{state.regs.rsi},
+    );
+    return true;
+}
+
+pub fn executeXeniaVdIsHsioTrainingSucceeded(state: anytype) bool {
+    state.regs.rax = 1;
+    observeXeniaVd(state, .vd_is_hsio_training_succeeded, .initialize_engines);
+    return true;
+}
+
+pub fn executeXeniaVdEnableRingBufferRptrWriteback(state: anytype) bool {
+    observeXeniaVd(state, .vd_enable_ring_buffer_rptr_writeback, .rptr_writeback);
+    machoCapturePrint(
+        "macho-processor: VdEnableRingBufferRPtrWriteBack import handled: ptr=0x{x} block_size_log2={d}\n",
+        .{ state.regs.rdi, state.regs.rsi },
+    );
+    return true;
+}
+
+pub fn executeXeniaVdInitializeEdram(state: anytype) bool {
+    state.regs.rax = 0;
+    observeXeniaVd(state, .vd_initialize_edram, .initialize_engines);
+    return true;
+}
+
+pub fn executeXeniaVdRetrainEdram(state: anytype) bool {
+    state.regs.rax = 0;
+    observeXeniaVd(state, .vd_retrain_edram, .initialize_engines);
+    return true;
+}
+
+pub fn executeXeniaVdRetrainEdramWorker(state: anytype) bool {
+    state.regs.rax = 0;
+    observeXeniaVd(state, .vd_retrain_edram_worker, .initialize_engines);
+    return true;
+}
+
 pub fn executeXeniaVdSetGraphicsInterruptCallback(state: anytype) bool {
     // VdSetGraphicsInterruptCallback pre-initialization: register the GPU interrupt
     // callback early to prevent GPU stalls during guest bootstrap.
@@ -836,6 +1150,8 @@ pub fn executeXeniaVdSetGraphicsInterruptCallback(state: anytype) bool {
     // This marks the import as pre-initialized for the xenia_pipeline diagnostics
     const callback = state.regs.rdi;
     const arg = state.regs.rsi;
+    observeXeniaVdCallback(state, callback, arg);
+    observeXeniaVd(state, .vd_set_graphics_interrupt_callback, .graphics_interrupt_callback);
     machoCapturePrint(
         "macho-processor: VdSetGraphicsInterruptCallback import is preinitialized; callback=0x{x} arg=0x{x}\n",
         .{ callback, arg },
@@ -900,9 +1216,11 @@ pub fn executeBasicIstreamSentryConstructor(state: anytype, sentry: u64, istream
 }
 
 const TestState = struct {
-    mem: [512]u8 = [_]u8{0} ** 512,
+    mem: [16384]u8 = [_]u8{0} ** 16384,
     heap_next: u64 = 320,
-    regs: struct { rax: u64 = 0 } = .{},
+    regs: struct { rax: u64 = 0, rdi: u64 = 0, rsi: u64 = 0 } = .{},
+    gpu_system_command_buffer: u64 = 0,
+    gpu_system_command_buffer_size: u64 = 0,
 
     fn guestMemory(self: *TestState, address: u64, count: u64) ?[]u8 {
         if (address + count > self.mem.len) return null;
@@ -934,6 +1252,10 @@ const TestState = struct {
         return std.mem.readInt(u64, self.mem[@intCast(address)..][0..8], .little);
     }
 
+    fn read32(self: *const TestState, address: u64) u32 {
+        return std.mem.readInt(u32, self.mem[@intCast(address)..][0..4], .little);
+    }
+
     fn write32(self: *TestState, address: u64, value: u32) void {
         std.mem.writeInt(u32, self.mem[@intCast(address)..][0..4], value, .little);
     }
@@ -943,6 +1265,38 @@ const TestState = struct {
     }
 };
 
+test "VdGetSystemCommandBuffer returns a persistent aligned buffer" {
+    var state = TestState{};
+    state.regs.rdi = 32;
+    state.regs.rsi = 256;
+    @memset(state.mem[32 .. 32 + 0x94], 0xA5);
+    @memset(state.mem[256 .. 256 + 4], 0xA5);
+
+    try std.testing.expect(executeXeniaVdGetSystemCommandBuffer(&state));
+    const first_address = state.read32(state.regs.rdi);
+    try std.testing.expect(first_address != 0);
+    try std.testing.expectEqual(@as(u32, 0x2000), state.read32(state.regs.rsi));
+    try std.testing.expectEqual(@as(u64, first_address), state.gpu_system_command_buffer);
+    try std.testing.expectEqual(@as(u64, 0x2000), state.gpu_system_command_buffer_size);
+    try std.testing.expectEqual(@as(u8, 0), state.mem[32 + 4]);
+    try std.testing.expectEqual(@as(u8, 0), state.mem[32 + 0x93]);
+
+    const heap_after_first = state.heap_next;
+    @memset(state.mem[32 .. 32 + 0x94], 0xA5);
+    try std.testing.expect(executeXeniaVdGetSystemCommandBuffer(&state));
+    try std.testing.expectEqual(first_address, state.read32(state.regs.rdi));
+    try std.testing.expectEqual(heap_after_first, state.heap_next);
+}
+
+test "VdPersistDisplay returns a guest-owned release pointer" {
+    var state = TestState{};
+    state.regs.rsi = 256;
+    try std.testing.expect(executeXeniaVdPersistDisplay(&state));
+    try std.testing.expectEqual(@as(u64, 1), state.regs.rax);
+    const persistent = state.read32(state.regs.rsi);
+    try std.testing.expectEqual(@as(u32, 320), persistent);
+}
+
 test "symbol normalization and contract lookup" {
     try std.testing.expectEqualStrings("open", normalizeSymbol("_open$INODE64"));
     try std.testing.expectEqual(Domain.libcxx, classifyDomain("__ZNSt3__15mutex4lockEv"));
@@ -950,6 +1304,7 @@ test "symbol normalization and contract lookup" {
     try std.testing.expectEqual(ContractId.libcxx_basic_string_push_back_char, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_string_init_fill, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_string_reserve, contractFor("__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7reserveEm").?.id);
+    try std.testing.expectEqual(ContractId.xenia_vd_persist_display, contractFor("VdPersistDisplay").?.id);
     try std.testing.expectEqual(ContractId.libcxx_ios_base_init, contractFor("__ZNSt3__18ios_base4initEPv").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_filebuf_constructor, contractFor("__ZNSt3__113basic_filebufIcNS_11char_traitsIcEEEC1Ev").?.id);
     try std.testing.expectEqual(ContractId.libcxx_basic_streambuf_pubsetbuf, contractFor("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE9pubsetbufB7v160006EPcl").?.id);
