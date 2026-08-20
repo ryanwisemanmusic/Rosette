@@ -666,6 +666,8 @@ fn isBenignSmallIntArgImport(name: []const u8) bool {
         "___cxa_allocate_exception",
         // Signal number (SIGILL=4, SIGSEGV=0xb, ...).
         "_sigaction",
+        // `raise(int)` receives a signal number, not an object receiver.
+        "_raise",
         // GtkOrientation / GtkWindowType / GType enums.
         "_gtk_box_new",
         "_gtk_window_new",
@@ -1080,6 +1082,7 @@ test "a genuine null receiver is still retained after the benign lists grow" {
 test "the two benign reasons stay separate and neither swallows the other" {
     // Scalar-argument list: not a pointer at all.
     try std.testing.expect(isBenignSmallIntArgImport("_abs"));
+    try std.testing.expect(isBenignSmallIntArgImport("_raise"));
     try std.testing.expect(isBenignSmallIntArgImport("_SDL_PauseAudioDevice"));
     try std.testing.expect(!isDocumentedNullSentinelImport("_abs"));
 

@@ -35,6 +35,7 @@ const statusByteForLahf = x64_decoder.statusByteForLahf;
 const applySahf = x64_decoder.applySahf;
 const RFL_DF: u32 = 1 << 10;
 const GuestAccess = types.GuestAccess;
+const GuestAssertionContext = types.GuestAssertionContext;
 const ControlTransferContext = types.ControlTransferContext;
 const GUEST_SIGILL = constants.GUEST_SIGILL;
 const readExtendedFloat80 = memory_mod.readExtendedFloat80;
@@ -2366,10 +2367,17 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
 
         .ud2 => {
             const symbol = self.metadata.nearestSymbol(self.regs.rip);
-            const assertion_age = self.executed_steps -| self.last_guest_assertion_step;
+            const assertion_context = if (self.last_guest_assertion.relevant(self.active_guest_thread, self.executed_steps, self.regs.rip))
+                self.last_guest_assertion
+            else
+                GuestAssertionContext{};
+            const assertion_age = if (assertion_context.valid)
+                self.executed_steps -| assertion_context.step
+            else
+                0;
             machoCapturePrint(
-                "macho-processor: UD2 encounter: rip=0x{x} {s}+0x{x} active=0x{x} signal_depth={d} assertion={s} assertion_age={d} assertion_return=0x{x} bytes=0f0b\n",
-                .{ self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(self.last_guest_assertion_class), assertion_age, self.last_guest_assertion_return },
+                "macho-processor: UD2 encounter: rip=0x{x} {s}+0x{x} active=0x{x} signal_depth={d} assertion={s} assertion_thread=0x{x} assertion_age={d} assertion_return=0x{x} bytes=0f0b\n",
+                .{ self.regs.rip, if (symbol) |entry| entry.name else "<unknown>", if (symbol) |entry| entry.offset else 0, self.active_guest_thread, self.signal_frame_count, @tagName(assertion_context.class), assertion_context.thread, assertion_age, assertion_context.return_address },
             );
             if (self.deliverGuestSignal(GUEST_SIGILL, self.regs.rip, d.len, self.regs.rip, null, 0, "ud2")) return;
             machoCapturePrint("macho-processor: UD2 instruction at rip=0x{x} — unhandled guest SIGILL\n", .{self.regs.rip});

@@ -6,6 +6,7 @@ const DecodedInsn = x64_decoder.DecodedInsn;
 const Size = x64_decoder.OperandSize;
 const compat_runtime = @import("macho_compat_runtime");
 const exit_diagnostics = @import("exit_diagnostics");
+const indirect_target_audit = @import("diagnostics").indirect_target_audit;
 const libcpp_shared_control_block = @import("cxx_abi").libcpp_shared_control_block;
 const macho_log = @import("dyld").event_log;
 const machoCapturePrint = macho_log.machoCapturePrint;
@@ -375,8 +376,76 @@ pub fn terminateForInvalidControlTransfer(self: anytype, context: ControlTransfe
     self.terminated = true;
 }
 
+/// Say what the memory behind the operand is, using the thread census the run
+/// already has.
+///
+/// An address is only "a stack" relative to a thread, and this runtime tracks
+/// every thread's stack pointer — so the answer was a comparison the
+/// diagnostics had every input for and never made.
+fn auditIndirectTargetRegion(self: anytype, context: ControlTransferContext) void {
+    var slots: [indirect_target_audit.window_slots]indirect_target_audit.Slot = undefined;
+    var slot_count: usize = 0;
+    var address = context.operand_address -| 64;
+    while (address < context.operand_address + 72 and slot_count < slots.len) : (address += 8) {
+        if (self.addrToOffset(address) == null) continue;
+        const value = self.read64(address);
+        slots[slot_count] = .{
+            .address = address,
+            .value = value,
+            .resolves_to_code = self.metadata.nearestSymbol(value) != null,
+            .executable = self.isExecutableAddress(value),
+        };
+        slot_count += 1;
+    }
+
+    var stacks: [48]indirect_target_audit.ThreadStack = undefined;
+    var stack_count: usize = 0;
+    // The faulting thread first: its own frame is the common and benign case,
+    // and leaving it out would report every callable held in a local as
+    // foreign.
+    stacks[stack_count] = .{ .handle = self.active_guest_thread, .stack_pointer = self.regs.rsp };
+    stack_count += 1;
+    for (self.suspended_guest_threads[0..self.suspended_guest_thread_count]) |suspended| {
+        if (stack_count == stacks.len) break;
+        stacks[stack_count] = .{ .handle = suspended.handle, .stack_pointer = suspended.regs.rsp };
+        stack_count += 1;
+    }
+
+    const audit = indirect_target_audit.classify(
+        context.operand_address,
+        slots[0..slot_count],
+        stacks[0..stack_count],
+        self.active_guest_thread,
+        self.isExecutableAddress(context.target_address),
+    );
+    machoCapturePrint(
+        "macho-processor:   operand region: kind={s} finding={s} owning_thread=0x{x} faulting_thread=0x{x} code_slots={d}/{d} ({d}%); {s}\n",
+        .{
+            audit.kind.label(),
+            audit.finding.label(),
+            audit.owning_thread,
+            audit.faulting_thread,
+            audit.code_slots,
+            audit.examined_slots,
+            audit.codeSlotPercent(),
+            audit.kind.meaning(),
+        },
+    );
+    if (audit.finding.actionable()) machoCapturePrint(
+        "macho-processor:   operand region finding: {s}\n",
+        .{audit.finding.meaning()},
+    );
+}
+
 pub fn logCrashDiagnostics(self: anytype, context: ControlTransferContext) void {
     machoCapturePrint("macho-processor: CRASH DIAGNOSTICS BEGIN\n", .{});
+
+    // Emit Vulkan forwarding state snapshot early so it's always present,
+    // even if the crash is unrelated to Vulkan — the overhead is one log line
+    // and a ring-buffer dump.
+    if (@hasField(@TypeOf(self.*), "dynamic_forwarder")) {
+        self.dynamic_forwarder.dumpVulkanStateSnapshot();
+    }
 
     const thread_handle = self.active_guest_thread;
     const thread_id = self.threadNumericId(thread_handle);
@@ -514,7 +583,14 @@ pub fn logCrashDiagnostics(self: anytype, context: ControlTransferContext) void 
             }
         }
 
-        machoCapturePrint("macho-processor:   jump table dump [0x{x} +/- 64 bytes]:\n", .{context.operand_address});
+        // Classify the region before describing it. This dump used to be
+        // labelled a "jump table" unconditionally, and in the observed crash it
+        // was a thread stack — so the reader was sent looking for a bad
+        // relocation while the evidence for "this is another thread's frame"
+        // sat in the census printed forty lines further down.
+        auditIndirectTargetRegion(self, context);
+
+        machoCapturePrint("macho-processor:   operand region dump [0x{x} +/- 64 bytes]:\n", .{context.operand_address});
         const dump_start = context.operand_address -| 64;
         const dump_end = context.operand_address + 72;
         var dump_addr = dump_start;

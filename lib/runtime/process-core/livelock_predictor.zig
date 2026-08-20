@@ -87,14 +87,22 @@ pub const Predictor = struct {
     observations: u64 = 0,
     distinct_signatures: u32 = 0,
     emissions: u64 = 0,
+    /// Signatures the wait audit judged healthy, so their detail was not
+    /// printed. Counted rather than silent: a predictor that quietly stops
+    /// reporting is indistinguishable from one that stopped working.
+    suppressed: u64 = 0,
 
-    /// Record one synchronization operation. `ring_stalled` is the caller's
-    /// verdict on forward progress (the ring write pointer has not advanced
-    /// for a long window, or no ring publication has ever been seen); a
-    /// signature is only *predicted* as a livelock when the ring is stalled.
-    pub fn note(self: *Predictor, state: anytype, op: Operation, object: u64, ring_stalled: bool) void {
+    /// Record one synchronization operation. `thread` is the guest thread that
+    /// performed it (0 when unknown — host-originated lines); without it the
+    /// guidance "find who waits on it" would name no one. `ring_stalled` is
+    /// the caller's verdict on forward progress (the ring write pointer has
+    /// not advanced for a long window, or no ring publication has ever been
+    /// seen); a signature is only *predicted* as a livelock when the ring is
+    /// stalled.
+    pub fn note(self: *Predictor, state: anytype, op: Operation, object: u64, thread: u64, ring_stalled: bool) void {
         self.observations +|= 1;
         const signature = self.findOrInsert(op, object) orelse return;
+        if (thread != 0) signature.thread = thread;
         self.pushRecent(op, object, state.executed_steps);
 
         const step = state.executed_steps;
@@ -143,7 +151,7 @@ pub const Predictor = struct {
             );
         }
         machoCapturePrint(
-            "LIVELOCK PREDICTOR: dump reason={s} distinct={d} retained={d} observations={d} recent_window={d} emissions={d} step={d}\n",
+            "LIVELOCK PREDICTOR: dump reason={s} distinct={d} retained={d} observations={d} recent_window={d} emissions={d} suppressed_by_audit={d} step={d}\n",
             .{
                 reason,
                 self.distinct_signatures,
@@ -151,6 +159,7 @@ pub const Predictor = struct {
                 self.observations,
                 self.recentCount(),
                 self.emissions,
+                self.suppressed,
                 state.executed_steps,
             },
         );
@@ -174,6 +183,26 @@ pub const Predictor = struct {
     }
 
     fn emit(self: *Predictor, state: anytype, signature: *const Signature) void {
+        // A pattern the audit has judged healthy is not printed.
+        //
+        // This predictor detects repetition, and repetition is what a working
+        // producer/consumer pump looks like. Printing every one buries the one
+        // that matters: the observed run emitted a scatter of entries for an
+        // audio pump doing its job while a genuinely stalled rotation sat among
+        // them indistinguishable. The audit decides, because it holds the one
+        // thing this predictor cannot see — whether anything else in the run
+        // advanced alongside the pattern.
+        if (comptime @hasField(@TypeOf(state.*), "wait_audit")) {
+            const audit = &state.wait_audit;
+            for (audit.subjects[0..audit.count]) |subject| {
+                if (subject.object != signature.object) continue;
+                const classification = audit.classify(subject, state.executed_steps);
+                if (classification == .expected_pump or classification == .expected_bounded) {
+                    self.suppressed +|= 1;
+                    return;
+                }
+            }
+        }
         self.emissions +|= 1;
         const guidance: []const u8 = switch (signature.op) {
             .wait => "the guest is parked on an object that never became ready; find who should signal it and confirm they ran",
@@ -303,23 +332,45 @@ test "wait cycle on a live object with a stalled ring is predicted" {
 
     // Healthy handshake: a few waits while the ring advances. Nothing fires.
     state.executed_steps = 1000;
-    predictor.note(&state, .wait, 0x827CEC14, false);
-    predictor.note(&state, .set_event, 0x827CEC28, false);
-    predictor.note(&state, .wait, 0x827CEC14, false);
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, false);
+    predictor.note(&state, .set_event, 0x827CEC28, 0x7fff2080, false);
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, false);
     try std.testing.expectEqual(@as(u64, 3), predictor.observations);
     try std.testing.expectEqual(@as(u32, 2), predictor.distinct_signatures);
 
     // The stall: the ring stops advancing and the same wait repeats. First
     // prediction fires at the MIN_CYCLE_COUNT doubling threshold.
     state.executed_steps = 2000;
-    predictor.note(&state, .wait, 0x827CEC14, true);
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
     state.executed_steps = 3000;
-    predictor.note(&state, .wait, 0x827CEC14, true);
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
     try std.testing.expectEqual(@as(u64, 5), predictor.observations);
     const signature = predictor.findOrInsert(.wait, 0x827CEC14).?;
     try std.testing.expectEqual(@as(u32, 4), signature.count);
     try std.testing.expectEqual(@as(u32, 1), signature.emissions);
     try std.testing.expectEqual(@as(u64, 1), predictor.emissions);
+    // The thread that performed the operation is named, so the guidance
+    // "find who waits on it" has an answer.
+    try std.testing.expectEqual(@as(u64, 0x7fff2110), signature.thread);
+}
+
+test "the last observed thread is retained per signature" {
+    const TestState = struct {
+        executed_steps: u64 = 0,
+    };
+    var predictor = Predictor{};
+    var state = TestState{};
+
+    state.executed_steps = 100;
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, false);
+    try std.testing.expectEqual(@as(u64, 0x7fff2110), predictor.findOrInsert(.wait, 0x827CEC14).?.thread);
+    // A later operation by a different thread updates the name.
+    state.executed_steps = 200;
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff20e0, false);
+    try std.testing.expectEqual(@as(u64, 0x7fff20e0), predictor.findOrInsert(.wait, 0x827CEC14).?.thread);
+    // An unknown thread never overwrites a known one.
+    predictor.note(&state, .wait, 0x827CEC14, 0, false);
+    try std.testing.expectEqual(@as(u64, 0x7fff20e0), predictor.findOrInsert(.wait, 0x827CEC14).?.thread);
 }
 
 test "timeout waits are their own signature and keep counting" {
@@ -330,11 +381,11 @@ test "timeout waits are their own signature and keep counting" {
     var state = TestState{};
 
     state.executed_steps = 100;
-    predictor.note(&state, .wait_timeout, 0x827CEC28, true);
+    predictor.note(&state, .wait_timeout, 0x827CEC28, 0x7fff2080, true);
     state.executed_steps = 200;
-    predictor.note(&state, .wait_timeout, 0x827CEC28, true);
+    predictor.note(&state, .wait_timeout, 0x827CEC28, 0x7fff2080, true);
     state.executed_steps = 300;
-    predictor.note(&state, .wait_timeout, 0x827CEC28, true);
+    predictor.note(&state, .wait_timeout, 0x827CEC28, 0x7fff2080, true);
 
     const signature = predictor.findOrInsert(.wait_timeout, 0x827CEC28).?;
     try std.testing.expectEqual(@as(u32, 3), signature.count);
@@ -351,14 +402,14 @@ test "distinct objects and operations stay distinct" {
     var predictor = Predictor{};
     var state = TestState{};
 
-    predictor.note(&state, .wait, 0x1000, true);
-    predictor.note(&state, .wait, 0x2000, true);
-    predictor.note(&state, .set_event, 0x1000, true);
-    predictor.note(&state, .release_semaphore, 0x3000, true);
+    predictor.note(&state, .wait, 0x1000, 0x7fff2110, true);
+    predictor.note(&state, .wait, 0x2000, 0x7fff2110, true);
+    predictor.note(&state, .set_event, 0x1000, 0x7fff2080, true);
+    predictor.note(&state, .release_semaphore, 0x3000, 0x7fff2080, true);
     try std.testing.expectEqual(@as(u32, 4), predictor.distinct_signatures);
 
     // The same (op, object) accumulates, not splits.
-    predictor.note(&state, .wait, 0x1000, true);
+    predictor.note(&state, .wait, 0x1000, 0x7fff2110, true);
     try std.testing.expectEqual(@as(u32, 4), predictor.distinct_signatures);
     try std.testing.expectEqual(@as(u32, 2), predictor.findOrInsert(.wait, 0x1000).?.count);
 }
@@ -373,7 +424,7 @@ test "full-table eviction keeps the hottest wait signature" {
     // Fill the table with distinct signatures.
     var i: u64 = 0;
     while (i < SIGNATURE_CAPACITY) : (i += 1) {
-        predictor.note(&state, .wait, 0x1000 + i * 0x100, false);
+        predictor.note(&state, .wait, 0x1000 + i * 0x100, 0x7fff2110, false);
         state.executed_steps += 1;
     }
     try std.testing.expectEqual(@as(u32, @intCast(SIGNATURE_CAPACITY)), predictor.distinct_signatures);
@@ -381,14 +432,14 @@ test "full-table eviction keeps the hottest wait signature" {
     // Make the first signature hot.
     var j: u64 = 0;
     while (j < 8) : (j += 1) {
-        predictor.note(&state, .wait, 0x1000, false);
+        predictor.note(&state, .wait, 0x1000, 0x7fff2110, false);
         state.executed_steps += 1;
     }
     try std.testing.expectEqual(@as(u32, 9), predictor.findOrInsert(.wait, 0x1000).?.count);
 
     // One more distinct signature evicts the least-used entry; the hot one
     // survives.
-    predictor.note(&state, .release_semaphore, 0x9999, false);
+    predictor.note(&state, .release_semaphore, 0x9999, 0x7fff2080, false);
     try std.testing.expectEqual(@as(u32, @intCast(SIGNATURE_CAPACITY)), predictor.distinct_signatures);
     try std.testing.expectEqual(@as(u32, 9), predictor.findOrInsert(.wait, 0x1000).?.count);
 }
@@ -402,7 +453,7 @@ test "recent ring wraps and reports the newest operations" {
 
     var i: u64 = 0;
     while (i < RECENT_CAPACITY + 4) : (i += 1) {
-        predictor.note(&state, .wait, 0x1000 + i, false);
+        predictor.note(&state, .wait, 0x1000 + i, 0x7fff2110, false);
         state.executed_steps += 1;
     }
     try std.testing.expectEqual(@as(usize, RECENT_CAPACITY), predictor.recentCount());

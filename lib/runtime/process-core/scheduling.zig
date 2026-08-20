@@ -43,10 +43,11 @@ fn restoreActiveGuestSignalState(self: anytype, state: GuestSignalState) void {
 }
 
 /// Starts a synthetic or newly-created guest context with no inherited signal
-/// nesting. Signal dispositions remain process-wide in `signal_actions`; only
-/// the in-flight handler frames are thread-local.
+/// nesting or assertion provenance. Signal dispositions remain process-wide;
+/// the in-flight handler frames and nearby-UD2 context are thread-local.
 pub fn resetActiveGuestSignalState(self: anytype) void {
     restoreActiveGuestSignalState(self, .{});
+    self.last_guest_assertion = .{};
 }
 
 pub fn beginCooperativeMainLoop(self: anytype) bool {
@@ -56,8 +57,10 @@ pub fn beginCooperativeMainLoop(self: anytype) bool {
         .regs = self.regs,
         .xmm = self.xmm,
         .ymm_hi = self.ymm_hi,
+        .k = self.k,
         .x87 = self.x87,
         .signal_state = captureActiveGuestSignalState(self),
+        .assertion_context = self.last_guest_assertion,
     };
     self.foreign_objects.main_loop_entries +|= 1;
     self.foreign_objects.main_loop_depth +|= 1;
@@ -88,6 +91,7 @@ pub fn startDeferredGuestThread(self: anytype, deferred: pthread_runtime.Deferre
     self.regs = .{};
     self.xmm = [_][16]u8{[_]u8{0} ** 16} ** 16;
     self.ymm_hi = [_][16]u8{[_]u8{0} ** 16} ** 16;
+    self.k = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8;
     self.x87 = .{};
     resetActiveGuestSignalState(self);
     self.coop_bootstrap_active = true;
@@ -119,8 +123,10 @@ pub fn saveActiveGuestThread(self: anytype, reason: []const u8) bool {
         .regs = self.regs,
         .xmm = self.xmm,
         .ymm_hi = self.ymm_hi,
+        .k = self.k,
         .x87 = self.x87,
         .signal_state = captureActiveGuestSignalState(self),
+        .assertion_context = self.last_guest_assertion,
     };
     self.suspended_guest_thread_count += 1;
     self.pthreads.markContextSuspended(self.active_guest_thread);
@@ -193,7 +199,9 @@ pub fn resumeSuspendedGuestThread(self: anytype) bool {
         self.regs = context.regs;
         self.xmm = context.xmm;
         self.ymm_hi = context.ymm_hi;
+        self.k = context.k;
         self.x87 = context.x87;
+        self.last_guest_assertion = context.assertion_context;
         const saved_rax = self.regs.rax;
         self.regs.rax = resume_decision.?.restoredRax(saved_rax);
         if (resume_decision.?.cancel_deadline_sequence != 0) {
@@ -856,6 +864,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         self.regs = context.regs;
         self.xmm = context.xmm;
         self.ymm_hi = context.ymm_hi;
+        self.k = context.k;
         self.x87 = context.x87;
         resetActiveGuestSignalState(self);
         self.regs.rip = function;
@@ -1071,8 +1080,10 @@ pub fn restoreMainLoopCaller(self: anytype, reason: []const u8) void {
     self.regs = context.regs;
     self.xmm = context.xmm;
     self.ymm_hi = context.ymm_hi;
+    self.k = context.k;
     self.x87 = context.x87;
     restoreActiveGuestSignalState(self, context.signal_state);
+    self.last_guest_assertion = context.assertion_context;
     self.cooperative_ui_context = null;
     self.active_guest_thread = 0;
     self.active_idle_source = 0;

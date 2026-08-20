@@ -12,6 +12,11 @@ const startup_observer = @import("diagnostics").startup_observer;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
 const guest_module_map = @import("diagnostics").guest_module_map;
 const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
+const deferred_work = @import("diagnostics").deferred_work;
+const deadlock_predictor = @import("diagnostics").deadlock_predictor;
+const bringup_failure = @import("diagnostics").bringup_failure;
+const wait_audit = @import("diagnostics").wait_audit;
+const guest_exception_ledger = @import("diagnostics").guest_exception_ledger;
 const preflight_lib = @import("preflight");
 const import_binding_predictor = @import("import_binding_predictor.zig");
 const livelock_predictor = @import("livelock_predictor.zig");
@@ -163,6 +168,10 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     observeKernelSurfaceReport(self, message);
     observeGuestWaitLiveness(self, message);
     observeImportBindingProbe(self, message);
+    observeDeferredWork(self, message);
+    observeGuestSyncObjects(self, message);
+    observeRegisterApertureReachability(self, message);
+    observeBringupFailure(self, message);
     self.observeBackendGuestLog(message);
     const raw_char: u8 = @truncate(prefix_char_raw);
     const prefix_char: u8 = if (raw_char >= 0x20 and raw_char <= 0x7E) raw_char else '?';
@@ -170,9 +179,7 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     const prefix = std.fmt.bufPrint(&prefix_buffer, "[xenia] {c}> ", .{prefix_char}) catch return false;
 
     if (!shouldSuppressRuntimeGuestLog(message)) {
-        _ = hostWriteFdAll(self.diagnostic_output_fd, prefix);
-        _ = hostWriteFdAll(self.diagnostic_output_fd, message);
-        if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.diagnostic_output_fd, "\n");
+        writeLineAtomic(self.diagnostic_output_fd, &.{ prefix, message });
     }
     if (self.macho_log.isOpen()) {
         var xenia_buffer: [4096]u8 = undefined;
@@ -182,10 +189,7 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     if (self.summary_output_fd >= 0 and shouldSummarizeGuestLog(prefix_char, message)) {
         var step_buffer: [64]u8 = undefined;
         const step_prefix = std.fmt.bufPrint(&step_buffer, "step={d} ", .{self.executed_steps}) catch "";
-        _ = hostWriteFdAll(self.summary_output_fd, step_prefix);
-        _ = hostWriteFdAll(self.summary_output_fd, prefix);
-        _ = hostWriteFdAll(self.summary_output_fd, message);
-        if (message.len == 0 or message[message.len - 1] != '\n') _ = hostWriteFdAll(self.summary_output_fd, "\n");
+        writeLineAtomic(self.summary_output_fd, &.{ step_prefix, prefix, message });
     }
 
     observeGuestModuleImages(self, message);
@@ -332,13 +336,46 @@ pub fn describeGuestAddress(self: anytype, address: u64) void {
     );
 }
 
-/// Write one mirrored guest line, adding the newline the guest may have omitted.
+/// Write one mirrored guest line as a single write syscall, adding the
+/// newline the guest may have omitted.
+///
+/// The guest logs from many threads at once (each calling AppendLogLine on
+/// its own stack), so a multi-part line lets another thread's bytes land
+/// inside it — that is the torn-line artifact in the mirror. Coalescing each
+/// line into one buffer and one write keeps lines atomic on a regular file,
+/// where the kernel serialises concurrent write syscalls.
 fn writeMirroredLine(self: anytype, prefix: []const u8, message: []const u8) void {
-    _ = hostWriteFdAll(self.guest_log_mirror_fd, prefix);
-    _ = hostWriteFdAll(self.guest_log_mirror_fd, message);
-    if (message.len == 0 or message[message.len - 1] != '\n') {
-        _ = hostWriteFdAll(self.guest_log_mirror_fd, "\n");
+    writeLineAtomic(self.guest_log_mirror_fd, &.{ prefix, message });
+}
+
+/// Coalesce one log line (prefix + message + optional newline) into a single
+/// write syscall. Lines that fit the stack buffer take the atomic fast path;
+/// oversized lines (a config dump, for instance) fall back to per-part
+/// writes, which are rare enough that a tear there is a cosmetic blemish
+/// rather than a parser hazard.
+fn writeLineAtomic(fd: i32, parts: []const []const u8) void {
+    if (fd < 0) return;
+    var total: usize = 0;
+    for (parts) |part| total += part.len;
+    const needs_newline = parts.len == 0 or parts[parts.len - 1].len == 0 or
+        parts[parts.len - 1][parts[parts.len - 1].len - 1] != '\n';
+    const newline_len: usize = if (needs_newline) 1 else 0;
+    if (total + newline_len <= 4096) {
+        var buffer: [4096]u8 = undefined;
+        var used: usize = 0;
+        for (parts) |part| {
+            @memcpy(buffer[used..][0..part.len], part);
+            used += part.len;
+        }
+        if (needs_newline) {
+            buffer[used] = '\n';
+            used += 1;
+        }
+        _ = hostWriteFdAll(fd, buffer[0..used]);
+        return;
     }
+    for (parts) |part| _ = hostWriteFdAll(fd, part);
+    if (needs_newline) _ = hostWriteFdAll(fd, "\n");
 }
 
 /// Observe the guest-driven GPU bootstrap from the mirrored guest log.
@@ -402,7 +439,52 @@ pub fn observeLivelockWaits(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "livelock_predictor")) return;
     const operation = livelockOperation(self, message) orelse return;
-    self.livelock_predictor.note(self, operation.op, operation.object, livelockRingStalled(self));
+    // The mirror runs on the guest thread that wrote the line, so the active
+    // thread is the one that performed the operation. Naming it is what makes
+    // "find who waits on it" answerable.
+    self.livelock_predictor.note(self, operation.op, operation.object, self.active_guest_thread, livelockRingStalled(self));
+}
+
+/// Fold a synchronisation object's address onto the one a reader can act on.
+///
+/// The console address is canonical: it appears in the title's own memory, it
+/// is stable across runs, and every other guest-side diagnostic uses it. Host
+/// pointers move with the emulator's mapping base and mean nothing outside one
+/// process — so a predictor keyed on a host pointer reports an object nobody
+/// can find, and splits its evidence away from the same object's console name.
+/// Feed one synchronisation event into the wait audit.
+///
+/// Shares the livelock predictor's observation points on purpose: two
+/// subsystems reasoning about the same behaviour from different event streams
+/// is how they end up disagreeing about what happened.
+fn auditSyncOperation(
+    self: anytype,
+    message: []const u8,
+    object: u64,
+    operation: wait_audit.Operation,
+) void {
+    if (comptime !@hasField(@TypeOf(self.*), "wait_audit")) return;
+    if (object == 0) return;
+    const handle: u32 = parseFixedWidthHexAfter(message, "handle=", sync_object_field_width) orelse 0;
+    const type_code: u32 = parseDecimalAfterU32(message, "type=") orelse 0;
+    self.wait_audit.observe(
+        object,
+        operation,
+        self.active_guest_thread,
+        handle,
+        type_code,
+        self.executed_steps,
+    );
+}
+
+fn parseDecimalAfterU32(message: []const u8, key: []const u8) ?u32 {
+    const value = parseDecimalAfter(message, key) orelse return null;
+    return if (value > std.math.maxInt(u32)) null else @intCast(value);
+}
+
+fn canonicalSyncObject(self: anytype, address: u64) u64 {
+    if (comptime !@hasField(@TypeOf(self.*), "sync_object_identity")) return address;
+    return self.sync_object_identity.resolve(address).canonical;
 }
 
 const LivelockOperation = struct {
@@ -414,10 +496,25 @@ fn livelockOperation(self: anytype, message: []const u8) ?LivelockOperation {
     // Detailed pre-wait line: remember the object for the coming result line.
     // The result line alone cannot name the object against a pre-change binary.
     if (std.mem.indexOf(u8, message, "KeWaitForSingleObject tid=") != null) {
-        if (parseHexAfter(message, "guest_obj=")) |object| {
-            self.livelock_pending_wait_object = object;
-        } else if (parseHexAfter(message, "obj_ptr=")) |object| {
-            self.livelock_pending_wait_object = object;
+        // This line names the object *both* ways, which is the only place the
+        // two are stated together. Learning the pair here is what stops every
+        // later line that prints only one of them from being attributed to a
+        // second, non-existent object.
+        if (comptime @hasField(@TypeOf(self.*), "sync_object_identity")) {
+            const host = parseFixedWidthHexAfter(message, "obj_ptr=", sync_object_field_width) orelse 0;
+            const console = parseFixedWidthHexAfter(message, "guest_obj=", sync_object_field_width) orelse 0;
+            self.sync_object_identity.observePair(host, console);
+        }
+        if (parseFixedWidthHexAfter(message, "guest_obj=", sync_object_field_width)) |object| {
+            self.livelock_pending_wait_object = canonicalSyncObject(self, object);
+        } else if (parseFixedWidthHexAfter(message, "obj_ptr=", sync_object_field_width)) |object| {
+            self.livelock_pending_wait_object = canonicalSyncObject(self, object);
+        } else if (std.mem.indexOf(u8, message, "obj_ptr=") != null) {
+            // The field is present and short: the line was spliced. Counting it
+            // keeps a truncated read from silently becoming a phantom object.
+            if (comptime @hasField(@TypeOf(self.*), "sync_object_identity")) {
+                self.sync_object_identity.truncated_reads +|= 1;
+            }
         }
         return null;
     }
@@ -427,27 +524,32 @@ fn livelockOperation(self: anytype, message: []const u8) ?LivelockOperation {
     if (std.mem.indexOf(u8, message, "KeWaitForSingleObject result=") != null) {
         const result = parseHexAfter(message, "result=") orelse return null;
         const op: livelock_predictor.Operation = if (result == 0x102) .wait_timeout else .wait;
-        const object: u64 = blk: {
-            if (parseHexAfter(message, "guest_obj=")) |object_value| break :blk object_value;
-            if (parseHexAfter(message, "obj_ptr=")) |object_value| break :blk object_value;
+        const object: u64 = canonicalSyncObject(self, blk: {
+            if (parseFixedWidthHexAfter(message, "guest_obj=", sync_object_field_width)) |value| break :blk value;
+            if (parseFixedWidthHexAfter(message, "obj_ptr=", sync_object_field_width)) |value| break :blk value;
             break :blk self.livelock_pending_wait_object;
-        };
+        });
         self.livelock_pending_wait_object = 0;
         if (object == 0) return null;
+        auditSyncOperation(self, message, object, if (op == .wait_timeout) .wait_timeout else .wait);
         return .{ .op = op, .object = object };
     }
     if (std.mem.indexOf(u8, message, "DEBUG: xeKeSetEvent: ptr=") != null) {
         const object = parseHexAfter(message, "ptr=") orelse return null;
         if (object == 0) return null;
-        return .{ .op = .set_event, .object = object };
+        const canonical = canonicalSyncObject(self, object);
+        auditSyncOperation(self, message, canonical, .signal);
+        return .{ .op = .set_event, .object = canonical };
     }
     // The generic `d>`-level export trace prints `KeReleaseSemaphore(<ptr>, ...)`
     // on every call; the fork's own instrumentation prints the same shape at
     // `i>` level with the object named. Either way the pointer is the first hex
     // token after the open paren.
     if (std.mem.indexOf(u8, message, "KeReleaseSemaphore(") != null) {
-        const object = firstHexAfterOpenParen(message, "KeReleaseSemaphore(") orelse return null;
-        if (object == 0) return null;
+        const raw = firstHexAfterOpenParen(message, "KeReleaseSemaphore(") orelse return null;
+        if (raw == 0) return null;
+        const object = canonicalSyncObject(self, raw);
+        auditSyncOperation(self, message, object, .signal);
         return .{ .op = .release_semaphore, .object = object };
     }
     return null;
@@ -553,6 +655,202 @@ fn observeKernelVariableIndirection(self: anytype, ordinal: u16, slot_address: u
     if (gpu.kernel_variables.isUnimplementedSentinel(slot_value, ordinal)) return;
     const storage = readGuestConsoleDword(self, slot_value) orelse return;
     self.gpu_kernel_variables.observeStorage(which, storage);
+}
+
+/// Record code generation that failed and the demand that later needs it.
+///
+/// These two events are billions of steps apart and in different subsystems, so
+/// without a ledger joining them the crash is attributed to the resolver that
+/// found a null rather than to the emit that produced one. The reason — an
+/// Xbyak error code and its text — exists only at the failure, so it is
+/// captured there and carried forward.
+pub fn observeDeferredWork(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "deferred_work")) return;
+
+    // `X64Emitter: Xbyak error <reason> (code=N) finalizing guest function
+    //  <ADDR> — function left undefined`
+    if (std.mem.indexOf(u8, message, "function left undefined") != null) {
+        const marker = "finalizing guest function ";
+        if (std.mem.indexOf(u8, message, marker)) |at| {
+            const address = parseHexAfter(message, marker) orelse return;
+            _ = at;
+            const reason_start = std.mem.indexOf(u8, message, "Xbyak error ");
+            const reason: []const u8 = if (reason_start) |start| blk: {
+                const rest = message[start..];
+                const end = std.mem.indexOf(u8, rest, " finalizing") orelse rest.len;
+                break :blk rest[0..end];
+            } else "code generation failed";
+            self.deferred_work.noteFailed(
+                address,
+                deferred_work.Kind.guest_function_codegen,
+                reason,
+                self.executed_steps,
+            );
+            machoCapturePrint(
+                "macho-processor: DEFERRED WORK PREDICTOR: latent_failure id=0x{x} kind=guest_function_codegen reason='{s}' step={d}; the first demand re-attempts the translation once, so a transient failure can still recover; only a second failure is a decided crash whose trigger is any call to this address. {s}\n",
+                .{ address, reason, self.executed_steps, deferred_work.Kind.guest_function_codegen.consequence() },
+            );
+            // A caught exception that produced this failure is the ledger's
+            // original scenario — the unwinder completed and the handler
+            // abandoned the work it was protecting. Correlate here, at the
+            // failure site, rather than at the demand site where the window
+            // has long since closed: the crash lands at the *call* to the
+            // undefined function, far outside the exception correlation
+            // window. With the fork's retry repair, the first demand
+            // re-attempts the translation, so only a second failure is fatal
+            // — but the abandonment is still the origin of the chain.
+            if (comptime @hasField(@TypeOf(self.*), "guest_exceptions")) {
+                if (self.guest_exceptions.noteDeferredFailure(self.executed_steps)) |record| {
+                    machoCapturePrint(
+                        "macho-processor: GUEST EXCEPTION PREDICTOR: CAUGHT_THEN_DEFERRED type={s} code={d} site={s} thrown_at_step={d} deferred_at_step={d}; {s}\n",
+                        .{ record.name(), record.code, record.site(), record.first_step, self.executed_steps, record.outcome.meaning() },
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    // The resolver asserts without naming the address it wanted, so the demand
+    // is joined to the failure by kind rather than by identity.
+    if (std.mem.indexOf(u8, message, "ResolveFunction: (fn) != nullptr") != null) {
+        const suspects = self.deferred_work.noteUnaddressedDemand(
+            deferred_work.Kind.guest_function_codegen,
+            self.executed_steps,
+        );
+        // A terminal event close behind an exception is what promotes a clean
+        // catch to a suspect. The distance between them is the whole of the
+        // evidence, so the correlation is left to the ledger's window rather
+        // than asserted here.
+        if (comptime @hasField(@TypeOf(self.*), "guest_exceptions")) {
+            if (self.guest_exceptions.noteTerminal(self.executed_steps)) |record| {
+                machoCapturePrint(
+                    "macho-processor: GUEST EXCEPTION PREDICTOR: CAUGHT_THEN_TERMINAL type={s} code={d} site={s} thrown_at_step={d} terminal_at_step={d}; {s}\n",
+                    .{ record.name(), record.code, record.site(), record.first_step, self.executed_steps, record.outcome.meaning() },
+                );
+            }
+        }
+        if (suspects == 0) return;
+        if (self.deferred_work.unambiguousSuspect(deferred_work.Kind.guest_function_codegen)) |item| {
+            machoCapturePrint(
+                "macho-processor: DEFERRED WORK PREDICTOR: FAILED_THEN_DEMANDED id=0x{x} reason='{s}' failed_at_step={d} demanded_at_step={d}; the resolver did not name the address it wanted and exactly one translation had failed, so the attribution is unambiguous. This crash belongs to that failure, not to the resolver\n",
+                .{ item.id, item.reason(), item.deferred_step, self.executed_steps },
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: DEFERRED WORK PREDICTOR: FAILED_THEN_DEMANDED suspects={d} demanded_at_step={d}; the resolver did not name the address it wanted and more than one translation had failed, so every failed translation listed above is a suspect and none can be singled out\n",
+                .{ suspects, self.executed_steps },
+            );
+        }
+    }
+}
+
+/// Record a subsystem that failed to come up, and the thread exit that makes
+/// the failure permanent.
+///
+/// The emulator logs the reason, returns false, and its thread exits — all
+/// correct, all silent from outside. Everything that was going to wait on that
+/// subsystem then waits on something nothing will ever signal, and the run
+/// settles into a steady spin with no error anywhere near the symptom.
+pub fn observeBringupFailure(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "bringup_failures")) return;
+    if (bringup_failure.classifyLine(message)) |subsystem| {
+        const before = self.bringup_failures.count;
+        self.bringup_failures.noteFailure(subsystem, message, self.executed_steps);
+        if (self.bringup_failures.count != before) machoCapturePrint(
+            "macho-processor: BRINGUP FAILURE: subsystem={s} step={d} reason='{s}'; {s}\n",
+            .{ subsystem.label(), self.executed_steps, message, subsystem.blocks() },
+        );
+        return;
+    }
+    // A thread exit is what turns "may still recover" into "cannot". The
+    // emulator names the thread, so the subsystem is recoverable from it.
+    if (std.mem.indexOf(u8, message, "Thread is now exiting") != null or
+        std.mem.indexOf(u8, message, "[ThreadExit]") != null)
+    {
+        if (std.mem.indexOf(u8, message, "GPU Command") != null or
+            std.mem.indexOf(u8, message, "01000010") != null)
+        {
+            self.bringup_failures.noteThreadExit(.gpu_command_processor);
+        }
+    }
+}
+
+/// Learn that the Xenos register aperture is reachable.
+///
+/// The emulator states this directly — `MMIO handler probe CP_RB_BASE
+/// addr=7FC80700 handler_registered=YES` — and it is the only evidence that
+/// exists, because the aperture's pages are unreadable by design and a title
+/// that programs its GPU through kernel exports never stores to them. Waiting
+/// for a guest store to prove reachability conflates "could a store arrive"
+/// with "did one", and the first is the precondition.
+pub fn observeRegisterApertureReachability(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_register_aperture_reachable")) return;
+    if (self.gpu_register_aperture_reachable) return;
+    if (std.mem.indexOf(u8, message, "handler_registered=YES") == null) return;
+    if (std.mem.indexOf(u8, message, "MMIO handler probe") == null and
+        std.mem.indexOf(u8, message, "MMIO protection invariant") == null) return;
+    self.gpu_register_aperture_reachable = true;
+    machoCapturePrint(
+        "macho-processor: GPU PRE-INITIALIZATION: the Xenos register aperture is reachable — the emulator has registered a handler for its pages, so a store that arrives is dispatched rather than lost. This is reachability, not usage: a title programming its GPU through kernel exports never stores here\n",
+        .{},
+    );
+}
+
+/// Learn guest synchronisation objects and who raises them.
+///
+/// The guest's own wait logging omits the object, so a guest-side wait-for graph
+/// cannot be built from waits. Notifications do carry an object, and knowing
+/// which objects are raised at all is what separates "nobody ever signalled
+/// this" from "the signal is late".
+pub fn observeGuestSyncObjects(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "deadlock_predictor")) return;
+
+    // Fed here rather than only at checkpoint time: the base is what validates
+    // every stated pair, and a pair accepted before it is known was accepted on
+    // the word of a line that may have been spliced.
+    if (comptime @hasField(State, "sync_object_identity")) {
+        if (self.xenia_memory_views.ready()) {
+            self.sync_object_identity.observeMappingBase(self.xenia_memory_views.mapping_base);
+        }
+        // `StashHandle: header=0x38d854bf4, handle=F8000154` is an untruncated
+        // 64-bit address next to the handle the title itself uses. It survives
+        // splicing that the eight-digit fields do not, so it is the most
+        // trustworthy identity channel in the log.
+        if (std.mem.indexOf(u8, message, "StashHandle: header=")) |_| {
+            const header = parseHex64After(message, "StashHandle: header=") orelse 0;
+            const handle = parseFixedWidthHexAfter(message, "handle=", sync_object_field_width) orelse 0;
+            self.sync_object_identity.observeHandleHeader(header, handle);
+        }
+    }
+    if (std.mem.indexOf(u8, message, "xeKeSetEvent:") != null) {
+        const object = canonicalSyncObject(self, parseHexAfter(message, "ptr=") orelse return);
+        self.deadlock_predictor.observeNotify(
+            object,
+            deadlock_predictor.ObjectKind.event,
+            self.active_guest_thread,
+            self.executed_steps,
+        );
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "KeReleaseSemaphore(") != null) {
+        const object = canonicalSyncObject(self, parseHexAfter(message, "KeReleaseSemaphore(") orelse return);
+        self.deadlock_predictor.observeNotify(
+            object,
+            deadlock_predictor.ObjectKind.semaphore,
+            self.active_guest_thread,
+            self.executed_steps,
+        );
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "NtCreateSemaphore(") != null) {
+        const object = canonicalSyncObject(self, parseHexAfter(message, "NtCreateSemaphore(") orelse return);
+        self.deadlock_predictor.observeObject(object, deadlock_predictor.ObjectKind.semaphore);
+    }
 }
 
 /// Join the emulator's callback-missing import probe into the binding ledger.
@@ -1163,6 +1461,43 @@ fn observeRingWritePointer(self: anytype, message: []const u8) void {
     }
 }
 
+/// A hex field the emulator prints at a fixed width, refused when it is short.
+///
+/// The emulator's logging is not line-atomic under this runtime, so lines
+/// splice: `obj_ptr=D001EC14` arrives as `obj_ptr=D001EC`, `obj_ptr=D001E0`, or
+/// even `obj_ptr=D`. Parsed leniently, each truncation becomes a *different*
+/// object address, and the predictors then report phantom objects nobody can
+/// find — the observed run produced `0xd001ec` and `0xd001e0` alongside the
+/// real `0xd001ec14` and gave all three their own recurrence counters.
+///
+/// The emulator formats these with an eight-digit specifier, so a shorter token
+/// is a truncated read by definition. That is a precise rule rather than a
+/// heuristic, which is why the field width is the thing checked.
+fn parseFixedWidthHexAfter(line: []const u8, marker: []const u8, width: usize) ?u32 {
+    const index = std.mem.indexOf(u8, line, marker) orelse return null;
+    var text = line[index + marker.len ..];
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) text = text[2..];
+    var length: usize = 0;
+    while (length < text.len and std.ascii.isHex(text[length])) : (length += 1) {}
+    if (length != width) return null;
+    return std.fmt.parseInt(u32, text[0..width], 16) catch null;
+}
+
+/// Width of the object-pointer fields in the emulator's synchronisation logging.
+const sync_object_field_width: usize = 8;
+
+/// A hex value of any width, up to 64 bits. Used for host addresses the
+/// emulator prints untruncated, which the 32-bit reader would silently mangle.
+fn parseHex64After(line: []const u8, marker: []const u8) ?u64 {
+    const index = std.mem.indexOf(u8, line, marker) orelse return null;
+    var text = line[index + marker.len ..];
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) text = text[2..];
+    var length: usize = 0;
+    while (length < text.len and length < 16 and std.ascii.isHex(text[length])) : (length += 1) {}
+    if (length == 0) return null;
+    return std.fmt.parseInt(u64, text[0..length], 16) catch null;
+}
+
 fn parseHexAfter(line: []const u8, marker: []const u8) ?u32 {
     const index = std.mem.indexOf(u8, line, marker) orelse return null;
     var text = line[index + marker.len ..];
@@ -1232,6 +1567,12 @@ fn observeRingBufferAddress(self: anytype, message: []const u8) void {
 pub fn observeXeniaPipelineGuestLog(self: anytype, message: []const u8) void {
     const observation = self.xenia_pipeline.observeLine(message, self.executed_steps) orelse return;
     if (!observation.first_observation) return;
+
+    // Reaching a new pipeline stage is the run demonstrably making progress,
+    // which is the only evidence that a handler did more than log and abandon.
+    if (comptime @hasField(@TypeOf(self.*), "guest_exceptions")) {
+        self.guest_exceptions.noteProgress(self.executed_steps);
+    }
 
     const spec = @import("diagnostics").xenia_pipeline_contracts.spec(observation.stage);
     // Structural progress settles every anomaly that came before it: the run

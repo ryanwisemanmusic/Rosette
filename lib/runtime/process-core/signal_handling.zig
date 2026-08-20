@@ -36,6 +36,14 @@ const GuestSignalFrame = @import("macho_core").types.GuestSignalFrame;
 const GuestAccess = @import("macho_core").types.GuestAccess;
 const memory_access = @import("memory_access.zig");
 const recovery_ledger = @import("ownership").ledger;
+const GuestAssertionContext = @import("macho_core").types.GuestAssertionContext;
+
+fn assertionContextForFault(self: anytype, fault_rip: u64) GuestAssertionContext {
+    if (self.last_guest_assertion.relevant(self.active_guest_thread, self.executed_steps, fault_rip)) {
+        return self.last_guest_assertion;
+    }
+    return .{};
+}
 
 pub fn handleSigaction(self: anytype) u64 {
     const signal_index = guestSignalIndex(self.regs.rdi) orelse return signalFailureResult();
@@ -85,6 +93,7 @@ pub fn deliverGuestSignal(
         machoCapturePrint("macho-processor: guest ignored signal {d} at rip=0x{x}\n", .{ signal, fault_rip });
         return true;
     }
+    const assertion_context = assertionContextForFault(self, fault_rip);
     if (action.flags & SA_NODEFER == 0 and self.signalIsActive(signal)) {
         if (signal != GUEST_SIGILL) return false;
         self.regs.rip = fault_rip +% instruction_len;
@@ -92,7 +101,11 @@ pub fn deliverGuestSignal(
             "macho-processor: deferred recursive guest signal {d} at rip=0x{x}; outer handler remains active\n",
             .{ signal, fault_rip },
         );
-        if (self.last_guest_assertion_class == .breakpoint_untracked_thread) {
+        const outer_assertion = if (self.signal_frame_count != 0)
+            self.signal_frames[self.signal_frame_count - 1].assertion_context
+        else
+            assertion_context;
+        if (outer_assertion.class == .breakpoint_untracked_thread) {
             machoCapturePrint(
                 "macho-processor: recursive signal provenance: Processor::OnThreadBreakpointHit asserted because the active modeled thread was absent from Xenia's debugger registry; this nested UD2 is handler fallout, not a second independent backend failure\n",
                 .{},
@@ -131,7 +144,12 @@ pub fn deliverGuestSignal(
     frame.fault_access = fault_access;
     frame.fault_width = fault_width;
     frame.fault_instruction = fault_instruction;
-    frame.assertion_class = self.last_guest_assertion_class;
+    frame.assertion_context = assertion_context;
+    frame.saved_assertion_context = self.last_guest_assertion;
+    frame.saved_xmm = self.xmm;
+    frame.saved_ymm_hi = self.ymm_hi;
+    frame.saved_k = self.k;
+    frame.saved_x87 = self.x87;
     self.signal_frame_count += 1;
     self.push(GUEST_SIGNAL_RETURN_SENTINEL);
     if (self.terminated) {
@@ -151,8 +169,8 @@ pub fn deliverGuestSignal(
     const backend_correlated = self.backend_diagnostics.signalCorrelates(self.executed_steps, fault_rip);
     if (backend_correlated) self.backend_diagnostics.noteSignalDelivery();
     machoCapturePrint(
-        "macho-processor: delivered guest signal {d} to 0x{x}; fault_rip=0x{x} fault_address=0x{x} access={s} siginfo=0x{x} ucontext=0x{x}\n",
-        .{ signal, action.handler, fault_rip, fault_address, if (fault_access) |access| @tagName(access) else "instruction", frame.siginfo, frame.ucontext },
+        "macho-processor: delivered guest signal {d} to 0x{x}; fault_rip=0x{x} fault_address=0x{x} access={s} assertion={s} assertion_thread=0x{x} siginfo=0x{x} ucontext=0x{x}\n",
+        .{ signal, action.handler, fault_rip, fault_address, if (fault_access) |access| @tagName(access) else "instruction", @tagName(assertion_context.class), assertion_context.thread, frame.siginfo, frame.ucontext },
     );
     if (backend_correlated) {
         machoCapturePrint(
@@ -160,19 +178,47 @@ pub fn deliverGuestSignal(
             .{ signal, fault_rip, @tagName(self.backend_diagnostics.last_backend_assertion_binding), self.backend_diagnostics.last_backend_assertion_rip, self.executed_steps -| self.backend_diagnostics.last_backend_assertion_step },
         );
     }
-    const assertion_distance = if (fault_rip >= self.last_guest_assertion_return)
-        fault_rip - self.last_guest_assertion_return
-    else
-        self.last_guest_assertion_return - fault_rip;
-    if (self.last_guest_assertion_class != .none and
-        self.executed_steps -| self.last_guest_assertion_step <= 4096 and
-        assertion_distance <= 16)
-    {
+    if (assertion_context.valid) {
+        const assertion_distance = if (fault_rip >= assertion_context.return_address)
+            fault_rip - assertion_context.return_address
+        else
+            assertion_context.return_address - fault_rip;
         machoCapturePrint(
-            "macho-processor: guest signal assertion provenance: signal={d} fault_rip=0x{x} assertion={s} assertion_return=0x{x} address_delta={d} step_delta={d}\n",
-            .{ signal, fault_rip, @tagName(self.last_guest_assertion_class), self.last_guest_assertion_return, assertion_distance, self.executed_steps -| self.last_guest_assertion_step },
+            "macho-processor: guest signal assertion provenance: signal={d} fault_rip=0x{x} assertion={s} assertion_thread=0x{x} assertion_return=0x{x} address_delta={d} step_delta={d}\n",
+            .{ signal, fault_rip, @tagName(assertion_context.class), assertion_context.thread, assertion_context.return_address, assertion_distance, self.executed_steps -| assertion_context.step },
         );
     }
+    return true;
+}
+
+/// Deliver a signal raised by the guest's `raise()` import rather than by an
+/// instruction fault. The normal signal path saves the import thunk's current
+/// context; patch the saved RIP/RSP to the import's return address so a handler
+/// returning through the guest signal trampoline resumes *after* `raise()` and
+/// does not re-enter the thunk or leave its return address on the stack.
+pub fn deliverRaisedGuestSignal(self: anytype, signal: u8, return_address: u64) bool {
+    const frame_count_before = self.signal_frame_count;
+    const import_rsp = self.regs.rsp;
+    if (!deliverGuestSignal(
+        self,
+        signal,
+        self.regs.rip,
+        0,
+        self.regs.rip,
+        null,
+        0,
+        "raise",
+    )) return false;
+
+    // SIG_IGN was handled without creating a frame; raise() still succeeds.
+    if (self.signal_frame_count == frame_count_before) return true;
+    const frame = &self.signal_frames[self.signal_frame_count - 1];
+    const bytes = self.guestMemory(frame.mcontext, DARWIN_MCONTEXT_SIZE) orelse return false;
+    var resume_regs = self.regs;
+    if (!readDarwinMcontext(bytes, &resume_regs)) return false;
+    resume_regs.rip = return_address;
+    resume_regs.rsp = import_rsp +% @sizeOf(u64);
+    writeDarwinMcontext(bytes, resume_regs, 6, 0, 0);
     return true;
 }
 
@@ -246,6 +292,14 @@ pub fn finishGuestSignalReturn(self: anytype) bool {
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.invalid_control_flow_target);
         return false;
     }
+    // A handler is allowed to use the full machine state. Restore the exact
+    // pre-signal vector, mask, x87, and assertion context rather than letting
+    // handler work leak into the interrupted guest thread.
+    self.xmm = frame.saved_xmm;
+    self.ymm_hi = frame.saved_ymm_hi;
+    self.k = frame.saved_k;
+    self.x87 = frame.saved_x87;
+    self.last_guest_assertion = frame.saved_assertion_context;
     const fault_bytes = self.guestMemoryConst(frame.fault_rip, frame.instruction_len) orelse &.{};
     // A SIGSEGV handler that returns with RIP unchanged is not necessarily
     // stuck: for a *protection* fault that is the whole protocol. The

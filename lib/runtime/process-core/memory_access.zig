@@ -2243,6 +2243,16 @@ fn observeRegisterApertureAccess(self: anytype, address: u64, access: GuestAcces
         self.active_guest_thread,
         self.executed_steps,
     );
+    // A delivered store is the point at which the emulator's register
+    // handler accepted the write.  Keep a backend-neutral mirror as well so
+    // the Xenos PM4/state path can explain draws that were preceded by direct
+    // MMIO programming rather than by a type-0 ring packet.  This mirror never
+    // makes an undelivered fault look successful.
+    if (delivered and access == .write and address % device_tree.gpu.xenos.register_stride == 0) {
+        if (device_tree.gpu.xenos.registerIndexOf(device_tree.gpu.xenos.register_aperture_base + offset)) |register| {
+            self.gpu_xenos_runtime.observeRegisterWrite(@intCast(register), @truncate(storedValueForFault(self)));
+        }
+    }
 }
 
 /// The value a faulting store was trying to write, when the instruction form
@@ -3573,6 +3583,15 @@ noinline fn recoverScalarReadFault(self: anytype, addr: u64, bytes: u8) ScalarRe
 pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     const State = @TypeOf(self.*);
     const bytes = bytesForSize(size);
+    // Xenos register pages are intentionally no-access in the guest mapping.
+    // Service a direct load from the same register file used by PM4 before the
+    // ordinary sparse/linear-memory probes turn it into a protection fault.
+    // This preserves the hardware-facing contract for polling code without
+    // making the aperture an ordinary writable memory region.
+    if (readXenosRegister(self, addr, size)) |value| {
+        observeDirectXenosRegisterAccess(self, value.guest_address, false, value.value);
+        return value.value;
+    }
     // Sparse mappings live outside the contiguous Mach-O image.  The memory
     // manager already knows how to read them, so don't require an unrelated
     // main-image offset before dispatching the read.  Writes have always
@@ -3636,6 +3655,65 @@ pub fn readMemVal(self: anytype, addr: u64, size: Size) u64 {
     }
     if (memoryTraceWanted(self)) recordMemoryAccess(self, effective_address, size, "read", value);
     return value;
+}
+
+const XenosRegisterRead = struct {
+    guest_address: u64,
+    value: u64,
+};
+
+/// Resolve either a console virtual Xenos aperture address or the host address
+/// of the same mapped aperture back to its dword register stream. The latter
+/// form is needed only for paths that are already operating on a translated
+/// host fault address; normal interpreter loads use the former.
+fn readXenosRegister(self: anytype, address: u64, size: Size) ?XenosRegisterRead {
+    const State = @TypeOf(self.*);
+    const byte_count: u64 = bytesForSize(size);
+    var guest_address: ?u64 = if (device_tree.gpu.xenos.registerApertureContains(address)) address else null;
+    if (guest_address == null) {
+        if (comptime !@hasField(State, "xenia_memory_views")) return null;
+        const host_base = self.xenia_memory_views.virtualHostAddress(
+            device_tree.gpu.xenos.register_aperture_base,
+        ) orelse return null;
+        if (address < host_base) return null;
+        const offset = address - host_base;
+        if (offset >= device_tree.gpu.xenos.register_aperture_size) return null;
+        guest_address = device_tree.gpu.xenos.register_aperture_base + offset;
+    }
+    const guest = guest_address.?;
+    const offset = guest - device_tree.gpu.xenos.register_aperture_base;
+    if (offset +| byte_count > device_tree.gpu.xenos.register_aperture_size) return null;
+    if (comptime !@hasField(State, "gpu_xenos_runtime")) return null;
+
+    var value: u64 = 0;
+    var byte_index: u64 = 0;
+    while (byte_index < byte_count) : (byte_index += 1) {
+        const dword_offset = offset + byte_index;
+        const register = device_tree.gpu.xenos.registerIndexOf(
+            device_tree.gpu.xenos.register_aperture_base + (dword_offset & ~@as(u64, 3)),
+        ) orelse return null;
+        const dword = self.gpu_xenos_runtime.readRegister(@intCast(register));
+        const shift: u5 = @intCast((dword_offset & 3) * 8);
+        value |= (@as(u64, (dword >> shift) & 0xFF)) << @as(u6, @intCast(byte_index * 8));
+    }
+    return .{ .guest_address = guest, .value = value };
+}
+
+fn observeDirectXenosRegisterAccess(self: anytype, address: u64, is_write: bool, value: u64) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "gpu_register_aperture")) return;
+    self.gpu_register_aperture.observe(
+        address,
+        is_write,
+        value,
+        .delivered,
+        self.regs.rip,
+        self.active_guest_thread,
+        self.executed_steps,
+    );
+    if (comptime @hasField(State, "gpu_register_aperture_reachable")) {
+        self.gpu_register_aperture_reachable = true;
+    }
 }
 
 fn readSized(storage: []const u8, size: Size) u64 {
