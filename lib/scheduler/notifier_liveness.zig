@@ -107,6 +107,10 @@ pub const Object = struct {
     last_notify_thread: u64 = 0,
     last_notify_pc: u64 = 0,
     first_wait_step: u64 = 0,
+    /// Bounded spurious wakes granted by the runtime so a waiter can re-check
+    /// its predicate. A count above zero plus a still-parked waiter means the
+    /// predicate is genuinely unsatisfied, not merely unwoken.
+    repair_attempts: u32 = 0,
     /// Threads that can still run: not waiting on this object, not finished.
     /// Supplied by the caller because only the scheduler knows.
     pub fn waiterCount(self: Object) u32 {
@@ -189,6 +193,31 @@ pub const Graph = struct {
         object.last_notify_step = step;
         object.last_notify_thread = thread;
         object.last_notify_pc = pc;
+    }
+
+    /// The never-notified object whose waiters have been stuck longest.
+    ///
+    /// Deliberately *not* `worstObject`: that ranks `observed_notifiers_parked`
+    /// above `never_notified` for the report, but only never-notified waiters
+    /// have the lost-wakeup repair. The report's worst object and the repair's
+    /// target are different questions, and letting one starve the other would
+    /// strand a repairable waiter behind a more severe-looking (but
+    /// unrepairable) one. The stall gate lives here so a caller cannot fire
+    /// the repair on a wait that has not been watched long enough.
+    pub fn worstNeverNotifiedObject(self: *Graph, current_step: u64, stall_steps: u64) ?*Object {
+        var worst: ?*Object = null;
+        var worst_age: u64 = 0;
+        for (self.objects[0..self.count]) |*object| {
+            if (!object.active) continue;
+            if (classify(object.*, current_step, stall_steps) != .never_notified) continue;
+            const age = current_step -| object.first_wait_step;
+            if (age < stall_steps) continue;
+            if (worst == null or age > worst_age) {
+                worst = object;
+                worst_age = age;
+            }
+        }
+        return worst;
     }
 
     /// The object most worth reporting: the one whose waiters are most stuck.
@@ -317,6 +346,26 @@ test "an untracked notifier remains real without a fabricated liveness verdict" 
     try std.testing.expectEqual(@as(u32, 0), object.notifierCount());
     try std.testing.expectEqual(@as(u64, 0xffff_f900_0000_0004), object.last_notify_thread);
     try std.testing.expectEqual(Progress.untracked_notifier_stale, classify(object.*, default_stall_steps + 101, default_stall_steps));
+}
+
+// The repair targets never-notified waiters specifically. An object whose
+// observed notifiers are all parked outranks one for the *report*, but has no
+// repair; the repair selector must not be starved by it.
+test "the repair selector ignores objects that outrank it for the report" {
+    var graph = Graph{};
+    // Never-notified waiter, stalled long past the gate.
+    graph.noteWait(0x15cd8140, 11, 100);
+    // Observed-notifiers-parked object (notifier parked on it), newer.
+    graph.noteNotify(0x19ad668, 7, 0xbb, 0, 5_000_000);
+    graph.noteWait(0x19ad668, 7, 5_000_100);
+
+    const for_report = graph.worstObject(10_000_000_000, default_stall_steps).?;
+    try std.testing.expectEqual(@as(u64, 0x19ad668), for_report.address);
+    const for_repair = graph.worstNeverNotifiedObject(10_000_000_000, default_stall_steps).?;
+    try std.testing.expectEqual(@as(u64, 0x15cd8140), for_repair.address);
+    // A never-notified wait that has not been watched long enough is not
+    // eligible for the repair yet.
+    try std.testing.expect(graph.worstNeverNotifiedObject(10_000_000, default_stall_steps) == null);
 }
 
 // The stronger lead outranks a long wait so it is not buried.
