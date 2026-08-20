@@ -47,6 +47,14 @@ const xenia_pipeline = @import("diagnostics").xenia_pipeline;
 const xenia_gpu_handoff = @import("diagnostics").xenia_gpu_handoff;
 const xenia_memory_views = @import("diagnostics").xenia_memory_views;
 const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
+const deadlock_predictor = @import("diagnostics").deadlock_predictor;
+const deferred_work = @import("diagnostics").deferred_work;
+const guest_exception_ledger = @import("diagnostics").guest_exception_ledger;
+const sync_object_identity = @import("diagnostics").sync_object_identity;
+const wait_audit = @import("diagnostics").wait_audit;
+const host_contract_coverage = @import("diagnostics").host_contract_coverage;
+const stall_release = @import("diagnostics").stall_release;
+const bringup_failure = @import("diagnostics").bringup_failure;
 const event_identity = @import("diagnostics").event_identity;
 const execution_tracepoints = @import("diagnostics").execution_tracepoints;
 const anomaly_ledger = @import("diagnostics").anomaly_ledger;
@@ -284,7 +292,6 @@ const ProfileAccountFlow = types.ProfileAccountFlow;
 const MAX_IDLE_CALLBACKS = types.MAX_IDLE_CALLBACKS;
 const IDLE_CALLBACK_HANDLE_BASE = types.IDLE_CALLBACK_HANDLE_BASE;
 const MAX_SUSPENDED_GUEST_THREADS = types.MAX_SUSPENDED_GUEST_THREADS;
-const GuestAssertionClass = types.GuestAssertionClass;
 const classifyGuestAssertion = types.classifyGuestAssertion;
 const timerQueueStateName = types.timerQueueStateName;
 const idleQueueSnapshotFor = types.idleQueueSnapshotFor;
@@ -399,9 +406,10 @@ pub const MachOState = struct {
     contract_verification: bool = false,
     max_steps: u64 = 0,
     guest_assertion_count: u64 = 0,
-    last_guest_assertion_class: GuestAssertionClass = .none,
-    last_guest_assertion_step: u64 = 0,
-    last_guest_assertion_return: u64 = 0,
+    /// Assertion provenance belongs to the active guest context. It is
+    /// snapshotted with registers when cooperative scheduling parks a thread,
+    /// so a later UD2 cannot inherit another thread's assertion.
+    last_guest_assertion: types.GuestAssertionContext = .{},
     atomic_cmpxchg: atomic_compare_exchange.Stats = .{},
     timer_queue_watch: struct {
         active: bool = false,
@@ -782,12 +790,48 @@ pub const MachOState = struct {
     /// every authentic counter in the subsystem, permanently: a frame the
     /// harness caused must never be summable with one the title caused.
     gpu_swap_substitution: gpu.SubstitutionLedger = .{},
+    /// Execution truth for the same substitution: what the synthetic queue
+    /// actually wrote into the published ring, as opposed to what the decision
+    /// layer authorised. See `lib/gpu/ring_injection.zig`. The packet lands in
+    /// ring memory the emulator reads; advancing the emulator's own write
+    /// pointer register is the one part no memory write can reach, and the
+    /// ledger and log line name that boundary out loud.
+    gpu_ring_injection: gpu.RingInjection = .{},
     /// The front buffer the most recent swap packet named, if the ring has ever
     /// held one. This is the only place a console-side frame's address, extent
     /// and format are all stated at once, so it is what a harness present path
     /// has to read.
     gpu_frontbuffer: ?gpu.Pm4SwapDescription = null,
     gpu_ring_scan_reports: u64 = 0,
+    /// Stateful Xenos PM4 execution derived from the guest's readable ring.
+    /// This does not advance CP_RPTR or manufacture a submission; it is the
+    /// backend-neutral state machine that a real Vulkan command recorder can
+    /// consume once the guest publishes a batch.
+    gpu_xenos_runtime: gpu.XenosRuntime = .{},
+    /// Lazy, process-owned Xenos EDRAM backing.  It is allocated after the
+    /// Mach-O state exists so a run that never reaches GPU setup pays no inline
+    /// struct cost, while every live PM4 runtime still has a real resolve store.
+    gpu_xenos_edram: []u8 = &.{},
+    /// Reusable linear RGBA8 target for the backend-neutral EDRAM resolve.
+    /// This remains separate from the guest front buffer until a non-zero
+    /// resolve exists, so an incomplete shader path cannot erase title pixels.
+    gpu_xenos_resolve_scratch: []u8 = &.{},
+    gpu_xenos_last_ring_epoch: u64 = std.math.maxInt(u64),
+    /// Guest-owned callback installed by VdSetGraphicsInterruptCallback.
+    /// PM4 completion is queued into the cooperative scheduler; it is never
+    /// invoked from the ring decoder's synchronous memory walk.
+    gpu_interrupt_callback: u64 = 0,
+    gpu_interrupt_callback_arg: u64 = 0,
+    gpu_interrupt_callback_registrations: u64 = 0,
+    gpu_interrupt_dispatches: u64 = 0,
+    gpu_interrupt_dispatch_failures: u64 = 0,
+    /// Persistent system command buffer returned by VdGetSystemCommandBuffer.
+    /// Xenia's Mac video layer allocates this from the physical system heap
+    /// and reuses it for the lifetime of the graphics system. Keeping the
+    /// address in Mach-O state makes repeated imports idempotent and prevents
+    /// a retry from exposing a different command buffer to the guest.
+    gpu_system_command_buffer: u64 = 0,
+    gpu_system_command_buffer_size: u64 = 0,
     /// Whether a draw packet has ever been found in ring memory. Latched: a
     /// drained ring holds an empty span, so a title that rendered a frame and
     /// had it consumed is indistinguishable through the pointers alone from one
@@ -835,6 +879,57 @@ pub const MachOState = struct {
     /// working handshake from a spin that looks like a stall in whichever
     /// subsystem the loop belongs to.
     guest_wait_liveness: guest_wait_liveness.Ledger = .{},
+    /// Threads that will never wake, and who was supposed to wake them. See
+    /// `lib/diagnostics/deadlock_predictor.zig`. A livelock burns CPU making no
+    /// progress and a deadlock burns nothing, so the detector that finds one is
+    /// structurally blind to the other: a parked thread emits no log lines and
+    /// is invisible to every heuristic built on activity.
+    deadlock_predictor: deadlock_predictor.Ledger = .{},
+    /// Work that was deferred because it failed, and the demand that later
+    /// needs it. See `lib/diagnostics/deferred_work.zig`. The two events are
+    /// billions of steps apart, so without this the crash is attributed to the
+    /// resolver that found a null rather than to the emit that produced one.
+    deferred_work: deferred_work.Ledger = .{},
+    /// One synchronisation object, one identity, however many address spaces
+    /// name it. See `lib/diagnostics/sync_object_identity.zig`. The emulator
+    /// prints `obj_ptr=` (host) and `guest_obj=` (console) for the same object
+    /// and other lines print only one of them, so without this an object waited
+    /// on through one name and signalled through the other is counted as two —
+    /// which is exactly the scatter of one-count predictor entries a stalled
+    /// run produces.
+    sync_object_identity: sync_object_identity.Table = .{},
+    /// Whether each repeating wait is a problem or the system working, and the
+    /// audit for the ones that are problems. See `lib/diagnostics/wait_audit.zig`.
+    /// Every predictor here detects a *pattern*, and patterns are what healthy
+    /// systems are made of — an audio pump and a wedged rotation are the same
+    /// pattern. What separates them is whether anything else in the run moved,
+    /// which is what this holds.
+    wait_audit: wait_audit.Ledger = .{},
+    /// How much of the capability surface the emulator needs from this host
+    /// actually works. See `lib/diagnostics/host_contract_coverage.zig`. Every
+    /// other diagnostic here is a microscope; this is the one that answers "how
+    /// far along is this" instead of "what is the frontier of the one ladder
+    /// this subsystem watches".
+    host_coverage: host_contract_coverage.Ledger = .{},
+    /// Bounded releases of waits nobody will ever satisfy, and what each one
+    /// proved. See `lib/diagnostics/stall_release.zig`. A parked thread on a
+    /// never-signalled object is either a lost wakeup (this runtime's defect)
+    /// or an unsatisfied predicate (the guest's), and nothing distinguishes
+    /// them from outside — one spurious wake does, because a correct waiter
+    /// re-checks its predicate on return.
+    stall_release: stall_release.Ledger = .{},
+    /// Subsystems that failed to come up, and whether the run stopped moving
+    /// afterwards. See `lib/diagnostics/bringup_failure.zig`. A subsystem that
+    /// fails takes its thread with it, and everything waiting on that thread
+    /// then waits for the rest of the run — the hang is downstream and the
+    /// cause is thousands of log lines earlier.
+    bringup_failures: bringup_failure.Ledger = .{},
+    /// Whether the emulator has registered a handler for the Xenos register
+    /// aperture's pages. The only evidence reachability can have: the pages are
+    /// unreadable by design, and a title that programs its GPU through kernel
+    /// exports never stores to them, so waiting for a guest store proves
+    /// nothing about whether one *could* arrive.
+    gpu_register_aperture_reachable: bool = false,
     /// Guest `KeSetEvent` calls that found their event already signalled,
     /// against the total observed. A wait that does not consume its signal
     /// never blocks, and every producer/consumer handshake above it free-runs
@@ -905,6 +1000,12 @@ pub const MachOState = struct {
     symbol_assembly: symbol_assembly_context.Tracker,
     symbol_assembly_catalog: ?symbol_assembly_context.Catalog = null,
     cxx_exceptions: cxx_exception_diagnostics.Tracker = .{},
+    /// Whether catching a guest C++ exception actually recovered anything. See
+    /// `lib/diagnostics/guest_exception_ledger.zig`. "Caught" describes the
+    /// unwinder, not the program: a handler that logs a failure and abandons
+    /// the work it was doing has handled the exception perfectly and left
+    /// something downstream to dereference a null.
+    guest_exceptions: guest_exception_ledger.Ledger = .{},
     spirv_cross: spirv_cross_diagnostics.Tracker = .{},
     unwinder: itanium_unwinder.Engine = .{},
     dynamic_casts: itanium_dynamic_cast.Engine = .{},
@@ -1163,6 +1264,9 @@ pub const MachOState = struct {
             .executable_max = executable_max,
         };
         errdefer result.deinit();
+        result.gpu_xenos_edram = try allocator.alloc(u8, gpu.edram.size_bytes);
+        @memset(result.gpu_xenos_edram, 0);
+        result.gpu_xenos_runtime.attachEdram(result.gpu_xenos_edram);
         for (result.segments) |segment| {
             const kind: memory_provenance.RegionKind = if (segment.initprot & 0x04 != 0)
                 .macho_text
@@ -1422,6 +1526,8 @@ pub const MachOState = struct {
         if (self.symbol_assembly_catalog) |*catalog| catalog.deinit();
         self.symbol_assembly.deinit();
         self.allocator.free(self.page_permissions);
+        if (self.gpu_xenos_resolve_scratch.len != 0) self.allocator.free(self.gpu_xenos_resolve_scratch);
+        if (self.gpu_xenos_edram.len != 0) self.allocator.free(self.gpu_xenos_edram);
         self.initializer_memory.deinit();
         self.allocator.free(self.decode_cache);
         self.allocator.destroy(self.decode_cache_pages);
@@ -2141,14 +2247,19 @@ pub const MachOState = struct {
             notifier_liveness.default_stall_steps,
         );
         const notifier_symbol = self.metadata.nearestSymbol(object.last_notify_pc);
+        // A granted repair that ended in a re-park is a stronger statement
+        // than "nobody ever signalled it": the waiter's predicate was checked
+        // and found false, so this is a guest-side deadlock, not a lost wake.
+        const repaired = object.repair_attempts != 0;
         machoCapturePrint(
-            "macho-processor: NOTIFIER LIVENESS: object=0x{x} state={s} waiters={d} distinct_notifiers={d} notifications={d} steps_since_notify={d} waiting_since_step={d} last_notify(step={d} thread=0x{x} pc=0x{x} symbol={s}+0x{x})\n",
+            "macho-processor: NOTIFIER LIVENESS: object=0x{x} state={s} waiters={d} distinct_notifiers={d} notifications={d} repairs={d} steps_since_notify={d} waiting_since_step={d} last_notify(step={d} thread=0x{x} pc=0x{x} symbol={s}+0x{x})\n",
             .{
                 object.address,
                 progress.label(),
                 object.waiterCount(),
                 object.notifierCount(),
                 object.notifications,
+                object.repair_attempts,
                 self.executed_steps -| object.last_notify_step,
                 object.first_wait_step,
                 object.last_notify_step,
@@ -2158,7 +2269,42 @@ pub const MachOState = struct {
                 if (notifier_symbol) |resolved| resolved.offset else 0,
             },
         );
-        machoCapturePrint("macho-processor: NOTIFIER LIVENESS GUIDANCE: {s}\n", .{progress.guidance()});
+        if (repaired) {
+            machoCapturePrint(
+                "macho-processor: NOTIFIER LIVENESS GUIDANCE: a bounded spurious wake was already granted {d} time(s) and the waiter re-parked — the predicate is genuinely unsatisfied. The creator never published the state it waits on; find the code that should have published it and confirm it ran. The once-per-generation guard stops further wakes, so this cannot become a synthetic busy loop\n",
+                .{object.repair_attempts},
+            );
+        } else {
+            machoCapturePrint("macho-processor: NOTIFIER LIVENESS GUIDANCE: {s}\n", .{progress.guidance()});
+        }
+        // The repair is per-class, not per-report: an `observed_notifiers_parked`
+        // object can outrank a never-notified one for the report, but only
+        // never-notified waiters have the lost-wakeup repair, and the selector
+        // inside `wakeNeverNotifiedWaiter` already applies the stall gate. The
+        // quiescence repair cannot reach these waiters: the rest of the run is
+        // alive, so "nothing runnable" never became true. The creator may have
+        // published its object state with the wake lost (a model artifact), so
+        // grant one generation-bounded spurious wake and let the guest's own
+        // predicate loop settle it. A satisfied but unwoken waiter proceeds; an
+        // unsatisfied one re-parks, and the once-per-generation guard stops a
+        // loop.
+        if (self.pthreads.wakeNeverNotifiedWaiter(self.executed_steps)) |repair| {
+            const woken_symbol = self.metadata.nearestSymbol(repair.thread);
+            machoCapturePrint(
+                "macho-processor: NOTIFIER LIVENESS REPAIR: granted one generation-bounded POSIX spurious wake thread=0x{x} object=0x{x} waited_steps={d} symbol={s}; the guest predicate loop re-checks its own condition on return\n",
+                .{
+                    repair.thread,
+                    repair.object,
+                    repair.waited_steps,
+                    if (woken_symbol) |resolved| resolved.name else "<unknown>",
+                },
+            );
+            // The wake happened here; what it proved is judged elsewhere. A
+            // release nobody reads the outcome of is a workaround, and one
+            // whose outcome is recorded is an experiment that settles which
+            // codebase the defect is in.
+            self.noteStallReleaseGranted(repair.object, repair.thread, repair.waited_steps);
+        }
     }
 
     /// Guest traffic to the GPU register aperture, and what it licenses a
@@ -2493,8 +2639,8 @@ pub const MachOState = struct {
             },
         );
         inline for (.{
-            gpu.KernelVariable.global_device,     gpu.KernelVariable.global_xam_device,
-            gpu.KernelVariable.gpu_clock_in_mhz,  gpu.KernelVariable.hsio_calibration_lock,
+            gpu.KernelVariable.global_device,    gpu.KernelVariable.global_xam_device,
+            gpu.KernelVariable.gpu_clock_in_mhz, gpu.KernelVariable.hsio_calibration_lock,
         }) |which| {
             const record = surface.entry(which);
             machoCapturePrint(
@@ -2513,8 +2659,8 @@ pub const MachOState = struct {
             );
         }
         inline for (.{
-            gpu.KernelVariable.global_device,     gpu.KernelVariable.global_xam_device,
-            gpu.KernelVariable.gpu_clock_in_mhz,  gpu.KernelVariable.hsio_calibration_lock,
+            gpu.KernelVariable.global_device,    gpu.KernelVariable.global_xam_device,
+            gpu.KernelVariable.gpu_clock_in_mhz, gpu.KernelVariable.hsio_calibration_lock,
         }) |which| {
             if (surface.entry(which).imported) {
                 switch (surface.writeDecision(which)) {
@@ -2551,7 +2697,7 @@ pub const MachOState = struct {
         var any_slot_bound = false;
         var every_slot_bound = true;
         inline for (.{
-            gpu.KernelVariable.global_device,    gpu.KernelVariable.gpu_clock_in_mhz,
+            gpu.KernelVariable.global_device,         gpu.KernelVariable.gpu_clock_in_mhz,
             gpu.KernelVariable.hsio_calibration_lock,
         }) |which| {
             const record = variables.entry(which);
@@ -2579,7 +2725,12 @@ pub const MachOState = struct {
             }
         }
 
-        if (self.gpu_register_aperture.total_reads + self.gpu_register_aperture.total_writes != 0) {
+        // Either the emulator declared a handler for the aperture's pages, or
+        // an access actually arrived. The first is reachability and the second
+        // is usage; usage implies reachability, so both satisfy it.
+        if (self.gpu_register_aperture_reachable or
+            self.gpu_register_aperture.total_reads + self.gpu_register_aperture.total_writes != 0)
+        {
             ledger.observe(.register_aperture_reachable, at);
         }
         if (self.gpu_bootstrap.seen(.initialize_engines)) ledger.observe(.engines_initialised, at);
@@ -2794,16 +2945,79 @@ pub const MachOState = struct {
                 machoCapturePrint(
                     "  outstanding span: projection={s} read={d} write={d} span={d} examined={d} walked={d} packets={d} draws={d} swaps={d} truncated={s} desync={s}; {s}\n",
                     .{
-                        chosen.projection.label(), geometry.read_pointer,
-                        geometry.write_pointer,    span,
-                        summary.dwords_examined,   summary.dwords_scanned,
-                        summary.packets,           summary.draw_packets,
-                        summary.swap_packets,
-                        if (summary.truncated) "YES" else "NO",
-                        if (summary.desynchronised) "YES" else "NO",
-                        summary.verdict(),
+                        chosen.projection.label(),                   geometry.read_pointer,
+                        geometry.write_pointer,                      span,
+                        summary.dwords_examined,                     summary.dwords_scanned,
+                        summary.packets,                             summary.draw_packets,
+                        summary.swap_packets,                        if (summary.truncated) "YES" else "NO",
+                        if (summary.desynchronised) "YES" else "NO", summary.verdict(),
                     },
                 );
+
+                // The ring scanner is deliberately read-only.  Once a new
+                // publication is observed, hand the same bounded, endian-
+                // decoded span to the stateful Xenos command processor so
+                // register state, draw state, completion events, and swap
+                // descriptions have a single owner.  Do not replay a drained
+                // ring when the producer has not advanced its publication.
+                if (span != 0 and self.gpu_xenos_last_ring_epoch != publication.advances) {
+                    self.gpu_xenos_last_ring_epoch = publication.advances;
+                    self.gpu_xenos_runtime.attachMemory(
+                        self,
+                        xenosMemoryRead,
+                        self,
+                        xenosMemoryWrite,
+                    );
+                    if (self.gpu_xenos_runtime.executeRingBytes(bytes, geometry.read_pointer, span, ring_dwords)) |execution| {
+                        if (execution.draws != 0) self.gpu_ring_draws_seen = true;
+                        machoCapturePrint(
+                            "macho-processor: XENOS PM4 execution: batches={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s}; state_draws={d} state_swaps={d}\n",
+                            .{
+                                self.gpu_xenos_runtime.batches,
+                                execution.dwords,
+                                execution.packets_after - execution.packets_before,
+                                execution.draws,
+                                execution.events,
+                                execution.swaps,
+                                execution.unknown_opcodes,
+                                if (execution.truncated) "YES" else "NO",
+                                self.gpu_xenos_runtime.draw_count,
+                                self.gpu_xenos_runtime.swap_count,
+                            },
+                        );
+                        if (execution.swaps != 0) {
+                            if (self.gpu_xenos_runtime.last_swap) |runtime_swap| {
+                                if (runtime_swap.plausible()) {
+                                    self.gpu_frontbuffer = runtime_swap;
+                                    self.offerGuestFrontBuffer(runtime_swap, self.gpu_xenos_runtime.frontBufferFetch());
+                                    machoCapturePrint(
+                                        "macho-processor: XENOS PM4 present handoff: frontbuffer=0x{x:0>8} extent={d}x{d} fetch={s}; stateful command processing supplied the presenter even when the generic ring scanner did not decode the swap\n",
+                                        .{
+                                            runtime_swap.frontbuffer_physical_address,
+                                            runtime_swap.width,
+                                            runtime_swap.height,
+                                            if (self.gpu_xenos_runtime.frontBufferFetch() != null) "observed" else "absent (defaults apply)",
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    } else |err| {
+                        machoCapturePrint(
+                            "macho-processor: XENOS PM4 execution refused: error={s} read={d} write={d} span={d} ring_dwords={d}\n",
+                            .{ @errorName(err), geometry.read_pointer, geometry.write_pointer, span, ring_dwords },
+                        );
+                    }
+                    if (self.gpu_interrupt_callback != 0) {
+                        const delivered = self.gpu_xenos_runtime.drainInterrupts(deliverGpuInterrupt, self, 32);
+                        if (delivered != 0) {
+                            machoCapturePrint(
+                                "macho-processor: XENOS GPU interrupts queued: delivered={d} callback=0x{x} arg=0x{x}\n",
+                                .{ delivered, self.gpu_interrupt_callback, self.gpu_interrupt_callback_arg },
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -2841,6 +3055,59 @@ pub const MachOState = struct {
                 .{},
             );
         }
+    }
+
+    fn deliverGpuInterrupt(context: *anyopaque, event: gpu.interrupt_controller.Event) void {
+        const self: *MachOState = @ptrCast(@alignCast(context));
+        self.gpu_interrupt_dispatches +|= 1;
+        if (self.gpu_interrupt_callback == 0) return;
+        const source = self.scheduleSignalCallback(
+            self.gpu_interrupt_callback,
+            self.gpu_interrupt_callback_arg,
+            event.id,
+            event.value,
+            "xenia_gpu_interrupt",
+        );
+        if (source == 0) {
+            self.gpu_interrupt_dispatch_failures +|= 1;
+            machoCapturePrint(
+                "macho-processor: XENOS GPU interrupt callback rejected: callback=0x{x} event={s} id=0x{x} value=0x{x}; guest execution was not fabricated\n",
+                .{ self.gpu_interrupt_callback, @tagName(event.kind), event.id, event.value },
+            );
+            return;
+        }
+        self.gpu_bootstrap.observe(.graphics_interrupt_dispatch, self.executed_steps);
+    }
+
+    fn xenosGpuSwap(value: u32, endian: u2) u32 {
+        return switch (endian) {
+            0 => value,
+            1 => ((value << 8) & 0xFF00_FF00) | ((value >> 8) & 0x00FF_00FF),
+            2 => @byteSwap(value),
+            3 => (value >> 16) | (value << 16),
+        };
+    }
+
+    fn xenosPhysicalHostAddress(self: *MachOState, address: u32) ?u64 {
+        const aligned = address & ~@as(u32, 3);
+        return self.xenia_memory_views.physicalHostAddress(aligned) orelse
+            self.xenia_memory_views.virtualHostAddress(aligned);
+    }
+
+    fn xenosMemoryRead(context: *anyopaque, address: u32) ?u32 {
+        const self: *MachOState = @ptrCast(@alignCast(context));
+        const host = self.xenosPhysicalHostAddress(address) orelse return null;
+        const bytes = self.guestMemoryConst(host, 4) orelse return null;
+        const raw = std.mem.readInt(u32, bytes[0..4], .little);
+        return xenosGpuSwap(raw, @truncate(address));
+    }
+
+    fn xenosMemoryWrite(context: *anyopaque, address: u32, value: u32, endian: u2) bool {
+        const self: *MachOState = @ptrCast(@alignCast(context));
+        const host = self.xenosPhysicalHostAddress(address) orelse return false;
+        const bytes = self.guestMemory(host, 4) orelse return false;
+        std.mem.writeInt(u32, bytes[0..4], xenosGpuSwap(value, endian), .little);
+        return true;
     }
 
     /// Print the dwords the producer actually wrote.
@@ -2900,6 +3167,746 @@ pub const MachOState = struct {
                 }
                 machoCapturePrint("    +{d: <5} {s}\n", .{ region.start + at, line[0..used] });
             }
+        }
+    }
+
+    /// Threads that will never wake, and who was supposed to wake them.
+    ///
+    /// Fed from the scheduler's own thread table for waits and from its
+    /// notifier graph for signals, so the two halves cannot drift apart. The
+    /// notifier roster is the most recent signaller per object rather than the
+    /// full set — the scheduler tracks notifiers as a slot mask and this needs
+    /// handles — which makes the roster a lower bound. A lower bound is the
+    /// safe direction: it can only ever make this *less* willing to call
+    /// something a deadlock.
+    pub fn refreshDeadlockPredictor(self: *MachOState) void {
+        if (self.xenia_memory_views.ready()) {
+            self.sync_object_identity.observeMappingBase(self.xenia_memory_views.mapping_base);
+        }
+        const ledger = &self.deadlock_predictor;
+        for (&self.pthreads.threads) |*thread| {
+            if (!thread.active) continue;
+            const parked = switch (thread.state) {
+                .waiting_mutex,
+                .waiting_condvar,
+                .waiting_semaphore,
+                .waiting_event,
+                .waiting_futex_address,
+                .waiting_join,
+                => true,
+                else => false,
+            };
+            const kind: deadlock_predictor.ObjectKind = switch (thread.state) {
+                .waiting_mutex => .mutex,
+                .waiting_condvar => .condvar,
+                .waiting_semaphore => .semaphore,
+                .waiting_event => .event,
+                .waiting_join => .thread_join,
+                else => .unknown,
+            };
+            const object = if (thread.wait_address != 0)
+                thread.wait_address
+            else if (thread.waiting_condvar != 0)
+                thread.waiting_condvar
+            else
+                thread.waiting_mutex;
+            const state: deadlock_predictor.ThreadState = if (parked)
+                .waiting
+            else if (thread.state == .terminated or thread.state == .cancelled)
+                .terminated
+            else
+                .running;
+            if (parked and object != 0) ledger.observeObject(object, kind);
+            ledger.observeThread(thread.handle, state, object, thread.blocked_since_step);
+        }
+        for (&self.pthreads.waits.objects) |*object| {
+            if (!object.active) continue;
+            if (object.notifications != 0) {
+                ledger.observeNotify(
+                    object.address,
+                    .condvar,
+                    object.last_notify_thread,
+                    object.last_notify_step,
+                );
+            }
+            // A granted repair is a fact about the object that the ledger
+            // cannot derive from notifications: a spurious wake is Rosette
+            // manufacturing a wake, not the guest signalling. Carried over so
+            // the deadlock report can distinguish "nobody ever signalled it"
+            // from "we woke it once and it re-parked, so the wait is
+            // genuinely unsatisfied".
+            if (object.repair_attempts != 0) {
+                ledger.observeRepair(object.address, object.repair_attempts);
+            }
+        }
+        ledger.refresh(self.executed_steps);
+    }
+
+    /// Judge the releases already granted, and consider granting one more.
+    ///
+    /// The scheduler's own repair path performs the wake; this decides whether
+    /// one is warranted and — the part that was missing — records what it
+    /// proved. A release nobody reads the outcome of is a workaround; a release
+    /// whose outcome is recorded is an experiment that settles which codebase
+    /// the defect is in.
+    pub fn refreshStallRelease(self: *MachOState) void {
+        const ledger = &self.stall_release;
+        const progress = self.stallReleaseProgress();
+
+        // Settle what is outstanding first: an attempt judged against the state
+        // that provoked the next one would attribute the wrong outcome.
+        var index: usize = 0;
+        while (index < ledger.count) : (index += 1) {
+            const object = ledger.attempts[index].object;
+            var re_parked = false;
+            for (&self.pthreads.threads) |*thread| {
+                if (!thread.active) continue;
+                if (thread.waiting_condvar != object and thread.wait_address != object) continue;
+                if (thread.state == .waiting_condvar) re_parked = true;
+            }
+            ledger.settle(object, progress, re_parked, self.executed_steps);
+        }
+
+        // A release that provably re-parked names the defect as guest-side, and
+        // the waiter's own state is the only thing that makes that actionable.
+        // Fetch it once per attempt: resolution, the object's ledger numbers,
+        // the waiting threads, and a probe of the bytes at the object when they
+        // are readable.
+        for (ledger.attempts[0..ledger.count]) |attempt| {
+            if (attempt.outcome != .predicate_unsatisfied or attempt.state_fetched) continue;
+            self.fetchStallReleaseState(attempt.object);
+            ledger.markStateFetched(attempt.object);
+        }
+    }
+
+    /// Fetch the state a provably-unsatisfied waiter is waiting on, so the
+    /// failure point is named rather than asserted.
+    ///
+    /// Three things together: where the object lives (a guest console address
+    /// the emulator's view can translate, or a host-side primitive), the
+    /// synchronisation ledger's own numbers for it (waiters, notifications,
+    /// repairs), and the bytes at the object when they are readable — a
+    /// correct waiter's predicate data sits in or near the object it waits on.
+    fn fetchStallReleaseState(self: *MachOState, object: u64) void {
+        // The synchronisation history this runtime keeps for the object, if it
+        // has one. The repairs count is the ledger's own answer to "did we
+        // already wake it and it re-parked" — the fact that separates a lost
+        // wakeup from a genuinely unsatisfied predicate.
+        var notifications: u64 = 0;
+        var repairs: u32 = 0;
+        var first_wait_step: u64 = 0;
+        if (self.pthreads.waits.find(object)) |entry| {
+            notifications = entry.notifications;
+            repairs = entry.repair_attempts;
+            first_wait_step = entry.first_wait_step;
+        }
+
+        // Where the object lives. A guest console address translates through
+        // the emulator's memory view; anything else is a host-side primitive
+        // whose waiter-visible predicate lives inside the guest, not here.
+        var resolution: []const u8 = "host-side primitive";
+        var host: u64 = object;
+        if (object <= std.math.maxInt(u32)) {
+            if (self.xenia_memory_views.virtualHostAddress(object)) |translated| {
+                host = translated;
+                resolution = "guest console address";
+            }
+        }
+
+        // The waiting threads, from the scheduler's own tables, and the kind
+        // they imply. A condvar waiter parks with a `waiting_condvar`; other
+        // waiters carry a `wait_address`.
+        var kind: []const u8 = "wait object";
+        var waiter_handles: [64]u64 = undefined;
+        var waiter_count: usize = 0;
+        var longest_park: u64 = 0;
+        for (&self.pthreads.threads) |*thread| {
+            if (!thread.active) continue;
+            const on_this = thread.waiting_condvar == object or thread.wait_address == object;
+            if (!on_this) continue;
+            if (thread.state == .waiting_condvar) kind = "condvar";
+            if (waiter_count < waiter_handles.len) {
+                waiter_handles[waiter_count] = thread.handle;
+                waiter_count += 1;
+            }
+            longest_park = @max(longest_park, thread.blocked_since_step);
+        }
+        const parked_steps = if (longest_park != 0) self.executed_steps -| longest_park else 0;
+
+        // Probe the bytes at the object when the emulator's memory view covers
+        // them. Five dwords is enough to show an event's signal state or a
+        // queue's head fields without turning the report into a memory dump.
+        var probed = false;
+        var dwords: [5]u32 = undefined;
+        if (self.guestMemoryConst(host, 20)) |bytes| {
+            for (0..5) |index| dwords[index] = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
+            probed = true;
+        }
+
+        machoCapturePrint(
+            "macho-processor: STALL RELEASE STATE: object=0x{x} kind={s} resolution={s} waiters={d} notifications={d} repairs={d} parked_steps={d} step={d}; a spurious wake already proved this predicate unsatisfied — the code that should have published the state it waits on never ran\n",
+            .{
+                object,        kind,    resolution,   waiter_count,
+                notifications, repairs, parked_steps, self.executed_steps,
+            },
+        );
+        if (probed) {
+            machoCapturePrint(
+                "  bytes at 0x{x}: q0=0x{x:0>8} q1=0x{x:0>8} q2=0x{x:0>8} q3=0x{x:0>8} q4=0x{x:0>8} {s}\n",
+                .{
+                    host, dwords[0], dwords[1], dwords[2], dwords[3], dwords[4],
+                    if (resolution[0] == 'g')
+                        "the waiter's predicate data is the guest memory behind this object"
+                    else
+                        "host-side primitive internals; the waiter's predicate lives inside the guest, not at this address",
+                },
+            );
+        } else {
+            machoCapturePrint(
+                "  object memory not readable through the emulator's memory view (host=0x{x}); the waiter's predicate state is elsewhere — in the guest object's own fields, not in this runtime's copy of it\n",
+                .{host},
+            );
+        }
+        for (waiter_handles[0..waiter_count]) |handle| {
+            machoCapturePrint(
+                "  waiter thread=0x{x} parked_steps={d} first_wait_step={d}\n",
+                .{ handle, parked_steps, first_wait_step },
+            );
+        }
+    }
+
+    /// The progress witness a release is judged against.
+    ///
+    /// The same axes the wait audit uses, so a release and a wait pattern can
+    /// never disagree about whether the run moved. Deliberately excludes
+    /// retired instructions: a livelock produces billions of those and would
+    /// make every release look like it worked.
+    fn stallReleaseProgress(self: *const MachOState) u64 {
+        return self.wait_audit.witness.get(.pipeline_stage) +
+            self.wait_audit.witness.get(.ring_publication) +
+            self.wait_audit.witness.get(.gpu_callback) +
+            self.wait_audit.witness.get(.module_load) +
+            self.wait_audit.witness.get(.presented_frame);
+    }
+
+    /// Record a release the notifier-liveness path performed.
+    ///
+    /// The wake itself belongs there — it owns the selector and the generation
+    /// guard — and this owns the question of what it proved. Calling the wake
+    /// from both places would grant two per checkpoint and quietly turn a
+    /// bounded experiment into a policy.
+    pub fn noteStallReleaseGranted(self: *MachOState, object: u64, thread: u64, waited_steps: u64) void {
+        const progress = self.stallReleaseProgress();
+        const decision = self.stall_release.authorise(
+            object,
+            1,
+            0,
+            waited_steps,
+            notifier_liveness.default_stall_steps,
+        );
+        if (!decision.granted()) return;
+        self.stall_release.noteReleased(object, 0, thread, progress, self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: STALL RELEASE: recorded object=0x{x} thread=0x{x} waited_steps={d} progress_witness={d} step={d}; {s}\n",
+            .{ object, thread, waited_steps, progress, self.executed_steps, decision.meaning() },
+        );
+    }
+
+    /// Which subsystem failed to come up, and whether that is why the run
+    /// stopped moving.
+    pub fn logBringupFailures(self: *MachOState) void {
+        const ledger = &self.bringup_failures;
+        if (ledger.count == 0) return;
+        // The same witness the wait audit classifies against, so the two can
+        // never disagree about whether the run is moving.
+        ledger.noteProgress(self.stallReleaseProgress(), self.executed_steps);
+        const finding = ledger.finding(self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: BRINGUP FAILURE: finding={s} failures={d} dropped={d} progress={d} last_progress_step={d} step={d}; {s}\n",
+            .{
+                finding.label(),
+                ledger.count,
+                ledger.dropped,
+                ledger.progress,
+                ledger.last_progress_step,
+                self.executed_steps,
+                ledger.verdict(self.executed_steps),
+            },
+        );
+        for (ledger.failures[0..ledger.count]) |entry| {
+            machoCapturePrint(
+                "  subsystem {s: <24} {s: <10} step={d} thread_exited={s} reason='{s}'\n",
+                .{
+                    entry.subsystem.label(),
+                    ledger.classify(entry, self.executed_steps).label(),
+                    entry.step,
+                    if (entry.thread_exited) "YES" else "NO",
+                    entry.reason(),
+                },
+            );
+        }
+        if (ledger.root(self.executed_steps)) |root| machoCapturePrint(
+            "macho-processor: BRINGUP FAILURE: ROOT subsystem={s} step={d} — {s}\n",
+            .{ root.subsystem.label(), root.step, root.subsystem.blocks() },
+        );
+    }
+
+    /// What the bounded releases proved.
+    pub fn logStallRelease(self: *MachOState) void {
+        self.refreshStallRelease();
+        const ledger = &self.stall_release;
+        if (ledger.count == 0 and ledger.refusals == 0) return;
+        machoCapturePrint(
+            "macho-processor: STALL RELEASE: objects={d} attempts={d}/{d} decisive={d} refusals={d} last_refusal={s} step={d}; {s}\n",
+            .{
+                ledger.count,
+                ledger.total_attempts,
+                stall_release.max_attempts_total,
+                ledger.decisiveCount(),
+                ledger.refusals,
+                if (ledger.last_refusal) |refusal| refusal.label() else "-",
+                self.executed_steps,
+                ledger.verdict(),
+            },
+        );
+        for (ledger.attempts[0..ledger.count]) |attempt| {
+            machoCapturePrint(
+                "  release object=0x{x:0>8} thread=0x{x} attempts={d} {s: <22} progress={d}->{d} released_step={d}\n",
+                .{
+                    attempt.object,
+                    attempt.thread,
+                    attempt.attempts,
+                    attempt.outcome.label(),
+                    attempt.progress_before,
+                    attempt.progress_after,
+                    attempt.released_step,
+                },
+            );
+            if (attempt.outcome.decisive()) machoCapturePrint(
+                "    verdict: {s}\n",
+                .{attempt.outcome.meaning()},
+            );
+        }
+    }
+
+    /// Score the host capability surface from what this run actually observed.
+    ///
+    /// Derived rather than maintained, like the graphics contract: every fact
+    /// already exists in some subsystem, and the value here is the join plus
+    /// the weighting. A second copy of the truth is how two reports in one run
+    /// end up contradicting each other.
+    pub fn refreshHostCoverage(self: *MachOState) void {
+        const C = host_contract_coverage.Capability;
+        const ledger = &self.host_coverage;
+
+        if (self.xenia_memory_views.ready()) {
+            ledger.record(C.address_space_translation, .satisfied, "console memory view base discovered");
+        }
+        if (self.executed_steps != 0) {
+            ledger.record(C.guest_memory_mapping, .satisfied, "guest image mapped and executing");
+        }
+        ledger.record(
+            C.memory_protection,
+            if (self.gpu_register_aperture_reachable) .satisfied else .untested,
+            "aperture handler registration is the only reachability evidence",
+        );
+        if (self.pthreads.created_threads != 0) {
+            ledger.record(C.thread_creation, .satisfied, "guest threads created and scheduled");
+            ledger.record(C.thread_scheduling, .satisfied, "cooperative rotation is running");
+            ledger.record(C.sync_primitives, .satisfied, "mutexes and condvars are servicing guest waits");
+        }
+
+        // The wait handshake is scored from the audit rather than from call
+        // counts: a handshake that answers every call and never releases anyone
+        // is exactly the degraded state this model exists to name.
+        const problems = self.wait_audit.problemCount(self.executed_steps);
+        if (self.wait_audit.count != 0) {
+            ledger.record(
+                C.wait_signal_handshake,
+                if (problems == 0) .satisfied else .degraded,
+                if (problems == 0) "every observed pattern advanced the run alongside it" else "at least one object is waited on and never signalled",
+            );
+        }
+
+        if (self.fs_forwarder.open_count != 0) {
+            ledger.record(C.file_read, .satisfied, "guest file reads are being serviced");
+        }
+        if (self.xenia_pipeline.hasReached(.disc_mounted)) {
+            ledger.record(C.disc_image, .satisfied, "disc image mounted");
+        }
+
+        const variables = self.gpu_kernel_variables.finding();
+        if (variables.imported_count != 0) {
+            ledger.record(
+                C.kernel_variable_surface,
+                if (variables.blocking == null) .satisfied else .unsatisfied,
+                "every imported kernel variable resolves through both dereferences",
+            );
+        }
+        if (self.gpu_import_binding.count != 0) {
+            ledger.record(
+                C.kernel_export_binding,
+                if (self.gpu_import_binding.worst().healthy()) .satisfied else .unsatisfied,
+                "probed imports are committed, translatable and begin with the export stub",
+            );
+        }
+
+        if (self.gpu_bootstrap.seen(.initialize_engines)) {
+            ledger.record(C.gpu_engine_init, .satisfied, "VdInitializeEngines ran");
+        }
+        if (self.gpu_ring_watch_base != 0) {
+            ledger.record(C.gpu_ring_buffer, .satisfied, "ring geometry established and readable");
+        }
+        if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch)) {
+            ledger.record(C.gpu_interrupt_callback, .satisfied, "callback registered and dispatched");
+        }
+        if (self.execution_tracepoints.roleEntered(.command_processor)) {
+            ledger.record(C.gpu_command_flow, .satisfied, "the command processor drained a batch");
+        }
+        ledger.record(
+            C.guest_swap_request,
+            if (self.execution_tracepoints.roleEntered(.swap)) .satisfied else .unsatisfied,
+            "VdSwap has never been entered",
+        );
+
+        // Score the guest Vulkan path from driver-bound work, not from the
+        // existence of a proc token or a successful synthetic return. Real
+        // command recording and queue submission are meaningful host
+        // execution evidence; a present without either is still only a
+        // request for a diagnostic refresh.
+        const observed_commands = self.dynamic_forwarder.guestVulkanObservedCommands();
+        const real_commands = self.dynamic_forwarder.guestVulkanCommandsForwarded();
+        const real_submits = self.dynamic_forwarder.guestVulkanQueueSubmits();
+        ledger.record(
+            C.graphics_command_execution,
+            if (real_submits != 0)
+                .satisfied
+            else if (real_commands != 0)
+                .degraded
+            else if (observed_commands != 0)
+                .degraded
+            else
+                .untested,
+            if (real_submits != 0)
+                "guest command buffers reached native Vulkan and were submitted"
+            else if (real_commands != 0)
+                "guest command buffers reached native Vulkan but no native submission was observed"
+            else if (observed_commands != 0)
+                "guest Vulkan commands were observed but had no native command-buffer mapping"
+            else
+                "no guest Vulkan command recording has been observed",
+        );
+        ledger.record(
+            C.frame_source,
+            if (self.dynamic_forwarder.guestFrontBufferAvailable()) .satisfied else .unsatisfied,
+            "no guest-produced image has ever held a picture",
+        );
+        if (self.native_window.layer_attachments != 0) {
+            ledger.record(C.window_surface, .satisfied, "Cocoa layer attached and the presenter is bound");
+        }
+        const frames = self.dynamic_forwarder.nativePresenterFramesPresented();
+        const real_presents = self.dynamic_forwarder.guestVulkanPresents();
+        ledger.record(
+            C.frame_presentation,
+            if (self.dynamic_forwarder.guestFrontBufferAvailable())
+                .satisfied
+            else if (real_presents != 0)
+                .degraded
+            else if (frames == 0)
+                .unsatisfied
+            else
+                .degraded,
+            if (self.dynamic_forwarder.guestFrontBufferAvailable())
+                "console front-buffer pixels were converted and handed to the presenter"
+            else if (real_presents != 0)
+                "guest vkQueuePresentKHR reached the native driver; visible pixels remain runtime-unvalidated"
+            else if (frames == 0)
+                "no frame has reached a presenter"
+            else
+                "only Rosette diagnostic frames have reached the window",
+        );
+
+        if (self.guest_exceptions.total_throws != 0) {
+            ledger.record(
+                C.exception_unwinding,
+                if (self.guest_exceptions.worst() == null) .satisfied else .degraded,
+                "phase-1 walk, handler install and catch retirement all complete",
+            );
+        }
+        ledger.record(
+            C.code_generation,
+            if (self.deferred_work.total_failures == 0) .satisfied else .degraded,
+            "translation works except for functions an emitter error left undefined",
+        );
+        if (self.dynamic_forwarder.forwarded != 0) {
+            ledger.record(C.locale_and_time, .satisfied, "host library forwarding is servicing queries");
+        }
+    }
+
+    /// The zoomed-out view: how much of the host contract works.
+    pub fn logHostCoverage(self: *MachOState) void {
+        self.refreshHostCoverage();
+        const ledger = &self.host_coverage;
+        const report = ledger.report();
+        machoCapturePrint(
+            "macho-processor: HOST CONTRACT COVERAGE: {d}% satisfied={d} degraded={d} unsatisfied={d} untested={d} of {d} step={d}; {s}\n",
+            .{
+                report.percent(),
+                report.satisfied,
+                report.degraded,
+                report.unsatisfied,
+                report.untested,
+                host_contract_coverage.capability_count,
+                self.executed_steps,
+                ledger.verdict(),
+            },
+        );
+        inline for (@typeInfo(host_contract_coverage.Layer).@"enum".fields) |field| {
+            const layer: host_contract_coverage.Layer = @enumFromInt(field.value);
+            const score = ledger.layerScore(layer);
+            machoCapturePrint(
+                "  layer {s: <18} {d: >3}%\n",
+                .{ layer.label(), score.percent() },
+            );
+        }
+        if (ledger.weakestLayer()) |weakest| machoCapturePrint(
+            "macho-processor: HOST CONTRACT COVERAGE: weakest layer is {s} at {d}% — this is where the next hour belongs, not wherever the last frontier happened to point\n",
+            .{ weakest.layer.label(), weakest.percent() },
+        );
+        var gaps: [host_contract_coverage.capability_count]host_contract_coverage.Capability = undefined;
+        for (ledger.criticalGaps(&gaps)) |capability| {
+            const entry = ledger.entry(capability);
+            machoCapturePrint(
+                "  critical gap {s: <34} {s: <12} layer={s} — {s}\n",
+                .{ capability.label(), entry.status.label(), capability.layer().label(), entry.note() },
+            );
+        }
+    }
+
+    /// Sample the independent progress axes the wait audit classifies against.
+    ///
+    /// Each axis is driven by a different subsystem, so a wait can freeze one
+    /// without freezing the others — and which ones it freezes is the finding.
+    /// Sampled here rather than at each observation because the observation
+    /// sites are in the log parser, which has no view of the run as a whole.
+    pub fn refreshWaitAuditWitness(self: *MachOState) void {
+        var stages: u64 = 0;
+        for (self.xenia_pipeline.reached) |reached| {
+            if (reached) stages += 1;
+        }
+        self.wait_audit.noteProgress(.pipeline_stage, stages);
+        self.wait_audit.noteProgress(.ring_publication, self.gpu_ring_publication.advances);
+        self.wait_audit.noteProgress(
+            .gpu_callback,
+            if (self.gpu_bootstrap.seen(.graphics_interrupt_dispatch)) 1 else 0,
+        );
+        self.wait_audit.noteProgress(.module_load, self.guest_modules.count);
+        self.wait_audit.noteProgress(
+            .presented_frame,
+            self.dynamic_forwarder.nativePresenterFramesPresented(),
+        );
+        self.wait_audit.noteProgress(.executed_steps, self.executed_steps);
+    }
+
+    /// Which repeating waits are problems, and the full audit for those only.
+    ///
+    /// The suppression is the point. A run has many handshakes and most of them
+    /// work; printing every one buries the one that does not, and the operator
+    /// then reads twelve healthy pumps looking for a defect that is on line
+    /// thirteen.
+    pub fn logWaitAudit(self: *MachOState) void {
+        self.refreshWaitAuditWitness();
+        const ledger = &self.wait_audit;
+        const problems = ledger.problemCount(self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: WAIT AUDIT: subjects={d} problems={d} suppressed={d} dropped={d} step={d}; {s}\n",
+            .{
+                ledger.count,
+                problems,
+                ledger.count - problems,
+                ledger.dropped,
+                self.executed_steps,
+                ledger.verdict(self.executed_steps),
+            },
+        );
+        // One line per subject, whatever its classification: a reader needs to
+        // know a pump exists and was judged healthy, or the suppression looks
+        // like the subsystem missing it.
+        for (ledger.subjects[0..ledger.count]) |subject| {
+            const classification = ledger.classify(subject, self.executed_steps);
+            machoCapturePrint(
+                "  subject object=0x{x:0>8} handle=0x{x:0>8} type={d} {s: <21} waits={d} timeouts={d} signals={d} threads={d} period_steps={d}\n",
+                .{
+                    subject.object,
+                    subject.handle,
+                    subject.type_code,
+                    classification.label(),
+                    subject.waits,
+                    subject.timeouts,
+                    subject.signals,
+                    subject.participant_count,
+                    subject.periodSteps(),
+                },
+            );
+            if (!classification.worthAuditing()) continue;
+
+            // The full audit, for problems only.
+            machoCapturePrint(
+                "    audit: first_step={d} last_step={d} sightings={d}; {s}\n",
+                .{ subject.first_step, subject.last_step, subject.sightings(), classification.meaning() },
+            );
+            for (subject.participants[0..subject.participant_count]) |thread| {
+                machoCapturePrint("    participant thread=0x{x}\n", .{thread});
+            }
+            var axes: [wait_audit.axis_count]wait_audit.Axis = undefined;
+            const frozen = ledger.frozenAxes(subject, &axes);
+            if (frozen.len == 0) continue;
+            machoCapturePrint("    holding back:", .{});
+            for (frozen) |axis| machoCapturePrint(" {s}", .{axis.label()});
+            machoCapturePrint(
+                " — these are the subsystems that have not advanced once since this pattern started. Anything not listed here kept working, so this wait is not what is blocking it\n",
+                .{},
+            );
+        }
+    }
+
+    /// Threads parked forever, and the reason nobody can release them.
+    pub fn logDeadlockPredictor(self: *MachOState) void {
+        // The identity table decides whether any of this is about one object or
+        // two, so it is reported alongside rather than buried.
+        const identity = &self.sync_object_identity;
+        if (identity.count != 0 or identity.rewrites != 0) machoCapturePrint(
+            "macho-processor: SYNC OBJECT IDENTITY: pairs={d} rewrites={d} conflicts={d} dropped={d} mapping_base=0x{x}; {s}\n",
+            .{ identity.count, identity.rewrites, identity.conflicts, identity.dropped, identity.mapping_base, identity.verdict() },
+        );
+        self.refreshDeadlockPredictor();
+        const ledger = &self.deadlock_predictor;
+        const worst = ledger.worst();
+        machoCapturePrint(
+            "macho-processor: DEADLOCK PREDICTOR: finding={s} objects={d} threads={d} parked={d} deadlocked={s} untracked(threads/objects)={d}/{d} step={d}; {s}\n",
+            .{
+                worst.finding.label(),
+                ledger.object_count,
+                ledger.thread_count,
+                ledger.parkedThreadCount(),
+                if (worst.finding.deadlocked()) "YES" else "NO",
+                ledger.untracked_threads,
+                ledger.untracked_objects,
+                self.executed_steps,
+                ledger.verdict(),
+            },
+        );
+        if (worst.object) |object| {
+            machoCapturePrint(
+                "  blocking object=0x{x} kind={s} waiters={d} notifiers={d} notifications={d} repairs={d} longest_park_steps={d} last_notify_step={d}\n",
+                .{
+                    object.address,
+                    object.kind.label(),
+                    object.waiters,
+                    object.notifier_count,
+                    object.notifications,
+                    object.repair_attempts,
+                    object.longest_park_steps,
+                    object.last_notify_step,
+                },
+            );
+            if (object.repair_attempts != 0) {
+                machoCapturePrint(
+                    "  repair note: a bounded spurious wake was granted {d} time(s) and the waiter re-parked — the predicate is genuinely unsatisfied, so this is a guest-side deadlock (the creator never published the state it waits on), not a lost wakeup. Find the code that should have published it and confirm it ran; the once-per-generation guard stops further wakes\n",
+                    .{object.repair_attempts},
+                );
+            }
+        }
+        // A cycle is a stronger statement than "no live root", so it is looked
+        // for explicitly rather than inferred from the classification.
+        for (ledger.threads[0..ledger.thread_count]) |thread| {
+            if (!thread.state.parked()) continue;
+            var chain: [8]u64 = undefined;
+            const cycle = ledger.findCycle(thread.handle, &chain) orelse continue;
+            machoCapturePrint(
+                "macho-processor: DEADLOCK PREDICTOR: WAIT_CYCLE length={d} — {s}\n",
+                .{ cycle.len, deadlock_predictor.Finding.wait_cycle.meaning() },
+            );
+            for (cycle, 0..) |handle, index| {
+                machoCapturePrint("    cycle[{d}] thread=0x{x}\n", .{ index, handle });
+            }
+            break;
+        }
+    }
+
+    /// Whether the run's caught exceptions recovered anything.
+    pub fn logGuestExceptions(self: *MachOState) void {
+        const ledger = &self.guest_exceptions;
+        // Throwing is ordinary C++ control flow; a run with no exceptions and
+        // no concern does not need a line on every checkpoint.
+        if (ledger.total_throws == 0) return;
+        machoCapturePrint(
+            "macho-processor: GUEST EXCEPTION PREDICTOR: types={d} throws={d} catches={d} concerning={s} dropped={d} step={d}; {s}\n",
+            .{
+                ledger.count,
+                ledger.total_throws,
+                ledger.total_catches,
+                if (ledger.worst() != null) "YES" else "NO",
+                ledger.dropped,
+                self.executed_steps,
+                ledger.verdict(),
+            },
+        );
+        for (ledger.records[0..ledger.count]) |record| {
+            machoCapturePrint(
+                "  exception type={s} outcome={s} throws={d} catches={d} code={d} unwind_frames={d} first_step={d} last_step={d} site={s}\n",
+                .{
+                    record.name(),
+                    record.outcome.label(),
+                    record.throws,
+                    record.catches,
+                    record.code,
+                    record.unwind_frames,
+                    record.first_step,
+                    record.last_step,
+                    record.site(),
+                },
+            );
+        }
+    }
+
+    /// Deferrals that became crashes, and the ones that are about to.
+    pub fn logDeferredWork(self: *MachOState) void {
+        const ledger = &self.deferred_work;
+        const finding = ledger.finding();
+        // Deferral is how the system works; a quiet ledger with nothing
+        // outstanding is not worth a line on every checkpoint.
+        if (finding == .quiet and ledger.total_failures == 0) return;
+        machoCapturePrint(
+            "macho-processor: DEFERRED WORK PREDICTOR: finding={s} deferrals={d} failures={d} demands={d} latent={d} fatal={d} unrecorded_demands={d} dropped={d} step={d}; {s}\n",
+            .{
+                finding.label(),
+                ledger.total_deferrals,
+                ledger.total_failures,
+                ledger.total_demands,
+                ledger.latentCount(),
+                ledger.fatalCount(),
+                ledger.demands_without_record,
+                ledger.dropped,
+                self.executed_steps,
+                finding.meaning(),
+            },
+        );
+        for (ledger.items[0..ledger.count]) |item| {
+            if (item.disposition != .failed) continue;
+            machoCapturePrint(
+                "  deferred id=0x{x} kind={s} {s} deferred_step={d} demanded_step={d} demands={d} reason='{s}' — {s}\n",
+                .{
+                    item.id,
+                    item.kind.label(),
+                    item.disposition.label(),
+                    item.deferred_step,
+                    item.demanded_step,
+                    item.demands,
+                    item.reason(),
+                    item.kind.consequence(),
+                },
+            );
         }
     }
 
@@ -3007,8 +4014,11 @@ pub const MachOState = struct {
             );
             return;
         };
-        const tiled = if (fetch) |constant| constant.tiled() else true;
-        const endian: gpu.xenos_texture.Endian = if (fetch) |constant|
+        const resolved = self.tryResolveXenosColorToFrontBuffer(swap, host);
+        const tiled = if (resolved) false else if (fetch) |constant| constant.tiled() else true;
+        const endian: gpu.xenos_texture.Endian = if (resolved)
+            .none
+        else if (fetch) |constant|
             @enumFromInt(constant.endianness())
         else
             .@"8in32";
@@ -3018,15 +4028,53 @@ pub const MachOState = struct {
             machoCapturePrint(
                 "macho-processor: GUEST FRONT BUFFER: console physical 0x{x:0>8} -> 0x{x} extent={d}x{d} tiled={s} endian={s} fetch={s}; the presenter will convert and show these pixels ahead of any emulator Vulkan image, because they are the console's own framebuffer\n",
                 .{
-                    swap.frontbuffer_physical_address, host,
-                    swap.width,                        swap.height,
-                    if (tiled) "YES" else "NO",        endian.label(),
-                    if (fetch != null) "observed" else "ABSENT (tiling and byte order assumed; a wrong assumption here produces a sheared or colour-swapped picture, not an error)",
+                    swap.frontbuffer_physical_address,                                                                                                                                                                                 host,
+                    swap.width,                                                                                                                                                                                                        swap.height,
+                    if (tiled) "YES" else "NO",                                                                                                                                                                                        endian.label(),
+                    if (resolved) "EDRAM RESOLVE (linear RGBA8)" else if (fetch != null) "observed" else "ABSENT (tiling and byte order assumed; a wrong assumption here produces a sheared or colour-swapped picture, not an error)",
                 },
             );
         }
     }
 
+    /// Resolve the stateful Xenos color target into the guest framebuffer when
+    /// the PM4 runtime has a real EDRAM result. The compact PM4 executor does
+    /// not claim to rasterize shaders, so an all-zero store is deliberately
+    /// ignored instead of replacing a title-owned framebuffer with black.
+    /// Successful resolves are linear RGBA8 and the caller presents them as
+    /// linear/none, avoiding a second guest tiling or endian transform.
+    fn tryResolveXenosColorToFrontBuffer(self: *MachOState, swap: gpu.Pm4SwapDescription, host: u64) bool {
+        if (self.gpu_xenos_runtime.last_draw == null) return false;
+        if (swap.width == 0 or swap.height == 0 or swap.width > 4096 or swap.height > 4096) return false;
+        const pitch_u64 = std.math.mul(u64, swap.width, 4) catch return false;
+        const bytes_u64 = std.math.mul(u64, pitch_u64, swap.height) catch return false;
+        if (bytes_u64 > std.math.maxInt(usize)) return false;
+        const bytes_len: usize = @intCast(bytes_u64);
+        if (self.gpu_xenos_resolve_scratch.len < bytes_len) {
+            const replacement = self.allocator.alloc(u8, bytes_len) catch return false;
+            if (self.gpu_xenos_resolve_scratch.len != 0) self.allocator.free(self.gpu_xenos_resolve_scratch);
+            self.gpu_xenos_resolve_scratch = replacement;
+        }
+        const scratch = self.gpu_xenos_resolve_scratch[0..bytes_len];
+        @memset(scratch, 0);
+        self.gpu_xenos_runtime.resolveCurrentColor(swap.width, swap.height, scratch, @intCast(pitch_u64)) catch return false;
+
+        var any_nonzero = false;
+        for (scratch) |byte| {
+            if (byte != 0) {
+                any_nonzero = true;
+                break;
+            }
+        }
+        if (!any_nonzero) return false;
+        const destination = self.guestMemory(host, bytes_u64) orelse return false;
+        @memcpy(destination, scratch);
+        machoCapturePrint(
+            "macho-processor: XENOS EDRAM resolve: target=0x{x} extent={d}x{d} bytes={d} source=stateful_color_target destination=guest_front_buffer\n",
+            .{ host, swap.width, swap.height, bytes_len },
+        );
+        return true;
+    }
 
     /// Whether the harness stood in for the title, and if not, what stopped it.
     pub fn logSwapSubstitution(self: *MachOState) void {
@@ -3043,13 +4091,31 @@ pub const MachOState = struct {
             .ring_drained = publication.drained_observations != 0,
             .frontbuffer_known = self.gpu_frontbuffer != null,
             .discovered_output_available = self.dynamic_forwarder.guestFrontBufferAvailable(),
-            // The one capability that does not exist yet. Stated as a fact the
-            // decision reads rather than baked into the decision, so closing it
-            // is one assignment instead of an edit to the policy.
-            .write_pointer_channel_available = false,
+            // The channel is open when the ring's host projections are writable
+            // from here: the packet, and the write-pointer value it implies,
+            // can be delivered into the ring memory the emulator reads. What a
+            // memory write cannot reach is the emulator's own memory-mapped
+            // register store — its stores are executed by guest code — and that
+            // boundary is stated out loud in the SYNTHETIC QUEUE line rather
+            // than hidden.
+            .write_pointer_channel_available = self.gpu_ring_watch_host_physical != 0 or
+                self.gpu_ring_watch_host_virtual != 0,
         };
         const decision = gpu.swap_substitution.decide(evidence, gpu.swap_substitution.default_quiet_steps);
+        const triggers_before = self.gpu_swap_substitution.triggers;
         self.gpu_swap_substitution.record(decision, self.executed_steps);
+        // Execute the tier the decision authorised, once per substitution
+        // episode. The decision stays `substituting` for every heartbeat while
+        // the producer is quiet, so gating on the trigger count is what stops
+        // the queue from re-injecting the same packet on a loop — a livelock
+        // of the harness's own making. Only tiers that fabricate guest
+        // behaviour write a packet: presenting the guest's own discovered
+        // pixels invents nothing and has no packet.
+        if (decision.tier.fabricatesGuestBehaviour() and
+            self.gpu_swap_substitution.triggers > triggers_before)
+        {
+            self.runSyntheticQueue();
+        }
 
         machoCapturePrint(
             "macho-processor: SWAP SUBSTITUTION: tier={s} blocked_by={s} step={d} triggers={d} presented={d} packets={d} pointers={d} fabricated={s}; {s}\n",
@@ -3088,6 +4154,124 @@ pub const MachOState = struct {
         if (decision.tier.fabricatesGuestBehaviour()) {
             _ = self.graphics_contract.substitute(.guest_swap_entered, self.executed_steps);
         }
+    }
+
+    /// Perform the tier the substitution authorised: write the swap packet the
+    /// title never wrote into the ring it published, and state the write
+    /// pointer that publication requires.
+    ///
+    /// The packet is data in memory the harness already owns, and everything
+    /// downstream of the write — decode, issue, refresh, present — is the
+    /// emulator's authentic code path. What no memory write can do is advance
+    /// the emulator's own memory-mapped write pointer register: its stores are
+    /// executed by guest code inside the emulator, so the value is computed,
+    /// recorded in the injection ledger, and reported as exactly the value the
+    /// guest must publish. The emulator's ring-change watch is the channel
+    /// that can act on it.
+    fn runSyntheticQueue(self: *MachOState) void {
+        const ledger = &self.gpu_ring_injection;
+        const publication = &self.gpu_ring_publication;
+
+        // The write pointer the packet goes at. The geometry carries the
+        // emulator's own pointer pair when it reports one; the tracker's last
+        // observed value is the fallback. Either way the refusal is named, not
+        // swallowed.
+        const write_pointer = blk: {
+            if (publication.geometry) |geometry| {
+                if (geometry.write_pointer != 0) break :blk geometry.write_pointer;
+            }
+            if (publication.last_value) |value| break :blk value;
+            ledger.recordBlocked(.no_write_pointer);
+            if (ledger.last_blocked_by == .no_write_pointer) machoCapturePrint(
+                "macho-processor: SYNTHETIC QUEUE: blocked — {s}\n",
+                .{gpu.ring_injection.Blocked.no_write_pointer.label()},
+            );
+            return;
+        };
+
+        const swap = self.gpu_frontbuffer orelse {
+            ledger.recordBlocked(.frontbuffer_implausible);
+            return;
+        };
+        if (!swap.plausible()) {
+            ledger.recordBlocked(.frontbuffer_implausible);
+            return;
+        }
+
+        // A coherent fetch constant describing the front buffer the swap
+        // names. The command processor only checks the XE_SWAP payload; the
+        // fetch dwords carry the surface's format and tiling for presentation,
+        // and defaults here are the same ones a packet without a fetch decodes
+        // to.
+        var fetch = gpu.pm4.FetchConstant{};
+        fetch.setBaseAddress(swap.frontbuffer_physical_address);
+        fetch.setSize2d(swap.width, swap.height);
+        fetch.setTiled(true);
+
+        var packet: [gpu.ring_injection.swap_reservation_dwords]u32 = undefined;
+        const used = gpu.pm4.encodeSwapSequence(
+            &packet,
+            fetch,
+            swap,
+            gpu.ring_injection.swap_reservation_dwords,
+        ) orelse return;
+        const dwords = packet[0..used];
+        if (self.gpu_ring_watch_size == 0) {
+            ledger.recordBlocked(.no_geometry);
+            return;
+        }
+        const ring_dwords: u32 = @intCast(@min(self.gpu_ring_watch_size / 4, std.math.maxInt(u32)));
+
+        // Write every projection the ring is readable through. The emulator
+        // may read the ring through any of them and the three aliases can
+        // disagree, so a single-address write is how a harness delivers a
+        // packet somewhere nobody looks.
+        var written_aliases: u32 = 0;
+        var first_inject: ?gpu.RingInject = null;
+        const aliases = [_]struct { name: []const u8, host: u64 }{
+            .{ .name = "physical", .host = self.gpu_ring_watch_host_physical },
+            .{ .name = "virtual", .host = self.gpu_ring_watch_host_virtual },
+        };
+        for (aliases) |alias| {
+            if (alias.host == 0) continue;
+            const ring = self.guestMemory(alias.host, @as(u64, ring_dwords) * 4) orelse continue;
+            const inject = gpu.ring_injection.injectSequence(ring, ring_dwords, write_pointer, dwords) orelse continue;
+            written_aliases += 1;
+            if (first_inject == null) first_inject = inject;
+            machoCapturePrint(
+                "  synthetic queue wrote projection={s} host=0x{x} dwords={d} wptr=0x{x}->0x{x} wrap={s}\n",
+                .{
+                    alias.name,                 alias.host,
+                    inject.dwords_written,      inject.write_pointer_before,
+                    inject.write_pointer_after, if (inject.wrapped) "YES" else "NO",
+                },
+            );
+        }
+        const inject = first_inject orelse {
+            ledger.recordBlocked(.not_writable);
+            machoCapturePrint(
+                "macho-processor: SYNTHETIC QUEUE: blocked — {s}\n",
+                .{gpu.ring_injection.Blocked.not_writable.label()},
+            );
+            return;
+        };
+        ledger.record(inject, self.executed_steps);
+        ledger.channel_open = true;
+        machoCapturePrint(
+            "macho-processor: SYNTHETIC QUEUE: injected swap packet dwords={d} ring_base=0x{x} wptr=0x{x}->0x{x} wrap={s} aliases={d}/2 frontbuffer=0x{x:0>8} {d}x{d} step={d}; the packet is in ring memory the emulator reads. The write pointer value is what the guest must publish — its register store is memory-mapped and only guest code can execute that store, so until the emulator's ring-change watch acts on this, nothing downstream may count it as an authentic submission\n",
+            .{
+                inject.dwords_written,
+                self.gpu_ring_watch_base,
+                inject.write_pointer_before,
+                inject.write_pointer_after,
+                if (inject.wrapped) "YES" else "NO",
+                written_aliases,
+                swap.frontbuffer_physical_address,
+                swap.width,
+                swap.height,
+                self.executed_steps,
+            },
+        );
     }
 
     /// The contract, printed as a ladder with owners.
@@ -3234,6 +4418,20 @@ pub const MachOState = struct {
             self.logPreinitialization();
             self.logGuestWaitLiveness();
             self.logImportBinding();
+            self.logHostCoverage();
+            self.logBringupFailures();
+            self.logStallRelease();
+            // Drive a refresh because the emulator will not: it refreshes on a
+            // swap, and this title has never swapped. The frame source is
+            // unchanged, so this cannot invent a picture — it only ensures the
+            // scan runs, which is the difference between "we tried and the
+            // guest had nothing" and "nobody ever looked".
+            _ = self.dynamic_forwarder.attemptScheduledRefresh(self);
+            self.dynamic_forwarder.logScheduledRefresh();
+            self.logWaitAudit();
+            self.logDeadlockPredictor();
+            self.logDeferredWork();
+            self.logGuestExceptions();
             self.logSwapSubstitution();
         }
 
@@ -3322,6 +4520,7 @@ pub const MachOState = struct {
         );
         self.dynamic_forwarder.logGraphicsProvenance();
         self.dynamic_forwarder.logGuestFrontBuffer();
+        self.dynamic_forwarder.logVulkanTiers();
         // A blocked count is an aggregate; the frontier needs to know which
         // resource the producer is parked on and for how long.
         self.pthreads.logThreadCensus(self.executed_steps, self.active_guest_thread);
@@ -3846,6 +5045,31 @@ pub const MachOState = struct {
                                 return result;
                             }
                         }.call,
+                        .raiseSignalFn = struct {
+                            fn raise(ptr: *anyopaque, signal: u8) primitive.types.RaiseResult {
+                                const st: *MachOState = @ptrCast(@alignCast(ptr));
+                                if (signal == 0 or signal >= st.signal_actions.len) return .failed;
+
+                                const action = st.signal_actions[signal];
+                                if (action.handler == 1) return .delivered; // SIG_IGN
+                                if (action.handler > 1) {
+                                    const return_address = st.read64(st.regs.rsp);
+                                    if (signal_handling.deliverRaisedGuestSignal(st, signal, return_address)) return .delivered;
+                                }
+
+                                // The default action, or an invalid installed
+                                // handler that could not be entered, terminates
+                                // the guest only. Never call the host raise API.
+                                st.exit_code = 128 + signal;
+                                st.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.unhandled_guest_signal);
+                                st.terminated = true;
+                                machoCapturePrint(
+                                    "macho-processor: guest raise({d}) applied default termination action; Rosette kept the host process alive\n",
+                                    .{signal},
+                                );
+                                return .terminated;
+                            }
+                        }.raise,
                         .pthreadMachThreadIdFn = struct {
                             fn lookup(ptr: *anyopaque, handle: u64) u64 {
                                 const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
@@ -3914,6 +5138,7 @@ pub const MachOState = struct {
         return switch (outcome) {
             .handled => |value| ImportHandlerResult{ .handled = value },
             .handled_void => .handled_void,
+            .control_transferred => .control_transferred,
             .unhandled => null,
         };
     }

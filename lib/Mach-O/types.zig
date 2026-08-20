@@ -553,12 +553,17 @@ pub const CooperativeUiContext = struct {
     regs: Regs,
     xmm: [16][16]u8,
     ymm_hi: [16][16]u8,
+    k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
     x87: X87State,
     /// Signal handlers are guest-thread execution state, just like the
     /// register file. Keeping them in the UI snapshot prevents a worker that
     /// is parked inside a handler from making the signal look recursively
     /// active when the cooperative scheduler runs another guest thread.
     signal_state: GuestSignalState = .{},
+    /// Assertion provenance is part of the guest context too. It must travel
+    /// with the registers or a UD2 on the next scheduled thread can inherit
+    /// the previous thread's assertion and be misclassified as its fallout.
+    assertion_context: GuestAssertionContext = .{},
     thread: u64 = 0,
     caller: u64 = 0,
 };
@@ -688,10 +693,14 @@ pub const SuspendedGuestThread = struct {
     regs: Regs = .{},
     xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
     x87: X87State = .{},
     /// POSIX signal nesting belongs to this guest thread, not to the one host
     /// interpreter thread on which all cooperative contexts happen to run.
     signal_state: GuestSignalState = .{},
+    /// The most recent assertion is retained only as context for a nearby UD2;
+    /// it is not process-wide diagnostic state.
+    assertion_context: GuestAssertionContext = .{},
 };
 
 pub const GuestSignalAction = struct {
@@ -703,6 +712,42 @@ pub const GuestSignalAction = struct {
 pub const GuestAssertionClass = guest_assertion_recovery.Class;
 pub const classifyGuestAssertion = guest_assertion_recovery.classify;
 pub const timerQueueStateName = guest_assertion_recovery.timerQueueStateName;
+
+/// Provenance carried from an assertion import to the UD2 it emits. The
+/// interpreter is cooperative, so a single Mach-O state serves many guest
+/// threads; storing this beside the active register file prevents one thread's
+/// assertion from being donated to another thread after a context switch.
+pub const GuestAssertionContext = struct {
+    valid: bool = false,
+    class: GuestAssertionClass = .none,
+    step: u64 = 0,
+    return_address: u64 = 0,
+    thread: u64 = 0,
+
+    pub fn relevant(self: *const GuestAssertionContext, thread: u64, step: u64, fault_rip: u64) bool {
+        if (!self.valid or self.thread == 0 or self.thread != thread) return false;
+        const age = step -| self.step;
+        const distance = if (fault_rip >= self.return_address)
+            fault_rip - self.return_address
+        else
+            self.return_address - fault_rip;
+        return age <= 4096 and distance <= 16;
+    }
+};
+
+test "assertion provenance is thread-local and bounded to the nearby UD2" {
+    const context = GuestAssertionContext{
+        .valid = true,
+        .class = .timer_queue_wait_item_state,
+        .step = 100,
+        .return_address = 0x2000,
+        .thread = 0x10,
+    };
+    try std.testing.expect(context.relevant(0x10, 100, 0x2008));
+    try std.testing.expect(!context.relevant(0x20, 100, 0x2008));
+    try std.testing.expect(!context.relevant(0x10, 4197, 0x2008));
+    try std.testing.expect(!context.relevant(0x10, 100, 0x2020));
+}
 
 pub const GuestSignalFrame = struct {
     signal: u8 = 0,
@@ -716,7 +761,16 @@ pub const GuestSignalFrame = struct {
     siginfo: u64 = 0,
     mcontext: u64 = 0,
     ucontext: u64 = 0,
-    assertion_class: GuestAssertionClass = .none,
+    /// The context that caused this signal and the context to restore after
+    /// the handler returns are intentionally separate. A handler may itself
+    /// assert before returning; that assertion must not replace the caller's
+    /// nearby-UD2 provenance.
+    assertion_context: GuestAssertionContext = .{},
+    saved_assertion_context: GuestAssertionContext = .{},
+    saved_xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    saved_ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
+    saved_k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
+    saved_x87: X87State = .{},
 };
 
 /// The complete signal nesting state of one cooperatively scheduled guest
