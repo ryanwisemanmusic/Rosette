@@ -1338,6 +1338,16 @@ pub fn build(b: *std.Build) void {
         const cxx_abi_test = b.addTest(.{ .root_module = cxx_abi_mod });
         check_step.dependOn(&b.addRunArtifact(cxx_abi_test).step);
         dyld_mod.addImport("event_log", event_log_mod);
+        // Rooted here, after the last addImport, so dyld's own tests execute
+        // rather than only compile as somebody else's dependency. The Vulkan
+        // loader bridge lives in this module, and its enumeration and
+        // create-info offsets are exactly the kind of rule that is silent at
+        // runtime and only visible as a guest failure many calls later.
+        const dyld_test = b.addTest(.{ .root_module = dyld_mod });
+        const run_dyld_test = b.addRunArtifact(dyld_test);
+        const dyld_check = b.step("dyld-check", "Run the dynamic linker and Vulkan loader bridge tests");
+        dyld_check.dependOn(&run_dyld_test.step);
+        check_step.dependOn(&run_dyld_test.step);
         const diagnostics_mod = b.createModule(.{
             .root_source_file = b.path("../lib/diagnostics/root.zig"),
             .target = target,
@@ -1655,10 +1665,23 @@ pub fn build(b: *std.Build) void {
             macho_processor_mod.linkFramework("QuartzCore", .{});
             macho_processor_mod.linkFramework("Metal", .{});
         }
+        // The Mach-O runtime carries the full MachOState struct (hundreds of
+        // diagnostics/ledger fields) as a stack local inside MachOState.init and
+        // loadAndRun; the inlined frames need ~18MB combined, which overflowed
+        // the 16MB default main stack with an EXC_BAD_ACCESS past the stack
+        // guard (killed before any handler could run, so no crash point). Give
+        // the main thread a stack that fits the actual frames with headroom.
         const macho_processor = b.addExecutable(.{
             .name = "macho_processor",
             .root_module = macho_processor_mod,
         });
+        // The Mach-O runtime carries the full MachOState struct (hundreds of
+        // diagnostics/ledger fields) as a stack local inside MachOState.init and
+        // loadAndRun; the inlined frames need ~18MB combined, which overflowed
+        // the 16MB default main stack with an EXC_BAD_ACCESS past the stack
+        // guard (killed before any handler could run, so no crash point). Give
+        // the main thread a stack that fits the actual frames with headroom.
+        macho_processor.stack_size = 64 * 1024 * 1024;
         b.installArtifact(macho_processor);
 
         const macho_processor_test_mod = b.createModule(.{
