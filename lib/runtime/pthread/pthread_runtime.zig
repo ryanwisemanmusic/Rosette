@@ -109,6 +109,10 @@ const Thread = struct {
     state: ThreadState = .runnable,
     blocked_since_step: u64 = 0,
     blocked_reason: []const u8 = "",
+    /// The thread this one is joining, when it is. Recorded because a join
+    /// that could not be honoured is a latent use-after-free, and the pair of
+    /// handles is what attributes the eventual crash to it.
+    waiting_join_target: u64 = 0,
     waiting_condvar: u64 = 0,
     waiting_mutex: u64 = 0,
     wait_generation: u64 = 0,
@@ -148,6 +152,10 @@ pub const Runtime = struct {
     created_threads: u64 = 0,
     deferred_threads: u64 = 0,
     joined_threads: u64 = 0,
+    /// Joins that returned success while the target was still running. Each
+    /// one is a window in which the caller may destroy state the target is
+    /// still using.
+    unhonoured_joins: u64 = 0,
     cancelled_threads: u64 = 0,
     // P0-1 (event-driven scheduler): bumped on every transition that can
     // change whether a suspended guest context is runnable. The cooperative
@@ -365,13 +373,14 @@ pub const Runtime = struct {
     pub fn logSummary(self: *const Runtime) void {
         if (self.created_threads == 0 and self.mutex_locks == 0 and self.collapsed_waits == 0 and self.tls_sets == 0) return;
         machoCapturePrint(
-            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits/quiescence_wakes)={d}/{d}/{d}/{d} timed_waits(started/signaled/expired)={d}/{d}/{d} indefinite_wait_sentinels={d} sleeps(timed_started/timed_completed/indefinite)={d}/{d}/{d} yield_hints={d} tls_sets={d} thread_id_queries={d}\n",
+            "macho-processor: pthread runtime: created={d} deferred={d} scheduled={d} completed={d} joined={d} unhonoured_joins={d} cancelled={d} blocked={d} mutex(lock/unlock/contention)={d}/{d}/{d} cond(notify/broadcast/waits/quiescence_wakes)={d}/{d}/{d}/{d} timed_waits(started/signaled/expired)={d}/{d}/{d} indefinite_wait_sentinels={d} sleeps(timed_started/timed_completed/indefinite)={d}/{d}/{d} yield_hints={d} tls_sets={d} thread_id_queries={d}\n",
             .{
                 self.created_threads,
                 self.deferred_threads,
                 self.scheduled_threads,
                 self.completed_threads,
                 self.joined_threads,
+                self.unhonoured_joins,
                 self.cancelled_threads,
                 self.blocked_threads,
                 self.mutex_locks,
@@ -820,6 +829,70 @@ pub const Runtime = struct {
     /// progress. A condition generation is eligible at most once per thread;
     /// repeatedly leaving and re-entering the same predicate loop without a
     /// real notification must not become a synthetic busy loop.
+    /// The notifier-liveness twin of `wakeOldestCondvarForQuiescence`, for the
+    /// case the quiescence path cannot reach: a condvar with waiters that has
+    /// NEVER been notified while the rest of the run is alive. The quiescence
+    /// repair only fires when nothing is runnable; a creator that published its
+    /// object state but whose notification was lost (a model artifact, e.g. the
+    /// notify ran before the condvar was registered) strands its waiter while
+    /// every other thread keeps executing. POSIX permits a spurious wake here:
+    /// the guest's predicate loop re-checks its own condition, so a satisfied
+    /// but unwoken waiter proceeds and an unsatisfied one re-parks. The same
+    /// once-per-generation guard as the quiescence path bounds the wake so it
+    /// cannot become a synthetic busy loop.
+    pub const NeverNotifiedRepair = struct {
+        thread: u64,
+        object: u64,
+        waited_steps: u64,
+    };
+
+    pub fn wakeNeverNotifiedWaiter(self: *Runtime, current_step: u64) ?NeverNotifiedRepair {
+        // The report's worst object and the repair's target are different
+        // questions: an `observed_notifiers_parked` object outranks a
+        // never-notified one for reporting but has no repair, so selecting by
+        // the overall worst would strand a repairable waiter behind one that
+        // cannot be helped. The stall gate lives inside the selector.
+        const object = self.waits.worstNeverNotifiedObject(current_step, scheduler.notifier_liveness.default_stall_steps) orelse return null;
+        var selected: ?*Thread = null;
+        for (&self.threads) |*thread| {
+            if (!thread.active or thread.state != .waiting_condvar or thread.spurious_wake_pending) continue;
+            if (thread.waiting_condvar != object.address) continue;
+            if (thread.waiting_condvar == thread.last_spurious_condvar and
+                thread.wait_generation == thread.last_spurious_generation) continue;
+            if (thread.waiting_mutex != 0 and self.mutexWouldBlock(thread.waiting_mutex, thread.handle)) continue;
+            if (selected == null or thread.blocked_since_step < selected.?.blocked_since_step) selected = thread;
+        }
+        const thread = selected orelse return null;
+        thread.spurious_wake_pending = true;
+        thread.last_spurious_condvar = thread.waiting_condvar;
+        thread.last_spurious_generation = thread.wait_generation;
+        // A re-parked waiter after a wake is a stronger statement than a
+        // never-signalled object: the predicate is provably unsatisfied. The
+        // count is what lets the liveness report say so instead of repeating
+        // "find who was supposed to signal it" forever.
+        object.repair_attempts +|= 1;
+        self.bumpStateVersion();
+        self.quiescence_spurious_wakes +|= 1;
+        self.emit(.{
+            .kind = .quiescence_recovery,
+            .step = current_step,
+            .thread = thread.handle,
+            .object = thread.waiting_condvar,
+            .generation = thread.wait_generation,
+            .runnable = 1,
+            .blocked = self.blocked_threads,
+            .reason = "never_notified_condvar_spurious_wake",
+        });
+        // The caller reports the repair against the object actually woken,
+        // which can differ from the report's worst object (the selector is
+        // per-class, the report is per-rank).
+        return .{
+            .thread = thread.handle,
+            .object = thread.waiting_condvar,
+            .waited_steps = current_step -| object.first_wait_step,
+        };
+    }
+
     pub fn wakeOldestCondvarForQuiescence(self: *Runtime, preferred_handle: u64, current_step: u64) ?u64 {
         var selected: ?*Thread = null;
         for (&self.threads) |*thread| {
@@ -923,15 +996,62 @@ pub const Runtime = struct {
         return 11;
     }
 
+    /// `pthread_join`, and the one thing it cannot currently honour.
+    ///
+    /// A correct join blocks the **caller** until the target terminates. This
+    /// one returns success immediately, because the import dispatch has no
+    /// outcome that means "re-execute me later" — every handler completes. The
+    /// consequence is not theoretical: `std::thread::join()` believes the
+    /// thread finished, the caller destroys whatever the thread was still
+    /// using, and the thread dispatches through a freed object some thousands
+    /// of steps later. That is a use-after-free with the crash arriving in a
+    /// different thread, in a different subsystem, long after the cause.
+    ///
+    /// Two things are fixed here and one is only reported:
+    ///
+    ///  * The *target* was being marked `waiting_join`, which is nonsense — it
+    ///    is running, and the state corrupted belonged to a thread doing real
+    ///    work. No thread's state is changed now: marking the caller instead
+    ///    would be wrong the other way, because the import returns and the
+    ///    caller resumes immediately, so a scheduler that believed it blocked
+    ///    would refuse to run it.
+    ///  * The early return is now recorded against the target, so the eventual
+    ///    crash can be attributed to it instead of to whatever memory happened
+    ///    to be reused.
+    ///
+    /// The early return itself stays until the dispatch grows a retry outcome;
+    /// inventing one here would change the contract every import is written
+    /// against.
     fn join(self: *Runtime, state: anytype) u64 {
-        const thread = self.threadForHandle(state.regs.rdi) orelse return 3;
-        if (thread.state != .terminated) {
-            thread.state = .waiting_join;
-            thread.blocked_since_step = schedulerStep(state);
-            thread.blocked_reason = "pthread_join waiting";
-            self.blocked_threads +|= 1;
+        const target = self.threadForHandle(state.regs.rdi) orelse return 3;
+        const caller_handle = self.currentThreadHandle(state);
+        const terminated = target.state == .terminated or target.state == .cancelled;
+
+        if (!terminated) {
+            // The relationship is recorded and **no state is changed**.
+            //
+            // Marking the target `waiting_join` — what this used to do —
+            // corrupted a thread that was running. Marking the *caller* would
+            // be equally wrong in the other direction: the import returns
+            // success, so the caller resumes executing immediately, and a
+            // scheduler that believed it was blocked would refuse to run it.
+            // Until the dispatch can express "re-execute me later", the honest
+            // state for both threads is the one they already had.
+            if (self.threadForHandle(caller_handle)) |caller| {
+                caller.waiting_join_target = target.handle;
+            }
+            self.unhonoured_joins +|= 1;
+            if (self.unhonoured_joins <= 8 or self.unhonoured_joins % 64 == 0) {
+                machoCapturePrint(
+                    "macho-processor: pthread join not honoured #{d}: caller=0x{x} target=0x{x} target_state={s} started_step={d}; the join returns success while the target is still running, so anything the caller destroys next is still in use by it. A crash that arrives later in another thread belongs to this line, not to the memory it lands in\n",
+                    .{ self.unhonoured_joins, caller_handle, target.handle, @tagName(target.state), target.blocked_since_step },
+                );
+            }
+        } else if (self.threadForHandle(caller_handle)) |caller| {
+            if (caller.waiting_join_target == target.handle) caller.waiting_join_target = 0;
         }
-        thread.joined = true;
+
+        target.joined = true;
         self.joined_threads +|= 1;
         if (state.regs.rsi != 0 and state.guestMemory(state.regs.rsi, 8) != null) state.write64(state.regs.rsi, 0);
         return 0;
@@ -1687,6 +1807,37 @@ test "global quiescence grants one POSIX spurious wake to oldest condvar waiter"
     // A genuine condition generation change makes a later wait eligible.
     runtime.threads[0].wait_generation = 1;
     try std.testing.expectEqual(first, runtime.wakeOldestCondvarForQuiescence(0, 104).?);
+}
+
+test "never-notified condvar waiter gets one bounded spurious wake" {
+    const waiter = SYNTHETIC_THREAD_BASE;
+    var runtime = Runtime{};
+    runtime.threads[0] = .{
+        .active = true,
+        .handle = waiter,
+        .started = true,
+        .state = .waiting_condvar,
+        .waiting_condvar = 0x4000,
+        .blocked_since_step = 10,
+    };
+    _ = runtime.condvarInit(0x4000);
+    // The wait registered the object with no notification history.
+    const slot = runtime.threadSlot(waiter).?;
+    runtime.waits.noteWait(0x4000, slot, 10);
+
+    // Stalled well past the default stall threshold with zero notifications.
+    try std.testing.expectEqual(waiter, runtime.wakeNeverNotifiedWaiter(500_000_000).?);
+    try std.testing.expect(runtime.threads[0].spurious_wake_pending);
+    try std.testing.expect(runtime.threads[0].last_spurious_condvar == 0x4000);
+
+    // The same wait generation is woken at most once; a satisfied predicate
+    // that re-parks must not mint artificial work.
+    runtime.threads[0].spurious_wake_pending = false;
+    try std.testing.expect(runtime.wakeNeverNotifiedWaiter(600_000_000) == null);
+
+    // A progressing object is not a never-notified casualty.
+    runtime.waits.noteNotify(0x4000, slot, waiter, 0, 700_000_000);
+    try std.testing.expect(runtime.wakeNeverNotifiedWaiter(800_000_000) == null);
 }
 
 test "thread state transitions" {
