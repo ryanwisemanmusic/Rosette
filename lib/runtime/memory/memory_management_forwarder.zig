@@ -140,8 +140,12 @@ pub const Manager = struct {
         // rejects every non-power-of-two-sized struct in allocate(), including
         // Capstone's cs_struct, and makes cs_open report CS_ERR_MEM.
         const address = self.allocate(state, size, 16) orelse return null;
-        const storage = state.guestMemory(address, @max(size, 1)) orelse return null;
-        @memset(storage, 0);
+        if (comptime @hasDecl(@TypeOf(state.*), "fillGuestMemory")) {
+            if (!state.fillGuestMemory(address, @max(size, 1), 0)) return null;
+        } else {
+            const storage = state.guestMemory(address, @max(size, 1)) orelse return null;
+            @memset(storage, 0);
+        }
         return address;
     }
 
@@ -164,8 +168,12 @@ pub const Manager = struct {
 
         const replacement = self.allocate(state, requested_size, old.alignment) orelse return null;
         const source = state.guestMemoryConst(address, old.size) orelse return null;
-        const destination = state.guestMemory(replacement, old.size) orelse return null;
-        std.mem.copyForwards(u8, destination, source);
+        if (comptime @hasDecl(@TypeOf(state.*), "writeGuestBytes")) {
+            if (!state.writeGuestBytes(replacement, source)) return null;
+        } else {
+            const destination = state.guestMemory(replacement, old.size) orelse return null;
+            std.mem.copyForwards(u8, destination, source);
+        }
         self.release(address);
         return replacement;
     }
