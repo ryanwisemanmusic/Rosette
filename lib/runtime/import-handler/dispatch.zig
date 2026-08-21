@@ -703,9 +703,10 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if ((name_hash == importNameHash("_strcpy") and std.mem.eql(u8, name, "_strcpy"))) {
         const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const destination = self.guestMemory(self.regs.rdi, source.len + 1) orelse return .{ .unsupported = 0 };
-        self.noteGuestWrite(self.regs.rdi, source.len + 1);
+        const mutation = self.captureMemoryMutation(self.regs.rdi, source.len + 1);
         @memcpy(destination[0..source.len], source);
         destination[source.len] = 0;
+        self.commitMemoryMutation(mutation, .bulk_copy);
         return .{ .handled = self.regs.rdi };
     }
     if ((name_hash == importNameHash("_strtoul") and std.mem.eql(u8, name, "_strtoul"))) {
@@ -969,13 +970,13 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if (std.mem.indexOf(u8, name, "recursive_mutexC1Ev") != null or
         std.mem.indexOf(u8, name, "recursive_mutexC2Ev") != null)
     {
-        if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
+        _ = self.fillGuestMemory(self.regs.rdi, 64, 0);
         return .{ .handled = self.regs.rdi };
     }
     if (libcpp_thread.classify(name)) |operation| {
         return switch (operation) {
             .construct => blk: {
-                if (self.guestMemory(self.regs.rdi, 64)) |storage| @memset(storage, 0);
+                _ = self.fillGuestMemory(self.regs.rdi, 64, 0);
                 break :blk .{ .handled = self.regs.rdi };
             },
             // Construction is intercepted and creates no native libc++ TLS
@@ -1575,9 +1576,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const requested_ns: i64 = @intCast(@min(total_ns, @as(u64, std.math.maxInt(i64))));
         self.pending_direct_sleep = scheduler.classifyGuestSleep(requested_ns);
         if (rem_ptr != 0) {
-            if (self.guestMemory(rem_ptr, 16)) |rem| {
-                @memset(rem, 0);
-            }
+            _ = self.fillGuestMemory(rem_ptr, 16, 0);
         }
         return .{ .handled = 0 };
     }
@@ -1847,8 +1846,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     }
     if ((name_hash == importNameHash("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev") and std.mem.eql(u8, name, "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev"))) {
         const object = self.regs.rdi;
-        if (self.guestMemory(object, 64)) |buf| {
-            @memset(buf, 0);
+        if (self.fillGuestMemory(object, 64, 0)) {
             if (self.libcxx_streams.object_model.ensureType(self, .basic_streambuf, null)) |record| {
                 self.write64(object, record.vtable);
             }
