@@ -4736,7 +4736,7 @@ pub fn writeMemVal(self: anytype, addr: u64, size: Size, val: u64) void {
 /// The watch set is what replaces "re-run with ROSETTE_MACHO_WRITE_DIAGNOSTICS
 ///=1" as the answer to "who wrote this field" — a flag asks the operator to
 /// predict, before the run, which address will matter.
-pub fn provenanceWanted(self: anytype, address: u64) bool {
+pub inline fn provenanceWanted(self: anytype, address: u64) bool {
     if (self.write_diagnostics_armed) return true;
     if (comptime !@hasField(@TypeOf(self.*), "provenance_watch")) return false;
     return self.provenance_watch.contains(address);
@@ -5593,9 +5593,28 @@ pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
     // cheap case.
     if (!touches_image_code and !self.sparse_memory.isExecutable(address, count)) return;
 
+    // A guest write landed on executable bytes; the cached decodes for that
+    // range no longer describe what will execute.
+    invalidateDecodeRange(self, address, count);
+}
+
+/// Clear every decode-cache entry whose instruction bytes overlap
+/// [address, end), or flush the whole cache when the range is too large to
+/// name its entries.
+///
+/// Callers are every event that can make a cached decode's "validated at fill
+/// time" verdict stale: a guest write to executable bytes (`noteGuestWrite`),
+/// a discarded/unmapped range, and a page-protection change (mprotect) in
+/// either direction. The walk itself is unchanged from `noteGuestWrite`; the
+/// extraction exists so protection changes and discards — which `noteGuestWrite`
+/// cannot see (the range is no longer executable by the time it is asked) —
+/// reach the same precise invalidation.
+pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
+    if (count == 0) return;
+    const end = address +| count;
     // Xenia emits and patches translated x64 in a sparse RWX code cache
     // (normally 0xA0000000..0xAFFFFFFF). Invalidate only cached instructions
-    // whose bytes overlap the write. A global generation flush on every JIT
+    // whose bytes overlap the range. A global generation flush on every JIT
     // byte store is correct but makes concurrent compilation prohibitively
     // expensive.
     const maximum_instruction_length: u64 = 15;
@@ -5809,10 +5828,11 @@ pub fn noteGuestRangeDiscarded(
     self.guest_lifetime.note(address, length, reason, self.executed_steps);
     // Provenance and vtable identity describe bytes that no longer exist.
     forgetMemoryWriteProvenance(self, address, length);
-    // Executable bytes at these addresses are new bytes. `noteGuestWrite`
-    // returns immediately for non-executable ranges, so this costs nothing on
-    // the ordinary data mapping.
-    noteGuestWrite(self, address, length);
+    // So do decoded instructions: the old backing may have been executable and
+    // executed from. `noteGuestWrite` cannot do this — its executable gate
+    // bails the moment the mapping is gone — so clear the range directly. The
+    // page-set bitmap makes this one bit test for the ordinary data mapping.
+    invalidateDecodeRange(self, address, length);
     if (recovery_ledger.throttled(self.guest_lifetime.events)) {
         machoCapturePrint(
             "macho-processor: guest range backing discarded #{d}: base=0x{x} length={d} reason={s} generation={d} step={d}; write provenance, vtable identity and decoded bytes for this range are retired. Any later \"nothing was ever stored here\" about this range is a statement about Rosette's memory management, not about the guest\n",
@@ -6030,6 +6050,12 @@ pub fn guestProtectSparseMemory(self: anytype, address: u64, length: u64, prot: 
     // bytes were written while the mapping was non-executable. Invalidate the
     // affected decoded range before any generated code may enter it.
     if (prot & 4 != 0) noteGuestWrite(self, address, effective_length);
+    // Removing the execute bit invalidates the decodes that were validated
+    // under the old state; `noteGuestWrite` only fires for the add direction.
+    // Fire for every non-executable mprotect — the page-set bitmap makes a
+    // range that never held a decode cost one bit test, and a range that did
+    // hold one must not keep executing after it stopped being code.
+    if (prot & 4 == 0) invalidateDecodeRange(self, address, effective_length);
     return true;
 }
 
@@ -6055,6 +6081,9 @@ pub fn guestProtectMappedMemory(self: anytype, address: u64, length: u64, prot: 
         .owner = "primary guest mprotect",
     });
     if (prot & 4 != 0) noteGuestWrite(self, address, length);
+    // Mirrors `guestProtectSparseMemory`: removing the execute bit must retire
+    // the decodes validated under the old state.
+    if (prot & 4 == 0) invalidateDecodeRange(self, address, length);
     return true;
 }
 

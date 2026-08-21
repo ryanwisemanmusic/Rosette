@@ -128,14 +128,29 @@ test "verification matches contract dispatch for stub symbols" {
         "_g_object_ref_sink",
         "__ZNSt3__18ios_base5clearEj",
         "_localtime",
-        "_readdir",
-        "__ZdlPv",
     };
     for (stubs) |sym| {
+        // Assert the strategy, not just the outcome. A symbol that is not a
+        // stub has no modelled outcome at all, so listing one here used to
+        // fail on a null dispatch with nothing to say which entry was wrong.
+        const resolved = runtime.resolveFromAllFamilies(sym) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(contract.ResolutionStrategy.stub, resolved.strategy);
         const outcome = runtime.dispatchFromAllFamilies(sym, 0);
         try std.testing.expect(outcome != null);
         try std.testing.expectEqual(@as(u64, 0), outcome.?.handled);
         try std.testing.expect(verifyDispatch(sym, outcome.?, 0));
+    }
+}
+
+test "host-forwarded symbols resolve but have no modelled outcome" {
+    // readdir fills a caller buffer and operator delete releases memory: a
+    // stub returning zero for either would be a silent wrong answer, so both
+    // forward to the host and dispatch deliberately produces nothing.
+    const forwarded = [_][]const u8{ "_readdir", "__ZdlPv" };
+    for (forwarded) |sym| {
+        const resolved = runtime.resolveFromAllFamilies(sym) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(contract.ResolutionStrategy.forward_to_host, resolved.strategy);
+        try std.testing.expect(runtime.dispatchFromAllFamilies(sym, 0) == null);
     }
 }
 

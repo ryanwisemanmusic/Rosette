@@ -181,6 +181,20 @@ pub fn verify(meta: core.InstructionMathMeta, cases: []const ProofCase) !void {
     try verifyReport(.{ .meta = meta, .cases = cases });
 }
 
+/// Whether every case in a report is a documented-contract restatement.
+///
+/// A documented-contract case carries no values to check: it names the table
+/// the instruction came from and nothing else. Two of them are worth no more
+/// than one, and in this tree the second is a verbatim copy of the first — so
+/// a "at least two cases per table" rule says nothing about these, and
+/// everything about the instructions that do model arithmetic.
+pub fn isDocumentedContractOnly(report: ProofReport) bool {
+    for (report.cases) |proof_case| {
+        if (proof_case != .documented_contract) return false;
+    }
+    return true;
+}
+
 pub fn verifyReport(report: ProofReport) !void {
     runtime_abi.isa.validateMathProofSet(.{
         .target_isa = @tagName(report.meta.target_isa),
@@ -192,6 +206,17 @@ pub fn verifyReport(report: ProofReport) !void {
 
     for (report.cases) |proof_case| {
         try std.testing.expectEqual(report.meta.operation, caseOperation(proof_case));
+        // A documented-contract case restates the instruction its own meta
+        // already names. On its own that restatement proves nothing — both
+        // literals live in the same generated file — so tie the two together:
+        // a case copied from a neighbouring instruction then fails here rather
+        // than passing as a proof about the wrong opcode.
+        if (proof_case == .documented_contract) {
+            const case = proof_case.documented_contract;
+            try std.testing.expectEqualStrings(report.meta.name, case.name);
+            try std.testing.expectEqualStrings(report.meta.path, case.path);
+            try std.testing.expectEqualStrings(report.meta.path, report.meta.source_table_path);
+        }
         try verifyCase(proof_case);
     }
 }

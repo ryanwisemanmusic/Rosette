@@ -268,6 +268,26 @@ pub const DecodeCacheEntry = struct {
     /// Which way of the set survives the next eviction. Exact LRU for two
     /// ways; see `MachOState.noteDecodeCacheUse`.
     recently_used: bool = false,
+    /// The fill that produced this entry ran the full validation gate chain
+    /// and it declined: the RIP is not a special-RIP target (table, stub
+    /// helper, libcpp stream, synthetic thunk), the address was executable,
+    /// config parsing was idle, and the special-RIP table is intact. Every
+    /// condition is monotone after the fill, and the entry survives only
+    /// while the bytes and permissions it was validated under still hold
+    /// (generation invalidation plus per-range clears on writes, discards
+    /// and mprotects), so a hit may skip the per-instruction gate chain
+    /// entirely. Entries filled by paths that cannot prove this (the
+    /// guest-function helper, startup while config parsing is active) stay
+    /// on the slow path.
+    fast_plain: bool = false,
+    /// Whether the fill's RIP was inside the host image's executable range.
+    /// Computed once per fill (hundreds of thousands of times) so the
+    /// per-instruction execution-history filter can classify the current
+    /// instruction with one load instead of re-running the two range compares
+    /// on every step (billions of times). Exact for the entry's RIP, and the
+    /// entry is only ever consulted for the RIP it was keyed by, so a hit's
+    /// classification is the fill's classification.
+    host_image: bool = false,
     /// Raw displacement from `decodeInsn`, before base/index/rip-relative
     /// resolution.  Used on cache hit to re-resolve the operand address
     /// from current register state without double-counting the base

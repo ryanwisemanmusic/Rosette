@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "FDIV", .path = "DIV/fdiv.inc", .encoding_count = 4, .source_path_len = 11 } },
-    .{ .documented_contract = .{ .name = "FDIV", .path = "DIV/fdiv.inc", .encoding_count = 4, .source_path_len = 11 } },
+    .{ .documented_contract = .{ .name = "FDIV", .path = "DIV/fdiv.inc", .encoding_count = 4, .source_path_len = 12 } },
+    .{ .documented_contract = .{ .name = "FDIV", .path = "DIV/fdiv.inc", .encoding_count = 4, .source_path_len = 12 } },
 };
 
 pub const proof_report = proofs.ProofReport{

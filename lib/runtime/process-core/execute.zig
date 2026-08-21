@@ -950,7 +950,8 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
             self.push(return_addr);
             self.regs.rip = target;
             self.logControlFlow("call_rel32", from_rip, target, d.len, return_addr);
-            if (self.sha1_tracer.enabled and
+            if (self.step_tracing_active and
+                self.sha1_tracer.enabled and
                 self.sha1_tracer.isActiveThread(self) and
                 self.sha1_tracer.depth < 4)
             {

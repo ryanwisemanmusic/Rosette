@@ -47,6 +47,18 @@ const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;
 const TRACE_BUFFER_LEN = constants.TRACE_BUFFER_LEN;
 const UNSUPPORTED_RUNTIME_EXIT_CODE = constants.UNSUPPORTED_RUNTIME_EXIT_CODE;
 
+/// FNV-1a 64-bit. Computed once per `handleImportSlow` dispatch so the
+/// name-compare chain costs u64 compares; the `eql` that follows each hash
+/// equality remains the arbiter, so a collision can never change behavior.
+/// Const-folded at comptime for the literal spellings.
+fn importNameHash(name: []const u8) u64 {
+    var hash: u64 = 14695981039346656037;
+    for (name) |byte| {
+        hash = (hash ^ byte) *% 1099511628211;
+    }
+    return hash;
+}
+
 fn guestSysconf(selector: i32) u64 {
     return guest_memory_geometry.darwinSysconf(selector) orelse
         @bitCast(@as(i64, -1));
@@ -121,7 +133,14 @@ pub fn handleImportImpl(self: anytype, imported: macho_metadata.ImportedSymbol) 
 
 pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) ImportHandlerResult {
     const name = imported.name;
-    if ((std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) and
+    // Hash once per dispatch so the ~120-name compare chain below becomes a
+    // sequence of u64 compares instead of string walks. Every hash equality
+    // is followed by the `eql` that used to stand alone: a collision can only
+    // cost one extra compare on the matched name, never select the wrong
+    // branch, so the chain's semantics are byte-for-byte unchanged.
+    const name_hash = importNameHash(name);
+    if (((name_hash == importNameHash("_exit") and std.mem.eql(u8, name, "_exit")) or
+        (name_hash == importNameHash("exit") and std.mem.eql(u8, name, "exit"))) and
         self.foreign_objects.main_loop_bypasses != 0)
     {
         machoCapturePrint(
@@ -129,19 +148,19 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             .{self.foreign_objects.main_loop_bypasses},
         );
     }
-    if (std.mem.eql(u8, name, "_exit") or std.mem.eql(u8, name, "exit")) {
+    if ((name_hash == importNameHash("_exit") and std.mem.eql(u8, name, "_exit")) or (name_hash == importNameHash("exit") and std.mem.eql(u8, name, "exit"))) {
         const exit_code = self.regs.rdi;
         if (beginGuestExit(self, exit_code)) return .control_transferred;
         if (self.terminated) return .control_transferred;
         return .{ .terminated = exit_code };
     }
-    if (std.mem.eql(u8, name, "_memcpy") or std.mem.eql(u8, name, "_memmove") or
-        std.mem.eql(u8, name, "___memcpy_chk") or std.mem.eql(u8, name, "___memmove_chk"))
+    if ((name_hash == importNameHash("_memcpy") and std.mem.eql(u8, name, "_memcpy")) or (name_hash == importNameHash("_memmove") and std.mem.eql(u8, name, "_memmove")) or
+        (name_hash == importNameHash("___memcpy_chk") and std.mem.eql(u8, name, "___memcpy_chk")) or (name_hash == importNameHash("___memmove_chk") and std.mem.eql(u8, name, "___memmove_chk")))
     {
         self.resolving_import_route = .guest_memory_copy;
         return handleGuestMemoryCopy(self, name);
     }
-    if (std.mem.eql(u8, name, "_memset") or std.mem.eql(u8, name, "___memset_chk")) {
+    if ((name_hash == importNameHash("_memset") and std.mem.eql(u8, name, "_memset")) or (name_hash == importNameHash("___memset_chk") and std.mem.eql(u8, name, "___memset_chk"))) {
         self.resolving_import_route = .memset;
         const dst = self.regs.rdi;
         const val: u8 = @truncate(self.regs.rsi);
@@ -155,11 +174,11 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = dst };
     }
-    if (std.mem.eql(u8, name, "_pthread_once")) {
+    if ((name_hash == importNameHash("_pthread_once") and std.mem.eql(u8, name, "_pthread_once"))) {
         self.resolving_import_route = .pthread_once;
         return handlePthreadOnce(self);
     }
-    if (std.mem.eql(u8, name, "_bzero") or std.mem.eql(u8, name, "__bzero")) {
+    if ((name_hash == importNameHash("_bzero") and std.mem.eql(u8, name, "_bzero")) or (name_hash == importNameHash("__bzero") and std.mem.eql(u8, name, "__bzero"))) {
         self.resolving_import_route = .bzero;
         const dst = self.regs.rdi;
         const count = self.regs.rsi;
@@ -172,7 +191,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = 0 };
     }
-    if (std.mem.eql(u8, name, "_sysconf")) {
+    if ((name_hash == importNameHash("_sysconf") and std.mem.eql(u8, name, "_sysconf"))) {
         self.resolving_import_route = .sysconf;
         const selector: i32 = @bitCast(@as(u32, @truncate(self.regs.rdi)));
         const value = guestSysconf(selector);
@@ -181,7 +200,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = value };
     }
-    if (std.mem.eql(u8, name, "_dlopen")) {
+    if ((name_hash == importNameHash("_dlopen") and std.mem.eql(u8, name, "_dlopen"))) {
         const path = self.guestCString(self.regs.rdi, 1024) orelse return .{ .handled = 0 };
         const handle = self.dynamic_forwarder.openGuest(path, self.regs.rsi);
         if (self.verbose_trace or handle == 0) {
@@ -192,11 +211,11 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = handle };
     }
-    if (std.mem.eql(u8, name, "_dlclose")) {
+    if ((name_hash == importNameHash("_dlclose") and std.mem.eql(u8, name, "_dlclose"))) {
         const result = self.dynamic_forwarder.closeGuest(self.regs.rdi);
         return .{ .handled = @as(u32, @bitCast(result)) };
     }
-    if (std.mem.eql(u8, name, "_dlsym")) {
+    if ((name_hash == importNameHash("_dlsym") and std.mem.eql(u8, name, "_dlsym"))) {
         const symbol = self.guestCString(self.regs.rsi, 512) orelse return .{ .handled = 0 };
         const address = self.dynamic_forwarder.lookupGuest(self.regs.rdi, symbol);
         if (address != 0) self.registerSyntheticThunk(address, 1, symbol);
@@ -214,11 +233,11 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return sdlResolution(resolution);
     }
     if (self.main_loop_type == .gtk) {
-        if (std.mem.eql(u8, name, "_gtk_main") and self.beginCooperativeMainLoop()) {
+        if ((name_hash == importNameHash("_gtk_main") and std.mem.eql(u8, name, "_gtk_main")) and self.beginCooperativeMainLoop()) {
             self.resolving_import_route = .coop_main;
             return .control_transferred;
         }
-        if (std.mem.eql(u8, name, "_gtk_main_quit") and self.cooperative_ui_context != null) {
+        if ((name_hash == importNameHash("_gtk_main_quit") and std.mem.eql(u8, name, "_gtk_main_quit")) and self.cooperative_ui_context != null) {
             self.resolving_import_route = .coop_main_quit;
             self.foreign_objects.main_loop_quits +|= 1;
             self.restoreMainLoopCaller("gtk_main_quit");
@@ -228,7 +247,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             self.resolving_import_route = .idle_add;
             return handleIdleAdd(self, name);
         }
-        if (std.mem.eql(u8, name, "_g_source_remove")) {
+        if ((name_hash == importNameHash("_g_source_remove") and std.mem.eql(u8, name, "_g_source_remove"))) {
             self.resolving_import_route = .idle_source_remove;
             return handleIdleSourceRemove(self);
         }
@@ -363,21 +382,21 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         };
     }
 
-    if (std.mem.eql(u8, name, "_objc_getClass")) {
+    if ((name_hash == importNameHash("_objc_getClass") and std.mem.eql(u8, name, "_objc_getClass"))) {
         const class_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
         const handle = self.compat.classNamed(class_name);
         self.registerOpaqueHandle(handle, "objc class identity");
         machoCapturePrint("    [objc] class {s} -> 0x{x}\n", .{ class_name, handle });
         return .{ .handled = handle };
     }
-    if (std.mem.eql(u8, name, "_sel_registerName")) {
+    if ((name_hash == importNameHash("_sel_registerName") and std.mem.eql(u8, name, "_sel_registerName"))) {
         const selector_name = self.guestCString(self.regs.rdi, 1024) orelse return .{ .unsupported = 0 };
         const handle = self.compat.selectorNamed(selector_name);
         self.registerOpaqueHandle(handle, "Objective-C selector identity");
         machoCapturePrint("    [objc] selector {s} -> 0x{x}\n", .{ selector_name, handle });
         return .{ .handled = handle };
     }
-    if (std.mem.eql(u8, name, "_objc_msgSend")) {
+    if ((name_hash == importNameHash("_objc_msgSend") and std.mem.eql(u8, name, "_objc_msgSend"))) {
         const selector_name = self.compat.selectorName(self.regs.rsi);
         const class_name = self.compat.className(self.regs.rdi);
         if (self.native_window.handleObjcMessage(
@@ -404,12 +423,12 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return if (result.modeled) .{ .handled = result.value } else .{ .unsupported = result.value };
     }
 
-    if (std.mem.eql(u8, name, "_objc_autoreleasePoolPush")) {
+    if ((name_hash == importNameHash("_objc_autoreleasePoolPush") and std.mem.eql(u8, name, "_objc_autoreleasePoolPush"))) {
         const handle = self.compat.currentThreadHandle();
         self.registerOpaqueHandle(handle, "Objective-C autorelease pool identity");
         return .{ .handled = handle };
     }
-    if (std.mem.eql(u8, name, "___assert_rtn")) {
+    if ((name_hash == importNameHash("___assert_rtn") and std.mem.eql(u8, name, "___assert_rtn"))) {
         self.guest_assertion_count += 1;
         const function_name = self.guestCString(self.regs.rdi, 1024) orelse "<unknown>";
         const file_name = self.guestCString(self.regs.rsi, 4096) orelse "<unknown>";
@@ -655,7 +674,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = 0 };
     }
 
-    if (std.mem.eql(u8, name, "_strcmp")) {
+    if ((name_hash == importNameHash("_strcmp") and std.mem.eql(u8, name, "_strcmp"))) {
         const lhs = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .unsupported = 0 };
         const rhs = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const ordering = std.mem.order(u8, lhs, rhs);
@@ -666,7 +685,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         };
         return .{ .handled = @as(u32, @bitCast(result)) };
     }
-    if (std.mem.eql(u8, name, "_strcasecmp")) {
+    if ((name_hash == importNameHash("_strcasecmp") and std.mem.eql(u8, name, "_strcasecmp"))) {
         const lhs = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .unsupported = 0 };
         const rhs = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const shared = @min(lhs.len, rhs.len);
@@ -681,7 +700,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const result: i32 = if (lhs.len < rhs.len) -1 else if (lhs.len > rhs.len) 1 else 0;
         return .{ .handled = @as(u32, @bitCast(result)) };
     }
-    if (std.mem.eql(u8, name, "_strcpy")) {
+    if ((name_hash == importNameHash("_strcpy") and std.mem.eql(u8, name, "_strcpy"))) {
         const source = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const destination = self.guestMemory(self.regs.rdi, source.len + 1) orelse return .{ .unsupported = 0 };
         self.noteGuestWrite(self.regs.rdi, source.len + 1);
@@ -689,7 +708,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         destination[source.len] = 0;
         return .{ .handled = self.regs.rdi };
     }
-    if (std.mem.eql(u8, name, "_strtoul")) {
+    if ((name_hash == importNameHash("_strtoul") and std.mem.eql(u8, name, "_strtoul"))) {
         self.resolving_import_route = .strtoul;
         const nptr = self.guestCString(self.regs.rdi, 1 << 20) orelse return .{ .handled = 0 };
         const endptr_ptr = self.regs.rsi;
@@ -749,7 +768,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         if (negate) return .{ .handled = @bitCast(@as(i64, -@as(i64, @bitCast(result)))) };
         return .{ .handled = result };
     }
-    if (std.mem.eql(u8, name, "_getenv")) {
+    if ((name_hash == importNameHash("_getenv") and std.mem.eql(u8, name, "_getenv"))) {
         const key = self.guestCString(self.regs.rdi, 256) orelse return .{ .handled = 0 };
         const raw = if (std.mem.eql(u8, key, "HOME"))
             std.c.getenv("HOME")
@@ -769,11 +788,11 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         if (!self.guestWriteCString(allocation, value)) return .{ .handled = 0 };
         return .{ .handled = allocation };
     }
-    if (std.mem.eql(u8, name, "_getpwuid_r")) {
+    if ((name_hash == importNameHash("_getpwuid_r") and std.mem.eql(u8, name, "_getpwuid_r"))) {
         if (self.regs.r8 != 0) self.write64(self.regs.r8, 0);
         return .{ .handled = 2 };
     }
-    if (std.mem.eql(u8, name, "___error")) {
+    if ((name_hash == importNameHash("___error") and std.mem.eql(u8, name, "___error"))) {
         if (self.guest_errno_address == 0) {
             self.guest_errno_address = self.guestAlloc(@sizeOf(c_int), @alignOf(c_int)) orelse return .{ .unsupported = 0 };
         }
@@ -893,7 +912,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const found = std.mem.indexOfScalarPos(u8, bytes, start, needle) orelse return .{ .handled = std.math.maxInt(u64) };
         return .{ .handled = found };
     }
-    if (std.mem.eql(u8, name, "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc")) {
+    if ((name_hash == importNameHash("__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc") and std.mem.eql(u8, name, "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc"))) {
         const rhs = self.guestCString(self.regs.rsi, 1 << 20) orelse return .{ .unsupported = 0 };
         const result = compat_runtime.compareLibcppStringWithBytes(self, self.regs.rdi, self.regs.rsi, rhs.len) orelse
             return .{ .unsupported = 0 };
@@ -906,19 +925,19 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = @as(u32, @bitCast(result)) };
     }
 
-    if (std.mem.eql(u8, name, "___cxa_guard_acquire")) {
+    if ((name_hash == importNameHash("___cxa_guard_acquire") and std.mem.eql(u8, name, "___cxa_guard_acquire"))) {
         const result = compat_runtime.cxaGuardAcquire(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
         // Track the guard address so we can clear it on initializer deferral
         self.guard_rollback.track(self.regs.rdi);
         return .{ .handled = result };
     }
-    if (std.mem.eql(u8, name, "___cxa_guard_release")) {
+    if ((name_hash == importNameHash("___cxa_guard_release") and std.mem.eql(u8, name, "___cxa_guard_release"))) {
         return if (compat_runtime.cxaGuardRelease(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
     }
-    if (std.mem.eql(u8, name, "___cxa_guard_abort")) {
+    if ((name_hash == importNameHash("___cxa_guard_abort") and std.mem.eql(u8, name, "___cxa_guard_abort"))) {
         return if (compat_runtime.cxaGuardAbort(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
     }
-    if (std.mem.eql(u8, name, "___cxa_atexit")) {
+    if ((name_hash == importNameHash("___cxa_atexit") and std.mem.eql(u8, name, "___cxa_atexit"))) {
         const registered = self.compat.registerAtexit(self.regs.rdi, self.regs.rsi, self.regs.rdx);
         if (self.verbose_trace) machoCapturePrint(
             "    [c++] __cxa_atexit(function=0x{x}, argument=0x{x}, dso=0x{x}) -> {}\n",
@@ -926,7 +945,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         );
         return .{ .handled = if (registered) 0 else 1 };
     }
-    if (std.mem.eql(u8, name, "_atexit")) {
+    if ((name_hash == importNameHash("_atexit") and std.mem.eql(u8, name, "_atexit"))) {
         const registered = self.compat.registerPlainAtexit(self.regs.rdi);
         if (self.verbose_trace) {
             machoCapturePrint(
@@ -936,15 +955,15 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = if (registered) 0 else 1 };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__112__next_primeEm")) {
+    if ((name_hash == importNameHash("__ZNSt3__112__next_primeEm") and std.mem.eql(u8, name, "__ZNSt3__112__next_primeEm"))) {
         return .{ .handled = nextPrime(self.regs.rdi) };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__18ios_base6xallocEv")) {
+    if ((name_hash == importNameHash("__ZNSt3__18ios_base6xallocEv") and std.mem.eql(u8, name, "__ZNSt3__18ios_base6xallocEv"))) {
         const slot = self.ios_xalloc_next;
         self.ios_xalloc_next +%= 1;
         return .{ .handled = slot };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__16chrono12system_clock3nowEv")) {
+    if ((name_hash == importNameHash("__ZNSt3__16chrono12system_clock3nowEv") and std.mem.eql(u8, name, "__ZNSt3__16chrono12system_clock3nowEv"))) {
         return .{ .handled = self.guest_time.wallNow() };
     }
     if (std.mem.indexOf(u8, name, "recursive_mutexC1Ev") != null or
@@ -965,20 +984,20 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
             .destroy => .handled_void,
         };
     }
-    if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path16__root_directoryEv")) {
+    if ((name_hash == importNameHash("__ZNKSt3__14__fs10filesystem4path16__root_directoryEv") and std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path16__root_directoryEv"))) {
         const path = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
         const bytes = self.guestMemoryConst(path.address, path.length) orelse return .{ .unsupported = 0 };
         self.regs.rdx = @intFromBool(bytes.len != 0 and bytes[0] == '/');
         return .{ .handled = path.address };
     }
-    if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path10__filenameEv")) {
+    if ((name_hash == importNameHash("__ZNKSt3__14__fs10filesystem4path10__filenameEv") and std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path10__filenameEv"))) {
         const path = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
         const bytes = self.guestMemoryConst(path.address, path.length) orelse return .{ .unsupported = 0 };
         const start = if (std.mem.lastIndexOfScalar(u8, bytes, '/')) |separator| separator + 1 else 0;
         self.regs.rdx = bytes.len - start;
         return .{ .handled = path.address + start };
     }
-    if (std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path13__parent_pathEv")) {
+    if ((name_hash == importNameHash("__ZNKSt3__14__fs10filesystem4path13__parent_pathEv") and std.mem.eql(u8, name, "__ZNKSt3__14__fs10filesystem4path13__parent_pathEv"))) {
         const path = compat_runtime.libcppStringView(self, self.regs.rdi) orelse return .{ .unsupported = 0 };
         const bytes = self.guestMemoryConst(path.address, path.length) orelse return .{ .unsupported = 0 };
         var end = bytes.len;
@@ -991,7 +1010,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = path.address };
     }
 
-    if (std.mem.eql(u8, name, "___dynamic_cast")) {
+    if ((name_hash == importNameHash("___dynamic_cast") and std.mem.eql(u8, name, "___dynamic_cast"))) {
         if (self.dynamic_casts.resolve(
             self,
             self.regs.rdi,
@@ -1040,15 +1059,15 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = 0 };
     }
 
-    if (std.mem.eql(u8, name, "__ZNSt3__16localeC1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeC2Ev")) {
+    if ((name_hash == importNameHash("__ZNSt3__16localeC1Ev") and std.mem.eql(u8, name, "__ZNSt3__16localeC1Ev")) or (name_hash == importNameHash("__ZNSt3__16localeC2Ev") and std.mem.eql(u8, name, "__ZNSt3__16localeC2Ev"))) {
         const ok = self.compat.initLocale(self, self.regs.rdi, null);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__16localeC1ERKS0_") or std.mem.eql(u8, name, "__ZNSt3__16localeC2ERKS0_")) {
+    if ((name_hash == importNameHash("__ZNSt3__16localeC1ERKS0_") and std.mem.eql(u8, name, "__ZNSt3__16localeC1ERKS0_")) or (name_hash == importNameHash("__ZNSt3__16localeC2ERKS0_") and std.mem.eql(u8, name, "__ZNSt3__16localeC2ERKS0_"))) {
         const ok = self.compat.initLocale(self, self.regs.rdi, self.regs.rsi);
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__16localeD1Ev") or std.mem.eql(u8, name, "__ZNSt3__16localeD2Ev")) {
+    if ((name_hash == importNameHash("__ZNSt3__16localeD1Ev") and std.mem.eql(u8, name, "__ZNSt3__16localeD1Ev")) or (name_hash == importNameHash("__ZNSt3__16localeD2Ev") and std.mem.eql(u8, name, "__ZNSt3__16localeD2Ev"))) {
         return if (self.compat.destroyLocale(self, self.regs.rdi)) .{ .handled = 0 } else .{ .unsupported = 0 };
     }
     // XModule constructors — Xenia-specific. Self-gating for non-Xenia
@@ -1063,7 +1082,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = self.regs.rdi };
     }
-    if (std.mem.eql(u8, name, "__ZNKSt3__16locale9use_facetERNS0_2idE")) {
+    if ((name_hash == importNameHash("__ZNKSt3__16locale9use_facetERNS0_2idE") and std.mem.eql(u8, name, "__ZNKSt3__16locale9use_facetERNS0_2idE"))) {
         const return_address = self.read64(self.regs.rsp);
         const caller_name = if (self.metadata.nearestSymbol(return_address)) |caller| caller.name else "";
         const kind: compat_runtime.LocaleFacetKind = if (std.mem.indexOf(u8, caller_name, "ctype") != null)
@@ -1076,23 +1095,23 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         const facet = self.compat.localeFacet(self, key, kind) orelse return .{ .unsupported = 0 };
         return .{ .handled = facet };
     }
-    if (std.mem.eql(u8, name, "__ZNKSt3__16locale4nameEv")) {
+    if ((name_hash == importNameHash("__ZNKSt3__16locale4nameEv") and std.mem.eql(u8, name, "__ZNKSt3__16locale4nameEv"))) {
         const ok = compat_runtime.initLibcppStringLiteral(self, self.regs.rdi, "C");
         return if (ok) .{ .handled = self.regs.rdi } else .{ .unsupported = 0 };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__115__get_classnameEPKcb")) {
+    if ((name_hash == importNameHash("__ZNSt3__115__get_classnameEPKcb") and std.mem.eql(u8, name, "__ZNSt3__115__get_classnameEPKcb"))) {
         const class_name = self.guestCString(self.regs.rdi, 64) orelse return .{ .unsupported = 0 };
         const mask = compat_runtime.libcppRegexClassMask(class_name, self.regs.rsi != 0);
         return .{ .handled = mask };
     }
-    if (std.mem.eql(u8, name, "___cxa_allocate_exception")) {
+    if ((name_hash == importNameHash("___cxa_allocate_exception") and std.mem.eql(u8, name, "___cxa_allocate_exception"))) {
         const object_size = self.regs.rdi;
         const allocation = self.memory_forwarder.allocate(self, object_size +| 64, 16) orelse return .{ .unsupported = 0 };
         const object_address = allocation + 64;
         self.cxx_exceptions.recordAllocation(allocation, object_address, object_size, self.read64(self.regs.rsp));
         return .{ .handled = object_address };
     }
-    if (std.mem.eql(u8, name, "___cxa_begin_catch")) {
+    if ((name_hash == importNameHash("___cxa_begin_catch") and std.mem.eql(u8, name, "___cxa_begin_catch"))) {
         const object_address = self.cxx_exceptions.beginCatch(self.regs.rdi);
         machoCapturePrint("macho-processor: __cxa_begin_catch object=0x{x}\n", .{object_address});
         if (comptime @hasField(@TypeOf(self.*), "guest_exceptions")) {
@@ -1100,7 +1119,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = object_address };
     }
-    if (std.mem.eql(u8, name, "___cxa_end_catch")) {
+    if ((name_hash == importNameHash("___cxa_end_catch") and std.mem.eql(u8, name, "___cxa_end_catch"))) {
         const catch_result = self.cxx_exceptions.endCatch();
         if (catch_result) |ended| {
             const object = ended.object_address;
@@ -1128,20 +1147,20 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .handled_void;
     }
-    if (std.mem.eql(u8, name, "___cxa_get_exception_ptr")) {
+    if ((name_hash == importNameHash("___cxa_get_exception_ptr") and std.mem.eql(u8, name, "___cxa_get_exception_ptr"))) {
         return .{ .handled = self.cxx_exceptions.exceptionPointer(self.regs.rdi) };
     }
-    if (std.mem.eql(u8, name, "___cxa_free_exception")) {
+    if ((name_hash == importNameHash("___cxa_free_exception") and std.mem.eql(u8, name, "___cxa_free_exception"))) {
         if (self.cxx_exceptions.freeException(self.regs.rdi)) |allocation| {
             self.memory_forwarder.releaseFrom(allocation.storage_address, self.regs.rip);
             self.vtable_tracker.forgetAddress(allocation.storage_address);
         }
         return .handled_void;
     }
-    if (std.mem.eql(u8, name, "__ZNSt20bad_array_new_lengthC1Ev")) {
+    if ((name_hash == importNameHash("__ZNSt20bad_array_new_lengthC1Ev") and std.mem.eql(u8, name, "__ZNSt20bad_array_new_lengthC1Ev"))) {
         return .{ .handled = self.regs.rdi };
     }
-    if (std.mem.eql(u8, name, "___cxa_throw")) {
+    if ((name_hash == importNameHash("___cxa_throw") and std.mem.eql(u8, name, "___cxa_throw"))) {
         const thrown = self.cxx_exceptions.recordThrow(
             self.regs.rdi,
             self.regs.rsi,
@@ -1334,7 +1353,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
         return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
     }
-    if (std.mem.eql(u8, name, "__Unwind_Resume") or std.mem.eql(u8, name, "__Unwind_Resume_or_Rethrow")) {
+    if ((name_hash == importNameHash("__Unwind_Resume") and std.mem.eql(u8, name, "__Unwind_Resume")) or (name_hash == importNameHash("__Unwind_Resume_or_Rethrow") and std.mem.eql(u8, name, "__Unwind_Resume_or_Rethrow"))) {
         if (self.unwinder.resumePhaseTwo(self)) return .control_transferred;
         if (self.unwinder.exhaustedWithoutHandler()) {
             machoCapturePrint(
@@ -1373,7 +1392,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.cxx_exception);
         return .{ .terminated = UNSUPPORTED_RUNTIME_EXIT_CODE };
     }
-    if (std.mem.eql(u8, name, "___cxa_rethrow")) {
+    if ((name_hash == importNameHash("___cxa_rethrow") and std.mem.eql(u8, name, "___cxa_rethrow"))) {
         const object_address = self.cxx_exceptions.recordRethrow() orelse self.regs.rdi;
         machoCapturePrint("macho-processor: guest rethrew exception object=0x{x}\n", .{object_address});
         const thrown = self.cxx_exceptions.last_throw orelse {
@@ -1410,7 +1429,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.resolving_import_route = .reallocate;
         return .{ .handled = self.memory_forwarder.reallocate(self, self.regs.rdi, self.regs.rsi) orelse 0 };
     }
-    if (std.mem.eql(u8, name, "_posix_memalign")) {
+    if ((name_hash == importNameHash("_posix_memalign") and std.mem.eql(u8, name, "_posix_memalign"))) {
         self.resolving_import_route = .posix_memalign;
         const output = self.regs.rdi;
         const alignment = self.regs.rsi;
@@ -1423,7 +1442,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.write64(output, allocation);
         return .{ .handled = 0 };
     }
-    if (std.mem.eql(u8, name, "_aligned_alloc")) {
+    if ((name_hash == importNameHash("_aligned_alloc") and std.mem.eql(u8, name, "_aligned_alloc"))) {
         self.resolving_import_route = .aligned_alloc;
         const alignment = self.regs.rdi;
         if (!std.math.isPowerOfTwo(alignment) or self.regs.rsi % alignment != 0) return .{ .handled = 0 };
@@ -1433,7 +1452,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.resolving_import_route = .calloc;
         return .{ .handled = self.memory_forwarder.allocateZeroed(self, self.regs.rdi, self.regs.rsi) orelse 0 };
     }
-    if (std.mem.eql(u8, name, "____chkstk_darwin")) {
+    if ((name_hash == importNameHash("____chkstk_darwin") and std.mem.eql(u8, name, "____chkstk_darwin"))) {
         self.resolving_import_route = .chkstk;
         return .{ .handled = self.regs.rax };
     }
@@ -1453,7 +1472,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         if (self.verbose_trace) machoCapturePrint("    [import] _memset(dst=0x{x}, value=0x{x}, count={d})\n", .{ dst, value, count });
         return .{ .handled = dst };
     }
-    if (std.mem.eql(u8, name, "___bzero")) {
+    if ((name_hash == importNameHash("___bzero") and std.mem.eql(u8, name, "___bzero"))) {
         const dst = self.regs.rdi;
         const count = self.regs.rsi;
         if (count == 0) return .handled_void;
@@ -1541,11 +1560,11 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = now };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__16chrono12steady_clock3nowEv")) {
+    if ((name_hash == importNameHash("__ZNSt3__16chrono12steady_clock3nowEv") and std.mem.eql(u8, name, "__ZNSt3__16chrono12steady_clock3nowEv"))) {
         return .{ .handled = self.guest_time.now() };
     }
 
-    if (std.mem.eql(u8, name, "_nanosleep")) {
+    if ((name_hash == importNameHash("_nanosleep") and std.mem.eql(u8, name, "_nanosleep"))) {
         const req_ptr = self.regs.rdi;
         const rem_ptr = self.regs.rsi;
         const req = self.guestMemory(req_ptr, 16) orelse return .{ .handled = @bitCast(@as(i64, -1)) };
@@ -1563,65 +1582,65 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = 0 };
     }
 
-    if (std.mem.eql(u8, name, "_open")) {
+    if ((name_hash == importNameHash("_open") and std.mem.eql(u8, name, "_open"))) {
         const path = self.guestCString(self.regs.rdi, 4096) orelse "";
         const result = self.fs_forwarder.open(self);
         self.noteProfileAccountOpen(path, result);
         return .{ .handled = result };
     }
-    if (std.mem.eql(u8, name, "_write")) {
+    if ((name_hash == importNameHash("_write") and std.mem.eql(u8, name, "_write"))) {
         return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.write(self))) };
     }
-    if (std.mem.eql(u8, name, "_close")) {
+    if ((name_hash == importNameHash("_close") and std.mem.eql(u8, name, "_close"))) {
         return .{ .handled = self.fs_forwarder.close(self) };
     }
-    if (std.mem.eql(u8, name, "_fstatat$INODE64") or std.mem.eql(u8, name, "_fstatat")) {
+    if ((name_hash == importNameHash("_fstatat$INODE64") and std.mem.eql(u8, name, "_fstatat$INODE64")) or (name_hash == importNameHash("_fstatat") and std.mem.eql(u8, name, "_fstatat"))) {
         return .{ .handled = self.fs_forwarder.fstatat(self) };
     }
-    if (std.mem.eql(u8, name, "_openat")) {
+    if ((name_hash == importNameHash("_openat") and std.mem.eql(u8, name, "_openat"))) {
         const path = self.guestCString(self.regs.rsi, 4096) orelse "";
         const result = self.fs_forwarder.openat(self);
         self.noteProfileAccountOpen(path, result);
         return .{ .handled = result };
     }
-    if (std.mem.eql(u8, name, "_fstat$INODE64") or std.mem.eql(u8, name, "_fstat")) {
+    if ((name_hash == importNameHash("_fstat$INODE64") and std.mem.eql(u8, name, "_fstat$INODE64")) or (name_hash == importNameHash("_fstat") and std.mem.eql(u8, name, "_fstat"))) {
         return .{ .handled = self.fs_forwarder.fstat(self) };
     }
-    if (std.mem.eql(u8, name, "_ftruncate") or std.mem.eql(u8, name, "_ftruncate64")) {
+    if ((name_hash == importNameHash("_ftruncate") and std.mem.eql(u8, name, "_ftruncate")) or (name_hash == importNameHash("_ftruncate64") and std.mem.eql(u8, name, "_ftruncate64"))) {
         return .{ .handled = self.fs_forwarder.ftruncate(self) };
     }
-    if (std.mem.eql(u8, name, "_shm_open")) {
+    if ((name_hash == importNameHash("_shm_open") and std.mem.eql(u8, name, "_shm_open"))) {
         return .{ .handled = self.fs_forwarder.shmOpen(self) };
     }
-    if (std.mem.eql(u8, name, "_shm_unlink")) {
+    if ((name_hash == importNameHash("_shm_unlink") and std.mem.eql(u8, name, "_shm_unlink"))) {
         return .{ .handled = self.fs_forwarder.shmUnlink(self) };
     }
-    if (std.mem.eql(u8, name, "_opendir$INODE64") or std.mem.eql(u8, name, "_opendir")) {
+    if ((name_hash == importNameHash("_opendir$INODE64") and std.mem.eql(u8, name, "_opendir$INODE64")) or (name_hash == importNameHash("_opendir") and std.mem.eql(u8, name, "_opendir"))) {
         return .{ .handled = self.fs_forwarder.opendir(self) };
     }
-    if (std.mem.eql(u8, name, "_dirfd")) {
+    if ((name_hash == importNameHash("_dirfd") and std.mem.eql(u8, name, "_dirfd"))) {
         return .{ .handled = self.fs_forwarder.dirfd(self) };
     }
-    if (std.mem.eql(u8, name, "_closedir")) {
+    if ((name_hash == importNameHash("_closedir") and std.mem.eql(u8, name, "_closedir"))) {
         return .{ .handled = self.fs_forwarder.closedir(self) };
     }
-    if (std.mem.eql(u8, name, "_readdir$INODE64") or std.mem.eql(u8, name, "_readdir")) {
+    if ((name_hash == importNameHash("_readdir$INODE64") and std.mem.eql(u8, name, "_readdir$INODE64")) or (name_hash == importNameHash("_readdir") and std.mem.eql(u8, name, "_readdir"))) {
         return .{ .handled = self.fs_forwarder.readdir(self) };
     }
-    if (std.mem.eql(u8, name, "_read")) {
+    if ((name_hash == importNameHash("_read") and std.mem.eql(u8, name, "_read"))) {
         const guest_fd = self.regs.rdi;
         const requested = self.regs.rdx;
         const result = self.fs_forwarder.read(self);
         self.noteProfileAccountRead(guest_fd, requested, result, 0);
         return .{ .handled = @bitCast(result) };
     }
-    if (std.mem.eql(u8, name, "_readv")) {
+    if ((name_hash == importNameHash("_readv") and std.mem.eql(u8, name, "_readv"))) {
         return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readv(self))) };
     }
-    if (std.mem.eql(u8, name, "_writev")) {
+    if ((name_hash == importNameHash("_writev") and std.mem.eql(u8, name, "_writev"))) {
         return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.writev(self))) };
     }
-    if (std.mem.eql(u8, name, "_pread$INODE64") or std.mem.eql(u8, name, "_pread")) {
+    if ((name_hash == importNameHash("_pread$INODE64") and std.mem.eql(u8, name, "_pread$INODE64")) or (name_hash == importNameHash("_pread") and std.mem.eql(u8, name, "_pread"))) {
         const guest_fd = self.regs.rdi;
         const requested = self.regs.rdx;
         const offset = self.regs.rcx;
@@ -1629,76 +1648,76 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.noteProfileAccountRead(guest_fd, requested, result, offset);
         return .{ .handled = @bitCast(result) };
     }
-    if (std.mem.eql(u8, name, "_pwrite$INODE64") or std.mem.eql(u8, name, "_pwrite")) {
+    if ((name_hash == importNameHash("_pwrite$INODE64") and std.mem.eql(u8, name, "_pwrite$INODE64")) or (name_hash == importNameHash("_pwrite") and std.mem.eql(u8, name, "_pwrite"))) {
         return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.pwrite(self))) };
     }
-    if (std.mem.eql(u8, name, "_lseek$INODE64") or std.mem.eql(u8, name, "_lseek")) {
+    if ((name_hash == importNameHash("_lseek$INODE64") and std.mem.eql(u8, name, "_lseek$INODE64")) or (name_hash == importNameHash("_lseek") and std.mem.eql(u8, name, "_lseek"))) {
         return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.lseek(self))) };
     }
-    if (std.mem.eql(u8, name, "_stat$INODE64") or std.mem.eql(u8, name, "_stat")) {
+    if ((name_hash == importNameHash("_stat$INODE64") and std.mem.eql(u8, name, "_stat$INODE64")) or (name_hash == importNameHash("_stat") and std.mem.eql(u8, name, "_stat"))) {
         return .{ .handled = self.fs_forwarder.stat(self) };
     }
-    if (std.mem.eql(u8, name, "_lstat$INODE64") or std.mem.eql(u8, name, "_lstat")) {
+    if ((name_hash == importNameHash("_lstat$INODE64") and std.mem.eql(u8, name, "_lstat$INODE64")) or (name_hash == importNameHash("_lstat") and std.mem.eql(u8, name, "_lstat"))) {
         return .{ .handled = self.fs_forwarder.lstat(self) };
     }
-    if (std.mem.eql(u8, name, "_access") or std.mem.eql(u8, name, "_access$INODE64")) {
+    if ((name_hash == importNameHash("_access") and std.mem.eql(u8, name, "_access")) or (name_hash == importNameHash("_access$INODE64") and std.mem.eql(u8, name, "_access$INODE64"))) {
         return .{ .handled = self.fs_forwarder.access(self) };
     }
-    if (std.mem.eql(u8, name, "_realpath$INODE64") or std.mem.eql(u8, name, "_realpath")) {
+    if ((name_hash == importNameHash("_realpath$INODE64") and std.mem.eql(u8, name, "_realpath$INODE64")) or (name_hash == importNameHash("_realpath") and std.mem.eql(u8, name, "_realpath"))) {
         return .{ .handled = self.fs_forwarder.realpath(self) };
     }
-    if (std.mem.eql(u8, name, "_getcwd")) {
+    if ((name_hash == importNameHash("_getcwd") and std.mem.eql(u8, name, "_getcwd"))) {
         return .{ .handled = self.fs_forwarder.getcwd(self) };
     }
-    if (std.mem.eql(u8, name, "_chdir")) {
+    if ((name_hash == importNameHash("_chdir") and std.mem.eql(u8, name, "_chdir"))) {
         return .{ .handled = self.fs_forwarder.chdir(self) };
     }
-    if (std.mem.eql(u8, name, "_readlink$INODE64") or std.mem.eql(u8, name, "_readlink")) {
+    if ((name_hash == importNameHash("_readlink$INODE64") and std.mem.eql(u8, name, "_readlink$INODE64")) or (name_hash == importNameHash("_readlink") and std.mem.eql(u8, name, "_readlink"))) {
         return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readlink(self))) };
     }
-    if (std.mem.eql(u8, name, "_dup")) {
+    if ((name_hash == importNameHash("_dup") and std.mem.eql(u8, name, "_dup"))) {
         return .{ .handled = self.fs_forwarder.dup(self) };
     }
-    if (std.mem.eql(u8, name, "_dup2")) {
+    if ((name_hash == importNameHash("_dup2") and std.mem.eql(u8, name, "_dup2"))) {
         return .{ .handled = self.fs_forwarder.dup2(self) };
     }
-    if (std.mem.eql(u8, name, "_fcntl")) {
+    if ((name_hash == importNameHash("_fcntl") and std.mem.eql(u8, name, "_fcntl"))) {
         return .{ .handled = self.fs_forwarder.fcntl(self) };
     }
-    if (std.mem.eql(u8, name, "_socket")) {
+    if ((name_hash == importNameHash("_socket") and std.mem.eql(u8, name, "_socket"))) {
         return .{ .handled = self.fs_forwarder.createSocket(self) };
     }
-    if (std.mem.eql(u8, name, "_setsockopt")) {
+    if ((name_hash == importNameHash("_setsockopt") and std.mem.eql(u8, name, "_setsockopt"))) {
         return .{ .handled = self.fs_forwarder.setSocketOption(self) };
     }
-    if (std.mem.eql(u8, name, "_connect")) {
+    if ((name_hash == importNameHash("_connect") and std.mem.eql(u8, name, "_connect"))) {
         return .{ .handled = self.fs_forwarder.connectSocket(self) };
     }
-    if (std.mem.eql(u8, name, "_send")) {
+    if ((name_hash == importNameHash("_send") and std.mem.eql(u8, name, "_send"))) {
         return .{ .handled = self.fs_forwarder.sendSocket(self) };
     }
-    if (std.mem.eql(u8, name, "_pipe")) {
+    if ((name_hash == importNameHash("_pipe") and std.mem.eql(u8, name, "_pipe"))) {
         return .{ .handled = self.fs_forwarder.pipe(self) };
     }
-    if (std.mem.eql(u8, name, "_mkdir") or std.mem.eql(u8, name, "_mkdir$INODE64")) {
+    if ((name_hash == importNameHash("_mkdir") and std.mem.eql(u8, name, "_mkdir")) or (name_hash == importNameHash("_mkdir$INODE64") and std.mem.eql(u8, name, "_mkdir$INODE64"))) {
         return .{ .handled = self.fs_forwarder.mkdir(self) };
     }
-    if (std.mem.eql(u8, name, "_unlink") or std.mem.eql(u8, name, "_unlink$INODE64")) {
+    if ((name_hash == importNameHash("_unlink") and std.mem.eql(u8, name, "_unlink")) or (name_hash == importNameHash("_unlink$INODE64") and std.mem.eql(u8, name, "_unlink$INODE64"))) {
         return .{ .handled = self.fs_forwarder.unlink(self) };
     }
-    if (std.mem.eql(u8, name, "_rename") or std.mem.eql(u8, name, "_rename$INODE64")) {
+    if ((name_hash == importNameHash("_rename") and std.mem.eql(u8, name, "_rename")) or (name_hash == importNameHash("_rename$INODE64") and std.mem.eql(u8, name, "_rename$INODE64"))) {
         return .{ .handled = self.fs_forwarder.rename(self) };
     }
-    if (std.mem.eql(u8, name, "_symlink") or std.mem.eql(u8, name, "_symlink$INODE64")) {
+    if ((name_hash == importNameHash("_symlink") and std.mem.eql(u8, name, "_symlink")) or (name_hash == importNameHash("_symlink$INODE64") and std.mem.eql(u8, name, "_symlink$INODE64"))) {
         return .{ .handled = self.fs_forwarder.symlink(self) };
     }
-    if (std.mem.eql(u8, name, "_mmap")) {
+    if ((name_hash == importNameHash("_mmap") and std.mem.eql(u8, name, "_mmap"))) {
         return .{ .handled = self.fs_forwarder.mmap(self) };
     }
-    if (std.mem.eql(u8, name, "_munmap")) {
+    if ((name_hash == importNameHash("_munmap") and std.mem.eql(u8, name, "_munmap"))) {
         return .{ .handled = self.fs_forwarder.munmap(self) };
     }
-    if (std.mem.eql(u8, name, "_mprotect")) {
+    if ((name_hash == importNameHash("_mprotect") and std.mem.eql(u8, name, "_mprotect"))) {
         return .{ .handled = self.fs_forwarder.mprotect(self) };
     }
     if (std.mem.endsWith(u8, name, "_fopen")) {
@@ -1725,7 +1744,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if (std.mem.endsWith(u8, name, "_fwrite")) {
         return .{ .handled = self.handleFwrite() };
     }
-    if (std.mem.eql(u8, name, "_fread")) {
+    if ((name_hash == importNameHash("_fread") and std.mem.eql(u8, name, "_fread"))) {
         return .{ .handled = self.handleFread() };
     }
     if (std.mem.endsWith(u8, name, "_fflush")) {
@@ -1737,7 +1756,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         machoCapturePrint("macho-processor: guest called abort()\n", .{});
         return .control_transferred;
     }
-    if (std.mem.eql(u8, name, "__tlv_atexit")) {
+    if ((name_hash == importNameHash("__tlv_atexit") and std.mem.eql(u8, name, "__tlv_atexit"))) {
         _ = self.compat.registerAtexit(self.regs.rdi, self.regs.rsi, self.regs.rdx);
         return .{ .handled = 0 };
     }
@@ -1762,10 +1781,10 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         self.exit_code = 0;
         return .control_transferred;
     }
-    if (std.mem.eql(u8, name, "_ftell") or std.mem.eql(u8, name, "_ftello")) {
+    if ((name_hash == importNameHash("_ftell") and std.mem.eql(u8, name, "_ftell")) or (name_hash == importNameHash("_ftello") and std.mem.eql(u8, name, "_ftello"))) {
         return .{ .handled = self.handleFtell() };
     }
-    if (std.mem.eql(u8, name, "_fseek") or std.mem.eql(u8, name, "_fseeko")) {
+    if ((name_hash == importNameHash("_fseek") and std.mem.eql(u8, name, "_fseek")) or (name_hash == importNameHash("_fseeko") and std.mem.eql(u8, name, "_fseeko"))) {
         return .{ .handled = self.handleFseek() };
     }
     if (std.mem.endsWith(u8, name, "_ferror")) {
@@ -1779,7 +1798,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = self.handlePutchar() };
     }
 
-    if (std.mem.eql(u8, name, "_sysctlbyname")) {
+    if ((name_hash == importNameHash("_sysctlbyname") and std.mem.eql(u8, name, "_sysctlbyname"))) {
         const sysctl_name = self.guestCString(self.regs.rdi, 256) orelse return .{ .unsupported = 0 };
         if (std.mem.startsWith(u8, sysctl_name, "hw.optional.")) {
             if (self.regs.rsi != 0 and self.regs.rdx != 0) {
@@ -1795,10 +1814,10 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = @bitCast(@as(i64, -1)) };
     }
-    if (std.mem.eql(u8, name, "_sigaction")) {
+    if ((name_hash == importNameHash("_sigaction") and std.mem.eql(u8, name, "_sigaction"))) {
         return .{ .handled = self.handleSigaction() };
     }
-    if (std.mem.eql(u8, name, "_setjmp")) {
+    if ((name_hash == importNameHash("_setjmp") and std.mem.eql(u8, name, "_setjmp"))) {
         const env_bytes = self.guestMemory(self.regs.rdi, @sizeOf(u64) * 4) orelse return .{ .unsupported = 0 };
         std.mem.writeInt(u64, env_bytes[0..8], self.regs.rsp, .little);
         std.mem.writeInt(u64, env_bytes[8..16], self.regs.rbx, .little);
@@ -1807,26 +1826,26 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = 0 };
     }
 
-    if (std.mem.eql(u8, name, "__ZNSt3__16thread4joinEv")) {
+    if ((name_hash == importNameHash("__ZNSt3__16thread4joinEv") and std.mem.eql(u8, name, "__ZNSt3__16thread4joinEv"))) {
         if (self.verbose_trace) machoCapturePrint("    [import] std::thread::join(object=0x{x})\n", .{self.regs.rdi});
         return .handled_void;
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__16thread20hardware_concurrencyEv")) {
+    if ((name_hash == importNameHash("__ZNSt3__16thread20hardware_concurrencyEv") and std.mem.eql(u8, name, "__ZNSt3__16thread20hardware_concurrencyEv"))) {
         const count = std.Thread.getCpuCount() catch 1;
         if (self.verbose_trace) machoCapturePrint("    [import] std::thread::hardware_concurrency() -> {d}\n", .{count});
         return .{ .handled = count };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__111this_thread6get_idEv")) {
+    if ((name_hash == importNameHash("__ZNSt3__111this_thread6get_idEv") and std.mem.eql(u8, name, "__ZNSt3__111this_thread6get_idEv"))) {
         const handle = self.pthreads.currentThreadHandle(self);
         if (self.verbose_trace) machoCapturePrint("    [import] std::this_thread::get_id() -> 0x{x}\n", .{handle});
         return .{ .handled = handle };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__119__thread_local_dataEv")) {
+    if ((name_hash == importNameHash("__ZNSt3__119__thread_local_dataEv") and std.mem.eql(u8, name, "__ZNSt3__119__thread_local_dataEv"))) {
         const allocation = self.guestAlloc(64, 16) orelse return .{ .unsupported = 0 };
         if (self.verbose_trace) machoCapturePrint("    [import] __thread_local_data() -> 0x{x}\n", .{allocation});
         return .{ .handled = allocation };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev")) {
+    if ((name_hash == importNameHash("__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev") and std.mem.eql(u8, name, "__ZNSt3__115basic_streambufIcNS_11char_traitsIcEEEC2Ev"))) {
         const object = self.regs.rdi;
         if (self.guestMemory(object, 64)) |buf| {
             @memset(buf, 0);
@@ -1837,11 +1856,11 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = object };
     }
-    if (std.mem.eql(u8, name, "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv")) {
+    if ((name_hash == importNameHash("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv") and std.mem.eql(u8, name, "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv"))) {
         if (self.verbose_trace) machoCapturePrint("    [import] operator<<(void* ptr=0x{x}) -> *this\n", .{self.regs.rsi});
         return .{ .handled = self.regs.rdi };
     }
-    if (std.mem.eql(u8, name, "__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv")) {
+    if ((name_hash == importNameHash("__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv") and std.mem.eql(u8, name, "__ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv"))) {
         const output_ptr = self.regs.rdi;
         const stringbuf_ptr = self.regs.rsi;
         if (!self.libcxx_streams.stringbufToString(self, stringbuf_ptr, output_ptr)) {
@@ -1874,7 +1893,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         };
     }
 
-    if (std.mem.eql(u8, name, "___sincosf_stret")) {
+    if ((name_hash == importNameHash("___sincosf_stret") and std.mem.eql(u8, name, "___sincosf_stret"))) {
         const angle: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
         const sin_val: f32 = @sin(angle);
         const cos_val: f32 = @cos(angle);
@@ -1885,7 +1904,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         }
         return .{ .handled = self.regs.rdi };
     }
-    if (std.mem.eql(u8, name, "_cosf")) {
+    if ((name_hash == importNameHash("_cosf") and std.mem.eql(u8, name, "_cosf"))) {
         const angle: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
         const result: f32 = @cos(angle);
         std.mem.writeInt(u32, self.xmm[0][0..4], @bitCast(result), .little);
@@ -1905,21 +1924,21 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     // it was quietly wrong. A missing math import is not a missing value here,
     // it is a wrong one, which is why these are handled rather than left to the
     // fallback that reports itself as returning zero.
-    if (std.mem.eql(u8, name, "_exp2")) {
+    if ((name_hash == importNameHash("_exp2") and std.mem.eql(u8, name, "_exp2"))) {
         const argument: f64 = @bitCast(std.mem.readInt(u64, self.xmm[0][0..8], .little));
         const result = exp2Double(argument);
         std.mem.writeInt(u64, self.xmm[0][0..8], @bitCast(result), .little);
         if (self.verbose_trace) machoCapturePrint("    [import] _exp2({d}) -> {d}\n", .{ argument, result });
         return .{ .handled = 0 };
     }
-    if (std.mem.eql(u8, name, "_exp2f")) {
+    if ((name_hash == importNameHash("_exp2f") and std.mem.eql(u8, name, "_exp2f"))) {
         const argument: f32 = @bitCast(std.mem.readInt(u32, self.xmm[0][0..4], .little));
         const result = exp2Single(argument);
         std.mem.writeInt(u32, self.xmm[0][0..4], @bitCast(result), .little);
         if (self.verbose_trace) machoCapturePrint("    [import] _exp2f({d}) -> {d}\n", .{ argument, result });
         return .{ .handled = 0 };
     }
-    if (std.mem.eql(u8, name, "_log2")) {
+    if ((name_hash == importNameHash("_log2") and std.mem.eql(u8, name, "_log2"))) {
         const argument: f64 = @bitCast(std.mem.readInt(u64, self.xmm[0][0..8], .little));
         const result = log2Double(argument);
         std.mem.writeInt(u64, self.xmm[0][0..8], @bitCast(result), .little);
@@ -2747,6 +2766,24 @@ test "pthread exit is thread-local only with an active cooperative context" {
     try std.testing.expect(pthreadExitIsThreadLocal(true, 0x7fff_2140));
     try std.testing.expect(!pthreadExitIsThreadLocal(true, 0));
     try std.testing.expect(!pthreadExitIsThreadLocal(false, 0x7fff_2140));
+}
+
+test "import name hash separates the slow chain's literals" {
+    // The hash-fast-fail chain relies on this property: distinct literals
+    // must hash apart, or a name that matches one literal would pay an extra
+    // eql on its hash-twin (correct but slower). A regression here — e.g. a
+    // hash that degenerates to a constant — would turn every dispatch back
+    // into a full string walk.
+    try std.testing.expectEqual(importNameHash("_exit"), importNameHash("_exit"));
+    try std.testing.expect(importNameHash("_exit") != importNameHash("_memcpy"));
+    try std.testing.expect(importNameHash("_memcpy") != importNameHash("_memmove"));
+    try std.testing.expect(importNameHash("_memset") != importNameHash("___memset_chk"));
+    try std.testing.expect(importNameHash("_objc_msgSend") != importNameHash("_sel_registerName"));
+    try std.testing.expect(importNameHash("_objc_msgSend") != importNameHash("_objc_getClass"));
+    try std.testing.expect(importNameHash("_strtoul") != importNameHash("_sysconf"));
+    try std.testing.expect(importNameHash("___cxa_throw") != importNameHash("___cxa_end_catch"));
+    // The two spellings of a name that the chain treats as one must agree.
+    try std.testing.expectEqual(importNameHash("exit"), importNameHash("exit"));
 }
 
 // The failure these replaced was not a missing value but a wrong one: the

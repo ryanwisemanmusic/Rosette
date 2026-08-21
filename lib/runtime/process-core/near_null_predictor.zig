@@ -748,6 +748,11 @@ fn isBenignSmallIntArgImport(name: []const u8) bool {
     // zero-argument; the observed rdi is register-allocation garbage, never a
     // receiver. Mangled form ends `3nowEv` (now() taking no args).
     if (std.mem.endsWith(u8, name, "3nowEv")) return true;
+    // libc++ basic_ostream::sentry destructor family (`...6sentryD1Ev` etc.)
+    // — modeled as a no-op primitive that never dereferences the receiver, so
+    // a near-null rdi predicts nothing, exactly like `_raise`. The sentry is a
+    // guest-stack guard; if it were ever near-null the handler still ignores it.
+    if (std.mem.indexOf(u8, name, "6sentryD") != null) return true;
     // Darwin symbol-suffix variants: `_fstatat$INODE64`, `_fstat$INODE64$UNIX2003`.
     if (std.mem.indexOf(u8, name, "$INODE64")) |at| {
         const base = name[0..at];
@@ -1085,6 +1090,14 @@ test "the two benign reasons stay separate and neither swallows the other" {
     try std.testing.expect(isBenignSmallIntArgImport("_raise"));
     try std.testing.expect(isBenignSmallIntArgImport("_SDL_PauseAudioDevice"));
     try std.testing.expect(!isDocumentedNullSentinelImport("_abs"));
+
+    // libc++ basic_ostream::sentry destructors: the primitive handler is a
+    // no-op that never dereferences the receiver, so a near-null rdi (the
+    // guest-stack sentry guard) predicts nothing. Both observed and
+    // version-tagged spellings are covered by the `6sentryD` family check.
+    try std.testing.expect(isBenignSmallIntArgImport("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev"));
+    try std.testing.expect(isBenignSmallIntArgImport("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD2Ev"));
+    try std.testing.expect(isBenignSmallIntArgImport("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1B7v160006Ev"));
 
     // Sentinel list: a real pointer whose null value is the documented default.
     try std.testing.expect(isDocumentedNullSentinelImport("_SDL_OpenAudioDevice"));

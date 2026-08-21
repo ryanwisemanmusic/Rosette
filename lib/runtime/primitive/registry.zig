@@ -77,6 +77,13 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "_abs", .handler = @import("handlers.zig").absInt },
     .{ .name_pattern = "compareEmmPKc", .handler = @import("handlers.zig").stringCompare },
     .{ .name_pattern = "sentryC1ERS3_", .handler = @import("handlers.zig").sentryC1 },
+    // basic_ostream::sentry::~sentry() — D0 (deleting), D1 (complete object)
+    // and D2 (base object) destructors. Pattern stops at `sentryD` so the
+    // version-tagged spelling (`...6sentryD1B7v160006Ev`) also matches; the
+    // handler is a no-op that never dereferences the guest stack sentry.
+    .{ .name_pattern = "sentryD1", .handler = @import("handlers.zig").sentryD1 },
+    .{ .name_pattern = "sentryD2", .handler = @import("handlers.zig").sentryD1 },
+    .{ .name_pattern = "sentryD0", .handler = @import("handlers.zig").sentryD1 },
     .{ .name_pattern = "random_deviceC1E", .handler = @import("handlers.zig").randomDeviceC1 },
     .{ .name_pattern = "random_deviceclEv", .handler = @import("handlers.zig").randomDeviceCl },
     .{ .name_pattern = "random_deviceD1Ev", .handler = @import("handlers.zig").randomDeviceD1 },
@@ -93,6 +100,15 @@ test "registry: match symbol by pattern" {
     try std.testing.expect(reg.matchSymbol("_vsnprintf") != null);
     try std.testing.expect(reg.matchSymbol("_sysctl") != null);
     try std.testing.expect(reg.matchSymbol("_raise") != null);
+    // libc++ basic_ostream::sentry destructor family resolves through the
+    // primitive library so stream writes never fall into the unresolved-import
+    // path. D1 (complete object) is the observed spelling; D0/D2 and the
+    // version-tagged variant share the no-op handler.
+    try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev") != null);
+    try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD2Ev") != null);
+    try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD0Ev") != null);
+    try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1B7v160006Ev") != null);
+    try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_") != null);
     try std.testing.expect(reg.matchSymbol("_sysctlbyname") == null);
     try std.testing.expect(reg.matchSymbol("_unknown_function") == null);
 }

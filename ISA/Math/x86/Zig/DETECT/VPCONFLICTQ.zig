@@ -13,7 +13,7 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VPCONFLICTQ", .path = "DETECT/VPCONFLICTQ.inc", .encoding_count = 3, .source_path_len = 19 } },
+    .{ .documented_contract = .{ .name = "VPCONFLICTQ", .path = "DETECT/VPCONFLICTQ.inc", .encoding_count = 3, .source_path_len = 22 } },
 };
 
 pub const proof_report = proofs.ProofReport{

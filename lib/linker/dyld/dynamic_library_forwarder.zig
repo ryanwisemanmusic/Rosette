@@ -191,6 +191,12 @@ const GuestSymbol = struct {
     token: u64 = 0,
     library_token: u64 = 0,
     kind: GuestSymbolKind = .@"opaque",
+    /// FNV-1a of the stored `name` slice, computed once at allocation. Every
+    /// guest call to this symbol re-dispatches through `forwardVulkanCommand`'s
+    /// ~55-name compare chain; the stored hash turns each of those string walks
+    /// into a u64 compare with no per-call hashing. Computed from the same
+    /// truncated slice `name` holds, so they always agree.
+    name_hash: u64 = 0,
     name_length: u8 = 0,
     name: [95]u8 = [_]u8{0} ** 95,
     calls: u64 = 0,
@@ -1340,6 +1346,7 @@ pub const Forwarder = struct {
             const name_length: u8 = @intCast(@min(symbol.len, entry.name.len));
             entry.* = .{ .token = token, .library_token = library_token, .kind = kind, .name_length = name_length };
             @memcpy(entry.name[0..name_length], symbol[0..name_length]);
+            entry.name_hash = vulkanNameHash(entry.name[0..name_length]);
             self.guest_lookup_count +|= 1;
             return token;
         }
@@ -1547,7 +1554,7 @@ pub const Forwarder = struct {
             .unmap_memory => state.regs.rax = self.unmapMemory(state),
             .destroy_device_object => state.regs.rax = self.destroyVulkanObject(state, entry.name[0..entry.name_length]),
             .command => {
-                self.forwardVulkanCommand(state, entry.name[0..entry.name_length]);
+                self.forwardVulkanCommand(state, entry.name_hash, entry.name[0..entry.name_length]);
                 state.regs.rax = 0;
             },
             .update_descriptor_sets => {
@@ -2020,7 +2027,7 @@ pub const Forwarder = struct {
         return true;
     }
 
-    fn forwardVulkanCommand(self: *Forwarder, state: anytype, name: []const u8) void {
+    fn forwardVulkanCommand(self: *Forwarder, state: anytype, name_hash: u64, name: []const u8) void {
         self.vulkan_device_void_calls +|= 1;
         self.vulkan_modeled_command_calls +|= 1;
         if (self.real_vulkan.device_lost) return;
@@ -2037,10 +2044,10 @@ pub const Forwarder = struct {
             .{ name, state.regs.rdi },
         );
 
-        if (std.mem.eql(u8, name, "vkCmdBindPipeline")) {
+        if ((name_hash == vulkanNameHash("vkCmdBindPipeline") and std.mem.eql(u8, name, "vkCmdBindPipeline"))) {
             const pipeline = self.real_vulkan.realPipeline(state.regs.rdx) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_bind_pipeline) |function| function(command_buffer, @intCast(state.regs.rsi), pipeline);
-        } else if (std.mem.eql(u8, name, "vkCmdExecuteCommands")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdExecuteCommands") and std.mem.eql(u8, name, "vkCmdExecuteCommands"))) {
             const count = state.regs.rsi;
             var secondary: [64]abi.CommandBuffer = [_]abi.CommandBuffer{null} ** 64;
             if (count > secondary.len or (count != 0 and state.guestMemoryConst(state.regs.rdx, count * 8) == null)) return;
@@ -2051,17 +2058,17 @@ pub const Forwarder = struct {
             if (self.real_vulkan.fn_ptrs.cmd_execute_commands) |function| {
                 function(command_buffer, @intCast(count), &secondary);
             }
-        } else if (std.mem.eql(u8, name, "vkCmdBindVertexBuffers")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBindVertexBuffers") and std.mem.eql(u8, name, "vkCmdBindVertexBuffers"))) {
             const count = state.regs.rdx;
             var buffers: [32]abi.Buffer = undefined;
             var offsets: [32]u64 = undefined;
             if (count > buffers.len or !copyGuestHandleArray(self, state, state.regs.rcx, count, @ptrCast(&buffers), .buffer)) return;
             if (!copyGuestStructs(u64, state, state.regs.r8, count, &offsets)) return;
             if (self.real_vulkan.fn_ptrs.cmd_bind_vertex_buffers) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(count), &buffers, &offsets);
-        } else if (std.mem.eql(u8, name, "vkCmdBindIndexBuffer")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBindIndexBuffer") and std.mem.eql(u8, name, "vkCmdBindIndexBuffer"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_bind_index_buffer) |function| function(command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx));
-        } else if (std.mem.eql(u8, name, "vkCmdBindDescriptorSets")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBindDescriptorSets") and std.mem.eql(u8, name, "vkCmdBindDescriptorSets"))) {
             const set_count = state.regs.r8;
             const dynamic_count = guestStackArg(state, 0);
             var sets: [32]u64 = undefined;
@@ -2079,66 +2086,66 @@ pub const Forwarder = struct {
                 @intCast(dynamic_count),
                 if (dynamic_count == 0) null else &dynamic_offsets,
             );
-        } else if (std.mem.eql(u8, name, "vkCmdPushDescriptorSetKHR")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdPushDescriptorSetKHR") and std.mem.eql(u8, name, "vkCmdPushDescriptorSetKHR"))) {
             self.forwardPushDescriptorSet(state, command_buffer);
-        } else if (std.mem.eql(u8, name, "vkCmdDraw")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDraw") and std.mem.eql(u8, name, "vkCmdDraw"))) {
             if (self.real_vulkan.fn_ptrs.cmd_draw) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(state.regs.r8));
-        } else if (std.mem.eql(u8, name, "vkCmdDrawIndexed")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDrawIndexed") and std.mem.eql(u8, name, "vkCmdDrawIndexed"))) {
             const vertex_offset: i32 = @bitCast(@as(u32, @truncate(state.regs.r8)));
             if (self.real_vulkan.fn_ptrs.cmd_draw_indexed) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), vertex_offset, @intCast(state.regs.r9));
-        } else if (std.mem.eql(u8, name, "vkCmdDrawIndirect")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDrawIndirect") and std.mem.eql(u8, name, "vkCmdDrawIndirect"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_draw_indirect) |function| function(command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx), @intCast(state.regs.r8));
-        } else if (std.mem.eql(u8, name, "vkCmdDrawIndexedIndirect")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDrawIndexedIndirect") and std.mem.eql(u8, name, "vkCmdDrawIndexedIndirect"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect) |function| function(command_buffer, buffer, state.regs.rdx, @intCast(state.regs.rcx), @intCast(state.regs.r8));
-        } else if (std.mem.eql(u8, name, "vkCmdDrawIndirectCount") or std.mem.eql(u8, name, "vkCmdDrawIndexedIndirectCount")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDrawIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndirectCount")) or (name_hash == vulkanNameHash("vkCmdDrawIndexedIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndexedIndirectCount"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             const count_buffer = self.real_vulkan.realBuffer(state.regs.rcx) orelse return;
             const max_draw_count = guestStackArg(state, 0);
             const stride = guestStackArg(state, 1);
-            if (std.mem.eql(u8, name, "vkCmdDrawIndirectCount")) {
+            if ((name_hash == vulkanNameHash("vkCmdDrawIndirectCount") and std.mem.eql(u8, name, "vkCmdDrawIndirectCount"))) {
                 if (self.real_vulkan.fn_ptrs.cmd_draw_indirect_count) |function| function(command_buffer, buffer, state.regs.rdx, count_buffer, state.regs.r8, @intCast(max_draw_count), @intCast(stride));
             } else if (self.real_vulkan.fn_ptrs.cmd_draw_indexed_indirect_count) |function| {
                 function(command_buffer, buffer, state.regs.rdx, count_buffer, state.regs.r8, @intCast(max_draw_count), @intCast(stride));
             }
-        } else if (std.mem.eql(u8, name, "vkCmdDispatch")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDispatch") and std.mem.eql(u8, name, "vkCmdDispatch"))) {
             if (self.real_vulkan.fn_ptrs.cmd_dispatch) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx));
-        } else if (std.mem.eql(u8, name, "vkCmdDispatchIndirect")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDispatchIndirect") and std.mem.eql(u8, name, "vkCmdDispatchIndirect"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_dispatch_indirect) |function| function(command_buffer, buffer, state.regs.rdx);
-        } else if (std.mem.eql(u8, name, "vkCmdDispatchBase")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdDispatchBase") and std.mem.eql(u8, name, "vkCmdDispatchBase"))) {
             if (self.real_vulkan.fn_ptrs.cmd_dispatch_base) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(state.regs.r8), @intCast(state.regs.r9), @intCast(guestStackArg(state, 0)));
-        } else if (std.mem.eql(u8, name, "vkCmdSetViewport")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetViewport") and std.mem.eql(u8, name, "vkCmdSetViewport"))) {
             var viewports: [16]abi.Viewport = undefined;
             if (!copyGuestStructs(abi.Viewport, state, state.regs.rcx, state.regs.rdx, &viewports)) return;
             if (self.real_vulkan.fn_ptrs.cmd_set_viewport) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), &viewports);
-        } else if (std.mem.eql(u8, name, "vkCmdSetScissor")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetScissor") and std.mem.eql(u8, name, "vkCmdSetScissor"))) {
             var scissors: [16]abi.Rect2D = undefined;
             if (!copyGuestStructs(abi.Rect2D, state, state.regs.rcx, state.regs.rdx, &scissors)) return;
             if (self.real_vulkan.fn_ptrs.cmd_set_scissor) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx), &scissors);
-        } else if (std.mem.eql(u8, name, "vkCmdSetBlendConstants")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetBlendConstants") and std.mem.eql(u8, name, "vkCmdSetBlendConstants"))) {
             var constants: [4]f32 = undefined;
             if (!copyGuestStructs(f32, state, state.regs.rsi, 4, &constants)) return;
             if (self.real_vulkan.fn_ptrs.cmd_set_blend_constants) |function| function(command_buffer, &constants);
-        } else if (std.mem.eql(u8, name, "vkCmdSetDepthBias")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetDepthBias") and std.mem.eql(u8, name, "vkCmdSetDepthBias"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_bias) |function| function(
                 command_buffer,
                 @bitCast(guestFloatArgument(state, 0)),
                 @bitCast(guestFloatArgument(state, 1)),
                 @bitCast(guestFloatArgument(state, 2)),
             );
-        } else if (std.mem.eql(u8, name, "vkCmdSetDepthBounds")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetDepthBounds") and std.mem.eql(u8, name, "vkCmdSetDepthBounds"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_bounds) |function| function(command_buffer, @bitCast(guestFloatArgument(state, 0)), @bitCast(guestFloatArgument(state, 1)));
-        } else if (std.mem.eql(u8, name, "vkCmdSetDepthTestEnable")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetDepthTestEnable") and std.mem.eql(u8, name, "vkCmdSetDepthTestEnable"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_test_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
-        } else if (std.mem.eql(u8, name, "vkCmdSetDepthWriteEnable")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetDepthWriteEnable") and std.mem.eql(u8, name, "vkCmdSetDepthWriteEnable"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_write_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
-        } else if (std.mem.eql(u8, name, "vkCmdSetDepthCompareOp")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetDepthCompareOp") and std.mem.eql(u8, name, "vkCmdSetDepthCompareOp"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_depth_compare_op) |function| function(command_buffer, @intCast(state.regs.rsi));
-        } else if (std.mem.eql(u8, name, "vkCmdSetStencilTestEnable")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetStencilTestEnable") and std.mem.eql(u8, name, "vkCmdSetStencilTestEnable"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_test_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
-        } else if (std.mem.eql(u8, name, "vkCmdSetStencilOp")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetStencilOp") and std.mem.eql(u8, name, "vkCmdSetStencilOp"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_op) |function| function(
                 command_buffer,
                 @intCast(state.regs.rsi),
@@ -2147,21 +2154,21 @@ pub const Forwarder = struct {
                 @intCast(state.regs.r8),
                 @intCast(state.regs.r9),
             );
-        } else if (std.mem.eql(u8, name, "vkCmdSetPrimitiveRestartEnable")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetPrimitiveRestartEnable") and std.mem.eql(u8, name, "vkCmdSetPrimitiveRestartEnable"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_primitive_restart_enable) |function| function(command_buffer, @intCast(state.regs.rsi));
-        } else if (std.mem.eql(u8, name, "vkCmdSetStencilCompareMask")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetStencilCompareMask") and std.mem.eql(u8, name, "vkCmdSetStencilCompareMask"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_compare_mask) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx));
-        } else if (std.mem.eql(u8, name, "vkCmdSetStencilWriteMask")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetStencilWriteMask") and std.mem.eql(u8, name, "vkCmdSetStencilWriteMask"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_write_mask) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx));
-        } else if (std.mem.eql(u8, name, "vkCmdSetStencilReference")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdSetStencilReference") and std.mem.eql(u8, name, "vkCmdSetStencilReference"))) {
             if (self.real_vulkan.fn_ptrs.cmd_set_stencil_reference) |function| function(command_buffer, @intCast(state.regs.rsi), @intCast(state.regs.rdx));
-        } else if (std.mem.eql(u8, name, "vkCmdPushConstants")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdPushConstants") and std.mem.eql(u8, name, "vkCmdPushConstants"))) {
             const size = state.regs.r8;
             var bytes: [256]u8 = undefined;
             if (!copyGuestBytes(state, state.regs.r9, size, &bytes)) return;
             const layout = self.real_vulkan.realPipelineLayout(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_push_constants) |function| function(command_buffer, layout, @intCast(state.regs.rdx), @intCast(state.regs.rcx), @intCast(size), if (size == 0) null else &bytes);
-        } else if (std.mem.eql(u8, name, "vkCmdBeginConditionalRenderingEXT")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBeginConditionalRenderingEXT") and std.mem.eql(u8, name, "vkCmdBeginConditionalRenderingEXT"))) {
             if (self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering) |function| {
                 var info: abi.ConditionalRenderingBeginInfoEXT = undefined;
                 if (!copyGuestValue(abi.ConditionalRenderingBeginInfoEXT, state, state.regs.rsi, &info) or info.p_next != null) return;
@@ -2169,9 +2176,9 @@ pub const Forwarder = struct {
                 info.p_next = null;
                 function(command_buffer, &info);
             }
-        } else if (std.mem.eql(u8, name, "vkCmdEndConditionalRenderingEXT")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdEndConditionalRenderingEXT") and std.mem.eql(u8, name, "vkCmdEndConditionalRenderingEXT"))) {
             if (self.real_vulkan.fn_ptrs.cmd_end_conditional_rendering) |function| function(command_buffer);
-        } else if (std.mem.eql(u8, name, "vkCmdBeginRendering") or std.mem.eql(u8, name, "vkCmdBeginRenderingKHR")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBeginRendering") and std.mem.eql(u8, name, "vkCmdBeginRendering")) or (name_hash == vulkanNameHash("vkCmdBeginRenderingKHR") and std.mem.eql(u8, name, "vkCmdBeginRenderingKHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_begin_rendering) |function| {
                 var info: abi.RenderingInfo = undefined;
                 if (!copyGuestValue(abi.RenderingInfo, state, state.regs.rsi, &info) or info.p_next != null) return;
@@ -2205,9 +2212,9 @@ pub const Forwarder = struct {
                 info.p_next = null;
                 function(command_buffer, &info);
             }
-        } else if (std.mem.eql(u8, name, "vkCmdEndRendering") or std.mem.eql(u8, name, "vkCmdEndRenderingKHR")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdEndRendering") and std.mem.eql(u8, name, "vkCmdEndRendering")) or (name_hash == vulkanNameHash("vkCmdEndRenderingKHR") and std.mem.eql(u8, name, "vkCmdEndRenderingKHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_end_rendering) |function| function(command_buffer);
-        } else if (std.mem.eql(u8, name, "vkCmdBeginRenderPass")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBeginRenderPass") and std.mem.eql(u8, name, "vkCmdBeginRenderPass"))) {
             const guest = state.guestMemoryConst(state.regs.rsi, @sizeOf(abi.RenderPassBeginInfo)) orelse return;
             var begin: abi.RenderPassBeginInfo = undefined;
             @memcpy(std.mem.asBytes(&begin), guest);
@@ -2221,9 +2228,9 @@ pub const Forwarder = struct {
             if (!copyGuestStructs(abi.ClearValue, state, clear_address, begin.clear_value_count, &clears)) return;
             begin.clear_values = if (begin.clear_value_count == 0) null else &clears;
             if (self.real_vulkan.fn_ptrs.cmd_begin_render_pass) |function| function(command_buffer, &begin, @intCast(state.regs.rdx));
-        } else if (std.mem.eql(u8, name, "vkCmdNextSubpass")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdNextSubpass") and std.mem.eql(u8, name, "vkCmdNextSubpass"))) {
             if (self.real_vulkan.fn_ptrs.cmd_next_subpass) |function| function(command_buffer, @intCast(state.regs.rsi));
-        } else if (std.mem.eql(u8, name, "vkCmdBeginRenderPass2") or std.mem.eql(u8, name, "vkCmdBeginRenderPass2KHR")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBeginRenderPass2") and std.mem.eql(u8, name, "vkCmdBeginRenderPass2")) or (name_hash == vulkanNameHash("vkCmdBeginRenderPass2KHR") and std.mem.eql(u8, name, "vkCmdBeginRenderPass2KHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_begin_render_pass2) |function| {
                 const guest_begin = state.guestMemoryConst(state.regs.rsi, @sizeOf(abi.RenderPassBeginInfo)) orelse return;
                 const guest_subpass = state.guestMemoryConst(state.regs.rdx, @sizeOf(abi.SubpassBeginInfo)) orelse return;
@@ -2240,7 +2247,7 @@ pub const Forwarder = struct {
                 begin.clear_values = if (begin.clear_value_count == 0) null else &clears;
                 function(command_buffer, &begin, &subpass);
             }
-        } else if (std.mem.eql(u8, name, "vkCmdNextSubpass2") or std.mem.eql(u8, name, "vkCmdNextSubpass2KHR")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdNextSubpass2") and std.mem.eql(u8, name, "vkCmdNextSubpass2")) or (name_hash == vulkanNameHash("vkCmdNextSubpass2KHR") and std.mem.eql(u8, name, "vkCmdNextSubpass2KHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_next_subpass2) |function| {
                 var begin: abi.SubpassBeginInfo = undefined;
                 var end: abi.SubpassEndInfo = undefined;
@@ -2248,80 +2255,80 @@ pub const Forwarder = struct {
                 if (begin.p_next != null or end.p_next != null) return;
                 function(command_buffer, &begin, &end);
             }
-        } else if (std.mem.eql(u8, name, "vkCmdEndRenderPass2") or std.mem.eql(u8, name, "vkCmdEndRenderPass2KHR")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdEndRenderPass2") and std.mem.eql(u8, name, "vkCmdEndRenderPass2")) or (name_hash == vulkanNameHash("vkCmdEndRenderPass2KHR") and std.mem.eql(u8, name, "vkCmdEndRenderPass2KHR"))) {
             if (self.real_vulkan.fn_ptrs.cmd_end_render_pass2) |function| {
                 var end: abi.SubpassEndInfo = undefined;
                 if (!copyGuestValue(abi.SubpassEndInfo, state, state.regs.rsi, &end) or end.p_next != null) return;
                 function(command_buffer, &end);
             }
-        } else if (std.mem.eql(u8, name, "vkCmdEndRenderPass")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdEndRenderPass") and std.mem.eql(u8, name, "vkCmdEndRenderPass"))) {
             if (self.real_vulkan.fn_ptrs.cmd_end_render_pass) |function| function(command_buffer);
-        } else if (std.mem.eql(u8, name, "vkCmdCopyBuffer")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdCopyBuffer") and std.mem.eql(u8, name, "vkCmdCopyBuffer"))) {
             const src = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             const dst = self.real_vulkan.realBuffer(state.regs.rdx) orelse return;
             var regions: [64]abi.BufferCopy = undefined;
             if (!copyGuestStructs(abi.BufferCopy, state, state.regs.r8, state.regs.rcx, &regions)) return;
             if (self.real_vulkan.fn_ptrs.cmd_copy_buffer) |function| function(command_buffer, src, dst, @intCast(state.regs.rcx), &regions);
-        } else if (std.mem.eql(u8, name, "vkCmdCopyImage")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdCopyImage") and std.mem.eql(u8, name, "vkCmdCopyImage"))) {
             const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
             const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return;
             var regions: [64]abi.ImageCopy = undefined;
             if (!copyGuestStructs(abi.ImageCopy, state, guestStackArg(state, 0), state.regs.r9, &regions)) return;
             if (self.real_vulkan.fn_ptrs.cmd_copy_image) |function| function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions);
-        } else if (std.mem.eql(u8, name, "vkCmdCopyBufferToImage")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdCopyBufferToImage") and std.mem.eql(u8, name, "vkCmdCopyBufferToImage"))) {
             const src = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             const dst = self.real_vulkan.realImage(state.regs.rdx) orelse return;
             var regions: [64]abi.BufferImageCopy = undefined;
             if (!copyGuestStructs(abi.BufferImageCopy, state, state.regs.r9, state.regs.r8, &regions)) return;
             if (self.real_vulkan.fn_ptrs.cmd_copy_buffer_to_image) |function| function(command_buffer, src, dst, @intCast(state.regs.rcx), @intCast(state.regs.r8), &regions);
-        } else if (std.mem.eql(u8, name, "vkCmdCopyImageToBuffer")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdCopyImageToBuffer") and std.mem.eql(u8, name, "vkCmdCopyImageToBuffer"))) {
             const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
             const dst = self.real_vulkan.realBuffer(state.regs.rcx) orelse return;
             var regions: [64]abi.BufferImageCopy = undefined;
             if (!copyGuestStructs(abi.BufferImageCopy, state, state.regs.r9, state.regs.r8, &regions)) return;
             if (self.real_vulkan.fn_ptrs.cmd_copy_image_to_buffer) |function| function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), &regions);
-        } else if (std.mem.eql(u8, name, "vkCmdBlitImage")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBlitImage") and std.mem.eql(u8, name, "vkCmdBlitImage"))) {
             const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
             const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return;
             var regions: [64]abi.ImageBlit = undefined;
             if (!copyGuestStructs(abi.ImageBlit, state, guestStackArg(state, 0), state.regs.r9, &regions)) return;
             if (self.real_vulkan.fn_ptrs.cmd_blit_image) |function| function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions, @intCast(guestStackArg(state, 1)));
-        } else if (std.mem.eql(u8, name, "vkCmdFillBuffer")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdFillBuffer") and std.mem.eql(u8, name, "vkCmdFillBuffer"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_fill_buffer) |function| function(command_buffer, buffer, state.regs.rdx, state.regs.rcx, @intCast(state.regs.r8));
-        } else if (std.mem.eql(u8, name, "vkCmdUpdateBuffer")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdUpdateBuffer") and std.mem.eql(u8, name, "vkCmdUpdateBuffer"))) {
             const buffer = self.real_vulkan.realBuffer(state.regs.rsi) orelse return;
             const size = state.regs.r8;
             var bytes: [65536]u8 = undefined;
             if (!copyGuestBytes(state, state.regs.r9, size, &bytes)) return;
             if (self.real_vulkan.fn_ptrs.cmd_update_buffer) |function| function(command_buffer, buffer, state.regs.rdx, size, if (size == 0) null else &bytes);
-        } else if (std.mem.eql(u8, name, "vkCmdResolveImage")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdResolveImage") and std.mem.eql(u8, name, "vkCmdResolveImage"))) {
             const src = self.real_vulkan.realImage(state.regs.rsi) orelse return;
             const dst = self.real_vulkan.realImage(state.regs.rcx) orelse return;
             var regions: [64]abi.ImageResolve = undefined;
             if (!copyGuestStructs(abi.ImageResolve, state, guestStackArg(state, 0), state.regs.r9, &regions)) return;
             if (self.real_vulkan.fn_ptrs.cmd_resolve_image) |function| function(command_buffer, src, @intCast(state.regs.rdx), dst, @intCast(state.regs.r8), @intCast(state.regs.r9), &regions);
-        } else if (std.mem.eql(u8, name, "vkCmdClearColorImage")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdClearColorImage") and std.mem.eql(u8, name, "vkCmdClearColorImage"))) {
             const image = self.real_vulkan.realImage(state.regs.rsi) orelse return;
             var value: abi.ClearColorValue = undefined;
             if (!copyGuestStructs(abi.ClearColorValue, state, state.regs.rcx, 1, @as(*[1]abi.ClearColorValue, @ptrCast(&value)))) return;
             var ranges: [32]abi.ImageSubresourceRange = undefined;
             if (!copyGuestStructs(abi.ImageSubresourceRange, state, state.regs.r9, state.regs.r8, &ranges)) return;
             if (self.real_vulkan.fn_ptrs.cmd_clear_color_image) |function| function(command_buffer, image, @intCast(state.regs.rdx), &value, @intCast(state.regs.r8), &ranges);
-        } else if (std.mem.eql(u8, name, "vkCmdClearDepthStencilImage")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdClearDepthStencilImage") and std.mem.eql(u8, name, "vkCmdClearDepthStencilImage"))) {
             const image = self.real_vulkan.realImage(state.regs.rsi) orelse return;
             var value: abi.ClearDepthStencilValue = undefined;
             if (!copyGuestStructs(abi.ClearDepthStencilValue, state, state.regs.rcx, 1, @as(*[1]abi.ClearDepthStencilValue, @ptrCast(&value)))) return;
             var ranges: [32]abi.ImageSubresourceRange = undefined;
             if (!copyGuestStructs(abi.ImageSubresourceRange, state, state.regs.r9, state.regs.r8, &ranges)) return;
             if (self.real_vulkan.fn_ptrs.cmd_clear_depth_stencil_image) |function| function(command_buffer, image, @intCast(state.regs.rdx), &value, @intCast(state.regs.r8), &ranges);
-        } else if (std.mem.eql(u8, name, "vkCmdClearAttachments")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdClearAttachments") and std.mem.eql(u8, name, "vkCmdClearAttachments"))) {
             var attachments: [32]abi.ClearAttachment = undefined;
             var rects: [64]abi.ClearRect = undefined;
             if (!copyGuestStructs(abi.ClearAttachment, state, state.regs.rdx, state.regs.rsi, &attachments)) return;
             if (!copyGuestStructs(abi.ClearRect, state, state.regs.r8, state.regs.rcx, &rects)) return;
             if (self.real_vulkan.fn_ptrs.cmd_clear_attachments) |function| function(command_buffer, @intCast(state.regs.rsi), &attachments, @intCast(state.regs.rcx), &rects);
-        } else if (std.mem.eql(u8, name, "vkCmdPipelineBarrier")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdPipelineBarrier") and std.mem.eql(u8, name, "vkCmdPipelineBarrier"))) {
             const memory_count = state.regs.r8;
             const memory_address = state.regs.r9;
             const buffer_count = guestStackArg(state, 0);
@@ -2356,18 +2363,18 @@ pub const Forwarder = struct {
                 @intCast(image_count),
                 if (image_count == 0) null else &images,
             );
-        } else if (std.mem.eql(u8, name, "vkCmdPipelineBarrier2") or std.mem.eql(u8, name, "vkCmdPipelineBarrier2KHR")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdPipelineBarrier2") and std.mem.eql(u8, name, "vkCmdPipelineBarrier2")) or (name_hash == vulkanNameHash("vkCmdPipelineBarrier2KHR") and std.mem.eql(u8, name, "vkCmdPipelineBarrier2KHR"))) {
             self.forwardPipelineBarrier2(state, command_buffer);
-        } else if (std.mem.eql(u8, name, "vkCmdBeginQuery")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdBeginQuery") and std.mem.eql(u8, name, "vkCmdBeginQuery"))) {
             const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_begin_query) |function| function(command_buffer, pool, @intCast(state.regs.rdx), @intCast(state.regs.rcx));
-        } else if (std.mem.eql(u8, name, "vkCmdEndQuery")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdEndQuery") and std.mem.eql(u8, name, "vkCmdEndQuery"))) {
             const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_end_query) |function| function(command_buffer, pool, @intCast(state.regs.rdx));
-        } else if (std.mem.eql(u8, name, "vkCmdResetQueryPool")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdResetQueryPool") and std.mem.eql(u8, name, "vkCmdResetQueryPool"))) {
             const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_reset_query_pool) |function| function(command_buffer, pool, @intCast(state.regs.rdx), @intCast(state.regs.rcx));
-        } else if (std.mem.eql(u8, name, "vkCmdCopyQueryPoolResults")) {
+        } else if ((name_hash == vulkanNameHash("vkCmdCopyQueryPoolResults") and std.mem.eql(u8, name, "vkCmdCopyQueryPoolResults"))) {
             const pool = self.real_vulkan.realQueryPool(state.regs.rsi) orelse return;
             const buffer = self.real_vulkan.realBuffer(state.regs.r8) orelse return;
             if (self.real_vulkan.fn_ptrs.cmd_copy_query_pool_results) |function| function(
@@ -5380,8 +5387,8 @@ pub const Forwarder = struct {
         resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_render_pass2, &.{ "vkCmdBeginRenderPass2", "vkCmdBeginRenderPass2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
         resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_next_subpass2, &.{ "vkCmdNextSubpass2", "vkCmdNextSubpass2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
         resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_render_pass2, &.{ "vkCmdEndRenderPass2", "vkCmdEndRenderPass2KHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
-        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering, &.{ "vkCmdBeginConditionalRenderingEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
-        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_conditional_rendering, &.{ "vkCmdEndConditionalRenderingEXT" }, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_conditional_rendering, &.{"vkCmdBeginConditionalRenderingEXT"}, &resolved_count, &absent_count, &absent_names, &absent_len);
+        resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_conditional_rendering, &.{"vkCmdEndConditionalRenderingEXT"}, &resolved_count, &absent_count, &absent_names, &absent_len);
         resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_begin_rendering, &.{ "vkCmdBeginRendering", "vkCmdBeginRenderingKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
         resolveAny(dpa, device, &self.real_vulkan.fn_ptrs.cmd_end_rendering, &.{ "vkCmdEndRendering", "vkCmdEndRenderingKHR" }, &resolved_count, &absent_count, &absent_names, &absent_len);
         resolveFn(dpa, device, &self.real_vulkan.fn_ptrs.cmd_copy_buffer, "vkCmdCopyBuffer", &resolved_count, &absent_count, &absent_names, &absent_len);
@@ -8464,6 +8471,18 @@ pub const Forwarder = struct {
     }
 };
 
+/// FNV-1a 64-bit. Mirrors `dispatch.importNameHash`: the forwarder cannot
+/// import the import-handler module, so the five-line hash is repeated here
+/// with the same constants. Computed once per guest symbol at allocation;
+/// const-folded at comptime for the literal spellings in the command chain.
+fn vulkanNameHash(name: []const u8) u64 {
+    var hash: u64 = 14695981039346656037;
+    for (name) |byte| {
+        hash = (hash ^ byte) *% 1099511628211;
+    }
+    return hash;
+}
+
 fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
     if (std.mem.eql(u8, symbol, "vkGetInstanceProcAddr")) return .get_instance_proc_addr;
     if (std.mem.eql(u8, symbol, "vkGetDeviceProcAddr")) return .get_device_proc_addr;
@@ -9166,6 +9185,19 @@ fn vkErrorInitializationFailedSigned() i32 {
 
 fn vkErrorOutOfHostMemory() u64 {
     return @as(u32, @bitCast(@as(i32, -1)));
+}
+
+test "guest symbol name hash separates the command chain's literals" {
+    // The stored-hash fast-fail in `forwardVulkanCommand` relies on distinct
+    // command literals hashing apart, so the hot vkCmd* calls pay u64 compares
+    // instead of string walks. Multi-name cases must still distinguish their
+    // spellings (the inner eql decides, but only after the hash agrees).
+    try std.testing.expectEqual(vulkanNameHash("vkCmdDraw"), vulkanNameHash("vkCmdDraw"));
+    try std.testing.expect(vulkanNameHash("vkCmdDraw") != vulkanNameHash("vkCmdDrawIndexed"));
+    try std.testing.expect(vulkanNameHash("vkCmdDrawIndexed") != vulkanNameHash("vkCmdDrawIndexedIndirect"));
+    try std.testing.expect(vulkanNameHash("vkCmdBindPipeline") != vulkanNameHash("vkCmdBindDescriptorSets"));
+    try std.testing.expect(vulkanNameHash("vkCmdBeginRenderPass2") != vulkanNameHash("vkCmdBeginRenderPass2KHR"));
+    try std.testing.expect(vulkanNameHash("vkCmdPipelineBarrier2") != vulkanNameHash("vkCmdPipelineBarrier2KHR"));
 }
 
 test "Vulkan guest symbol classification covers surface bootstrap" {

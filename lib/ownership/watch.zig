@@ -113,6 +113,13 @@ pub const Set = struct {
     }
 
     pub fn contains(self: *Set, address: u64) bool {
+        // Unarmed watch: nothing is watched, so nothing can match. One load
+        // and one compare replace the page hash, the index probe and the
+        // `rejected` RMW for every store while the set is empty — which is the
+        // whole run unless a subsystem declared a page or generated code
+        // seeded one. A rejection is only meaningful once there is something
+        // to be rejected from.
+        if (self.count == 0) return false;
         if (self.entryIndexFor(address)) |entry_index| {
             self.entries[entry_index].hits +|= 1;
             self.recorded +|= 1;
@@ -124,6 +131,7 @@ pub const Set = struct {
 
     /// Non-mutating membership, for reporting.
     pub fn covers(self: *const Set, address: u64) bool {
+        if (self.count == 0) return false;
         return self.entryIndexFor(address) != null;
     }
 
@@ -164,7 +172,10 @@ pub const Set = struct {
 
 test "a watched page records, an unwatched address does not" {
     var set = Set{};
+    // An unarmed watch rejects nothing: the check is one compare, and the
+    // rejection counter only moves once there is something to be rejected from.
     try std.testing.expect(!set.contains(0x40e0000130));
+    try std.testing.expectEqual(@as(u64, 0), set.rejected);
 
     try std.testing.expect(set.watchPage(0x40e0000130, .declared));
     try std.testing.expect(set.contains(0x40e0000130));
@@ -173,7 +184,7 @@ test "a watched page records, an unwatched address does not" {
     // Next page along is not covered.
     try std.testing.expect(!set.contains(0x40e0001000));
     try std.testing.expectEqual(@as(u64, 2), set.recorded);
-    try std.testing.expectEqual(@as(u64, 2), set.rejected);
+    try std.testing.expectEqual(@as(u64, 1), set.rejected);
 }
 
 test "seeding is idempotent per page" {

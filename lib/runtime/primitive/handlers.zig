@@ -651,6 +651,22 @@ pub fn sentryC1(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled_void;
 }
 
+/// Implements `std::basic_ostream::sentry::~sentry()` — the destructor of
+/// the output-sentinel guard libc++ constructs around every formatted write.
+///
+/// In libc++ the only effect is flushing the tied stream when the unitbuf
+/// flag is set; the modeled streams here write straight to host fds with no
+/// buffering to flush, so the effect is a no-op. This must never dereference
+/// `this`: the sentry lives on the guest stack and its bytes belong to the
+/// guest. Resolving the import here is what stops the call from falling into
+/// the unresolved-import path (synthetic `rax=0` + unknown-symbol assembly
+/// diagnostics on every stream write).
+/// ABI: rdi = this (sentry*). No return value.
+pub fn sentryD1(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    _ = ctx;
+    return .handled_void;
+}
+
 /// Implements `std::random_device::random_device(const std::string&)` —
 /// constructs a random_device with a token string (e.g. "/dev/urandom").
 /// For emulation, we write a marker at the object to show it's initialized.
@@ -1041,4 +1057,40 @@ test "handlers: bsearch returns the matching guest element or null" {
     std.mem.writeInt(u32, state.memory[4..8], 7, .little);
     try std.testing.expectEqual(Result.handled, bsearch(0, &ctx));
     try std.testing.expectEqual(@as(u64, 0), state.result);
+}
+
+test "handlers: sentry destructor is a no-op void handler that never dereferences the receiver" {
+    const TestState = struct {
+        fn readArg(_: *anyopaque, _: u8) u64 {
+            return 0;
+        }
+        fn setResult(_: *anyopaque, _: u64) void {}
+        fn readGuest(_: *const anyopaque, _: u64, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn writeGuest(_: *anyopaque, _: u64, _: []const u8) ?void {
+            return null;
+        }
+        fn readCString(_: *const anyopaque, _: u64) ?[]const u8 {
+            return null;
+        }
+        fn callGuest(_: *anyopaque, _: u64, _: [6]u64) u64 {
+            return 0;
+        }
+    };
+
+    var state: u64 = 0;
+    const ctx = PrimitiveContext{
+        .ptr = &state,
+        .readArgFn = TestState.readArg,
+        .setResultFn = TestState.setResult,
+        .readGuestFn = TestState.readGuest,
+        .writeGuestFn = TestState.writeGuest,
+        .readCStringFn = TestState.readCString,
+        .callGuestFn = TestState.callGuest,
+    };
+
+    // The destructor must resolve as a void no-op: the guest stack sentry is
+    // never read or written, so a null/zeroed receiver is not a fault.
+    try std.testing.expectEqual(Result.handled_void, sentryD1(0, &ctx));
 }

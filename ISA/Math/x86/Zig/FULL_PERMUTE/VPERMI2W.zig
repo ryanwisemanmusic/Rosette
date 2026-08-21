@@ -13,7 +13,7 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VPERMI2W", .path = "FULL_PERMUTE/VPERMI2W.inc", .encoding_count = 3, .source_path_len = 22 } },
+    .{ .documented_contract = .{ .name = "VPERMI2W", .path = "FULL_PERMUTE/VPERMI2W.inc", .encoding_count = 3, .source_path_len = 25 } },
 };
 
 pub const proof_report = proofs.ProofReport{

@@ -13,7 +13,7 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "XLATB", .path = "TABLE/XLATB.inc", .encoding_count = 2, .source_path_len = 12 } },
+    .{ .documented_contract = .{ .name = "XLATB", .path = "TABLE/XLATB.inc", .encoding_count = 2, .source_path_len = 15 } },
 };
 
 pub const proof_report = proofs.ProofReport{

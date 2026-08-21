@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VBROADCASTI64X4", .path = "LOAD/VBROADCASTI64X4.inc", .encoding_count = 1, .source_path_len = 22 } },
-    .{ .documented_contract = .{ .name = "VBROADCASTI64X4", .path = "LOAD/VBROADCASTI64X4.inc", .encoding_count = 1, .source_path_len = 22 } },
+    .{ .documented_contract = .{ .name = "VBROADCASTI64X4", .path = "LOAD/VBROADCASTI64X4.inc", .encoding_count = 1, .source_path_len = 24 } },
+    .{ .documented_contract = .{ .name = "VBROADCASTI64X4", .path = "LOAD/VBROADCASTI64X4.inc", .encoding_count = 1, .source_path_len = 24 } },
 };
 
 pub const proof_report = proofs.ProofReport{

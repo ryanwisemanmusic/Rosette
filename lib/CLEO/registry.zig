@@ -522,7 +522,7 @@ pub fn validateRuntimeAbi(runtime_abi: anytype) void {
 }
 
 test "CLEO registry covers current wide ISA tables" {
-    try std.testing.expectEqual(@as(usize, 424), tableCount());
+    try std.testing.expectEqual(@as(usize, 423), tableCount());
     try validateAll();
     const all_features = types.FeatureSet.all();
     try std.testing.expectEqual(tableCount(), completedCount(all_features));

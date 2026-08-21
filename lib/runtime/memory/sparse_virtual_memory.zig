@@ -157,6 +157,20 @@ pub const Manager = struct {
     // diagnostic path costs nothing until it is used.
     page_cache: ?*PageCache = null,
     page_cache_generation: u64 = 1,
+    /// How many of the current mappings and activations are executable.
+    ///
+    /// `noteGuestWrite` asks whether a store landed on executable bytes after
+    /// *every* guest write, and the sparse half of that question costs a page
+    /// cache probe. A guest that has no executable sparse memory — which is
+    /// every guest before its first JIT mapping, and many for their whole run
+    /// — can answer it from this counter instead of probing.
+    ///
+    /// Refreshed when the page-cache generation shows the records changed,
+    /// rather than inside `bumpPageCache`: several callers bump *before*
+    /// appending the record they are about to add, so a refresh there would
+    /// describe the state one mutation ago.
+    executable_records: u64 = 0,
+    executable_records_generation: u64 = 0,
 
     pub const PageCache = [PAGE_CACHE_ENTRIES]PageCacheEntry;
 
@@ -1012,7 +1026,27 @@ pub const Manager = struct {
         return @constCast(self).isExecutableInner(address, length);
     }
 
+    /// Whether any sparse record is currently executable.
+    fn anyExecutableRecord(self: *Manager) bool {
+        if (self.executable_records_generation != self.page_cache_generation) {
+            self.executable_records_generation = self.page_cache_generation;
+            var count: u64 = 0;
+            for (self.mappings.items) |*mapping| {
+                if (mapping.executable) count += 1;
+            }
+            for (self.activations.items) |*activation| {
+                if (activation.executable) count += 1;
+            }
+            self.executable_records = count;
+        }
+        return self.executable_records != 0;
+    }
+
     fn isExecutableInner(self: *Manager, address: u64, length: u64) bool {
+        // No sparse record is executable, so no sparse address can be. This is
+        // asked after every guest write; without it each one pays a page-cache
+        // probe to be told the same thing.
+        if (!self.anyExecutableRecord()) return false;
         const end = std.math.add(u64, address, length) catch return false;
         if (length != 0) {
             const page = address >> 12;

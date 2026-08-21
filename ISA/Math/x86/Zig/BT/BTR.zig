@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "BTR", .path = "BT/BTR.inc", .encoding_count = 6, .source_path_len = 9 } },
-    .{ .documented_contract = .{ .name = "BTR", .path = "BT/BTR.inc", .encoding_count = 6, .source_path_len = 9 } },
+    .{ .documented_contract = .{ .name = "BTR", .path = "BT/BTR.inc", .encoding_count = 6, .source_path_len = 10 } },
+    .{ .documented_contract = .{ .name = "BTR", .path = "BT/BTR.inc", .encoding_count = 6, .source_path_len = 10 } },
 };
 
 pub const proof_report = proofs.ProofReport{

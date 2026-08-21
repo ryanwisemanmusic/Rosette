@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "UNPCKLPS", .path = "UNPACK/UNPCKLPS.inc", .encoding_count = 6, .source_path_len = 15 } },
-    .{ .documented_contract = .{ .name = "UNPCKLPS", .path = "UNPACK/UNPCKLPS.inc", .encoding_count = 6, .source_path_len = 15 } },
+    .{ .documented_contract = .{ .name = "UNPCKLPS", .path = "UNPACK/UNPCKLPS.inc", .encoding_count = 6, .source_path_len = 19 } },
+    .{ .documented_contract = .{ .name = "UNPCKLPS", .path = "UNPACK/UNPCKLPS.inc", .encoding_count = 6, .source_path_len = 19 } },
 };
 
 pub const proof_report = proofs.ProofReport{

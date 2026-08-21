@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VBLENDMPS", .path = "BLEND/VBLENDMPS.inc", .encoding_count = 3, .source_path_len = 20 } },
-    .{ .documented_contract = .{ .name = "VBLENDMPS", .path = "BLEND/VBLENDMPS.inc", .encoding_count = 3, .source_path_len = 20 } },
+    .{ .documented_contract = .{ .name = "VBLENDMPS", .path = "BLEND/VBLENDMPS.inc", .encoding_count = 3, .source_path_len = 19 } },
+    .{ .documented_contract = .{ .name = "VBLENDMPS", .path = "BLEND/VBLENDMPS.inc", .encoding_count = 3, .source_path_len = 19 } },
 };
 
 pub const proof_report = proofs.ProofReport{

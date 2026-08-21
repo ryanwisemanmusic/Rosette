@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "FXSAVE", .path = "SAVE/FXSAVE.inc", .encoding_count = 2, .source_path_len = 16 } },
-    .{ .documented_contract = .{ .name = "FXSAVE", .path = "SAVE/FXSAVE.inc", .encoding_count = 2, .source_path_len = 16 } },
+    .{ .documented_contract = .{ .name = "FXSAVE", .path = "SAVE/FXSAVE.inc", .encoding_count = 2, .source_path_len = 15 } },
+    .{ .documented_contract = .{ .name = "FXSAVE", .path = "SAVE/FXSAVE.inc", .encoding_count = 2, .source_path_len = 15 } },
 };
 
 pub const proof_report = proofs.ProofReport{

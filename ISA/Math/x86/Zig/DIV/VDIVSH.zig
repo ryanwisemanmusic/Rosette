@@ -14,6 +14,7 @@ pub const meta = core.InstructionMathMeta{
 
 pub const proof_cases = [_]proofs.ProofCase{
     .{ .divsd_vex = .{ .dest_or_src1 = .{ 12, 9 }, .src = .{ 3, 1 }, .expected = .{ 4, 9 } } },
+    .{ .divsd_vex = .{ .dest_or_src1 = .{ 20, 7 }, .src = .{ 4, 55 }, .expected = .{ 5, 7 } } },
 };
 
 pub const proof_report = proofs.ProofReport{

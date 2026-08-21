@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VFNMADD231PH", .path = "FUSED/VFNMADD231PH.inc", .encoding_count = 3, .source_path_len = 23 } },
-    .{ .documented_contract = .{ .name = "VFNMADD231PH", .path = "FUSED/VFNMADD231PH.inc", .encoding_count = 3, .source_path_len = 23 } },
+    .{ .documented_contract = .{ .name = "VFNMADD231PH", .path = "FUSED/VFNMADD231PH.inc", .encoding_count = 3, .source_path_len = 22 } },
+    .{ .documented_contract = .{ .name = "VFNMADD231PH", .path = "FUSED/VFNMADD231PH.inc", .encoding_count = 3, .source_path_len = 22 } },
 };
 
 pub const proof_report = proofs.ProofReport{

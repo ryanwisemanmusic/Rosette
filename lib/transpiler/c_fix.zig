@@ -530,6 +530,18 @@ pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_m
 
     try appendDepoisonFixes(allocator, source, &edits, cpp_mode);
     if (cpp_mode) {
+        // A C++ source gets only the rewrites that are themselves C++: the
+        // passes below this point produce C, and several of them (the `(int)`
+        // return wrap, the unused-variable annotations) would be wrong here.
+        //
+        // These four used to be unreachable. The early return sat above them,
+        // so the block at the end of this function that ran them "if
+        // (cpp_mode)" could never execute, and every C++-only rewrite the
+        // transpiler implements was dead code.
+        try appendStaticCastVoidUnwrap(allocator, source, tokens, &edits);
+        try appendFmtPointerCasts(allocator, source, tokens, &edits);
+        try appendOldStyleCastConversion(allocator, source, tokens, &edits);
+        try appendUndefinedReinterpretCast(allocator, source, tokens, &edits);
         return .{ .edits = edits, .warning = warning };
     }
     try appendBracketAttributeFixes(allocator, source, tokens, &edits, cpp_mode);
@@ -549,10 +561,6 @@ pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_m
     try appendMissingBraces(allocator, source, tokens, &edits);
     try appendDeprecatedDeclReplacement(allocator, source, tokens, &edits);
     try appendLogicalOpParentheses(allocator, source, tokens, &edits);
-    if (cpp_mode) {
-        try appendOldStyleCastConversion(allocator, source, tokens, &edits);
-        try appendUndefinedReinterpretCast(allocator, source, tokens, &edits);
-    }
 
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {

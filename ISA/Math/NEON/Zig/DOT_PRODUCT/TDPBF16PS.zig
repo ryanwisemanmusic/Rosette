@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "TDPBF16PS", .path = "DOT_PRODUCT/TDPBF16PS.inc", .encoding_count = 1, .source_path_len = 26 } },
-    .{ .documented_contract = .{ .name = "TDPBF16PS", .path = "DOT_PRODUCT/TDPBF16PS.inc", .encoding_count = 1, .source_path_len = 26 } },
+    .{ .documented_contract = .{ .name = "TDPBF16PS", .path = "DOT_PRODUCT/TDPBF16PS.inc", .encoding_count = 1, .source_path_len = 25 } },
+    .{ .documented_contract = .{ .name = "TDPBF16PS", .path = "DOT_PRODUCT/TDPBF16PS.inc", .encoding_count = 1, .source_path_len = 25 } },
 };
 
 pub const proof_report = proofs.ProofReport{

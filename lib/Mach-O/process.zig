@@ -1044,6 +1044,19 @@ pub const MachOState = struct {
     /// The epoch makes that omitted interval explicit to post-fault walkers.
     execution_history_epoch: u64 = 0,
     execution_history_filter_active: bool = false,
+    /// Whether the instruction currently being stepped is inside the host
+    /// image's executable range, set once per step by the decode-cache fast
+    /// path (from the entry's fill-time classification) or by the slow path's
+    /// own range compare. The execution-history filter reads this instead of
+    /// re-running the two range compares on every step.
+    step_host_image: bool = false,
+    /// One load replaces the per-instruction gates for the init-time
+    /// diagnostic switches (verbose trace, SHA1 tracer, trace range). True
+    /// when any of them can fire; computed once in `loadAndRun` after all
+    /// three are set, because none of them ever changes after startup. A
+    /// future per-instruction post-decode gate must extend that computation
+    /// or its gate will silently never fire.
+    step_tracing_active: bool = false,
     trace_range_start: ?u64 = null,
     trace_range_end: ?u64 = null,
     last_trace_rip: u64 = 0,
@@ -5021,7 +5034,10 @@ pub const MachOState = struct {
                                 while (iter < max_iters) : (iter += 1) {
                                     if (st.terminated or st.faulted) break;
 
-                                    const d = st.decodeWithLiveOperands() orelse break;
+                                    // No gate chain ran before this decode (this
+                                    // loop deliberately skips it), so the fill must
+                                    // not mark the entry fast_plain.
+                                    const d = st.decodeWithLiveOperands(false) orelse break;
                                     if (d.op == .invalid) break;
 
                                     if (d.op == .ret) {
@@ -6052,9 +6068,6 @@ pub const MachOState = struct {
         );
     }
 
-    /// Decode the instruction at the current RIP and resolve its memory operand
-    /// against the **live** register file, via the decode cache. This is the
-    /// execution path's decoder; the other two are readers.
     /// Whether a cached decode's address has to be recomputed from live registers.
     ///
     /// The address is `displacement + base + index*scale (+ segment base)`. Every
@@ -6089,7 +6102,41 @@ pub const MachOState = struct {
         used.recently_used = true;
     }
 
-    fn decodeWithLiveOperands(self: *MachOState) ?DecodedInsn {
+    /// The decode-cache entry for the current RIP, when one exists that was
+    /// filled with the full validation gate chain already run and declined
+    /// (not a special-RIP target, executable, config parsing idle, table
+    /// intact). On such a hit the per-instruction gate chain is provably
+    /// redundant, so `step` skips it. Probe semantics match
+    /// `decodeWithLiveOperands`' own hit condition, so a non-null result here
+    /// is exactly "the next decode would hit and the entry is plain". The
+    /// returned classification doubles as the execution-history filter's
+    /// host-image test, computed once per fill instead of per step.
+    inline fn decodeFastPlainHostImage(self: *const MachOState) ?bool {
+        const rip = self.regs.rip;
+        const set_base = constants.decodeCacheSetBase(rip);
+        const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
+        for (ways) |*candidate| {
+            if (candidate.rip == rip and
+                candidate.code_generation == self.code_generation and
+                candidate.fast_plain)
+            {
+                return candidate.host_image;
+            }
+        }
+        return null;
+    }
+
+    /// Decode the instruction at the current RIP and resolve its memory operand
+    /// against the **live** register file, via the decode cache. This is the
+    /// execution path's decoder; the other two are readers.
+    ///
+    /// `gates_free` tells the fill path whether the caller already proved this
+    /// RIP needs no special handling and is executable (the `step` fast path,
+    /// where the special-RIP chain declined and `isExecutableAddress` passed).
+    /// Only then may the entry be marked `fast_plain`; the guest-function
+    /// helper and other non-gated decoders pass false and keep those entries on
+    /// the slow path.
+    fn decodeWithLiveOperands(self: *MachOState, gates_free: bool) ?DecodedInsn {
         // F17 (throughput audit): CS has no base in long mode — `segmentBase`
         // returns 0 for every segment but FS and GS (see addressing.zig). The
         // call was two compares and a load per instruction to add zero.
@@ -6249,6 +6296,22 @@ pub const MachOState = struct {
             .decoded = decoded,
             .displacement = raw_displacement,
             .instruction_byte_count = instruction_byte_count,
+            // The fast path is only sound for a fill that ran the validation
+            // gate chain and saw it decline. `gates_free` already means the
+            // special-RIP chain declined and the address was executable; the
+            // config-parsing clause is monotone (it only ever turns off), and
+            // the special-RIP table, once built, never changes — so the extra
+            // guards below are belt-and-suspenders that keep startup and the
+            // failed-table fallback on the slow path without needing to
+            // reason about either invariant.
+            .fast_plain = gates_free and
+                !self.config_parsing_active and
+                !self.special_rip_table_failed,
+            // Computed here, once per fill, so the execution-history filter can
+            // classify this instruction with one load on later hits instead of
+            // re-running the range compare on every step.
+            .host_image = fetch_address >= self.executable_min and
+                fetch_address < self.executable_max,
         };
         // F4: this page now holds a cached decode, so a later store into it has
         // to run the invalidation walk. Noted for the instruction's whole
@@ -6452,22 +6515,48 @@ pub const MachOState = struct {
         // load-time-resolved table plus O(1) range/state probes; the chain
         // runs only when rip could actually match a target, with identical
         // short-circuit semantics.
-        if (self.specialRipPossible()) {
-            if (self.handleInternalCompatibility()) return !self.terminated;
-            if (self.handleTlvBootstrap()) return !self.terminated;
-            if (self.handleBoundImportThunk()) return !self.terminated;
-            if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
-            if (self.handleDynamicLibraryThunk()) return !self.terminated;
-            if (self.handleStubHelperTransition()) {
-                return !self.terminated;
+        //
+        // F18 (throughput audit): the chain and the executability probe are
+        // still recomputed per instruction even when every fact they verify
+        // is invariant for a given RIP. A decode-cache hit whose entry was
+        // filled with the chain declined and the address verified executable
+        // (`fast_plain`) makes both redundant: the entry survives only while
+        // the bytes and permissions it was validated under still hold, and
+        // every condition the chain tests is monotone after the fill. One
+        // probe replaces the binary search, the range/state probes and the
+        // sparse executability probe on the hot path; everything here still
+        // runs on misses, on entries filled without the gates, during config
+        // parsing, and whenever the special-RIP table fallback is active.
+        var gates_free = false;
+        if (self.decodeFastPlainHostImage()) |host_image| {
+            // The fast entry was validated (executable, not a special target)
+            // at fill time and survives only while the bytes and permissions
+            // it was validated under still hold. Its fill-time host-image
+            // classification is exact for this RIP, so the execution-history
+            // filter below reads one field instead of re-running the range
+            // compare on every step.
+            self.step_host_image = host_image;
+        } else {
+            gates_free = !self.specialRipPossible();
+            if (!gates_free) {
+                if (self.handleInternalCompatibility()) return !self.terminated;
+                if (self.handleTlvBootstrap()) return !self.terminated;
+                if (self.handleBoundImportThunk()) return !self.terminated;
+                if (self.handleSyntheticRuntimeThunk()) return !self.terminated;
+                if (self.handleDynamicLibraryThunk()) return !self.terminated;
+                if (self.handleStubHelperTransition()) {
+                    return !self.terminated;
+                }
+                self.handleTomlReadNextIntegrity();
+                if (self.handleTomlAsciiFastPath()) return !self.terminated;
+                if (self.handlePatchDbEmptyPatchArray()) return !self.terminated;
             }
-            self.handleTomlReadNextIntegrity();
-            if (self.handleTomlAsciiFastPath()) return !self.terminated;
-            if (self.handlePatchDbEmptyPatchArray()) return !self.terminated;
+            if (!self.isExecutableAddress(self.regs.rip)) return self.recoverNonExecutableRip();
+            self.step_host_image = self.regs.rip >= self.executable_min and
+                self.regs.rip < self.executable_max;
         }
-        if (!self.isExecutableAddress(self.regs.rip)) return self.recoverNonExecutableRip();
         self.pending_control_transfer = null;
-        const decoded = self.decodeWithLiveOperands() orelse return self.reportDecodeFailure();
+        const decoded = self.decodeWithLiveOperands(gates_free) orelse return self.reportDecodeFailure();
         if (decoded.op == .invalid) return self.reportInvalidInstruction();
         // Instruction history, gated behaviourally rather than by a flag.
         //
@@ -6480,7 +6569,10 @@ pub const MachOState = struct {
         // Generated code is the only region these recognizers ask about, and it
         // is a small fraction of executed steps (Xenia's own JIT compiler
         // dominates), so recording exactly there makes the tape both affordable
-        // and deep where it is consulted. Two range compares, no page lookup.
+        // and deep where it is consulted. The host/generated split is classified
+        // upstream (`step_host_image`) — from the decode entry on the fast path
+        // and the range compare on the slow path — so this block does one load,
+        // no page lookup.
         switch (self.execution_history.policy) {
             .disabled => {},
             .all => {
@@ -6488,9 +6580,11 @@ pub const MachOState = struct {
                 self.recordTrace(decoded);
             },
             .generated_code_only => {
-                const in_host_image = self.regs.rip >= self.executable_min and
-                    self.regs.rip < self.executable_max;
-                if (in_host_image) {
+                // Classified upstream: the decode-cache fast path read the
+                // entry's fill-time classification, the slow path computed the
+                // same range compare this block used to run. One load replaces
+                // the two range compares per step.
+                if (self.step_host_image) {
                     // One increment per contiguous omitted native interval,
                     // not per instruction. Besides keeping the counter stable,
                     // this makes the hot host-code path a predictable branch.
@@ -6518,24 +6612,36 @@ pub const MachOState = struct {
             self.coop_bootstrap_index = idx + 1;
             if (self.coop_bootstrap_index == 24) self.reportCoopBootstrapComplete();
         }
-        if (self.verbose_trace) log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
-        // Observe the resolved function entry itself rather than relying on
-        // the preceding call target. Lazy-import stubs may transfer here via a
-        // jump after Rosette has already handled the original call.
-        if (self.sha1_tracer.enabled and
-            !self.sha1_tracer.active and
-            self.internal_targets.sha1_process_bytes != 0 and
-            self.regs.rip == self.internal_targets.sha1_process_bytes)
-        {
-            self.sha1_tracer.onProcessBytesEntry(self);
+        // F19 (throughput audit): these gates are diagnostics that are off in
+        // the steady state — the verbose trace and the SHA1 tracer are
+        // env-gated off by default and the trace range is unset unless set by
+        // hand — and each used to pay a load and a branch per instruction just
+        // to be asked. `step_tracing_active` is computed once at startup from
+        // the three immutable switches, so the cluster below costs one load
+        // and one not-taken branch on the hot path; each gate still
+        // self-checks inside so the aggregate can never over-fire.
+        if (self.step_tracing_active) {
+            if (self.verbose_trace) log.debug("rip=0x{x} op={s} len={d}", .{ self.regs.rip, @tagName(decoded.op), decoded.len });
+            // Observe the resolved function entry itself rather than relying
+            // on the preceding call target. Lazy-import stubs may transfer
+            // here via a jump after Rosette has already handled the original
+            // call.
+            if (self.sha1_tracer.enabled and
+                !self.sha1_tracer.active and
+                self.internal_targets.sha1_process_bytes != 0 and
+                self.regs.rip == self.internal_targets.sha1_process_bytes)
+            {
+                self.sha1_tracer.onProcessBytesEntry(self);
+            }
+            if (self.shouldTraceRIP(self.regs.rip)) self.emitTargetTrace(decoded);
         }
-        if (self.shouldTraceRIP(self.regs.rip)) self.emitTargetTrace(decoded);
         const old_rip = self.regs.rip;
         x64_interpreter.execute(self, decoded);
         if (!self.terminated and self.regs.rip == old_rip) {
             self.regs.rip +%= decoded.len;
         }
         if (!self.terminated and
+            self.step_tracing_active and
             self.sha1_tracer.enabled and
             self.sha1_tracer.isActiveThread(self))
         {
@@ -7910,6 +8016,13 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     output.human("Loading imports...\n", .{});
     state.cpu_profile = selectedCpuProfile();
     state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");
+    // F19: all three per-instruction trace gates are init-time switches that
+    // never change after startup, so one boolean carries their combined state
+    // into the hot path. Any future per-instruction post-decode gate must
+    // extend this expression.
+    state.step_tracing_active = state.verbose_trace or
+        state.sha1_tracer.enabled or
+        state.trace_range_start != null;
     state.unwinder.verbose = state.verbose_trace or environmentFlag("ROSETTE_MACHO_UNWIND_VERBOSE");
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");

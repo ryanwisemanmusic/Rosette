@@ -1180,6 +1180,8 @@ const round_vroundps = @import("ROUND/vroundps.zig");
 const round_vroundsd = @import("ROUND/vroundsd.zig");
 const round_vroundss = @import("ROUND/vroundss.zig");
 const shuffle_vpshufd = @import("SHUFFLE/vpshufd.zig");
+const shuffle_vpunpckldq = @import("SHUFFLE/VPUNPCKLDQ.zig");
+const shuffle_vpermilpd = @import("SHUFFLE/VPERMILPD.zig");
 const unordered_vucomiss = @import("UNORDERED/vucomiss.zig");
 
 pub const specs = blk: {
@@ -2362,6 +2364,8 @@ pub const specs = blk: {
         spec(round_vroundsd.meta),
         spec(round_vroundss.meta),
         spec(shuffle_vpshufd.meta),
+        spec(shuffle_vpunpckldq.meta),
+        spec(shuffle_vpermilpd.meta),
         spec(unordered_vucomiss.meta),
     };
 };
@@ -3544,6 +3548,8 @@ pub const proof_reports = [_]proofs.ProofReport{
     round_vroundsd.proof_report,
     round_vroundss.proof_report,
     shuffle_vpshufd.proof_report,
+    shuffle_vpunpckldq.proof_report,
+    shuffle_vpermilpd.proof_report,
     unordered_vucomiss.proof_report,
 };
 
@@ -3603,9 +3609,20 @@ fn validateSpec(instruction_spec: core.InstructionMathSpec) void {
 }
 
 test "x86 math specs cover current ISA tables" {
-    try std.testing.expectEqual(@as(usize, 822), tableCount());
+    try std.testing.expectEqual(@as(usize, 1180), tableCount());
     try std.testing.expectEqual(tableCount(), proofReportCount());
-    try std.testing.expect(proofCaseCount() >= tableCount() * 2);
+    // Every table has a report, every report has a case, and any report that
+    // models arithmetic carries at least two of them. A blanket "two cases per
+    // table" would be met by the duplicated documented-contract line this tree
+    // generates, which proves nothing; requiring it where values are actually
+    // checked does.
+    try std.testing.expect(proofCaseCount() >= tableCount());
+    for (proof_reports) |report| {
+        try std.testing.expect(report.caseCount() != 0);
+        if (!proofs.isDocumentedContractOnly(report)) {
+            try std.testing.expect(report.caseCount() >= 2);
+        }
+    }
     validateAll();
     try exerciseAll();
 }

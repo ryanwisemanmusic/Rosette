@@ -554,9 +554,26 @@ pub fn laneCount(comptime bits: usize, comptime T: type) usize {
     return bits / scalar_bits;
 }
 
+/// Whether a declared maximum width is one CLEO can lower: a whole number of
+/// 128-bit NEON blocks, from a single block up to the internal 1024-bit
+/// vector.
+///
+/// `validateWideWidth` — the comptime gate the lowering itself goes through —
+/// has always accepted 128. The two runtime checks that used to spell this
+/// rule out by hand both required *more* than one block, so every
+/// 128-bit-only instruction in the registry (MOVSS, MOVSD, MOVLPS, MOVHPS,
+/// MOVHLPS, MOVLHPS and their VEX forms) failed a rule its own lowering
+/// passes: `validateMeta` refused them outright and `safetyReport` reported
+/// them permanently incomplete. One predicate, used by both.
+pub fn isLowerableWidth(bits: usize) bool {
+    return switch (bits) {
+        VECTOR_BLOCK_BITS, 256, 512, 1024 => true,
+        else => false,
+    };
+}
+
 pub fn validateMeta(meta: InstructionMeta) SafetyError!void {
-    if (meta.max_width_bits <= VECTOR_BLOCK_BITS or meta.max_width_bits % VECTOR_BLOCK_BITS != 0) return SafetyError.InvalidWideWidth;
-    if (meta.max_width_bits != 256 and meta.max_width_bits != 512 and meta.max_width_bits != 1024) return SafetyError.InvalidWideWidth;
+    if (!isLowerableWidth(meta.max_width_bits)) return SafetyError.InvalidWideWidth;
     if (meta.element_bits == 0 or meta.max_width_bits % meta.element_bits != 0) return SafetyError.InvalidElementWidth;
     if (meta.blockCount() == 0) return SafetyError.InvalidBlockWidth;
 }
@@ -570,7 +587,7 @@ pub fn safetyReport(meta: InstructionMeta, features: FeatureSet) SafetyReport {
         .width_bits = meta.max_width_bits,
         .element_bits = meta.element_bits,
         .block_count = meta.blockCount(),
-        .width_ok = meta.max_width_bits > VECTOR_BLOCK_BITS and meta.max_width_bits % VECTOR_BLOCK_BITS == 0,
+        .width_ok = isLowerableWidth(meta.max_width_bits),
         .element_ok = meta.element_bits != 0 and meta.max_width_bits % meta.element_bits == 0,
         .block_ok = meta.blockCount() == meta.max_width_bits / VECTOR_BLOCK_BITS,
         .asm_template_present = meta.asm_template.len != 0,

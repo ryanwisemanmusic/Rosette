@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "FCOMP", .path = "X87_FPU/FCOMP.inc", .encoding_count = 4, .source_path_len = 19 } },
-    .{ .documented_contract = .{ .name = "FCOMP", .path = "X87_FPU/FCOMP.inc", .encoding_count = 4, .source_path_len = 19 } },
+    .{ .documented_contract = .{ .name = "FCOMP", .path = "X87_FPU/FCOMP.inc", .encoding_count = 4, .source_path_len = 17 } },
+    .{ .documented_contract = .{ .name = "FCOMP", .path = "X87_FPU/FCOMP.inc", .encoding_count = 4, .source_path_len = 17 } },
 };
 
 pub const proof_report = proofs.ProofReport{

@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "INCSSP", .path = "SHADOW/INCSSP.inc", .encoding_count = 2, .source_path_len = 19 } },
-    .{ .documented_contract = .{ .name = "INCSSP", .path = "SHADOW/INCSSP.inc", .encoding_count = 2, .source_path_len = 19 } },
+    .{ .documented_contract = .{ .name = "INCSSP", .path = "SHADOW/INCSSP.inc", .encoding_count = 2, .source_path_len = 17 } },
+    .{ .documented_contract = .{ .name = "INCSSP", .path = "SHADOW/INCSSP.inc", .encoding_count = 2, .source_path_len = 17 } },
 };
 
 pub const proof_report = proofs.ProofReport{

@@ -13,9 +13,9 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VPOPCNTW", .path = "RET/VPOPCNTW.inc", .encoding_count = 3, .source_path_len = 13 } },
-    .{ .documented_contract = .{ .name = "VPOPCNTW", .path = "RET/VPOPCNTW.inc", .encoding_count = 3, .source_path_len = 13 } },
-    .{ .documented_contract = .{ .name = "VPOPCNTW", .path = "RET/VPOPCNTW.inc", .encoding_count = 3, .source_path_len = 13 } },
+    .{ .documented_contract = .{ .name = "VPOPCNTW", .path = "RET/VPOPCNTW.inc", .encoding_count = 3, .source_path_len = 16 } },
+    .{ .documented_contract = .{ .name = "VPOPCNTW", .path = "RET/VPOPCNTW.inc", .encoding_count = 3, .source_path_len = 16 } },
+    .{ .documented_contract = .{ .name = "VPOPCNTW", .path = "RET/VPOPCNTW.inc", .encoding_count = 3, .source_path_len = 16 } },
 };
 
 pub const proof_report = proofs.ProofReport{

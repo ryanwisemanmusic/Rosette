@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VPERMQ", .path = "PERMUTE/VPERMQ.inc", .encoding_count = 5, .source_path_len = 12 } },
-    .{ .documented_contract = .{ .name = "VPERMQ", .path = "PERMUTE/VPERMQ.inc", .encoding_count = 5, .source_path_len = 12 } },
+    .{ .documented_contract = .{ .name = "VPERMQ", .path = "PERMUTE/VPERMQ.inc", .encoding_count = 5, .source_path_len = 18 } },
+    .{ .documented_contract = .{ .name = "VPERMQ", .path = "PERMUTE/VPERMQ.inc", .encoding_count = 5, .source_path_len = 18 } },
 };
 
 pub const proof_report = proofs.ProofReport{

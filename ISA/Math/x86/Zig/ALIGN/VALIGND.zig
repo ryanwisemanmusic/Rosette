@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "VALIGND", .path = "ALIGN/VALIGND.inc", .encoding_count = 3, .source_path_len = 18 } },
-    .{ .documented_contract = .{ .name = "VALIGND", .path = "ALIGN/VALIGND.inc", .encoding_count = 3, .source_path_len = 18 } },
+    .{ .documented_contract = .{ .name = "VALIGND", .path = "ALIGN/VALIGND.inc", .encoding_count = 3, .source_path_len = 17 } },
+    .{ .documented_contract = .{ .name = "VALIGND", .path = "ALIGN/VALIGND.inc", .encoding_count = 3, .source_path_len = 17 } },
 };
 
 pub const proof_report = proofs.ProofReport{

@@ -13,7 +13,7 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "KXNORB", .path = "LOGICAL_XNOR/KXNORB.inc", .encoding_count = 1, .source_path_len = 22 } },
+    .{ .documented_contract = .{ .name = "KXNORB", .path = "LOGICAL_XNOR/KXNORB.inc", .encoding_count = 1, .source_path_len = 23 } },
 };
 
 pub const proof_report = proofs.ProofReport{

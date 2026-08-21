@@ -13,8 +13,8 @@ pub const meta = core.InstructionMathMeta{
 };
 
 pub const proof_cases = [_]proofs.ProofCase{
-    .{ .documented_contract = .{ .name = "BNDMOV", .path = "BOUND/BNDMOV.inc", .encoding_count = 4, .source_path_len = 24 } },
-    .{ .documented_contract = .{ .name = "BNDMOV", .path = "BOUND/BNDMOV.inc", .encoding_count = 4, .source_path_len = 24 } },
+    .{ .documented_contract = .{ .name = "BNDMOV", .path = "BOUND/BNDMOV.inc", .encoding_count = 4, .source_path_len = 16 } },
+    .{ .documented_contract = .{ .name = "BNDMOV", .path = "BOUND/BNDMOV.inc", .encoding_count = 4, .source_path_len = 16 } },
 };
 
 pub const proof_report = proofs.ProofReport{
