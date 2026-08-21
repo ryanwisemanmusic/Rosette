@@ -36,6 +36,7 @@ pub const execution_tracepoints = @import("execution_tracepoints.zig");
 pub const anomaly_ledger = @import("anomaly_ledger.zig");
 pub const spirv_cross_diagnostics = @import("spirv_cross_diagnostics.zig");
 pub const opaque_lifetime_recovery = @import("opaque_lifetime_recovery.zig");
+pub const null_write_recovery = @import("null_write_recovery.zig");
 pub const launch_argument_accelerator = @import("launch_argument_accelerator.zig");
 pub const startup_observer = @import("startup_observer.zig");
 pub const logging_runtime = @import("logging_runtime.zig");
@@ -71,6 +72,7 @@ test {
     _ = anomaly_ledger;
     _ = spirv_cross_diagnostics;
     _ = opaque_lifetime_recovery;
+    _ = null_write_recovery;
     _ = launch_argument_accelerator;
     _ = startup_observer;
     _ = logging_runtime;
