@@ -705,7 +705,13 @@ pub fn build(b: *std.Build) void {
         tp_mod.addIncludePath(b.path("../include/shims/win32"));
         tp_mod.addIncludePath(b.path("../include"));
         const tp_test = b.addTest(.{ .root_module = tp_mod });
-        check_step.dependOn(&tp_test.step);
+        // llvm.zig reaches the host debug/runtime C symbols, which nothing
+        // links into a bare test binary; the rest of third_party runs.
+        if (comptime std.mem.eql(u8, rel_path, "llvm/llvm.zig")) {
+            check_step.dependOn(&tp_test.step);
+        } else {
+            check_step.dependOn(&b.addRunArtifact(tp_test).step);
+        }
     }
 
     // Graphics ABI validation tests
@@ -742,22 +748,22 @@ pub fn build(b: *std.Build) void {
 
     {
         const svx_test = b.addTest(.{ .root_module = svx_module });
-        check_step.dependOn(&svx_test.step);
+        check_step.dependOn(&b.addRunArtifact(svx_test).step);
     }
 
     {
         const cleo_test = b.addTest(.{ .root_module = cleo_module });
-        check_step.dependOn(&cleo_test.step);
+        check_step.dependOn(&b.addRunArtifact(cleo_test).step);
     }
 
     {
         const contract_test = b.addTest(.{ .root_module = contract_mod });
-        check_step.dependOn(&contract_test.step);
+        check_step.dependOn(&b.addRunArtifact(contract_test).step);
     }
 
     {
         const jit_test = b.addTest(.{ .root_module = jit_mod });
-        check_step.dependOn(&jit_test.step);
+        check_step.dependOn(&b.addRunArtifact(jit_test).step);
     }
 
     {
@@ -768,7 +774,7 @@ pub fn build(b: *std.Build) void {
         });
         isa_math_test_mod.addImport("runtime_abi_handshake", runtime_abi_module);
         const isa_math_test = b.addTest(.{ .root_module = isa_math_test_mod });
-        check_step.dependOn(&isa_math_test.step);
+        check_step.dependOn(&b.addRunArtifact(isa_math_test).step);
     }
 
     {
@@ -880,7 +886,7 @@ pub fn build(b: *std.Build) void {
         });
         yasm_mod.addImport("runtime_abi_handshake", runtime_abi_module);
         const yasm_test = b.addTest(.{ .root_module = yasm_mod });
-        check_step.dependOn(&yasm_test.step);
+        check_step.dependOn(&b.addRunArtifact(yasm_test).step);
     }
 
     {
@@ -958,7 +964,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const lib866d_test = b.addTest(.{ .root_module = lib866d_mod });
-        check_step.dependOn(&lib866d_test.step);
+        check_step.dependOn(&b.addRunArtifact(lib866d_test).step);
     }
 
     {
@@ -985,7 +991,7 @@ pub fn build(b: *std.Build) void {
         compat_router_test_mod.addImport("entrypoint_kernel_process_guard", entrypoint_kernel_process_guard_module);
         compat_router_test_mod.addImport("exit_diagnostics", exit_diagnostics_module);
         const compat_router_test = b.addTest(.{ .root_module = compat_router_test_mod });
-        check_step.dependOn(&compat_router_test.step);
+        check_step.dependOn(&b.addRunArtifact(compat_router_test).step);
     }
 
     {
@@ -1093,7 +1099,7 @@ pub fn build(b: *std.Build) void {
     );
     decoder_family_check_step.dependOn(&run_setcc_stack_regression_test.step);
     const isa_highway_test = b.addTest(.{ .root_module = isa_highway_module });
-    check_step.dependOn(&isa_highway_test.step);
+    check_step.dependOn(&b.addRunArtifact(isa_highway_test).step);
     const isa_decode_test = b.addTest(.{ .root_module = isa_decode_module });
     const run_isa_decode_test = b.addRunArtifact(isa_decode_test);
     check_step.dependOn(&run_isa_decode_test.step);
@@ -1161,10 +1167,10 @@ pub fn build(b: *std.Build) void {
         elf_processor_test_mod.addImport("cleo_routing", cleo_routing_mod);
         elf_processor_test_mod.addImport("execution_history", execution_history_mod);
         const elf_processor_test = b.addTest(.{ .root_module = elf_processor_test_mod });
-        check_step.dependOn(&elf_processor_test.step);
+        check_step.dependOn(&b.addRunArtifact(elf_processor_test).step);
 
         const x64_guest_abi_test = b.addTest(.{ .root_module = x64_guest_abi_mod });
-        check_step.dependOn(&x64_guest_abi_test.step);
+        check_step.dependOn(&b.addRunArtifact(x64_guest_abi_test).step);
     }
 
     // TOML processor (patch file format parser)
@@ -1175,7 +1181,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const toml_processor_test = b.addTest(.{ .root_module = toml_processor_mod });
-        check_step.dependOn(&toml_processor_test.step);
+        check_step.dependOn(&b.addRunArtifact(toml_processor_test).step);
 
         const toml_exe_mod = b.createModule(.{
             .root_source_file = b.path("../lib/processor/TOML_processor/main.zig"),
@@ -1198,7 +1204,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const ps1_processor_test = b.addTest(.{ .root_module = ps1_processor_mod });
-        check_step.dependOn(&ps1_processor_test.step);
+        check_step.dependOn(&b.addRunArtifact(ps1_processor_test).step);
 
         const ps1_exe_mod = b.createModule(.{
             .root_source_file = b.path("../lib/processor/ps1_processor/main.zig"),
@@ -1768,22 +1774,22 @@ pub fn build(b: *std.Build) void {
 
     {
         const dll_test = b.addTest(.{ .root_module = dll_translator_module });
-        check_step.dependOn(&dll_test.step);
+        check_step.dependOn(&b.addRunArtifact(dll_test).step);
     }
 
     {
         const dyld_cache_test = b.addTest(.{ .root_module = dyld_cache_tree_module });
-        check_step.dependOn(&dyld_cache_test.step);
+        check_step.dependOn(&b.addRunArtifact(dyld_cache_test).step);
     }
 
     {
         const pseudo_kernel_cache_test = b.addTest(.{ .root_module = pseudo_kernel_cache_module });
-        check_step.dependOn(&pseudo_kernel_cache_test.step);
+        check_step.dependOn(&b.addRunArtifact(pseudo_kernel_cache_test).step);
     }
 
     {
         const pseudo_kernel_code_cache_table_test = b.addTest(.{ .root_module = pseudo_kernel_code_cache_table_module });
-        check_step.dependOn(&pseudo_kernel_code_cache_table_test.step);
+        check_step.dependOn(&b.addRunArtifact(pseudo_kernel_code_cache_table_test).step);
     }
 
     {
@@ -1793,7 +1799,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const transpiler_test = b.addTest(.{ .root_module = transpiler_mod });
-        check_step.dependOn(&transpiler_test.step);
+        check_step.dependOn(&b.addRunArtifact(transpiler_test).step);
 
         const transpiler_cli_mod = b.createModule(.{
             .root_source_file = b.path("../lib/transpiler/main.zig"),
