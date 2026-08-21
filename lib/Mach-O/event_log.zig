@@ -38,7 +38,12 @@ pub fn resetThreadFds() void {
 /// A line longer than the buffer is truncated with a marker rather than
 /// dropped: losing the tail of a diagnostic is recoverable, losing the fact
 /// that it fired is not.
-var capture_buffer: [8192]u8 = undefined;
+// Formatting is performed from translated guest threads as well as host/UI
+// callbacks. A process-global buffer lets one diagnostic overwrite another
+// between formatCapture and either write, producing the byte-interleaved
+// synchronization lines seen in Xenia logs. Keep the scratch storage with the
+// caller just like the per-thread file descriptors.
+threadlocal var capture_buffer: [8192]u8 = undefined;
 
 fn formatCapture(buffer: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.bufPrint(buffer, fmt, args) catch blk: {

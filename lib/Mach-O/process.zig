@@ -490,6 +490,11 @@ pub const MachOState = struct {
     jit_commit_count: u64 = 0,
     jit_export_count: u64 = 0,
     opaque_destructor_quarantines: u64 = 0,
+    /// NUL terminator stores skipped inside a zeroed `xe::StringBuffer` (see
+    /// `lib/diagnostics/null_write_recovery.zig`): the empty-buffer write is a
+    /// no-op and the buffer self-heals on next use, so the repair continues
+    /// the run instead of terminating on a debug-path cleanup.
+    string_buffer_null_write_repairs: u64 = 0,
     cooperative_starvation_warnings: u64 = 0,
     last_cooperative_starvation_step: u64 = 0,
     // A context's suspended_step predates the wait notification that may make
@@ -2014,9 +2019,12 @@ pub const MachOState = struct {
     pub const readMem128 = memory_access.readMem128;
     pub const writeMem128 = memory_access.writeMem128;
     pub const guestMemory = memory_access.guestMemory;
-    /// F3: bulk import routes (memcpy/memset/bzero/strcpy) write guest memory
+    pub const writeGuestBytes = memory_access.writeGuestBytes;
+    pub const fillGuestMemory = memory_access.fillGuestMemory;
+    /// Bulk import routes (memcpy/memset/bzero/strcpy) write guest memory
     /// directly through `guestMemory`, so they must announce the write for
-    /// decode-cache invalidation exactly as a scalar store does.
+    /// decode-cache invalidation and vtable ownership exactly as a scalar
+    /// store does.
     pub const noteGuestWrite = memory_access.noteGuestWrite;
     pub const guestMemoryConst = memory_access.guestMemoryConst;
     pub const guestAlloc = memory_access.guestAlloc;
@@ -4082,7 +4090,9 @@ pub const MachOState = struct {
         }
         if (!any_nonzero) return false;
         const destination = self.guestMemory(host, bytes_u64) orelse return false;
+        const mutation = self.captureMemoryMutation(host, bytes_u64);
         @memcpy(destination, scratch);
+        self.commitMemoryMutation(mutation, .bulk_copy);
         machoCapturePrint(
             "macho-processor: XENOS EDRAM resolve: target=0x{x} extent={d}x{d} bytes={d} source=stateful_color_target destination=guest_front_buffer\n",
             .{ host, swap.width, swap.height, bytes_len },
@@ -4966,9 +4976,7 @@ pub const MachOState = struct {
                         .writeGuestFn = struct {
                             fn write(ptr: *anyopaque, address: u64, data: []const u8) ?void {
                                 const inner_st: *MachOState = @ptrCast(@alignCast(ptr));
-                                const dest = inner_st.guestMemory(address, @intCast(data.len)) orelse return null;
-                                @memcpy(dest[0..data.len], data);
-                                return {};
+                                return if (inner_st.writeGuestBytes(address, data)) {} else null;
                             }
                         }.write,
                         .readCStringFn = struct {

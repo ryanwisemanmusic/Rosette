@@ -24,9 +24,11 @@ pub fn handleSyntheticRuntimeThunk(self: anytype) bool {
             if (source_end < source_begin) {
                 self.regs.rax = source_begin;
             } else if (self.guestMemory(source_begin, source_end - source_begin)) |bytes| {
+                const mutation = self.captureMemoryMutation(source_begin, source_end - source_begin);
                 for (bytes) |*byte| {
                     byte.* = if (thunk == .ctype_toupper_range) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
                 }
+                self.commitMemoryMutation(mutation, .bulk_copy);
                 self.regs.rax = source_end;
             } else {
                 self.regs.rax = source_begin;
@@ -37,14 +39,22 @@ pub fn handleSyntheticRuntimeThunk(self: anytype) bool {
             const count = source_end -| source_begin;
             const source = self.guestMemoryConst(source_begin, count);
             const destination = self.guestMemory(self.regs.rcx, count);
-            if (source != null and destination != null) std.mem.copyForwards(u8, destination.?, source.?);
+            if (source != null and destination != null) {
+                const mutation = self.captureMemoryMutation(self.regs.rcx, count);
+                std.mem.copyForwards(u8, destination.?, source.?);
+                self.commitMemoryMutation(mutation, .bulk_copy);
+            }
             self.regs.rax = source_end;
         },
         .ctype_narrow_range => {
             const count = source_end -| source_begin;
             const source = self.guestMemoryConst(source_begin, count);
             const destination = self.guestMemory(self.regs.r8, count);
-            if (source != null and destination != null) std.mem.copyForwards(u8, destination.?, source.?);
+            if (source != null and destination != null) {
+                const mutation = self.captureMemoryMutation(self.regs.r8, count);
+                std.mem.copyForwards(u8, destination.?, source.?);
+                self.commitMemoryMutation(mutation, .bulk_copy);
+            }
             self.regs.rax = source_end;
         },
         .locale_destroy => {
@@ -63,7 +73,7 @@ pub fn handleSyntheticRuntimeThunk(self: anytype) bool {
                     self.regs.rdx = 0;
                     return false;
                 };
-                if (self.guestMemory(empty, 1)) |b| b[0] = 0;
+                _ = self.fillGuestMemory(empty, 1, 0);
                 self.internal_targets.xmodule_empty_string = empty;
             }
             self.regs.rax = self.internal_targets.xmodule_empty_string;
