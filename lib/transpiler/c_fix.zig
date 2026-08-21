@@ -510,6 +510,35 @@ pub fn fixSource(allocator: std.mem.Allocator, source: []const u8) !FixResult {
 }
 
 pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_mode: bool) !FixResult {
+    return fixSourceWithOptions(allocator, source, cpp_mode, .{});
+}
+
+/// What the C++ pipeline is allowed to rewrite.
+pub const CppOptions = struct {
+    /// Convert `(T)x` to `static_cast`/`reinterpret_cast`, and rewrite
+    /// undefined `reinterpret_cast` forms.
+    ///
+    /// **Off by default, and it must stay off until the pass can tell a cast
+    /// from a type.** Its test for "this parenthesised group is a cast" is
+    /// positional, and C++ puts parenthesised type lists in places that are not
+    /// casts: `int (*)(DIR*)` is a function-pointer declarator and
+    /// `std::function<void(void*)>` is a template argument. It rewrote both,
+    /// producing `int (*)reinterpret_cast<DIR*>(>)` and
+    /// `std::function<voidreinterpret_cast<void*>(> callback)`, and stopped the
+    /// tree compiling. The compiler wrapper edits sources in place, so a bad
+    /// rewrite is not a failed build — it is a damaged working tree.
+    ///
+    /// The pass and its tests are kept because the transformation is wanted;
+    /// what is missing is a sound predicate for whether a `(` opens a cast.
+    cast_rewrites: bool = false,
+};
+
+pub fn fixSourceWithOptions(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    cpp_mode: bool,
+    cpp_options: CppOptions,
+) !FixResult {
     var tok = Tokenizer.init(source);
     var all_tokens: std.ArrayList(Token) = .empty;
     defer all_tokens.deinit(allocator);
@@ -540,8 +569,10 @@ pub fn fixSourceWithMode(allocator: std.mem.Allocator, source: []const u8, cpp_m
         // transpiler implements was dead code.
         try appendStaticCastVoidUnwrap(allocator, source, tokens, &edits);
         try appendFmtPointerCasts(allocator, source, tokens, &edits);
-        try appendOldStyleCastConversion(allocator, source, tokens, &edits);
-        try appendUndefinedReinterpretCast(allocator, source, tokens, &edits);
+        if (cpp_options.cast_rewrites) {
+            try appendOldStyleCastConversion(allocator, source, tokens, &edits);
+            try appendUndefinedReinterpretCast(allocator, source, tokens, &edits);
+        }
         return .{ .edits = edits, .warning = warning };
     }
     try appendBracketAttributeFixes(allocator, source, tokens, &edits, cpp_mode);
@@ -2860,7 +2891,15 @@ fn appendOldStyleCastConversion(
             prev_kind == .keyword_while or
             prev_kind == .keyword_switch or
             prev_kind == .keyword_for or
-            prev_kind == .keyword_return)
+            prev_kind == .keyword_return or
+            // A cast's opening parenthesis never follows a closing bracket.
+            // `int (*)(DIR*)` is a function-pointer type, not a cast of
+            // `DIR*`; rewriting it produced `int (*)reinterpret_cast<DIR*>(>)`
+            // and stopped the file compiling. The same guard covers a call
+            // through a parenthesized callee, `(*fn)(x)`, and a call through a
+            // subscript, `table[i](x)`.
+            prev_kind == .rparen or
+            prev_kind == .rbracket)
         {
             continue;
         }
@@ -3605,7 +3644,7 @@ test "logical-op-parentheses no wrap when already parenthesised" {
 
 test "old-style-cast int to float in cpp mode" {
     const src = "double x = (double)42;";
-    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    var result = try fixSourceWithOptions(std.testing.allocator, src, true, .{ .cast_rewrites = true });
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
@@ -3614,7 +3653,7 @@ test "old-style-cast int to float in cpp mode" {
 
 test "old-style-cast pointer cast in cpp mode" {
     const src = "void *p = (uint32_t *)ptr;";
-    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    var result = try fixSourceWithOptions(std.testing.allocator, src, true, .{ .cast_rewrites = true });
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);
@@ -3635,9 +3674,31 @@ test "old-style-cast does not touch function call parens" {
     try std.testing.expectEqual(@as(usize, 0), result.edits.items.len);
 }
 
+test "old-style-cast conversion leaves function pointer types alone" {
+    // The declarator that broke a real build: the parenthesised `(DIR*)` here
+    // is the parameter list of a function-pointer type, and the `(` before it
+    // closes `(*)`. Nothing whose opening parenthesis follows a closing bracket
+    // is a cast.
+    const src =
+        \\using DirHandle = std::unique_ptr<DIR, int (*)(DIR*)>;
+        \\void g(void) {
+        \\  int (*fn)(int) = nullptr;
+        \\  (*fn)(3);
+        \\}
+        \\
+    ;
+    var result = try fixSourceWithOptions(std.testing.allocator, src, true, .{ .cast_rewrites = true });
+    defer result.deinit(std.testing.allocator);
+    const output = try applyEdits(std.testing.allocator, src, result.edits.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "int (*)(DIR*)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "reinterpret_cast<DIR*>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "int (*fn)(int)") != null);
+}
+
 test "old-style-cast struct keyword cast" {
     const src = "struct Foo *p = (struct Foo *)ptr;";
-    var result = try fixSourceWithMode(std.testing.allocator, src, true);
+    var result = try fixSourceWithOptions(std.testing.allocator, src, true, .{ .cast_rewrites = true });
     defer result.deinit(std.testing.allocator);
     const output = try applyEdits(std.testing.allocator, src, result.edits.items);
     defer std.testing.allocator.free(output);

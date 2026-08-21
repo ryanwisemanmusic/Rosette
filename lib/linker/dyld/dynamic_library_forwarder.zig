@@ -338,6 +338,14 @@ const MAX_REAL_QUEUES = 64;
 /// a table that is too short is reported to the guest as truncation rather
 /// than silently trimmed.
 const MAX_HOST_DEVICE_EXTENSIONS = 256;
+/// Upper bound on a single surface enumeration the bridge can hand back.
+/// MoltenVK reports sixty surface formats for a Metal surface, so this has to
+/// clear that comfortably.
+const MAX_SURFACE_ENUMERATION: u32 = 128;
+/// How many swapchain images the bridge can name. A swapchain asks the driver
+/// for `minImageCount + 1` and can legitimately get more; the count advertised
+/// to the guest is clamped to this, and the fill then always satisfies it.
+const MAX_SWAPCHAIN_IMAGES: usize = 8;
 /// How many memory types the modelled adapter advertises when no real
 /// physical device has been queried. Every memoryTypeBits mask the modelled
 /// tier hands the guest has to stay inside this count.
@@ -351,7 +359,7 @@ const VulkanResourceKind = enum { image, buffer };
 const SwapchainRecord = struct {
     synthetic: u64 = 0,
     real: abi.SwapchainKHR = 0,
-    image_handles: [4]u64 = [_]u64{0} ** 4,
+    image_handles: [MAX_SWAPCHAIN_IMAGES]u64 = [_]u64{0} ** MAX_SWAPCHAIN_IMAGES,
     image_count: u32 = 0,
 };
 
@@ -1188,6 +1196,7 @@ pub const Forwarder = struct {
     /// or zero. Kept so a destroy call can be checked against what was
     /// actually issued.
     debug_messenger_handle: u64 = 0,
+    surface_enumeration_bound_reported: bool = false,
     // Rosette's own presentation path, independent of the guest's modelled
     // Vulkan objects. The guest calling vkQueuePresentKHR is a request; this is
     // what actually reaches the display.
@@ -1261,7 +1270,7 @@ pub const Forwarder = struct {
     scheduled_refresh_attempts: u64 = 0,
     scheduled_refresh_successes: u64 = 0,
     frame_source_absence_logged: ?rosette_gpu.FrameAbsence = null,
-    vulkan_swapchain_image_handles: [4]u64 = [_]u64{0} ** 4,
+    vulkan_swapchain_image_handles: [MAX_SWAPCHAIN_IMAGES]u64 = [_]u64{0} ** MAX_SWAPCHAIN_IMAGES,
     vulkan_swapchain_image_count: u32 = 0,
     /// Optional native pipeline-cache persistence. It is deliberately opt-in:
     /// the guest's cache objects remain authoritative unless the shell sets a
@@ -3971,36 +3980,75 @@ pub const Forwarder = struct {
         return 0;
     }
 
+    /// vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface,
+    /// pSurfaceFormatCount, pSurfaceFormats): the count is rdx, the array rcx.
+    ///
+    /// The probe reports at most what the fill can deliver, so a caller that
+    /// sizes its array from the probe always gets VK_SUCCESS back. Reporting
+    /// the driver's full count and then truncating the fill is not a partial
+    /// answer — it is a loop that never ends. The standard two-call idiom
+    /// resizes to the count it was handed, is told VK_INCOMPLETE for an array
+    /// that is exactly that size, and asks again with the same size forever.
+    /// MoltenVK reports sixty formats for a Metal surface against a bridge
+    /// table of sixteen, and Xenia's presenter span three billion interpreted
+    /// instructions in that loop without ever leaving it.
+    /// Clamp a driver enumeration to what the bridge's fixed table can return.
+    ///
+    /// Reported once per kind: a caller that sees a smaller list than the
+    /// driver has is a fact worth one line, and the alternative — telling the
+    /// guest the driver's count and then not delivering it — is what makes a
+    /// two-call enumeration loop forever.
+    fn boundSurfaceEnumeration(self: *Forwarder, driver_count: u32, kind: []const u8) u32 {
+        const bound: u32 = MAX_SURFACE_ENUMERATION;
+        if (driver_count <= bound) return driver_count;
+        if (!self.surface_enumeration_bound_reported) {
+            self.surface_enumeration_bound_reported = true;
+            machoCapturePrint(
+                "macho-processor: host reports {d} {s} but the bridge table holds {d}; the guest is told {d} so its enumeration terminates\n",
+                .{ driver_count, kind, bound, bound },
+            );
+        }
+        return bound;
+    }
+
     fn enumerateRealSurfaceFormats(self: *Forwarder, state: anytype) u64 {
         const count_address = state.regs.rdx;
         if (count_address == 0 or state.guestMemory(count_address, 4) == null) return vkErrorInitializationFailed();
         const get_proc = self.real_vulkan.get_instance_proc_addr orelse return vkErrorInitializationFailed();
         const address = get_proc(self.real_vulkan.instance orelse return vkErrorInitializationFailed(), "vkGetPhysicalDeviceSurfaceFormatsKHR") orelse return vkErrorInitializationFailed();
         const get_formats: abi.PfnGetPhysicalDeviceSurfaceFormatsKHR = @ptrCast(@alignCast(address));
-        var count: u32 = 0;
-        var result = get_formats(self.real_vulkan.physical_device orelse return vkErrorInitializationFailed(), self.real_vulkan.surface, &count, null);
+        const physical_device = self.real_vulkan.physical_device orelse return vkErrorInitializationFailed();
+        var formats: [MAX_SURFACE_ENUMERATION]abi.SurfaceFormatKHR = [_]abi.SurfaceFormatKHR{.{}} ** MAX_SURFACE_ENUMERATION;
+        var driver_count: u32 = 0;
+        var result = get_formats(physical_device, self.real_vulkan.surface, &driver_count, null);
         self.noteRealVulkanResult(result, "vkGetPhysicalDeviceSurfaceFormatsKHR");
         if (result != abi.SUCCESS and result != abi.INCOMPLETE) return @as(u32, @bitCast(result));
+        const available = self.boundSurfaceEnumeration(driver_count, "surface formats");
         if (state.regs.rcx == 0) {
-            state.write32(count_address, count);
-            return 0;
+            state.write32(count_address, available);
+            return @as(u32, @bitCast(abi.SUCCESS));
         }
-        const requested = state.read32(count_address);
-        const written: u32 = @min(@min(requested, count), 16);
-        if (written != 0 and state.guestMemory(state.regs.rcx, @as(u64, written) * @sizeOf(abi.SurfaceFormatKHR)) == null) return vkErrorInitializationFailed();
-        var formats: [16]abi.SurfaceFormatKHR = [_]abi.SurfaceFormatKHR{.{}} ** 16;
-        var host_count = written;
-        result = get_formats(self.real_vulkan.physical_device.?, self.real_vulkan.surface, &host_count, &formats);
-        self.noteRealVulkanResult(result, "vkGetPhysicalDeviceSurfaceFormatsKHR");
-        if (result != abi.SUCCESS and result != abi.INCOMPLETE) return @as(u32, @bitCast(result));
-        const actual = @min(@min(host_count, written), 16);
-        for (0..actual) |index| {
-            state.write32(state.regs.rcx + @as(u64, @intCast(index)) * 8, formats[index].format);
-            state.write32(state.regs.rcx + @as(u64, @intCast(index)) * 8 + 4, formats[index].color_space);
+        const capacity = state.read32(count_address);
+        const written: u32 = @min(capacity, available);
+        var actual: u32 = 0;
+        if (written != 0) {
+            var host_count = written;
+            result = get_formats(physical_device, self.real_vulkan.surface, &host_count, &formats);
+            self.noteRealVulkanResult(result, "vkGetPhysicalDeviceSurfaceFormatsKHR");
+            // VK_INCOMPLETE from the driver here only says it has more than
+            // the bridge asked for, which is what the bridge asked for.
+            if (result != abi.SUCCESS and result != abi.INCOMPLETE) return @as(u32, @bitCast(result));
+            actual = @min(host_count, written);
+            const span = @as(u64, actual) * @sizeOf(abi.SurfaceFormatKHR);
+            if (span != 0 and state.guestMemory(state.regs.rcx, span) == null) return vkErrorInitializationFailed();
+            for (0..actual) |index| {
+                state.write32(state.regs.rcx + @as(u64, @intCast(index)) * 8, formats[index].format);
+                state.write32(state.regs.rcx + @as(u64, @intCast(index)) * 8 + 4, formats[index].color_space);
+            }
         }
         state.write32(count_address, actual);
         self.vulkan_tiers.note(.surface_formats, .real);
-        return if (actual < requested or result == abi.INCOMPLETE) abi.INCOMPLETE else 0;
+        return @as(u32, @bitCast(if (actual < available) abi.INCOMPLETE else abi.SUCCESS));
     }
 
     fn enumerateRealSurfacePresentModes(self: *Forwarder, state: anytype) u64 {
@@ -4013,23 +4061,28 @@ pub const Forwarder = struct {
         var result = get_modes(self.real_vulkan.physical_device orelse return vkErrorInitializationFailed(), self.real_vulkan.surface, &count, null);
         self.noteRealVulkanResult(result, "vkGetPhysicalDeviceSurfacePresentModesKHR");
         if (result != abi.SUCCESS and result != abi.INCOMPLETE) return @as(u32, @bitCast(result));
+        const available = self.boundSurfaceEnumeration(count, "surface present modes");
         if (state.regs.rcx == 0) {
-            state.write32(count_address, count);
-            return 0;
+            state.write32(count_address, available);
+            return @as(u32, @bitCast(abi.SUCCESS));
         }
-        const requested = state.read32(count_address);
-        const written: u32 = @min(@min(requested, count), 16);
-        if (written != 0 and state.guestMemory(state.regs.rcx, @as(u64, written) * 4) == null) return vkErrorInitializationFailed();
-        var modes: [16]u32 = [_]u32{0} ** 16;
-        var host_count = written;
-        result = get_modes(self.real_vulkan.physical_device.?, self.real_vulkan.surface, &host_count, &modes);
-        self.noteRealVulkanResult(result, "vkGetPhysicalDeviceSurfacePresentModesKHR");
-        if (result != abi.SUCCESS and result != abi.INCOMPLETE) return @as(u32, @bitCast(result));
-        const actual = @min(@min(host_count, written), 16);
-        for (0..actual) |index| state.write32(state.regs.rcx + @as(u64, @intCast(index)) * 4, modes[index]);
+        const capacity = state.read32(count_address);
+        const written: u32 = @min(capacity, available);
+        var modes: [MAX_SURFACE_ENUMERATION]u32 = [_]u32{0} ** MAX_SURFACE_ENUMERATION;
+        var actual: u32 = 0;
+        if (written != 0) {
+            var host_count = written;
+            result = get_modes(self.real_vulkan.physical_device.?, self.real_vulkan.surface, &host_count, &modes);
+            self.noteRealVulkanResult(result, "vkGetPhysicalDeviceSurfacePresentModesKHR");
+            if (result != abi.SUCCESS and result != abi.INCOMPLETE) return @as(u32, @bitCast(result));
+            actual = @min(host_count, written);
+            const span = @as(u64, actual) * 4;
+            if (span != 0 and state.guestMemory(state.regs.rcx, span) == null) return vkErrorInitializationFailed();
+            for (0..actual) |index| state.write32(state.regs.rcx + @as(u64, @intCast(index)) * 4, modes[index]);
+        }
         state.write32(count_address, actual);
         self.vulkan_tiers.note(.surface_present_modes, .real);
-        return if (actual < requested or result == abi.INCOMPLETE) abi.INCOMPLETE else 0;
+        return @as(u32, @bitCast(if (actual < available) abi.INCOMPLETE else abi.SUCCESS));
     }
 
     fn writeRealSurfaceSupport(self: *Forwarder, state: anytype) u64 {
@@ -6547,10 +6600,10 @@ pub const Forwarder = struct {
                 self.vulkan_tiers.note(.swapchain, .real);
                 return 0;
             }
-            const requested = state.read32(count_address);
-            const written: u32 = @min(@min(requested, exposed_count), record.image_handles.len);
+            const capacity = state.read32(count_address);
+            const written: u32 = @min(@min(capacity, exposed_count), record.image_handles.len);
             if (written != 0 and state.guestMemory(state.regs.rcx, @as(u64, written) * 8) == null) return vkErrorInitializationFailed();
-            var real_images: [4]abi.Image = [_]abi.Image{0} ** 4;
+            var real_images: [MAX_SWAPCHAIN_IMAGES]abi.Image = [_]abi.Image{0} ** MAX_SWAPCHAIN_IMAGES;
             var driver_count = written;
             result = self.real_vulkan.fn_ptrs.get_swapchain_images.?(self.real_vulkan.device.?, real_swapchain, &driver_count, &real_images);
             self.noteRealVulkanResult(result, "vkGetSwapchainImagesKHR");
@@ -6569,7 +6622,12 @@ pub const Forwarder = struct {
             state.write32(count_address, actual);
             self.vulkan_swapchain_images_enumerated +|= actual;
             self.vulkan_tiers.note(.swapchain, .real);
-            return if (actual < requested or result == abi.INCOMPLETE) abi.INCOMPLETE else abi.SUCCESS;
+            // The driver's VK_INCOMPLETE only says it has more images than the
+            // bridge can name, and the probe already told the guest the smaller
+            // number. Reporting it here would tell a caller its correctly sized
+            // array was too small, and the standard two-call loop would ask
+            // again with the same size for the rest of the run.
+            return @as(u32, @bitCast(if (actual < exposed_count) abi.INCOMPLETE else abi.SUCCESS));
         }
 
         const count = if (self.vulkan_swapchain_image_count == 0) 3 else self.vulkan_swapchain_image_count;
@@ -10166,4 +10224,59 @@ test "the bridge capability chain links its nodes and then hands off to the gues
     var empty: BridgeCapabilityScratch = .{};
     try std.testing.expectEqual(@intFromPtr(&guest_node), @intFromPtr(spliceBridgeCapabilityChain(&empty, @ptrCast(&guest_node)).?));
     try std.testing.expect(spliceBridgeCapabilityChain(&empty, null) == null);
+}
+
+test "a caller's two-call enumeration loop terminates against the bridge contract" {
+    // The loop Xenia's presenter runs, verbatim in shape: probe with a null
+    // array, resize to the reported count, fill, and only stop on VK_SUCCESS.
+    // It has no iteration bound of its own, so the bridge's contract is the
+    // only thing that ends it — and when the bridge reported a count it then
+    // refused to deliver, the loop ran for three billion instructions.
+    const available = [_]abi.ExtensionProperties{
+        testExtensionProperty("VK_KHR_swapchain", 70),
+        testExtensionProperty("VK_KHR_portability_subset", 1),
+        testExtensionProperty("VK_KHR_maintenance1", 2),
+    };
+    var state = TestState{};
+    const count_address: u64 = 8;
+    const array_address: u64 = 64;
+
+    var reported: u32 = 0;
+    var iterations: usize = 0;
+    while (iterations < 8) : (iterations += 1) {
+        state.write32(count_address, reported);
+        const were_empty = reported == 0;
+        const result = writeExtensionPropertiesArray(
+            &state,
+            count_address,
+            if (were_empty) 0 else array_address,
+            &available,
+        );
+        reported = state.read32(count_address);
+        if (result == @as(u64, @as(u32, @bitCast(abi.SUCCESS)))) {
+            if (!were_empty or reported == 0) break;
+        } else if (result != @as(u64, @as(u32, @bitCast(abi.INCOMPLETE)))) {
+            break;
+        }
+    }
+    // Probe, then fill: two passes, and the second is the one that ends it.
+    try std.testing.expectEqual(@as(usize, 1), iterations);
+    try std.testing.expectEqual(@as(u32, available.len), reported);
+}
+
+test "a surface enumeration is bounded to what the fill can deliver" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    // Under the bound the driver's own count passes through untouched.
+    try std.testing.expectEqual(@as(u32, 2), forwarder.boundSurfaceEnumeration(2, "surface present modes"));
+    try std.testing.expectEqual(MAX_SURFACE_ENUMERATION, forwarder.boundSurfaceEnumeration(MAX_SURFACE_ENUMERATION, "surface formats"));
+    try std.testing.expect(!forwarder.surface_enumeration_bound_reported);
+
+    // Over it, the guest is told the number the bridge can actually fill —
+    // MoltenVK reports sixty surface formats for a Metal surface — and the
+    // truncation is reported once rather than per call.
+    try std.testing.expectEqual(MAX_SURFACE_ENUMERATION, forwarder.boundSurfaceEnumeration(4096, "surface formats"));
+    try std.testing.expect(forwarder.surface_enumeration_bound_reported);
+    try std.testing.expectEqual(MAX_SURFACE_ENUMERATION, forwarder.boundSurfaceEnumeration(4096, "surface formats"));
+    try std.testing.expect(MAX_SURFACE_ENUMERATION >= 60);
 }
