@@ -636,6 +636,65 @@ pub fn stringCompare(_: SlotIndex, ctx: *const PrimitiveContext) Result {
     return .handled;
 }
 
+/// Implements `std::basic_string<char>::rfind(char c, size_t pos) const` —
+/// the position of the last occurrence of `c` at or before `pos`, or `npos`
+/// (all ones) when absent.
+///
+/// The observed callers (`find_base_name_from_path`, `find_last_of`) both
+/// pass `pos = npos` and read the returned size_t straight into a compare
+/// against -1, so the value must be real: a fabricated 0 would make a path
+/// resolver believe its separator sits at index 0 and return a wrong base
+/// name. Unlike the sentry destructor, this primitive does dereference `this`
+/// (the string object and its data), so a near-null receiver must stay visible
+/// to the near-null predictor rather than be suppressed.
+/// ABI: rdi = this (const string*), rsi = c (char), rdx = pos (size_t).
+/// Returns size_t in rax.
+pub fn stringRFind(_: SlotIndex, ctx: *const PrimitiveContext) Result {
+    const this_ptr = ctx.readArg(0);
+    const ch = ctx.readArg(1) & 0xff;
+    const pos = ctx.readArg(2);
+    const npos: u64 = std.math.maxInt(u64);
+
+    if (this_ptr == 0) return .unsupported;
+    const header = ctx.readGuest(this_ptr, 24) orelse return .unsupported;
+
+    // libc++ basic_string<char> on x86_64, canonical layout:
+    //   long:  byte 0 LSB set  → __cap_ at 0..7, __size_ at 8..15, __data_
+    //          pointer at 16..23
+    //   short: byte 0 LSB clear → size = byte0 >> 1, data starts at this+1
+    const is_long = (header[0] & 1) == 1;
+    const string_len: u64 = if (is_long)
+        std.mem.readInt(u64, header[8..16], .little)
+    else
+        header[0] >> 1;
+    const data_ptr: u64 = if (is_long)
+        std.mem.readInt(u64, header[16..24], .little)
+    else
+        this_ptr + 1;
+
+    if (string_len == 0) {
+        ctx.setResult(npos);
+        return .handled;
+    }
+    if (data_ptr == 0) return .unsupported;
+
+    // A corrupt guest size or pointer fails the guest read and falls through
+    // to the caller's existing path, exactly as if the import were unresolved.
+    const bytes = ctx.readGuest(data_ptr, @intCast(string_len)) orelse return .unsupported;
+
+    var index = @min(pos, string_len - 1);
+    while (true) {
+        if (bytes[@intCast(index)] == ch) {
+            ctx.setResult(index);
+            return .handled;
+        }
+        if (index == 0) break;
+        index -= 1;
+    }
+    ctx.setResult(npos);
+    return .handled;
+}
+
 /// Implements `std::basic_ostream::sentry::sentry(basic_ostream&)` —
 /// constructs a sentry object that checks the stream state and flushes
 /// tied streams. For emulation, we just mark the sentry as OK.
@@ -1057,6 +1116,94 @@ test "handlers: bsearch returns the matching guest element or null" {
     std.mem.writeInt(u32, state.memory[4..8], 7, .little);
     try std.testing.expectEqual(Result.handled, bsearch(0, &ctx));
     try std.testing.expectEqual(@as(u64, 0), state.result);
+}
+
+test "handlers: stringRFind returns the last char position at or before pos, or npos" {
+    const TestState = struct {
+        args: [6]u64 = .{0} ** 6,
+        result: u64 = 0,
+        memory: [256]u8 = [_]u8{0} ** 256,
+
+        fn readArg(ptr: *anyopaque, index: u8) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (index < 6) self.args[index] else 0;
+        }
+        fn setResult(ptr: *anyopaque, value: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = value;
+        }
+        fn readGuest(ptr: *const anyopaque, address: u64, size_bytes: usize) ?[]const u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            const start: usize = @intCast(address);
+            const end = std.math.add(usize, start, size_bytes) catch return null;
+            if (end > self.memory.len) return null;
+            return self.memory[start..end];
+        }
+        fn writeGuest(_: *anyopaque, _: u64, _: []const u8) ?void {
+            return null;
+        }
+        fn readCString(_: *const anyopaque, _: u64) ?[]const u8 {
+            return null;
+        }
+        fn callGuest(_: *anyopaque, _: u64, _: [6]u64) u64 {
+            return 0;
+        }
+    };
+
+    var state = TestState{};
+    const ctx = PrimitiveContext{
+        .ptr = &state,
+        .readArgFn = TestState.readArg,
+        .setResultFn = TestState.setResult,
+        .readGuestFn = TestState.readGuest,
+        .writeGuestFn = TestState.writeGuest,
+        .readCStringFn = TestState.readCString,
+        .callGuestFn = TestState.callGuest,
+    };
+
+    // Short-string object at offset 16: byte0 = size << 1, data at this+1.
+    // "hello" → byte0 = 10, inline bytes "hello".
+    state.memory[16] = 10;
+    @memcpy(state.memory[17..22], "hello");
+    state.args = .{ 16, 'l', std.math.maxInt(u64), 0, 0, 0 };
+    try std.testing.expectEqual(Result.handled, stringRFind(0, &ctx));
+    try std.testing.expectEqual(@as(u64, 3), state.result);
+
+    // rfind('h', 0) — the char exists only at index 0.
+    state.args = .{ 16, 'h', 0, 0, 0, 0 };
+    try std.testing.expectEqual(Result.handled, stringRFind(0, &ctx));
+    try std.testing.expectEqual(@as(u64, 0), state.result);
+
+    // rfind('o', 1) — 'o' sits at index 4, beyond the clamped position.
+    state.args = .{ 16, 'o', 1, 0, 0, 0 };
+    try std.testing.expectEqual(Result.handled, stringRFind(0, &ctx));
+    try std.testing.expectEqual(std.math.maxInt(u64), state.result);
+
+    // Absent char → npos (all ones), the value callers compare against -1.
+    state.args = .{ 16, 'x', std.math.maxInt(u64), 0, 0, 0 };
+    try std.testing.expectEqual(Result.handled, stringRFind(0, &ctx));
+    try std.testing.expectEqual(std.math.maxInt(u64), state.result);
+
+    // Long-string object: byte0 LSB set (capacity marker), size at 8..15,
+    // data pointer at 16..23. Data lives at offset 64.
+    state.memory[32] = 1;
+    std.mem.writeInt(u64, state.memory[40..48], 11, .little);
+    std.mem.writeInt(u64, state.memory[48..56], 64, .little);
+    @memcpy(state.memory[64..75], "hello world");
+    state.args = .{ 32, 'o', std.math.maxInt(u64), 0, 0, 0 };
+    try std.testing.expectEqual(Result.handled, stringRFind(0, &ctx));
+    try std.testing.expectEqual(@as(u64, 7), state.result);
+
+    // Empty string → npos without touching data.
+    state.memory[80] = 0;
+    state.args = .{ 80, 'a', std.math.maxInt(u64), 0, 0, 0 };
+    try std.testing.expectEqual(Result.handled, stringRFind(0, &ctx));
+    try std.testing.expectEqual(std.math.maxInt(u64), state.result);
+
+    // Unreadable receiver stays visible to the near-null predictor: the
+    // handler must refuse rather than fabricate a position.
+    state.args = .{ 0, 'a', 0, 0, 0, 0 };
+    try std.testing.expectEqual(Result.unsupported, stringRFind(0, &ctx));
 }
 
 test "handlers: sentry destructor is a no-op void handler that never dereferences the receiver" {

@@ -76,6 +76,14 @@ const builtin_primitives = [_]PrimitiveDef{
     .{ .name_pattern = "strtol", .handler = @import("handlers.zig").strtol },
     .{ .name_pattern = "_abs", .handler = @import("handlers.zig").absInt },
     .{ .name_pattern = "compareEmmPKc", .handler = @import("handlers.zig").stringCompare },
+    // basic_string<char>::rfind(char, size_t) const — the trailing `Ecm` pins
+    // it to the char overload (rfind(const char*, size_t, size_t) and the
+    // string_view overload have different encodings), and the `allocatorIcEEE`
+    // prefix pins it to basic_string rather than basic_string_view, whose
+    // layout is a bare {data, size} and must not be read as an SSO object.
+    // The `B7v160006` spelling is the version-tagged export.
+    .{ .name_pattern = "allocatorIcEEE5rfindEcm", .handler = @import("handlers.zig").stringRFind },
+    .{ .name_pattern = "allocatorIcEEE5rfindB7v160006Ecm", .handler = @import("handlers.zig").stringRFind },
     .{ .name_pattern = "sentryC1ERS3_", .handler = @import("handlers.zig").sentryC1 },
     // basic_ostream::sentry::~sentry() — D0 (deleting), D1 (complete object)
     // and D2 (base object) destructors. Pattern stops at `sentryD` so the
@@ -109,6 +117,13 @@ test "registry: match symbol by pattern" {
     try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD0Ev") != null);
     try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1B7v160006Ev") != null);
     try std.testing.expect(reg.matchSymbol("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_") != null);
+    // basic_string<char>::rfind(char, size_t) — both the plain and
+    // version-tagged spellings resolve through the primitive library, and the
+    // basic_string_view overload (whose layout is a bare {data, size} and must
+    // not be read as an SSO object) stays unmatched.
+    try std.testing.expect(reg.matchSymbol("__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm") != null);
+    try std.testing.expect(reg.matchSymbol("__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindB7v160006Ecm") != null);
+    try std.testing.expect(reg.matchSymbol("__ZNKSt3__117basic_string_viewIcNSt11char_traitsIcEEE5rfindEcm") == null);
     try std.testing.expect(reg.matchSymbol("_sysctlbyname") == null);
     try std.testing.expect(reg.matchSymbol("_unknown_function") == null);
 }
