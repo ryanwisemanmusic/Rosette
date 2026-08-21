@@ -30,6 +30,42 @@ pub const NeonMirrorShape = struct {
     neon_has_assembly: bool,
 };
 
+pub const PpcTableShape = struct {
+    name: []const u8,
+    mnemonic: []const u8,
+    category: []const u8,
+    form: []const u8,
+    handler: []const u8,
+    jit_lowering: []const u8,
+    source_path: []const u8,
+    encoding_count: usize,
+    primary_opcode: u8,
+    has_semantic: bool,
+    has_registers: bool,
+    has_condition_model: bool,
+};
+
+pub const PpcNeonMirrorShape = struct {
+    ppc_path: []const u8,
+    neon_path: []const u8,
+    declared_ppc_table: []const u8,
+    ppc_name: []const u8,
+    neon_name: []const u8,
+    ppc_lowering: []const u8,
+    neon_lowering: []const u8,
+    ppc_encoding_count: usize,
+    neon_encoding_count: usize,
+    ppc_has_semantic: bool,
+    neon_has_semantic: bool,
+    ppc_has_registers: bool,
+    neon_has_registers: bool,
+    ppc_has_condition_model: bool,
+    neon_has_condition_model: bool,
+    neon_has_register_model: bool,
+    neon_has_flag_model: bool,
+    neon_has_assembly: bool,
+};
+
 pub const NeonLoweringShape = struct {
     name: []const u8,
     jit_lowering: []const u8,
@@ -157,6 +193,83 @@ pub fn validateNeonLowering(shape: NeonLoweringShape) void {
         common.violation("isa-neon", "assembly_shape", "name={s} lowering={s} assembly template lacks ARM64/NEON opcodes", .{ shape.name, shape.jit_lowering });
 }
 
+pub fn validatePpcTable(shape: PpcTableShape) void {
+    common.noteValidation();
+    if (shape.name.len == 0)
+        common.violation("isa-ppc", "missing_name", "table={s} has no instruction name", .{shape.source_path});
+    if (shape.mnemonic.len == 0)
+        common.violation("isa-ppc", "missing_mnemonic", "table={s} name={s} has no assembler mnemonic", .{ shape.source_path, shape.name });
+    if (shape.category.len == 0 or isPlaceholder(shape.category))
+        common.violation("isa-ppc", "missing_category", "table={s} name={s} has no category", .{ shape.source_path, shape.name });
+    if (shape.form.len == 0 or isPlaceholder(shape.form))
+        common.violation("isa-ppc", "missing_form", "table={s} name={s} has no PowerPC instruction form", .{ shape.source_path, shape.name });
+    if (shape.primary_opcode > 63)
+        common.violation("isa-ppc", "bad_primary_opcode", "table={s} name={s} primary opcode {d} is outside 0..63", .{ shape.source_path, shape.name, shape.primary_opcode });
+    if (shape.handler.len == 0)
+        common.violation("isa-ppc", "missing_handler", "table={s} name={s} has no PPC handler", .{ shape.source_path, shape.name });
+    if (shape.jit_lowering.len == 0)
+        common.violation("isa-ppc", "missing_lowering", "table={s} name={s} has no jit_lowering", .{ shape.source_path, shape.name });
+    if (shape.encoding_count == 0)
+        common.violation("isa-ppc", "missing_encodings", "table={s} name={s} has no encodings", .{ shape.source_path, shape.name });
+    if (!shape.has_semantic)
+        common.violation("isa-ppc", "missing_semantic", "table={s} name={s} has no semantic block", .{ shape.source_path, shape.name });
+    if (!shape.has_registers)
+        common.violation("isa-ppc", "missing_registers", "table={s} name={s} has no read/write register contract", .{ shape.source_path, shape.name });
+    if (!shape.has_condition_model)
+        common.violation("isa-ppc", "missing_condition_model", "table={s} name={s} has no CR/XER/FPSCR/VSCR contract", .{ shape.source_path, shape.name });
+}
+
+pub fn validatePpcMirrorTableCounts(ppc_count: usize, neon_count: usize) void {
+    common.noteValidation();
+    if (ppc_count != neon_count)
+        common.violation("isa-ppc-neon", "mirror_count", "PPC table count {d} differs from NEON mirror count {d}", .{ ppc_count, neon_count });
+}
+
+pub fn validateMissingPpcNeonMirror(ppc_path: []const u8) void {
+    common.noteValidation();
+    common.violation("isa-ppc-neon", "missing_mirror", "PPC table {s} has no ARM64/NEON mirror table", .{ppc_path});
+}
+
+pub fn validatePpcNeonMirror(shape: PpcNeonMirrorShape) void {
+    common.noteValidation();
+    if (!samePathLeaf(shape.ppc_path, shape.neon_path))
+        common.violation("isa-ppc-neon", "mirror_path", "ppc={s} neon={s} do not mirror the same instruction folder/name", .{ shape.ppc_path, shape.neon_path });
+    if (!samePathLeaf(shape.ppc_path, shape.declared_ppc_table))
+        common.violation("isa-ppc-neon", "declared_ppc_table", "neon={s} declares ppc_table={s}, expected {s}", .{ shape.neon_path, shape.declared_ppc_table, shape.ppc_path });
+    if (!asciiEql(shape.ppc_name, shape.neon_name))
+        common.violation("isa-ppc-neon", "mirror_name", "ppc={s} neon={s} names differ ({s} vs {s})", .{ shape.ppc_path, shape.neon_path, shape.ppc_name, shape.neon_name });
+    if (!asciiEql(shape.ppc_lowering, shape.neon_lowering))
+        common.violation("isa-ppc-neon", "lowering_tag", "ppc={s} neon={s} lowering tags differ ({s} vs {s})", .{ shape.ppc_path, shape.neon_path, shape.ppc_lowering, shape.neon_lowering });
+    if (shape.ppc_encoding_count != shape.neon_encoding_count)
+        common.violation("isa-ppc-neon", "encoding_scope", "ppc={s} neon={s} encoding rows differ ({d} vs {d})", .{ shape.ppc_path, shape.neon_path, shape.ppc_encoding_count, shape.neon_encoding_count });
+    if (shape.ppc_has_semantic and !shape.neon_has_semantic)
+        common.violation("isa-ppc-neon", "semantic_scope", "neon={s} dropped the PPC semantic contract", .{shape.neon_path});
+    if (shape.ppc_has_registers and !shape.neon_has_registers)
+        common.violation("isa-ppc-neon", "register_scope", "neon={s} dropped the PPC read/write register contract", .{shape.neon_path});
+    if (shape.ppc_has_condition_model and !shape.neon_has_condition_model)
+        common.violation("isa-ppc-neon", "condition_scope", "neon={s} dropped the PPC CR/XER/FPSCR/VSCR contract", .{shape.neon_path});
+    if (!shape.neon_has_register_model)
+        common.violation("isa-ppc-neon", "register_model", "neon={s} has no ARM64/NEON register model", .{shape.neon_path});
+    if (!shape.neon_has_flag_model)
+        common.violation("isa-ppc-neon", "flag_model", "neon={s} has no ARM64/NEON condition model", .{shape.neon_path});
+    if (!shape.neon_has_assembly)
+        common.violation("isa-ppc-neon", "assembly_contract", "neon={s} has no ARM64/NEON assembly contract", .{shape.neon_path});
+}
+
+pub fn validatePpcNeonLowering(shape: NeonLoweringShape) void {
+    common.noteValidation();
+    if (shape.jit_lowering.len == 0)
+        common.violation("isa-ppc-neon", "empty_lowering_tag", "name={s} has no lowering tag", .{shape.name});
+    if (shape.kind.len == 0)
+        common.violation("isa-ppc-neon", "empty_lowering_kind", "name={s} lowering={s} has no lowering kind", .{ shape.name, shape.jit_lowering });
+    if (shape.assembly.len == 0)
+        common.violation("isa-ppc-neon", "empty_assembly", "name={s} lowering={s} has no assembly or fallback body", .{ shape.name, shape.jit_lowering });
+    if (shape.can_lower and !looksLikePpcArm64Assembly(shape.assembly))
+        common.violation("isa-ppc-neon", "assembly_shape", "name={s} lowering={s} assembly template lacks ARM64/NEON opcodes", .{ shape.name, shape.jit_lowering });
+    if (!shape.can_lower and !contains(shape.assembly, "bl "))
+        common.violation("isa-ppc-neon", "empty_fallback", "name={s} lowering={s} fallback does not call a Rosette helper", .{ shape.name, shape.jit_lowering });
+}
+
 pub fn validateMathSpec(shape: MathSpecShape) void {
     common.noteValidation();
     if (shape.target_isa.len == 0)
@@ -215,6 +328,28 @@ pub fn validateMathProofSet(shape: MathProofSetShape) void {
         common.violation("isa-math-proof", "missing_operation", "instruction={s} path={s} has no proof-set operation", .{ shape.instruction_name, shape.path });
     if (shape.proof_case_count < 2)
         common.violation("isa-math-proof", "thin_proof_set", "instruction={s} path={s} has only {d} hardcoded proof cases", .{ shape.instruction_name, shape.path, shape.proof_case_count });
+}
+
+fn looksLikePpcArm64Assembly(assembly: []const u8) bool {
+    const opcodes = [_][]const u8{
+        "add",     "adc",   "sub",     "sbc",   "neg",    "mul",    "smull", "umull",
+        "smulh",   "umulh", "sdiv",    "udiv",  "and",    "orr",    "orn",   "eor",
+        "eon",     "bic",   "mvn",     "lsl",   "lsr",    "asr",    "ror",   "bfi",
+        "ubfx",    "sxt",   "clz",     "rev",   "cmp",    "cset",   "csel",  "ldr",
+        "str",     "ldax",  "stlx",    "prfm",  "dmb",    "dsb",    "isb",   "dc ",
+        "ic ",     "fadd",  "fsub",    "fmul",  "fdiv",   "fsqrt",  "fmadd", "fmsub",
+        "fneg",    "fabs",  "fmov",    "fcvt",  "fcmp",   "fcsel",  "frint", "frecpe",
+        "frsqrte", "scvtf", "ucvtf",   "movi",  "dup",    "ext",    "tbl",   "zip",
+        "xtn",     "sqxtn", "uqxtn",   "sshll", "cmeq",   "cmhi",   "cmgt",  "cmhs",
+        "cmge",    "bsl",   "fmla",    "fmls",  "fmax",   "fmin",   "smax",  "smin",
+        "umax",    "umin",  "ushl",    "sshl",  "urhadd", "srhadd", "uqadd", "sqadd",
+        "uqsub",   "sqsub", "sqdmulh", "ld1",   "st1",    "mrs",    "msr",   "b.",
+        "br ",     "blr",   "b #",     "mov",
+    };
+    for (opcodes) |opcode| {
+        if (contains(assembly, opcode)) return true;
+    }
+    return false;
 }
 
 fn isPlaceholder(value: []const u8) bool {
@@ -292,5 +427,25 @@ test "ISA ABI lowering validator accepts ARM64 skeleton" {
         .kind = "neon_vector",
         .assembly = "fadd vD.4s, vN.4s, vM.4s",
         .can_lower = true,
+    });
+}
+
+test "ISA ABI PPC validator accepts a scalar lowering" {
+    validatePpcNeonLowering(.{
+        .name = "addx",
+        .jit_lowering = "arm64_ppc_addx",
+        .kind = "arm64_scalar",
+        .assembly = "add xD, xA, xB",
+        .can_lower = true,
+    });
+}
+
+test "ISA ABI PPC validator accepts a helper fallback" {
+    validatePpcNeonLowering(.{
+        .name = "vmsumubm",
+        .jit_lowering = "arm64_ppc_vmsumubm_helper",
+        .kind = "fallback",
+        .assembly = "bl rosette_ppc_vmsum",
+        .can_lower = false,
     });
 }
