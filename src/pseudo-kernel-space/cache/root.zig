@@ -339,11 +339,17 @@ test "budget pressure evicts cold unpinned blocks" {
     });
     defer cache.deinit();
 
-    const cold = try cache.registerMachOBlock(0x1000, 400 * system_defines.KiB, 0x8000, 400 * system_defines.KiB, 0);
-    const hot = try cache.registerMachOBlock(0x3000, 400 * system_defines.KiB, 0xA000, 400 * system_defines.KiB, 0);
+    // A 1 MiB software-L3 target leaves 640 KiB for Mach-O blocks once the
+    // IBTC and dyld tables take their share, so the block size has to let two
+    // blocks coexist and three not. At 400 KiB each, no two blocks fit and the
+    // hot block was evicted right behind the cold one — the policy was doing
+    // exactly what it should with a fixture that could not express the case.
+    const block_bytes = 300 * system_defines.KiB;
+    const cold = try cache.registerMachOBlock(0x1000, block_bytes, 0x8000, block_bytes, 0);
+    const hot = try cache.registerMachOBlock(0x3000, block_bytes, 0xA000, block_bytes, 0);
     cache.touchMachOBlock(hot);
 
-    _ = try cache.registerMachOBlock(0x5000, 400 * system_defines.KiB, 0xC000, 400 * system_defines.KiB, 0);
+    _ = try cache.registerMachOBlock(0x5000, block_bytes, 0xC000, block_bytes, 0);
 
     try std.testing.expect(cache.blocks.get(cold) == null);
     try std.testing.expect(cache.blocks.get(hot) != null);

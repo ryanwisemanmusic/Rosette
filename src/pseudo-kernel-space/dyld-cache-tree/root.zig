@@ -112,7 +112,15 @@ pub const RadixTree = struct {
         if (count == 0) return null;
         for (0..count) |i| {
             if (node.keys[i] == key) {
-                return @atomicLoad(u64, &node.children[i], .acquire);
+                const child = @atomicLoad(u64, &node.children[i], .acquire);
+                // A zero child is an empty slot, which is how `remove` leaves
+                // one and what `freeNodeRecursive` has always assumed. Handing
+                // it back as a found child made every caller build a pointer
+                // from zero: `lookup` and `insert` both dereference it, so a
+                // removed key whose nibble is zero crashed the next lookup
+                // rather than reporting a miss.
+                if (child == 0) return null;
+                return child;
             }
         }
         return null;
@@ -129,7 +137,10 @@ pub const RadixTree = struct {
         }
         @atomicStore(u8, &node.keys[count], key, .release);
         @atomicStore(u64, &node.children[count], child, .release);
-        _ = @cmpxchgWeak(u8, &node.count, count, count + 1, .release, .monotonic);
+        // A weak compare-exchange may fail spuriously, and the result was
+        // discarded: the slot would be written and then never published,
+        // making the child permanently invisible to `findChild`.
+        _ = @cmpxchgStrong(u8, &node.count, count, count + 1, .release, .monotonic);
     }
 
     pub fn lookup(self: *RadixTree, guest_pc: u64) ?*TranslationEntry {
@@ -202,11 +213,17 @@ pub const RadixTree = struct {
         const count = @atomicLoad(u8, &node.count, .acquire);
         for (0..count) |i| {
             if (node.keys[i] == leaf_nibble) {
-                const entry = @as(*TranslationEntry, @ptrFromInt(node.children[i]));
+                const child = @atomicLoad(u64, &node.children[i], .acquire);
+                if (child == 0) return;
+                const entry = @as(*TranslationEntry, @ptrFromInt(child));
+                // Empty the slot but keep its key, so a later insert of the
+                // same nibble reuses it instead of appending a second slot for
+                // a key this node already lists.
                 @atomicStore(u64, &node.children[i], 0, .release);
-                @atomicStore(u8, &node.keys[i], 0, .release);
-                const entry_slice: []TranslationEntry = @ptrCast(@as([*]TranslationEntry, @ptrCast(entry))[0..1]);
-                self.allocator.free(entry_slice);
+                // Allocated with `create`; `deinit` frees it with `destroy`.
+                // Re-deriving a slice to hand to `free` describes a different
+                // allocation than the one that was made.
+                self.allocator.destroy(entry);
                 _ = @atomicRmw(u64, &self.entry_count, .Sub, 1, .monotonic);
                 return;
             }
