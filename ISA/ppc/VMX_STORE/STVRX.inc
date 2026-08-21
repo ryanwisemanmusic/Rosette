@@ -1,0 +1,38 @@
+// VMX_STORE/STVRX.inc
+
+// Canonical table metadata for registry-wide .inc validation.
+operand_encoding = [
+  { op_en = "X", operand_1 = "VR[VS]", operand_2 = "GPR[RA] or 0", operand_3 = "GPR[RB]", operand_4 = "N/A" },
+]
+
+source_isa = "ppc"
+name = "stvrx"
+mnemonic = "stvrx"
+category = "vector_store"
+operation = "MEM128[EA & ~15] = vS"
+
+form = "X"
+primary_opcode = 31
+opcode_pattern = "0x7c00054e"
+opcode_mask = "0xfc0007fe"
+instruction_length = 4
+byte_order = "big_endian"
+
+encodings = [
+  { opcode = "0x7c00054e", form = "stvrx [VS], [RA0], [RB]", op_en = "X" }
+]
+
+reads = ["VR[VS]", "GPR[RA]", "GPR[RB]"]
+writes = ["MEM"]
+flags_written = ["none"]
+special_registers = ["VSCR"]
+
+semantic = """
+EA <- ((rA|0) + (rB)) & ~15
+MEM(EA, 16) <- (vS)
+the word lanes are byte-reversed on a little-endian host
+"""
+
+handler = "ppc_stvrx"
+jit_lowering = "arm64_ppc_stvrx"
+
