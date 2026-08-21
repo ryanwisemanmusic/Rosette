@@ -22,6 +22,7 @@ const pointer_firewall = @import("dyld").pointer_firewall;
 const semantic_fault_classifier = @import("diagnostics").semantic_fault_classifier;
 const zero_adjudication = @import("diagnostics").zero_adjudication;
 const opaque_lifetime_recovery = @import("diagnostics").opaque_lifetime_recovery;
+const null_write_recovery = @import("diagnostics").null_write_recovery;
 const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const vt = @import("vtable");
 const guest_log = @import("guest_log.zig");
@@ -5072,6 +5073,7 @@ pub fn ensureGuestAccess(self: anytype, address: u64, bytes: u8, access: GuestAc
 pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) void {
     if (self.terminal_memory_failure != null) return;
     if (tryQuarantineOpaqueDestructor(self, address)) return;
+    if (tryRepairStringBufferNullTerminator(self, address, bytes, access)) return;
     const description = describeGuestAccess(self, address, bytes, access);
     if (access != .execute and description.mapped and !description.allowed) {
         if (self.sparse_memory.containsMapped(address, bytes)) {
@@ -5299,6 +5301,61 @@ pub fn tryQuarantineOpaqueDestructor(self: anytype, address: u64) bool {
     machoCapturePrint(
         "macho-processor: opaque lifetime quarantine #{d}: destructor={s} this=0x{x} owner={s} restored_caller=0x{x} via={s}; skipped invalid guest cleanup without dereferencing API identity\n",
         .{ self.opaque_destructor_quarantines, symbol.name, address, policy.owner, return_address, restored_via },
+    );
+    return true;
+}
+
+/// Repair the empty-buffer NUL terminator of a zeroed `xe::StringBuffer`.
+///
+/// `StringBuffer::Reset()` ends with `buffer_[0] = 0`. When the object's
+/// backing pointer member reads zero (the bypassing bulk-writer family the
+/// object-header clobbers document), that store lands on the zero page and the
+/// run would terminate inside a debug-path cleanup (`ResetScope` in
+/// `PPCTranslator::Translate`). The store is a no-op the guest can never
+/// observe — the buffer is empty either way and self-heals on next use
+/// (`Grow()`'s `realloc(NULL, …)` behaves as `malloc`) — so skipping it
+/// leaves the object in exactly the state the method is producing. The
+/// envelope is pinned to `StringBuffer` + a zero byte + the `mov_mem8_imm8`
+/// shape by `null_write_recovery`; anything else still terminates with full
+/// diagnostics.
+fn tryRepairStringBufferNullTerminator(self: anytype, address: u64, bytes: u8, access: GuestAccess) bool {
+    const fault_rip = self.regs.rip;
+    const symbol = self.metadata.nearestSymbol(fault_rip) orelse return false;
+    const source: []const u8 = if (self.sparse_memory.executableBytesConst(fault_rip, 16)) |sparse_code|
+        sparse_code
+    else blk: {
+        const offset = translateGuest(self, fault_rip, 1, .execute) orelse return false;
+        if (offset >= self.mem.len) return false;
+        break :blk self.mem[@intCast(offset)..][0..@min(@as(usize, 16), self.mem.len - @as(usize, @intCast(offset)))];
+    };
+    if (source.len == 0) return false;
+    const decoded = decodeInsn(source);
+    if (decoded.len == 0) return false;
+    if (!null_write_recovery.isStringBufferNullTerminator(
+        symbol.name,
+        @tagName(decoded.op),
+        decoded.imm,
+        address,
+        bytes,
+        access == .write,
+    )) return false;
+
+    // Skip the store: the terminator write is the no-op, and the rest of the
+    // method (its epilogue) completes normally with `buffer_offset_` already
+    // cleared by the store that executed before the fault.
+    self.regs.rip +%= decoded.len;
+    self.string_buffer_null_write_repairs +|= 1;
+    machoCapturePrint(
+        "macho-processor: NEAR-NULL REPAIR #{d}: StringBuffer null-buffer NUL terminator skipped rip=0x{x} symbol={s} this(rdi)=0x{x} address=0x{x} bytes={d} step={d}; the backing buffer member reads zero — the same bypassing bulk-writer family as the object-header clobbers — and the empty-buffer write is a no-op the guest cannot observe, so the run continues with the write omitted\n",
+        .{
+            self.string_buffer_null_write_repairs,
+            fault_rip,
+            symbol.name,
+            self.regs.rdi,
+            address,
+            bytes,
+            self.executed_steps,
+        },
     );
     return true;
 }
@@ -5580,6 +5637,35 @@ pub fn guestMemory(self: anytype, addr: u64, count: u64) ?[]u8 {
     return self.mem[off_usize .. off_usize + count_usize];
 }
 
+/// Copy host-owned bytes into guest memory while preserving the complete
+/// ranged-mutation contract. `guestMemory` deliberately returns a mutable
+/// slice for callers that need to perform structured writes, but a raw
+/// `@memcpy` after that call otherwise bypasses vtable ownership tracking and
+/// write provenance. Keep byte-oriented bridge writes on this path so a bulk
+/// overwrite of a live guest object cannot be mistaken for an unexplained
+/// alias-coherence failure later.
+pub fn writeGuestBytes(self: anytype, addr: u64, bytes: []const u8) bool {
+    if (bytes.len == 0) return true;
+    const count: u64 = @intCast(bytes.len);
+    const destination = guestMemory(self, addr, count) orelse return false;
+    const mutation = captureMemoryMutation(self, addr, count);
+    @memcpy(destination, bytes);
+    commitMemoryMutation(self, mutation, .bulk_copy);
+    return true;
+}
+
+/// Fill guest memory through the same ownership/provenance boundary as a
+/// scalar or vector store. This is used by allocator and compatibility shims
+/// that initialize guest-side C++ objects without executing guest memset.
+pub fn fillGuestMemory(self: anytype, addr: u64, count: u64, value: u8) bool {
+    if (count == 0) return true;
+    const destination = guestMemory(self, addr, count) orelse return false;
+    const mutation = captureMemoryMutation(self, addr, count);
+    @memset(destination, value);
+    commitMemoryMutation(self, mutation, .bulk_fill);
+    return true;
+}
+
 pub fn noteGuestWrite(self: anytype, address: u64, count: u64) void {
     if (count == 0) return;
     const end = address +| count;
@@ -5688,7 +5774,9 @@ pub fn guestAlloc(self: anytype, requested_size: u64, alignment: u64) ?u64 {
     const stack_floor = self.mem_base + self.mem_size -| self.stack_size;
     if (end > stack_floor) return null;
     const storage = guestMemory(self, start, size) orelse return null;
+    const mutation = captureMemoryMutation(self, start, size);
     @memset(storage, 0);
+    commitMemoryMutation(self, mutation, .bulk_fill);
     self.heap_next = end;
     _ = self.memory_regions.register(start, size, .{}, .guest_heap, "guestAlloc", self.regs.rip);
     _ = self.pointer_firewall.register(start, size, .{ .kind = .owned_guest, .may_dereference = true, .owner = "guestAlloc" });
@@ -6156,9 +6244,12 @@ pub fn cxxExceptionMessage(self: anytype, object_address: u64) ?[]const u8 {
 }
 
 pub fn guestWriteCString(self: anytype, addr: u64, bytes: []const u8) bool {
-    if (guestMemory(self, addr, bytes.len + 1)) |buf| {
+    const count = std.math.add(usize, bytes.len, 1) catch return false;
+    if (guestMemory(self, addr, @intCast(count))) |buf| {
+        const mutation = captureMemoryMutation(self, addr, @intCast(count));
         @memcpy(buf[0..bytes.len], bytes);
         buf[bytes.len] = 0;
+        commitMemoryMutation(self, mutation, .bulk_copy);
         return true;
     }
     return false;

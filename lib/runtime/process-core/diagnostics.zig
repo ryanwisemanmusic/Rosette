@@ -473,6 +473,12 @@ pub fn logPerformanceAccelerationSummary(self: anytype) void {
             .{self.opaque_destructor_quarantines},
         );
     }
+    if (self.string_buffer_null_write_repairs != 0) {
+        machoCapturePrint(
+            "macho-processor: null-write recovery: string_buffer_repairs={d}; skipped empty-buffer NUL terminator stores through a zeroed backing pointer — the StringBuffer self-heals on next use\n",
+            .{self.string_buffer_null_write_repairs},
+        );
+    }
     if (self.profile_account_flow.attempts != 0) {
         machoCapturePrint(
             "macho-processor: profile Account lifecycle: attempts={d} successes={d} failures={d} active={} final_stage={s} last_xuid={x:0>16} last_bytes_read={d}/{d}\n",
