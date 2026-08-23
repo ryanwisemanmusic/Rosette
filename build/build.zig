@@ -395,6 +395,28 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The direct PowerPC path: ISA/ppc/decode answers what an encoding is,
+    // lib/runtime/ppc answers what it does. Neither goes through x86-64.
+    const ppc_decode_module = b.createModule(.{
+        .root_source_file = b.path("../ISA/ppc/decode/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The ARM64 instruction encoder the PowerPC recompiler emits through.
+    const arm64_encode_module = b.createModule(.{
+        .root_source_file = b.path("../lib/compiler/arm64/encode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ppc_runtime_module = b.createModule(.{
+        .root_source_file = b.path("../lib/runtime/ppc/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ppc_runtime_module.addImport("ppc_decode", ppc_decode_module);
+    ppc_runtime_module.addImport("arm64_encode", arm64_encode_module);
+    // The recompiler maps executable memory through libc.
+    ppc_runtime_module.link_libc = true;
     const svx_module = b.createModule(.{
         .root_source_file = b.path("../lib/SVX/root.zig"),
         .target = target,
@@ -413,6 +435,14 @@ pub fn build(b: *std.Build) void {
     });
     const jit_mod = b.createModule(.{
         .root_source_file = b.path("../lib/compiler/JIT/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Runtime analogue of the build graph: keeps compilation evidence
+    // separate from activation evidence and enforces application startup
+    // ordering before a run is considered ready.
+    const ready_compiler_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/ready-compiler/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -764,6 +794,44 @@ pub fn build(b: *std.Build) void {
     {
         const jit_test = b.addTest(.{ .root_module = jit_mod });
         check_step.dependOn(&b.addRunArtifact(jit_test).step);
+    }
+
+    {
+        const ppc_decode_check = b.addTest(.{ .root_module = ppc_decode_module });
+        check_step.dependOn(&b.addRunArtifact(ppc_decode_check).step);
+    }
+
+    {
+        const ppc_runtime_check = b.addTest(.{ .root_module = ppc_runtime_module });
+        check_step.dependOn(&b.addRunArtifact(ppc_runtime_check).step);
+    }
+
+    {
+        const arm64_encode_check = b.addTest(.{ .root_module = arm64_encode_module });
+        check_step.dependOn(&b.addRunArtifact(arm64_encode_check).step);
+    }
+
+    {
+        // Xbox 360 XEX2 image reading, for running a title against the PowerPC
+        // runtime without Xenia owning the module load.
+        const xex_module = b.createModule(.{
+            .root_source_file = b.path("../lib/linker/xex/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const xex_check = b.addTest(.{ .root_module = xex_module });
+        check_step.dependOn(&b.addRunArtifact(xex_check).step);
+    }
+
+    {
+        const isa_ppc_test_mod = b.createModule(.{
+            .root_source_file = b.path("../ISA/ppc_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        isa_ppc_test_mod.addImport("runtime_abi_handshake", runtime_abi_module);
+        const isa_ppc_test = b.addTest(.{ .root_module = isa_ppc_test_mod });
+        check_step.dependOn(&b.addRunArtifact(isa_ppc_test).step);
     }
 
     {
@@ -1275,6 +1343,9 @@ pub fn build(b: *std.Build) void {
         const preflight_test = b.addTest(.{ .root_module = preflight_mod });
         check_step.dependOn(&b.addRunArtifact(preflight_test).step);
 
+        const ready_compiler_test = b.addTest(.{ .root_module = ready_compiler_mod });
+        check_step.dependOn(&b.addRunArtifact(ready_compiler_test).step);
+
         const gpu_mod = b.createModule(.{
             .root_source_file = b.path("../lib/gpu/root.zig"),
             .target = target,
@@ -1554,6 +1625,7 @@ pub fn build(b: *std.Build) void {
         process_core_mod.addImport("gpu", gpu_mod);
         process_core_mod.addImport("device_tree", device_tree_mod);
         process_core_mod.addImport("preflight", preflight_mod);
+        process_core_mod.addImport("ready_compiler", ready_compiler_mod);
         // Rooted so these run rather than merely compile. Until this target
         // existed the module's tests only ever type-checked as part of the
         // processor build, where they are never instantiated — two of them had
@@ -1659,6 +1731,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("gpu", gpu_mod);
         macho_processor_mod.addImport("device_tree", device_tree_mod);
         macho_processor_mod.addImport("preflight", preflight_mod);
+        macho_processor_mod.addImport("ready_compiler", ready_compiler_mod);
         macho_processor_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
@@ -1717,6 +1790,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("gpu", gpu_mod);
         macho_processor_test_mod.addImport("device_tree", device_tree_mod);
         macho_processor_test_mod.addImport("preflight", preflight_mod);
+        macho_processor_test_mod.addImport("ready_compiler", ready_compiler_mod);
         macho_processor_test_mod.addImport("import_handler", import_handler_mod);
         if (is_macos) {
             macho_processor_test_mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{macos_sdk_root}) });
