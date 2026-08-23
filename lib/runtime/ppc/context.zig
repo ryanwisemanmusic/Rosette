@@ -76,9 +76,9 @@ pub const Context = struct {
 };
 
 test "a gap names itself instead of looking like a guest fault" {
-    const gap = Outcome{ .unimplemented = .vpermwi128 };
+    const gap = Outcome{ .unimplemented = .vupkd3d128 };
     try std.testing.expect(gap.isGap());
-    try std.testing.expectEqualStrings("vpermwi128", gap.unimplemented.mnemonic());
+    try std.testing.expectEqualStrings("vupkd3d128", gap.unimplemented.mnemonic());
     try std.testing.expect(!(Outcome{ .branch = 0x8200_0000 }).isGap());
     try std.testing.expect(!(Outcome{ .trap = {} }).isGap());
 }

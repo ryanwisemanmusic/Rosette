@@ -14,10 +14,10 @@
 //! the pattern happens to be symmetric, which for a texture-swizzle table is
 //! often enough to look like it works.
 //!
-//! The Xenon's VMX128 extension widens the register file to 128 entries. The
-//! register file here is sized for that; the VMX128 *instructions* are decoded
-//! but not yet executed, and report themselves as gaps rather than aliasing
-//! down to their 32-register AltiVec cousins.
+//! The Xenon's VMX128 extension widens the register file to 128 entries and
+//! adds its own encodings for most of these operations. Those live in vmx128.zig
+//! and share the lane helpers below, because the two instruction sets differ in
+//! how a register is *named*, not in what a lane means.
 
 const std = @import("std");
 const ppc_decode = @import("ppc_decode");
@@ -48,7 +48,7 @@ fn writeVr(c: *Context, index: u5, value: Vector) void {
 
 /// The 16 bytes of a vector, in architectural order: byte 0 is the most
 /// significant byte of word 0.
-fn toBytes(v: Vector) [16]u8 {
+pub fn toBytes(v: Vector) [16]u8 {
     var out: [16]u8 = undefined;
     inline for (0..4) |word| {
         std.mem.writeInt(u32, out[word * 4 ..][0..4], v[word], .big);
@@ -56,7 +56,7 @@ fn toBytes(v: Vector) [16]u8 {
     return out;
 }
 
-fn fromBytes(bytes: [16]u8) Vector {
+pub fn fromBytes(bytes: [16]u8) Vector {
     var out: Vector = undefined;
     inline for (0..4) |word| {
         out[word] = std.mem.readInt(u32, bytes[word * 4 ..][0..4], .big);
@@ -65,7 +65,7 @@ fn fromBytes(bytes: [16]u8) Vector {
 }
 
 /// View a vector as N elements of type T, element 0 leftmost.
-fn toLanes(comptime T: type, v: Vector) [16 / @sizeOf(T)]T {
+pub fn toLanes(comptime T: type, v: Vector) [16 / @sizeOf(T)]T {
     const count = 16 / @sizeOf(T);
     const bytes = toBytes(v);
     var out: [count]T = undefined;
@@ -75,7 +75,7 @@ fn toLanes(comptime T: type, v: Vector) [16 / @sizeOf(T)]T {
     return out;
 }
 
-fn fromLanes(comptime T: type, lanes: [16 / @sizeOf(T)]T) Vector {
+pub fn fromLanes(comptime T: type, lanes: [16 / @sizeOf(T)]T) Vector {
     const count = 16 / @sizeOf(T);
     var bytes: [16]u8 = undefined;
     inline for (0..count) |i| {
@@ -84,25 +84,25 @@ fn fromLanes(comptime T: type, lanes: [16 / @sizeOf(T)]T) Vector {
     return fromBytes(bytes);
 }
 
-fn toFloats(v: Vector) [4]f32 {
+pub fn toFloats(v: Vector) [4]f32 {
     var out: [4]f32 = undefined;
     inline for (0..4) |i| out[i] = @bitCast(v[i]);
     return out;
 }
 
-fn fromFloats(values: [4]f32) Vector {
+pub fn fromFloats(values: [4]f32) Vector {
     var out: Vector = undefined;
     inline for (0..4) |i| out[i] = @bitCast(values[i]);
     return out;
 }
 
-fn setSaturated(c: *Context) void {
+pub fn setSaturated(c: *Context) void {
     c.state.vscr |= Vscr.sat;
 }
 
 /// A vector compare's Rc bit writes CR6: bit 0 means every lane matched, bit 2
 /// means no lane did. Guests branch on both, so neither can be left unwritten.
-fn recordCr6(c: *Context, insn: Instruction, result: Vector) void {
+pub fn recordCr6(c: *Context, insn: Instruction, result: Vector) void {
     if (!insn.rc()) return;
     var all: bool = true;
     var none: bool = true;
@@ -233,6 +233,82 @@ pub fn execute(c: *Context, insn: Instruction) Fault!Outcome {
         .vcfux => convertToFloat(c, insn, u32),
         .vctsxs => convertToInteger(c, insn, i32),
         .vctuxs => convertToInteger(c, insn, u32),
+
+        // -- Xenon unaligned vector load/store ------------------------------------------
+        .lvlx, .lvlxl => loadUnaligned(c, insn, .left),
+        .lvrx, .lvrxl => loadUnaligned(c, insn, .right),
+        .stvlx, .stvlxl => storeUnaligned(c, insn, .left),
+        .stvrx, .stvrxl => storeUnaligned(c, insn, .right),
+
+        // -- carry / borrow -------------------------------------------------------------
+        .vaddcuw => carryOut(c, insn, .add),
+        .vsubcuw => carryOut(c, insn, .subtract),
+
+        // -- rounding average ------------------------------------------------------------
+        .vavgub => average(c, insn, u8),
+        .vavguh => average(c, insn, u16),
+        .vavguw => average(c, insn, u32),
+        .vavgsb => average(c, insn, i8),
+        .vavgsh => average(c, insn, i16),
+        .vavgsw => average(c, insn, i32),
+
+        // -- multiply even / odd ----------------------------------------------------------
+        .vmuleub => multiplyLanes(c, insn, u8, u16, .even),
+        .vmuloub => multiplyLanes(c, insn, u8, u16, .odd),
+        .vmulesb => multiplyLanes(c, insn, i8, i16, .even),
+        .vmulosb => multiplyLanes(c, insn, i8, i16, .odd),
+        .vmuleuh => multiplyLanes(c, insn, u16, u32, .even),
+        .vmulouh => multiplyLanes(c, insn, u16, u32, .odd),
+        .vmulesh => multiplyLanes(c, insn, i16, i32, .even),
+        .vmulosh => multiplyLanes(c, insn, i16, i32, .odd),
+
+        // -- multiply-accumulate -----------------------------------------------------------
+        .vmhaddshs => multiplyHighAdd(c, insn, false),
+        .vmhraddshs => multiplyHighAdd(c, insn, true),
+        .vmladduhm => multiplyLowAdd(c, insn),
+        .vmsumubm => multiplySum(c, insn, u8, u32, .modulo),
+        .vmsummbm => multiplySumMixed(c, insn),
+        .vmsumuhm => multiplySum(c, insn, u16, u32, .modulo),
+        .vmsumuhs => multiplySum(c, insn, u16, u32, .saturate),
+        .vmsumshm => multiplySum(c, insn, i16, i32, .modulo),
+        .vmsumshs => multiplySum(c, insn, i16, i32, .saturate),
+
+        // -- horizontal sums ------------------------------------------------------------------
+        .vsumsws => sumAcross(c, insn, .all_four),
+        .vsum2sws => sumAcross(c, insn, .pairs),
+        .vsum4sbs => sumWithin(c, insn, i8, i32),
+        .vsum4shs => sumWithin(c, insn, i16, i32),
+        .vsum4ubs => sumWithin(c, insn, u8, u32),
+
+        // -- pack -------------------------------------------------------------------------------
+        .vpkuhum => pack(c, insn, u16, u8, .modulo),
+        .vpkuwum => pack(c, insn, u32, u16, .modulo),
+        .vpkuhus => pack(c, insn, u16, u8, .saturate),
+        .vpkuwus => pack(c, insn, u32, u16, .saturate),
+        .vpkshus => pack(c, insn, i16, u8, .saturate),
+        .vpkswus => pack(c, insn, i32, u16, .saturate),
+        .vpkshss => pack(c, insn, i16, i8, .saturate),
+        .vpkswss => pack(c, insn, i32, i16, .saturate),
+        .vpkpx => packPixel(c, insn),
+
+        // -- unpack -----------------------------------------------------------------------------
+        .vupkhsb => unpack(c, insn, i8, i16, .high),
+        .vupklsb => unpack(c, insn, i8, i16, .low),
+        .vupkhsh => unpack(c, insn, i16, i32, .high),
+        .vupklsh => unpack(c, insn, i16, i32, .low),
+        .vupkhpx => unpackPixel(c, insn, .high),
+        .vupklpx => unpackPixel(c, insn, .low),
+
+        // -- whole-register shifts ------------------------------------------------------------------
+        .vsl => shiftWhole(c, insn, .left, .bits),
+        .vsr => shiftWhole(c, insn, .right, .bits),
+        .vslo => shiftWhole(c, insn, .left, .bytes),
+        .vsro => shiftWhole(c, insn, .right, .bytes),
+
+        // -- bounds compare and transcendental estimates ---------------------------------------------
+        .vcmpbfp => compareBounds(c, insn),
+        .vexptefp => floatUnary(c, insn, .exp2),
+        .vlogefp => floatUnary(c, insn, .log2),
 
         // -- status --------------------------------------------------------------------
         .mfvscr => moveFromVscr(c, insn),
@@ -617,7 +693,7 @@ fn floatMultiplyAdd(c: *Context, insn: Instruction, comptime negate_subtract: bo
     return .advance;
 }
 
-const FloatUnaryKind = enum { reciprocal, reciprocal_sqrt, floor, ceil, truncate, nearest };
+const FloatUnaryKind = enum { reciprocal, reciprocal_sqrt, floor, ceil, truncate, nearest, exp2, log2 };
 
 fn floatUnary(c: *Context, insn: Instruction, comptime kind: FloatUnaryKind) Outcome {
     const f = insn.vx();
@@ -631,6 +707,11 @@ fn floatUnary(c: *Context, insn: Instruction, comptime kind: FloatUnaryKind) Out
             .ceil => @ceil(b[i]),
             .truncate => @trunc(b[i]),
             .nearest => @round(b[i]),
+            // The architecture only requires these to be estimates (relative
+            // error under 1/32), but a correctly-rounded result is inside that
+            // bound, so computing exactly is a legal implementation.
+            .exp2 => std.math.exp2(b[i]),
+            .log2 => std.math.log2(b[i]),
         };
     }
     writeVr(c, f.vd(), fromFloats(out));
@@ -677,6 +758,497 @@ fn convertToInteger(c: *Context, insn: Instruction, comptime T: type) Outcome {
     }
     if (saturated) setSaturated(c);
     writeVr(c, f.vd(), fromLanes(T, out));
+    return .advance;
+}
+
+// ---------------------------------------------------------------------------
+// Xenon unaligned vector load / store
+//
+// `lvlx`/`lvrx` exist to load a quadword that is not on a 16-byte boundary,
+// which `lvx` cannot do because it discards the low four address bits. The pair
+// splits the access: lvlx takes the bytes from the address to the end of its
+// block and left-justifies them, lvrx takes the bytes before the address and
+// right-justifies them, and a `vor` of the two at addresses A and A+16 rebuilds
+// the unaligned quadword.
+//
+// The bytes the instruction does not reach are *zeroed*, not left alone. That
+// is what makes the vor idiom work: if either half preserved the register's
+// prior contents, the or would merge in stale bytes.
+// ---------------------------------------------------------------------------
+
+const UnalignedSide = enum { left, right };
+
+fn loadUnaligned(c: *Context, insn: Instruction, comptime side: UnalignedSide) Fault!Outcome {
+    const f = insn.x();
+    const ea: u32 = @truncate(c.state.ra0(f.ra()) +% c.gpr(f.rb()));
+    const offset: usize = ea & 15;
+    var bytes: [16]u8 = [_]u8{0} ** 16;
+    switch (side) {
+        .left => {
+            // Bytes [EA, EA + 16 - offset) land at the front of the register.
+            var i: usize = 0;
+            while (i < 16 - offset) : (i += 1) {
+                bytes[i] = try c.memory.read(u8, ea +% @as(u32, @intCast(i)));
+            }
+        },
+        .right => {
+            // Bytes [EA - offset, EA) land at the back of the register.
+            var i: usize = 0;
+            while (i < offset) : (i += 1) {
+                bytes[16 - offset + i] = try c.memory.read(u8, ea - @as(u32, @intCast(offset - i)));
+            }
+        },
+    }
+    writeVr(c, f.vd(), fromBytes(bytes));
+    return .advance;
+}
+
+fn storeUnaligned(c: *Context, insn: Instruction, comptime side: UnalignedSide) Fault!Outcome {
+    const f = insn.x();
+    const ea: u32 = @truncate(c.state.ra0(f.ra()) +% c.gpr(f.rb()));
+    const offset: usize = ea & 15;
+    const bytes = toBytes(readVr(c, f.vs()));
+    switch (side) {
+        .left => {
+            var i: usize = 0;
+            while (i < 16 - offset) : (i += 1) {
+                const at = ea +% @as(u32, @intCast(i));
+                try c.memory.write(u8, at, bytes[i]);
+                c.breakReservation(at);
+            }
+        },
+        .right => {
+            var i: usize = 0;
+            while (i < offset) : (i += 1) {
+                const at = ea - @as(u32, @intCast(offset - i));
+                try c.memory.write(u8, at, bytes[16 - offset + i]);
+                c.breakReservation(at);
+            }
+        },
+    }
+    return .advance;
+}
+
+// ---------------------------------------------------------------------------
+// Carry, average, and the multiply family
+// ---------------------------------------------------------------------------
+
+/// `vaddcuw` and `vsubcuw` produce the carry/borrow *as a value*, one per word,
+/// because a 128-bit add has to be built from four 32-bit ones and the carry
+/// between them has to be visible to the next instruction.
+fn carryOut(c: *Context, insn: Instruction, comptime kind: AddSubKind) Outcome {
+    const f = insn.vx();
+    const a = readVr(c, f.va());
+    const b = readVr(c, f.vb());
+    var out: Vector = undefined;
+    inline for (0..4) |i| {
+        out[i] = switch (kind) {
+            .add => @intFromBool(@addWithOverflow(a[i], b[i])[1] != 0),
+            // vsubcuw reports *no* borrow as 1, which is the complement of the
+            // subtract overflow flag.
+            .subtract => @intFromBool(@subWithOverflow(a[i], b[i])[1] == 0),
+        };
+    }
+    writeVr(c, f.vd(), out);
+    return .advance;
+}
+
+/// The AltiVec average rounds up: (a + b + 1) >> 1. The sum is computed one bit
+/// wider than the lane so it cannot overflow before the shift.
+fn average(c: *Context, insn: Instruction, comptime T: type) Outcome {
+    const f = insn.vx();
+    const info = @typeInfo(T).int;
+    const Wide = std.meta.Int(info.signedness, info.bits + 2);
+    const a = toLanes(T, readVr(c, f.va()));
+    const b = toLanes(T, readVr(c, f.vb()));
+    var out: @TypeOf(a) = undefined;
+    for (&out, a, b) |*o, x, y| {
+        const sum: Wide = @as(Wide, x) + @as(Wide, y) + 1;
+        o.* = @intCast(sum >> 1);
+    }
+    writeVr(c, f.vd(), fromLanes(T, out));
+    return .advance;
+}
+
+const LaneParity = enum { even, odd };
+
+/// `vmule*`/`vmulo*` multiply alternating lanes into double-width results, which
+/// is how AltiVec gets a full-precision product without a second instruction.
+/// Element 0 is leftmost, so "even" means indices 0, 2, 4, ... counted from the
+/// left - reading them from the right would take the wrong half of every pair.
+fn multiplyLanes(
+    c: *Context,
+    insn: Instruction,
+    comptime Src: type,
+    comptime Dst: type,
+    comptime parity: LaneParity,
+) Outcome {
+    const f = insn.vx();
+    const dst_count = 16 / @sizeOf(Dst);
+    const a = toLanes(Src, readVr(c, f.va()));
+    const b = toLanes(Src, readVr(c, f.vb()));
+    var out: [dst_count]Dst = undefined;
+    inline for (0..dst_count) |i| {
+        const index = i * 2 + @as(usize, if (parity == .even) 0 else 1);
+        out[i] = @as(Dst, a[index]) *% @as(Dst, b[index]);
+    }
+    writeVr(c, f.vd(), fromLanes(Dst, out));
+    return .advance;
+}
+
+/// Saturate a wide value into `T`, reporting whether it had to clamp.
+pub fn saturate(comptime T: type, value: anytype) struct { value: T, clamped: bool } {
+    const lo = std.math.minInt(T);
+    const hi = std.math.maxInt(T);
+    if (value < lo) return .{ .value = lo, .clamped = true };
+    if (value > hi) return .{ .value = hi, .clamped = true };
+    return .{ .value = @intCast(value), .clamped = false };
+}
+
+/// `vmhaddshs` keeps the *high* half of a 16x16 product before adding, which is
+/// the fixed-point multiply a guest uses for fractional values. `vmhraddshs`
+/// rounds that half instead of truncating it.
+fn multiplyHighAdd(c: *Context, insn: Instruction, comptime rounded: bool) Outcome {
+    const f = insn.va();
+    const a = toLanes(i16, readVr(c, f.va()));
+    const b = toLanes(i16, readVr(c, f.vb()));
+    const addend = toLanes(i16, readVr(c, f.vc()));
+    var out: [8]i16 = undefined;
+    var clamped = false;
+    for (&out, a, b, addend) |*o, x, y, z| {
+        var product: i32 = @as(i32, x) * @as(i32, y);
+        if (rounded) product += 0x4000;
+        const shifted: i32 = product >> 15;
+        const result = saturate(i16, shifted + @as(i32, z));
+        clamped = clamped or result.clamped;
+        o.* = result.value;
+    }
+    if (clamped) setSaturated(c);
+    writeVr(c, f.vd(), fromLanes(i16, out));
+    return .advance;
+}
+
+fn multiplyLowAdd(c: *Context, insn: Instruction) Outcome {
+    const f = insn.va();
+    const a = toLanes(u16, readVr(c, f.va()));
+    const b = toLanes(u16, readVr(c, f.vb()));
+    const addend = toLanes(u16, readVr(c, f.vc()));
+    var out: [8]u16 = undefined;
+    for (&out, a, b, addend) |*o, x, y, z| o.* = x *% y +% z;
+    writeVr(c, f.vd(), fromLanes(u16, out));
+    return .advance;
+}
+
+/// `vmsum*` is a dot product per 32-bit lane: the products of the sub-lanes
+/// inside each word are summed and added to the matching word of vC.
+fn multiplySum(
+    c: *Context,
+    insn: Instruction,
+    comptime Src: type,
+    comptime Acc: type,
+    comptime mode: Overflow,
+) Outcome {
+    const f = insn.va();
+    const per_word = 4 / @sizeOf(Src);
+    const Wide = std.meta.Int(@typeInfo(Acc).int.signedness, 64);
+    const a = toLanes(Src, readVr(c, f.va()));
+    const b = toLanes(Src, readVr(c, f.vb()));
+    const addend = toLanes(Acc, readVr(c, f.vc()));
+    var out: [4]Acc = undefined;
+    var clamped = false;
+    inline for (0..4) |word| {
+        var total: Wide = addend[word];
+        inline for (0..per_word) |sub| {
+            const index = word * per_word + sub;
+            total += @as(Wide, a[index]) * @as(Wide, b[index]);
+        }
+        switch (mode) {
+            .modulo => out[word] = @truncate(@as(Wide, @bitCast(total))),
+            .saturate => {
+                const result = saturate(Acc, total);
+                clamped = clamped or result.clamped;
+                out[word] = result.value;
+            },
+        }
+    }
+    if (clamped) setSaturated(c);
+    writeVr(c, f.vd(), fromLanes(Acc, out));
+    return .advance;
+}
+
+/// `vmsummbm` is the odd one out: vA's bytes are signed and vB's are unsigned,
+/// so it cannot share the symmetric path above.
+fn multiplySumMixed(c: *Context, insn: Instruction) Outcome {
+    const f = insn.va();
+    const a = toLanes(i8, readVr(c, f.va()));
+    const b = toLanes(u8, readVr(c, f.vb()));
+    const addend = toLanes(i32, readVr(c, f.vc()));
+    var out: [4]i32 = undefined;
+    inline for (0..4) |word| {
+        var total: i64 = addend[word];
+        inline for (0..4) |sub| {
+            const index = word * 4 + sub;
+            total += @as(i64, a[index]) * @as(i64, b[index]);
+        }
+        out[word] = @truncate(total);
+    }
+    writeVr(c, f.vd(), fromLanes(i32, out));
+    return .advance;
+}
+
+const SumSpan = enum { all_four, pairs };
+
+/// `vsumsws` reduces all four words into the last lane; `vsum2sws` reduces two
+/// pairs into lanes 1 and 3. The lanes that receive nothing are zeroed, not
+/// left holding vA - a guest reading them would otherwise see a partial sum.
+fn sumAcross(c: *Context, insn: Instruction, comptime span: SumSpan) Outcome {
+    const f = insn.vx();
+    const a = toLanes(i32, readVr(c, f.va()));
+    const addend = toLanes(i32, readVr(c, f.vb()));
+    var out: [4]i32 = .{ 0, 0, 0, 0 };
+    var clamped = false;
+    switch (span) {
+        .all_four => {
+            var total: i64 = addend[3];
+            for (a) |value| total += value;
+            const result = saturate(i32, total);
+            clamped = result.clamped;
+            out[3] = result.value;
+        },
+        .pairs => {
+            inline for (0..2) |pair| {
+                const lane = pair * 2 + 1;
+                var total: i64 = addend[lane];
+                total += a[pair * 2];
+                total += a[pair * 2 + 1];
+                const result = saturate(i32, total);
+                clamped = clamped or result.clamped;
+                out[lane] = result.value;
+            }
+        },
+    }
+    if (clamped) setSaturated(c);
+    writeVr(c, f.vd(), fromLanes(i32, out));
+    return .advance;
+}
+
+/// `vsum4*` sums the sub-lanes *within* each word and adds the matching word of
+/// vB, leaving four independent accumulators rather than one.
+fn sumWithin(c: *Context, insn: Instruction, comptime Src: type, comptime Acc: type) Outcome {
+    const f = insn.vx();
+    const per_word = 4 / @sizeOf(Src);
+    const Wide = std.meta.Int(@typeInfo(Acc).int.signedness, 64);
+    const a = toLanes(Src, readVr(c, f.va()));
+    const addend = toLanes(Acc, readVr(c, f.vb()));
+    var out: [4]Acc = undefined;
+    var clamped = false;
+    inline for (0..4) |word| {
+        var total: Wide = addend[word];
+        inline for (0..per_word) |sub| total += a[word * per_word + sub];
+        const result = saturate(Acc, total);
+        clamped = clamped or result.clamped;
+        out[word] = result.value;
+    }
+    if (clamped) setSaturated(c);
+    writeVr(c, f.vd(), fromLanes(Acc, out));
+    return .advance;
+}
+
+// ---------------------------------------------------------------------------
+// Pack and unpack
+//
+// A pack takes vA and vB and produces one register of half-width lanes, vA's
+// lanes first. The saturating forms are where the signedness matters twice:
+// `vpkshus` reads *signed* halfwords and writes *unsigned* bytes, so a negative
+// input clamps to zero rather than wrapping to 0xFF.
+// ---------------------------------------------------------------------------
+
+fn pack(
+    c: *Context,
+    insn: Instruction,
+    comptime Src: type,
+    comptime Dst: type,
+    comptime mode: Overflow,
+) Outcome {
+    const f = insn.vx();
+    const src_count = 16 / @sizeOf(Src);
+    const a = toLanes(Src, readVr(c, f.va()));
+    const b = toLanes(Src, readVr(c, f.vb()));
+    var out: [16 / @sizeOf(Dst)]Dst = undefined;
+    var clamped = false;
+    inline for (0..src_count) |i| {
+        const value = a[i];
+        out[i] = switch (mode) {
+            .modulo => @truncate(value),
+            .saturate => blk: {
+                const result = saturate(Dst, value);
+                clamped = clamped or result.clamped;
+                break :blk result.value;
+            },
+        };
+    }
+    inline for (0..src_count) |i| {
+        const value = b[i];
+        out[src_count + i] = switch (mode) {
+            .modulo => @truncate(value),
+            .saturate => blk: {
+                const result = saturate(Dst, value);
+                clamped = clamped or result.clamped;
+                break :blk result.value;
+            },
+        };
+    }
+    if (clamped) setSaturated(c);
+    writeVr(c, f.vd(), fromLanes(Dst, out));
+    return .advance;
+}
+
+/// `vpkpx` packs eight words into eight 1-5-5-5 pixels. The source bit
+/// positions are not the low bits of each channel: the architecture takes bit 7
+/// for the alpha bit and bits 8-12, 16-20, 24-28 for the three colour channels,
+/// which is the layout a 8-8-8-8 pixel already has.
+fn packPixel(c: *Context, insn: Instruction) Outcome {
+    const f = insn.vx();
+    const a = toLanes(u32, readVr(c, f.va()));
+    const b = toLanes(u32, readVr(c, f.vb()));
+    var out: [8]u16 = undefined;
+    inline for (0..4) |i| {
+        out[i] = packOnePixel(a[i]);
+        out[4 + i] = packOnePixel(b[i]);
+    }
+    writeVr(c, f.vd(), fromLanes(u16, out));
+    return .advance;
+}
+
+fn packOnePixel(word: u32) u16 {
+    // Architectural bit 7 -> result bit 15, then bits 8..12, 16..20, 24..28.
+    const alpha: u16 = @intCast((word >> 24) & 1);
+    const red: u16 = @intCast((word >> 19) & 0x1F);
+    const green: u16 = @intCast((word >> 11) & 0x1F);
+    const blue: u16 = @intCast((word >> 3) & 0x1F);
+    return (alpha << 15) | (red << 10) | (green << 5) | blue;
+}
+
+const UnpackHalf = enum { high, low };
+
+fn unpack(
+    c: *Context,
+    insn: Instruction,
+    comptime Src: type,
+    comptime Dst: type,
+    comptime half: UnpackHalf,
+) Outcome {
+    const f = insn.vx();
+    const dst_count = 16 / @sizeOf(Dst);
+    const b = toLanes(Src, readVr(c, f.vb()));
+    const base = if (half == .high) 0 else dst_count;
+    var out: [dst_count]Dst = undefined;
+    inline for (0..dst_count) |i| out[i] = b[base + i];
+    writeVr(c, f.vd(), fromLanes(Dst, out));
+    return .advance;
+}
+
+/// `vupkhpx` reverses `vpkpx`: the alpha bit is *sign-replicated* across the
+/// whole byte, so a set alpha unpacks to 0xFF rather than to 1.
+fn unpackPixel(c: *Context, insn: Instruction, comptime half: UnpackHalf) Outcome {
+    const f = insn.vx();
+    const b = toLanes(u16, readVr(c, f.vb()));
+    const base: usize = if (half == .high) 0 else 4;
+    var out: [4]u32 = undefined;
+    inline for (0..4) |i| {
+        const pixel = b[base + i];
+        const alpha: u32 = if (pixel & 0x8000 != 0) 0xFF else 0x00;
+        const red: u32 = (pixel >> 10) & 0x1F;
+        const green: u32 = (pixel >> 5) & 0x1F;
+        const blue: u32 = pixel & 0x1F;
+        out[i] = (alpha << 24) | (red << 16) | (green << 8) | blue;
+    }
+    writeVr(c, f.vd(), fromLanes(u32, out));
+    return .advance;
+}
+
+// ---------------------------------------------------------------------------
+// Whole-register shifts
+//
+// These shift the register as one 128-bit quantity rather than lane by lane.
+// The shift amount comes from the *last* byte of vB - the architecture requires
+// every byte of vB to carry the same amount and leaves the result undefined
+// otherwise, so reading one byte is both correct and cheaper than checking.
+// ---------------------------------------------------------------------------
+
+const WholeShiftUnit = enum { bits, bytes };
+
+fn shiftWhole(
+    c: *Context,
+    insn: Instruction,
+    comptime side: UnalignedSide,
+    comptime unit: WholeShiftUnit,
+) Outcome {
+    const f = insn.vx();
+    const source = toBytes(readVr(c, f.va()));
+    const control = toBytes(readVr(c, f.vb()))[15];
+    var out: [16]u8 = [_]u8{0} ** 16;
+
+    switch (unit) {
+        .bytes => {
+            const amount: usize = (control >> 3) & 0xF;
+            var i: usize = 0;
+            while (i < 16 - amount) : (i += 1) {
+                switch (side) {
+                    .left => out[i] = source[i + amount],
+                    .right => out[i + amount] = source[i],
+                }
+            }
+        },
+        .bits => {
+            const amount: u3 = @intCast(control & 7);
+            if (amount == 0) {
+                out = source;
+            } else {
+                const carry: u3 = @intCast(8 - @as(u5, amount));
+                var i: usize = 0;
+                while (i < 16) : (i += 1) {
+                    switch (side) {
+                        .left => {
+                            const next: u8 = if (i + 1 < 16) source[i + 1] else 0;
+                            out[i] = (source[i] << amount) | (next >> carry);
+                        },
+                        .right => {
+                            const prev: u8 = if (i > 0) source[i - 1] else 0;
+                            out[i] = (source[i] >> amount) | (prev << carry);
+                        },
+                    }
+                }
+            }
+        },
+    }
+    writeVr(c, f.vd(), fromBytes(out));
+    return .advance;
+}
+
+/// `vcmpbfp` is a bounds test, not a comparison: each result word reports
+/// whether vA[i] left the range [-vB[i], +vB[i]], with *zero* meaning in range.
+/// Both bits clear is the success case, which is why Rc reports "none set".
+fn compareBounds(c: *Context, insn: Instruction) Outcome {
+    const f = insn.vc();
+    const a = toFloats(readVr(c, f.va()));
+    const b = toFloats(readVr(c, f.vb()));
+    var out: Vector = undefined;
+    inline for (0..4) |i| {
+        var word: u32 = 0;
+        if (!(a[i] <= b[i])) word |= 0x8000_0000;
+        if (!(a[i] >= -b[i])) word |= 0x4000_0000;
+        out[i] = word;
+    }
+    writeVr(c, f.vd(), out);
+    // Only CR6 bit 2 is defined for vcmpbfp: set when every lane is in bounds.
+    if (insn.rc()) {
+        var all_in_bounds = true;
+        for (out) |word| {
+            if (word != 0) all_in_bounds = false;
+        }
+        c.state.setCrField(6, if (all_in_bounds) 0b0010 else 0b0000);
+    }
     return .advance;
 }
 
@@ -868,6 +1440,302 @@ test "vcfsx applies the fixed-point scale in its immediate" {
     // UIMM = 3 -> divide by 8.
     _ = try h.run(vxWord(3, 3, 2, 842)); // vcfsx
     try testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 4.0 }, toFloats(h.state.vr[3]));
+}
+
+test "lvlx and lvrx rebuild an unaligned quadword when ored together" {
+    var h = Harness{};
+    for (0..48) |i| h.buf[i] = @intCast(i + 1);
+    h.state.gpr[4] = base_address;
+    h.state.gpr[5] = 5; // deliberately unaligned
+
+    _ = try h.run((31 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (519 << 1)); // lvlx v3
+    h.state.gpr[5] = 5 + 16;
+    _ = try h.run((31 << 26) | (4 << 21) | (4 << 16) | (5 << 11) | (551 << 1)); // lvrx v4
+    _ = try h.run(vxWord(5, 3, 4, 1156)); // vor v5, v3, v4
+
+    // The result must be the 16 bytes starting at the unaligned address.
+    const bytes = toBytes(h.state.vr[5]);
+    for (bytes, 0..) |byte, i| {
+        try testing.expectEqual(@as(u8, @intCast(5 + i + 1)), byte);
+    }
+}
+
+test "the half an unaligned load does not reach is zeroed, not preserved" {
+    var h = Harness{};
+    for (0..32) |i| h.buf[i] = 0xEE;
+    h.state.vr[3] = .{ 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+    h.state.gpr[4] = base_address;
+    h.state.gpr[5] = 12; // offset 12 -> only four bytes are in range
+    _ = try h.run((31 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (519 << 1)); // lvlx
+    const bytes = toBytes(h.state.vr[3]);
+    try testing.expectEqual(@as(u8, 0xEE), bytes[3]);
+    // Without the zero fill the vor idiom would merge stale bytes.
+    try testing.expectEqual(@as(u8, 0x00), bytes[4]);
+    try testing.expectEqual(@as(u8, 0x00), bytes[15]);
+}
+
+test "stvlx and stvrx write back exactly what the loads read" {
+    var h = Harness{};
+    for (0..48) |i| h.buf[i] = @intCast(i + 1);
+    h.state.vr[3] = .{ 0xAABBCCDD, 0x11223344, 0x55667788, 0x99AABBCC };
+    h.state.gpr[4] = base_address;
+    h.state.gpr[5] = 32 + 3;
+    _ = try h.run((31 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (647 << 1)); // stvlx
+    h.state.gpr[5] = 32 + 3 + 16;
+    _ = try h.run((31 << 26) | (3 << 21) | (4 << 16) | (5 << 11) | (679 << 1)); // stvrx
+
+    const expected = toBytes(h.state.vr[3]);
+    for (expected, 0..) |byte, i| {
+        try testing.expectEqual(byte, h.buf[32 + 3 + i]);
+    }
+    // The byte before the range is untouched.
+    try testing.expectEqual(@as(u8, 35), h.buf[34]);
+}
+
+test "vaddcuw reports a carry and vsubcuw reports the absence of a borrow" {
+    var h = Harness{};
+    h.state.vr[1] = .{ 0xFFFFFFFF, 1, 5, 5 };
+    h.state.vr[2] = .{ 1, 1, 3, 7 };
+    _ = try h.run(vxWord(3, 1, 2, 384)); // vaddcuw
+    try testing.expectEqual(Vector{ 1, 0, 0, 0 }, h.state.vr[3]);
+    _ = try h.run(vxWord(3, 1, 2, 1408)); // vsubcuw
+    // 5-3 does not borrow (1); 5-7 does (0).
+    try testing.expectEqual(Vector{ 1, 1, 1, 0 }, h.state.vr[3]);
+}
+
+test "the vector average rounds up rather than truncating" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(u32, .{ 3, 4, 0xFFFFFFFF, 0 });
+    h.state.vr[2] = fromLanes(u32, .{ 4, 4, 0xFFFFFFFF, 0 });
+    _ = try h.run(vxWord(3, 1, 2, 1154)); // vavguw
+    // (3+4+1)>>1 = 4, not 3. The last lane proves the sum is computed wider
+    // than the lane: 0xFFFFFFFF averaged with itself is itself.
+    try testing.expectEqual([4]u32{ 4, 4, 0xFFFFFFFF, 0 }, toLanes(u32, h.state.vr[3]));
+
+    h.state.vr[1] = fromLanes(i8, .{ -3, -4, 127, -128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    h.state.vr[2] = fromLanes(i8, .{ -4, -4, 127, -128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    _ = try h.run(vxWord(3, 1, 2, 1282)); // vavgsb
+    const signed = toLanes(i8, h.state.vr[3]);
+    try testing.expectEqual(@as(i8, -3), signed[0]); // (-3 + -4 + 1) >> 1
+    try testing.expectEqual(@as(i8, 127), signed[2]);
+    try testing.expectEqual(@as(i8, -128), signed[3]);
+}
+
+test "vmuleuh takes the even halfwords counted from the left" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(u16, .{ 2, 100, 3, 100, 4, 100, 5, 100 });
+    h.state.vr[2] = fromLanes(u16, .{ 10, 200, 10, 200, 10, 200, 10, 200 });
+    _ = try h.run(vxWord(3, 1, 2, 584)); // vmuleuh
+    try testing.expectEqual([4]u32{ 20, 30, 40, 50 }, toLanes(u32, h.state.vr[3]));
+    _ = try h.run(vxWord(3, 1, 2, 72)); // vmulouh
+    try testing.expectEqual([4]u32{ 20000, 20000, 20000, 20000 }, toLanes(u32, h.state.vr[3]));
+}
+
+test "vmulesb keeps the sign that vmuleub would lose" {
+    var h = Harness{};
+    var lanes: [16]i8 = [_]i8{0} ** 16;
+    lanes[0] = -2;
+    h.state.vr[1] = fromLanes(i8, lanes);
+    var other: [16]i8 = [_]i8{0} ** 16;
+    other[0] = 3;
+    h.state.vr[2] = fromLanes(i8, other);
+    _ = try h.run(vxWord(3, 1, 2, 776)); // vmulesb
+    try testing.expectEqual(@as(i16, -6), toLanes(i16, h.state.vr[3])[0]);
+    _ = try h.run(vxWord(3, 1, 2, 520)); // vmuleub
+    try testing.expectEqual(@as(u16, 254 * 3), toLanes(u16, h.state.vr[3])[0]);
+}
+
+test "vmhaddshs keeps the high half of the product and saturates the sum" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(i16, .{ 0x4000, 32767, 0, 0, 0, 0, 0, 0 });
+    h.state.vr[2] = fromLanes(i16, .{ 0x4000, 32767, 0, 0, 0, 0, 0, 0 });
+    h.state.vr[4] = fromLanes(i16, .{ 0, 32767, 0, 0, 0, 0, 0, 0 });
+    _ = try h.run(vaWord(3, 1, 2, 4, 32)); // vmhaddshs
+    const out = toLanes(i16, h.state.vr[3]);
+    // (0x4000 * 0x4000) >> 15 = 0x2000.
+    try testing.expectEqual(@as(i16, 0x2000), out[0]);
+    // The second lane overflows and clamps, latching VSCR.SAT.
+    try testing.expectEqual(@as(i16, 32767), out[1]);
+    try testing.expect(h.state.vscr & Vscr.sat != 0);
+}
+
+test "vmladduhm is a plain modulo multiply-add on halfwords" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(u16, .{ 3, 0xFFFF, 0, 0, 0, 0, 0, 0 });
+    h.state.vr[2] = fromLanes(u16, .{ 4, 2, 0, 0, 0, 0, 0, 0 });
+    h.state.vr[4] = fromLanes(u16, .{ 5, 1, 0, 0, 0, 0, 0, 0 });
+    _ = try h.run(vaWord(3, 1, 2, 4, 34)); // vmladduhm
+    const out = toLanes(u16, h.state.vr[3]);
+    try testing.expectEqual(@as(u16, 17), out[0]);
+    // 0xFFFF * 2 + 1 wraps rather than saturating.
+    try testing.expectEqual(@as(u16, 0xFFFF), out[1]);
+}
+
+test "vmsumuhm is a dot product inside each word" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(u16, .{ 2, 3, 0, 0, 0, 0, 0, 0 });
+    h.state.vr[2] = fromLanes(u16, .{ 10, 20, 0, 0, 0, 0, 0, 0 });
+    h.state.vr[4] = fromLanes(u32, .{ 1, 0, 0, 0 });
+    _ = try h.run(vaWord(3, 1, 2, 4, 38)); // vmsumuhm
+    // 2*10 + 3*20 + 1 = 81, all inside word 0.
+    try testing.expectEqual([4]u32{ 81, 0, 0, 0 }, toLanes(u32, h.state.vr[3]));
+}
+
+test "vmsummbm mixes a signed multiplicand with an unsigned one" {
+    var h = Harness{};
+    var a: [16]i8 = [_]i8{0} ** 16;
+    a[0] = -1;
+    h.state.vr[1] = fromLanes(i8, a);
+    var b: [16]u8 = [_]u8{0} ** 16;
+    b[0] = 200;
+    h.state.vr[2] = fromLanes(u8, b);
+    h.state.vr[4] = fromLanes(i32, .{ 0, 0, 0, 0 });
+    _ = try h.run(vaWord(3, 1, 2, 4, 37)); // vmsummbm
+    // Reading vB as signed would give +56 here instead of -200.
+    try testing.expectEqual(@as(i32, -200), toLanes(i32, h.state.vr[3])[0]);
+}
+
+test "vsumsws collapses four words into the last lane and zeroes the rest" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(i32, .{ 1, 2, 3, 4 });
+    h.state.vr[2] = fromLanes(i32, .{ 100, 100, 100, 10 });
+    _ = try h.run(vxWord(3, 1, 2, 1928)); // vsumsws
+    try testing.expectEqual([4]i32{ 0, 0, 0, 20 }, toLanes(i32, h.state.vr[3]));
+}
+
+test "vsum2sws reduces pairs into lanes one and three" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(i32, .{ 1, 2, 3, 4 });
+    h.state.vr[2] = fromLanes(i32, .{ 0, 10, 0, 20 });
+    _ = try h.run(vxWord(3, 1, 2, 1672)); // vsum2sws
+    try testing.expectEqual([4]i32{ 0, 13, 0, 27 }, toLanes(i32, h.state.vr[3]));
+}
+
+test "vsum4sbs accumulates within each word independently" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(i8, .{ 1, 2, 3, 4, 1, 1, 1, 1, 0, 0, 0, 0, -1, -1, -1, -1 });
+    h.state.vr[2] = fromLanes(i32, .{ 0, 100, 0, 0 });
+    _ = try h.run(vxWord(3, 1, 2, 1800)); // vsum4sbs
+    try testing.expectEqual([4]i32{ 10, 104, 0, -4 }, toLanes(i32, h.state.vr[3]));
+}
+
+test "vpkuhum truncates where vpkuhus saturates" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(u16, .{ 0x0102, 0x00FF, 0x0100, 0, 0, 0, 0, 0 });
+    h.state.vr[2] = fromLanes(u16, .{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    _ = try h.run(vxWord(3, 1, 2, 14)); // vpkuhum
+    const truncated = toLanes(u8, h.state.vr[3]);
+    try testing.expectEqual(@as(u8, 0x02), truncated[0]);
+    try testing.expectEqual(@as(u8, 0x00), truncated[2]);
+
+    _ = try h.run(vxWord(3, 1, 2, 142)); // vpkuhus
+    const saturated = toLanes(u8, h.state.vr[3]);
+    try testing.expectEqual(@as(u8, 0xFF), saturated[0]);
+    try testing.expectEqual(@as(u8, 0xFF), saturated[2]);
+    try testing.expect(h.state.vscr & Vscr.sat != 0);
+}
+
+test "vpkshus clamps a negative signed source to zero, not to 0xFF" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(i16, .{ -1, -32768, 300, 0, 0, 0, 0, 0 });
+    h.state.vr[2] = fromLanes(i16, .{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    _ = try h.run(vxWord(3, 1, 2, 270)); // vpkshus
+    const out = toLanes(u8, h.state.vr[3]);
+    try testing.expectEqual(@as(u8, 0), out[0]);
+    try testing.expectEqual(@as(u8, 0), out[1]);
+    try testing.expectEqual(@as(u8, 255), out[2]);
+}
+
+test "a pack puts vA's lanes first and vB's second" {
+    var h = Harness{};
+    h.state.vr[1] = fromLanes(u16, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    h.state.vr[2] = fromLanes(u16, .{ 9, 10, 11, 12, 13, 14, 15, 16 });
+    _ = try h.run(vxWord(3, 1, 2, 14)); // vpkuhum
+    const out = toLanes(u8, h.state.vr[3]);
+    try testing.expectEqual(@as(u8, 1), out[0]);
+    try testing.expectEqual(@as(u8, 8), out[7]);
+    try testing.expectEqual(@as(u8, 9), out[8]);
+    try testing.expectEqual(@as(u8, 16), out[15]);
+}
+
+test "vupkhsb sign-extends where a zero-extend would lose the sign" {
+    var h = Harness{};
+    var lanes: [16]i8 = [_]i8{0} ** 16;
+    lanes[0] = -1;
+    lanes[8] = -2;
+    h.state.vr[2] = fromLanes(i8, lanes);
+    _ = try h.run(vxWord(3, 0, 2, 526)); // vupkhsb
+    try testing.expectEqual(@as(i16, -1), toLanes(i16, h.state.vr[3])[0]);
+    _ = try h.run(vxWord(3, 0, 2, 654)); // vupklsb
+    try testing.expectEqual(@as(i16, -2), toLanes(i16, h.state.vr[3])[0]);
+}
+
+test "vpkpx and vupkhpx round-trip a pixel through the 1-5-5-5 layout" {
+    var h = Harness{};
+    // Alpha set, R=0x1F, G=0x00, B=0x1F in an 8-8-8-8 word.
+    h.state.vr[1] = fromLanes(u32, .{ 0x01_F8_00_F8, 0, 0, 0 });
+    h.state.vr[2] = fromLanes(u32, .{ 0, 0, 0, 0 });
+    _ = try h.run(vxWord(3, 1, 2, 782)); // vpkpx
+    const packed_pixel = toLanes(u16, h.state.vr[3])[0];
+    try testing.expectEqual(@as(u16, 0x8000 | (0x1F << 10) | 0x1F), packed_pixel);
+
+    h.state.vr[4] = h.state.vr[3];
+    _ = try h.run(vxWord(5, 0, 4, 846)); // vupkhpx
+    const unpacked = toLanes(u32, h.state.vr[5])[0];
+    // Alpha comes back sign-replicated as 0xFF, not as 1.
+    try testing.expectEqual(@as(u32, 0xFF_1F_00_1F), unpacked);
+}
+
+test "vslo and vsro shift the whole register by bytes" {
+    var h = Harness{};
+    h.state.vr[1] = .{ 0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F };
+    h.state.vr[2] = fromLanes(u8, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4 << 3 });
+    _ = try h.run(vxWord(3, 1, 2, 1036)); // vslo
+    try testing.expectEqual(Vector{ 0x04050607, 0x08090A0B, 0x0C0D0E0F, 0 }, h.state.vr[3]);
+    _ = try h.run(vxWord(3, 1, 2, 1100)); // vsro
+    try testing.expectEqual(Vector{ 0, 0x00010203, 0x04050607, 0x08090A0B }, h.state.vr[3]);
+}
+
+test "vsl and vsr shift the whole register by bits" {
+    var h = Harness{};
+    h.state.vr[1] = .{ 0x80000000, 0, 0, 1 };
+    h.state.vr[2] = fromLanes(u8, .{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 });
+    _ = try h.run(vxWord(3, 1, 2, 452)); // vsl
+    // The bit shifted out of the top of one byte enters the next: a lane-wise
+    // shift would leave the low word at 2 and lose the carry between bytes.
+    try testing.expectEqual(Vector{ 0, 0, 0, 2 }, h.state.vr[3]);
+
+    h.state.vr[1] = .{ 2, 0, 0, 0 };
+    _ = try h.run(vxWord(3, 1, 2, 708)); // vsr
+    try testing.expectEqual(Vector{ 1, 0, 0, 0 }, h.state.vr[3]);
+}
+
+test "vcmpbfp reports zero for a lane inside its bounds" {
+    var h = Harness{};
+    h.state.vr[1] = fromFloats(.{ 0.5, 2.0, -2.0, 1.0 });
+    h.state.vr[2] = fromFloats(.{ 1.0, 1.0, 1.0, 1.0 });
+    _ = try h.run(vcWord(3, 1, 2, 1, 966)); // vcmpbfp.
+    const out = h.state.vr[3];
+    try testing.expectEqual(@as(u32, 0), out[0]); // in bounds
+    try testing.expectEqual(@as(u32, 0x8000_0000), out[1]); // above +vB
+    try testing.expectEqual(@as(u32, 0x4000_0000), out[2]); // below -vB
+    try testing.expectEqual(@as(u32, 0), out[3]); // exactly on the bound
+    // Only CR6 bit 2 is defined, and only when every lane is in bounds.
+    try testing.expectEqual(@as(u4, 0b0000), h.state.crField(6));
+
+    h.state.vr[1] = fromFloats(.{ 0.5, 0.5, 0.5, 0.5 });
+    _ = try h.run(vcWord(3, 1, 2, 1, 966));
+    try testing.expectEqual(@as(u4, 0b0010), h.state.crField(6));
+}
+
+test "vexptefp and vlogefp are inverses within their estimate tolerance" {
+    var h = Harness{};
+    h.state.vr[2] = fromFloats(.{ 0.0, 1.0, 2.0, 3.0 });
+    _ = try h.run(vxWord(3, 0, 2, 394)); // vexptefp
+    try testing.expectEqual([4]f32{ 1.0, 2.0, 4.0, 8.0 }, toFloats(h.state.vr[3]));
+    h.state.vr[4] = h.state.vr[3];
+    _ = try h.run(vxWord(5, 0, 4, 458)); // vlogefp
+    try testing.expectEqual([4]f32{ 0.0, 1.0, 2.0, 3.0 }, toFloats(h.state.vr[5]));
 }
 
 test "a VMX128 instruction reports itself rather than aliasing to AltiVec" {

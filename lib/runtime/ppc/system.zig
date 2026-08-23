@@ -216,7 +216,7 @@ test "mtspr and mfspr round-trip LR and CTR" {
 
 test "an SPR Rosette does not model reports itself instead of reading zero" {
     var h = Harness{};
-    const outcome = h.run(mfsprWord(3, 1013)); // DABR, unmodelled
+    const outcome = h.run(mfsprWord(3, 700)); // not a Xenon SPR
     try testing.expect(outcome.isGap());
     try testing.expectEqual(ppc_decode.Op.mfspr, outcome.unimplemented);
     try testing.expectEqual(@as(u64, 0), h.state.gpr[3]); // untouched

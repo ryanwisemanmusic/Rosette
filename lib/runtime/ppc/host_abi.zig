@@ -29,6 +29,7 @@ const state_mod = @import("state.zig");
 const memory_mod = @import("memory.zig");
 const context_mod = @import("context.zig");
 const execute_mod = @import("execute.zig");
+const jit_mod = @import("jit/root.zig");
 
 const State = state_mod.State;
 const Memory = memory_mod.Memory;
@@ -143,7 +144,19 @@ const Binding = struct {
     guest: GuestState = undefined,
     state: State = .{},
     calls: CallCache = .{},
+    /// The recompiler, when this host can allocate executable memory and the
+    /// embedder has not turned it off. A null one is not an error: the
+    /// interpreter is the complete implementation and the recompiler is a
+    /// throughput optimisation over it.
+    jit: ?jit_mod.Jit = null,
 };
+
+/// Whether newly bound threads get a recompiler. Off until an embedder asks:
+/// a JIT that starts itself changes the timing of every run, including the ones
+/// being used to diagnose something else.
+var jit_enabled: bool = false;
+/// Code cache size per guest thread.
+var jit_capacity: usize = 4 * 1024 * 1024;
 
 /// Xbox 360 titles run a bounded number of guest threads; the kernel's own
 /// limit is well under this. A fixed table keeps binding lock-free on the hot
@@ -251,6 +264,12 @@ pub export fn rosette_ppc_bind_context(guest: *const GuestState) callconv(.c) i3
     for (&bindings) |*binding| {
         if (!binding.used) {
             binding.* = .{ .used = true, .guest = guest.*, .state = .{}, .calls = .{} };
+            if (jit_enabled) {
+                binding.jit = jit_mod.Jit.init(
+                    std.heap.page_allocator,
+                    jit_capacity,
+                ) catch null;
+            }
             return 1;
         }
     }
@@ -262,14 +281,45 @@ pub export fn rosette_ppc_bind_context(guest: *const GuestState) callconv(.c) i3
 pub export fn rosette_ppc_release_context(host_context: *anyopaque) callconv(.c) void {
     bindings_lock.lock();
     defer bindings_lock.unlock();
-    if (findBinding(host_context)) |binding| binding.used = false;
+    if (findBinding(host_context)) |binding| {
+        if (binding.jit) |*j| j.deinit();
+        binding.jit = null;
+        binding.used = false;
+    }
+}
+
+/// Turn the recompiler on or off for threads bound after this call. Returns
+/// whether the host can run one at all.
+pub export fn rosette_ppc_set_recompiler_enabled(enabled: i32) callconv(.c) i32 {
+    if (!jit_mod.Jit.available()) return 0;
+    jit_enabled = enabled != 0;
+    return 1;
+}
+
+/// Recompiler counters for a bound thread, for the embedder's run summary.
+pub export fn rosette_ppc_recompiler_stats(
+    host_context: *anyopaque,
+    out_blocks: *u64,
+    out_instructions: *u64,
+) callconv(.c) i32 {
+    bindings_lock.lock();
+    defer bindings_lock.unlock();
+    const binding = findBinding(host_context) orelse return 0;
+    const j = &(binding.jit orelse return 0);
+    out_blocks.* = j.stats.blocks_executed;
+    out_instructions.* = j.stats.instructions_executed;
+    return 1;
 }
 
 pub export fn rosette_ppc_invalidate_range(guest_low: u32, guest_high: u32) callconv(.c) void {
     bindings_lock.lock();
     defer bindings_lock.unlock();
     for (&bindings) |*binding| {
-        if (binding.used) binding.calls.invalidate(guest_low, guest_high);
+        if (!binding.used) continue;
+        binding.calls.invalidate(guest_low, guest_high);
+        // Compiled code for the range is now stale in exactly the way that
+        // matters: it would execute the previous contents of those addresses.
+        if (binding.jit) |*j| j.invalidate(guest_low, guest_high);
     }
 }
 
@@ -315,6 +365,16 @@ fn runBound(
             return;
         }
 
+        // A compiled block first, when one covers this address. It runs the
+        // same architected state changes the interpreter would, so the loop
+        // below picks up wherever it stopped.
+        if (binding.jit) |*j| {
+            if (runCompiledBlock(binding, j, out_result, retired_at_entry, return_address)) |handled| {
+                if (handled) return;
+                continue;
+            }
+        }
+
         const at = binding.state.pc;
         const outcome = execute_mod.step(&ctx) catch {
             finish(binding, out_result, .memory_fault, at, retired_at_entry, null);
@@ -322,7 +382,17 @@ fn runBound(
         };
 
         switch (outcome) {
-            .advance => {},
+            .advance => {
+                // `icbi` is the guest saying the instructions at an address
+                // changed. Draining it here, rather than inside the executor,
+                // keeps the interpreter unaware of whether a recompiler exists.
+                if (binding.state.pending_icache_invalidation) |changed| {
+                    binding.state.pending_icache_invalidation = null;
+                    if (binding.jit) |*j| {
+                        j.invalidate(changed & ~@as(u32, 127), (changed | 127) +% 1);
+                    }
+                }
+            },
 
             .branch => |target| {
                 if (target == return_address) {
@@ -394,6 +464,42 @@ fn runBound(
             },
         }
     }
+}
+
+/// Try to run a compiled block at the current PC.
+///
+/// Returns null when there is nothing compiled to run, true when the run is
+/// over and `out_result` has been filled in, and false when the caller should
+/// keep going from wherever the block left the PC.
+fn runCompiledBlock(
+    binding: *Binding,
+    j: *jit_mod.Jit,
+    out_result: *RunResult,
+    retired_at_entry: u64,
+    return_address: u32,
+) ?bool {
+    const address = binding.state.pc;
+    const block = j.lookup(address) orelse {
+        // Not compiled yet. Count the visit; compilation happens once the
+        // address has proved it is worth the cost.
+        if (j.noteExecution(address)) {
+            _ = j.compileAt(memoryFor(binding), address) catch {};
+        }
+        return null;
+    };
+
+    // The block accumulates its own retired count into the guest state before
+    // it returns, so nothing has to be added here.
+    const outcome = j.run(block, &binding.state, memoryFor(binding));
+    if (outcome.faulted) {
+        finish(binding, out_result, .memory_fault, outcome.address, retired_at_entry, null);
+        return true;
+    }
+    if (binding.state.pc == return_address) {
+        finish(binding, out_result, .returned, binding.state.pc, retired_at_entry, null);
+        return true;
+    }
+    return false;
 }
 
 fn finish(
@@ -578,28 +684,26 @@ test "register state syncs in and back out around one request" {
     rosette_ppc_release_context(&emb);
 }
 
-test "an unimplemented instruction is named across the ABI" {
+test "the 4-20-20-20 vertex sub-format executes across the ABI" {
     resetBindings();
     var emb = FakeEmbedder{};
+    const four_twenty = ppc_decode.Op.vupkd3d128.info().pattern | (@as(u32, 6) << 18);
+    emb.vr[0] = .{ 0, 0, 0xA34567FF, 0xFFF12345 };
     emb.loadProgram(0, &.{
-        0x38600001, // li r3, 1
-        0x18000210, // vpermwi128
+        four_twenty,
+        0x44000002, // sc
+        0x4E800020, // blr
     });
+    emb.lr = 0x100;
     const guest = emb.guestState();
     _ = rosette_ppc_bind_context(&guest);
 
     var result: RunResult = undefined;
     rosette_ppc_execute(&emb, 0, 0x100, &result);
-    try testing.expectEqual(@intFromEnum(RunStatus.unimplemented), result.status);
-    try testing.expectEqual(@as(u32, 4), result.address);
-    try testing.expect(result.unimplemented_opcode != null);
-    try testing.expectEqualStrings(
-        "vpermwi128",
-        std.mem.span(result.unimplemented_opcode.?),
-    );
-    // The register the first instruction wrote is still delivered: a gap does
-    // not discard the work that preceded it.
-    try testing.expectEqual(@as(u64, 1), emb.gpr[3]);
+    try testing.expectEqual(@intFromEnum(RunStatus.returned), result.status);
+    try testing.expect(result.unimplemented_opcode == null);
+    try testing.expectEqual(@as(u32, 1), emb.system_calls);
+    try testing.expectEqual([4]u32{ 0x40412345, 0x403FFFFF, 0x40434567, 0x3F80000A }, emb.vr[0]);
     rosette_ppc_release_context(&emb);
 }
 
@@ -740,6 +844,97 @@ test "the condition register round-trips through the embedder's accessors" {
     try testing.expectEqual(@intFromEnum(RunStatus.returned), result.status);
     // CR0 = EQ, written back through write_cr rather than left in Rosette.
     try testing.expectEqual(@as(u32, 0b0010) << 28, emb.cr);
+    rosette_ppc_release_context(&emb);
+}
+
+test "the recompiler is off until an embedder asks for it" {
+    resetBindings();
+    // A JIT that started itself would change the timing of every run,
+    // including the ones being used to diagnose something unrelated.
+    try testing.expect(!jit_enabled);
+    defer _ = rosette_ppc_set_recompiler_enabled(0);
+    if (jit_mod.Jit.available()) {
+        try testing.expectEqual(@as(i32, 1), rosette_ppc_set_recompiler_enabled(1));
+        try testing.expect(jit_enabled);
+    } else {
+        try testing.expectEqual(@as(i32, 0), rosette_ppc_set_recompiler_enabled(1));
+    }
+}
+
+test "a hot loop gives the same answer with and without the recompiler" {
+    if (!jit_mod.Jit.available()) return error.SkipZigTest;
+
+    // A counted loop whose body is entirely in the compiled subset, run for
+    // long enough that the body crosses the hotness threshold and compiles.
+    const program = [_]u32{
+        0x38600000, // li    r3, 0
+        0x38800000, // li    r4, 0
+        0x38840001, // addi  r4, r4, 1      <- loop body, address 8
+        0x7C632214, // add   r3, r3, r4
+        0x2C040064, // cmpwi r4, 100
+        0x4082FFF4, // bne   -12
+        0x44000002, // sc
+    };
+
+    var interpreted: u64 = 0;
+    var compiled: u64 = 0;
+    for ([_]bool{ false, true }) |use_jit| {
+        resetBindings();
+        _ = rosette_ppc_set_recompiler_enabled(if (use_jit) 1 else 0);
+        defer _ = rosette_ppc_set_recompiler_enabled(0);
+
+        var emb = FakeEmbedder{};
+        emb.loadProgram(0, &program);
+        const guest = emb.guestState();
+        try testing.expectEqual(@as(i32, 1), rosette_ppc_bind_context(&guest));
+
+        var result: RunResult = undefined;
+        rosette_ppc_execute(&emb, 0, 0x800, &result);
+        // The `sc` at the end is handled by the fake embedder, so the run ends
+        // by returning rather than by stopping on the system call.
+        try testing.expectEqual(@as(u32, 1), emb.system_calls);
+        // 1 + 2 + ... + 100
+        try testing.expectEqual(@as(u64, 5050), emb.gpr[3]);
+        try testing.expectEqual(@as(u64, 100), emb.gpr[4]);
+        if (use_jit) compiled = emb.gpr[3] else interpreted = emb.gpr[3];
+        rosette_ppc_release_context(&emb);
+    }
+    try testing.expectEqual(interpreted, compiled);
+}
+
+test "an icbi drops the compiled code for the block it names" {
+    if (!jit_mod.Jit.available()) return error.SkipZigTest;
+    resetBindings();
+    _ = rosette_ppc_set_recompiler_enabled(1);
+    defer _ = rosette_ppc_set_recompiler_enabled(0);
+
+    var emb = FakeEmbedder{};
+    // A loop that goes hot, then an icbi over its own address range, then the
+    // same loop again. The second pass must not run the first pass's code.
+    const program = [_]u32{
+        0x38800000, // li    r4, 0
+        0x38840001, // addi  r4, r4, 1
+        0x2C040014, // cmpwi r4, 20
+        0x4082FFF8, // bne   -8
+        0x38A00000, // li    r5, 0
+        0x7CA5FFAC, // icbi  r5, r31
+        0x44000002, // sc
+    };
+    emb.loadProgram(0, &program);
+    emb.gpr[31] = 0;
+    const guest = emb.guestState();
+    _ = rosette_ppc_bind_context(&guest);
+
+    var result: RunResult = undefined;
+    rosette_ppc_execute(&emb, 0, 0x800, &result);
+    try testing.expectEqual(@as(u64, 20), emb.gpr[4]);
+
+    // The icbi ran, so nothing compiled for the block it covered survives.
+    bindings_lock.lock();
+    const binding = findBinding(&emb).?;
+    const has_block = if (binding.jit) |*j| j.lookup(4) != null else false;
+    bindings_lock.unlock();
+    try testing.expect(!has_block);
     rosette_ppc_release_context(&emb);
 }
 

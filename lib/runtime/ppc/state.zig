@@ -102,13 +102,59 @@ pub const Spr = struct {
     pub const dec: u10 = 22;
     pub const srr0: u10 = 26;
     pub const srr1: u10 = 27;
+    pub const vrsave: u10 = 256;
+    pub const tbl_read: u10 = 268;
+    pub const tbu_read: u10 = 269;
     pub const sprg0: u10 = 272;
     pub const sprg1: u10 = 273;
     pub const sprg2: u10 = 274;
     pub const sprg3: u10 = 275;
-    pub const tbl_read: u10 = 268;
-    pub const tbu_read: u10 = 269;
+    pub const tbl_write: u10 = 284;
+    pub const tbu_write: u10 = 285;
     pub const pvr: u10 = 287;
+    /// Xenon hardware-implementation registers. The kernel writes them during
+    /// bring-up and reads them back; nothing in Rosette acts on their contents.
+    pub const hid0: u10 = 1008;
+    pub const hid1: u10 = 1009;
+    pub const iabr: u10 = 1010;
+    pub const hid4: u10 = 1012;
+    pub const dabr: u10 = 1013;
+    pub const dabrx: u10 = 1015;
+    pub const buscsr: u10 = 1016;
+    pub const l2cr: u10 = 1017;
+    /// Processor identification. Read-only on hardware.
+    pub const pir: u10 = 1023;
+    /// Xenon performance monitor: one control register and six counters.
+    pub const mmcr0: u10 = 952;
+    pub const pmc1: u10 = 953;
+    pub const pmc2: u10 = 954;
+    pub const pmc3: u10 = 957;
+    pub const pmc4: u10 = 958;
+    pub const mmcr1: u10 = 956;
+    pub const mmcra: u10 = 955;
+
+    /// SPRs that are pure storage on the Xenon: the kernel writes a value and
+    /// expects to read the same value back, and nothing else in the machine
+    /// observes them.
+    ///
+    /// Modelling these as storage rather than refusing them is the difference
+    /// between a kernel bring-up path that completes and one that stops on its
+    /// first configuration write. Modelling *everything* as storage would be
+    /// the opposite mistake: an SPR with real semantics would read back the
+    /// value written instead of the value the hardware would have produced,
+    /// which is a wrong answer rather than a missing one.
+    pub const storage_backed = [_]u10{
+        dsisr, dar,  dabr,   dabrx, iabr,  hid0,  hid1,
+        hid4,  l2cr, buscsr, mmcr0, mmcr1, mmcra, pmc1,
+        pmc2,  pmc3, pmc4,
+    };
+
+    pub fn isStorageBacked(number: u10) bool {
+        for (storage_backed) |candidate| {
+            if (candidate == number) return true;
+        }
+        return false;
+    }
 };
 
 /// The full architected register file.
@@ -130,6 +176,15 @@ pub const State = struct {
     sprg: [4]u64 = [_]u64{0} ** 4,
     srr0: u64 = 0,
     srr1: u64 = 0,
+    /// Vector register save mask. The guest saves and restores it around
+    /// vector code, so it has to read back what was written.
+    vrsave: u32 = 0,
+    /// Decrementer. Rosette does not tick it; the scheduler owns guest time.
+    decrementer: u32 = 0,
+    /// Backing store for the Xenon SPRs listed in `Spr.storage_backed`.
+    spr_storage: [Spr.storage_backed.len]u64 = [_]u64{0} ** Spr.storage_backed.len,
+    /// Processor identification, reported to the guest as-is.
+    processor_id: u64 = 0,
     /// The Xenon's processor version register, reported to the guest as-is.
     pvr: u32 = 0x00710200,
 
@@ -138,6 +193,11 @@ pub const State = struct {
     reservation: Reservation = .{},
     /// Instructions retired, for throughput accounting and watchdogs.
     instructions_retired: u64 = 0,
+    /// Set by `icbi`. The dispatcher drains it and drops any compiled code for
+    /// that block: `icbi` followed by `isync` is the architected way a guest
+    /// says "the instructions at this address changed", and it is the only
+    /// notice a recompiler is entitled to.
+    pending_icache_invalidation: ?u32 = null,
     /// Time base, advanced by the scheduler rather than by instruction count.
     time_base: u64 = 0,
 
@@ -207,11 +267,26 @@ pub const State = struct {
             Spr.sprg1 => self.sprg[1],
             Spr.sprg2 => self.sprg[2],
             Spr.sprg3 => self.sprg[3],
-            Spr.tbl_read => self.time_base & 0xFFFFFFFF,
-            Spr.tbu_read => self.time_base >> 32,
+            Spr.vrsave => self.vrsave,
+            Spr.tbl_read, Spr.tbl_write => self.time_base & 0xFFFFFFFF,
+            Spr.tbu_read, Spr.tbu_write => self.time_base >> 32,
+            Spr.dec => self.decrementer,
             Spr.pvr => self.pvr,
-            else => null,
+            Spr.pir => self.processor_id,
+            else => if (Spr.isStorageBacked(number)) self.storageSpr(number) else null,
         };
+    }
+
+    /// Find the storage slot for an SPR, or null if it has none.
+    fn storageSlot(number: u10) ?usize {
+        for (Spr.storage_backed, 0..) |candidate, index| {
+            if (candidate == number) return index;
+        }
+        return null;
+    }
+
+    fn storageSpr(self: *const State, number: u10) u64 {
+        return if (storageSlot(number)) |index| self.spr_storage[index] else 0;
     }
 
     pub fn writeSpr(self: *State, number: u10, value: u64) bool {
@@ -225,7 +300,21 @@ pub const State = struct {
             Spr.sprg1 => self.sprg[1] = value,
             Spr.sprg2 => self.sprg[2] = value,
             Spr.sprg3 => self.sprg[3] = value,
-            else => return false,
+            Spr.vrsave => self.vrsave = @truncate(value),
+            Spr.dec => self.decrementer = @truncate(value),
+            // The time base is writable through 284/285 and read through
+            // 268/269; the read-side numbers are not writable.
+            Spr.tbl_write => self.time_base = (self.time_base & 0xFFFFFFFF_00000000) |
+                (value & 0xFFFFFFFF),
+            Spr.tbu_write => self.time_base = (self.time_base & 0xFFFFFFFF) |
+                (value << 32),
+            // PVR and PIR identify the processor. A write is architecturally
+            // ignored rather than refused: the kernel does not expect a fault.
+            Spr.pvr, Spr.pir => {},
+            else => {
+                const index = storageSlot(number) orelse return false;
+                self.spr_storage[index] = value;
+            },
         }
         return true;
     }
@@ -303,6 +392,43 @@ test "SPR reads and writes route to the architected slots" {
     try std.testing.expectEqual(@as(?u64, 0x8205_1234), state.readSpr(Spr.lr));
     // An SPR Rosette does not model reports itself rather than silently
     // returning zero, so an unmodelled kernel SPR is visible as a gap.
-    try std.testing.expectEqual(@as(?u64, null), state.readSpr(1013));
-    try std.testing.expect(!state.writeSpr(1013, 1));
+    try std.testing.expectEqual(@as(?u64, null), state.readSpr(700));
+    try std.testing.expect(!state.writeSpr(700, 1));
+}
+
+test "VRSAVE round-trips so a vector save/restore pair is not lossy" {
+    var state = State{};
+    try std.testing.expect(state.writeSpr(Spr.vrsave, 0xFFFF_0001));
+    try std.testing.expectEqual(@as(?u64, 0xFFFF_0001), state.readSpr(Spr.vrsave));
+    try std.testing.expectEqual(@as(u32, 0xFFFF_0001), state.vrsave);
+}
+
+test "a storage-backed Xenon SPR reads back exactly what was written" {
+    var state = State{};
+    for (Spr.storage_backed) |number| {
+        const value: u64 = 0x1000 + @as(u64, number);
+        try std.testing.expect(state.writeSpr(number, value));
+        try std.testing.expectEqual(@as(?u64, value), state.readSpr(number));
+    }
+    // Each one has its own slot: writing one must not disturb another.
+    try std.testing.expect(state.readSpr(Spr.hid0).? != state.readSpr(Spr.hid1).?);
+}
+
+test "the time base is written through 284/285 and read through 268/269" {
+    var state = State{};
+    try std.testing.expect(state.writeSpr(Spr.tbl_write, 0xAABB_CCDD));
+    try std.testing.expect(state.writeSpr(Spr.tbu_write, 0x1122_3344));
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_AABB_CCDD), state.time_base);
+    try std.testing.expectEqual(@as(?u64, 0xAABB_CCDD), state.readSpr(Spr.tbl_read));
+    try std.testing.expectEqual(@as(?u64, 0x1122_3344), state.readSpr(Spr.tbu_read));
+}
+
+test "PVR and PIR accept a write without faulting and keep identifying the core" {
+    var state = State{};
+    const pvr_before = state.readSpr(Spr.pvr).?;
+    // Hardware ignores the write; refusing it would fault a kernel that does
+    // not expect one.
+    try std.testing.expect(state.writeSpr(Spr.pvr, 0));
+    try std.testing.expectEqual(@as(?u64, pvr_before), state.readSpr(Spr.pvr));
+    try std.testing.expectEqual(@as(?u64, 0), state.readSpr(Spr.pir));
 }

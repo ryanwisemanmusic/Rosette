@@ -89,6 +89,13 @@ pub fn execute(c: *Context, insn: Instruction) Fault!Outcome {
         .lmw => loadMultiple(c, insn),
         .stmw => storeMultiple(c, insn),
 
+        // String forms. The byte count is immediate for the `i` variants and
+        // comes from XER for the `x` ones.
+        .lswi => loadString(c, insn, .immediate),
+        .lswx => loadString(c, insn, .from_xer),
+        .stswi => storeString(c, insn, .immediate),
+        .stswx => storeString(c, insn, .from_xer),
+
         // Load-and-reserve / store-conditional.
         .lwarx => loadReserve(c, insn, u32),
         .ldarx => loadReserve(c, insn, u64),
@@ -99,7 +106,8 @@ pub fn execute(c: *Context, insn: Instruction) Fault!Outcome {
         // rest are hints, and Rosette's guest memory is already coherent.
         .dcbz => zeroCacheBlock(c, insn, 32),
         .dcbz128 => zeroCacheBlock(c, insn, 128),
-        .dcbf, .dcbi, .dcbst, .dcbt, .dcbtst, .icbi => .advance,
+        .icbi => invalidateInstructionCache(c, insn),
+        .dcbf, .dcbi, .dcbst, .dcbt, .dcbtst => .advance,
 
         else => .{ .unimplemented = insn.op },
     };
@@ -218,6 +226,102 @@ fn storeMultiple(c: *Context, insn: Instruction) Fault!Outcome {
     return .advance;
 }
 
+// ---------------------------------------------------------------------------
+// String moves
+//
+// `lswi`/`lswx` fill consecutive registers a byte at a time, starting at rD and
+// wrapping r31 -> r0. Two details decide whether the result is right:
+//
+//   * Bytes land in the register from the *high* end of its low word down, so
+//     the first byte of a four-byte group becomes bits 32..39 and the last
+//     becomes bits 56..63. Filling from the low end instead reverses every
+//     group of four, which looks like an endianness bug in the caller.
+//   * A partial final register is zero-filled in the bytes the count did not
+//     reach, not left holding what it had. A guest that reads the tail of a
+//     short string would otherwise see the previous contents.
+//
+// The count is 32 when the NB field is zero: NB encodes 1..32 in five bits, so
+// the zero encoding has to mean the maximum.
+// ---------------------------------------------------------------------------
+
+const StringCount = enum { immediate, from_xer };
+
+fn stringByteCount(c: *const Context, insn: Instruction, comptime source: StringCount) u32 {
+    return switch (source) {
+        .immediate => blk: {
+            const nb = insn.x().nb();
+            break :blk if (nb == 0) 32 else @as(u32, nb);
+        },
+        // XER's low seven bits carry the transfer count, and zero means zero -
+        // a zero-length string move is a defined no-op, not a 128-byte one.
+        .from_xer => @as(u32, c.state.xer.byte_count),
+    };
+}
+
+fn stringAddress(c: *const Context, insn: Instruction, comptime source: StringCount) u32 {
+    const f = insn.x();
+    return switch (source) {
+        // lswi addresses rA alone; lswx adds rB.
+        .immediate => @truncate(c.state.ra0(f.ra())),
+        .from_xer => @truncate(c.state.ra0(f.ra()) +% c.gpr(f.rb())),
+    };
+}
+
+fn loadString(c: *Context, insn: Instruction, comptime source: StringCount) Fault!Outcome {
+    const f = insn.x();
+    const count = stringByteCount(c, insn, source);
+    if (count == 0) return .advance;
+
+    var ea = stringAddress(c, insn, source);
+    var reg: u5 = f.rt();
+    var byte_in_word: u32 = 0;
+    var accumulator: u64 = 0;
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const byte: u64 = try c.memory.read(u8, ea);
+        // Bits 32..39 first, then 40..47, and so on: the shift walks down the
+        // low word from its high byte.
+        accumulator |= byte << @intCast(24 - byte_in_word * 8);
+        ea +%= 1;
+        byte_in_word += 1;
+        if (byte_in_word == 4) {
+            c.setGpr(reg, accumulator);
+            accumulator = 0;
+            byte_in_word = 0;
+            reg = reg +% 1;
+        }
+    }
+    // The final partial register keeps the zeros the accumulator started with.
+    if (byte_in_word != 0) c.setGpr(reg, accumulator);
+    return .advance;
+}
+
+fn storeString(c: *Context, insn: Instruction, comptime source: StringCount) Fault!Outcome {
+    const f = insn.x();
+    const count = stringByteCount(c, insn, source);
+    if (count == 0) return .advance;
+
+    var ea = stringAddress(c, insn, source);
+    var reg: u5 = f.rs();
+    var byte_in_word: u32 = 0;
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const word: u64 = c.gpr(reg);
+        const byte: u8 = @truncate(word >> @intCast(24 - byte_in_word * 8));
+        try c.memory.write(u8, ea, byte);
+        c.breakReservation(ea);
+        ea +%= 1;
+        byte_in_word += 1;
+        if (byte_in_word == 4) {
+            byte_in_word = 0;
+            reg = reg +% 1;
+        }
+    }
+    return .advance;
+}
+
 fn loadReserve(c: *Context, insn: Instruction, comptime T: type) Fault!Outcome {
     const f = insn.x();
     const ea: u32 = @truncate(c.state.ra0(f.ra()) +% c.gpr(f.rb()));
@@ -241,6 +345,18 @@ fn storeConditional(c: *Context, insn: Instruction, comptime T: type) Fault!Outc
     if (c.state.xer.so) cr0 |= 0b0001;
     c.state.setCrField(0, cr0);
     c.state.reservation.clear();
+    return .advance;
+}
+
+/// `icbi` is the guest telling the machine that the instructions in a block
+/// have changed. Rosette's interpreter re-fetches every instruction and does
+/// not care, but a compiled block was built from the previous contents, so the
+/// address is recorded for the dispatcher to act on. Treating `icbi` as a pure
+/// no-op is what makes a recompiler run stale code after a module is patched.
+fn invalidateInstructionCache(c: *Context, insn: Instruction) Outcome {
+    const f = insn.x();
+    const ea: u32 = @truncate(c.state.ra0(f.ra()) +% c.gpr(f.rb()));
+    c.state.pending_icache_invalidation = ea;
     return .advance;
 }
 
@@ -393,6 +509,106 @@ test "an intervening store breaks the reservation" {
     try testing.expect(h.state.reservation.valid);
     _ = try h.run(dWord(36, 3, 4, 16)); // stw r3, 16(r4): same 128-byte block
     try testing.expect(!h.state.reservation.valid);
+}
+
+test "lswi packs bytes from the high end of each register's low word" {
+    var h = Harness{};
+    h.buf[0..8].* = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    h.state.gpr[4] = base_address;
+    // lswi r5, r4, 8 -> two full registers.
+    _ = try h.run((31 << 26) | (5 << 21) | (4 << 16) | (8 << 11) | (597 << 1));
+    try testing.expectEqual(@as(u64, 0x1122_3344), h.state.gpr[5]);
+    try testing.expectEqual(@as(u64, 0x5566_7788), h.state.gpr[6]);
+}
+
+test "a partial string register is zero-filled, not left holding stale bytes" {
+    var h = Harness{};
+    h.buf[0..8].* = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    h.state.gpr[4] = base_address;
+    h.state.gpr[6] = 0xDEAD_BEEF_DEAD_BEEF;
+    // lswi r5, r4, 6 -> one full register plus two bytes.
+    _ = try h.run((31 << 26) | (5 << 21) | (4 << 16) | (6 << 11) | (597 << 1));
+    try testing.expectEqual(@as(u64, 0x1122_3344), h.state.gpr[5]);
+    try testing.expectEqual(@as(u64, 0x5566_0000), h.state.gpr[6]);
+}
+
+test "an NB field of zero means the maximum transfer, not none" {
+    var h = Harness{};
+    for (0..32) |i| h.buf[i] = @intCast(i + 1);
+    h.state.gpr[4] = base_address;
+    // lswi r0, r4, 0 -> 32 bytes into r0..r7.
+    _ = try h.run((31 << 26) | (0 << 21) | (4 << 16) | (0 << 11) | (597 << 1));
+    try testing.expectEqual(@as(u64, 0x0102_0304), h.state.gpr[0]);
+    try testing.expectEqual(@as(u64, 0x1D1E_1F20), h.state.gpr[7]);
+}
+
+test "the string register run wraps from r31 back to r0" {
+    var h = Harness{};
+    h.buf[0..8].* = .{ 0xAA, 0xAA, 0xAA, 0xAA, 0xBB, 0xBB, 0xBB, 0xBB };
+    h.state.gpr[4] = base_address;
+    // lswi r31, r4, 8 -> r31 then r0.
+    _ = try h.run((31 << 26) | (31 << 21) | (4 << 16) | (8 << 11) | (597 << 1));
+    try testing.expectEqual(@as(u64, 0xAAAA_AAAA), h.state.gpr[31]);
+    try testing.expectEqual(@as(u64, 0xBBBB_BBBB), h.state.gpr[0]);
+}
+
+test "lswx and stswx take their length from XER" {
+    var h = Harness{};
+    h.buf[0..4].* = .{ 0xDE, 0xAD, 0xBE, 0xEF };
+    h.state.gpr[4] = base_address;
+    h.state.gpr[5] = 0;
+    h.state.xer.byte_count = 3;
+    // lswx r6, r4, r5
+    _ = try h.run((31 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (533 << 1));
+    try testing.expectEqual(@as(u64, 0xDEAD_BE00), h.state.gpr[6]);
+
+    // A zero count is a defined no-op rather than a maximum transfer.
+    h.state.gpr[7] = 0x1234;
+    h.state.xer.byte_count = 0;
+    _ = try h.run((31 << 26) | (7 << 21) | (4 << 16) | (5 << 11) | (533 << 1));
+    try testing.expectEqual(@as(u64, 0x1234), h.state.gpr[7]);
+}
+
+test "stswi round-trips through lswi" {
+    var h = Harness{};
+    h.state.gpr[4] = base_address;
+    h.state.gpr[10] = 0x0102_0304;
+    h.state.gpr[11] = 0x0506_0708;
+    // stswi r10, r4, 8
+    _ = try h.run((31 << 26) | (10 << 21) | (4 << 16) | (8 << 11) | (725 << 1));
+    try testing.expectEqual(@as(u8, 0x01), h.buf[0]);
+    try testing.expectEqual(@as(u8, 0x08), h.buf[7]);
+
+    h.state.gpr[10] = 0;
+    h.state.gpr[11] = 0;
+    _ = try h.run((31 << 26) | (10 << 21) | (4 << 16) | (8 << 11) | (597 << 1));
+    try testing.expectEqual(@as(u64, 0x0102_0304), h.state.gpr[10]);
+    try testing.expectEqual(@as(u64, 0x0506_0708), h.state.gpr[11]);
+}
+
+test "stswx writes exactly the XER byte count" {
+    var h = Harness{};
+    @memset(h.buf[0..8], 0xFF);
+    h.state.gpr[4] = base_address;
+    h.state.gpr[5] = 0;
+    h.state.gpr[6] = 0x1122_3344;
+    h.state.xer.byte_count = 2;
+    // stswx r6, r4, r5
+    _ = try h.run((31 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (661 << 1));
+    try testing.expectEqual(@as(u8, 0x11), h.buf[0]);
+    try testing.expectEqual(@as(u8, 0x22), h.buf[1]);
+    try testing.expectEqual(@as(u8, 0xFF), h.buf[2]);
+}
+
+test "icbi records the block whose instructions changed" {
+    var h = Harness{};
+    h.state.gpr[4] = base_address;
+    h.state.gpr[5] = 0x40;
+    try testing.expectEqual(@as(?u32, null), h.state.pending_icache_invalidation);
+    _ = try h.run(xWord(0, 4, 5, 982)); // icbi
+    // A no-op here would leave a recompiler executing the previous contents of
+    // the block the guest just rewrote.
+    try testing.expectEqual(@as(?u32, base_address + 0x40), h.state.pending_icache_invalidation);
 }
 
 test "dcbz zeroes a block and dcbt is a no-op" {

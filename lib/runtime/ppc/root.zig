@@ -15,9 +15,11 @@
 //!   loadstore  - loads, stores, atomics, cache management
 //!   fpu        - floating point, conversion, FPSCR
 //!   vmx        - AltiVec
+//!   vmx128     - the Xenon's 128-register VMX128 extension
 //!   system     - system calls, SPRs, traps, barriers
 //!   execute    - opcode routing and the step loop
 //!   host_abi   - the C ABI an embedder (Xenia's macOS PPC backend) calls
+//!   jit        - the PowerPC to ARM64 block recompiler
 //!
 //! Coverage is measured, not asserted: `coverage()` runs every opcode in the
 //! table through the dispatcher and counts which ones reach a handler. A gap
@@ -34,9 +36,13 @@ pub const branch = @import("branch.zig");
 pub const loadstore = @import("loadstore.zig");
 pub const fpu = @import("fpu.zig");
 pub const vmx = @import("vmx.zig");
+pub const vmx128 = @import("vmx128.zig");
 pub const system = @import("system.zig");
 pub const execute = @import("execute.zig");
 pub const host_abi = @import("host_abi.zig");
+pub const jit = @import("jit/root.zig");
+/// Differential verification of the recompiler against the interpreter.
+const jit_differential = @import("jit_differential.zig");
 
 pub const State = state.State;
 pub const Xer = state.Xer;
@@ -71,6 +77,26 @@ pub const Coverage = struct {
     }
 };
 
+/// The encoding used to probe one opcode for coverage.
+///
+/// The canonical pattern has every variable field zeroed, which is a valid
+/// instruction for almost everything. The exceptions are the SPR moves: SPR 0
+/// and TBR 0 do not exist on any PowerPC, so probing with the zero pattern
+/// would report `mfspr` as unimplemented no matter how many SPRs are modelled.
+/// Probing those with a register the architecture actually defines measures the
+/// handler instead of the field.
+fn probeEncoding(op: Op) u32 {
+    const pattern = op.info().pattern;
+    // The SPR field stores its two five-bit halves swapped.
+    const spr_lr: u32 = ((8 & 0x1F) << 5) | ((8 >> 5) & 0x1F);
+    const tbr_tbl: u32 = ((268 & 0x1F) << 5) | ((268 >> 5) & 0x1F);
+    return switch (op) {
+        .mfspr, .mtspr => pattern | (spr_lr << 11),
+        .mftb => pattern | (tbr_tbl << 11),
+        else => pattern,
+    };
+}
+
 /// Probe every opcode in the table by executing its canonical encoding against
 /// scratch state, and count which ones reach a handler.
 ///
@@ -91,7 +117,7 @@ pub fn coverage() Coverage {
         if (op != .invalid) {
             total += 1;
             var ctx = Context.init(&scratch, Memory.fromSlice(&buffer, 0));
-            const insn = ppc_decode.decodeWord(0, op.info().pattern);
+            const insn = ppc_decode.decodeWord(0, probeEncoding(op));
             if (execute.executeInstruction(&ctx, insn)) |outcome| {
                 switch (outcome) {
                     .unimplemented, .illegal => {},
@@ -124,7 +150,7 @@ pub fn reportCoverage(writer: anytype) !void {
                 if (op != .invalid and execute.unitOf(op) == unit) {
                     unit_total += 1;
                     var ctx = Context.init(&scratch, Memory.fromSlice(&buffer, 0));
-                    const insn = ppc_decode.decodeWord(0, op.info().pattern);
+                    const insn = ppc_decode.decodeWord(0, probeEncoding(op));
                     if (execute.executeInstruction(&ctx, insn)) |outcome| {
                         switch (outcome) {
                             .unimplemented, .illegal => {},
@@ -150,21 +176,41 @@ test {
     _ = loadstore;
     _ = fpu;
     _ = vmx;
+    _ = vmx128;
     _ = system;
     _ = execute;
     _ = host_abi;
+    _ = jit;
+    _ = jit_differential;
 }
 
 test "instruction coverage is measured and does not regress" {
     const summary = coverage();
     try std.testing.expectEqual(@as(usize, 455), summary.total);
-    // 313/455 as of this pass: the scalar core is complete (integer 67/67,
-    // branch 13/13, float 56/56) and AltiVec is 104/239. The gaps are the 75
-    // VMX128 encodings, the AltiVec multiply-accumulate and pack tail, and the
-    // four string load/store forms - each named individually by the dispatcher
-    // rather than silently executed as something else.
-    try std.testing.expect(summary.implemented >= 313);
-    try std.testing.expectEqual(summary.total, summary.implemented + summary.gaps);
+    // Every Xenon encoding reaches a handler. The measurement is a probe, not
+    // an assertion in a comment: it executes each opcode's canonical encoding
+    // through the dispatcher, so a handler that is deleted or misrouted shows
+    // up here rather than as a guest that behaves oddly.
+    try std.testing.expectEqual(@as(usize, 455), summary.implemented);
+    try std.testing.expectEqual(@as(usize, 0), summary.gaps);
+}
+
+test "the 4-20-20-20 vertex sub-format reaches the VMX128 handler" {
+    var scratch: State = .{};
+    var buffer: [256]u8 = [_]u8{0} ** 256;
+    var ctx = Context.init(&scratch, Memory.fromSlice(&buffer, 0));
+
+    const four_twenty = @as(u32, 6) << 2; // type 6 in the VX128_3/4 immediate
+    const unpack_word = Op.vupkd3d128.info().pattern | (four_twenty << 16);
+    const high = (@as(u32, 0xA) << 28) | (@as(u32, 0x34567) << 8) | 0xFF;
+    const low = (@as(u32, 0xFFFFF) << 20) | 0x12345;
+    scratch.vr[0] = .{ 0, 0, high, low };
+    const outcome = try executeInstruction(&ctx, decodeWord(0, unpack_word));
+    try std.testing.expectEqual(Outcome.advance, outcome);
+    try std.testing.expectEqual(@as(u32, 0x40412345), scratch.vr[0][0]);
+    try std.testing.expectEqual(@as(u32, 0x403FFFFF), scratch.vr[0][1]);
+    try std.testing.expectEqual(@as(u32, 0x40434567), scratch.vr[0][2]);
+    try std.testing.expectEqual(@as(u32, 0x3F80000A), scratch.vr[0][3]);
 }
 
 test "every implemented instruction belongs to a real execution unit" {

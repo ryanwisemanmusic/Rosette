@@ -21,6 +21,7 @@ const branch = @import("branch.zig");
 const loadstore = @import("loadstore.zig");
 const fpu = @import("fpu.zig");
 const vmx = @import("vmx.zig");
+const vmx128 = @import("vmx128.zig");
 const system = @import("system.zig");
 
 pub const Context = ctx_mod.Context;
@@ -35,6 +36,9 @@ pub const Unit = enum {
     loadstore,
     floating_point,
     vector,
+    /// The Xenon's VMX128 extension. Split from `vector` because its encodings
+    /// name registers differently, not because the operations differ.
+    vector128,
     system,
     /// No unit: the encoding decoded to nothing.
     none,
@@ -76,6 +80,18 @@ fn unitFor(comptime op: Op) Unit {
     for (vector_ops) |candidate| if (op == candidate) return .vector;
 
     const name = @tagName(op);
+    // The VMX128 encodings come first: `lvx128` is a vector load, but not a
+    // *VMX* one, and routing it by its `lv` prefix would decode its registers
+    // with the wrong field layout.
+    //
+    // `dcbz128` is the exception the name test would get wrong: the 128 is the
+    // cache-block size, not the register file, and it is an ordinary DCBZ-form
+    // cache instruction that belongs with the other memory operations.
+    if (op != .dcbz128 and name.len > 3 and
+        std.mem.eql(u8, name[name.len - 3 ..], "128"))
+    {
+        return .vector128;
+    }
     // Vector memory before scalar memory: `lvx` is a load, but not a GPR load.
     if (startsWith(name, "lv") or startsWith(name, "stv")) return .vector;
     if (name[0] == 'v') return .vector;
@@ -114,6 +130,7 @@ pub fn executeInstruction(c: *Context, insn: Instruction) Fault!Outcome {
         .loadstore => loadstore.execute(c, insn),
         .floating_point => fpu.execute(c, insn),
         .vector => vmx.execute(c, insn),
+        .vector128 => vmx128.execute(c, insn),
         .system => system.execute(c, insn),
         .none => .illegal,
     };
@@ -219,6 +236,11 @@ test "the routing exceptions land where the group would not put them" {
     try testing.expectEqual(Unit.floating_point, unitOf(.mffsx));
     // Grouped with the condition register, executed by the vector unit.
     try testing.expectEqual(Unit.vector, unitOf(.mfvscr));
+    // The VMX128 encodings have their own unit, but `dcbz128` is a cache
+    // instruction whose 128 is a block size, not a register file.
+    try testing.expectEqual(Unit.vector128, unitOf(.lvx128));
+    try testing.expectEqual(Unit.vector128, unitOf(.vpermwi128));
+    try testing.expectEqual(Unit.loadstore, unitOf(.dcbz128));
 }
 
 test "every opcode routes somewhere" {
@@ -302,16 +324,18 @@ test "a system call stops the run with the PC still on the sc" {
     try testing.expectEqual(base_address + 4, h.state.pc);
 }
 
-test "an unimplemented instruction stops the run and names itself" {
+test "the 4-20-20-20 vertex sub-format executes before a later system call" {
     var h = Harness{};
+    const four_twenty = Op.vupkd3d128.info().pattern | (@as(u32, 6) << 18);
+    h.state.vr[0] = .{ 0, 0, 0xA34567FF, 0xFFF12345 };
     h.load(&.{
-        0x38600001, // li r3, 1
-        0x18000210, // vpermwi128
+        four_twenty,
+        0x44000002, // sc
     });
     var c = h.context();
     const stop = try run(&c, 10);
-    try testing.expectEqual(Op.vpermwi128, stop.unimplemented.op);
-    try testing.expectEqual(base_address + 4, stop.unimplemented.address);
+    try testing.expectEqual(@as(u7, 0), stop.system_call);
+    try testing.expectEqual([4]u32{ 0x40412345, 0x403FFFFF, 0x40434567, 0x3F80000A }, h.state.vr[0]);
     try testing.expectEqual(base_address + 4, h.state.pc);
 }
 
