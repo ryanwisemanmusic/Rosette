@@ -1,0 +1,9 @@
+name = "xenia-x86-graphics-contract"
+version = "0.1.0-local"
+kind = "guest-vdswap-handoff-contract"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
+
+# This package records source-level Xenia handoff facts. It never supplies a
+# guest address, command buffer, native handle, or presentation result.
