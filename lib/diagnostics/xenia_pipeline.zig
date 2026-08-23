@@ -257,9 +257,14 @@ pub fn classifyLine(line: []const u8) ?Stage {
         return .disc_mounted;
     if (contains(line, "Emulator::CompleteLaunch ENTRY")) return .complete_launch_started;
     if (contains(line, "Module loaded successfully")) return .user_module_loaded;
+    if (contains(line, "FinishLoadingUserModule stage=Precompile.begin")) return .precompile_requested;
+    if (contains(line, "FinishLoadingUserModule stage=Precompile.end") or
+        contains(line, "XexModule::Precompile END"))
+        return .precompile_completed;
     if (contains(line, "User module finished loading successfully") or
         contains(line, "module fully ready"))
         return .user_module_ready;
+    if (contains(line, "Initializing shader storage")) return .shader_storage_requested;
     if (contains(line, "Shader storage init request completed")) return .shader_storage_ready;
     if (contains(line, "Guest main thread ready") or
         (contains(line, "GUEST EXECUTE:") and contains(line, "fid=0")))
@@ -299,7 +304,10 @@ test "pipeline records the setup launch and first-frame frontier" {
         "LaunchPath: Detected XISO",
         "DEBUG: Emulator::CompleteLaunch ENTRY",
         "DEBUG: Module loaded successfully",
+        "[DEBUG] KernelState::FinishLoadingUserModule stage=Precompile.begin",
+        "[DEBUG] KernelState::FinishLoadingUserModule stage=Precompile.end",
         "DEBUG: User module finished loading successfully",
+        "DEBUG: Initializing shader storage...",
         "DEBUG: Shader storage init request completed",
         "DEBUG: Guest main thread ready",
         "DEBUG: CompleteLaunch SUCCEEDED",
@@ -360,7 +368,10 @@ test "pipeline distinguishes callback import readiness from guest registration" 
         "LaunchPath: Detected XISO",
         "DEBUG: Emulator::CompleteLaunch ENTRY",
         "DEBUG: Module loaded successfully",
+        "[DEBUG] KernelState::FinishLoadingUserModule stage=Precompile.begin",
+        "[DEBUG] KernelState::FinishLoadingUserModule stage=Precompile.end",
         "DEBUG: User module finished loading successfully",
+        "DEBUG: Initializing shader storage...",
         "DEBUG: Shader storage init request completed",
         "DEBUG: Guest main thread ready",
     };
