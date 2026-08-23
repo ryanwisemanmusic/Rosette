@@ -69,6 +69,26 @@ pub const Runtime = struct {
     longest_same_site_run: u64 = 0,
     slow_progress_reports: u64 = 0,
     slow_progress_notified_at: u64 = 0,
+    /// Per-thread view of the same window. One aggregate table averages a
+    /// parked consumer and a busy producer into a shape that describes
+    /// neither, which is how a starved ring reads as ordinary execution.
+    stall_threads: [types.max_stall_threads]types.ThreadSample =
+        [_]types.ThreadSample{.{}} ** types.max_stall_threads,
+    stall_thread_count: usize = 0,
+    stall_threads_dropped: u64 = 0,
+
+    // --- Scheduler/wait evidence -----------------------------------------
+    // A hot `yield_processor` site is only actionable when the scheduler says
+    // no producer can run and the wait graph says the predicate has stayed
+    // unchanged. The fields are supplied on heartbeat cadence by the Mach-O
+    // host; they are intentionally not guessed from instruction samples.
+    runnable_threads: u64 = 0,
+    parked_threads: u64 = 0,
+    wait_object: u64 = 0,
+    wait_notifications: u64 = 0,
+    wait_first_step: u64 = 0,
+    wait_last_change_step: u64 = 0,
+    scheduling_evidence_step: u64 = 0,
 
     pub fn configure(self: *Runtime, contract: types.Contract, enforce: bool) void {
         self.* = .{
@@ -85,6 +105,27 @@ pub const Runtime = struct {
 
     pub fn enabled(self: *const Runtime) bool {
         return self.phase != .disabled;
+    }
+
+    /// A zero total budget is intentional for the Xenia gameplay contract.
+    /// Quiet-window diagnostics and typed compile/ordering failures remain
+    /// active; this only answers whether the aggregate activation counter can
+    /// stop the run.
+    pub fn activationBudgetUnlimited(self: *const Runtime) bool {
+        const contract = self.contract orelse return true;
+        return contract.activation_budget_steps == 0;
+    }
+
+    pub fn activationBudgetMode(self: *const Runtime) []const u8 {
+        return if (self.activationBudgetUnlimited()) "unlimited" else "finite";
+    }
+
+    /// The readiness gate is terminal once authentic native presentation has
+    /// been proven. The application may continue running gameplay, but this
+    /// startup compiler must not keep selecting activation work after that
+    /// point.
+    pub fn terminal(self: *const Runtime) bool {
+        return self.phase == .ready or self.phase == .failed;
     }
 
     pub fn beginCompile(self: *Runtime, step: u64) void {
@@ -243,7 +284,7 @@ pub const Runtime = struct {
     /// This is intentionally separate from a semantic milestone: a loop can
     /// execute billions of instructions without completing startup.
     pub fn noteProgress(self: *Runtime, step: u64, rip: u64, thread: u64, source: []const u8) void {
-        if (!self.enabled() or self.phase == .failed) return;
+        if (!self.enabled() or self.phase == .failed or self.phase == .ready) return;
         self.noteExecutionSample(step, rip, thread);
         self.last_source = source;
     }
@@ -256,7 +297,7 @@ pub const Runtime = struct {
     /// handful of samples per run cannot tell a loop from forward motion.
     /// Everything here is O(1) so the finer cadence stays affordable.
     pub fn noteExecutionSample(self: *Runtime, step: u64, rip: u64, thread: u64) void {
-        if (!self.enabled() or self.phase == .failed) return;
+        if (!self.enabled() or self.phase == .failed or self.phase == .ready) return;
         if (step >= self.last_progress_step) self.last_progress_step = step;
         // Track whether the witness is moving before overwriting it. A step
         // count alone cannot separate a spin from forward execution, because
@@ -272,6 +313,68 @@ pub const Runtime = struct {
         self.last_rip = rip;
         self.last_thread = thread;
         self.sampleSite(rip, thread, step);
+        self.sampleThread(rip, thread, step);
+    }
+
+    /// Attribute one sample to its thread. The table is capped at a handful of
+    /// entries and scanned linearly: startup only has a few interesting
+    /// threads, and a bounded scan of that size costs less than the hash it
+    /// would replace.
+    fn sampleThread(self: *Runtime, rip: u64, thread: u64, step: u64) void {
+        for (self.stall_threads[0..self.stall_thread_count]) |*entry| {
+            if (entry.thread != thread) continue;
+            if (rip != entry.last_rip) entry.rip_changes +|= 1;
+            entry.last_rip = rip;
+            entry.samples +|= 1;
+            entry.last_step = step;
+            return;
+        }
+        if (self.stall_thread_count >= self.stall_threads.len) {
+            self.stall_threads_dropped +|= 1;
+            return;
+        }
+        self.stall_threads[self.stall_thread_count] = .{
+            .thread = thread,
+            .samples = 1,
+            .last_rip = rip,
+            .first_step = step,
+            .last_step = step,
+        };
+        self.stall_thread_count += 1;
+    }
+
+    /// The thread that moved least during the window. A thread that never
+    /// changed its instruction pointer is parked, whatever the aggregate site
+    /// spread says about the process as a whole.
+    pub fn mostParkedThread(self: *const Runtime) types.ThreadSample {
+        var best: types.ThreadSample = .{};
+        for (self.stall_threads[0..self.stall_thread_count]) |entry| {
+            if (!entry.parked()) continue;
+            if (entry.samples > best.samples) best = entry;
+        }
+        return best;
+    }
+
+    /// The stage that consumed the most steps.
+    ///
+    /// When a total budget runs out this is the only actionable fact in the
+    /// report: the contract did not fail, one stage ate the allowance.
+    pub fn costliestStage(self: *const Runtime) ?types.StageSpec {
+        const contract = self.contract orelse return null;
+        var best: ?types.StageSpec = null;
+        var best_steps: u64 = 0;
+        for (contract.stages) |spec| {
+            const duration = self.stage_duration[@intCast(spec.id)];
+            if (duration <= best_steps) continue;
+            best_steps = duration;
+            best = spec;
+        }
+        return best;
+    }
+
+    pub fn stageDuration(self: *const Runtime, id: u8) u64 {
+        if (id >= self.stage_duration.len) return 0;
+        return self.stage_duration[@intCast(id)];
     }
 
     /// Record one named sub-milestone breadcrumb.
@@ -282,14 +385,22 @@ pub const Runtime = struct {
     /// without being reported as a hang, while one that goes genuinely silent
     /// still trips the window.
     pub fn noteWorkUnit(self: *Runtime, name: []const u8, step: u64) void {
-        if (!self.enabled() or self.phase == .failed) return;
+        self.noteWorkUnitAt(name, step, 0, 0);
+    }
+
+    /// Record the producer context alongside the breadcrumb. A text line is
+    /// useful as a coordinate, but the thread and guest RIP answer the harder
+    /// question: did the owner make this progress, or did another worker merely
+    /// emit a log while the owner remained parked?
+    pub fn noteWorkUnitAt(self: *Runtime, name: []const u8, step: u64, thread: u64, rip: u64) void {
+        if (!self.enabled() or self.phase == .failed or self.phase == .ready) return;
         if (name.len == 0) return;
         // A repeated identical breadcrumb is a loop, not progress. Requiring
         // the name to change keeps a chatty retry loop from holding the quiet
         // window open forever.
         if (self.work_unit.matches(name)) return;
-        self.work_unit.set(name, step);
-        self.work_unit_history[self.work_unit_history_index].set(name, step);
+        self.work_unit.setAt(name, step, thread, rip);
+        self.work_unit_history[self.work_unit_history_index].setAt(name, step, thread, rip);
         self.work_unit_history_index = (self.work_unit_history_index + 1) %
             self.work_unit_history.len;
         self.work_unit_count +|= 1;
@@ -373,12 +484,76 @@ pub const Runtime = struct {
         return best;
     }
 
+    /// The `rank`-th hottest site, rank zero being the hottest, ordered by
+    /// samples descending and address ascending so the order is stable.
+    ///
+    /// Repeated selection rather than a sort: the table is small and fixed,
+    /// and sorting in place would reorder live state while a report walks it.
+    /// Returns an empty site once the ranks are exhausted.
+    pub fn siteByRank(self: *const Runtime, rank: usize) types.StallSite {
+        var previous_samples: u64 = ~@as(u64, 0);
+        var previous_rip: u64 = 0;
+        var position: usize = 0;
+        var chosen: types.StallSite = .{};
+        while (position <= rank) : (position += 1) {
+            chosen = .{};
+            for (self.stall_sites) |site| {
+                if (site.samples == 0) continue;
+                const after_previous = site.samples < previous_samples or
+                    (site.samples == previous_samples and site.rip > previous_rip);
+                if (!after_previous) continue;
+                const better = chosen.samples == 0 or site.samples > chosen.samples or
+                    (site.samples == chosen.samples and site.rip < chosen.rip);
+                if (better) chosen = site;
+            }
+            if (chosen.samples == 0) return .{};
+            previous_samples = chosen.samples;
+            previous_rip = chosen.rip;
+        }
+        return chosen;
+    }
+
     pub fn distinctSites(self: *const Runtime) usize {
         var count: usize = 0;
         for (self.stall_sites) |site| {
             if (site.samples != 0) count += 1;
         }
         return count;
+    }
+
+    pub fn noteSchedulingEvidence(
+        self: *Runtime,
+        runnable_threads: u64,
+        parked_threads: u64,
+        wait_object: u64,
+        wait_notifications: u64,
+        wait_first_step: u64,
+        wait_last_change_step: u64,
+        step: u64,
+    ) void {
+        if (!self.enabled() or self.phase == .ready) return;
+        self.runnable_threads = runnable_threads;
+        self.parked_threads = parked_threads;
+        self.wait_object = wait_object;
+        self.wait_notifications = wait_notifications;
+        self.wait_first_step = wait_first_step;
+        self.wait_last_change_step = wait_last_change_step;
+        self.scheduling_evidence_step = step;
+    }
+
+    pub fn spinVerdict(self: *const Runtime, step: u64) types.SpinVerdict {
+        if (!self.spinning()) return .not_concentrated;
+        if (self.runnable_threads != 0) return .runnable_producer_present;
+        if (self.wait_object == 0) return .predicate_unobserved;
+        const contract = self.contract orelse return .predicate_recently_changed;
+        const stable_since = if (self.wait_notifications == 0)
+            self.wait_first_step
+        else
+            self.wait_last_change_step;
+        if (stable_since == 0 or step -| stable_since < contract.quiet_budget_steps) {
+            return .predicate_recently_changed;
+        }
+        return .scheduling_starvation;
     }
 
     /// Clear the quiet-window evidence. Called when a contract edge is
@@ -390,13 +565,16 @@ pub const Runtime = struct {
         self.stall_site_evictions = 0;
         self.same_site_run = 0;
         self.longest_same_site_run = 0;
+        self.stall_threads = [_]types.ThreadSample{.{}} ** types.max_stall_threads;
+        self.stall_thread_count = 0;
+        self.stall_threads_dropped = 0;
     }
 
     /// Observe a contract edge. Missing prerequisites are failures, not merely
     /// statistics, because the purpose of this layer is to stop an invalid
     /// startup order before downstream symptoms bury it.
     pub fn noteStage(self: *Runtime, id: u8, step: u64, source: []const u8) bool {
-        if (!self.enabled() or self.phase == .failed) return false;
+        if (!self.enabled() or self.phase == .failed or self.phase == .ready) return false;
         const spec = self.stage(id) orelse {
             self.fail(.{
                 .kind = .missing_milestone,
@@ -447,7 +625,7 @@ pub const Runtime = struct {
     }
 
     pub fn noteWait(self: *Runtime, object: u64, signaled: bool, step: u64) void {
-        if (!self.enabled()) return;
+        if (!self.enabled() or self.phase == .ready) return;
         if (signaled) {
             self.wait_signal_count +|= 1;
             if (self.pending_wait_object == object) self.pending_wait_object = 0;
@@ -541,8 +719,8 @@ pub const Runtime = struct {
     /// The same text carries the guest's own progress breadcrumbs, so this is
     /// also where the work-unit axis is fed.
     pub fn observeCompilerText(self: *Runtime, line: []const u8, step: u64, rip: u64, thread: u64) void {
-        if (!self.enabled()) return;
-        if (workUnitFromText(line)) |name| self.noteWorkUnit(name, step);
+        if (!self.enabled() or self.phase == .ready) return;
+        if (workUnitFromText(line)) |name| self.noteWorkUnitAt(name, step, thread, rip);
         const kind = compilerDiagnosticKind(line) orelse return;
         self.compiler_diagnostic_count +|= 1;
         // The state machine deliberately keeps the first failure as the
@@ -611,7 +789,10 @@ pub const Runtime = struct {
             result.frontier_step = self.first_stage_step[@intCast(self.frontier_stage_id)];
         }
         result.last_work_unit = self.workUnitName();
+        result.last_work_unit_owner = self.work_unit.ownerSlice();
         result.last_work_unit_step = self.work_unit.step;
+        result.last_work_unit_thread = self.work_unit.thread;
+        result.last_work_unit_rip = self.work_unit.rip;
         result.work_units_since_milestone = self.workUnitsSinceMilestone();
         result.quiet_steps = step -| self.lastNamedProgressStep();
         result.quiet_budget_steps = contract.quiet_budget_steps;
@@ -620,10 +801,21 @@ pub const Runtime = struct {
         result.hot_site = self.hottestSite();
         result.distinct_sites = self.distinctSites();
         result.stall_samples = self.stall_samples;
+        result.spin_verdict = self.spinVerdict(step);
+        result.stall_evictions = self.stall_site_evictions;
         result.milestone_thread = self.milestone_thread;
         result.current_thread = self.last_thread;
         result.thread_changed = self.milestone_thread != 0 and
             self.milestone_thread != self.last_thread;
+        result.failure = self.failure.kind;
+        if (self.costliestStage()) |spec| {
+            result.costliest_stage = spec.name;
+            result.costliest_stage_steps = self.stageDuration(spec.id);
+            if (contract.activation_budget_steps != 0) {
+                result.costliest_stage_percent =
+                    (result.costliest_stage_steps *| 100) / contract.activation_budget_steps;
+            }
+        }
         return result;
     }
 
@@ -1174,6 +1366,33 @@ test "exhausting the total budget while work advances accuses the budget" {
     try std.testing.expectEqualStrings("Loader stage=Hash.begin", runtime.failure.observed);
 }
 
+test "an unlimited activation waits for the terminal contract instead of a step cap" {
+    const stages = [_]types.StageSpec{
+        .{ .id = 0, .name = "entry" },
+        .{ .id = 1, .name = "authentic_native_presented", .prerequisites = @as(u64, 1) },
+    };
+    var runtime = Runtime{};
+    runtime.configure(.{
+        .name = "test",
+        .stages = &stages,
+        .activation_budget_steps = 0,
+        .quiet_budget_steps = 0,
+    }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    try std.testing.expect(runtime.sealCompile(0));
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    try std.testing.expect(runtime.activationBudgetUnlimited());
+    try std.testing.expectEqualStrings("unlimited", runtime.activationBudgetMode());
+    try std.testing.expectEqual(types.Evaluation.waiting, runtime.evaluate(50_000_000_000));
+    try std.testing.expectEqual(types.FailureKind.none, runtime.failure.kind);
+
+    try std.testing.expect(runtime.noteStage(1, 50_000_000_001, "authentic native presentation"));
+    try std.testing.expectEqual(types.Evaluation.ready, runtime.evaluate(50_000_000_001));
+    try std.testing.expect(runtime.terminal());
+    try std.testing.expect(!runtime.noteStage(0, 50_000_000_002, "post-terminal duplicate"));
+}
+
 test "stage durations expose a stage that is merely slow" {
     const stages = [_]types.StageSpec{
         .{ .id = 0, .name = "entry" },
@@ -1279,4 +1498,118 @@ test "contract progress reads as an ordered block sequence" {
     const complete = runtime.contractProgress();
     try std.testing.expectEqual(@as(usize, 3), complete.required_reached);
     try std.testing.expectEqual(@as(usize, 3), complete.current_block);
+}
+
+test "guidance never tells a stopped run that nothing needs investigation" {
+    const stages = [_]types.StageSpec{
+        .{ .id = 0, .name = "entry" },
+        .{ .id = 1, .name = "frame", .prerequisites = @as(u64, 1) },
+    };
+    var runtime = Runtime{};
+    runtime.configure(.{
+        .name = "test",
+        .stages = &stages,
+        .activation_budget_steps = 100,
+        .quiet_budget_steps = 90,
+    }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    try std.testing.expect(runtime.sealCompile(0));
+    try std.testing.expect(runtime.noteStage(0, 20, "entry observed"));
+
+    // Inside the quiet grace period, but the total budget is gone. The old
+    // guidance keyed only on the progress class and answered "no investigation
+    // is required" on a run that had just been stopped.
+    try std.testing.expectEqual(types.ProgressClass.milestone_advancing, runtime.classifyProgress(100));
+    try std.testing.expectEqual(types.Evaluation.failed, runtime.evaluate(100));
+    try std.testing.expectEqual(types.FailureKind.activation_budget_exhausted, runtime.failure.kind);
+
+    const diagnosis = runtime.diagnose(100);
+    try std.testing.expectEqual(types.FailureKind.activation_budget_exhausted, diagnosis.failure);
+    try std.testing.expect(std.mem.indexOf(u8, diagnosis.guidance(), "no investigation") == null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnosis.guidance(), "activation_budget_steps") != null);
+}
+
+test "an exhausted budget names the stage that consumed it" {
+    const stages = [_]types.StageSpec{
+        .{ .id = 0, .name = "cheap" },
+        .{ .id = 1, .name = "expensive", .prerequisites = @as(u64, 1) },
+        .{ .id = 2, .name = "final", .prerequisites = @as(u64, 2) },
+    };
+    var runtime = Runtime{};
+    runtime.configure(.{
+        .name = "test",
+        .stages = &stages,
+        .activation_budget_steps = 1000,
+        .quiet_budget_steps = 900,
+    }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    try std.testing.expect(runtime.sealCompile(0));
+    try std.testing.expect(runtime.noteStage(0, 50, "cheap"));
+    try std.testing.expect(runtime.noteStage(1, 650, "expensive"));
+
+    const diagnosis = runtime.diagnose(1000);
+    try std.testing.expectEqualStrings("expensive", diagnosis.costliest_stage);
+    try std.testing.expectEqual(@as(u64, 600), diagnosis.costliest_stage_steps);
+    // Sixty percent of the whole allowance went to one stage: that, not the
+    // missing edge, is what the reader has to act on.
+    try std.testing.expectEqual(@as(u64, 60), diagnosis.costliest_stage_percent);
+}
+
+test "a parked consumer is separated from a busy producer" {
+    const stages = [_]types.StageSpec{
+        .{ .id = 0, .name = "entry" },
+        .{ .id = 1, .name = "frame", .prerequisites = @as(u64, 1) },
+    };
+    var runtime = Runtime{};
+    runtime.configure(.{
+        .name = "test",
+        .stages = &stages,
+        .activation_budget_steps = 100_000,
+        .quiet_budget_steps = 10,
+    }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    try std.testing.expect(runtime.sealCompile(0));
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // One thread parked on a single address, one walking new code. The
+    // aggregate table sees a wide spread and calls the process healthy; only
+    // the per-thread view shows the parked consumer.
+    var sample: u64 = 0;
+    while (sample < 40) : (sample += 1) {
+        runtime.noteExecutionSample(2 + sample * 2, 0xa000, 0x7fff2000);
+        runtime.noteExecutionSample(3 + sample * 2, 0xb000 + sample * 0x30, 0xfffff900);
+    }
+    try std.testing.expect(!runtime.spinning());
+
+    const parked = runtime.mostParkedThread();
+    try std.testing.expectEqual(@as(u64, 0x7fff2000), parked.thread);
+    try std.testing.expectEqual(@as(u64, 40), parked.samples);
+    try std.testing.expectEqual(@as(u64, 0), parked.mobilityPercent());
+    try std.testing.expect(parked.parked());
+
+    for (runtime.stall_threads[0..runtime.stall_thread_count]) |entry| {
+        if (entry.thread != 0xfffff900) continue;
+        try std.testing.expect(!entry.parked());
+        try std.testing.expect(entry.mobilityPercent() > 90);
+    }
+    try std.testing.expectEqual(@as(usize, 2), runtime.stall_thread_count);
+}
+
+test "sites are rankable so a report can lead with the one that matters" {
+    const stages = [_]types.StageSpec{.{ .id = 0, .name = "entry" }};
+    var runtime = Runtime{};
+    runtime.configure(.{ .name = "test", .stages = &stages, .quiet_budget_steps = 1000 }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    try std.testing.expect(runtime.sealCompile(0));
+
+    // One address sampled repeatedly, two sampled once each.
+    var sample: u64 = 0;
+    while (sample < 10) : (sample += 1) runtime.noteExecutionSample(10 + sample, 0xc000, 0x11);
+    runtime.noteExecutionSample(30, 0xd000, 0x11);
+    runtime.noteExecutionSample(31, 0xe000, 0x11);
+
+    try std.testing.expectEqual(@as(u64, 0xc000), runtime.siteByRank(0).rip);
+    try std.testing.expect(runtime.siteByRank(0).samples > runtime.siteByRank(1).samples);
+    // Ranks past the occupied slots must terminate rather than repeat.
+    try std.testing.expectEqual(@as(u64, 0), runtime.siteByRank(64).samples);
 }

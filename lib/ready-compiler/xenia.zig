@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const graphics_contract = @import("xenia_graphics_contract");
 
 pub const Stage = enum(u8) {
     image_ready,
@@ -28,7 +29,10 @@ pub const Stage = enum(u8) {
     disc_mounted,
     complete_launch_started,
     user_module_loaded,
+    precompile_requested,
+    precompile_completed,
     user_module_ready,
+    shader_storage_requested,
     shader_storage_ready,
     guest_main_ready,
     complete_launch_ready,
@@ -46,8 +50,60 @@ pub const Stage = enum(u8) {
     authentic_native_presented,
 };
 
-pub const pipeline_stage_count: u8 = 23;
-pub const pipeline_stage_base: u8 = @intFromEnum(Stage.emulator_setup_started);
+const graphics_handoff_stage_names = [_][]const u8{
+    "guest_vdswap_entered",
+    "guest_swap_packet_encoded",
+    "guest_vdswap_completed",
+    "guest_swap_published",
+    "authentic_swap_consumed",
+    "authentic_refresh_succeeded",
+    "authentic_native_presented",
+};
+
+comptime {
+    if (!graphics_contract.contractIsWellFormed()) {
+        @compileError("xenia graphics handoff package is internally inconsistent");
+    }
+    if (!graphics_contract.matchesReadyCompilerNames(graphics_handoff_stage_names[0..])) {
+        @compileError("xenia graphics handoff package drifted from the Ready Compiler contract");
+    }
+}
+
+/// The diagnostics pipeline has its own enum and now includes the three
+/// boundaries that used to be hidden inside `user_module_ready`. Keep this
+/// mapping explicit: arithmetic over the Ready Compiler enum would silently
+/// map a diagnostics stage to the wrong edge whenever an internal boundary is
+/// inserted into the activation contract.
+pub const pipeline_stages = [_]Stage{
+    .emulator_setup_started,
+    .memory_ready,
+    .processor_ready,
+    .patch_database_ready,
+    .kernel_globals_started,
+    .kernel_globals_ready,
+    .kernel_modules_ready,
+    .graphics_setup_started,
+    .command_processor_ready,
+    .graphics_ready,
+    .emulator_setup_ready,
+    .launch_path_started,
+    .disc_mounted,
+    .complete_launch_started,
+    .user_module_loaded,
+    .precompile_requested,
+    .precompile_completed,
+    .user_module_ready,
+    .shader_storage_requested,
+    .shader_storage_ready,
+    .guest_main_ready,
+    .complete_launch_ready,
+    .ring_buffer_ready,
+    .surface_ready,
+    .guest_output_ready,
+    .first_present,
+};
+
+pub const pipeline_stage_count: u8 = @intCast(pipeline_stages.len);
 
 fn bit(stage: Stage) u64 {
     return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(stage)));
@@ -73,8 +129,11 @@ const specs = [_]types.StageSpec{
     .{ .id = @intFromEnum(Stage.disc_mounted), .name = "disc_mounted", .prerequisites = bit(.launch_path_started), .owner = "xenia:vfs", .description = "XISO route selected" },
     .{ .id = @intFromEnum(Stage.complete_launch_started), .name = "complete_launch_started", .prerequisites = bit(.disc_mounted), .owner = "xenia:launcher", .description = "CompleteLaunch entered" },
     .{ .id = @intFromEnum(Stage.user_module_loaded), .name = "user_module_loaded", .prerequisites = bit(.complete_launch_started), .owner = "xenia:xex_loader", .description = "default.xex loaded" },
-    .{ .id = @intFromEnum(Stage.user_module_ready), .name = "user_module_ready", .prerequisites = bit(.user_module_loaded), .owner = "xenia:kernel_state", .description = "user module wiring completed" },
-    .{ .id = @intFromEnum(Stage.shader_storage_ready), .name = "shader_storage_ready", .prerequisites = bit(.user_module_ready), .owner = "xenia:graphics", .description = "title shader storage initialized" },
+    .{ .id = @intFromEnum(Stage.precompile_requested), .name = "precompile_requested", .prerequisites = bit(.user_module_loaded), .owner = "xenia:kernel_state", .description = "FinishLoadingUserModule entered the XexModule precompile boundary" },
+    .{ .id = @intFromEnum(Stage.precompile_completed), .name = "precompile_completed", .prerequisites = bit(.precompile_requested), .owner = "xenia:xex_loader", .description = "XexModule precompile and discovered-function pass returned" },
+    .{ .id = @intFromEnum(Stage.user_module_ready), .name = "user_module_ready", .prerequisites = bit(.precompile_completed), .owner = "xenia:kernel_state", .description = "user module wiring and precompile completion were reported" },
+    .{ .id = @intFromEnum(Stage.shader_storage_requested), .name = "shader_storage_requested", .prerequisites = bit(.user_module_ready), .owner = "xenia:graphics", .description = "CompleteLaunch entered the title shader-storage request" },
+    .{ .id = @intFromEnum(Stage.shader_storage_ready), .name = "shader_storage_ready", .prerequisites = bit(.shader_storage_requested), .owner = "xenia:graphics", .description = "title shader storage initialization request completed" },
     .{ .id = @intFromEnum(Stage.guest_main_ready), .name = "guest_main_ready", .prerequisites = bit(.shader_storage_ready), .owner = "xenia:kernel_state", .description = "guest main thread is running" },
     .{ .id = @intFromEnum(Stage.complete_launch_ready), .name = "complete_launch_ready", .prerequisites = bit(.guest_main_ready), .owner = "xenia:launcher", .description = "CompleteLaunch returned success" },
     .{ .id = @intFromEnum(Stage.ring_buffer_ready), .name = "ring_buffer_ready", .prerequisites = bit(.complete_launch_ready), .owner = "guest:title", .description = "guest command ring initialized" },
@@ -98,17 +157,39 @@ pub fn contract() types.Contract {
     return .{
         .name = "xenia-halo3-runtime",
         .stages = &specs,
-        // A finite default is intentional. It converts a missing startup edge
-        // into a bounded report instead of allowing a run to consume the
-        // supervisor's entire wall-clock budget. Override for a slower build.
-        .activation_budget_steps = 500_000_000,
+        // The title owns the duration of guest startup. A total instruction
+        // cap made a healthy-but-slow Xenia route fail before it could reach
+        // VdSwap. Zero means unlimited activation; the contract still ends
+        // at authentic_native_presented and quiet/compile/order failures stay
+        // active.
+        .activation_budget_steps = 0,
         .quiet_budget_steps = 150_000_000,
     };
 }
 
 pub fn pipelineStage(raw_stage: u8) ?Stage {
     if (raw_stage >= pipeline_stage_count) return null;
-    return @enumFromInt(pipeline_stage_base + raw_stage);
+    return pipeline_stages[raw_stage];
+}
+
+/// Work-unit boundaries are emitted by the Xenia macOS launch path before the
+/// coarser pipeline observer sees its next stage. They are deliberately parsed
+/// here, beside the contract, so the Ready Compiler can distinguish "the
+/// graphics request was never entered" from "the request entered and never
+/// completed".
+pub fn workUnitStage(line: []const u8) ?Stage {
+    if (std.mem.indexOf(u8, line, "FinishLoadingUserModule stage=Precompile.begin") != null) {
+        return .precompile_requested;
+    }
+    if (std.mem.indexOf(u8, line, "FinishLoadingUserModule stage=Precompile.end") != null or
+        std.mem.indexOf(u8, line, "XexModule::Precompile END") != null)
+    {
+        return .precompile_completed;
+    }
+    if (std.mem.indexOf(u8, line, "Initializing shader storage") != null) {
+        return .shader_storage_requested;
+    }
+    return null;
 }
 
 /// The numeric values mirror diagnostics.xenia_gpu_handoff.Phase without
@@ -128,11 +209,21 @@ pub fn handoffPhase(raw_phase: u8) ?Stage {
 
 test "Xenia contract ends at authentic native presentation" {
     const active = contract();
-    try std.testing.expectEqual(@as(usize, 33), active.stages.len);
+    try std.testing.expectEqual(@as(usize, 36), active.stages.len);
     try std.testing.expectEqual(Stage.authentic_native_presented, @as(Stage, @enumFromInt(active.stages[active.stages.len - 1].id)));
     try std.testing.expect(active.stages[@intFromEnum(Stage.first_present)].required == false);
-    try std.testing.expectEqual(Stage.first_present, pipelineStage(22) orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(Stage.first_present, pipelineStage(25) orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(Stage.authentic_native_presented, handoffPhase(15) orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(Stage.precompile_requested, workUnitStage("FinishLoadingUserModule stage=Precompile.begin") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(Stage.precompile_completed, workUnitStage("FinishLoadingUserModule stage=Precompile.end") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(Stage.shader_storage_requested, workUnitStage("DEBUG: Initializing shader storage...") orelse return error.TestUnexpectedResult);
+    try std.testing.expect(graphics_contract.requiredArgumentsPresent(graphics_contract.required_argument_mask));
+    try std.testing.expectEqual(graphics_contract.HandoffVerdict.authentic_native_presented, graphics_contract.classifyHandoff(graphics_contract.all_handoff_stages_mask));
+}
+
+test "Xenia activation has no aggregate budget but has a terminal edge" {
+    try std.testing.expectEqual(@as(u64, 0), contract().activation_budget_steps);
+    try std.testing.expectEqual(graphics_contract.HandoffStage.authentic_native_presented, graphics_contract.terminal_stage);
 }
 
 test "every stage names the subsystem that owes it" {
