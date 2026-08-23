@@ -2336,8 +2336,8 @@ pub const MachOState = struct {
             "rosette:image_loaded",
         );
         machoCapturePrint(
-            "macho-processor: READY COMPILER: configured contract={s} enforce={} activation_budget={d} quiet_budget={d}; compile checks are now separate from activation evidence\n",
-            .{ runtime_contract.name, enforce, runtime_contract.activation_budget_steps, runtime_contract.quiet_budget_steps },
+            "macho-processor: READY COMPILER: configured contract={s} enforce={} activation_budget={d} activation_budget_mode={s} quiet_budget={d}; compile checks are now separate from activation evidence\n",
+            .{ runtime_contract.name, enforce, runtime_contract.activation_budget_steps, self.ready.activationBudgetMode(), runtime_contract.quiet_budget_steps },
         );
     }
 
@@ -2430,6 +2430,16 @@ pub const MachOState = struct {
 
     pub fn observeReadyCompilerText(self: *MachOState, line: []const u8) void {
         if (!self.ready.enabled()) return;
+        // These boundaries are finer than the legacy Xenia pipeline stages.
+        // Observe them before the generic guest-log observers consume the same
+        // line so `user_module_ready` cannot hide the precompile return or make
+        // a never-entered shader request look like a failed shader backend.
+        if (ready_compiler.xenia.workUnitStage(line)) |stage| {
+            const stage_bit = @as(u64, 1) << @as(u6, @intCast(@intFromEnum(stage)));
+            const already_reached = self.ready.reached_mask & stage_bit != 0;
+            const accepted = self.ready.noteStage(@intFromEnum(stage), self.executed_steps, "xenia:work_unit");
+            if (!already_reached) self.logReadyCompilerStage(stage, accepted, self.executed_steps, "xenia:work_unit");
+        }
         if (ready_compiler.Runtime.compilerDiagnosticKind(line)) |kind| {
             machoCapturePrint(
                 "macho-processor: READY COMPILER: compiler-diagnostic kind={s} step={d} rip=0x{x} thread=0x{x} text={s}\n",
@@ -2503,7 +2513,17 @@ pub const MachOState = struct {
     /// Evaluate only at heartbeats. The semantic contract is not allowed to
     /// add a per-instruction search to the interpreter's hot loop.
     noinline fn pollReadyCompiler(self: *MachOState, at_step: u64) void {
-        if (!self.ready.enabled()) return;
+        if (!self.ready.enabled() or self.ready.phase == .ready) return;
+        const wait_object = self.pthreads.worstWaitObject(at_step);
+        self.ready.noteSchedulingEvidence(
+            self.pthreads.activeCount(),
+            self.pthreads.blocked_threads,
+            if (wait_object) |object| object.address else 0,
+            if (wait_object) |object| object.notifications else 0,
+            if (wait_object) |object| object.first_wait_step else 0,
+            if (wait_object) |object| object.last_notify_step else 0,
+            at_step,
+        );
         self.ready.noteProgress(at_step, self.regs.rip, self.active_guest_thread, "heartbeat");
         // A startup step that runs past one quiet budget while still reporting
         // named work is slow, not stuck. Saying so out loud keeps the long
@@ -2511,7 +2531,7 @@ pub const MachOState = struct {
         if (self.ready.takeSlowProgressNotice(at_step)) {
             const symbol = self.metadata.nearestSymbol(self.regs.rip);
             machoCapturePrint(
-                "macho-processor: READY COMPILER: SLOW BUT PROGRESSING stage={s} owner={s} last_named_work={s} at_step={d} step={d} milestone_quiet_steps={d} quiet_budget={d} rip=0x{x} {s}+0x{x} notice={d}\n",
+                "macho-processor: READY COMPILER: SLOW BUT PROGRESSING stage={s} owner={s} last_named_work={s} work_owner={s} work_thread=0x{x} work_rip=0x{x} at_step={d} step={d} milestone_quiet_steps={d} quiet_budget={d} rip=0x{x} {s}+0x{x} notice={d}\n",
                 .{
                     if (self.ready.firstMissingRequired()) |spec| spec.name else "<none>",
                     if (self.ready.firstMissingRequired()) |spec|
@@ -2519,6 +2539,9 @@ pub const MachOState = struct {
                     else
                         "<none>",
                     self.ready.workUnitName(),
+                    if (self.ready.work_unit.ownerSlice().len != 0) self.ready.work_unit.ownerSlice() else "<unknown>",
+                    self.ready.work_unit.thread,
+                    self.ready.work_unit.rip,
                     self.ready.work_unit.step,
                     at_step,
                     at_step -| self.ready.last_milestone_step,
@@ -2537,7 +2560,7 @@ pub const MachOState = struct {
         switch (evaluation) {
             .waiting => {},
             .ready => machoCapturePrint(
-                "macho-processor: READY COMPILER: GREEN application-ready contract={s} step={d}; authentic native presentation is now proven\n",
+                "macho-processor: READY COMPILER: GREEN application-ready contract={s} step={d}; terminal=authentic_native_presented activation_polling=closed authentic native presentation is now proven\n",
                 .{ self.ready.contract.?.name, at_step },
             ),
             .failed => {
@@ -2591,7 +2614,7 @@ pub const MachOState = struct {
         if (!self.ready.enabled()) return;
         const diagnosis = self.ready.diagnose(self.executed_steps);
         machoCapturePrint(
-            "macho-processor: READY COMPILER: DIAGNOSIS progress={s} blockage={s} missing={s} owner={s} description={s} frontier={s}@{d} stall_steps={d} quiet_budget={d} activation_steps={d}/{d}\n",
+            "macho-processor: READY COMPILER: DIAGNOSIS progress={s} blockage={s} missing={s} owner={s} description={s} frontier={s}@{d} stall_steps={d} quiet_budget={d} activation_steps={d}/{d} activation_budget_mode={s}\n",
             .{
                 diagnosis.progress.label(),
                 diagnosis.blockage.label(),
@@ -2604,21 +2627,45 @@ pub const MachOState = struct {
                 diagnosis.quiet_budget_steps,
                 diagnosis.activation_steps,
                 diagnosis.activation_budget_steps,
+                self.ready.activationBudgetMode(),
             },
         );
         machoCapturePrint(
-            "macho-processor: READY COMPILER: DIAGNOSIS last_named_work={s} at_step={d} work_units_since_milestone={d} total_work_units={d} slow_progress_notices={d}\n",
+            "macho-processor: READY COMPILER: DIAGNOSIS last_named_work={s} work_owner={s} work_thread=0x{x} work_rip=0x{x} at_step={d} work_units_since_milestone={d} total_work_units={d} slow_progress_notices={d}\n",
             .{
                 if (diagnosis.last_work_unit.len != 0) diagnosis.last_work_unit else "<none reported by the stage owner>",
+                if (diagnosis.last_work_unit_owner.len != 0) diagnosis.last_work_unit_owner else "<unknown>",
+                diagnosis.last_work_unit_thread,
+                diagnosis.last_work_unit_rip,
                 diagnosis.last_work_unit_step,
                 diagnosis.work_units_since_milestone,
                 self.ready.work_unit_count,
                 self.ready.slow_progress_reports,
             },
         );
-        const hot_symbol = self.metadata.nearestSymbol(diagnosis.hot_site.rip);
+        // When a total budget runs out, the contract did not fail: one stage
+        // ate the allowance. Naming it and its share is the only actionable
+        // fact in the report.
         machoCapturePrint(
-            "macho-processor: READY COMPILER: DIAGNOSIS hot_site=0x{x} {s}+0x{x} samples={d}/{d} distinct_sites={d} evictions={d} longest_same_site_run={d} steps=[{d}..{d}]\n",
+            "macho-processor: READY COMPILER: DIAGNOSIS costliest_stage={s} cost_steps={d} cost_percent_of_budget={d}%\n",
+            .{
+                if (diagnosis.costliest_stage.len != 0) diagnosis.costliest_stage else "<none>",
+                diagnosis.costliest_stage_steps,
+                diagnosis.costliest_stage_percent,
+            },
+        );
+        const hot_symbol = self.metadata.nearestSymbol(diagnosis.hot_site.rip);
+        // A high eviction rate means the sample table could not hold the
+        // working set, so the spread below is a sketch. Saying so is better
+        // than letting the reader over-trust it.
+        const attribution_confidence: []const u8 = if (diagnosis.stall_samples == 0)
+            "none"
+        else if (diagnosis.stall_evictions *| 2 > diagnosis.stall_samples)
+            "low (sample table saturated)"
+        else
+            "good";
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS hot_site=0x{x} {s}+0x{x} samples={d}/{d} distinct_sites={d} evictions={d} confidence={s} longest_same_site_run={d} steps=[{d}..{d}]\n",
             .{
                 diagnosis.hot_site.rip,
                 if (hot_symbol) |resolved| resolved.name else "<unknown>",
@@ -2626,12 +2673,62 @@ pub const MachOState = struct {
                 diagnosis.hot_site.samples,
                 diagnosis.stall_samples,
                 diagnosis.distinct_sites,
-                self.ready.stall_site_evictions,
+                diagnosis.stall_evictions,
+                attribution_confidence,
                 self.ready.longest_same_site_run,
                 diagnosis.hot_site.first_step,
                 diagnosis.hot_site.last_step,
             },
         );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS spin_verdict={s} scheduler(runnable/parked)={d}/{d} wait_object=0x{x} wait_notifications={d} wait_stable_since={d} evidence_step={d}; a concentrated site is not classified as scheduling starvation without all three witnesses\n",
+            .{
+                diagnosis.spin_verdict.label(),
+                self.ready.runnable_threads,
+                self.ready.parked_threads,
+                self.ready.wait_object,
+                self.ready.wait_notifications,
+                if (self.ready.wait_notifications == 0)
+                    self.ready.wait_first_step
+                else
+                    self.ready.wait_last_change_step,
+                self.ready.scheduling_evidence_step,
+            },
+        );
+        // One aggregate table averages a parked consumer and a busy producer
+        // into a shape that describes neither. Per thread, a mobility of zero
+        // is a thread that never moved.
+        for (self.ready.stall_threads[0..self.ready.stall_thread_count]) |entry| {
+            const thread_symbol = self.metadata.nearestSymbol(entry.last_rip);
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: DIAGNOSIS thread=0x{x} samples={d} mobility={d}% parked={} last_rip=0x{x} {s}+0x{x} steps=[{d}..{d}]\n",
+                .{
+                    entry.thread,
+                    entry.samples,
+                    entry.mobilityPercent(),
+                    entry.parked(),
+                    entry.last_rip,
+                    if (thread_symbol) |resolved| resolved.name else "<unknown>",
+                    if (thread_symbol) |resolved| resolved.offset else 0,
+                    entry.first_step,
+                    entry.last_step,
+                },
+            );
+        }
+        const parked = self.ready.mostParkedThread();
+        if (parked.samples != 0) {
+            const parked_symbol = self.metadata.nearestSymbol(parked.last_rip);
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: DIAGNOSIS parked_thread=0x{x} samples={d} rip=0x{x} {s}+0x{x}; this thread never changed its instruction pointer during the window, so it is waiting rather than working\n",
+                .{
+                    parked.thread,
+                    parked.samples,
+                    parked.last_rip,
+                    if (parked_symbol) |resolved| resolved.name else "<unknown>",
+                    if (parked_symbol) |resolved| resolved.offset else 0,
+                },
+            );
+        }
         machoCapturePrint(
             "macho-processor: READY COMPILER: DIAGNOSIS milestone_thread=0x{x} current_thread=0x{x} thread_changed={} waits(timeout/signaled)={d}/{d} pending_wait=0x{x}\n",
             .{
@@ -2657,11 +2754,14 @@ pub const MachOState = struct {
             if (check.passed) passed_compile_checks += 1;
         }
         machoCapturePrint(
-            "macho-processor: READY COMPILER SUMMARY: phase={s} enforce={} progress={s} compile_checks={d}/{d} checks_dropped={d} functions={d} functions_dropped={d} compiler_diagnostics={d} waits(timeout/signaled)={d}/{d} milestones={d}/{d} work_units={d} slow_notices={d} activation_start={d} last_milestone={d} last_named_work={d} last_progress={d} missing={s} missing_owner={s} failure={s}\n",
+            "macho-processor: READY COMPILER SUMMARY: phase={s} enforce={} progress={s} activation_budget={d} activation_budget_mode={s} terminal={} compile_checks={d}/{d} checks_dropped={d} functions={d} functions_dropped={d} compiler_diagnostics={d} waits(timeout/signaled)={d}/{d} milestones={d}/{d} work_units={d} slow_notices={d} activation_start={d} last_milestone={d} last_named_work={d} last_progress={d} missing={s} missing_owner={s} failure={s}\n",
             .{
                 @tagName(self.ready.phase),
                 self.ready.enforce,
                 self.ready.classifyProgress(self.executed_steps).label(),
+                if (self.ready.contract) |active_contract| active_contract.activation_budget_steps else 0,
+                self.ready.activationBudgetMode(),
+                self.ready.terminal(),
                 passed_compile_checks,
                 self.ready.compile_check_count,
                 self.ready.compile_checks_dropped,
@@ -2755,20 +2855,25 @@ pub const MachOState = struct {
             const entry = self.ready.workUnitHistoryAt(trail_position);
             if (entry.len == 0) continue;
             machoCapturePrint(
-                "macho-processor: READY COMPILER: report work-unit [{d}] step={d} name={s}\n",
-                .{ trail_position, entry.step, entry.slice() },
+                "macho-processor: READY COMPILER: report work-unit [{d}] step={d} owner={s} thread=0x{x} rip=0x{x} name={s}\n",
+                .{ trail_position, entry.step, if (entry.ownerSlice().len != 0) entry.ownerSlice() else "<unknown>", entry.thread, entry.rip, entry.slice() },
             );
         }
         // Where the guest spent the window that never reached the next edge.
         // The shape of this table is the finding: one site holding nearly every
         // sample is a loop, while a wide spread is ordinary forward execution
         // that simply has no breadcrumb naming it.
-        for (self.ready.stall_sites) |site| {
-            if (site.samples == 0) continue;
+        // Hottest first, and only the top few: dumping every occupied slot in
+        // hash order buries the site that matters under single-sample noise.
+        var site_rank: usize = 0;
+        while (site_rank < ready_compiler.types.reported_stall_sites) : (site_rank += 1) {
+            const site = self.ready.siteByRank(site_rank);
+            if (site.samples == 0) break;
             const symbol = self.metadata.nearestSymbol(site.rip);
             machoCapturePrint(
-                "macho-processor: READY COMPILER: report site rip=0x{x} {s}+0x{x} samples={d}/{d} thread=0x{x} steps=[{d}..{d}]\n",
+                "macho-processor: READY COMPILER: report site [{d}] rip=0x{x} {s}+0x{x} samples={d}/{d} thread=0x{x} steps=[{d}..{d}]\n",
                 .{
+                    site_rank,
                     site.rip,
                     if (symbol) |resolved| resolved.name else "<unknown>",
                     if (symbol) |resolved| resolved.offset else 0,
@@ -2780,6 +2885,12 @@ pub const MachOState = struct {
                 },
             );
         }
+        if (self.ready.distinctSites() > site_rank) {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: report site ... {d} colder sites omitted of {d} occupied\n",
+                .{ self.ready.distinctSites() - site_rank, self.ready.distinctSites() },
+            );
+        }
         if (self.ready.pending_wait_object != 0) {
             machoCapturePrint(
                 "macho-processor: READY COMPILER: report pending-wait object=0x{x} since_step={d}\n",
@@ -2787,6 +2898,531 @@ pub const MachOState = struct {
             );
         }
         if (self.ready.failure.kind != .none) self.logReadyCompilerFailure();
+    }
+
+    /// How many symbols the reference scan resolves in one pass. The scan is
+    /// linear in image size and independent of this, so the bound only caps
+    /// how many questions one pass can answer.
+    pub const max_reference_targets: usize = 64;
+
+    /// The world the compile plan asks its questions of.
+    ///
+    /// Every probe here is a lookup, a stat, or a table hit — nothing executes
+    /// guest code and nothing waits. That is the whole point: the same
+    /// preconditions the run would discover four hundred million instructions
+    /// in are answered before it starts.
+    pub const ReadyPlanContext = struct {
+        state: *MachOState,
+        io: std.Io,
+        image_path: []const u8,
+        vex_ready: bool,
+        fragments: [max_reference_targets][]const u8 = [_][]const u8{""} ** max_reference_targets,
+        addresses: [max_reference_targets]u64 = [_]u64{0} ** max_reference_targets,
+        referenced: [max_reference_targets]bool = [_]bool{false} ** max_reference_targets,
+        target_count: usize = 0,
+        scanned_bytes: u64 = 0,
+        direct_call_sites: u64 = 0,
+        image_fingerprint: u64 = 0,
+        target_fingerprint: u64 = 0,
+        static_cache_hit: bool = false,
+
+        fn resolve(self: *ReadyPlanContext, fragment: []const u8) ?u64 {
+            var found: [1]u64 = .{0};
+            const count = self.state.metadata.symbolAddressesMatching(
+                ready_compiler.xenia_plan.symbol_prefix,
+                fragment,
+                &found,
+            );
+            if (count == 0) return null;
+            return found[0];
+        }
+
+        fn targetIndex(self: *const ReadyPlanContext, fragment: []const u8) ?usize {
+            for (self.fragments[0..self.target_count], 0..) |entry, index| {
+                if (std.mem.eql(u8, entry, fragment)) return index;
+            }
+            return null;
+        }
+
+        fn addTarget(self: *ReadyPlanContext, fragment: []const u8) void {
+            if (self.targetIndex(fragment) != null) return;
+            if (self.target_count >= self.fragments.len) return;
+            const address = self.resolve(fragment) orelse return;
+            self.fragments[self.target_count] = fragment;
+            self.addresses[self.target_count] = address;
+            self.target_count += 1;
+        }
+
+        /// Fingerprint the executable bytes after Mach-O mapping and any
+        /// load-time patching.  The cache is therefore tied to the bytes the
+        /// reference scan actually observes, not merely to the source file's
+        /// original contents.
+        fn executableFingerprint(self: *const ReadyPlanContext) ?u64 {
+            const start = self.state.executable_min;
+            const end = self.state.executable_max;
+            if (end <= start) return null;
+            const bytes = memory_access.guestMemoryConst(self.state, start, end - start) orelse return null;
+            return std.hash.Wyhash.hash(0, bytes);
+        }
+
+        fn targetFingerprint(self: *const ReadyPlanContext) u64 {
+            var count = @as(u64, @intCast(self.target_count));
+            var result = std.hash.Wyhash.hash(0, std.mem.asBytes(&count));
+            for (self.fragments[0..self.target_count], 0..) |fragment, index| {
+                result = ready_compiler.cache.foldTarget(result, fragment, self.addresses[index]);
+            }
+            return result;
+        }
+
+        fn restoreCachedReferences(self: *ReadyPlanContext, snapshot_value: ready_compiler.cache.Snapshot) void {
+            self.referenced = [_]bool{false} ** max_reference_targets;
+            for (self.referenced[0..self.target_count], 0..) |*referenced, index| {
+                referenced.* = snapshot_value.referenced_mask & (@as(u64, 1) << @as(u6, @intCast(index))) != 0;
+            }
+            self.scanned_bytes = snapshot_value.scanned_bytes;
+            self.direct_call_sites = snapshot_value.direct_call_sites;
+            self.static_cache_hit = true;
+        }
+
+        fn snapshot(self: *const ReadyPlanContext) ready_compiler.cache.Snapshot {
+            var referenced_mask: u64 = 0;
+            for (self.referenced[0..self.target_count], 0..) |referenced, index| {
+                if (referenced) referenced_mask |= @as(u64, 1) << @as(u6, @intCast(index));
+            }
+            return .{
+                .image_fingerprint = self.image_fingerprint,
+                .contract_fingerprint = ready_compiler.xenia_plan.fingerprint(),
+                .target_fingerprint = self.target_fingerprint,
+                .target_count = self.target_count,
+                .referenced_mask = referenced_mask,
+                .scanned_bytes = self.scanned_bytes,
+                .direct_call_sites = self.direct_call_sites,
+            };
+        }
+
+        /// One pass over the executable range, marking which of the resolved
+        /// targets something calls directly.
+        ///
+        /// Direct `call rel32` only. Virtual dispatch and `std::function` reach
+        /// their targets through tables this does not read, so an unmarked
+        /// target is evidence and not proof — which is why the units that
+        /// consume this are advisory.
+        fn scanReferences(self: *ReadyPlanContext) void {
+            if (self.target_count == 0) return;
+            const start = self.state.executable_min;
+            const end = self.state.executable_max;
+            if (end <= start) return;
+            const span = end - start;
+            const bytes = memory_access.guestMemoryConst(self.state, start, span) orelse return;
+            self.scanned_bytes = bytes.len;
+
+            var low: u64 = std.math.maxInt(u64);
+            var high: u64 = 0;
+            for (self.addresses[0..self.target_count]) |address| {
+                low = @min(low, address);
+                high = @max(high, address);
+            }
+
+            var offset: usize = 0;
+            while (offset + 5 <= bytes.len) : (offset += 1) {
+                if (bytes[offset] != 0xE8) continue;
+                const displacement = std.mem.readInt(i32, bytes[offset + 1 ..][0..4], .little);
+                const site = start +% @as(u64, offset) +% 5;
+                const target = @as(u64, @bitCast(@as(i64, @bitCast(site)) +% displacement));
+                if (target < low or target > high) continue;
+                self.direct_call_sites +|= 1;
+                for (self.addresses[0..self.target_count], 0..) |address, index| {
+                    if (address == target) self.referenced[index] = true;
+                }
+            }
+        }
+
+        // --- probe callbacks ---------------------------------------------
+
+        fn imageFact(context: *anyopaque, name: []const u8) bool {
+            const self: *ReadyPlanContext = @ptrCast(@alignCast(context));
+            const state = self.state;
+            if (std.mem.eql(u8, name, "mach-o-header")) return state.segments.len != 0;
+            if (std.mem.eql(u8, name, "entry-point")) return state.entry_point_vaddr != 0;
+            if (std.mem.eql(u8, name, "text-segment")) return state.executable_max > state.executable_min;
+            if (std.mem.eql(u8, name, "symbol-table")) {
+                return state.metadata.definedSymbolAddress("_main") != null or
+                    state.metadata.symbolAddressWithPrefix("_") != null;
+            }
+            if (std.mem.eql(u8, name, "bundle-executable")) {
+                return std.mem.indexOf(u8, self.image_path, ".app/Contents/MacOS/") != null;
+            }
+            return false;
+        }
+
+        fn symbolExists(context: *anyopaque, name: []const u8) bool {
+            const self: *ReadyPlanContext = @ptrCast(@alignCast(context));
+            return self.resolve(name) != null;
+        }
+
+        fn callSiteExists(context: *anyopaque, name: []const u8) bool {
+            const self: *ReadyPlanContext = @ptrCast(@alignCast(context));
+            const index = self.targetIndex(name) orelse return false;
+            return self.referenced[index];
+        }
+
+        fn hostCapability(context: *anyopaque, name: []const u8) bool {
+            const self: *ReadyPlanContext = @ptrCast(@alignCast(context));
+            if (std.mem.eql(u8, name, "decoder-audit")) return self.vex_ready;
+            if (std.mem.eql(u8, name, "vex-safety")) return self.vex_ready;
+            if (std.mem.eql(u8, name, "vulkan-loader")) {
+                // Either the SDK is configured or a loader sits on one of the
+                // usual paths. Advisory, so a false negative costs a note.
+                if (std.c.getenv("VULKAN_SDK") != null) return true;
+                const candidates = [_][]const u8{
+                    "/usr/local/lib/libvulkan.1.dylib",
+                    "/opt/homebrew/lib/libvulkan.1.dylib",
+                };
+                for (candidates) |candidate| {
+                    _ = std.Io.Dir.cwd().statFile(self.io, candidate, .{}) catch continue;
+                    return true;
+                }
+                return false;
+            }
+            // Presentation goes through AppKit, which is part of the platform.
+            if (std.mem.eql(u8, name, "window-system")) return true;
+            return false;
+        }
+
+        fn assetVerdict(
+            context: *anyopaque,
+            path: []const u8,
+            kind: ready_compiler.plan.AssetKind,
+        ) ready_compiler.plan.AssetVerdict {
+            const self: *ReadyPlanContext = @ptrCast(@alignCast(context));
+            var verdict: ready_compiler.plan.AssetVerdict = .{};
+            const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch {
+                // Absent and unreadable are different findings, and stat cannot
+                // always tell them apart. Report absence, which is the far more
+                // common cause and the one the detail line names.
+                return verdict;
+            };
+            verdict.present = true;
+            verdict.size = stat.size;
+            if (stat.kind == .directory) {
+                verdict.readable = true;
+                verdict.writable = true;
+                verdict.well_formed = kind == .directory or kind == .writable_directory;
+                return verdict;
+            }
+
+            var header: [16]u8 = @splat(0);
+            var read: usize = 0;
+            if (std.Io.Dir.cwd().openFile(self.io, path, .{})) |opened| {
+                var file = opened;
+                defer file.close(self.io);
+                var buffer: [64]u8 = undefined;
+                var reader = file.readerStreaming(self.io, &buffer);
+                read = reader.interface.readSliceShort(&header) catch 0;
+                verdict.readable = read != 0 or stat.size == 0;
+            } else |_| {
+                verdict.readable = false;
+                return verdict;
+            }
+
+            verdict.well_formed = switch (kind) {
+                .any_file => stat.size != 0,
+                .directory, .writable_directory => false,
+                .xex => read >= 4 and std.mem.eql(u8, header[0..4], "XEX2"),
+                // A disc image has no single magic across the formats Xenia
+                // accepts, so the check is that it is plausibly a filesystem
+                // rather than a stub or a truncated download.
+                .disc_image => stat.size >= (1 << 20),
+                .spirv => read >= 4 and
+                    std.mem.readInt(u32, header[0..4], .little) == 0x07230203,
+                // Configuration is text; a NUL in the head means it is not.
+                .toml => read != 0 and std.mem.indexOfScalar(u8, header[0..read], 0) == null,
+                .dylib => read >= 4 and blk: {
+                    const magic = std.mem.readInt(u32, header[0..4], .little);
+                    break :blk magic == 0xfeedfacf or magic == 0xfeedface or
+                        magic == 0xcafebabe or magic == 0xbebafeca;
+                },
+            };
+            return verdict;
+        }
+
+        pub fn probe(self: *ReadyPlanContext) ready_compiler.plan.Probe {
+            return .{
+                .context = self,
+                .symbolExists = symbolExists,
+                .callSiteExists = callSiteExists,
+                .assetVerdict = assetVerdict,
+                .hostCapability = hostCapability,
+                .imageFact = imageFact,
+            };
+        }
+    };
+
+    fn emitReadyPlanUnit(context: *anyopaque, progress: ready_compiler.plan.Progress) void {
+        _ = context;
+        switch (progress.outcome) {
+            .ok => machoCapturePrint(
+                "macho-processor: READY COMPILER: [{d}/{d}] Checking {s} object {s}\n",
+                .{ progress.index, progress.total, progress.unit.category.label(), progress.unit.name },
+            ),
+            .failed => machoCapturePrint(
+                "macho-processor: READY COMPILER: [{d}/{d}] FAILED {s} object {s}: {s} (needed for: {s})\n",
+                .{
+                    progress.index,
+                    progress.total,
+                    progress.unit.category.label(),
+                    progress.unit.name,
+                    progress.detail,
+                    progress.unit.purpose,
+                },
+            ),
+            .indeterminate => machoCapturePrint(
+                "macho-processor: READY COMPILER: [{d}/{d}] UNKNOWN {s} object {s}: {s}\n",
+                .{
+                    progress.index,
+                    progress.total,
+                    progress.unit.category.label(),
+                    progress.unit.name,
+                    progress.detail,
+                },
+            ),
+            .skipped, .pending => {},
+        }
+    }
+
+    /// Infer what shape a file must have from how it is named.
+    fn readyPlanAssetKind(path: []const u8) ?ready_compiler.plan.AssetKind {
+        if (std.mem.endsWith(u8, path, ".iso")) return .disc_image;
+        if (std.mem.endsWith(u8, path, ".xex")) return .xex;
+        if (std.mem.endsWith(u8, path, ".toml")) return .toml;
+        if (std.mem.endsWith(u8, path, ".spv")) return .spirv;
+        if (std.mem.endsWith(u8, path, ".dylib")) return .dylib;
+        if (std.mem.endsWith(u8, path, ".zar") or
+            std.mem.endsWith(u8, path, ".zip") or
+            std.mem.endsWith(u8, path, ".xcp") or
+            std.mem.endsWith(u8, path, ".bin")) return .any_file;
+        return null;
+    }
+
+    fn readyPlanCachePath() ?[]const u8 {
+        if (std.c.getenv("ROSETTE_READY_COMPILER_CACHE")) |raw| {
+            const value = std.mem.span(raw);
+            if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "off")) return null;
+            return value;
+        }
+        // The event logger creates .rosette before this plan runs.  Keeping
+        // the cache beside the two diagnostic logs makes it route-local and
+        // avoids putting generated artifacts in the source tree.
+        return ".rosette/ready-compiler.plan.cache";
+    }
+
+    fn readyPackagePath() ?[]const u8 {
+        if (std.c.getenv("ROSETTE_READY_COMPILER_PACKAGE")) |raw| {
+            const value = std.mem.span(raw);
+            if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "off")) return null;
+            return value;
+        }
+        return ".rosette/packages/xenia-halo3-ready.r3pkg";
+    }
+
+    /// Run the startup compile plan before any guest instruction executes.
+    ///
+    /// Returns false when a required unit failed, in which case the caller must
+    /// not start the guest: every later verdict would be a consequence of a
+    /// precondition the run already knows is missing.
+    pub fn runReadyCompilerPlan(
+        self: *MachOState,
+        io: std.Io,
+        image_path: []const u8,
+        args: []const []const u8,
+        vex_ready: bool,
+    ) bool {
+        if (!self.ready.enabled()) return true;
+
+        var assets_storage: [16]ready_compiler.xenia_plan.AssetUnit = undefined;
+        var asset_count: usize = 0;
+        // The files this run will actually touch are the ones it was pointed
+        // at. Declaring a fixed list would check paths this launch does not
+        // use and miss the one it does.
+        for (args) |argument| {
+            if (asset_count >= assets_storage.len) break;
+            if (argument.len == 0 or argument[0] == '-') continue;
+            const kind = readyPlanAssetKind(argument) orelse continue;
+            assets_storage[asset_count] = .{
+                .path = argument,
+                .kind = kind,
+                .purpose = "a file this launch was pointed at",
+            };
+            asset_count += 1;
+        }
+
+        var plan_storage = ready_compiler.plan.Plan{};
+        ready_compiler.xenia_plan.build(&plan_storage, assets_storage[0..asset_count]);
+
+        var context = ReadyPlanContext{
+            .state = self,
+            .io = io,
+            .image_path = image_path,
+            .vex_ready = vex_ready,
+        };
+        for (ready_compiler.xenia_plan.contract_units) |unit| context.addTarget(unit.fragment);
+        for (ready_compiler.xenia_plan.symbol_units) |unit| context.addTarget(unit.fragment);
+        const cache_path = readyPlanCachePath();
+        const package_path = readyPackagePath();
+        context.image_fingerprint = context.executableFingerprint() orelse 0;
+        context.target_fingerprint = context.targetFingerprint();
+
+        var restored_cache = false;
+        if (package_path) |path| {
+            if (context.image_fingerprint != 0) {
+                if (ready_compiler.package.load(path, self.allocator)) |manifest| {
+                    if (manifest.matchesStaticPlan(
+                        context.image_fingerprint,
+                        ready_compiler.xenia_plan.fingerprint(),
+                        context.target_fingerprint,
+                        context.target_count,
+                    )) {
+                        context.restoreCachedReferences(.{
+                            .image_fingerprint = manifest.image_fingerprint,
+                            .contract_fingerprint = manifest.contract_fingerprint,
+                            .target_fingerprint = manifest.static_plan_target_fingerprint,
+                            .target_count = manifest.static_plan_target_count,
+                            .referenced_mask = manifest.static_plan_referenced_mask,
+                            .scanned_bytes = manifest.static_plan_scanned_bytes,
+                            .direct_call_sites = manifest.static_plan_direct_call_sites,
+                        });
+                        restored_cache = true;
+                        machoCapturePrint(
+                            "macho-processor: READY COMPILER: package HIT path={s} image=0x{x} targets={d} scanned_bytes={d} direct_call_sites={d}\n",
+                            .{ path, context.image_fingerprint, context.target_count, context.scanned_bytes, context.direct_call_sites },
+                        );
+                    }
+                }
+            }
+        }
+        if (!restored_cache) if (cache_path) |path| {
+            if (context.image_fingerprint != 0) {
+                if (ready_compiler.cache.load(path, self.allocator)) |snapshot| {
+                    if (ready_compiler.cache.matches(
+                        snapshot,
+                        context.image_fingerprint,
+                        ready_compiler.xenia_plan.fingerprint(),
+                        context.target_fingerprint,
+                        context.target_count,
+                    )) {
+                        context.restoreCachedReferences(snapshot);
+                        restored_cache = true;
+                        machoCapturePrint(
+                            "macho-processor: READY COMPILER: static plan cache HIT path={s} image=0x{x} targets={d} scanned_bytes={d} direct_call_sites={d}\n",
+                            .{ path, context.image_fingerprint, context.target_count, context.scanned_bytes, context.direct_call_sites },
+                        );
+                    }
+                }
+            }
+        };
+        if (!restored_cache) {
+            context.scanReferences();
+            if (cache_path) |path| {
+                if (context.image_fingerprint == 0) {
+                    machoCapturePrint(
+                        "macho-processor: READY COMPILER: static plan cache skipped because executable fingerprinting was unavailable\n",
+                        .{},
+                    );
+                } else {
+                    if (ready_compiler.cache.store(path, self.allocator, context.snapshot())) {
+                        machoCapturePrint(
+                            "macho-processor: READY COMPILER: static plan cache STORE path={s} image=0x{x} targets={d} scanned_bytes={d} direct_call_sites={d}\n",
+                            .{ path, context.image_fingerprint, context.target_count, context.scanned_bytes, context.direct_call_sites },
+                        );
+                    } else {
+                        machoCapturePrint(
+                            "macho-processor: READY COMPILER: static plan cache unavailable path={s}; continuing with in-memory evidence\n",
+                            .{path},
+                        );
+                    }
+                }
+            }
+        }
+
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: compile plan OPEN units={d} assets={d} reference_targets={d} scanned_bytes={d} direct_call_sites={d}\n",
+            .{
+                plan_storage.count,
+                asset_count,
+                context.target_count,
+                context.scanned_bytes,
+                context.direct_call_sites,
+            },
+        );
+
+        const emitter = ready_compiler.plan.Emitter{
+            .context = &context,
+            .emit = emitReadyPlanUnit,
+        };
+        const summary = plan_storage.run(context.probe(), emitter);
+
+        const static_snapshot = context.snapshot();
+        if (summary.halted_at == 0 and package_path != null and static_snapshot.image_fingerprint != 0) {
+            const manifest = ready_compiler.xenia_plan.packageManifest(static_snapshot);
+            if (ready_compiler.package.store(package_path.?, self.allocator, manifest)) {
+                machoCapturePrint(
+                    "macho-processor: READY COMPILER: package STORE path={s} kind=xenia-halo3-startup artifacts={d} image=0x{x} target_fingerprint=0x{x}\n",
+                    .{ package_path.?, manifest.artifact_count, manifest.image_fingerprint, manifest.static_plan_target_fingerprint },
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: READY COMPILER: package unavailable path={s}; static evidence remains in memory/cache\n",
+                    .{package_path.?},
+                );
+            }
+        }
+
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: compile plan {s} units={d}/{d} ok={d} failed={d} unknown={d} skipped={d}\n",
+            .{
+                if (summary.halted_at != 0) "RED" else if (summary.failed != 0) "AMBER" else "GREEN",
+                summary.ok,
+                summary.total,
+                summary.ok,
+                summary.failed,
+                summary.indeterminate,
+                summary.skipped,
+            },
+        );
+        if (summary.halted_at != 0) {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: compile plan RED at [{d}/{d}] {s} object {s}; halting before the guest executes because every later verdict would be a consequence of this\n",
+                .{
+                    summary.halted_at,
+                    summary.total,
+                    summary.halted_unit.category.label(),
+                    summary.halted_unit.name,
+                },
+            );
+            self.ready.noteCompileCheck(
+                "startup-plan",
+                false,
+                "a required startup precondition is missing; see the compile plan units above",
+            );
+            return false;
+        }
+        // Advisory units that failed are reported and do not stop the run.
+        // Most of them are reachability, where a missing direct call site is
+        // evidence about the scan's reach as much as about the guest, and
+        // refusing to launch over that would be failing on the gate's own
+        // blind spot.
+        if (summary.failed != 0 or summary.indeterminate != 0) {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: compile plan AMBER advisory_failures={d} unknown={d}; every required precondition resolved, so the run continues\n",
+                .{ summary.failed, summary.indeterminate },
+            );
+        }
+        self.ready.noteCompileCheck(
+            "startup-plan",
+            true,
+            "every required startup precondition resolved before execution",
+        );
+        return true;
     }
 
     /// Which producer stopped, when threads are waiting for something that will
@@ -4981,6 +5617,12 @@ pub const MachOState = struct {
         // and the dominant source of log traffic at the same time.
         if (force or state_changed or self.graphics_summary_emissions % 16 == 0) {
             self.logRingContents();
+            // The preinitialization ledger reads kernel-variable state. Refresh
+            // that state before sampling the ledger so this report cannot lag
+            // behind the variable report emitted later in the full summary.
+            // Provisioning remains owner-gated: title-owned pointers are never
+            // fabricated, and structured HSIO state is not synthesized here.
+            self.refreshKernelVariables();
             self.logPreinitialization();
             self.logGuestWaitLiveness();
             self.logImportBinding();
@@ -8747,6 +9389,19 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         environmentUnsigned("ROSETTE_MACHO_READY_QUIET_STEPS", 0),
         vex_audit.ready(),
     );
+    // The startup compile plan runs here: after the image is mapped and its
+    // symbols are indexed, and before a single guest instruction executes. A
+    // precondition that is missing now is missing at step four hundred million
+    // too, and this is the only point where saying so costs milliseconds
+    // instead of minutes.
+    if (!state.runReadyCompilerPlan(io, options.path, options.args, vex_audit.ready())) {
+        state.logReadyCompilerSummary();
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: refusing to launch; the startup contract cannot be satisfied by this image\n",
+            .{},
+        );
+        return 125;
+    }
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
     machoCapturePrint("ROSETTE: MachO state setup completed successfully\n", .{});
 
