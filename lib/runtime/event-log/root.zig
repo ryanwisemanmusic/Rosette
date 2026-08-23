@@ -14,3 +14,7 @@ pub const checkPointSync = el.checkPointSync;
 pub const Kind = el.Kind;
 pub const Event = el.Event;
 pub const Logger = el.Logger;
+
+test {
+    _ = el;
+}

@@ -10,6 +10,11 @@ const c = @cImport({
 threadlocal var thread_macho_fd: i32 = -1;
 threadlocal var thread_scheduler_fd: i32 = -1;
 threadlocal var thread_primitive_fd: i32 = -1;
+// Unlike the three historical thread-local streams, the readiness stream is
+// intentionally process-wide. Compiler failures are often reported from a
+// translated guest thread, and a thread-local descriptor would silently omit
+// exactly the Xbyak line that explains why a generated function was abandoned.
+var ready_compiler_fd: i32 = -1;
 
 pub fn setThreadFds(macho: i32, scheduler: i32, primitive: i32) void {
     thread_macho_fd = macho;
@@ -21,6 +26,7 @@ pub fn resetThreadFds() void {
     thread_macho_fd = -1;
     thread_scheduler_fd = -1;
     thread_primitive_fd = -1;
+    ready_compiler_fd = -1;
 }
 
 /// F15 (throughput audit): format into a thread-local stack buffer instead of
@@ -68,6 +74,9 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
     if (thread_macho_fd >= 0) {
         writeLineAtomic(thread_macho_fd, text);
     }
+    if (ready_compiler_fd >= 0 and isReadyCompilerLine(text)) {
+        writeLineAtomic(ready_compiler_fd, text);
+    }
 }
 
 /// Write one diagnostic line as a single write syscall, adding the newline
@@ -108,6 +117,34 @@ fn isSchedulerTableLine(text: []const u8) bool {
         std.mem.startsWith(u8, text, "scheduler: REG");
 }
 
+/// Keep a compact, high-signal companion log for the runtime readiness gate.
+/// The full stream remains in rosette-runtime.log; this filter deliberately
+/// includes both the gate's own records and the native/JIT diagnostics that
+/// explain why a generated function was not usable.
+fn isReadyCompilerLine(text: []const u8) bool {
+    const markers = [_][]const u8{
+        "READY COMPILER",
+        "undefined label",
+        "label is not found",
+        "Xbyak",
+        "function left undefined",
+        "X64Emitter",
+        "X64Assembler",
+        "PPCTranslator",
+        "PPCFrontend",
+        "DEFERRED WORK PREDICTOR",
+        "GUEST EXCEPTION PREDICTOR",
+        "ResolveFunction",
+        "codegen",
+        "generated guest function",
+        "NEAR NULL PREDICTOR",
+    };
+    for (markers) |marker| {
+        if (std.mem.indexOf(u8, text, marker) != null) return true;
+    }
+    return false;
+}
+
 test "scheduler tables are routed away from the runtime console" {
     try std.testing.expect(isSchedulerTableLine(
         "scheduler: THREAD TABLE BEGIN reason=runnable rotation quantum\n",
@@ -123,6 +160,21 @@ test "scheduler tables are routed away from the runtime console" {
     ));
     try std.testing.expect(!isSchedulerTableLine(
         "[xenia] i> Module \\Device\\Cdrom0\\default.xex:\n",
+    ));
+}
+
+test "ready compiler filter keeps code-generation evidence and drops ordinary lines" {
+    try std.testing.expect(isReadyCompilerLine(
+        "macho-processor: Xbyak exception detail: code=11 reason='label is not found'\n",
+    ));
+    try std.testing.expect(isReadyCompilerLine(
+        "macho-processor: DEFERRED WORK PREDICTOR: latent_failure id=0x1\n",
+    ));
+    try std.testing.expect(isReadyCompilerLine(
+        "macho-processor: READY COMPILER: BLOCKED kind=LABEL_REFERENCE_UNBOUND\n",
+    ));
+    try std.testing.expect(!isReadyCompilerLine(
+        "[xenia] i> VdInitializeEngines completed\n",
     ));
 }
 
@@ -151,6 +203,7 @@ pub const Logger = struct {
     macho_fd: i32 = -1,
     scheduler_fd: i32 = -1,
     primitive_fd: i32 = -1,
+    ready_compiler_fd: i32 = -1,
 
     pub fn isOpen(self: *const Logger) bool {
         return self.macho_fd >= 0;
@@ -213,7 +266,32 @@ pub const Logger = struct {
             }
         }
 
+        if (environmentPath("ROSETTE_READY_COMPILER_LOG")) |ready_path| {
+            if (ready_path.len != 0 and !std.ascii.eqlIgnoreCase(ready_path, "off")) {
+                self.openReadyCompilerPath(allocator, ready_path);
+            }
+        } else {
+            const ready_path = std.fs.path.join(allocator, &.{ directory, "rosette-ready-compiler.log" }) catch return;
+            defer allocator.free(ready_path);
+            self.openReadyCompilerPath(allocator, ready_path);
+        }
+
+        ready_compiler_fd = self.ready_compiler_fd;
         setThreadFds(self.macho_fd, self.scheduler_fd, self.primitive_fd);
+    }
+
+    fn openReadyCompilerPath(self: *Logger, allocator: std.mem.Allocator, path: []const u8) void {
+        const directory = std.fs.path.dirname(path) orelse return;
+        makePathRecursive(allocator, directory) catch return;
+        const path_z = allocator.dupeZ(u8, path) catch return;
+        defer allocator.free(path_z);
+        const fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c_uint, 0o644));
+        if (fd < 0) return;
+        self.ready_compiler_fd = fd;
+        writeAll(
+            fd,
+            "=== rosette-ready-compiler.log opened ===\n# Filtered readiness/compiler evidence; rosette-runtime.log remains the complete stream.\n",
+        );
     }
 
     pub fn close(self: *Logger) void {
@@ -230,9 +308,14 @@ pub const Logger = struct {
             _ = c.write(self.primitive_fd, "=== rosette-primitive.log closed ===\n", 37);
             _ = c.close(self.primitive_fd);
         }
+        if (self.ready_compiler_fd >= 0) {
+            writeAll(self.ready_compiler_fd, "=== rosette-ready-compiler.log closed ===\n");
+            _ = c.close(self.ready_compiler_fd);
+        }
         self.macho_fd = -1;
         self.scheduler_fd = -1;
         self.primitive_fd = -1;
+        self.ready_compiler_fd = -1;
     }
 
     pub fn captureLine(self: *Logger, text: []const u8) void {
@@ -246,6 +329,7 @@ pub const Logger = struct {
         if (self.macho_fd >= 0) _ = c.fsync(self.macho_fd);
         if (self.scheduler_fd >= 0) _ = c.fsync(self.scheduler_fd);
         if (self.primitive_fd >= 0) _ = c.fsync(self.primitive_fd);
+        if (self.ready_compiler_fd >= 0) _ = c.fsync(self.ready_compiler_fd);
     }
 
     pub fn emit(self: *Logger, event: Event) void {
@@ -314,6 +398,7 @@ pub fn checkPointSync() void {
     if (thread_macho_fd >= 0) _ = c.fsync(thread_macho_fd);
     if (thread_scheduler_fd >= 0) _ = c.fsync(thread_scheduler_fd);
     if (thread_primitive_fd >= 0) _ = c.fsync(thread_primitive_fd);
+    if (ready_compiler_fd >= 0) _ = c.fsync(ready_compiler_fd);
 }
 
 fn routeRoot() ?[]const u8 {
