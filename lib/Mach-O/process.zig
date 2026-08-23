@@ -79,6 +79,7 @@ const runtime_output = @import("diagnostics").runtime_output;
 const tlv_runtime = @import("guest_abi").tlv_runtime;
 const diagnostic_text_accelerator = @import("diagnostics").diagnostic_text_accelerator;
 const preflight_lib = @import("preflight");
+const ready_compiler = @import("ready_compiler");
 const symbol_assembly_context = macho_core.symbol_assembly_context;
 const export_table_manager = @import("dyld").export_table_manager;
 const export_table_lifecycle = @import("dyld").export_table_lifecycle;
@@ -139,6 +140,15 @@ const RegId = x64_decoder.RegId;
 const Cond = x64_decoder.Condition;
 const Op = x64_decoder.Op;
 const DecodedInsn = x64_decoder.DecodedInsn;
+
+/// A decode-cache hit that has already passed the plain-RIP gate chain. The
+/// old step path returned only `host_image` from its first probe, then probed
+/// the same set again in `decodeWithLiveOperands`. Carrying the decoded form
+/// through the first probe makes that one cache lookup do both jobs.
+const FastPlainDecode = struct {
+    decoded: DecodedInsn,
+    host_image: bool,
+};
 
 /// Relative control-flow operands are signed displacements, not memory
 /// addresses. `rip_relative` is also used for RIP-relative ModRM operands, so
@@ -686,6 +696,10 @@ pub const MachOState = struct {
     /// dump then restates the file rather than reporting what the guest bound,
     /// so it must never be used as the second, independent reading.
     preflight_dump_is_accelerated: bool = false,
+    /// Runtime build/activation gate. Compilation and execution are separate
+    /// states: a generated function is not considered useful until an actual
+    /// activation boundary and the Xenia startup contract have been observed.
+    ready: ready_compiler.Runtime = .{},
     memory_forwarder: memory_management_forwarder.Manager,
     sparse_memory: sparse_virtual_memory.Manager,
     /// Derived model of the guest address window. Replaces the hardcoded
@@ -1091,6 +1105,14 @@ pub const MachOState = struct {
     // so the fast path is a direct slice read; enable with
     // ROSETTE_MACHO_MEMORY_TRACE=1 when diagnosing faults/near-null causality.
     memory_trace_enabled: bool = false,
+    // A waiter that has never been notified is not, by itself, a lost-wakeup
+    // proof. Long-lived host workers (for example Xenia's idle audio media
+    // player) legitimately park on a POSIX condition variable until work is
+    // published. Keep the predictor report enabled, but make the synthetic
+    // spurious-wake repair an explicit diagnostic experiment.
+    // Enable with ROSETTE_MACHO_NEVER_NOTIFIED_REPAIR=1 only after the object
+    // has been identified as a broken guest wait rather than an idle worker.
+    never_notified_repair_enabled: bool = false,
     // R3 (perf audit, N4): expensive write bookkeeping — capture/commit
     // before-images, the general memory_writes provenance ledger, detailed
     // vtable mutation attribution, and the suspicious-write detector — serves
@@ -2229,6 +2251,13 @@ pub const MachOState = struct {
             self.active_guest_thread,
             caller,
         ) orelse return;
+        self.ready.noteEntered(hit.address, self.executed_steps, self.active_guest_thread, caller);
+        if (self.ready.enabled()) {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: function-enter role={s} name={s} address=0x{x} step={d} thread=0x{x} caller=0x{x}\n",
+                .{ @tagName(hit.role), hit.name, hit.address, self.executed_steps, self.active_guest_thread, caller },
+            );
+        }
         const identity = self.event_stream.next(
             .execution_boundary,
             self.executed_steps,
@@ -2252,6 +2281,512 @@ pub const MachOState = struct {
                 if (caller_symbol) |resolved| resolved.offset else 0,
             },
         );
+    }
+
+    /// Configure the runtime analogue of the Xenia build graph after command
+    /// line compatibility options have been applied. The gate is only active
+    /// for Xenia targets unless the caller explicitly forces it through the
+    /// environment; ordinary Mach-O applications keep the generic loader
+    /// behaviour they had before this contract existed.
+    pub fn configureReadyCompiler(
+        self: *MachOState,
+        enabled: bool,
+        enforce: bool,
+        activation_budget_steps: u64,
+        quiet_budget_steps: u64,
+        decoder_ready: bool,
+    ) void {
+        if (!enabled or !self.has_xenia_compat) {
+            self.ready.disable();
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: disabled xenia_compat={} requested={}\n",
+                .{ self.has_xenia_compat, enabled },
+            );
+            return;
+        }
+
+        var runtime_contract = ready_compiler.xenia.contract();
+        if (activation_budget_steps != 0) runtime_contract.activation_budget_steps = activation_budget_steps;
+        if (quiet_budget_steps != 0) runtime_contract.quiet_budget_steps = quiet_budget_steps;
+        self.ready.configure(runtime_contract, enforce);
+        self.ready.beginCompile(self.executed_steps);
+
+        const image_ready = self.entry_point_vaddr != 0 and self.segments.len != 0;
+        self.ready.noteCompileCheck(
+            "mach-o-image",
+            image_ready,
+            if (image_ready) "mapped executable image has an entry point" else "image has no executable entry point",
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: compile-check name=mach-o-image passed={} detail={s}\n",
+            .{ image_ready, if (image_ready) "mapped executable image has an entry point" else "image has no executable entry point" },
+        );
+        self.ready.noteCompileCheck(
+            "decoder-audit",
+            decoder_ready,
+            if (decoder_ready) "baseline VEX decoder audit passed" else "baseline VEX decoder audit failed",
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: compile-check name=decoder-audit passed={} detail={s}\n",
+            .{ decoder_ready, if (decoder_ready) "baseline VEX decoder audit passed" else "baseline VEX decoder audit failed" },
+        );
+        _ = self.ready.noteStage(
+            @intFromEnum(ready_compiler.xenia.Stage.image_ready),
+            self.executed_steps,
+            "rosette:image_loaded",
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: configured contract={s} enforce={} activation_budget={d} quiet_budget={d}; compile checks are now separate from activation evidence\n",
+            .{ runtime_contract.name, enforce, runtime_contract.activation_budget_steps, runtime_contract.quiet_budget_steps },
+        );
+    }
+
+    /// Seal Rosette's build-style phase and begin the guest/Xenia activation
+    /// phase. This is called only after pre-main initialization has completed,
+    /// so an initializer failure cannot be mislabeled as a gameplay failure.
+    pub fn sealReadyCompilerCompile(self: *MachOState) bool {
+        if (!self.ready.enabled()) return true;
+        self.ready.noteCompileCheck(
+            "static-initializers",
+            true,
+            "pre-main initializer transaction completed",
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: compile-check name=static-initializers passed=true detail=pre-main initializer transaction completed\n",
+            .{},
+        );
+        if (!self.ready.sealCompile(self.executed_steps)) {
+            self.logReadyCompilerFailure();
+            return false;
+        }
+        _ = self.ready.noteStage(
+            @intFromEnum(ready_compiler.xenia.Stage.compile_ready),
+            self.executed_steps,
+            "rosette:compile_checks",
+        );
+        _ = self.ready.noteStage(
+            @intFromEnum(ready_compiler.xenia.Stage.static_initializers_complete),
+            self.executed_steps,
+            "rosette:static_initializers",
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: compile phase GREEN; activation phase opened at step={d}; the guest application is not ready until authentic native presentation\n",
+            .{self.executed_steps},
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: activation phase OPEN compile_checks={d} dropped={d}\n",
+            .{ self.ready.compile_check_count, self.ready.compile_checks_dropped },
+        );
+        return true;
+    }
+
+    /// Map the existing Xenia pipeline observer into the generic contract.
+    /// The process-core observer calls this without importing Xenia-specific
+    /// types, which keeps the observer usable by other Mach-O targets.
+    pub fn noteReadyCompilerPipelineStage(self: *MachOState, raw_stage: u8, at_step: u64) void {
+        if (!self.ready.enabled()) return;
+        const stage = ready_compiler.xenia.pipelineStage(raw_stage) orelse {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: invalid pipeline stage raw={d} step={d}; no contract stage can consume this evidence\n",
+                .{ raw_stage, at_step },
+            );
+            return;
+        };
+        const accepted = self.ready.noteStage(@intFromEnum(stage), at_step, "xenia:pipeline");
+        self.logReadyCompilerStage(stage, accepted, at_step, "xenia:pipeline");
+    }
+
+    pub fn noteReadyCompilerGpuPhase(self: *MachOState, raw_phase: u8, at_step: u64) void {
+        if (!self.ready.enabled()) return;
+        const stage = ready_compiler.xenia.handoffPhase(raw_phase) orelse {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: invalid GPU handoff phase raw={d} step={d}; no contract stage can consume this evidence\n",
+                .{ raw_phase, at_step },
+            );
+            return;
+        };
+        const accepted = self.ready.noteStage(@intFromEnum(stage), at_step, "xenia:gpu_handoff");
+        self.logReadyCompilerStage(stage, accepted, at_step, "xenia:gpu_handoff");
+    }
+
+    pub fn noteReadyCompilerWait(self: *MachOState, object: u64, signaled: bool, at_step: u64) void {
+        if (!self.ready.enabled()) return;
+        const was_pending = self.ready.pending_wait_object == object;
+        self.ready.noteWait(object, signaled, at_step);
+        if (!signaled or was_pending) {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: wait object=0x{x} signaled={} step={d} pending=0x{x} timeout_count={d} signal_count={d}\n",
+                .{
+                    object,
+                    signaled,
+                    at_step,
+                    self.ready.pending_wait_object,
+                    self.ready.wait_timeout_count,
+                    self.ready.wait_signal_count,
+                },
+            );
+        }
+    }
+
+    pub fn observeReadyCompilerText(self: *MachOState, line: []const u8) void {
+        if (!self.ready.enabled()) return;
+        if (ready_compiler.Runtime.compilerDiagnosticKind(line)) |kind| {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: compiler-diagnostic kind={s} step={d} rip=0x{x} thread=0x{x} text={s}\n",
+                .{ kind.label(), self.executed_steps, self.regs.rip, self.active_guest_thread, line },
+            );
+        }
+        self.ready.observeCompilerText(line, self.executed_steps, self.regs.rip, self.active_guest_thread);
+    }
+
+    fn logReadyCompilerStage(
+        self: *MachOState,
+        stage: ready_compiler.xenia.Stage,
+        accepted: bool,
+        at_step: u64,
+        source: []const u8,
+    ) void {
+        const spec = self.ready.stage(@intFromEnum(stage)) orelse return;
+        const missing_prerequisites = spec.prerequisites & ~self.ready.reached_mask;
+        const next_missing = self.ready.firstMissingRequired();
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: stage name={s} id={d} accepted={} required={} owner={s} step={d} elapsed_steps={d} prerequisites=0x{x} missing_prerequisites=0x{x} reached=0x{x} next={s} next_owner={s} source={s}\n",
+            .{
+                spec.name,
+                spec.id,
+                accepted,
+                spec.required,
+                if (spec.owner.len != 0) spec.owner else "<unattributed>",
+                at_step,
+                self.ready.stage_duration[@intCast(spec.id)],
+                spec.prerequisites,
+                missing_prerequisites,
+                self.ready.reached_mask,
+                if (next_missing) |next| next.name else "<complete>",
+                if (next_missing) |next|
+                    (if (next.owner.len != 0) next.owner else "<unattributed>")
+                else
+                    "<none>",
+                source,
+            },
+        );
+        self.logReadyCompilerProgress();
+        if (!accepted and self.ready.failure.kind != .none) self.logReadyCompilerFailure();
+    }
+
+    /// The contract as an ordered block sequence, the way a build log reads.
+    /// Emitted on every accepted edge so the runtime phase has the same
+    /// at-a-glance progression the build phase already has.
+    fn logReadyCompilerProgress(self: *const MachOState) void {
+        if (!self.ready.enabled()) return;
+        const progress = self.ready.contractProgress();
+        const next = self.ready.firstMissingRequired();
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: CONTRACT PROGRESS block={d}/{d} required={d}/{d} edges={d}/{d} next={s} next_owner={s} next_detail={s}\n",
+            .{
+                progress.current_block,
+                progress.required_total,
+                progress.required_reached,
+                progress.required_total,
+                progress.reached,
+                progress.total,
+                if (next) |spec| spec.name else "<complete>",
+                if (next) |spec|
+                    (if (spec.owner.len != 0) spec.owner else "<unattributed>")
+                else
+                    "<none>",
+                if (next) |spec| spec.description else "every required edge reached",
+            },
+        );
+    }
+
+    /// Evaluate only at heartbeats. The semantic contract is not allowed to
+    /// add a per-instruction search to the interpreter's hot loop.
+    noinline fn pollReadyCompiler(self: *MachOState, at_step: u64) void {
+        if (!self.ready.enabled()) return;
+        self.ready.noteProgress(at_step, self.regs.rip, self.active_guest_thread, "heartbeat");
+        // A startup step that runs past one quiet budget while still reporting
+        // named work is slow, not stuck. Saying so out loud keeps the long
+        // stages visible without letting them end the run.
+        if (self.ready.takeSlowProgressNotice(at_step)) {
+            const symbol = self.metadata.nearestSymbol(self.regs.rip);
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: SLOW BUT PROGRESSING stage={s} owner={s} last_named_work={s} at_step={d} step={d} milestone_quiet_steps={d} quiet_budget={d} rip=0x{x} {s}+0x{x} notice={d}\n",
+                .{
+                    if (self.ready.firstMissingRequired()) |spec| spec.name else "<none>",
+                    if (self.ready.firstMissingRequired()) |spec|
+                        (if (spec.owner.len != 0) spec.owner else "<unattributed>")
+                    else
+                        "<none>",
+                    self.ready.workUnitName(),
+                    self.ready.work_unit.step,
+                    at_step,
+                    at_step -| self.ready.last_milestone_step,
+                    if (self.ready.contract) |active| active.quiet_budget_steps else 0,
+                    self.regs.rip,
+                    if (symbol) |resolved| resolved.name else "<unknown>",
+                    if (symbol) |resolved| resolved.offset else 0,
+                    self.ready.slow_progress_reports,
+                },
+            );
+        }
+        const evaluation = self.ready.evaluate(at_step);
+        if ((evaluation == .failed and self.ready.last_reported_phase == .failed) or
+            (evaluation != .failed and self.ready.last_reported_phase == self.ready.phase)) return;
+        self.ready.last_reported_phase = self.ready.phase;
+        switch (evaluation) {
+            .waiting => {},
+            .ready => machoCapturePrint(
+                "macho-processor: READY COMPILER: GREEN application-ready contract={s} step={d}; authentic native presentation is now proven\n",
+                .{ self.ready.contract.?.name, at_step },
+            ),
+            .failed => {
+                self.logReadyCompilerFailure();
+                if (self.ready.enforce and !self.terminated) {
+                    self.faulted = true;
+                    self.exit_code = 125;
+                    self.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+                    self.terminated = true;
+                    machoCapturePrint(
+                        "macho-processor: READY COMPILER: strict gate stopped execution before application readiness; no gameplay result is valid\n",
+                        .{},
+                    );
+                }
+            },
+        }
+    }
+
+    fn logReadyCompilerFailure(self: *const MachOState) void {
+        const failure = self.ready.failure;
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: BLOCKED kind={s} stage={s} function={s} step={d} rip=0x{x} thread=0x{x} object=0x{x} missing_prerequisites=0x{x} compiler_diagnostics={d} waits(timeout/signaled)={d}/{d} expected={s} observed={s} reason={s}\n",
+            .{
+                failure.kind.label(),
+                if (failure.stage.len != 0) failure.stage else "<none>",
+                if (failure.function.len != 0) failure.function else "<none>",
+                failure.step,
+                failure.rip,
+                failure.thread,
+                failure.object,
+                failure.missing_prerequisites,
+                self.ready.compiler_diagnostic_count,
+                self.ready.wait_timeout_count,
+                self.ready.wait_signal_count,
+                if (failure.expected.len != 0) failure.expected else "<none>",
+                if (failure.observed.len != 0) failure.observed else "<none>",
+                if (failure.reason.len != 0) failure.reason else "<none>",
+            },
+        );
+        self.logReadyCompilerDiagnosis();
+    }
+
+    /// The evidence behind the verdict.
+    ///
+    /// A blocked line alone says that startup stopped; it does not say which
+    /// axis froze, who owed the missing edge, what the guest was last observed
+    /// doing, or where it spent the quiet window. Those four facts are what
+    /// turn a stall report into an investigation, so they are emitted together
+    /// and derived from one snapshot to keep them consistent.
+    fn logReadyCompilerDiagnosis(self: *const MachOState) void {
+        if (!self.ready.enabled()) return;
+        const diagnosis = self.ready.diagnose(self.executed_steps);
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS progress={s} blockage={s} missing={s} owner={s} description={s} frontier={s}@{d} stall_steps={d} quiet_budget={d} activation_steps={d}/{d}\n",
+            .{
+                diagnosis.progress.label(),
+                diagnosis.blockage.label(),
+                if (diagnosis.missing_stage.len != 0) diagnosis.missing_stage else "<none>",
+                if (diagnosis.missing_owner.len != 0) diagnosis.missing_owner else "<unattributed>",
+                if (diagnosis.missing_description.len != 0) diagnosis.missing_description else "<none>",
+                if (diagnosis.frontier_stage.len != 0) diagnosis.frontier_stage else "<none>",
+                diagnosis.frontier_step,
+                diagnosis.quiet_steps,
+                diagnosis.quiet_budget_steps,
+                diagnosis.activation_steps,
+                diagnosis.activation_budget_steps,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS last_named_work={s} at_step={d} work_units_since_milestone={d} total_work_units={d} slow_progress_notices={d}\n",
+            .{
+                if (diagnosis.last_work_unit.len != 0) diagnosis.last_work_unit else "<none reported by the stage owner>",
+                diagnosis.last_work_unit_step,
+                diagnosis.work_units_since_milestone,
+                self.ready.work_unit_count,
+                self.ready.slow_progress_reports,
+            },
+        );
+        const hot_symbol = self.metadata.nearestSymbol(diagnosis.hot_site.rip);
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS hot_site=0x{x} {s}+0x{x} samples={d}/{d} distinct_sites={d} evictions={d} longest_same_site_run={d} steps=[{d}..{d}]\n",
+            .{
+                diagnosis.hot_site.rip,
+                if (hot_symbol) |resolved| resolved.name else "<unknown>",
+                if (hot_symbol) |resolved| resolved.offset else 0,
+                diagnosis.hot_site.samples,
+                diagnosis.stall_samples,
+                diagnosis.distinct_sites,
+                self.ready.stall_site_evictions,
+                self.ready.longest_same_site_run,
+                diagnosis.hot_site.first_step,
+                diagnosis.hot_site.last_step,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS milestone_thread=0x{x} current_thread=0x{x} thread_changed={} waits(timeout/signaled)={d}/{d} pending_wait=0x{x}\n",
+            .{
+                diagnosis.milestone_thread,
+                diagnosis.current_thread,
+                diagnosis.thread_changed,
+                self.ready.wait_timeout_count,
+                self.ready.wait_signal_count,
+                self.ready.pending_wait_object,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: GUIDANCE {s}\n",
+            .{diagnosis.guidance()},
+        );
+    }
+
+    pub fn logReadyCompilerSummary(self: *const MachOState) void {
+        if (!self.ready.enabled()) return;
+        const missing = self.ready.firstMissingRequired();
+        var passed_compile_checks: usize = 0;
+        for (self.ready.compile_checks[0..self.ready.compile_check_count]) |check| {
+            if (check.passed) passed_compile_checks += 1;
+        }
+        machoCapturePrint(
+            "macho-processor: READY COMPILER SUMMARY: phase={s} enforce={} progress={s} compile_checks={d}/{d} checks_dropped={d} functions={d} functions_dropped={d} compiler_diagnostics={d} waits(timeout/signaled)={d}/{d} milestones={d}/{d} work_units={d} slow_notices={d} activation_start={d} last_milestone={d} last_named_work={d} last_progress={d} missing={s} missing_owner={s} failure={s}\n",
+            .{
+                @tagName(self.ready.phase),
+                self.ready.enforce,
+                self.ready.classifyProgress(self.executed_steps).label(),
+                passed_compile_checks,
+                self.ready.compile_check_count,
+                self.ready.compile_checks_dropped,
+                self.ready.function_count,
+                self.ready.functions_dropped,
+                self.ready.compiler_diagnostic_count,
+                self.ready.wait_timeout_count,
+                self.ready.wait_signal_count,
+                @popCount(self.ready.reached_mask),
+                if (self.ready.contract) |active_contract| active_contract.stages.len else 0,
+                self.ready.work_unit_count,
+                self.ready.slow_progress_reports,
+                self.ready.activation_start_step,
+                self.ready.last_milestone_step,
+                self.ready.lastNamedProgressStep(),
+                self.ready.last_progress_step,
+                if (missing) |stage| stage.name else "<none>",
+                if (missing) |stage|
+                    (if (stage.owner.len != 0) stage.owner else "<unattributed>")
+                else
+                    "<none>",
+                self.ready.failure.kind.label(),
+            },
+        );
+        self.logReadyCompilerProgress();
+        // A failure emits its own evidence below, next to the blocked line.
+        // Without one, the summary is the only place the evidence can appear,
+        // so a run that stopped short without a typed failure still explains
+        // where startup actually got to.
+        if (self.ready.failure.kind == .none) self.logReadyCompilerDiagnosis();
+        for (self.ready.compile_checks[0..self.ready.compile_check_count]) |check| {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: report compile-check name={s} passed={} detail={s}\n",
+                .{ check.name, check.passed, check.detail },
+            );
+        }
+        if (self.ready.contract) |active_contract| {
+            for (active_contract.stages) |spec| {
+                const stage_bit = @as(u64, 1) << @as(u6, @intCast(spec.id));
+                const reached = self.ready.reached_mask & stage_bit != 0;
+                machoCapturePrint(
+                    "macho-processor: READY COMPILER: report stage id={d} name={s} required={} reached={} owner={s} first_step={d} elapsed_steps={d} prerequisites=0x{x} missing_prerequisites=0x{x} blockage={s} description={s}\n",
+                    .{
+                        spec.id,
+                        spec.name,
+                        spec.required,
+                        reached,
+                        if (spec.owner.len != 0) spec.owner else "<unattributed>",
+                        self.ready.first_stage_step[@intCast(spec.id)],
+                        self.ready.stage_duration[@intCast(spec.id)],
+                        spec.prerequisites,
+                        spec.prerequisites & ~self.ready.reached_mask,
+                        // Naming the blockage per stage separates "could not
+                        // have run yet" from "ran and stayed silent" without
+                        // making the reader decode the prerequisite mask.
+                        if (reached)
+                            "NONE"
+                        else if (spec.prerequisites & ~self.ready.reached_mask != 0)
+                            "PREREQUISITES_UNMET"
+                        else
+                            "OWNER_SILENT",
+                        spec.description,
+                    },
+                );
+            }
+        }
+        for (self.ready.functions[0..self.ready.function_count]) |function| {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: report function address=0x{x} state={s} module={s} name={s} compile_started={d} compiled={d} installed={d} entered={d} last_progress={d} entry_thread=0x{x} caller=0x{x}\n",
+                .{
+                    function.address,
+                    @tagName(function.state),
+                    if (function.module.len != 0) function.module else "<unknown>",
+                    if (function.name.len != 0) function.name else "<unknown>",
+                    function.compile_started_step,
+                    function.compiled_step,
+                    function.installed_step,
+                    function.entered_step,
+                    function.last_progress_step,
+                    function.entry_thread,
+                    function.caller,
+                },
+            );
+        }
+        // The approach to the frontier, oldest first. The last breadcrumb says
+        // where startup stopped; the trail says how it got there, which is what
+        // separates a subsystem that never started from one that got most of
+        // the way through and stopped on a specific step.
+        var trail_position: usize = 0;
+        while (trail_position < ready_compiler.types.work_unit_history_len) : (trail_position += 1) {
+            const entry = self.ready.workUnitHistoryAt(trail_position);
+            if (entry.len == 0) continue;
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: report work-unit [{d}] step={d} name={s}\n",
+                .{ trail_position, entry.step, entry.slice() },
+            );
+        }
+        // Where the guest spent the window that never reached the next edge.
+        // The shape of this table is the finding: one site holding nearly every
+        // sample is a loop, while a wide spread is ordinary forward execution
+        // that simply has no breadcrumb naming it.
+        for (self.ready.stall_sites) |site| {
+            if (site.samples == 0) continue;
+            const symbol = self.metadata.nearestSymbol(site.rip);
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: report site rip=0x{x} {s}+0x{x} samples={d}/{d} thread=0x{x} steps=[{d}..{d}]\n",
+                .{
+                    site.rip,
+                    if (symbol) |resolved| resolved.name else "<unknown>",
+                    if (symbol) |resolved| resolved.offset else 0,
+                    site.samples,
+                    self.ready.stall_samples,
+                    site.thread,
+                    site.first_step,
+                    site.last_step,
+                },
+            );
+        }
+        if (self.ready.pending_wait_object != 0) {
+            machoCapturePrint(
+                "macho-processor: READY COMPILER: report pending-wait object=0x{x} since_step={d}\n",
+                .{ self.ready.pending_wait_object, self.ready.pending_wait_step },
+            );
+        }
+        if (self.ready.failure.kind != .none) self.logReadyCompilerFailure();
     }
 
     /// Which producer stopped, when threads are waiting for something that will
@@ -2304,28 +2839,35 @@ pub const MachOState = struct {
         // never-notified waiters have the lost-wakeup repair, and the selector
         // inside `wakeNeverNotifiedWaiter` already applies the stall gate. The
         // quiescence repair cannot reach these waiters: the rest of the run is
-        // alive, so "nothing runnable" never became true. The creator may have
-        // published its object state with the wake lost (a model artifact), so
-        // grant one generation-bounded spurious wake and let the guest's own
-        // predicate loop settle it. A satisfied but unwoken waiter proceeds; an
-        // unsatisfied one re-parks, and the once-per-generation guard stops a
-        // loop.
-        if (self.pthreads.wakeNeverNotifiedWaiter(self.executed_steps)) |repair| {
-            const woken_symbol = self.metadata.nearestSymbol(repair.thread);
+        // alive, so "nothing runnable" never became true.
+        //
+        // Do not mutate a potentially healthy host worker merely because its
+        // condition variable has never been signalled. If this is a confirmed
+        // guest lost-wakeup, the old bounded experiment remains available via
+        // ROSETTE_MACHO_NEVER_NOTIFIED_REPAIR=1.
+        if (self.never_notified_repair_enabled) {
+            if (self.pthreads.wakeNeverNotifiedWaiter(self.executed_steps)) |repair| {
+                const woken_symbol = self.metadata.nearestSymbol(repair.thread);
+                machoCapturePrint(
+                    "macho-processor: NOTIFIER LIVENESS REPAIR: granted one generation-bounded POSIX spurious wake thread=0x{x} object=0x{x} waited_steps={d} symbol={s}; the guest predicate loop re-checks its own condition on return\n",
+                    .{
+                        repair.thread,
+                        repair.object,
+                        repair.waited_steps,
+                        if (woken_symbol) |resolved| resolved.name else "<unknown>",
+                    },
+                );
+                // The wake happened here; what it proved is judged elsewhere.
+                // A release nobody reads the outcome of is a workaround, and
+                // one whose outcome is recorded is an experiment that settles
+                // which codebase the defect is in.
+                self.noteStallReleaseGranted(repair.object, repair.thread, repair.waited_steps);
+            }
+        } else if (progress == .never_notified) {
             machoCapturePrint(
-                "macho-processor: NOTIFIER LIVENESS REPAIR: granted one generation-bounded POSIX spurious wake thread=0x{x} object=0x{x} waited_steps={d} symbol={s}; the guest predicate loop re-checks its own condition on return\n",
-                .{
-                    repair.thread,
-                    repair.object,
-                    repair.waited_steps,
-                    if (woken_symbol) |resolved| resolved.name else "<unknown>",
-                },
+                "macho-processor: NOTIFIER LIVENESS REPAIR: disabled by default for never-notified waits; this may be an intentional idle worker. Set ROSETTE_MACHO_NEVER_NOTIFIED_REPAIR=1 only after identifying a guest lost-wakeup\n",
+                .{},
             );
-            // The wake happened here; what it proved is judged elsewhere. A
-            // release nobody reads the outcome of is a workaround, and one
-            // whose outcome is recorded is an experiment that settles which
-            // codebase the defect is in.
-            self.noteStallReleaseGranted(repair.object, repair.thread, repair.waited_steps);
         }
     }
 
@@ -6114,12 +6656,10 @@ pub const MachOState = struct {
     /// filled with the full validation gate chain already run and declined
     /// (not a special-RIP target, executable, config parsing idle, table
     /// intact). On such a hit the per-instruction gate chain is provably
-    /// redundant, so `step` skips it. Probe semantics match
-    /// `decodeWithLiveOperands`' own hit condition, so a non-null result here
-    /// is exactly "the next decode would hit and the entry is plain". The
-    /// returned classification doubles as the execution-history filter's
-    /// host-image test, computed once per fill instead of per step.
-    inline fn decodeFastPlainHostImage(self: *const MachOState) ?bool {
+    /// redundant, so `step` skips it. This returns the decoded instruction as
+    /// well as the cached host-image classification, avoiding a second probe
+    /// in `decodeWithLiveOperands`.
+    inline fn decodeFastPlain(self: *MachOState) ?FastPlainDecode {
         const rip = self.regs.rip;
         const set_base = constants.decodeCacheSetBase(rip);
         const ways = self.decode_cache[set_base..][0..constants.DECODE_CACHE_WAYS];
@@ -6128,7 +6668,23 @@ pub const MachOState = struct {
                 candidate.code_generation == self.code_generation and
                 candidate.fast_plain)
             {
-                return candidate.host_image;
+                self.decode_cache_hits +|= 1;
+                noteDecodeCacheUse(ways, candidate);
+                var decoded = candidate.decoded;
+                if (addressNeedsLiveRegisters(decoded)) {
+                    const address_size: Size = if (decoded.has_0x67) .bits32 else .bits64;
+                    decoded.addr = x64_decoder.resolveMemoryAddress(&self.regs, .{
+                        .displacement = candidate.displacement,
+                        .has_index = decoded.sib_has_index,
+                        .index_reg = decoded.sib_index_reg,
+                        .scale = decoded.sib_scale,
+                        .has_base = decoded.sib_has_base,
+                        .base_reg = decoded.sib_base_reg,
+                        .rip_relative = decoded.rip_relative,
+                        .segment = decoded.segment,
+                    }, self.regs.rip +% decoded.len, address_size, .long64, decoded.op != .lea_reg_mem);
+                }
+                return .{ .decoded = decoded, .host_image = candidate.host_image };
             }
         }
         return null;
@@ -6535,15 +7091,18 @@ pub const MachOState = struct {
         // sparse executability probe on the hot path; everything here still
         // runs on misses, on entries filled without the gates, during config
         // parsing, and whenever the special-RIP table fallback is active.
+        self.pending_control_transfer = null;
+        var decoded: DecodedInsn = undefined;
         var gates_free = false;
-        if (self.decodeFastPlainHostImage()) |host_image| {
+        if (self.decodeFastPlain()) |fast| {
             // The fast entry was validated (executable, not a special target)
             // at fill time and survives only while the bytes and permissions
             // it was validated under still hold. Its fill-time host-image
             // classification is exact for this RIP, so the execution-history
             // filter below reads one field instead of re-running the range
             // compare on every step.
-            self.step_host_image = host_image;
+            self.step_host_image = fast.host_image;
+            decoded = fast.decoded;
         } else {
             gates_free = !self.specialRipPossible();
             if (!gates_free) {
@@ -6562,9 +7121,8 @@ pub const MachOState = struct {
             if (!self.isExecutableAddress(self.regs.rip)) return self.recoverNonExecutableRip();
             self.step_host_image = self.regs.rip >= self.executable_min and
                 self.regs.rip < self.executable_max;
+            decoded = self.decodeWithLiveOperands(gates_free) orelse return self.reportDecodeFailure();
         }
-        self.pending_control_transfer = null;
-        const decoded = self.decodeWithLiveOperands(gates_free) orelse return self.reportDecodeFailure();
         if (decoded.op == .invalid) return self.reportInvalidInstruction();
         // Instruction history, gated behaviourally rather than by a flag.
         //
@@ -6855,6 +7413,11 @@ pub const MachOState = struct {
     // single call site without it, which is exactly how they got here. The
     // bodies are unchanged; only their address is.
     noinline fn reportProgressCheckpoint(self: *MachOState, steps: u64) void {
+        // Attribute the readiness gate's quiet window at this cadence rather
+        // than at the heartbeat. A whole run only produces a handful of
+        // heartbeats, and a handful of samples cannot tell a loop from forward
+        // motion; the sample itself is O(1), so the finer rate is affordable.
+        self.ready.noteExecutionSample(steps, self.regs.rip, self.active_guest_thread);
         const symbol = self.metadata.nearestSymbol(self.regs.rip);
         const heap_summary = self.memory_forwarder.summary();
         const snapshot: startup_observer.Snapshot = .{
@@ -7011,6 +7574,7 @@ pub const MachOState = struct {
             .reason = "heartbeat",
             .symbol = if (hb_symbol) |resolved| resolved.name else "",
         });
+        self.pollReadyCompiler(steps);
     }
 
     /// Try to find real queued work for a parked cooperative context, and
@@ -8035,6 +8599,8 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.memory_trace_enabled = environmentFlag("ROSETTE_MACHO_MEMORY_TRACE");
+    state.never_notified_repair_enabled =
+        environmentFlag("ROSETTE_MACHO_NEVER_NOTIFIED_REPAIR");
     state.allow_assumed_dispatch_continuation = !environmentFlag("ROSETTE_MACHO_STRICT_DISPATCH");
     // R3 (perf audit): full mutation provenance, detailed vtable mutation
     // attribution and the suspicious-write detector default off. The narrow
@@ -8091,6 +8657,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     machoCapturePrint("  initializers: {d}\n", .{state.metadata.initializer_count});
     machoCapturePrint("  strict initializers: {}\n", .{state.strict_initializers});
     machoCapturePrint("  strict imports: {}\n", .{state.strict_imports});
+    machoCapturePrint("  never-notified wait repair: {}\n", .{state.never_notified_repair_enabled});
     machoCapturePrint("  x64 cpu profile: {s}\n", .{state.cpu_profile.label()});
     machoCapturePrint(
         "  advertised ISA: SSE4.2={} AVX={} AVX2={} AVX-512F={} XCR0=0x{x}\n",
@@ -8166,6 +8733,20 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         .{state.event_stream.run_id},
     );
     state.armGraphicsTracepoints();
+    const image_is_xenia = has_xbdm_diagnostics or
+        std.mem.indexOf(u8, options.path, "xenia") != null or
+        std.mem.indexOf(u8, slice, "VdSwap") != null;
+    const ready_gate_requested = environmentFlag("ROSETTE_MACHO_READY_GATE") or image_is_xenia;
+    const ready_gate_enabled = ready_gate_requested and
+        !environmentFlag("ROSETTE_MACHO_READY_GATE_OFF");
+    const ready_gate_enforce = !environmentFlag("ROSETTE_MACHO_READY_GATE_REPORT_ONLY");
+    state.configureReadyCompiler(
+        ready_gate_enabled,
+        ready_gate_enforce,
+        environmentUnsigned("ROSETTE_MACHO_READY_MAX_STEPS", 0),
+        environmentUnsigned("ROSETTE_MACHO_READY_QUIET_STEPS", 0),
+        vex_audit.ready(),
+    );
     state.launch_options.logConfiguration(state.internal_targets.cvar_add_to_launch_options_count);
     machoCapturePrint("ROSETTE: MachO state setup completed successfully\n", .{});
 
@@ -8197,6 +8778,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.backend_diagnostics.logSummary();
         state.xenia_pipeline.logSummary(state.executed_steps);
         state.xenia_gpu_handoff.logSummary(state.executed_steps);
+        state.logReadyCompilerSummary();
         state.export_table_mgr.logSummary();
         state.export_table_lc.logSummary();
         state.export_registry.logSummary();
@@ -8218,6 +8800,17 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.logPerformanceAccelerationSummary();
         machoCapturePrint("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
         return state.exit_code;
+    }
+
+    if (!state.sealReadyCompilerCompile()) {
+        state.logReadyCompilerSummary();
+        if (state.ready.enforce) {
+            state.faulted = true;
+            state.terminated = true;
+            state.exit_code = 125;
+            state.termination_reason = @intFromEnum(exit_diagnostics.TerminationReason.runtime_invariant_failure);
+            return state.exit_code;
+        }
     }
 
     state.startup.enter(.main_enter, state.executed_steps);
@@ -8293,6 +8886,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.backend_diagnostics.logSummary();
     state.xenia_pipeline.logSummary(state.executed_steps);
     state.xenia_gpu_handoff.logSummary(state.executed_steps);
+    state.logReadyCompilerSummary();
     // The run is over, so "still unclassified" has stopped meaning "not yet"
     // and started meaning "the pipeline never advanced past it". Sealing before
     // the frontier report is what turns the ledger from a permanent blocker
