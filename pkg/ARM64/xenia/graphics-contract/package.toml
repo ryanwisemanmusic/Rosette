@@ -1,0 +1,9 @@
+name = "xenia-arm64-graphics-contract"
+version = "0.1.0-local"
+kind = "guest-vdswap-handoff-contract"
+architectures = ["arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# This package records the same guest handoff facts on the ARM64 host route;
+# it does not claim that the unrun PPC-to-ARM64 Xenia route is operational.
