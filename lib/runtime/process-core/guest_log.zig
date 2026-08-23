@@ -157,6 +157,12 @@ pub fn emitRuntimeSummaryHeartbeat(self: anytype, snapshot: startup_observer.Sna
 pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_raw: u64) bool {
     const length = @min(length_raw, GUEST_LOG_BUFFER_SIZE);
     const message = self.guestMemoryConst(address, length) orelse return false;
+    // Compiler failures can cross the guest log boundary before they become a
+    // null-function or no-progress symptom. The ready compiler keeps this
+    // recognizer cheap and inactive for non-Xenia targets.
+    if (comptime @hasDecl(@TypeOf(self.*), "observeReadyCompilerText")) {
+        self.observeReadyCompilerText(message);
+    }
     observePreflightGuestLog(self, message);
     observeXeniaPipelineGuestLog(self, message);
     observeGpuBootstrapGuestLog(self, message);
@@ -439,6 +445,13 @@ pub fn observeLivelockWaits(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "livelock_predictor")) return;
     const operation = livelockOperation(self, message) orelse return;
+    if (comptime @hasDecl(@TypeOf(self.*), "noteReadyCompilerWait")) {
+        switch (operation.op) {
+            .wait => self.noteReadyCompilerWait(operation.object, true, self.executed_steps),
+            .wait_timeout => self.noteReadyCompilerWait(operation.object, false, self.executed_steps),
+            else => {},
+        }
+    }
     // The mirror runs on the guest thread that wrote the line, so the active
     // thread is the one that performed the operation. Naming it is what makes
     // "find who waits on it" answerable.
@@ -1026,6 +1039,9 @@ pub fn observeXeniaGpuHandoffGuestLog(self: anytype, message: []const u8) void {
     if (comptime !@hasField(State, "xenia_gpu_handoff")) return;
     const observation = self.xenia_gpu_handoff.observeLine(message, self.executed_steps) orelse return;
     if (!observation.advanced) return;
+    if (comptime @hasDecl(@TypeOf(self.*), "noteReadyCompilerGpuPhase")) {
+        self.noteReadyCompilerGpuPhase(@intFromEnum(observation.current), self.executed_steps);
+    }
     machoCapturePrint(
         "macho-processor: Xenia GPU handoff advanced: {s} -> {s} at step={d}\n",
         .{ @tagName(observation.previous), @tagName(observation.current), self.executed_steps },
@@ -1567,6 +1583,9 @@ fn observeRingBufferAddress(self: anytype, message: []const u8) void {
 pub fn observeXeniaPipelineGuestLog(self: anytype, message: []const u8) void {
     const observation = self.xenia_pipeline.observeLine(message, self.executed_steps) orelse return;
     if (!observation.first_observation) return;
+    if (comptime @hasDecl(@TypeOf(self.*), "noteReadyCompilerPipelineStage")) {
+        self.noteReadyCompilerPipelineStage(@intFromEnum(observation.stage), observation.step);
+    }
 
     // Reaching a new pipeline stage is the run demonstrably making progress,
     // which is the only evidence that a handler did more than log and abandon.
