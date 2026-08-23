@@ -446,6 +446,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The graphics handoff package is deliberately selected by the host ISA.
+    // It contributes immutable ABI/ordering facts only; it cannot provide a
+    // guest pointer, command buffer, or presentation event.
+    const xenia_graphics_contract_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/graphics-contract/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/graphics-contract/src/root.zig");
+    const xenia_graphics_contract_mod = b.createModule(.{
+        .root_source_file = xenia_graphics_contract_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_graphics_contract", xenia_graphics_contract_mod);
     const bridge_register_trace_module = b.createModule(.{
         .root_source_file = b.path("../src/bridge/register-tracing/runtime.zig"),
         .target = target,
@@ -1345,6 +1358,26 @@ pub fn build(b: *std.Build) void {
 
         const ready_compiler_test = b.addTest(.{ .root_module = ready_compiler_mod });
         check_step.dependOn(&b.addRunArtifact(ready_compiler_test).step);
+
+        // Compile-side companion to the readiness gate: the resolutions a
+        // finished link set leaves undetermined produce no diagnostic from
+        // either the compiler or the linker, and surface as runtime defects.
+        const link_audit_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/link-audit/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const link_audit_test = b.addTest(.{ .root_module = link_audit_mod });
+        check_step.dependOn(&b.addRunArtifact(link_audit_test).step);
+
+        const link_audit_tool_mod = b.createModule(.{
+            .root_source_file = b.path("../src/tooling/link-audit/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        link_audit_tool_mod.addImport("link_audit", link_audit_mod);
+        const link_audit_tool_test = b.addTest(.{ .root_module = link_audit_tool_mod });
+        check_step.dependOn(&b.addRunArtifact(link_audit_tool_test).step);
 
         const gpu_mod = b.createModule(.{
             .root_source_file = b.path("../lib/gpu/root.zig"),
