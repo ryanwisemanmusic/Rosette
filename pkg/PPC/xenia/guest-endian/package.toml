@@ -1,0 +1,10 @@
+name = "xenia-ppc-guest-endian"
+version = "0.1.0-local"
+kind = "guest-endian-source-mirror"
+role = "build-time"
+architectures = ["ppc64"]
+language = "zig"
+verification = "verify.sh"
+
+# This route represents a direct PPC host build. The guest vectors remain the
+# same as the x86 and ARM64 mirrors even though the host route is big-endian.
