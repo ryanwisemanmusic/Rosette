@@ -1,0 +1,7 @@
+name = "rosette-x86-sha-abi"
+version = "0.1.0-local"
+kind = "source-mirror-crypto-abi"
+role = "source-mirror"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
