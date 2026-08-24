@@ -8,10 +8,38 @@ const std = @import("std");
 const event_log = @import("event_log");
 const contracts = @import("xenia_pipeline_contracts.zig");
 const shader_storage_contract = @import("xenia_shader_storage_contract");
+/// Which phrase witnesses which stage is fixed when Xenia is compiled, so the
+/// table and its rare-character filter are resolved at build time rather than
+/// re-walked per log line. What stays here is the part that needs the run:
+/// ordering, prerequisites, and whether an observation is accepted.
+const phrase_map = @import("xenia_log_phrase_map");
 
 const machoCapturePrint = event_log.machoCapturePrint;
 
 pub const Stage = contracts.Stage;
+
+comptime {
+    // The package and the contract each declare the stage vocabulary, and a
+    // rename on either side would otherwise leave rules that can never fire
+    // and a frontier that silently reports an earlier stage than the run
+    // reached. Matching by name and position makes that a build error.
+    const package_fields = std.meta.fields(phrase_map.Stage);
+    const contract_fields = std.meta.fields(contracts.Stage);
+    if (package_fields.len != contract_fields.len) {
+        @compileError("xenia log-phrase package and pipeline contract disagree on the stage count");
+    }
+    for (package_fields, contract_fields) |package_field, contract_field| {
+        if (!std.mem.eql(u8, package_field.name, contract_field.name)) {
+            @compileError(
+                "xenia log-phrase package stage '" ++ package_field.name ++
+                    "' does not match contract stage '" ++ contract_field.name ++ "'",
+            );
+        }
+        if (package_field.value != contract_field.value) {
+            @compileError("xenia log-phrase package stage '" ++ package_field.name ++ "' has a different ordinal");
+        }
+    }
+}
 pub const Subsystem = contracts.Subsystem;
 
 pub const Observation = struct {
@@ -262,52 +290,17 @@ pub const Engine = struct {
     }
 };
 
+/// The stage a Xenia log line witnesses, or null.
+///
+/// The 33 sequential substring searches this used to run moved into
+/// `pkg/common/xenia/log-phrase-map`, which rejects a phrase with a single bit
+/// test when the line cannot contain it. Null stays the overwhelmingly common
+/// answer and is now much cheaper to reach, which matters because this runs on
+/// every guest log line.
 pub fn classifyLine(line: []const u8) ?Stage {
-    if (contains(line, "Initializing Memory")) return .emulator_setup_started;
-    if (contains(line, "Initializing Exports")) return .memory_ready;
-    if (contains(line, "Processor setup completed successfully") or
-        contains(line, "Processor::Setup() completed successfully"))
-        return .processor_ready;
-    if (contains(line, "Creating patcher")) return .patch_database_ready;
-    if (contains(line, "PIPELINE: Kernel guest globals begin")) return .kernel_globals_started;
-    if (contains(line, "PIPELINE: Kernel guest globals ready")) return .kernel_globals_ready;
-    if (contains(line, "Kernel initialization completed successfully")) return .kernel_modules_ready;
-    if (contains(line, "Setting up graphics system")) return .graphics_setup_started;
-    if (contains(line, "CommandProcessor::Initialize() SUCCEEDED")) return .command_processor_ready;
-    if (contains(line, "Graphics system setup completed successfully")) return .graphics_ready;
-    if (contains(line, "Emulator setup completed successfully")) return .emulator_setup_ready;
-    if (contains(line, "Emulator::LaunchPath ENTRY")) return .launch_path_started;
-    if (contains(line, "LaunchPath: Detected XISO") or
-        contains(line, "XISO case detected"))
-        return .disc_mounted;
-    if (contains(line, "Emulator::CompleteLaunch ENTRY")) return .complete_launch_started;
-    if (contains(line, "Module loaded successfully")) return .user_module_loaded;
-    if (contains(line, "FinishLoadingUserModule stage=Precompile.begin")) return .precompile_requested;
-    if (contains(line, "FinishLoadingUserModule stage=Precompile.end") or
-        contains(line, "XexModule::Precompile END"))
-        return .precompile_completed;
-    if (contains(line, "User module finished loading successfully") or
-        contains(line, "module fully ready"))
-        return .user_module_ready;
-    if (contains(line, "Initializing shader storage")) return .shader_storage_requested;
-    // This line is emitted after the request function returns and can follow
-    // the five-second timeout continuation. It is intentionally not a ready
-    // edge. The command-processor thread's explicit completion line is.
-    if (contains(line, "GPU THREAD: Shader storage initialization completed")) return .shader_storage_ready;
-    if (contains(line, "Guest main thread ready") or
-        (contains(line, "GUEST EXECUTE:") and contains(line, "fid=0")))
-        return .guest_main_ready;
-    if (contains(line, "CompleteLaunch SUCCEEDED")) return .complete_launch_ready;
-    if (contains(line, "RING BUFFER INITIALIZED") or
-        contains(line, "InitializeRingBuffer completed") or
-        contains(line, "InitializeRingBuffer COMPLETE"))
-        return .ring_buffer_ready;
-    if (contains(line, "Created") and contains(line, "swapchain") or
-        contains(line, "surface binding validated"))
-        return .surface_ready;
-    if (contains(line, "first guest output image available")) return .guest_output_ready;
-    if (contains(line, "first present SUCCESS")) return .first_present;
-    return null;
+    const stage = phrase_map.classify(line) orelse return null;
+    // Same vocabulary, proven identical by the comptime block above.
+    return @enumFromInt(@intFromEnum(stage));
 }
 
 fn contains(haystack: []const u8, needle: []const u8) bool {
