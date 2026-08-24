@@ -1,6 +1,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const table = @import("table.zig");
+const handlers = @import("handlers.zig");
+const xenia_primitive_contract = @import("xenia_primitive_contract");
 
 const Handler = types.Handler;
 
@@ -17,12 +19,31 @@ pub const MatchKind = enum {
 
 pub const PrimitiveRegistry = struct {
     defs: []const PrimitiveDef,
+    package_fast_path: bool = false,
 
     pub fn init(defs: []const PrimitiveDef) PrimitiveRegistry {
         return .{ .defs = defs };
     }
 
     pub fn matchSymbol(self: *const PrimitiveRegistry, symbol_name: []const u8) ?Handler {
+        // The package is only a route-selection index. Every returned handler
+        // is one of the existing definitions below, and the general scan stays
+        // authoritative for symbols outside the package's narrow families.
+        if (self.package_fast_path) {
+            if (xenia_primitive_contract.lookup(symbol_name)) |family| {
+                return switch (family) {
+                    .strlen => handlers.strlen,
+                    .memcmp => handlers.memcmp,
+                    .memcpy => handlers.memcpy,
+                    .strcmp => handlers.strcmp,
+                    .cxa_guard_acquire => handlers.cxaGuardAcquire,
+                    .cxa_guard_release => handlers.cxaGuardRelease,
+                    .cxa_guard_abort => handlers.cxaGuardAbort,
+                    .string_compare => handlers.stringCompare,
+                    .string_rfind => handlers.stringRFind,
+                };
+            }
+        }
         for (self.defs) |def| {
             const matches = switch (def.match_kind) {
                 .contains => std.mem.indexOf(u8, symbol_name, def.name_pattern) != null,
@@ -98,7 +119,7 @@ const builtin_primitives = [_]PrimitiveDef{
 };
 
 pub fn builtin() PrimitiveRegistry {
-    return PrimitiveRegistry.init(&builtin_primitives);
+    return .{ .defs = &builtin_primitives, .package_fast_path = true };
 }
 
 test "registry: match symbol by pattern" {
@@ -163,4 +184,15 @@ test "registry: out of bounds slots do not register" {
 test "registry: empty defs list matches nothing" {
     const reg = PrimitiveRegistry.init(&.{});
     try std.testing.expect(reg.matchSymbol("_strlen") == null);
+}
+
+test "registry: package fast families retain the existing handler route" {
+    const reg = builtin();
+    try std.testing.expect(xenia_primitive_contract.contractIsWellFormed());
+    try std.testing.expect(reg.matchSymbol("_strlen") != null);
+    try std.testing.expect(reg.matchSymbol("_memcmp") != null);
+    try std.testing.expect(reg.matchSymbol("_memcpy") != null);
+    try std.testing.expect(reg.matchSymbol("_strcmp") != null);
+    try std.testing.expect(reg.matchSymbol("___cxa_guard_abort") != null);
+    try std.testing.expect(reg.matchSymbol("__ZNKSt3__117basic_string_viewIcNSt11char_traitsIcEEE5rfindEcm") == null);
 }
