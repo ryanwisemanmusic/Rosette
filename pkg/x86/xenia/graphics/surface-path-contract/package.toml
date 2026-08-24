@@ -1,0 +1,9 @@
+name = "xenia-x86-surface-path-contract"
+version = "0.1.0-local"
+kind = "vulkan-metal-surface-ordering"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
+
+# FBO is Xenia's render-target/cache path here. Native presentation still
+# requires the guest surface call and the Vulkan-to-Metal WSI chain.
