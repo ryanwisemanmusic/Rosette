@@ -1,6 +1,7 @@
 name = "xenia-arm64-wait-contract"
 version = "0.1.0-local"
 kind = "runtime-synchronization-contract"
+role = "build-time"
 architectures = ["x86_64", "ppc64", "arm64"]
 language = "zig"
 verification = "verify.sh"
