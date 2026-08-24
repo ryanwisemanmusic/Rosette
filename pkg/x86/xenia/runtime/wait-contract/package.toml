@@ -1,0 +1,10 @@
+name = "xenia-x86-wait-contract"
+version = "0.1.0-local"
+kind = "runtime-synchronization-contract"
+architectures = ["x86_64", "ppc64", "arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# The model is portable, but the evidence that motivated it is route-local.
+# It must not be used as permission to rewrite a live guest wait. The route is
+# x86-64; the target matrix it verifies is all three.
