@@ -526,6 +526,20 @@ pub const Runtime = struct {
         return null;
     }
 
+    /// Undo the publication half of `takeNewestDeferred` when creating the
+    /// cooperative execution context fails. The old path left the entry
+    /// marked `started` with `deferred_threads == 0`, which produced a
+    /// runnable pthread with no saved context and made the scheduler report a
+    /// false global deadlock at its next zero-active boundary.
+    pub fn requeueDeferred(self: *Runtime, handle: u64) void {
+        const thread = self.threadForHandle(handle) orelse return;
+        if (!thread.active or !thread.started or thread.state != .runnable) return;
+        thread.started = false;
+        self.deferred_threads +|= 1;
+        self.scheduled_threads -|= 1;
+        self.bumpStateVersion();
+    }
+
     /// P0-1 (event-driven scheduler): invalidates the cooperative scheduler's
     /// cached suspended-runnable count. Called only where a thread state
     /// transition (or condvar notification) can change whether a suspended
