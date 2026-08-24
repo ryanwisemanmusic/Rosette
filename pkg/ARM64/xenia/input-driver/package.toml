@@ -1,0 +1,7 @@
+name = "xenia-arm64-input-driver"
+version = "0.1.0-local"
+kind = "host-input-driver-contract"
+role = "build-time"
+architectures = ["arm64"]
+language = "zig"
+verification = "verify.sh"
