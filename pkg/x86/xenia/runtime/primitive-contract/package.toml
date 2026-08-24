@@ -1,0 +1,9 @@
+name = "xenia-x86-primitive-contract"
+version = "0.1.0-local"
+kind = "mach-o-primitive-route-contract"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
+
+# This package only selects handlers that already exist in Rosette's primitive
+# registry. It never dereferences a guest pointer or replaces a handler.
