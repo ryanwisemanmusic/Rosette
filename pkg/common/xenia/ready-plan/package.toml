@@ -1,0 +1,7 @@
+name = "xenia-ready-plan"
+version = "0.1.0"
+kind = "facts"
+role = "build-time"
+guest_architecture = "x86-64"
+host_architecture = "any"
+description = "Static Xenia startup contract, plan vocabulary, and readiness routing facts."
