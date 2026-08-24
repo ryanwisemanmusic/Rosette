@@ -1,0 +1,13 @@
+name = "common-text-phrase-filter"
+version = "0.1.0-local"
+kind = "comptime-phrase-rejection-filter"
+role = "build-time"
+# Route-independent: the structure is derived from the phrase set, not from the
+# architecture Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The filter only ever proves a match is impossible. Callers run a real
+# comparison on survivors, and each carries a test that the filtered and
+# unfiltered answers agree.
