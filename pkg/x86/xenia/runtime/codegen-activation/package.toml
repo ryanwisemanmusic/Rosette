@@ -1,6 +1,7 @@
 name = "xenia-x86-codegen-activation"
 version = "0.1.0-local"
 kind = "x86-64-codegen-and-activation-contract"
+role = "build-time"
 architectures = ["x86_64"]
 language = "zig"
 verification = "verify.sh"
