@@ -1,0 +1,11 @@
+name = "common-abi-rosette-ppc-host"
+version = "0.1.0-local"
+kind = "host-abi-symbol-catalogue"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The names and required/optional status of the direct PowerPC provider are
+# compile-time contract facts. The live adapter, guest-memory validation and
+# callback execution remain in lib/runtime/ppc and lib/linker/dyld.
