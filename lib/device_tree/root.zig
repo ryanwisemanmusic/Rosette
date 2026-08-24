@@ -29,6 +29,14 @@ pub const gpu = struct {
     pub const xenos = @import("gpu/xenos.zig");
 };
 
+pub const audio = struct {
+    pub const apu = @import("audio/apu.zig");
+};
+
+pub const hid = struct {
+    pub const controller = @import("hid/controller.zig");
+};
+
 pub const Tree = schema.Tree;
 pub const Value = schema.Value;
 pub const Source = schema.Source;
@@ -43,4 +51,6 @@ test {
     _ = constraint;
     _ = cpu.xenon;
     _ = gpu.xenos;
+    _ = audio.apu;
+    _ = hid.controller;
 }

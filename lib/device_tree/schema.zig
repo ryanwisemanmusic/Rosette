@@ -32,6 +32,13 @@ pub const NodeKind = enum(u8) {
     surface,
     consumer,
     runtime,
+    // Subsystems with their own hardware boundaries. Appended rather than
+    // inserted: the JSON form matches by name, but an ordinal shift would
+    // still invalidate any stored tree that encoded the tag numerically.
+    audio,
+    input,
+    timers,
+    io,
     other,
 };
 

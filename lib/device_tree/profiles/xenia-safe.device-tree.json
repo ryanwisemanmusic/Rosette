@@ -136,6 +136,330 @@
           "mutability": "read_only"
         }
       ]
+    },
+    {
+      "path": "/audio",
+      "kind": "audio",
+      "properties": [
+        {
+          "name": "sample-rate-hz",
+          "value_kind": "unsigned",
+          "unsigned_value": 48000,
+          "mutability": "read_only"
+        },
+        {
+          "name": "mix-channels",
+          "value_kind": "unsigned",
+          "unsigned_value": 6,
+          "mutability": "read_only"
+        },
+        {
+          "name": "xma-decode-context-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 320,
+          "mutability": "read_only"
+        },
+        {
+          "name": "voice-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 256,
+          "mutability": "read_only"
+        },
+        {
+          "name": "host-frame-samples-per-channel",
+          "value_kind": "unsigned",
+          "unsigned_value": 256,
+          "mutability": "configurable"
+        },
+        {
+          "name": "host-frame-bytes",
+          "value_kind": "unsigned",
+          "unsigned_value": 6144,
+          "mutability": "read_only"
+        },
+        {
+          "name": "xma-codec-core-present",
+          "value_kind": "boolean",
+          "boolean_value": false,
+          "mutability": "read_only"
+        },
+        {
+          "name": "decode-owner",
+          "value_kind": "text",
+          "text_value": "guest-xma-hardware",
+          "mutability": "read_only"
+        }
+      ]
+    },
+    {
+      "path": "/hid",
+      "kind": "input",
+      "properties": [
+        {
+          "name": "port-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 4,
+          "mutability": "read_only"
+        },
+        {
+          "name": "console-sample-rate-hz",
+          "value_kind": "unsigned",
+          "unsigned_value": 60,
+          "mutability": "read_only"
+        },
+        {
+          "name": "host-poll-rate-hz",
+          "value_kind": "unsigned",
+          "unsigned_value": 120,
+          "mutability": "configurable"
+        },
+        {
+          "name": "thumbstick-bits",
+          "value_kind": "unsigned",
+          "unsigned_value": 16,
+          "mutability": "read_only"
+        },
+        {
+          "name": "trigger-bits",
+          "value_kind": "unsigned",
+          "unsigned_value": 8,
+          "mutability": "read_only"
+        },
+        {
+          "name": "rumble-motor-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 2,
+          "mutability": "read_only"
+        }
+      ]
+    },
+    {
+      "path": "/hid/controllers",
+      "kind": "input",
+      "properties": [
+        {
+          "name": "attached-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 0,
+          "mutability": "configurable"
+        }
+      ]
+    },
+    {
+      "path": "/hid/controllers/0",
+      "kind": "input",
+      "properties": [
+        {
+          "name": "type",
+          "value_kind": "text",
+          "text_value": "gamepad",
+          "mutability": "read_only"
+        },
+        {
+          "name": "connected",
+          "value_kind": "boolean",
+          "boolean_value": false,
+          "mutability": "configurable"
+        },
+        {
+          "name": "has-triggers",
+          "value_kind": "boolean",
+          "boolean_value": true,
+          "mutability": "read_only"
+        },
+        {
+          "name": "has-thumbsticks",
+          "value_kind": "boolean",
+          "boolean_value": true,
+          "mutability": "read_only"
+        },
+        {
+          "name": "has-rumble",
+          "value_kind": "boolean",
+          "boolean_value": true,
+          "mutability": "read_only"
+        }
+      ]
+    },
+    {
+      "path": "/timers",
+      "kind": "timers",
+      "properties": [
+        {
+          "name": "max-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 64,
+          "mutability": "read_only"
+        },
+        {
+          "name": "tick-nanoseconds",
+          "value_kind": "unsigned",
+          "unsigned_value": 100,
+          "mutability": "read_only"
+        },
+        {
+          "name": "max-period-ms",
+          "value_kind": "unsigned",
+          "unsigned_value": 60000,
+          "mutability": "read_only"
+        },
+        {
+          "name": "negative-timeout-is-relative",
+          "value_kind": "boolean",
+          "boolean_value": true,
+          "mutability": "read_only"
+        }
+      ]
+    },
+    {
+      "path": "/io",
+      "kind": "io",
+      "properties": [
+        {
+          "name": "max-pending-completions",
+          "value_kind": "unsigned",
+          "unsigned_value": 256,
+          "mutability": "read_only"
+        },
+        {
+          "name": "max-open-files",
+          "value_kind": "unsigned",
+          "unsigned_value": 1024,
+          "mutability": "read_only"
+        },
+        {
+          "name": "disc-sector-bytes",
+          "value_kind": "unsigned",
+          "unsigned_value": 2048,
+          "mutability": "read_only"
+        },
+        {
+          "name": "completion-writes-information-before-status",
+          "value_kind": "boolean",
+          "boolean_value": true,
+          "mutability": "read_only"
+        }
+      ]
+    },
+    {
+      "path": "/gpu/shader",
+      "kind": "gpu",
+      "properties": [
+        {
+          "name": "unified-alu-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 48,
+          "mutability": "read_only"
+        },
+        {
+          "name": "texture-fetch-units",
+          "value_kind": "unsigned",
+          "unsigned_value": 16,
+          "mutability": "read_only"
+        },
+        {
+          "name": "gpr-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 128,
+          "mutability": "read_only"
+        },
+        {
+          "name": "float-constant-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 512,
+          "mutability": "read_only"
+        },
+        {
+          "name": "bool-constant-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 256,
+          "mutability": "read_only"
+        },
+        {
+          "name": "interpolator-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 16,
+          "mutability": "read_only"
+        },
+        {
+          "name": "max-shader-bytes",
+          "value_kind": "unsigned",
+          "unsigned_value": 65536,
+          "mutability": "read_only"
+        },
+        {
+          "name": "max-control-flow-nesting",
+          "value_kind": "unsigned",
+          "unsigned_value": 8,
+          "mutability": "read_only"
+        }
+      ]
+    },
+    {
+      "path": "/gpu/render-target",
+      "kind": "gpu",
+      "properties": [
+        {
+          "name": "edram-bytes",
+          "value_kind": "unsigned",
+          "unsigned_value": 10485760,
+          "mutability": "read_only"
+        },
+        {
+          "name": "tile-count",
+          "value_kind": "unsigned",
+          "unsigned_value": 2048,
+          "mutability": "read_only"
+        },
+        {
+          "name": "tile-width-samples",
+          "value_kind": "unsigned",
+          "unsigned_value": 80,
+          "mutability": "read_only"
+        },
+        {
+          "name": "tile-height-samples",
+          "value_kind": "unsigned",
+          "unsigned_value": 16,
+          "mutability": "read_only"
+        },
+        {
+          "name": "tile-bytes",
+          "value_kind": "unsigned",
+          "unsigned_value": 5120,
+          "mutability": "read_only"
+        },
+        {
+          "name": "max-color-targets",
+          "value_kind": "unsigned",
+          "unsigned_value": 4,
+          "mutability": "read_only"
+        },
+        {
+          "name": "max-msaa-samples",
+          "value_kind": "unsigned",
+          "unsigned_value": 4,
+          "mutability": "read_only"
+        }
+      ]
+    },
+    {
+      "path": "/gpu/texture",
+      "kind": "gpu",
+      "properties": [
+        {
+          "name": "tile-edge-blocks",
+          "value_kind": "unsigned",
+          "unsigned_value": 32,
+          "mutability": "read_only"
+        },
+        {
+          "name": "compressed-block-edge",
+          "value_kind": "unsigned",
+          "unsigned_value": 4,
+          "mutability": "read_only"
+        }
+      ]
     }
   ]
 }
