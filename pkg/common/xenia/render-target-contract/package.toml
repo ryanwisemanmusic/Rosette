@@ -1,0 +1,7 @@
+name = "common-xenia-render-target-contract"
+version = "0.1.0-local"
+kind = "console-edram-render-target-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
