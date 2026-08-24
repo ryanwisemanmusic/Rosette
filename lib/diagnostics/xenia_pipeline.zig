@@ -7,6 +7,7 @@
 const std = @import("std");
 const event_log = @import("event_log");
 const contracts = @import("xenia_pipeline_contracts.zig");
+const shader_storage_contract = @import("xenia_shader_storage_contract");
 
 const machoCapturePrint = event_log.machoCapturePrint;
 
@@ -39,9 +40,13 @@ pub const Engine = struct {
     gpu_callback_pending_events: u64 = 0,
     gpu_callback_first_pending_step: u64 = 0,
     gpu_callback_registered_step: u64 = 0,
+    shader_storage_timeout_continuation: bool = false,
 
     pub fn observeLine(self: *Engine, line: []const u8, step: u64) ?Observation {
         self.observeGpuCallbackContract(line, step);
+        if (contains(line, "Shader storage blocking wait timed out")) {
+            self.shader_storage_timeout_continuation = true;
+        }
         if (contains(line, "Failed to launch title path is empty") or
             contains(line, "DEBUG: TARGET PATH: ''"))
         {
@@ -74,10 +79,7 @@ pub const Engine = struct {
             };
         }
 
-        const prerequisite_missing = if (index == 0)
-            false
-        else
-            !self.reached[index - 1];
+        const prerequisite_missing = !self.prerequisitesSatisfied(stage);
         if (prerequisite_missing) self.out_of_order_events +|= 1;
         self.reached[index] = true;
         self.first_step[index] = step;
@@ -104,6 +106,19 @@ pub const Engine = struct {
     pub fn nextSubsystem(self: *const Engine) ?Subsystem {
         const next = self.nextRequired() orelse return null;
         return contracts.spec(next).subsystem;
+    }
+
+    /// A request-return log is not enough to prove shader storage. Xenia's
+    /// macOS path can return after its blocking wait times out, then let the
+    /// launch path continue. Only the GPU-thread completion line is a real
+    /// ready edge; the package keeps the timeout as a separate verdict.
+    pub fn shaderStorageVerdict(self: *const Engine) shader_storage_contract.Verdict {
+        var observed: u8 = 0;
+        if (self.hasReached(.user_module_ready)) observed |= shader_storage_contract.stageBit(.user_module_ready);
+        if (self.hasReached(.shader_storage_requested)) observed |= shader_storage_contract.stageBit(.shader_storage_requested);
+        if (self.hasReached(.shader_storage_ready)) observed |= shader_storage_contract.stageBit(.shader_storage_ready);
+        if (self.hasReached(.guest_main_ready)) observed |= shader_storage_contract.stageBit(.guest_main_ready);
+        return shader_storage_contract.classify(observed, .blocking, self.shader_storage_timeout_continuation);
     }
 
     pub fn stepsSinceProgress(self: *const Engine, current_step: u64) u64 {
@@ -231,6 +246,16 @@ pub const Engine = struct {
         self.frontier = contiguous;
     }
 
+    fn prerequisitesSatisfied(self: *const Engine, stage: Stage) bool {
+        var required = contracts.prerequisites(stage);
+        var index: usize = 0;
+        while (required != 0) : (index += 1) {
+            if ((required & 1) != 0 and !self.reached[index]) return false;
+            required >>= 1;
+        }
+        return true;
+    }
+
     fn lastEventForFrontier(self: *const Engine) u64 {
         const stage = self.frontier orelse return 0;
         return self.first_step[@intFromEnum(stage)];
@@ -265,7 +290,10 @@ pub fn classifyLine(line: []const u8) ?Stage {
         contains(line, "module fully ready"))
         return .user_module_ready;
     if (contains(line, "Initializing shader storage")) return .shader_storage_requested;
-    if (contains(line, "Shader storage init request completed")) return .shader_storage_ready;
+    // This line is emitted after the request function returns and can follow
+    // the five-second timeout continuation. It is intentionally not a ready
+    // edge. The command-processor thread's explicit completion line is.
+    if (contains(line, "GPU THREAD: Shader storage initialization completed")) return .shader_storage_ready;
     if (contains(line, "Guest main thread ready") or
         (contains(line, "GUEST EXECUTE:") and contains(line, "fid=0")))
         return .guest_main_ready;
@@ -308,7 +336,7 @@ test "pipeline records the setup launch and first-frame frontier" {
         "[DEBUG] KernelState::FinishLoadingUserModule stage=Precompile.end",
         "DEBUG: User module finished loading successfully",
         "DEBUG: Initializing shader storage...",
-        "DEBUG: Shader storage init request completed",
+        "DEBUG: GPU THREAD: Shader storage initialization completed!",
         "DEBUG: Guest main thread ready",
         "DEBUG: CompleteLaunch SUCCEEDED",
         "RING BUFFER INITIALIZED",
@@ -339,6 +367,29 @@ test "first guest execution proves the main thread even without a breadcrumb" {
 
     try std.testing.expectEqual(Stage.guest_main_ready, observation.stage);
     try std.testing.expect(engine.hasReached(.guest_main_ready));
+}
+
+test "shader storage request return is not completion after a timeout" {
+    var engine = Engine{};
+    _ = engine.observeLine("DEBUG: User module finished loading successfully", 10).?;
+    _ = engine.observeLine("DEBUG: Initializing shader storage...", 20).?;
+    try std.testing.expect(engine.observeLine(
+        "DEBUG: Shader storage blocking wait timed out; continuing launch",
+        30,
+    ) == null);
+    try std.testing.expect(engine.observeLine(
+        "DEBUG: Shader storage init request completed in 5001 ms (blocking=YES)",
+        31,
+    ) == null);
+    try std.testing.expectEqual(
+        shader_storage_contract.Verdict.explicit_timeout_continuation,
+        engine.shaderStorageVerdict(),
+    );
+    try std.testing.expect(engine.frontier == null);
+    try std.testing.expectEqual(
+        Stage.shader_storage_ready,
+        classifyLine("DEBUG: GPU THREAD: Shader storage initialization completed!").?,
+    );
 }
 
 test "pipeline recognizes the Xenia ring-buffer completion breadcrumb" {
@@ -372,8 +423,9 @@ test "pipeline distinguishes callback import readiness from guest registration" 
         "[DEBUG] KernelState::FinishLoadingUserModule stage=Precompile.end",
         "DEBUG: User module finished loading successfully",
         "DEBUG: Initializing shader storage...",
-        "DEBUG: Shader storage init request completed",
+        "DEBUG: GPU THREAD: Shader storage initialization completed!",
         "DEBUG: Guest main thread ready",
+        "DEBUG: CompleteLaunch SUCCEEDED",
     };
     for (setup_lines, 0..) |line, index| {
         _ = engine.observeLine(line, index + 1).?;
