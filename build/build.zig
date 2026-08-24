@@ -1579,6 +1579,79 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&b.addRunArtifact(x64_guest_abi_test).step);
     }
 
+    // Console subsystem libraries: audio, HID, config, and the three GPU
+    // subdirectories. Each satisfies a pkg contract and is tested against it
+    // here, so a contract edit that the implementation does not follow fails
+    // the gate rather than surfacing as silence, a dead controller, or a
+    // wrong-looking frame.
+    {
+        const Subsystem = struct {
+            root: []const u8,
+            contract_name: []const u8,
+            contract_root: []const u8,
+        };
+        const subsystems = [_]Subsystem{
+            .{
+                .root = "../lib/audio/root.zig",
+                .contract_name = "xenia_audio_contract",
+                .contract_root = "../pkg/common/xenia/audio-contract/src/root.zig",
+            },
+            .{
+                .root = "../lib/hid/root.zig",
+                .contract_name = "xenia_input_contract",
+                .contract_root = "../pkg/common/xenia/input-contract/src/root.zig",
+            },
+            .{
+                .root = "../lib/gpu/shader/root.zig",
+                .contract_name = "xenia_shader_contract",
+                .contract_root = "../pkg/common/xenia/shader-contract/src/root.zig",
+            },
+            .{
+                .root = "../lib/gpu/render_target/root.zig",
+                .contract_name = "xenia_render_target_contract",
+                .contract_root = "../pkg/common/xenia/render-target-contract/src/root.zig",
+            },
+            .{
+                .root = "../lib/gpu/texture_cache/root.zig",
+                .contract_name = "xenia_texture_contract",
+                .contract_root = "../pkg/common/xenia/texture-contract/src/root.zig",
+            },
+        };
+        inline for (subsystems) |subsystem| {
+            const subsystem_mod = b.createModule(.{
+                .root_source_file = b.path(subsystem.root),
+                .target = target,
+                .optimize = optimize,
+            });
+            subsystem_mod.addImport(subsystem.contract_name, b.createModule(.{
+                .root_source_file = b.path(subsystem.contract_root),
+                .target = target,
+                .optimize = optimize,
+            }));
+            const subsystem_test = b.addTest(.{ .root_module = subsystem_mod });
+            check_step.dependOn(&b.addRunArtifact(subsystem_test).step);
+        }
+
+        // Config needs both its schema and the existing TOML parser.
+        const config_mod = b.createModule(.{
+            .root_source_file = b.path("../lib/config/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        config_mod.addImport("xenia_config_schema", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/config-schema/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        config_mod.addImport("toml_processor", b.createModule(.{
+            .root_source_file = b.path("../lib/processor/TOML_processor/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        const config_test = b.addTest(.{ .root_module = config_mod });
+        check_step.dependOn(&b.addRunArtifact(config_test).step);
+    }
+
     // TOML processor (patch file format parser)
     {
         const toml_processor_mod = b.createModule(.{
@@ -1706,6 +1779,21 @@ pub fn build(b: *std.Build) void {
             "../pkg/common/abi/host-contract-catalogue/src/root.zig",
             "../pkg/common/text/phrase-filter/src/root.zig",
             "../pkg/common/xenia/ready-plan/src/root.zig",
+            // Console-hardware and kernel-ABI contracts. Route-independent for
+            // the same reason register-map is: they describe the Xbox 360 and
+            // its kernel, not the host Rosette was compiled for.
+            "../pkg/common/xenia/audio-contract/src/root.zig",
+            "../pkg/common/xenia/input-contract/src/root.zig",
+            "../pkg/common/xenia/user-contract/src/root.zig",
+            "../pkg/common/xenia/config-schema/src/root.zig",
+            "../pkg/common/xenia/shader-contract/src/root.zig",
+            "../pkg/common/xenia/render-target-contract/src/root.zig",
+            "../pkg/common/xenia/texture-contract/src/root.zig",
+            "../pkg/common/xenia/io-completion-contract/src/root.zig",
+            "../pkg/common/xenia/timer-contract/src/root.zig",
+            "../pkg/common/xenia/ob-contract/src/root.zig",
+            "../pkg/common/xenia/mount-contract/src/root.zig",
+            "../pkg/common/xenia/kernel-object-contract/src/root.zig",
         };
         inline for (common_package_roots) |package_root| {
             const package_mod = b.createModule(.{
@@ -1741,6 +1829,8 @@ pub fn build(b: *std.Build) void {
             "../pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig",
             "../pkg/x86/xenia/runtime/wait-contract/src/root.zig",
             "../pkg/x86/xenia/memory/heap-range/src/root.zig",
+            "../pkg/x86/xenia/audio-driver/src/root.zig",
+            "../pkg/x86/xenia/input-driver/src/root.zig",
             "../pkg/ARM64/xenia/graphics-contract/src/root.zig",
             "../pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig",
             "../pkg/ARM64/xenia/bridge/abi-bridge/src/root.zig",
@@ -1754,6 +1844,8 @@ pub fn build(b: *std.Build) void {
             "../pkg/ARM64/xenia/runtime/shader-storage-contract/src/root.zig",
             "../pkg/ARM64/xenia/runtime/wait-contract/src/root.zig",
             "../pkg/ARM64/xenia/memory/heap-range/src/root.zig",
+            "../pkg/ARM64/xenia/audio-driver/src/root.zig",
+            "../pkg/ARM64/xenia/input-driver/src/root.zig",
             "../pkg/x86/xenia/guest-endian/src/root.zig",
             "../pkg/ARM64/xenia/guest-endian/src/root.zig",
             "../pkg/PPC/xenia/guest-endian/src/root.zig",
