@@ -323,6 +323,7 @@ pub fn yieldActiveGuestThreadForWait(self: anytype, reason: []const u8) bool {
         worker = self.active_guest_thread;
     } else if (self.pthreads.takeNewestDeferred()) |next| {
         if (!self.startDeferredGuestThread(next)) {
+            self.pthreads.requeueDeferred(next.handle);
             _ = self.resumeSuspendedGuestThread();
             return false;
         }
@@ -636,6 +637,7 @@ pub fn finishActiveGuestThread(self: anytype) void {
     if (self.startNextIdleCallback("idle-return", false)) return;
     if (self.pthreads.takeNewestDeferred()) |next| {
         if (self.startDeferredGuestThread(next)) return;
+        self.pthreads.requeueDeferred(next.handle);
     }
     if (self.resumeSuspendedGuestThread()) return;
 
