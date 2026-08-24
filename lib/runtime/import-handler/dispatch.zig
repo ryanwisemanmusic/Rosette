@@ -974,9 +974,44 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = self.regs.rdi };
     }
     if (libcpp_thread.classify(name)) |operation| {
+        if (self.write_diagnostics_armed) {
+            const caller = importCallerAddress(self);
+            if (self.memory_forwarder.containingAllocation(self.regs.rdi)) |allocation| {
+                machoCapturePrint(
+                    "macho-processor: libc++ thread-struct ABI: operation={s} this=0x{x} size={d} allocation_base=0x{x} allocation_size={d} member_offset=0x{x} caller=0x{x} {s}+0x{x} step={d} thread=0x{x}\n",
+                    .{
+                        @tagName(operation),
+                        self.regs.rdi,
+                        libcpp_thread.storage_size,
+                        allocation.base,
+                        allocation.size,
+                        allocation.offset,
+                        caller,
+                        self.metadata.symbolLabel(caller),
+                        if (self.metadata.nearestSymbol(caller)) |symbol| symbol.offset else 0,
+                        self.executed_steps,
+                        self.active_guest_thread,
+                    },
+                );
+            } else {
+                machoCapturePrint(
+                    "macho-processor: libc++ thread-struct ABI: operation={s} this=0x{x} size={d} allocation=<none> caller=0x{x} {s}+0x{x} step={d} thread=0x{x}\n",
+                    .{
+                        @tagName(operation),
+                        self.regs.rdi,
+                        libcpp_thread.storage_size,
+                        caller,
+                        self.metadata.symbolLabel(caller),
+                        if (self.metadata.nearestSymbol(caller)) |symbol| symbol.offset else 0,
+                        self.executed_steps,
+                        self.active_guest_thread,
+                    },
+                );
+            }
+        }
         return switch (operation) {
             .construct => blk: {
-                _ = self.fillGuestMemory(self.regs.rdi, 64, 0);
+                _ = self.fillGuestMemory(self.regs.rdi, libcpp_thread.storage_size, 0);
                 break :blk .{ .handled = self.regs.rdi };
             },
             // Construction is intercepted and creates no native libc++ TLS
