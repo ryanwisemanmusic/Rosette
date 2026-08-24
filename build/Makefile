@@ -59,6 +59,21 @@ HOST_CONTRACT_CATALOGUE_SRC := pkg/common/abi/host-contract-catalogue/src/root.z
 LIBCPP_THREAD_ABI_SRC := pkg/common/abi/libcpp-thread-struct/src/root.zig
 PHRASE_FILTER_SRC := pkg/common/text/phrase-filter/src/root.zig
 XENIA_READY_PLAN_SRC := pkg/common/xenia/ready-plan/src/root.zig
+# Console-hardware and kernel-ABI contracts. Route-independent: they describe
+# the Xbox 360 and its kernel, not the host Rosette is compiled for, so they
+# have no entry in the `uname -m` block below.
+XENIA_AUDIO_CONTRACT_SRC := pkg/common/xenia/audio-contract/src/root.zig
+XENIA_INPUT_CONTRACT_SRC := pkg/common/xenia/input-contract/src/root.zig
+XENIA_USER_CONTRACT_SRC := pkg/common/xenia/user-contract/src/root.zig
+XENIA_CONFIG_SCHEMA_SRC := pkg/common/xenia/config-schema/src/root.zig
+XENIA_SHADER_CONTRACT_SRC := pkg/common/xenia/shader-contract/src/root.zig
+XENIA_RENDER_TARGET_CONTRACT_SRC := pkg/common/xenia/render-target-contract/src/root.zig
+XENIA_TEXTURE_CONTRACT_SRC := pkg/common/xenia/texture-contract/src/root.zig
+XENIA_IO_COMPLETION_CONTRACT_SRC := pkg/common/xenia/io-completion-contract/src/root.zig
+XENIA_TIMER_CONTRACT_SRC := pkg/common/xenia/timer-contract/src/root.zig
+XENIA_OB_CONTRACT_SRC := pkg/common/xenia/ob-contract/src/root.zig
+XENIA_MOUNT_CONTRACT_SRC := pkg/common/xenia/mount-contract/src/root.zig
+XENIA_KERNEL_OBJECT_CONTRACT_SRC := pkg/common/xenia/kernel-object-contract/src/root.zig
 XENIA_GRAPHICS_CONTRACT_SRC := pkg/x86/xenia/graphics-contract/src/root.zig
 XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/x86/xenia/graphics/surface-path-contract/src/root.zig
 XENIA_SHADER_STORAGE_CONTRACT_SRC := pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig
@@ -73,6 +88,8 @@ XENIA_HEAP_RANGE_SRC := pkg/x86/xenia/memory/heap-range/src/root.zig
 # This package's module root is the evidence table, not a `root.zig`; the
 # `main.zig` beside it is the standalone CLI and is not linked here.
 XENIA_STARTUP_EVIDENCE_SRC := pkg/x86/xenia/diagnostics/startup-evidence/src/evidence.zig
+XENIA_AUDIO_DRIVER_SRC := pkg/x86/xenia/audio-driver/src/root.zig
+XENIA_INPUT_DRIVER_SRC := pkg/x86/xenia/input-driver/src/root.zig
 ifeq ($(shell uname -m),arm64)
 XENIA_GRAPHICS_CONTRACT_SRC := pkg/ARM64/xenia/graphics-contract/src/root.zig
 XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig
@@ -86,6 +103,8 @@ XENIA_WAIT_CONTRACT_SRC := pkg/ARM64/xenia/runtime/wait-contract/src/root.zig
 XENIA_TRANSLATION_PROGRESS_SRC := pkg/ARM64/xenia/runtime/translation-progress/src/root.zig
 XENIA_HEAP_RANGE_SRC := pkg/ARM64/xenia/memory/heap-range/src/root.zig
 XENIA_STARTUP_EVIDENCE_SRC := pkg/ARM64/xenia/diagnostics/startup-evidence/src/evidence.zig
+XENIA_AUDIO_DRIVER_SRC := pkg/ARM64/xenia/audio-driver/src/root.zig
+XENIA_INPUT_DRIVER_SRC := pkg/ARM64/xenia/input-driver/src/root.zig
 endif
 MACHO_NATIVE_WINDOW_OBJ := $(ROOT_DIR)/$(BP)macho_native_window_bridge.o
 XENIA_HEAP_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)xenia_heap_exports_anchor.o
