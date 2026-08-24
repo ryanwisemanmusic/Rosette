@@ -1,0 +1,12 @@
+name = "common-abi-host-contract-catalogue"
+version = "0.1.0-local"
+kind = "host-abi-contract-catalogue"
+role = "build-time"
+# Route-independent: the host C/C++/ObjC symbols Rosette recognises do not vary
+# with the architecture Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# Facts and the comptime rejection filter over them. Dispatch, match ranking and
+# the mutable registry stay in lib/Contract.
