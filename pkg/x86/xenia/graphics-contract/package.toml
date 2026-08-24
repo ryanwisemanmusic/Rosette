@@ -1,6 +1,7 @@
 name = "xenia-x86-graphics-contract"
 version = "0.1.0-local"
 kind = "guest-vdswap-handoff-contract"
+role = "build-time"
 architectures = ["x86_64"]
 language = "zig"
 verification = "verify.sh"
