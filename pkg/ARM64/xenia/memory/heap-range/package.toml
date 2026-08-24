@@ -1,0 +1,11 @@
+name = "xenia-arm64-heap-range"
+version = "0.1.0-local"
+kind = "page-range-selection-abi"
+role = "hybrid"
+architectures = ["arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# The package owns the immutable selection policy used by Xenia's page-table
+# allocator. Xenia remains responsible for locking, host mapping, and writing
+# PageEntry state; the Rosette provider only chooses a valid page range.
