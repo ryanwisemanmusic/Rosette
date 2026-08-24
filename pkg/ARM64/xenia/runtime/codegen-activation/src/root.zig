@@ -12,60 +12,6 @@ pub const host_codegen = "arm64-native-bridge";
 pub const max_labels = 256;
 pub const LabelId = u16;
 
-pub const LabelState = struct {
-    defined: bool = false,
-    references: u32 = 0,
-    address: u64 = 0,
-};
-
-pub const CodegenStatus = enum {
-    ready,
-    undefined_label,
-    duplicate_label,
-    invalid_reference,
-};
-
-pub const LabelLedger = struct {
-    labels: [max_labels]LabelState = [_]LabelState{.{}} ** max_labels,
-    label_count: u16 = 0,
-    duplicate: bool = false,
-    invalid: bool = false,
-
-    pub fn reference(self: *LabelLedger, id: LabelId) bool {
-        if (id >= max_labels) {
-            self.invalid = true;
-            return false;
-        }
-        self.labels[id].references +|= 1;
-        self.label_count = @max(self.label_count, id + 1);
-        return true;
-    }
-
-    pub fn define(self: *LabelLedger, id: LabelId, address: u64) bool {
-        if (id >= max_labels) {
-            self.invalid = true;
-            return false;
-        }
-        if (self.labels[id].defined) {
-            self.duplicate = true;
-            return false;
-        }
-        self.labels[id].defined = true;
-        self.labels[id].address = address;
-        self.label_count = @max(self.label_count, id + 1);
-        return true;
-    }
-
-    pub fn validate(self: *const LabelLedger) CodegenStatus {
-        if (self.invalid) return .invalid_reference;
-        if (self.duplicate) return .duplicate_label;
-        for (self.labels[0..self.label_count]) |label| {
-            if (label.references != 0 and !label.defined) return .undefined_label;
-        }
-        return .ready;
-    }
-};
-
 pub fn rel32Displacement(from_end: u64, target: u64) ?i64 {
     if (target >= from_end) {
         const distance = target - from_end;
@@ -132,25 +78,6 @@ pub fn classifyActivation(sample: ActivationSample) ActivationVerdict {
 test "package identity is the ARM64 native bridge route" {
     try std.testing.expectEqualStrings("arm64", host_architecture);
     try std.testing.expectEqualStrings("arm64-native-bridge", host_codegen);
-}
-
-test "the ledger rejects the undefined-label shape reported by Xbyak" {
-    var ledger = LabelLedger{};
-    try std.testing.expect(ledger.reference(11));
-    try std.testing.expectEqual(CodegenStatus.undefined_label, ledger.validate());
-    try std.testing.expect(ledger.define(11, 0x1000));
-    try std.testing.expectEqual(CodegenStatus.ready, ledger.validate());
-}
-
-test "duplicate and out-of-range labels are never ready" {
-    var ledger = LabelLedger{};
-    try std.testing.expect(ledger.define(3, 0x2000));
-    try std.testing.expect(!ledger.define(3, 0x3000));
-    try std.testing.expectEqual(CodegenStatus.duplicate_label, ledger.validate());
-
-    var invalid = LabelLedger{};
-    try std.testing.expect(!invalid.reference(max_labels));
-    try std.testing.expectEqual(CodegenStatus.invalid_reference, invalid.validate());
 }
 
 test "rel32 range uses the signed x86 displacement limits" {
