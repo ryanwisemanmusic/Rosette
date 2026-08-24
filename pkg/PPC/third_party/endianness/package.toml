@@ -1,0 +1,11 @@
+name = "rosette-ppc-endianness"
+version = "0.1.0-local"
+kind = "source-mirror-endianness"
+role = "source-mirror"
+architectures = ["ppc64"]
+language = "zig"
+verification = "verify.sh"
+
+# Fixed-width byte-order and guest big-endian vectors are mirrored across the
+# x86, ARM64, and PPC routes. The direct PPC host is big-endian, unlike the
+# current macOS routes.
