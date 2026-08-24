@@ -1,0 +1,12 @@
+name = "common-xenia-log-phrase-map"
+version = "0.1.0-local"
+kind = "xenia-log-phrase-stage-map"
+role = "build-time"
+# Route-independent: Xenia's log strings do not change with the architecture
+# Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package maps text to stage identity and pre-computes the rejection filter.
+# Ordering, prerequisites and acceptance stay in lib's pipeline observer.
