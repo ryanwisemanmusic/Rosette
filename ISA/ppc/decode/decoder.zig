@@ -206,6 +206,16 @@ test "a big-endian word decodes to its opcode and operands" {
     try std.testing.expectEqual(@as(u32, 0x82000004), insn.nextAddress());
 }
 
+test "the Xenia prologue std encoding decodes as a DS-form store" {
+    // std r28, -40(r1), observed at the first direct-PPC guest frontier.
+    const bytes = [_]u8{ 0xfb, 0x81, 0xff, 0xd8 };
+    const insn = decodeBytes(0x8258_dfe8, &bytes);
+    try std.testing.expectEqual(Op.std, insn.op);
+    try std.testing.expectEqual(@as(u5, 28), insn.ds().rs());
+    try std.testing.expectEqual(@as(u5, 1), insn.ds().ra());
+    try std.testing.expectEqual(@as(i64, -40), insn.ds().dsField());
+}
+
 test "little-endian bytes decode to something else entirely" {
     // The same word fed in host order is a different instruction. This is the
     // failure a missing byte swap produces: a clean decode of the wrong thing.
