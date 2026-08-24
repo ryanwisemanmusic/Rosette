@@ -2430,6 +2430,14 @@ pub const MachOState = struct {
 
     pub fn observeReadyCompilerText(self: *MachOState, line: []const u8) void {
         if (!self.ready.enabled()) return;
+        if (ready_compiler.xenia.translationProgressFromText(line)) |event| {
+            if (self.ready.noteTranslationProgress(event.generation, self.executed_steps)) {
+                machoCapturePrint(
+                    "macho-processor: READY COMPILER: translation-progress accepted generation={d} guest_function=0x{x} step={d}\n",
+                    .{ event.generation, event.guest_function, self.executed_steps },
+                );
+            }
+        }
         // These boundaries are finer than the legacy Xenia pipeline stages.
         // Observe them before the generic guest-log observers consume the same
         // line so `user_module_ready` cannot hide the precompile return or make
@@ -2635,10 +2643,11 @@ pub const MachOState = struct {
         // climbing next to a stall verdict is looking at a gate that went blind,
         // not at a guest that stopped.
         machoCapturePrint(
-            "macho-processor: READY COMPILER: DIAGNOSIS external_progress advances={d} last_step={d} heap_high_water=0x{x} heap_live={d} threads_created={d}; these rise only when the guest needs more than it has ever held, so a loop that allocates and frees cannot produce them\n",
+            "macho-processor: READY COMPILER: DIAGNOSIS external_progress advances={d} last_step={d} translation_generation={d} heap_high_water=0x{x} heap_live={d} threads_created={d}; translation_generation rises only after PPC guest code is assembled, while the other counters rise only when the guest needs more than it has ever held\n",
             .{
                 diagnosis.external_progress_advances,
                 diagnosis.external_progress_step,
+                diagnosis.external_translation_generation,
                 self.ready.external_progress.heap_high_water,
                 self.ready.external_progress.heap_live,
                 self.ready.external_progress.threads_created,
@@ -6166,6 +6175,42 @@ pub const MachOState = struct {
         return result;
     }
 
+    /// Call a translated guest function synchronously from a runtime bridge.
+    ///
+    /// The direct PPC adapter uses this for Xenia's CR, syscall, call
+    /// resolution and trap callbacks. Those callbacks are guest x86 code even
+    /// though the PPC interpreter is native ARM64, so invoking the host
+    /// pointer would cross both an ABI and an address-space boundary. A
+    /// distinctive guest return sentinel lets the normal `step` path service
+    /// imports and synthetic thunks inside the callback while preserving the
+    /// caller's full register file afterwards.
+    pub fn callGuestFunction(self: *MachOState, fn_address: u64, args: [6]u64) u64 {
+        const saved_regs = self.regs;
+        const sentinel: u64 = 0xCA11_CA11_CA11_CA11;
+        var result: u64 = 0;
+
+        self.regs.rdi = args[0];
+        self.regs.rsi = args[1];
+        self.regs.rdx = args[2];
+        self.regs.rcx = args[3];
+        self.regs.r8 = args[4];
+        self.regs.r9 = args[5];
+        self.regs.rsp -%= 8;
+        if (self.guestMemory(self.regs.rsp, 8)) |destination| {
+            std.mem.writeInt(u64, destination[0..8], sentinel, .little);
+            self.regs.rip = fn_address;
+
+            var iterations: u32 = 0;
+            while (iterations < 100_000 and !self.terminated and !self.faulted) : (iterations += 1) {
+                if (self.regs.rip == sentinel) break;
+                if (!self.step()) break;
+            }
+            result = self.regs.rax;
+        }
+        self.regs = saved_regs;
+        return result;
+    }
+
     pub fn tryPrimitiveDispatch(self: *MachOState, imported: macho_metadata.ImportedSymbol) ?ImportHandlerResult {
         const dispatch_cb = import_handler.PrimitiveDispatchCallbacks{
             .ctx = self,
@@ -9375,6 +9420,18 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.memory_trace_enabled = environmentFlag("ROSETTE_MACHO_MEMORY_TRACE");
+    // The instruction tape records generated code only, because host-image code
+    // outruns it by orders of magnitude — 662 million filtered steps against a
+    // few hundred recorded in a recorded run. That is the right default and the
+    // wrong one for a *native* fault: a null C++ receiver in Xenia's own code is
+    // host-image code, so its entire producer chain is filtered and the
+    // causality engine has nothing to walk. This knob trades throughput for that
+    // chain on a deliberate diagnostic run, and is named in the empty-window
+    // explanation so a reader is told how to get the evidence rather than that
+    // it does not exist.
+    if (environmentFlag("ROSETTE_MACHO_NATIVE_TRACE")) {
+        state.execution_history.policy = .all;
+    }
     state.never_notified_repair_enabled =
         environmentFlag("ROSETTE_MACHO_NEVER_NOTIFIED_REPAIR");
     state.allow_assumed_dispatch_continuation = !environmentFlag("ROSETTE_MACHO_STRICT_DISPATCH");
