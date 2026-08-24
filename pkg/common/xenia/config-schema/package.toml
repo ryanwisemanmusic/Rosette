@@ -1,0 +1,7 @@
+name = "common-xenia-config-schema"
+version = "0.1.0-local"
+kind = "emulator-config-schema"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
