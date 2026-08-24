@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const ppc_decode = @import("ppc_decode");
+const routing = @import("ppc_instruction_routing");
 const ctx_mod = @import("context.zig");
 
 const integer = @import("integer.zig");
@@ -44,58 +45,22 @@ pub const Unit = enum {
     none,
 };
 
-/// Instructions the coarse group would route to the wrong unit.
-///
-/// The Xenon table carries no supervisor instructions at all - no rfid, no
-/// segment-register or TLB moves - because Xbox 360 titles run in problem
-/// state. An encoding for one decodes to `.invalid`, which is the right
-/// answer: it is not a gap in Rosette, it is not a valid title instruction.
-const system_ops = [_]Op{
-    .sc,   .sync, .isync, .eieio, .mfspr,  .mtspr,
-    .mftb, .mfcr, .mtcrf, .mcrxr, .tw,     .td,
-    .twi,  .tdi,  .mfmsr, .mtmsr, .mtmsrd,
-};
-
-const branch_ops = [_]Op{
-    .bx,   .bcx,   .bclrx, .bcctrx, .crand, .crandc,
-    .cror, .crorc, .crxor, .crnand, .crnor, .creqv,
-    .mcrf,
-};
-
-/// FPSCR access instructions, which the group calls condition-register work.
-const fpu_ops = [_]Op{ .mcrfs, .mffsx, .mtfsfx, .mtfsb0x, .mtfsb1x, .mtfsfix };
-
-/// The vector status moves, which do not start with `v`.
-const vector_ops = [_]Op{ .mfvscr, .mtvscr };
-
-fn startsWith(name: []const u8, prefix: []const u8) bool {
-    return name.len >= prefix.len and std.mem.eql(u8, name[0..prefix.len], prefix);
-}
-
 fn unitFor(comptime op: Op) Unit {
     if (op == .invalid) return .none;
-    for (system_ops) |candidate| if (op == candidate) return .system;
-    for (branch_ops) |candidate| if (op == candidate) return .branch;
-    for (fpu_ops) |candidate| if (op == candidate) return .floating_point;
-    for (vector_ops) |candidate| if (op == candidate) return .vector;
 
     const name = @tagName(op);
-    // The VMX128 encodings come first: `lvx128` is a vector load, but not a
-    // *VMX* one, and routing it by its `lv` prefix would decode its registers
-    // with the wrong field layout.
-    //
-    // `dcbz128` is the exception the name test would get wrong: the 128 is the
-    // cache-block size, not the register file, and it is an ordinary DCBZ-form
-    // cache instruction that belongs with the other memory operations.
-    if (op != .dcbz128 and name.len > 3 and
-        std.mem.eql(u8, name[name.len - 3 ..], "128"))
-    {
-        return .vector128;
+    if (routing.overrideFor(name)) |hint| {
+        return switch (hint) {
+            .system => .system,
+            .branch => .branch,
+            .floating_point => .floating_point,
+            .vector => .vector,
+        };
     }
-    // Vector memory before scalar memory: `lvx` is a load, but not a GPR load.
-    if (startsWith(name, "lv") or startsWith(name, "stv")) return .vector;
-    if (name[0] == 'v') return .vector;
-    if (startsWith(name, "lf") or startsWith(name, "stf")) return .floating_point;
+    if (routing.isVector128(name)) return .vector128;
+    if (routing.isVectorMemory(name)) return .vector;
+    if (routing.isVector(name)) return .vector;
+    if (routing.isFloatingMemory(name)) return .floating_point;
     if (name[0] == 'f') return .floating_point;
 
     return switch (op.info().group) {

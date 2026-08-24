@@ -144,6 +144,11 @@ const Binding = struct {
     guest: GuestState = undefined,
     state: State = .{},
     calls: CallCache = .{},
+    /// The native C ABI uses `virtual_membase`. A translated embedder can
+    /// instead supply a checked callback view while keeping that public
+    /// struct byte-for-byte stable. The override is a runtime facility, not
+    /// an alternate ABI layout.
+    memory_override: ?Memory = null,
     /// The recompiler, when this host can allocate executable memory and the
     /// embedder has not turned it off. A null one is not an error: the
     /// interpreter is the complete implementation and the recompiler is a
@@ -211,6 +216,8 @@ fn syncFromGuest(binding: *Binding) void {
     s.xer.ov = g.xer_ov.* != 0;
     s.xer.so = g.xer_so.* != 0;
     s.vscr = if (g.vscr_sat.* != 0) 1 else 0;
+    s.vrsave = g.vrsave.*;
+    s.reserved_val = g.reserved_val.*;
     s.cr = g.read_cr(g.host_context);
 }
 
@@ -228,10 +235,13 @@ fn syncToGuest(binding: *Binding) void {
     g.xer_ov.* = @intFromBool(s.xer.ov);
     g.xer_so.* = @intFromBool(s.xer.so);
     g.vscr_sat.* = @intFromBool(s.vscr & 1 != 0);
+    g.vrsave.* = s.vrsave;
+    g.reserved_val.* = s.reserved_val;
     g.write_cr(g.host_context, s.cr);
 }
 
 fn memoryFor(binding: *const Binding) Memory {
+    if (binding.memory_override) |memory| return memory;
     const size: usize = @intCast(@min(
         binding.guest.guest_address_space_size,
         @as(u64, std.math.maxInt(u32)) + 1,
@@ -243,15 +253,27 @@ fn memoryFor(binding: *const Binding) Memory {
 // Exported entry points
 // ---------------------------------------------------------------------------
 
-pub export fn rosette_ppc_host_available() callconv(.c) i32 {
+pub fn rosette_ppc_host_available() callconv(.c) i32 {
     return 1;
 }
 
-pub export fn rosette_ppc_host_identity() callconv(.c) [*:0]const u8 {
+pub fn rosette_ppc_host_identity() callconv(.c) [*:0]const u8 {
     return identity;
 }
 
-pub export fn rosette_ppc_bind_context(guest: *const GuestState) callconv(.c) i32 {
+pub fn rosette_ppc_bind_context(guest: *const GuestState) callconv(.c) i32 {
+    return bindContext(guest, null);
+}
+
+/// Bind a guest state whose address space is owned by another runtime. This
+/// is intentionally a Zig-only entry point: Xenia's public C contract remains
+/// the six-pointer ABI above, while Rosette's translated dyld bridge can give
+/// the execution core a checked guest-memory provider.
+pub fn bindContextWithMemory(guest: *const GuestState, memory: Memory) i32 {
+    return bindContext(guest, memory);
+}
+
+fn bindContext(guest: *const GuestState, memory: ?Memory) i32 {
     if (guest.abi_version != abi_version) return 0;
 
     bindings_lock.lock();
@@ -259,11 +281,18 @@ pub export fn rosette_ppc_bind_context(guest: *const GuestState) callconv(.c) i3
 
     if (findBinding(guest.host_context)) |existing| {
         existing.guest = guest.*;
+        existing.memory_override = memory;
         return 1;
     }
     for (&bindings) |*binding| {
         if (!binding.used) {
-            binding.* = .{ .used = true, .guest = guest.*, .state = .{}, .calls = .{} };
+            binding.* = .{
+                .used = true,
+                .guest = guest.*,
+                .state = .{},
+                .calls = .{},
+                .memory_override = memory,
+            };
             if (jit_enabled) {
                 binding.jit = jit_mod.Jit.init(
                     std.heap.page_allocator,
@@ -278,7 +307,7 @@ pub export fn rosette_ppc_bind_context(guest: *const GuestState) callconv(.c) i3
     return 0;
 }
 
-pub export fn rosette_ppc_release_context(host_context: *anyopaque) callconv(.c) void {
+pub fn rosette_ppc_release_context(host_context: *anyopaque) callconv(.c) void {
     bindings_lock.lock();
     defer bindings_lock.unlock();
     if (findBinding(host_context)) |binding| {
@@ -290,14 +319,14 @@ pub export fn rosette_ppc_release_context(host_context: *anyopaque) callconv(.c)
 
 /// Turn the recompiler on or off for threads bound after this call. Returns
 /// whether the host can run one at all.
-pub export fn rosette_ppc_set_recompiler_enabled(enabled: i32) callconv(.c) i32 {
+pub fn rosette_ppc_set_recompiler_enabled(enabled: i32) callconv(.c) i32 {
     if (!jit_mod.Jit.available()) return 0;
     jit_enabled = enabled != 0;
     return 1;
 }
 
 /// Recompiler counters for a bound thread, for the embedder's run summary.
-pub export fn rosette_ppc_recompiler_stats(
+pub fn rosette_ppc_recompiler_stats(
     host_context: *anyopaque,
     out_blocks: *u64,
     out_instructions: *u64,
@@ -311,7 +340,7 @@ pub export fn rosette_ppc_recompiler_stats(
     return 1;
 }
 
-pub export fn rosette_ppc_invalidate_range(guest_low: u32, guest_high: u32) callconv(.c) void {
+pub fn rosette_ppc_invalidate_range(guest_low: u32, guest_high: u32) callconv(.c) void {
     bindings_lock.lock();
     defer bindings_lock.unlock();
     for (&bindings) |*binding| {
@@ -323,7 +352,7 @@ pub export fn rosette_ppc_invalidate_range(guest_low: u32, guest_high: u32) call
     }
 }
 
-pub export fn rosette_ppc_execute(
+pub fn rosette_ppc_execute(
     host_context: *anyopaque,
     address: u32,
     return_address: u32,

@@ -24,6 +24,17 @@ pub const Fault = error{
     Unaligned,
 };
 
+/// A guest-memory provider used when the PPC runtime is embedded inside
+/// another translator. Native Xenia can hand us a flat host mapping, but a
+/// translated x86 process exposes guest addresses through Rosette's sparse
+/// memory manager instead. Keeping the provider at the memory boundary lets
+/// the instruction runtime stay unaware of which side owns the bytes.
+pub const Access = struct {
+    context: *anyopaque,
+    read: *const fn (*anyopaque, u32, []u8) bool,
+    write: *const fn (*anyopaque, u32, []const u8) bool,
+};
+
 /// A flat view of the guest's physical address space.
 ///
 /// The Xbox 360 address space is 32-bit, so an effective address is a u32 and
@@ -35,9 +46,22 @@ pub const Memory = struct {
     base: [*]u8,
     len: usize,
     origin: u32 = 0,
+    access: ?Access = null,
 
     pub fn fromSlice(bytes: []u8, origin: u32) Memory {
         return .{ .base = bytes.ptr, .len = bytes.len, .origin = origin };
+    }
+
+    pub fn fromCallbacks(access: Access, len: usize, origin: u32) Memory {
+        // `base` is never dereferenced while `access` is present. A non-null
+        // sentinel keeps the representation compact and leaves all ordinary
+        // slice-backed callers unchanged.
+        return .{
+            .base = @ptrFromInt(1),
+            .len = len,
+            .origin = origin,
+            .access = access,
+        };
     }
 
     pub fn contains(self: Memory, address: u32, size: usize) bool {
@@ -47,7 +71,7 @@ pub const Memory = struct {
         return self.len - offset >= size;
     }
 
-    fn slice(self: Memory, address: u32, comptime size: usize) Fault![]u8 {
+    fn slice(self: Memory, address: u32, size: usize) Fault![]u8 {
         if (address < self.origin) return Fault.OutOfBounds;
         const offset = address - self.origin;
         if (offset >= self.len) return Fault.OutOfBounds;
@@ -55,11 +79,38 @@ pub const Memory = struct {
         return self.base[offset .. offset + size];
     }
 
+    fn readBytes(self: Memory, address: u32, destination: []u8) Fault!void {
+        if (address < self.origin) return Fault.OutOfBounds;
+        const offset = address - self.origin;
+        if (offset >= self.len) return Fault.OutOfBounds;
+        if (self.len - offset < destination.len) return Fault.Truncated;
+        if (self.access) |access| {
+            if (!access.read(access.context, address, destination)) return Fault.OutOfBounds;
+            return;
+        }
+        const bytes = try self.slice(address, destination.len);
+        @memcpy(destination, bytes);
+    }
+
+    fn writeBytes(self: Memory, address: u32, source: []const u8) Fault!void {
+        if (address < self.origin) return Fault.OutOfBounds;
+        const offset = address - self.origin;
+        if (offset >= self.len) return Fault.OutOfBounds;
+        if (self.len - offset < source.len) return Fault.Truncated;
+        if (self.access) |access| {
+            if (!access.write(access.context, address, source)) return Fault.OutOfBounds;
+            return;
+        }
+        const bytes = try self.slice(address, source.len);
+        @memcpy(bytes, source);
+    }
+
     /// Read a big-endian guest value: the normal PowerPC load.
     pub fn read(self: Memory, comptime T: type, address: u32) Fault!T {
         const size = @sizeOf(T);
-        const bytes = try self.slice(address, size);
-        return std.mem.readInt(T, bytes[0..size], .big);
+        var bytes: [size]u8 = undefined;
+        try self.readBytes(address, &bytes);
+        return std.mem.readInt(T, &bytes, .big);
     }
 
     /// Read with the bytes taken in host order: `lhbrx`, `lwbrx`, `ldbrx`.
@@ -67,27 +118,31 @@ pub const Memory = struct {
     /// swapping here would be swapping twice.
     pub fn readReversed(self: Memory, comptime T: type, address: u32) Fault!T {
         const size = @sizeOf(T);
-        const bytes = try self.slice(address, size);
-        return std.mem.readInt(T, bytes[0..size], .little);
+        var bytes: [size]u8 = undefined;
+        try self.readBytes(address, &bytes);
+        return std.mem.readInt(T, &bytes, .little);
     }
 
     /// Write a big-endian guest value: the normal PowerPC store.
     pub fn write(self: Memory, comptime T: type, address: u32, value: T) Fault!void {
         const size = @sizeOf(T);
-        const bytes = try self.slice(address, size);
-        std.mem.writeInt(T, bytes[0..size], value, .big);
+        var bytes: [size]u8 = undefined;
+        std.mem.writeInt(T, &bytes, value, .big);
+        try self.writeBytes(address, &bytes);
     }
 
     /// Write with the bytes left in host order: `sthbrx`, `stwbrx`, `stdbrx`.
     pub fn writeReversed(self: Memory, comptime T: type, address: u32, value: T) Fault!void {
         const size = @sizeOf(T);
-        const bytes = try self.slice(address, size);
-        std.mem.writeInt(T, bytes[0..size], value, .little);
+        var bytes: [size]u8 = undefined;
+        std.mem.writeInt(T, &bytes, value, .little);
+        try self.writeBytes(address, &bytes);
     }
 
     /// Read a 128-bit vector as four big-endian words, lane 0 highest.
     pub fn readVector(self: Memory, address: u32) Fault![4]u32 {
-        const bytes = try self.slice(address, 16);
+        var bytes: [16]u8 = undefined;
+        try self.readBytes(address, &bytes);
         var out: [4]u32 = undefined;
         inline for (0..4) |lane| {
             out[lane] = std.mem.readInt(u32, bytes[lane * 4 ..][0..4], .big);
@@ -96,19 +151,30 @@ pub const Memory = struct {
     }
 
     pub fn writeVector(self: Memory, address: u32, value: [4]u32) Fault!void {
-        const bytes = try self.slice(address, 16);
+        var bytes: [16]u8 = undefined;
         inline for (0..4) |lane| {
             std.mem.writeInt(u32, bytes[lane * 4 ..][0..4], value[lane], .big);
         }
+        try self.writeBytes(address, &bytes);
     }
 
     /// Zero a cache block, as `dcbz` and `dcbz128` do.
     pub fn zeroBlock(self: Memory, address: u32, size: u32) Fault!void {
         const aligned = address & ~(size - 1);
-        if (aligned < self.origin) return Fault.OutOfBounds;
+        if (size == 0 or !self.contains(aligned, size)) return Fault.Truncated;
+        if (self.access != null) {
+            var zeros = [_]u8{0} ** 256;
+            var cursor = aligned;
+            var remaining = size;
+            while (remaining != 0) {
+                const count: usize = @intCast(@min(remaining, @as(u32, zeros.len)));
+                try self.writeBytes(cursor, zeros[0..count]);
+                cursor += @intCast(count);
+                remaining -= @intCast(count);
+            }
+            return;
+        }
         const offset = aligned - self.origin;
-        if (offset >= self.len) return Fault.OutOfBounds;
-        if (self.len - offset < size) return Fault.Truncated;
         @memset(self.base[offset .. offset + size], 0);
     }
 

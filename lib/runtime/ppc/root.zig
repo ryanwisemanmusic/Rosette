@@ -40,6 +40,7 @@ pub const vmx128 = @import("vmx128.zig");
 pub const system = @import("system.zig");
 pub const execute = @import("execute.zig");
 pub const host_abi = @import("host_abi.zig");
+pub const guest_bridge = @import("guest_bridge.zig");
 pub const jit = @import("jit/root.zig");
 /// Differential verification of the recompiler against the interpreter.
 const jit_differential = @import("jit_differential.zig");
@@ -180,6 +181,7 @@ test {
     _ = system;
     _ = execute;
     _ = host_abi;
+    _ = guest_bridge;
     _ = jit;
     _ = jit_differential;
 }

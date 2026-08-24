@@ -179,6 +179,10 @@ pub const State = struct {
     /// Vector register save mask. The guest saves and restores it around
     /// vector code, so it has to read back what was written.
     vrsave: u32 = 0,
+    /// Value observed by the most recent load-reserve. Xenia exposes this
+    /// separately in its PPC context, so preserve it across the host ABI even
+    /// though the reservation-valid/address pair decides stwcx success.
+    reserved_val: u64 = 0,
     /// Decrementer. Rosette does not tick it; the scheduler owns guest time.
     decrementer: u32 = 0,
     /// Backing store for the Xenon SPRs listed in `Spr.storage_backed`.

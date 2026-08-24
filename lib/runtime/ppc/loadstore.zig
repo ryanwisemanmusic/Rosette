@@ -328,6 +328,7 @@ fn loadReserve(c: *Context, insn: Instruction, comptime T: type) Fault!Outcome {
     const value: u64 = try c.memory.read(T, ea);
     c.setGpr(f.rt(), value);
     c.state.reservation.set(ea);
+    c.state.reserved_val = value;
     return .advance;
 }
 
