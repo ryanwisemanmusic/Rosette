@@ -1,0 +1,7 @@
+name = "rosette-ppc-half-abi"
+version = "0.1.0-local"
+kind = "source-mirror-graphics-math"
+role = "source-mirror"
+architectures = ["powerpc64"]
+language = "zig"
+verification = "verify.sh"
