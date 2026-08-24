@@ -1,0 +1,10 @@
+name = "xenia-x86-guest-endian"
+version = "0.1.0-local"
+kind = "guest-endian-source-mirror"
+role = "build-time"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
+
+# The source mirrors the ARM64 and PPC route packages. Host-specific facts are
+# explicit; guest-facing vectors must remain identical across every route.
