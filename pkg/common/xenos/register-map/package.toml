@@ -1,0 +1,12 @@
+name = "common-xenos-register-map"
+version = "0.1.0-local"
+kind = "console-hardware-register-map"
+role = "build-time"
+# Route-independent: Xenos register indices are Xbox 360 silicon, not a fact
+# about the host Rosette was compiled for. One copy, no mirror to keep in sync.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package holds register numbers and aperture bounds only. It stores no
+# register values and decodes no bit fields; lib/gpu still owns both.
