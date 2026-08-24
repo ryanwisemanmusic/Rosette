@@ -1,6 +1,7 @@
 name = "xenia-x86-shader-storage-contract"
 version = "0.1.0-local"
 kind = "shader-storage-handoff-contract"
+role = "build-time"
 architectures = ["x86_64"]
 language = "zig"
 verification = "verify.sh"
