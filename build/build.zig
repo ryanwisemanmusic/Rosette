@@ -459,6 +459,133 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ready_compiler_mod.addImport("xenia_graphics_contract", xenia_graphics_contract_mod);
+    // The surface-path package separates Xenia's FBO render-target label from
+    // the actual Vulkan-to-Metal WSI chain. It is compile-time evidence only;
+    // native surface creation and presentation still require runtime events.
+    const xenia_surface_path_contract_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/graphics/surface-path-contract/src/root.zig");
+    const xenia_surface_path_contract_mod = b.createModule(.{
+        .root_source_file = xenia_surface_path_contract_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_surface_path_contract", xenia_surface_path_contract_mod);
+    // The shader-storage package records the Xenia macOS command-processor
+    // handoff. It distinguishes explicit completion from the five-second
+    // blocking-timeout continuation; it cannot synthesize either event.
+    const xenia_shader_storage_contract_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/runtime/shader-storage-contract/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig");
+    const xenia_shader_storage_contract_mod = b.createModule(.{
+        .root_source_file = xenia_shader_storage_contract_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_shader_storage_contract", xenia_shader_storage_contract_mod);
+    // Which Xenia subsystem owns a Mach-O symbol is fixed when Xenia is
+    // compiled, so the readiness gate looks it up instead of deriving it. The
+    // package supplies only the mapping; deciding whether executing inside a
+    // subsystem counts as progress stays in the runtime, which is the only
+    // place that knows what else has happened.
+    const xenia_launch_phase_map_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/runtime/launch-phase-map/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/runtime/launch-phase-map/src/root.zig");
+    const xenia_launch_phase_map_mod = b.createModule(.{
+        .root_source_file = xenia_launch_phase_map_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_launch_phase_map", xenia_launch_phase_map_mod);
+    // The remaining five packages were on disk with tests and reached nothing
+    // that ships. A package that is only in the test list is a claim nobody
+    // can check against the binary, so each one is selected by the same host
+    // ISA rule and imported by the module that consumes its facts.
+    //
+    // The guest is an x86-64 Mach-O image whose own guest is 32-bit big-endian
+    // Xenon on *both* routes, so the ABI facts below do not change with the
+    // host build. Only which host encoding and branch reach the route means
+    // does.
+    const xenia_abi_bridge_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/bridge/abi-bridge/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/bridge/abi-bridge/src/root.zig");
+    const xenia_abi_bridge_mod = b.createModule(.{
+        .root_source_file = xenia_abi_bridge_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_abi_bridge", xenia_abi_bridge_mod);
+    // Host-side facts for the PPC guest bridge: guest words stay big-endian
+    // and four-byte aligned whichever way the host reads them, and the host's
+    // own branch reach is the route's, not the guest's.
+    const xenia_guest_bridge_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/runtime/guest-bridge/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/runtime/guest-bridge/src/root.zig");
+    const xenia_guest_bridge_mod = b.createModule(.{
+        .root_source_file = xenia_guest_bridge_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_guest_bridge", xenia_guest_bridge_mod);
+    // Xbyak label binding and the activation classifier. The label ledger
+    // refuses to call a code buffer ready with an unbound label, which is the
+    // exception the earlier evidence carried; the classifier separates
+    // precompile progress from a silent graphics owner.
+    const xenia_codegen_activation_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/runtime/codegen-activation/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/runtime/codegen-activation/src/root.zig");
+    const xenia_codegen_activation_mod = b.createModule(.{
+        .root_source_file = xenia_codegen_activation_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_codegen_activation", xenia_codegen_activation_mod);
+    // The wait boundary: a consuming wait cannot succeed without consuming a
+    // pending signal. The package models the invariant; the live pthread and
+    // kernel-event implementations stay in charge of behavior.
+    const xenia_wait_contract_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/runtime/wait-contract/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/runtime/wait-contract/src/root.zig");
+    const xenia_wait_contract_mod = b.createModule(.{
+        .root_source_file = xenia_wait_contract_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_wait_contract", xenia_wait_contract_mod);
+    // The activation report parser. Its stage vocabulary is the Ready
+    // Compiler's, which is exactly why it is imported here: a stage renamed on
+    // one side and not the other is a report that quietly stops matching, and
+    // the comptime cross-check in `lib/ready-compiler/xenia.zig` fails the
+    // build instead.
+    const xenia_startup_evidence_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/diagnostics/startup-evidence/src/evidence.zig")
+    else
+        b.path("../pkg/x86/xenia/diagnostics/startup-evidence/src/evidence.zig");
+    const xenia_startup_evidence_mod = b.createModule(.{
+        .root_source_file = xenia_startup_evidence_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    ready_compiler_mod.addImport("xenia_startup_evidence", xenia_startup_evidence_mod);
+    // Primitive dispatch is a Mach-O hot path. The package supplies only a
+    // family lookup; the existing primitive handlers and fallback definitions
+    // remain in charge of behavior.
+    const xenia_primitive_contract_root = if (target.result.cpu.arch == .aarch64)
+        b.path("../pkg/ARM64/xenia/runtime/primitive-contract/src/root.zig")
+    else
+        b.path("../pkg/x86/xenia/runtime/primitive-contract/src/root.zig");
+    const xenia_primitive_contract_mod = b.createModule(.{
+        .root_source_file = xenia_primitive_contract_root,
+        .target = target,
+        .optimize = optimize,
+    });
     const bridge_register_trace_module = b.createModule(.{
         .root_source_file = b.path("../src/bridge/register-tracing/runtime.zig"),
         .target = target,
@@ -1317,6 +1444,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        primitive_mod.addImport("xenia_primitive_contract", xenia_primitive_contract_mod);
         const vtable_mod = b.createModule(.{
             .root_source_file = b.path("../lib/runtime/vtable/root.zig"),
             .target = target,
@@ -1358,6 +1486,52 @@ pub fn build(b: *std.Build) void {
 
         const ready_compiler_test = b.addTest(.{ .root_module = ready_compiler_mod });
         check_step.dependOn(&b.addRunArtifact(ready_compiler_test).step);
+
+        // The route packages under `pkg/` ship inside the processor, so their
+        // own tests belong in the same gate as everything else that does.
+        // Each package carries a `verify.sh`, but a check that only runs when
+        // someone remembers to run it is not a check — a drifted package
+        // reached the built binary and the suite stayed green.
+        //
+        // Both routes are tested regardless of which one this build selects.
+        // The unselected one is the companion that a later ARM64 or x86 host
+        // will link, and letting it rot until that host exists is how the
+        // "preflight contract" packages stop matching the route they mirror.
+        const route_package_roots = [_][]const u8{
+            "../pkg/x86/xenia/graphics-contract/src/root.zig",
+            "../pkg/x86/xenia/graphics/surface-path-contract/src/root.zig",
+            "../pkg/x86/xenia/bridge/abi-bridge/src/root.zig",
+            // This package's tests live beside the evidence table rather than
+            // in a `root.zig`; `main.zig` is its executable half.
+            "../pkg/x86/xenia/diagnostics/startup-evidence/src/evidence.zig",
+            "../pkg/x86/xenia/runtime/codegen-activation/src/root.zig",
+            "../pkg/x86/xenia/runtime/launch-phase-map/src/root.zig",
+            "../pkg/x86/xenia/runtime/primitive-contract/src/root.zig",
+            "../pkg/x86/xenia/runtime/guest-bridge/src/root.zig",
+            "../pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig",
+            "../pkg/x86/xenia/runtime/wait-contract/src/root.zig",
+            "../pkg/ARM64/xenia/graphics-contract/src/root.zig",
+            "../pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig",
+            "../pkg/ARM64/xenia/bridge/abi-bridge/src/root.zig",
+            // Same split as the x86 copy: the tests live beside the evidence
+            // table, and `main.zig` is the executable half.
+            "../pkg/ARM64/xenia/diagnostics/startup-evidence/src/evidence.zig",
+            "../pkg/ARM64/xenia/runtime/codegen-activation/src/root.zig",
+            "../pkg/ARM64/xenia/runtime/guest-bridge/src/root.zig",
+            "../pkg/ARM64/xenia/runtime/launch-phase-map/src/root.zig",
+            "../pkg/ARM64/xenia/runtime/primitive-contract/src/root.zig",
+            "../pkg/ARM64/xenia/runtime/shader-storage-contract/src/root.zig",
+            "../pkg/ARM64/xenia/runtime/wait-contract/src/root.zig",
+        };
+        inline for (route_package_roots) |package_root| {
+            const package_mod = b.createModule(.{
+                .root_source_file = b.path(package_root),
+                .target = target,
+                .optimize = optimize,
+            });
+            const package_test = b.addTest(.{ .root_module = package_mod });
+            check_step.dependOn(&b.addRunArtifact(package_test).step);
+        }
 
         // Compile-side companion to the readiness gate: the resolutions a
         // finished link set leaves undetermined produce no diagnostic from
@@ -1464,6 +1638,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         diagnostics_mod.addImport("event_log", event_log_mod);
+        diagnostics_mod.addImport("xenia_shader_storage_contract", xenia_shader_storage_contract_mod);
         const diagnostics_test = b.addTest(.{ .root_module = diagnostics_mod });
         check_step.dependOn(&b.addRunArtifact(diagnostics_test).step);
         diagnostics_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
