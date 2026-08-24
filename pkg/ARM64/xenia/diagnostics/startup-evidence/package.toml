@@ -1,10 +1,11 @@
 name = "xenia-arm64-startup-evidence"
 version = "0.1.0-local"
-kind = "log-contract-verifier"
+kind = "facts"
+role = "build-time"
+tooling = "src/main.zig"
 architectures = ["x86_64", "ppc64", "arm64"]
 language = "zig"
 verification = "verify.sh"
 
-# The parser is architecture-neutral. The evidence it consumes is not: a
-# PPC64 or ARM64 run must be fed its own logs and must never inherit an x86
-# verdict merely because the stage names match. The route is ARM64.
+# The package owns only immutable route/stage/vocabulary facts. The offline
+# CLI is tooling; its mutable log observer is lib/diagnostics/xenia_startup_evidence.zig.
