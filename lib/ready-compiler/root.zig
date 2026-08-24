@@ -3,7 +3,9 @@
 //! `ready-compiler` is the runtime analogue of a build graph. It records what
 //! was compiled, what was installed, and whether those artifacts actually
 //! activated in the order required by the application. The core is guest
-//! agnostic; `xenia` is the first concrete contract.
+//! agnostic; `xenia` is the first concrete contract. Keep this root as the
+//! dependency anchor so changes in the concrete contract invalidate the
+//! processor's linked readiness module as well as its standalone tests.
 
 pub const types = @import("types.zig");
 pub const runtime = @import("runtime.zig");

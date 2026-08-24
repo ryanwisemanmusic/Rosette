@@ -341,10 +341,41 @@ pub const Runtime = struct {
             self.external_progress_step = step;
             return;
         }
-        if (!counters.advancedFrom(self.external_progress)) return;
-        self.external_progress = counters;
+        // Translation progress is reported asynchronously through the guest
+        // log. Preserve it when the periodic heap/thread snapshot arrives,
+        // whose literal does not carry that event's generation.
+        const merged = types.ExternalProgress{
+            .heap_high_water = counters.heap_high_water,
+            .heap_live = counters.heap_live,
+            .threads_created = counters.threads_created,
+            .translation_generation = @max(
+                counters.translation_generation,
+                self.external_progress.translation_generation,
+            ),
+        };
+        if (!merged.advancedFrom(self.external_progress)) return;
+        self.external_progress = merged;
         self.external_progress_step = step;
         self.external_progress_advances +|= 1;
+    }
+
+    /// Record a successful PPC guest-function translation reported by Xenia.
+    ///
+    /// The generation is assigned by Xenia after assembly succeeds, not by
+    /// this observer. Strict monotonicity rejects replayed or out-of-order log
+    /// lines, so a noisy logger cannot buy repeated quiet windows.
+    pub fn noteTranslationProgress(self: *Runtime, generation: u64, step: u64) bool {
+        if (!self.enabled() or self.phase != .activation) return false;
+        if (generation == 0 or generation <= self.external_progress.translation_generation) return false;
+        self.external_progress.translation_generation = generation;
+        self.external_progress_seen = true;
+        self.external_progress_step = step;
+        self.external_progress_advances +|= 1;
+        return true;
+    }
+
+    pub fn translationProgressGeneration(self: *const Runtime) u64 {
+        return self.external_progress.translation_generation;
     }
 
     /// The most recent step at which a host-serviced counter advanced.
@@ -978,6 +1009,23 @@ pub const Runtime = struct {
         self.pending_wait_step = step;
     }
 
+    /// A timeout result is evidence that a wait returned, not proof that the
+    /// thread is still parked on that object.  The log bridge can observe a
+    /// timeout from one Xenia worker and then observe another worker (or the
+    /// same worker) making named progress before the next readiness poll.  In
+    /// that shape, retaining the old object as a live blocker would let one
+    /// stale line override the execution and host-progress witnesses.
+    ///
+    /// Keep the observation available for diagnostics, but only let it drive a
+    /// terminal wait verdict while it is at least as recent as every other
+    /// progress witness.  A genuinely parked wait still has no later named or
+    /// host-serviced progress and therefore remains eligible for the existing
+    /// wait test.
+    fn pendingWaitIsCurrent(self: *const Runtime) bool {
+        if (self.pending_wait_object == 0) return false;
+        return self.pending_wait_step >= self.lastNamedProgressStep();
+    }
+
     /// Classify text that can explain a runtime compiler failure. The caller
     /// may continue recording the text after the first typed failure; first
     /// failure wins for control flow, but later evidence must remain visible
@@ -1146,6 +1194,7 @@ pub const Runtime = struct {
         result.quiet_budget_steps = contract.quiet_budget_steps;
         result.external_progress_advances = self.external_progress_advances;
         result.external_progress_step = self.externalProgressStep();
+        result.external_translation_generation = self.external_progress.translation_generation;
         result.activation_steps = step -| self.activation_start_step;
         result.activation_budget_steps = contract.activation_budget_steps;
         result.hot_site = self.hottestSite();
@@ -1262,7 +1311,7 @@ pub const Runtime = struct {
         if (contract.quiet_budget_steps != 0 and
             step -| self.lastNamedProgressStep() >= contract.quiet_budget_steps)
         {
-            if (self.pending_wait_object != 0) {
+            if (self.pendingWaitIsCurrent()) {
                 self.fail(.{
                     .kind = .wait_unsignaled,
                     .stage = if (missing) |spec| spec.name else "",
@@ -1492,6 +1541,28 @@ test "quiet activation timeout identifies an unsignaled wait" {
     try std.testing.expectEqual(types.Evaluation.failed, runtime.evaluate(5));
     try std.testing.expectEqual(types.FailureKind.wait_unsignaled, runtime.failure.kind);
     try std.testing.expectEqual(@as(u64, 0x88), runtime.failure.object);
+}
+
+test "a timeout is stale after later startup progress" {
+    const stages = [_]types.StageSpec{
+        .{ .id = 0, .name = "entry" },
+        .{ .id = 1, .name = "frame", .prerequisites = @as(u64, 1) },
+    };
+    var runtime = Runtime{};
+    runtime.configure(.{ .name = "test", .stages = &stages, .activation_budget_steps = 1000, .quiet_budget_steps = 4 }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    try std.testing.expect(runtime.sealCompile(0));
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // The timeout returned at step 2. A later worker then made named progress;
+    // the old result must remain diagnostic evidence without becoming the
+    // reason the gate stops that worker's startup.
+    runtime.noteWait(0x88, false, 2);
+    runtime.noteWorkUnit("worker stage=translation", 20);
+    runtime.noteExecutionSample(30, 0x1000, 0x11);
+    try std.testing.expectEqual(types.Evaluation.failed, runtime.evaluate(30));
+    try std.testing.expectEqual(types.FailureKind.entered_but_no_progress, runtime.failure.kind);
+    try std.testing.expectEqual(@as(u64, 0), runtime.failure.object);
 }
 
 test "named work keeps a slow startup step from being reported as a hang" {
@@ -2252,6 +2323,23 @@ test "a host-serviced counter keeps a silent but working guest alive" {
     try std.testing.expect(runtime.external_progress_advances != 0);
     try std.testing.expectEqual(types.ProgressClass.external_advancing, runtime.classifyProgress(1000));
     try std.testing.expect(runtime.phase != .failed);
+}
+
+test "successful guest translation is monotonic external progress" {
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+    try std.testing.expect(runtime.noteTranslationProgress(8, 20));
+    try std.testing.expectEqual(@as(u64, 1), runtime.external_progress_advances);
+    try std.testing.expectEqual(@as(u64, 8), runtime.translationProgressGeneration());
+    try std.testing.expect(!runtime.noteTranslationProgress(8, 30));
+    try std.testing.expect(!runtime.noteTranslationProgress(7, 40));
+    try std.testing.expect(runtime.noteTranslationProgress(16, 110));
+    try std.testing.expectEqual(@as(u64, 2), runtime.external_progress_advances);
+    try std.testing.expectEqual(types.ProgressClass.external_advancing, runtime.classifyProgress(110));
+
+    // A later periodic snapshot must not erase the asynchronous generation.
+    runtime.noteExternalProgress(.{ .heap_high_water = 100 }, 120);
+    try std.testing.expectEqual(@as(u64, 16), runtime.translationProgressGeneration());
 }
 
 test "a guest that obtains nothing still fails on schedule" {

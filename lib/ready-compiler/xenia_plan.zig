@@ -16,30 +16,19 @@ const plan = @import("plan.zig");
 const xenia = @import("xenia.zig");
 const cache = @import("cache.zig");
 const ready_package = @import("package.zig");
+const static_plan = @import("xenia_ready_plan");
 
-pub const symbol_prefix = "__ZN2xe";
+pub const symbol_prefix = static_plan.symbol_prefix;
+pub const SymbolUnit = static_plan.SymbolUnit;
+pub const ContractUnit = static_plan.ContractUnit;
+pub const HostUnit = static_plan.HostUnit;
+pub const contract_units = static_plan.contract_units;
+pub const symbol_units = static_plan.symbol_units;
+pub const host_units = static_plan.host_units;
+pub const image_units = static_plan.image_units;
 
-/// Changes to the static contract invalidate the plan cache.  The fingerprint
-/// is derived from the actual declarations rather than maintained as a second
-/// hand-written version number, so adding/reordering a target cannot silently
-/// reuse an old reference bitmap.
 pub fn fingerprint() u64 {
-    var result = std.hash.Wyhash.hash(0, symbol_prefix);
-    for (contract_units) |unit| {
-        result = std.hash.Wyhash.hash(result, unit.fragment);
-        result = std.hash.Wyhash.hash(result, unit.purpose);
-        var stage = @intFromEnum(unit.stage);
-        result = std.hash.Wyhash.hash(result, std.mem.asBytes(&stage));
-        var reachability_required = unit.reachability_required;
-        result = std.hash.Wyhash.hash(result, std.mem.asBytes(&reachability_required));
-    }
-    for (symbol_units) |unit| {
-        result = std.hash.Wyhash.hash(result, unit.fragment);
-        result = std.hash.Wyhash.hash(result, unit.purpose);
-        var required = unit.required;
-        result = std.hash.Wyhash.hash(result, std.mem.asBytes(&required));
-    }
-    return result;
+    return static_plan.fingerprint();
 }
 
 /// Build the package manifest that may be vendored or reused by a later
@@ -87,80 +76,6 @@ pub fn packageManifest(snapshot: cache.Snapshot) ready_package.Manifest {
     return manifest;
 }
 
-/// A function whose absence makes some part of startup impossible.
-pub const SymbolUnit = struct {
-    fragment: []const u8,
-    purpose: []const u8,
-    required: bool = true,
-};
-
-/// A contract stage tied to the code that must run for it to be reported.
-pub const ContractUnit = struct {
-    stage: xenia.Stage,
-    fragment: []const u8,
-    purpose: []const u8,
-    /// Whether absence of any reference to the implementation halts the plan.
-    ///
-    /// Advisory by default, and that default is a statement about the analysis
-    /// rather than about Xenia. The reference scan finds direct `call rel32`
-    /// sites; Xenia reaches a great deal of its startup through virtual
-    /// dispatch and `std::function`, whose targets live in tables the scan does
-    /// not cover. A missing reference is therefore strong evidence and not
-    /// proof, and halting a run on it would be failing the build over a limit
-    /// of the gate's own vision.
-    ///
-    /// The presence half of the same stage is a separate, required unit, so a
-    /// genuinely missing implementation still halts.
-    reachability_required: bool = false,
-};
-
-/// The code without which the corresponding startup stage cannot occur.
-///
-/// The ordering mirrors the contract so the emitted plan reads in the order
-/// the run will need these, the way a build log reads in dependency order.
-pub const contract_units = [_]ContractUnit{
-    .{ .stage = .emulator_setup_started, .fragment = "8Emulator5SetupE", .purpose = "Emulator::Setup must exist to begin bring-up" },
-    .{ .stage = .memory_ready, .fragment = "6Memory10InitializeE", .purpose = "guest memory initialization" },
-    .{ .stage = .processor_ready, .fragment = "3cpu9Processor5SetupE", .purpose = "CPU frontend and backend bring-up" },
-    .{ .stage = .kernel_globals_started, .fragment = "11KernelState28InitializeKernelGuestGlobalsE", .purpose = "kernel guest globals" },
-    .{ .stage = .graphics_setup_started, .fragment = "14GraphicsSystem5SetupE", .purpose = "GraphicsSystem::Setup" },
-    .{ .stage = .command_processor_ready, .fragment = "16CommandProcessor10InitializeE", .purpose = "GPU command processor bring-up" },
-    .{ .stage = .complete_launch_started, .fragment = "8Emulator14CompleteLaunchE", .purpose = "the launch path that loads the title" },
-    .{ .stage = .user_module_loaded, .fragment = "11KernelState19SetExecutableModuleE", .purpose = "wiring default.xex as the executable module" },
-    .{ .stage = .precompile_requested, .fragment = "9XexModule10PrecompileE", .purpose = "entering the title's discovered-function precompile pass" },
-    .{ .stage = .precompile_completed, .fragment = "9XexModule10PrecompileE", .purpose = "returning from the title's discovered-function precompile pass" },
-    .{ .stage = .user_module_ready, .fragment = "11KernelState23FinishLoadingUserModuleE", .purpose = "completing user module load" },
-    .{ .stage = .shader_storage_requested, .fragment = "14GraphicsSystem23InitializeShaderStorageE", .purpose = "entering per-title shader storage initialization" },
-    // The stage the current run stops at. Its implementation being present is
-    // exactly what distinguishes "the code is missing" from "the code is never
-    // called", and those need different fixes.
-    .{ .stage = .shader_storage_ready, .fragment = "14GraphicsSystem23InitializeShaderStorageE", .purpose = "per-title shader storage initialization" },
-    .{ .stage = .guest_main_ready, .fragment = "11KernelState12LaunchModuleE", .purpose = "starting the guest main thread" },
-};
-
-/// Functions the contract does not name a stage for, but whose absence would
-/// make the run fail later and less legibly.
-pub const symbol_units = [_]SymbolUnit{
-    .{ .fragment = "9XexModule10PrecompileE", .purpose = "ahead-of-time translation of discovered guest functions" },
-    .{ .fragment = "9XexModule12LoadContinueE", .purpose = "XEX image load" },
-    .{ .fragment = "3gpu16CommandProcessor13ExecutePacketE", .purpose = "guest command ring execution", .required = false },
-    .{ .fragment = "2ui9Presenter", .purpose = "host presentation", .required = false },
-};
-
-/// Host capabilities named by the probe rather than by the image.
-pub const HostUnit = struct {
-    name: []const u8,
-    purpose: []const u8,
-    required: bool = true,
-};
-
-pub const host_units = [_]HostUnit{
-    .{ .name = "decoder-audit", .purpose = "the x86-64 decoder handles the encodings this image contains" },
-    .{ .name = "vex-safety", .purpose = "VEX encodings are decodable or provably absent", .required = false },
-    .{ .name = "vulkan-loader", .purpose = "a Vulkan loader is present for the graphics path", .required = false },
-    .{ .name = "window-system", .purpose = "a native window can be created for presentation", .required = false },
-};
-
 /// A file the run reads or writes, declared with the shape it must have.
 pub const AssetUnit = struct {
     path: []const u8,
@@ -173,11 +88,14 @@ pub const AssetUnit = struct {
 /// fundamental, so they run first: nothing below them means anything if the
 /// image itself is not what it claims to be.
 pub fn addImageUnits(target: *plan.Plan) void {
-    target.add(.{ .category = .image, .name = "mach-o-header", .purpose = "the file is a mapped 64-bit Mach-O image" });
-    target.add(.{ .category = .image, .name = "entry-point", .purpose = "the image declares an entry point" });
-    target.add(.{ .category = .image, .name = "text-segment", .purpose = "an executable text segment is mapped" });
-    target.add(.{ .category = .image, .name = "symbol-table", .purpose = "a symbol table is present for contract resolution" });
-    target.add(.{ .category = .image, .name = "bundle-executable", .purpose = "the image is the app bundle's executable", .required = false });
+    for (image_units) |unit| {
+        target.add(.{
+            .category = .image,
+            .name = unit.name,
+            .purpose = unit.purpose,
+            .required = unit.required,
+        });
+    }
 }
 
 pub fn addHostUnits(target: *plan.Plan) void {
@@ -308,28 +226,7 @@ test "asset units carry the shape the file must have" {
 /// were wrong when the list was first written, so the arithmetic is checked
 /// rather than trusted.
 pub fn fragmentIsWellFormed(fragment: []const u8) bool {
-    var index: usize = 0;
-    var components: usize = 0;
-    while (index < fragment.len) {
-        if (fragment[index] == 'E') {
-            index += 1;
-            continue;
-        }
-        if (fragment[index] < '0' or fragment[index] > '9') return false;
-        var length: usize = 0;
-        while (index < fragment.len and fragment[index] >= '0' and fragment[index] <= '9') {
-            length = length * 10 + (fragment[index] - '0');
-            index += 1;
-        }
-        if (length == 0) return false;
-        // The identifier must actually be present and that long. A trailing
-        // component may be cut short by the fragment ending, which is only
-        // legal when it consumes the entire remainder.
-        if (index + length > fragment.len) return false;
-        index += length;
-        components += 1;
-    }
-    return components != 0;
+    return static_plan.fragmentIsWellFormed(fragment);
 }
 
 test "every symbol fragment agrees with its own Itanium length prefixes" {

@@ -312,6 +312,10 @@ pub const ExternalProgress = struct {
     heap_live: u64 = 0,
     /// Cumulative guest threads created. A spin loop does not create threads.
     threads_created: u64 = 0,
+    /// Monotonic generation of successfully assembled guest functions reported
+    /// by the emulator's PPC frontend. A heartbeat or a retry that never
+    /// installs code cannot advance this value.
+    translation_generation: u64 = 0,
 
     /// Whether any counter is strictly greater than in `previous`.
     ///
@@ -321,7 +325,8 @@ pub const ExternalProgress = struct {
     pub fn advancedFrom(self: ExternalProgress, previous: ExternalProgress) bool {
         return self.heap_high_water > previous.heap_high_water or
             self.heap_live > previous.heap_live or
-            self.threads_created > previous.threads_created;
+            self.threads_created > previous.threads_created or
+            self.translation_generation > previous.translation_generation;
     }
 };
 
@@ -443,6 +448,7 @@ pub const Diagnosis = struct {
     /// anything to say — which is itself the finding when a guest is stuck.
     external_progress_advances: u64 = 0,
     external_progress_step: u64 = 0,
+    external_translation_generation: u64 = 0,
     activation_steps: u64 = 0,
     activation_budget_steps: u64 = 0,
     /// Where the guest spent the quiet window.
