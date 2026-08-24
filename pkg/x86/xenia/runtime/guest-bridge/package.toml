@@ -1,0 +1,9 @@
+name = "xenia-x86-guest-bridge"
+version = "0.1.0-local"
+kind = "x86-64-guest-bridge-contract"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
+
+# This package states host facts for the x86-64 route. It does not claim that
+# an ARM64 log is x86-64 execution evidence, or the reverse.
