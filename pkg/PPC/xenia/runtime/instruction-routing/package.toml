@@ -1,0 +1,7 @@
+name = "xenia-ppc-instruction-routing"
+version = "0.1.0"
+kind = "facts"
+role = "build-time"
+guest_architecture = "ppc32-xenon"
+host_architecture = "any"
+description = "Static Xenon opcode exception and prefix routing facts."
