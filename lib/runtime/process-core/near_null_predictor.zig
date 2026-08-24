@@ -38,6 +38,11 @@
 const std = @import("std");
 const machoCapturePrint = @import("dyld").event_log.machoCapturePrint;
 const symbolication = @import("macho_core").symbolication;
+/// Whether `rdi` is a receiver at a given callee is fixed by that callee's
+/// declared signature, so it is resolved at build time rather than by walking a
+/// string table on the dispatch path. See the package README for why it lives
+/// under `pkg/common/` with no route mirror.
+const receiver_classification = @import("common_receiver_classification");
 
 /// Receivers below this bound are "near null": dereferencing them faults on
 /// the zero page or a tiny tag-like address. Matches the existing 0x1000
@@ -142,7 +147,8 @@ pub const Predictor = struct {
         // is the documented request for a default. Either way retaining it
         // spends a signature slot on a correct call and teaches the reader to
         // distrust the tool.
-        if (isBenignSmallIntArgImport(symbol) or isDocumentedNullSentinelImport(symbol)) {
+        const argument_class = receiver_classification.classify(symbol);
+        if (!argument_class.predictsCasualty()) {
             self.benign_skipped +|= 1;
             return;
         }
@@ -193,7 +199,7 @@ pub const Predictor = struct {
             );
         }
         machoCapturePrint(
-            "NEAR NULL PREDICTOR: dump reason={s} distinct={d} retained={d} near_null_dispatches={d} benign_skipped={d} native_receivers={d} recent_window={d} emissions={d}\n",
+            "NEAR NULL PREDICTOR: dump reason={s} distinct={d} retained={d} near_null_dispatches={d} benign_skipped={d} native_receivers={d} recent_window={d} emissions={d} abi={s}/{s}; a skipped dispatch is one where the callee's signature says {s} is not a receiver, not one whose fault was ignored\n",
             .{
                 reason,
                 self.distinct_signatures,
@@ -203,6 +209,9 @@ pub const Predictor = struct {
                 self.native_receiver_events,
                 self.recentCount(),
                 self.emissions,
+                receiver_classification.guest_abi,
+                receiver_classification.receiver_register,
+                receiver_classification.receiver_register,
             },
         );
     }
@@ -575,193 +584,13 @@ fn resolveCallerLabel(state: anytype, caller: u64, buffer: []u8) []const u8 {
     return symbolication.describeState(state, caller, buffer);
 }
 
-/// Symbols whose first argument is a *pointer* for which null is the documented
-/// way to ask for a default, not a mistake.
-///
-/// Kept separate from the scalar list on purpose. These genuinely take a
-/// pointer in rdi, so the shape check cannot dismiss them — what dismisses them
-/// is the API contract, and a reader deciding whether to add a symbol needs to
-/// know which of the two questions they are answering. Mixing them into one bag
-/// invites adding a real receiver because "the other entries looked similar".
-fn isDocumentedNullSentinelImport(name: []const u8) bool {
-    const exact = [_][]const u8{
-        // SDL_OpenAudioDevice(NULL, ...) requests the default output device.
-        // Passing a device name is the *unusual* call; null is the norm.
-        "_SDL_OpenAudioDevice",
-        // SDL_AudioInit(NULL) / SDL_VideoInit(NULL) select the default driver.
-        "_SDL_AudioInit",
-        "_SDL_VideoInit",
-        // SDL_GetHint / SDL_SetHint with a null name is a documented no-op
-        // returning null, not a dereference.
-        "_SDL_GetHintBoolean",
-    };
-    for (exact) |candidate| {
-        if (std.mem.eql(u8, name, candidate)) return true;
-    }
-    return false;
-}
-
-/// Symbols whose first argument is a small integer / size / fd / clock id /
-/// legal-null pointer rather than a receiver that will be dereferenced.
-/// A near-null rdi on these can never produce a near-null casualty, so they
-/// are skipped to keep the retained signatures receiver-shaped.
-fn isBenignSmallIntArgImport(name: []const u8) bool {
-    const exact = [_][]const u8{
-        // C++ allocation / deallocation — size arg, or a pointer that the
-        // standard permits to be null (`delete nullptr` is a no-op).
-        "__Znwm", // operator new(unsigned long)
-        "__Znam", // operator new[](unsigned long)
-        "__ZnwmRKSt9nothrow_t",
-        "__ZnamRKSt9nothrow_t",
-        "__ZdlPv", // operator delete(void*)
-        "__ZdaPv", // operator delete[](void*)
-        "__ZdlPvm", // sized operator delete
-        "__ZdaPvm",
-        "_malloc",
-        "_calloc",
-        "_realloc",
-        "_free",
-        // fd / dirfd / clockid first args — integers, never dereferenced.
-        "_write",
-        "_read",
-        "_pwrite",
-        "_pread",
-        "_close",
-        "_open",
-        "_openat",
-        "_fcntl",
-        "_fstat",
-        "_fstatat",
-        "_ftruncate",
-        "_lseek",
-        "_dup",
-        "_dup2",
-        "_dirfd",
-        "_opendir",
-        "_closedir",
-        "_readdir",
-        "_fsync",
-        "_fchmod",
-        "_fchown",
-        "_flock",
-        // mmap(NULL) requests any mapping; munmap/madvise of 0 is a no-op.
-        "_mmap",
-        "_munmap",
-        "_madvise",
-        "_mlock",
-        "_munlock",
-        "_msync",
-        // clockid first arg.
-        "_clock_gettime",
-        "_clock_getres",
-        "_clock_settime",
-        "_nanosleep",
-        // pthread_threadid_np(NULL) means the calling thread.
-        "_pthread_threadid_np",
-        // Takes no meaningful first arg.
-        "___error",
-        // Size arg (hash table growth).
-        "__ZNSt3__112__next_primeEm",
-        // Exception object size.
-        "___cxa_allocate_exception",
-        // Signal number (SIGILL=4, SIGSEGV=0xb, ...).
-        "_sigaction",
-        // `raise(int)` receives a signal number, not an object receiver.
-        "_raise",
-        // GtkOrientation / GtkWindowType / GType enums.
-        "_gtk_box_new",
-        "_gtk_window_new",
-        "_gtk_window_get_type",
-        "_gtk_container_get_type",
-        // No-argument accessors; rdi is register-allocation garbage.
-        "_pthread_self",
-        "_objc_autoreleasePoolPush",
-        // nl_item / sysconf name / socket domain / SDL log priority enums.
-        "_nl_langinfo",
-        "_sysconf",
-        "_socket",
-        "_SDL_LogSetAllPriority",
-        // ffs(x) — the first arg is the integer value being scanned.
-        "_ffs",
-        // time(NULL) is the standard call form and never dereferences.
-        "_time",
-        // pthread_key_t is an opaque index, not a pointer.
-        "_pthread_setspecific",
-        // fd first arg.
-        "_fdopen",
-        // CCOperation enum (0=encrypt, 1=decrypt).
-        "_CCCrypt",
-        // Aligned operator new/delete — size / align, never dereferenced.
-        "__ZnwmSt11align_val_t",
-        "__ZnamSt11align_val_t",
-        "__ZnwmSt11align_val_tRKSt9nothrow_t",
-        "__ZnamSt11align_val_tRKSt9nothrow_t",
-        "__ZdlPvSt11align_val_t",
-        "__ZdaPvSt11align_val_t",
-        // asctime(NULL) is tolerated by the Darwin libc path (returns without
-        // dereferencing), and the observed single dispatch never produced a
-        // casualty across a 2.9B-step run — first arg is not a receiver here.
-        "_asctime",
-        // <stdlib.h> integer functions. `abs(0)` is the single most misleading
-        // prediction the tool can make: rdi is the value being operated on, so
-        // a "near-null receiver" here is just a small number, and small numbers
-        // are what these take.
-        "_abs",
-        "_labs",
-        "_llabs",
-        "_exit",
-        "__exit",
-        "_srand",
-        "_srandom",
-        // Integer seconds / microseconds / fd.
-        "_sleep",
-        "_usleep",
-        "_alarm",
-        "_isatty",
-        // SDL: scalar first argument. SDL_AudioDeviceID, an SDL_INIT_* mask, or
-        // a device/joystick index — all integers, none dereferenced. A device
-        // id of 0x101 or a subsystem mask of 0x10 is a correct call, not a
-        // near-null receiver.
-        "_SDL_Init",
-        "_SDL_InitSubSystem",
-        "_SDL_QuitSubSystem",
-        "_SDL_WasInit",
-        "_SDL_PauseAudioDevice",
-        "_SDL_CloseAudioDevice",
-        "_SDL_LockAudioDevice",
-        "_SDL_UnlockAudioDevice",
-        "_SDL_GetAudioDeviceStatus",
-        "_SDL_ClearQueuedAudio",
-        "_SDL_GetQueuedAudioSize",
-        "_SDL_GetAudioDeviceName",
-        "_SDL_GetAudioDriver",
-        "_SDL_IsGameController",
-        "_SDL_GameControllerOpen",
-        "_SDL_JoystickOpen",
-        "_SDL_JoystickNameForIndex",
-        "_SDL_Delay",
-    };
-    for (exact) |candidate| {
-        if (std.mem.eql(u8, name, candidate)) return true;
-    }
-    // std::chrono::{steady,system,high_resolution}_clock::now() — static,
-    // zero-argument; the observed rdi is register-allocation garbage, never a
-    // receiver. Mangled form ends `3nowEv` (now() taking no args).
-    if (std.mem.endsWith(u8, name, "3nowEv")) return true;
-    // libc++ basic_ostream::sentry destructor family (`...6sentryD1Ev` etc.)
-    // — modeled as a no-op primitive that never dereferences the receiver, so
-    // a near-null rdi predicts nothing, exactly like `_raise`. The sentry is a
-    // guest-stack guard; if it were ever near-null the handler still ignores it.
-    if (std.mem.indexOf(u8, name, "6sentryD") != null) return true;
-    // Darwin symbol-suffix variants: `_fstatat$INODE64`, `_fstat$INODE64$UNIX2003`.
-    if (std.mem.indexOf(u8, name, "$INODE64")) |at| {
-        const base = name[0..at];
-        for (exact) |candidate| {
-            if (std.mem.eql(u8, base, candidate)) return true;
-        }
-    }
-    return false;
-}
+// `isDocumentedNullSentinelImport` and `isBenignSmallIntArgImport` used to
+// live here as two inline string tables walked on every near-null dispatch.
+// Both answered a question fixed by the callee's declared signature, so they
+// moved to `pkg/common/abi/receiver-classification`, which also names the
+// class instead of collapsing it to a boolean — a zero-argument function and
+// a documented null default are dismissed for different reasons, and the
+// report now says which.
 
 test "predictor records first sight and recurrence separately" {
     const TestState = struct {
@@ -1084,28 +913,48 @@ test "a genuine null receiver is still retained after the benign lists grow" {
     try std.testing.expectEqual(@as(u32, 3), predictor.distinct_signatures);
 }
 
-test "the two benign reasons stay separate and neither swallows the other" {
-    // Scalar-argument list: not a pointer at all.
-    try std.testing.expect(isBenignSmallIntArgImport("_abs"));
-    try std.testing.expect(isBenignSmallIntArgImport("_raise"));
-    try std.testing.expect(isBenignSmallIntArgImport("_SDL_PauseAudioDevice"));
-    try std.testing.expect(!isDocumentedNullSentinelImport("_abs"));
+test "the dismissal reasons stay separate and neither swallows the other" {
+    // The classification moved to `pkg/common/abi/receiver-classification`, so
+    // this asserts the behaviour the predictor depends on rather than the
+    // table's shape: the reasons must stay distinguishable, and none of them
+    // may claim a receiver-shaped symbol.
+    const Class = receiver_classification.Class;
+
+    // Not a pointer at all.
+    try std.testing.expectEqual(Class.scalar_first_argument, receiver_classification.classify("_abs"));
+    try std.testing.expectEqual(Class.scalar_first_argument, receiver_classification.classify("_raise"));
+    try std.testing.expectEqual(
+        Class.scalar_first_argument,
+        receiver_classification.classify("_SDL_PauseAudioDevice"),
+    );
+
+    // No argument at all — the class the `_getpagesize` false positive needed.
+    // A run reported it three times with a stale `rdi=0x2`, directly above the
+    // one real finding in the same dump.
+    try std.testing.expectEqual(Class.no_arguments, receiver_classification.classify("_getpagesize"));
 
     // libc++ basic_ostream::sentry destructors: the primitive handler is a
     // no-op that never dereferences the receiver, so a near-null rdi (the
     // guest-stack sentry guard) predicts nothing. Both observed and
     // version-tagged spellings are covered by the `6sentryD` family check.
-    try std.testing.expect(isBenignSmallIntArgImport("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev"));
-    try std.testing.expect(isBenignSmallIntArgImport("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD2Ev"));
-    try std.testing.expect(isBenignSmallIntArgImport("__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1B7v160006Ev"));
+    for ([_][]const u8{
+        "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev",
+        "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD2Ev",
+        "__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1B7v160006Ev",
+    }) |sentry| {
+        try std.testing.expect(!receiver_classification.predictsCasualty(sentry));
+    }
 
-    // Sentinel list: a real pointer whose null value is the documented default.
-    try std.testing.expect(isDocumentedNullSentinelImport("_SDL_OpenAudioDevice"));
-    try std.testing.expect(!isBenignSmallIntArgImport("_SDL_OpenAudioDevice"));
+    // A real pointer whose null value is the documented default. Distinct from
+    // the scalar class because only the API contract dismisses it.
+    try std.testing.expectEqual(
+        Class.nullable_pointer_first_argument,
+        receiver_classification.classify("_SDL_OpenAudioDevice"),
+    );
 
-    // Neither list may claim a receiver-shaped symbol.
-    try std.testing.expect(!isBenignSmallIntArgImport("_SDL_FreeSurface"));
-    try std.testing.expect(!isDocumentedNullSentinelImport("_SDL_FreeSurface"));
+    // No class may claim a receiver-shaped symbol.
+    try std.testing.expectEqual(Class.receiver, receiver_classification.classify("_SDL_FreeSurface"));
+    try std.testing.expect(receiver_classification.predictsCasualty("_SDL_FreeSurface"));
 }
 
 // Native member-call casualties never pass through import dispatch, so the

@@ -8,6 +8,9 @@ const std = @import("std");
 const macho_log = @import("dyld").event_log;
 const gpu = @import("gpu");
 const machoCapturePrint = macho_log.machoCapturePrint;
+/// The rejection structure over a fixed phrase set is a build-time artifact;
+/// deciding what a matched line *means* stays here.
+const phrase_filter = @import("phrase_filter");
 const startup_observer = @import("diagnostics").startup_observer;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
 const guest_module_map = @import("diagnostics").guest_module_map;
@@ -95,34 +98,44 @@ pub fn hostWriteFdAll(fd: i32, bytes: []const u8) bool {
     return true;
 }
 
+/// Markers that promote an informational guest line into the summary.
+///
+/// Which strings these are is fixed when Rosette is compiled, so the rejection
+/// structure over them is built then too — see `summary_marker_filter` below.
+const summary_markers = [_][]const u8{
+    "RunTitle",
+    "LaunchPath",
+    "LaunchDiscImage",
+    "CompleteLaunch",
+    "MountPath",
+    "GetFileSignature",
+    "DiscImage",
+    "UserModule",
+    "XexModule",
+    "LoadUserModule",
+    "LaunchModule",
+    "SetExecutableModule",
+    "GraphicsSystem",
+    "VulkanPresenter",
+    "RING BUFFER",
+    "main thread",
+    "stage=",
+    "FAILED",
+    "failed",
+    "assert",
+};
+
+/// Comptime rejection filter over `summary_markers`.
+///
+/// This runs on every guest log line that is not already an error or warning,
+/// which is nearly all of them. It used to be 21 substring searches per line to
+/// establish the common answer of "no". The filter makes one pass over the line
+/// and then retires each marker with a bit test.
+const summary_marker_filter = phrase_filter.Filter(&summary_markers);
+
 pub fn shouldSummarizeGuestLog(level: u8, message: []const u8) bool {
     if (level == 'F' or level == 'E' or level == 'e' or level == 'W' or level == 'w') return true;
-    const markers = [_][]const u8{
-        "RunTitle",
-        "LaunchPath",
-        "LaunchDiscImage",
-        "CompleteLaunch",
-        "MountPath",
-        "GetFileSignature",
-        "DiscImage",
-        "UserModule",
-        "XexModule",
-        "LoadUserModule",
-        "LaunchModule",
-        "SetExecutableModule",
-        "GraphicsSystem",
-        "VulkanPresenter",
-        "RING BUFFER",
-        "main thread",
-        "stage=",
-        "FAILED",
-        "failed",
-        "assert",
-    };
-    for (markers) |marker| {
-        if (std.mem.indexOf(u8, message, marker) != null) return true;
-    }
-    return false;
+    return summary_marker_filter.anyPresent(message);
 }
 
 pub fn shouldSuppressRuntimeGuestLog(message: []const u8) bool {

@@ -5367,6 +5367,7 @@ pub fn dumpTerminalAddressProvenance(self: anytype, effective_address: u64) void
 pub fn dumpNearNullProducerSlot(self: anytype) void {
     const count: usize = if (self.memory_trace_filled) MEMORY_TRACE_BUFFER_LEN else self.memory_trace_index;
     var reverse_index = count;
+    var reported: usize = 0;
     while (reverse_index != 0) {
         reverse_index -= 1;
         const index = if (self.memory_trace_filled)
@@ -5383,8 +5384,9 @@ pub fn dumpNearNullProducerSlot(self: anytype) void {
 
         const reader = self.metadata.nearestSymbol(access.instruction_address);
         machoCapturePrint(
-            "macho-processor: near-null producer slot: loaded_zero_from=0x{x} reader=0x{x} {s}+0x{x} op={s}\n",
+            "macho-processor: near-null producer slot candidate={d}: loaded_zero_from=0x{x} reader=0x{x} {s}+0x{x} op={s}\n",
             .{
+                reported,
                 access.address,
                 access.instruction_address,
                 self.metadata.symbolLabel(access.instruction_address),
@@ -5392,6 +5394,17 @@ pub fn dumpNearNullProducerSlot(self: anytype) void {
                 access.instruction,
             },
         );
+        if (self.memory_forwarder.containingAllocation(access.address)) |allocation| {
+            machoCapturePrint(
+                "macho-processor: near-null producer allocation: slot=0x{x} base=0x{x} size={d} offset=0x{x}\n",
+                .{ access.address, allocation.base, allocation.size, allocation.offset },
+            );
+        } else {
+            machoCapturePrint(
+                "macho-processor: near-null producer allocation: slot=0x{x} live_allocation=<none>\n",
+                .{access.address},
+            );
+        }
         if (self.memory_writes.lookup(access.address)) |writer| {
             const symbol = self.metadata.nearestSymbol(writer.instruction_address);
             machoCapturePrint(
@@ -5415,7 +5428,12 @@ pub fn dumpNearNullProducerSlot(self: anytype) void {
                 .{ access.address, self.memory_writes.entries.count(), self.memory_writes.dropped_slots },
             );
         }
-        return;
+        reported += 1;
+        // The terminal native call often performs a few stack spills after
+        // loading the actual null source. Keep enough candidates to expose a
+        // heap/container slot without turning a fault report into a full ring
+        // dump. The newest candidate remains first for backwards readability.
+        if (reported == 8) break;
     }
 }
 

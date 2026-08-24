@@ -226,12 +226,36 @@ pub fn dumpTerminal(self: anytype, effective_address: u64) void {
         },
     );
 
+    // The policy verdict says which rule was violated. The shape says which
+    // investigation finds the cause, and the two are different questions: an
+    // exact zero at a zero-offset accessor is as consistent with an empty
+    // container as with a clobbered pointer, and only one of those hunts ends
+    // anywhere.
+    machoCapturePrint(
+        "macho-processor: NEAR-NULL SHAPE: receiver_shape={s} zero_offset_accessor={} admits_empty_container={}; {s}\n",
+        .{
+            contract.receiver_shape.label(),
+            contract.zero_offset_accessor,
+            contract.receiver_shape.admitsEmptyContainer(),
+            contract.shapeExplanation(),
+        },
+    );
+
     if (contract.isNativeNullReceiver()) {
         machoCapturePrint(
             "macho-processor: NEAR-NULL PRODUCER FRONTIER: first_invalid=native_cpp_receiver receiver_abi=sysv_rdi receiver=0x{x} fault_base=0x{x} field_offset=0x{x} callee={s}; find the call that supplied RDI=0 or the function that returned the receiver — do not investigate address 0x{x} as allocated memory\n",
             .{ self.regs.rdi, base_value, decoded.addr, terminal_symbol, effective_address },
         );
         dumpFaultLocalNativeFrames(self);
+        // Native receiver faults have no generated-code register chain to
+        // walk, but the bounded memory ring still retains the native load
+        // immediately before the fault when memory tracing is enabled. Use
+        // that slot to look up the last retained writer; otherwise this path
+        // discards the evidence that distinguishes an empty container from a
+        // clobbered object header.
+        if (@hasDecl(memory_access, "dumpNearNullProducerSlot")) {
+            memory_access.dumpNearNullProducerSlot(self);
+        }
         machoCapturePrint(
             "macho-processor: near-null causality: BYTE ORDER SURVEY suppressed_for=proven_native_null_receiver; register-shaped byte reversals are ambient values in this native frame and cannot outrank the zero SysV receiver contract\n",
             .{},
@@ -936,16 +960,24 @@ pub fn retainedWindow(self: anytype) RetainedWindow {
 /// fault is outside this tape by construction.
 pub fn filteredWindowReason(fault_in_host_image: bool) []const u8 {
     return if (fault_in_host_image)
-        "fault is in native Mach-O host code, intentionally outside the generated-code-only history; use fault-local ownership evidence or explicitly enable all-instruction tracing"
+        "fault is in native Mach-O host code, which the generated-code-only tape excludes by construction — this is a policy boundary, not a missing producer; re-run with ROSETTE_MACHO_NATIVE_TRACE=1 to record host instructions and get the producer chain, or read the fault-local ownership evidence below"
     else
         "fault is in generated code but no instruction in this thread passed the generated-code-only policy; this is a policy or ordering defect";
 }
 
 test "filtered history distinguishes native exclusion from generated policy defect" {
+    // A native fault must say the tape excludes it *and* how to get the tape.
+    // The previous wording said only "explicitly enable all-instruction
+    // tracing", which named no knob and left the reader with a dead end.
     try std.testing.expect(std.mem.indexOf(
         u8,
         filteredWindowReason(true),
-        "intentionally outside",
+        "excludes by construction",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        filteredWindowReason(true),
+        "ROSETTE_MACHO_NATIVE_TRACE=1",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
