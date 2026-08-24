@@ -1,6 +1,7 @@
 name = "xenia-arm64-primitive-contract"
 version = "0.1.0-local"
 kind = "mach-o-primitive-route-contract"
+role = "build-time"
 architectures = ["arm64"]
 language = "zig"
 verification = "verify.sh"
