@@ -1,0 +1,11 @@
+name = "xenia-arm64-codegen-activation"
+version = "0.1.0-local"
+kind = "x86-64-codegen-and-activation-contract"
+architectures = ["arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# The route is ARM64; the code-generation facts stay x86-64 because the guest
+# does. This package validates host-side facts. It is not an Xbyak replacement
+# and it never turns an unresolved label or missing activation edge into
+# success.
