@@ -1,5 +1,5 @@
 const std = @import("std");
-const evidence = @import("evidence.zig");
+const evidence = @import("startup_evidence_runtime");
 
 const usage =
     \\usage: xenia-x86-startup-evidence <ready-compiler.log> <runtime.log>
