@@ -1,0 +1,11 @@
+name = "xenia-arm64-abi-bridge"
+version = "0.1.0-local"
+kind = "cross-architecture-zero-trust"
+architectures = ["x86_64", "ppc64", "arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# This package is source-visible and intentionally local. It is bridge evidence
+# for the current machine set, not a GitHub release or an implicit dependency
+# download. The route is ARM64; the target matrix it verifies is all three,
+# because the guest value space is the same on every route.
