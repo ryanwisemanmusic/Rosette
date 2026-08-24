@@ -1,0 +1,12 @@
+name = "common-abi-near-null-shape"
+version = "0.1.0-local"
+kind = "guest-abi-near-null-shape"
+role = "build-time"
+# Route-independent: the x86-64 Darwin zero page, the Itanium mangling rule and
+# the libc++ member layouts do not vary with the host Rosette was compiled for.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# Facts only. Whether a near-null dereference may be tolerated, and whether
+# Rosette may manufacture storage for it, stays in lib's near_null_contract.
