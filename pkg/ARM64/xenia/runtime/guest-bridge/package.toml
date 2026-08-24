@@ -1,6 +1,7 @@
 name = "xenia-arm64-guest-bridge"
 version = "0.1.0-local"
 kind = "arm64-guest-bridge-contract"
+role = "build-time"
 architectures = ["arm64"]
 language = "zig"
 verification = "verify.sh"
