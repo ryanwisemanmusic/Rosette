@@ -82,8 +82,23 @@ pub fn History(comptime Entry: type) type {
                 return self.thread_entries == 0 and self.policy == .disabled;
             }
 
+            /// Whether this thread's window is empty *because the policy
+            /// declined its instructions*.
+            ///
+            /// `recorded` counts the whole process; `thread_entries` counts one
+            /// thread. Requiring `recorded == 0` therefore made this predicate
+            /// unreachable as soon as any *other* thread recorded anything —
+            /// and under `generated_code_only` the JIT threads always do. A
+            /// native fault on a UI or callback thread then reported "nothing
+            /// was retained for this thread yet", which reads as a transient
+            /// and is actually permanent: that thread runs host-image code, and
+            /// host-image code is exactly what the policy filters. The question
+            /// this answers is about one thread, so every term in it has to be
+            /// about that thread.
             pub fn emptyBecauseFiltered(self: Window) bool {
-                return self.thread_entries == 0 and self.recorded == 0 and self.skipped != 0;
+                return self.thread_entries == 0 and
+                    self.policy == .generated_code_only and
+                    self.skipped != 0;
             }
 
             pub fn reaches(self: Window) bool {
@@ -476,4 +491,57 @@ test "zero slots degrades to recording nothing rather than trapping" {
     history.record(1, .{ .thread = 1 });
     try std.testing.expectEqual(@as(usize, 0), history.totalCount());
     try std.testing.expect(!history.windowFor(1).reaches());
+}
+
+test "a filtered thread is not reported as merely empty" {
+    // The regression: `recorded` is process-wide and `thread_entries` is not.
+    // A window with entries on other threads must still explain *this* thread's
+    // emptiness as filtering, or a native fault reads as "nothing yet" forever.
+    const window = History(u8).Window{
+        .thread_entries = 0,
+        .thread_capacity = 512,
+        .total_entries = 111,
+        .live_threads = 3,
+        .slot_capacity = 8,
+        .evictions = 0,
+        .policy = .generated_code_only,
+        .recorded = 111,
+        .skipped = 662167987,
+    };
+    try std.testing.expect(window.emptyBecauseFiltered());
+    try std.testing.expect(!window.emptyBecauseDisabled());
+    try std.testing.expect(!window.reaches());
+}
+
+test "a disabled window is never reported as filtered" {
+    const window = History(u8).Window{
+        .thread_entries = 0,
+        .thread_capacity = 512,
+        .total_entries = 0,
+        .live_threads = 0,
+        .slot_capacity = 8,
+        .evictions = 0,
+        .policy = .disabled,
+        .recorded = 0,
+        .skipped = 12,
+    };
+    try std.testing.expect(window.emptyBecauseDisabled());
+    try std.testing.expect(!window.emptyBecauseFiltered());
+}
+
+test "a thread with retained entries is neither disabled nor filtered" {
+    const window = History(u8).Window{
+        .thread_entries = 9,
+        .thread_capacity = 512,
+        .total_entries = 120,
+        .live_threads = 3,
+        .slot_capacity = 8,
+        .evictions = 0,
+        .policy = .generated_code_only,
+        .recorded = 120,
+        .skipped = 5,
+    };
+    try std.testing.expect(window.reaches());
+    try std.testing.expect(!window.emptyBecauseFiltered());
+    try std.testing.expect(!window.emptyBecauseDisabled());
 }
