@@ -77,6 +77,49 @@ pub const Runtime = struct {
     stall_thread_count: usize = 0,
     stall_threads_dropped: u64 = 0,
 
+    // --- Symbol-attributed progress ---------------------------------------
+    // Some subsystems run for hundreds of millions of instructions without
+    // logging anything. Their code still has a name, and a route package can
+    // say which subsystem a symbol belongs to; that is a build-time fact, so
+    // the host resolves it once per progress checkpoint and hands the answer
+    // down here.
+    //
+    // Attribution is evidence, not permission. Three rules keep it from
+    // holding a dead run open: the credit must come from a thread that is on
+    // the launch path, its phase's prerequisite stage must already have been
+    // reached, and the symbol must be one this phase has not already seen.
+    // Revisiting known code retires instructions without reaching anything,
+    // which is what a hang looks like from the outside and what it must keep
+    // looking like from in here.
+    attributed_phase_id: u8 = 0,
+    attributed_phase_active: bool = false,
+    attributed_phase_label: []const u8 = "",
+    attributed_owner: []const u8 = "",
+    attributed_after_stage: []const u8 = "",
+    // Carried alongside the owner so a carrier joining this phase is judged by
+    // the same proxy claim the phase itself was admitted under.
+    attributed_proxy_owner: []const u8 = "",
+    attributed_proxy_after_stage: []const u8 = "",
+    attributed_last_phase_label: []const u8 = "",
+    attributed_last_owner: []const u8 = "",
+    attributed_symbol_hashes: [types.max_attributed_symbols]u64 =
+        [_]u64{0} ** types.max_attributed_symbols,
+    attributed_symbol_count: usize = 0,
+    attributed_symbols_dropped: u64 = 0,
+    attributed_credits: u64 = 0,
+    attributed_rejected_thread: u64 = 0,
+    attributed_rejected_stage: u64 = 0,
+
+    // --- Independent progress evidence -----------------------------------
+    // Counters the host services on the guest's behalf. They are the answer to
+    // the symbol axis saturating: an emulator translating its guest's code
+    // forever revisits the same translator functions, so "no new symbol" stops
+    // meaning "no progress" long before the work stops.
+    external_progress: types.ExternalProgress = .{},
+    external_progress_step: u64 = 0,
+    external_progress_advances: u64 = 0,
+    external_progress_seen: bool = false,
+
     // --- Scheduler/wait evidence -----------------------------------------
     // A hot `yield_processor` site is only actionable when the scheduler says
     // no producer can run and the wait graph says the predicate has stayed
@@ -280,6 +323,35 @@ pub const Runtime = struct {
         self.last_thread = thread;
     }
 
+    /// Record the host-serviced counters at this checkpoint.
+    ///
+    /// O(1) and called on the progress-checkpoint cadence, not per instruction.
+    /// The first call establishes a baseline and never counts as progress: the
+    /// counters arrive already non-zero, and treating that as an advance would
+    /// hand every run one free window it did not earn.
+    pub fn noteExternalProgress(
+        self: *Runtime,
+        counters: types.ExternalProgress,
+        step: u64,
+    ) void {
+        if (!self.enabled() or self.phase == .failed or self.phase == .ready) return;
+        if (!self.external_progress_seen) {
+            self.external_progress_seen = true;
+            self.external_progress = counters;
+            self.external_progress_step = step;
+            return;
+        }
+        if (!counters.advancedFrom(self.external_progress)) return;
+        self.external_progress = counters;
+        self.external_progress_step = step;
+        self.external_progress_advances +|= 1;
+    }
+
+    /// The most recent step at which a host-serviced counter advanced.
+    pub fn externalProgressStep(self: *const Runtime) u64 {
+        return if (self.external_progress_seen) self.external_progress_step else 0;
+    }
+
     /// Record an interpreter heartbeat or another trusted execution witness.
     /// This is intentionally separate from a semantic milestone: a loop can
     /// execute billions of instructions without completing startup.
@@ -416,6 +488,255 @@ pub const Runtime = struct {
         return self.work_unit.slice();
     }
 
+    /// Name of the most recently reached required contract edge.
+    ///
+    /// Route-specific attribution may use this as a bounded context signal
+    /// when the current instruction resolves only to a generic host helper.
+    /// It is deliberately read-only: the route package cannot advance the
+    /// readiness graph by asking for its name.
+    pub fn frontierStageName(self: *const Runtime) []const u8 {
+        if (!self.frontier_reached) return "";
+        return (self.stage(self.frontier_stage_id) orelse return "").name;
+    }
+
+    /// Whether the observed thread is allowed to speak for startup progress.
+    ///
+    /// Two threads can legitimately be doing startup work: the one that
+    /// reached the last milestone, and the one the last milestone just handed
+    /// off to. Startup is full of those handoffs — the launch thread posts
+    /// shader storage to the command-processor thread and blocks, then starts
+    /// guest main and stops being the actor entirely — so a rule that only
+    /// ever trusts the milestone thread goes blind at exactly the moments the
+    /// contract is moving fastest.
+    ///
+    /// The handoff is recognised without guessing: a phase declares the stage
+    /// it cannot precede, and a phase whose stage is the *most recent* one
+    /// reached is by definition the work that stage just enabled. A thread
+    /// running some other subsystem's phase from five milestones ago is not on
+    /// the launch path — it is a worker that happens to be busy, and a busy
+    /// worker is what a hung launch looks like from the outside.
+    ///
+    /// Frontier equality alone is not enough, and assuming it was cost a run.
+    /// The last few startup edges land in quick succession and then the
+    /// contract sits waiting on one owner for a long time. Every phase that
+    /// owner runs declares an *earlier* prerequisite — it has to, since its
+    /// prerequisite is what enabled it — so once the frontier moves past that
+    /// edge, frontier equality rejects the blocked owner's own evidence. The
+    /// gate then reports silence it created itself, and fails the run for it.
+    ///
+    /// So a phase may also speak when it belongs to the subsystem that owes
+    /// the missing edge. That is not a relaxation: it is the same question
+    /// asked about the right stage. Frontier equality asks "did the last edge
+    /// enable this work"; owner match asks "is this the work the *next* edge is
+    /// waiting for". Both are on the launch path. A busy worker owned by
+    /// neither is still refused, which is the property worth keeping.
+    fn attributionThreadAllowed(
+        self: *const Runtime,
+        thread: u64,
+        after_stage: []const u8,
+        owner: []const u8,
+        proxy_owner: []const u8,
+        proxy_after_stage: []const u8,
+    ) bool {
+        if (self.milestone_thread == 0) return true;
+        if (thread == self.milestone_thread) return true;
+        if (self.ownsMissingEdge(owner)) return true;
+        // A proxy owner speaks only after its own stage has landed. Before
+        // that the phase is doing the same work on its own initiative and has
+        // no claim on anybody else's progress.
+        if (proxy_owner.len != 0 and
+            self.attributionStageReached(proxy_after_stage) and
+            self.ownsMissingEdge(proxy_owner)) return true;
+        if (after_stage.len == 0 or !self.frontier_reached) return false;
+        const frontier = self.stage(self.frontier_stage_id) orelse return false;
+        return std.mem.eql(u8, frontier.name, after_stage);
+    }
+
+    /// Whether this subsystem is the one that owes the edge the contract is
+    /// currently waiting for.
+    ///
+    /// An empty owner never matches. A phase that names nobody cannot be the
+    /// blocked owner, and treating "unknown" as "whoever we are waiting for"
+    /// would hand every carrier a permanent pass.
+    fn ownsMissingEdge(self: *const Runtime, owner: []const u8) bool {
+        if (owner.len == 0) return false;
+        const missing = self.firstMissingRequired() orelse return false;
+        if (missing.owner.len == 0) return false;
+        return std.mem.eql(u8, missing.owner, owner);
+    }
+
+    /// Whether a phase's declared prerequisite stage has actually been reached.
+    ///
+    /// A route package says which contract edge a phase cannot precede; the
+    /// gate is the only side that knows which edges have landed. An unknown
+    /// stage name passes rather than fails — the compile-time cross-check in
+    /// the contract is what catches a name that does not exist, and failing
+    /// here as well would turn one clear build error into a silent runtime
+    /// behaviour change.
+    fn attributionStageReached(self: *const Runtime, stage_name: []const u8) bool {
+        if (stage_name.len == 0) return true;
+        const contract = self.contract orelse return true;
+        for (contract.stages) |spec| {
+            if (!std.mem.eql(u8, spec.name, stage_name)) continue;
+            const bit = stageBit(spec.id) orelse return true;
+            return self.reached_mask & bit != 0;
+        }
+        return true;
+    }
+
+    fn resetAttribution(self: *Runtime) void {
+        self.attributed_phase_active = false;
+        self.attributed_phase_id = 0;
+        self.attributed_phase_label = "";
+        self.attributed_owner = "";
+        self.attributed_after_stage = "";
+        self.attributed_proxy_owner = "";
+        self.attributed_proxy_after_stage = "";
+        self.attributed_symbol_count = 0;
+        self.attributed_symbols_dropped = 0;
+    }
+
+    /// Whether this phase has reached this symbol before in the current window.
+    ///
+    /// The set is keyed by phase *and* symbol but is shared across phases and
+    /// reset only at a contract edge. Per-phase sets would look tidier and
+    /// would be wrong: a loop that alternates between two subsystems — reading
+    /// a cvar and touching the game database, say — would clear the set on
+    /// every switch and credit progress forever. The budget belongs to the
+    /// window the quiet timer measures, not to whichever phase is current.
+    fn attributionSymbolIsNew(self: *Runtime, phase_id: u8, symbol: []const u8) bool {
+        if (symbol.len == 0) return false;
+        var hash = std.hash.Wyhash.hash(0, symbol);
+        hash = std.hash.Wyhash.hash(hash, &[_]u8{phase_id});
+        for (self.attributed_symbol_hashes[0..self.attributed_symbol_count]) |seen| {
+            if (seen == hash) return false;
+        }
+        if (self.attributed_symbol_count >= self.attributed_symbol_hashes.len) {
+            // The phase has spent its evidence. Further symbols are real, but
+            // the gate has already been told everything this axis can tell it,
+            // and continuing to credit would turn a bounded signal into an
+            // unbounded reprieve.
+            self.attributed_symbols_dropped +|= 1;
+            return false;
+        }
+        self.attributed_symbol_hashes[self.attributed_symbol_count] = hash;
+        self.attributed_symbol_count += 1;
+        return true;
+    }
+
+    /// Record that the guest was observed executing inside a named startup
+    /// region, and return whether that counted as progress.
+    ///
+    /// `phase_id`, `label` and `owner` come from the route package; `symbol` is
+    /// the resolved Mach-O symbol the sample landed in. A `carrier` symbol
+    /// (libc++, libc, UTF-8 — code with no subsystem of its own) names no
+    /// phase and instead joins whichever phase last identified itself, which
+    /// is how a byte-at-a-time container copy inside a parser gets attributed
+    /// to the parser rather than to nothing.
+    ///
+    /// Returns false far more often than true, and that is the design. A
+    /// return of true means one thing only: this thread reached code inside
+    /// this phase that it had not reached before.
+    pub fn noteAttributedSite(
+        self: *Runtime,
+        attribution: types.SiteAttribution,
+        symbol: []const u8,
+        step: u64,
+        rip: u64,
+        thread: u64,
+    ) bool {
+        if (!self.enabled() or self.phase != .activation) return false;
+        // A carrier is judged by the phase it would join, not by its own empty
+        // one: it is the same thread continuing the same work.
+        const gate_stage = if (attribution.carrier)
+            (if (self.attributed_phase_active) self.attributed_after_stage else "")
+        else
+            attribution.after_stage;
+        // A carrier inherits the whole identity of the phase it joins, owner
+        // and proxy included. Judging it by its own empty owner would refuse
+        // the libc++ helper that a blocked subsystem is calling from inside
+        // its own code — the single most common shape of a real sample.
+        const gate_owner = if (attribution.carrier)
+            (if (self.attributed_phase_active) self.attributed_owner else "")
+        else
+            attribution.owner;
+        const gate_proxy_owner = if (attribution.carrier)
+            (if (self.attributed_phase_active) self.attributed_proxy_owner else "")
+        else
+            attribution.proxy_owner;
+        const gate_proxy_stage = if (attribution.carrier)
+            (if (self.attributed_phase_active) self.attributed_proxy_after_stage else "")
+        else
+            attribution.proxy_after_stage;
+        if (!self.attributionThreadAllowed(
+            thread,
+            gate_stage,
+            gate_owner,
+            gate_proxy_owner,
+            gate_proxy_stage,
+        )) {
+            self.attributed_rejected_thread +|= 1;
+            return false;
+        }
+        if (attribution.carrier) {
+            // A carrier before any phase has been established is a sample with
+            // nothing behind it. Guessing an owner here is how a report ends up
+            // confidently naming the wrong subsystem.
+            if (!self.attributed_phase_active) return false;
+        } else if (!self.attributed_phase_active or self.attributed_phase_id != attribution.phase_id) {
+            if (!self.attributionStageReached(attribution.after_stage)) {
+                self.attributed_rejected_stage +|= 1;
+                return false;
+            }
+            self.attributed_phase_active = true;
+            self.attributed_phase_id = attribution.phase_id;
+            self.attributed_phase_label = attribution.label;
+            self.attributed_owner = attribution.owner;
+            self.attributed_after_stage = attribution.after_stage;
+            self.attributed_proxy_owner = attribution.proxy_owner;
+            self.attributed_proxy_after_stage = attribution.proxy_after_stage;
+            self.attributed_last_phase_label = attribution.label;
+            self.attributed_last_owner = attribution.owner;
+        }
+        if (!self.attributionSymbolIsNew(attribution.phase_id, symbol)) return false;
+        self.attributed_credits +|= 1;
+
+        // The breadcrumb has to change on every credit or `noteWorkUnitAt`
+        // treats it as a repeated name and discards it, which is exactly the
+        // behaviour a spinning producer needs and exactly the wrong behaviour
+        // for a parser walking new code. The distinct-site count is the thing
+        // that changed, so it is the thing that goes in the name; it counts
+        // the whole window rather than the current phase, which is also what
+        // bounds how long attribution can keep a window open.
+        var buffer: [types.max_work_unit_name]u8 = undefined;
+        const rendered = std.fmt.bufPrint(
+            buffer[0..],
+            "{s} sites={d}",
+            .{ self.attributed_phase_label, self.attributed_symbol_count },
+        ) catch self.attributed_phase_label;
+        self.noteWorkUnitAt(rendered, step, thread, rip);
+        return true;
+    }
+
+    /// The startup region the guest was last attributed to, or empty.
+    pub fn attributedPhaseLabel(self: *const Runtime) []const u8 {
+        if (!self.attributed_phase_active) return "";
+        return self.attributed_phase_label;
+    }
+
+    pub fn attributedOwner(self: *const Runtime) []const u8 {
+        if (!self.attributed_phase_active) return "";
+        return self.attributed_owner;
+    }
+
+    pub fn attributedLastPhaseLabel(self: *const Runtime) []const u8 {
+        return self.attributed_last_phase_label;
+    }
+
+    pub fn attributedLastOwner(self: *const Runtime) []const u8 {
+        return self.attributed_last_owner;
+    }
+
     /// The retained trail in chronological order, oldest first. An entry of
     /// zero length was never filled.
     pub fn workUnitHistoryAt(self: *const Runtime, position: usize) types.WorkUnit {
@@ -439,7 +760,14 @@ pub const Runtime = struct {
     /// quiet window is measured from here rather than from the last contract
     /// edge, which is what stops a slow startup step from reading as a stall.
     pub fn lastNamedProgressStep(self: *const Runtime) u64 {
-        return @max(self.last_milestone_step, self.work_unit.step);
+        const named = @max(self.last_milestone_step, self.work_unit.step);
+        // A host-serviced counter is unnamed but not silent: it says the guest
+        // obtained something, which no amount of spinning can do. Folding it in
+        // here rather than only into the classification means the quiet timer
+        // itself stops running, so a long legitimate stretch of work does not
+        // have to out-run a clock it was never actually failing.
+        if (self.external_progress_advances == 0) return named;
+        return @max(named, self.external_progress_step);
     }
 
     /// Direct-mapped sample insert. Bounded and O(1): the interpreter's
@@ -570,9 +898,13 @@ pub const Runtime = struct {
         self.stall_threads_dropped = 0;
     }
 
-    /// Observe a contract edge. Missing prerequisites are failures, not merely
-    /// statistics, because the purpose of this layer is to stop an invalid
-    /// startup order before downstream symptoms bury it.
+    /// Observe a contract edge. Missing prerequisites are failures for required
+    /// edges, not merely statistics, because the purpose of this layer is to
+    /// stop an invalid startup order before downstream symptoms bury it.
+    /// Optional edges are advisory evidence: a host diagnostic present can
+    /// legitimately occur before the guest has produced its first frame. It
+    /// is retained for reporting but must not terminate the application or
+    /// reset the quiet window for the required guest-owned frontier.
     pub fn noteStage(self: *Runtime, id: u8, step: u64, source: []const u8) bool {
         if (!self.enabled() or self.phase == .failed or self.phase == .ready) return false;
         const spec = self.stage(id) orelse {
@@ -589,9 +921,14 @@ pub const Runtime = struct {
         };
         const bit = stageBit(id) orelse return false;
         if ((self.reached_mask & bit) != 0) return true;
-        if (spec.prerequisites & ~self.reached_mask != 0) {
+        const missing_prerequisites = spec.prerequisites & ~self.reached_mask;
+        if (missing_prerequisites != 0) {
             self.reached_mask |= bit;
             self.first_stage_step[@intCast(id)] = step;
+            if (!spec.required) {
+                self.last_source = source;
+                return true;
+            }
             self.fail(.{
                 .kind = .ordering_violation,
                 .stage = spec.name,
@@ -601,7 +938,7 @@ pub const Runtime = struct {
                 .step = step,
                 .rip = self.last_rip,
                 .thread = self.last_thread,
-                .missing_prerequisites = spec.prerequisites & ~self.reached_mask,
+                .missing_prerequisites = missing_prerequisites,
             });
             return false;
         }
@@ -621,6 +958,11 @@ pub const Runtime = struct {
         // The next quiet window must describe the next stage, not every site
         // observed since activation opened.
         self.resetSiteSamples();
+        // Symbols already seen become new evidence again past a contract edge:
+        // the same parser running before and after a milestone is doing
+        // different work, and the credit budget belongs to the window rather
+        // than to the run.
+        self.resetAttribution();
         return true;
     }
 
@@ -763,6 +1105,12 @@ pub const Runtime = struct {
         if (step -| self.last_milestone_step < quiet) return .milestone_advancing;
         if (self.workUnitsSinceMilestone() != 0 and
             step -| self.work_unit.step < quiet) return .work_advancing;
+        // Ranked below named work and above bare execution, which is exactly
+        // its strength: it is weaker evidence than a subsystem saying what it
+        // is doing, and far stronger than instructions retiring, because a
+        // spin loop produces the latter and cannot produce this.
+        if (self.external_progress_advances != 0 and
+            step -| self.external_progress_step < quiet) return .external_advancing;
         if (self.last_progress_step <= self.last_milestone_step) return .frozen;
         if (self.spinning()) return .spinning;
         return .executing_only;
@@ -796,6 +1144,8 @@ pub const Runtime = struct {
         result.work_units_since_milestone = self.workUnitsSinceMilestone();
         result.quiet_steps = step -| self.lastNamedProgressStep();
         result.quiet_budget_steps = contract.quiet_budget_steps;
+        result.external_progress_advances = self.external_progress_advances;
+        result.external_progress_step = self.externalProgressStep();
         result.activation_steps = step -| self.activation_start_step;
         result.activation_budget_steps = contract.activation_budget_steps;
         result.hot_site = self.hottestSite();
@@ -803,6 +1153,12 @@ pub const Runtime = struct {
         result.stall_samples = self.stall_samples;
         result.spin_verdict = self.spinVerdict(step);
         result.stall_evictions = self.stall_site_evictions;
+        result.attributed_phase = self.attributedPhaseLabel();
+        result.attributed_owner = self.attributedOwner();
+        result.attributed_last_phase = self.attributedLastPhaseLabel();
+        result.attributed_last_owner = self.attributedLastOwner();
+        result.attributed_symbols = self.attributed_symbol_count;
+        result.attributed_credits = self.attributed_credits;
         result.milestone_thread = self.milestone_thread;
         result.current_thread = self.last_thread;
         result.thread_changed = self.milestone_thread != 0 and
@@ -957,7 +1313,14 @@ pub const Runtime = struct {
                 }),
                 // Named work is still advancing, so the window has not really
                 // gone quiet and there is nothing to report here.
-                .milestone_advancing, .work_advancing, .unknown => {},
+                //
+                // `external_advancing` joins them and is in practice
+                // unreachable: `lastNamedProgressStep` folds the same axis into
+                // the guard above, so a fresh host-serviced counter keeps the
+                // window open before the classification is ever consulted. It
+                // is listed rather than merged into an `else` so that adding a
+                // class later is a build error here instead of a silent pass.
+                .milestone_advancing, .work_advancing, .external_advancing, .unknown => {},
             }
             return if (self.phase == .failed) .failed else .waiting;
         }
@@ -1291,6 +1654,29 @@ test "blockage separates an unmet prerequisite from a silent owner" {
     try std.testing.expectEqualStrings("final", blocked.missing_stage);
 }
 
+test "optional evidence may arrive before its prerequisite without stopping" {
+    const stages = [_]types.StageSpec{
+        .{ .id = 0, .name = "entry" },
+        .{ .id = 1, .name = "guest_output", .prerequisites = @as(u64, 1) },
+        .{ .id = 2, .name = "host_present", .required = false, .prerequisites = @as(u64, 2) },
+    };
+    var runtime = Runtime{};
+    runtime.configure(.{ .name = "test", .stages = &stages }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    try std.testing.expect(runtime.sealCompile(0));
+
+    // A diagnostic clear can be presented while the guest output edge is still
+    // absent. It is useful evidence, but it is not an invalid application
+    // order and must not become the first failure.
+    try std.testing.expect(runtime.noteStage(2, 1, "host diagnostic present"));
+    try std.testing.expectEqual(types.FailureKind.none, runtime.failure.kind);
+    try std.testing.expectEqual(@as(u64, 0), runtime.last_milestone_step);
+
+    try std.testing.expect(runtime.noteStage(0, 2, "entry observed"));
+    try std.testing.expect(runtime.noteStage(1, 3, "guest output observed"));
+    try std.testing.expectEqual(@as(u64, 3), runtime.last_milestone_step);
+}
+
 test "work units are recognized by shape, not by one guest's vocabulary" {
     try std.testing.expectEqualStrings(
         "XexModule::LoadContinue stage=ScanCodeRanges.end",
@@ -1612,4 +1998,530 @@ test "sites are rankable so a report can lead with the one that matters" {
     try std.testing.expect(runtime.siteByRank(0).samples > runtime.siteByRank(1).samples);
     // Ranks past the occupied slots must terminate rather than repeat.
     try std.testing.expectEqual(@as(u64, 0), runtime.siteByRank(64).samples);
+}
+
+// --- Symbol-attributed progress ------------------------------------------
+//
+// The behaviour under test is the one that decides whether a long silent
+// startup step reads as slow or as stuck, so each case below is a specific
+// wrong answer the design has to keep giving correctly.
+
+/// Contract shaped like the failing Xenia window: an edge is reached, the next
+/// edge belongs to a subsystem that has not been entered yet, and the guest
+/// keeps executing in between.
+fn attributionFixture(runtime: *Runtime, stages: []const types.StageSpec) void {
+    runtime.configure(.{ .name = "test", .stages = stages, .quiet_budget_steps = 100 }, true);
+    runtime.noteCompileCheck("codegen", true, "installed");
+    _ = runtime.sealCompile(0);
+}
+
+const attribution_stages = [_]types.StageSpec{
+    .{ .id = 0, .name = "entry", .owner = "rosette:loader" },
+    .{ .id = 1, .name = "frame", .prerequisites = @as(u64, 1), .owner = "guest:title" },
+};
+
+test "reaching new code inside a silent subsystem is progress" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // Without attribution this window is exactly the failing run: instructions
+    // retire across many sites and no owner reports anything.
+    var sample: u64 = 0;
+    while (sample < 40) : (sample += 1) {
+        runtime.noteExecutionSample(2 + sample, 0x5000 + sample * 0x40, 0x11);
+    }
+    try std.testing.expectEqual(types.ProgressClass.executing_only, runtime.classifyProgress(500));
+
+    // One attributed symbol from the milestone thread is enough to name it.
+    try std.testing.expect(runtime.noteAttributedSite(
+        .{
+            .phase_id = 7,
+            .label = "xe::kernel::util::GameInfoDatabase phase=title-metadata",
+            .owner = "xenia:xam",
+            .after_stage = "entry",
+        },
+        "__ZN2xe6kernel4util16GameInfoDatabase12GetTitleNameE",
+        520,
+        0x5000,
+        0x11,
+    ));
+    try std.testing.expectEqual(types.ProgressClass.work_advancing, runtime.classifyProgress(560));
+    try std.testing.expectEqual(types.Evaluation.waiting, runtime.evaluate(560));
+    try std.testing.expectEqualStrings("xenia:xam", runtime.attributedOwner());
+    const named = runtime.diagnose(560);
+    try std.testing.expectEqualStrings("xenia:xam", named.attributed_owner);
+    // The owner that owes the edge and the owner that was running are
+    // different facts, and the report has to keep them apart.
+    try std.testing.expectEqualStrings("guest:title", named.missing_owner);
+}
+
+// The shape of the run that motivated the owner arm of the thread gate: a
+// burst of startup edges lands, the contract then waits a long time on one
+// owner, and that owner does its work on a thread no milestone ever came from.
+const blocked_owner_stages = [_]types.StageSpec{
+    .{ .id = 0, .name = "entry", .owner = "rosette:loader" },
+    .{ .id = 1, .name = "processor_ready", .prerequisites = @as(u64, 1) << 0, .owner = "xenia:cpu" },
+    .{ .id = 2, .name = "user_module_ready", .prerequisites = @as(u64, 1) << 1, .owner = "xenia:kernel_state" },
+    .{ .id = 3, .name = "guest_main_ready", .prerequisites = @as(u64, 1) << 2, .owner = "xenia:kernel_state" },
+    .{ .id = 4, .name = "surface_ready", .prerequisites = @as(u64, 1) << 3, .owner = "xenia:presenter" },
+    .{ .id = 5, .name = "ring_buffer_ready", .prerequisites = @as(u64, 1) << 4, .owner = "guest:title" },
+};
+
+/// Drive the fixture to the exact state the failing run reported: the last
+/// milestone came from the launch thread, and the frontier is `surface_ready`
+/// while the contract waits on `guest:title`.
+fn blockedOwnerFixture(runtime: *Runtime) !void {
+    attributionFixture(runtime, &blocked_owner_stages);
+    runtime.noteExecutionSample(1, 0x1000, 0xAA);
+    try std.testing.expect(runtime.noteStage(0, 2, "entry"));
+    try std.testing.expect(runtime.noteStage(1, 3, "processor ready"));
+    try std.testing.expect(runtime.noteStage(2, 4, "user module ready"));
+    try std.testing.expect(runtime.noteStage(3, 5, "guest main running"));
+    try std.testing.expect(runtime.noteStage(4, 6, "surface acquired"));
+    try std.testing.expectEqual(@as(u64, 0xAA), runtime.milestone_thread);
+    try std.testing.expectEqualStrings("surface_ready", runtime.frontierStageName());
+    try std.testing.expectEqualStrings("guest:title", (runtime.firstMissingRequired() orelse unreachable).owner);
+}
+
+/// The same contract stopped before guest main, with the frontier deliberately
+/// past `processor_ready` so the frontier-equality arm cannot admit a
+/// translation sample and the proxy arm is the only thing under test.
+fn preGuestMainFixture(runtime: *Runtime) !void {
+    attributionFixture(runtime, &blocked_owner_stages);
+    runtime.noteExecutionSample(1, 0x1000, 0xAA);
+    try std.testing.expect(runtime.noteStage(0, 2, "entry"));
+    try std.testing.expect(runtime.noteStage(1, 3, "processor ready"));
+    try std.testing.expect(runtime.noteStage(2, 4, "user module ready"));
+    try std.testing.expectEqualStrings("user_module_ready", runtime.frontierStageName());
+}
+
+test "the blocked owner may report from a thread no milestone came from" {
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+
+    // A phase owned by the subsystem that owes the missing edge. Its own
+    // prerequisite is two stages behind the frontier, which is the normal
+    // case — a phase's prerequisite is what enabled it, not what follows it.
+    const guest_export = types.SiteAttribution{
+        .phase_id = 14,
+        .label = "guest::title kernel-export phase=guest-execution",
+        .owner = "guest:title",
+        .after_stage = "guest_main_ready",
+    };
+    try std.testing.expect(runtime.noteAttributedSite(
+        guest_export,
+        "__ZN2xe6kernel8xboxkrnl17KeTlsAlloc_entryEv",
+        50,
+        0x7000,
+        0xBB,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), runtime.attributed_rejected_thread);
+    try std.testing.expectEqualStrings("guest:title", runtime.attributedOwner());
+}
+
+test "a background subsystem still cannot speak for a blocked contract" {
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+
+    // Same off-milestone thread, same stale prerequisite — but owned by a
+    // subsystem the contract is not waiting on. This is the busy worker the
+    // gate exists to refuse, and relaxing the rule must not have admitted it.
+    const metadata = types.SiteAttribution{
+        .phase_id = 7,
+        .label = "xe::kernel::util::GameInfoDatabase phase=title-metadata",
+        .owner = "xenia:xam",
+        .after_stage = "guest_main_ready",
+    };
+    try std.testing.expect(!runtime.noteAttributedSite(
+        metadata,
+        "__ZN2xe6kernel4util16GameInfoDatabase12GetTitleNameE",
+        50,
+        0x7000,
+        0xBB,
+    ));
+    try std.testing.expectEqual(@as(u64, 1), runtime.attributed_rejected_thread);
+    try std.testing.expectEqual(@as(u64, 0), runtime.attributed_credits);
+}
+
+test "a proxy owner speaks only after its own stage has landed" {
+    // The translator's symbols are `xenia:cpu`, and after guest main starts the
+    // only thing that makes them run is the title reaching new code. Before
+    // guest main the same symbols are the emulator precompiling on its own
+    // initiative and carry no claim on the title's progress.
+    const translation = types.SiteAttribution{
+        .phase_id = 13,
+        .label = "xe::cpu::ppc::PPCTranslator phase=guest-translation",
+        .owner = "xenia:cpu",
+        .after_stage = "processor_ready",
+        .proxy_owner = "guest:title",
+        .proxy_after_stage = "guest_main_ready",
+    };
+
+    var early = Runtime{};
+    try preGuestMainFixture(&early);
+    // `guest_main_ready` has not landed, so the proxy is not yet a claim, and
+    // `xenia:cpu` is neither the blocked owner nor the frontier's phase.
+    try std.testing.expect(!early.noteAttributedSite(
+        translation,
+        "__ZN2xe5Arena5AllocEmm",
+        10,
+        0x8000,
+        0xBB,
+    ));
+    try std.testing.expectEqual(@as(u64, 1), early.attributed_rejected_thread);
+
+    var late = Runtime{};
+    try blockedOwnerFixture(&late);
+    try std.testing.expect(late.noteAttributedSite(
+        translation,
+        "__ZN2xe5Arena5AllocEmm",
+        50,
+        0x8000,
+        0xBB,
+    ));
+    try std.testing.expectEqual(@as(u64, 1), late.attributed_credits);
+}
+
+test "a carrier inherits the proxy of the phase it joins" {
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+    const translation = types.SiteAttribution{
+        .phase_id = 13,
+        .label = "xe::cpu::ppc::PPCTranslator phase=guest-translation",
+        .owner = "xenia:cpu",
+        .after_stage = "processor_ready",
+        .proxy_owner = "guest:title",
+        .proxy_after_stage = "guest_main_ready",
+    };
+    try std.testing.expect(runtime.noteAttributedSite(translation, "__ZN2xe5Arena5AllocEmm", 50, 0x8000, 0xBB));
+
+    // A libc++ helper called from inside that phase, on the same off-milestone
+    // thread. Judged by its own empty owner it would be refused, and it is the
+    // most common shape a real sample takes.
+    const carrier = types.SiteAttribution{ .phase_id = 16, .label = "host::runtime phase=carrier", .carrier = true };
+    try std.testing.expect(runtime.noteAttributedSite(
+        carrier,
+        "__ZNSt3__16vectorIhNS_9allocatorIhEEE6resizeEm",
+        60,
+        0x8100,
+        0xBB,
+    ));
+    try std.testing.expectEqual(@as(u64, 2), runtime.attributed_credits);
+}
+
+test "the evidence budget still bounds a blocked owner" {
+    // The owner arm removes a refusal, so the cap has to be the thing that
+    // still ends a genuinely stuck run. A blocked owner that keeps reaching
+    // new symbols gets exactly `max_attributed_symbols` credits and no more.
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+    const guest_export = types.SiteAttribution{
+        .phase_id = 14,
+        .label = "guest::title kernel-export phase=guest-execution",
+        .owner = "guest:title",
+        .after_stage = "guest_main_ready",
+    };
+    var index: usize = 0;
+    while (index < types.max_attributed_symbols + 8) : (index += 1) {
+        var name_buffer: [64]u8 = undefined;
+        const symbol = std.fmt.bufPrint(name_buffer[0..], "__ZN2xe6kernel8xboxkrnl{d}_entryEv", .{index}) catch unreachable;
+        _ = runtime.noteAttributedSite(guest_export, symbol, 50 + index, 0x8000 + index * 0x10, 0xBB);
+    }
+    try std.testing.expectEqual(@as(u64, types.max_attributed_symbols), runtime.attributed_credits);
+    try std.testing.expect(runtime.attributed_symbols_dropped != 0);
+}
+
+test "a host-serviced counter keeps a silent but working guest alive" {
+    // The failing run in one fixture: the contract stops reaching edges, no
+    // subsystem narrates anything, and the guest keeps allocating. The gate
+    // used to call that a stall while heap growth was still climbing.
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+    var counters = types.ExternalProgress{ .heap_high_water = 1000, .heap_live = 500 };
+    runtime.noteExternalProgress(counters, 10);
+    // The first sight of the counters is a baseline, never an advance.
+    try std.testing.expectEqual(@as(u64, 0), runtime.external_progress_advances);
+
+    var step: u64 = 20;
+    while (step < 1000) : (step += 20) {
+        counters.heap_high_water += 7;
+        runtime.noteExternalProgress(counters, step);
+        try std.testing.expectEqual(types.Evaluation.waiting, runtime.evaluate(step));
+    }
+    try std.testing.expect(runtime.external_progress_advances != 0);
+    try std.testing.expectEqual(types.ProgressClass.external_advancing, runtime.classifyProgress(1000));
+    try std.testing.expect(runtime.phase != .failed);
+}
+
+test "a guest that obtains nothing still fails on schedule" {
+    // The property the axis must not destroy. Counters that stop advancing put
+    // the quiet timer back in charge, and the run ends.
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+    const counters = types.ExternalProgress{ .heap_high_water = 1000 };
+    runtime.noteExternalProgress(counters, 10);
+    runtime.noteExternalProgress(.{ .heap_high_water = 1001 }, 20);
+    try std.testing.expectEqual(@as(u64, 1), runtime.external_progress_advances);
+
+    // Repeating the same values is not progress, however many times it arrives.
+    var step: u64 = 30;
+    while (step < 400) : (step += 10) {
+        runtime.noteExternalProgress(.{ .heap_high_water = 1001 }, step);
+        runtime.noteExecutionSample(step, 0x9000 + step, 0xBB);
+    }
+    try std.testing.expectEqual(@as(u64, 1), runtime.external_progress_advances);
+    try std.testing.expectEqual(types.Evaluation.failed, runtime.evaluate(400));
+}
+
+test "a counter that goes backwards is a reset, not progress" {
+    var runtime = Runtime{};
+    try blockedOwnerFixture(&runtime);
+    runtime.noteExternalProgress(.{ .heap_high_water = 1000, .heap_live = 900 }, 10);
+    runtime.noteExternalProgress(.{ .heap_high_water = 4, .heap_live = 2 }, 20);
+    try std.testing.expectEqual(@as(u64, 0), runtime.external_progress_advances);
+    // A single rising member is enough, even beside a falling one.
+    runtime.noteExternalProgress(.{ .heap_high_water = 4, .heap_live = 5000 }, 30);
+    try std.testing.expectEqual(@as(u64, 1), runtime.external_progress_advances);
+}
+
+test "revisiting known code is not progress" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+    const symbol = "__ZN2xe6kernel3xam10XdbfHeaderC1Ev";
+    const title = types.SiteAttribution{ .phase_id = 7, .label = "phase=title-metadata", .owner = "xenia:xam" };
+    try std.testing.expect(runtime.noteAttributedSite(title, symbol, 10, 0x5000, 0x11));
+    // The same function again is a loop, whatever the instruction pointer does
+    // inside it. This is the property that keeps a genuinely stuck subsystem
+    // from holding the quiet window open forever.
+    try std.testing.expect(!runtime.noteAttributedSite(title, symbol, 200, 0x5004, 0x11));
+    try std.testing.expectEqual(@as(u64, 1), runtime.attributed_credits);
+}
+
+test "a stuck subsystem exhausts its evidence and fails on schedule" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // Spend the whole credit budget on distinct symbols, then keep executing.
+    var index: usize = 0;
+    while (index < types.max_attributed_symbols + 8) : (index += 1) {
+        var name_buffer: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(name_buffer[0..], "__ZN2xe6kernel3xamFn{d}Ev", .{index}) catch unreachable;
+        _ = runtime.noteAttributedSite(
+            .{ .phase_id = 7, .label = "phase=title-metadata", .owner = "xenia:xam" },
+            name,
+            10 + index,
+            0x5000,
+            0x11,
+        );
+    }
+    try std.testing.expectEqual(@as(u64, types.max_attributed_symbols), runtime.attributed_credits);
+    try std.testing.expect(runtime.attributed_symbols_dropped != 0);
+
+    // Past the budget the window is quiet again and the gate stops the run,
+    // which is the whole point: attribution buys evidence, not immunity.
+    const quiet_step = runtime.lastNamedProgressStep() + 1000;
+    runtime.noteExecutionSample(quiet_step, 0x9000, 0x11);
+    try std.testing.expectEqual(types.Evaluation.failed, runtime.evaluate(quiet_step));
+    try std.testing.expectEqual(types.FailureKind.entered_but_no_progress, runtime.failure.kind);
+}
+
+test "a busy worker running old work cannot speak for the launch thread" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    // The milestone was reached on thread 0x11; 0x22 is a worker.
+    runtime.noteExecutionSample(1, 0x4000, 0x11);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // Its phase depends on a stage from before the frontier, so it is work the
+    // last milestone did not enable. A worker that has been busy all along is
+    // exactly what a hung launch looks like from the outside.
+    try std.testing.expect(!runtime.noteAttributedSite(
+        .{
+            .phase_id = 14,
+            .label = "xe::ui::Presenter phase=presentation",
+            .owner = "xenia:presenter",
+            .after_stage = "",
+        },
+        "__ZN2xe2ui9Presenter18RefreshGuestOutputE",
+        50,
+        0x7000,
+        0x22,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), runtime.attributed_credits);
+    try std.testing.expectEqual(@as(u64, 1), runtime.attributed_rejected_thread);
+    try std.testing.expectEqualStrings("", runtime.attributedPhaseLabel());
+}
+
+test "the thread a milestone handed off to may speak for it" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    runtime.noteExecutionSample(1, 0x4000, 0x11);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // Startup hands work across threads constantly: shader storage is posted
+    // to the command-processor thread, and guest main takes over entirely.
+    // A phase whose prerequisite is the frontier itself is the work that
+    // frontier just enabled, whichever thread picked it up.
+    const handoff = types.SiteAttribution{
+        .phase_id = 12,
+        .label = "guest::title kernel-export phase=guest-execution",
+        .owner = "guest:title",
+        .after_stage = "entry",
+    };
+    try std.testing.expect(runtime.noteAttributedSite(handoff, "__ZN2xe6kernel8xboxkrnl12VdSwap_entryE", 50, 0x7000, 0x22));
+    try std.testing.expectEqualStrings("guest:title", runtime.attributedOwner());
+    try std.testing.expectEqual(@as(u64, 0), runtime.attributed_rejected_thread);
+
+    // A carrier on that same thread continues the handed-off work rather than
+    // being judged against a phase of its own.
+    try std.testing.expect(runtime.noteAttributedSite(
+        .{ .phase_id = 15, .label = "host::runtime phase=carrier", .carrier = true },
+        "__ZNSt3__112__to_addressB7v160006IhEEPT_S2_",
+        60,
+        0x7004,
+        0x22,
+    ));
+    try std.testing.expectEqual(@as(u64, 2), runtime.attributed_credits);
+}
+
+test "a carrier before any phase names nothing" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+    // libc++ with no phase behind it. Guessing an owner here is how a report
+    // ends up confidently accusing the wrong subsystem.
+    try std.testing.expect(!runtime.noteAttributedSite(
+        .{ .phase_id = 15, .label = "host::runtime phase=carrier", .carrier = true },
+        "__ZNSt3__112__to_addressB7v160006IhEEPT_S2_",
+        10,
+        0x5000,
+        0x11,
+    ));
+    try std.testing.expectEqualStrings("", runtime.attributedPhaseLabel());
+
+    // With a phase established, the same carrier joins it and keeps its owner.
+    try std.testing.expect(runtime.noteAttributedSite(
+        .{
+            .phase_id = 7,
+            .label = "xe::kernel::util::GameInfoDatabase phase=title-metadata",
+            .owner = "xenia:xam",
+        },
+        "__ZN2xe6kernel4util16GameInfoDatabase7GetIconEv",
+        20,
+        0x5000,
+        0x11,
+    ));
+    try std.testing.expect(runtime.noteAttributedSite(
+        .{ .phase_id = 15, .label = "host::runtime phase=carrier", .carrier = true },
+        "__ZNSt3__112__to_addressB7v160006IhEEPT_S2_",
+        30,
+        0x5000,
+        0x11,
+    ));
+    try std.testing.expectEqualStrings("xenia:xam", runtime.attributedOwner());
+    try std.testing.expectEqual(@as(u64, 2), runtime.attributed_credits);
+}
+
+test "a contract edge restores the credit budget" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+    const symbol = "__ZN2xe6kernel3xam11UserTracker20AddTitleToPlayedListEv";
+    const profile = types.SiteAttribution{ .phase_id = 8, .label = "phase=user-profile", .owner = "xenia:xam" };
+    try std.testing.expect(runtime.noteAttributedSite(profile, symbol, 10, 0x5000, 0x11));
+    try std.testing.expect(!runtime.noteAttributedSite(profile, symbol, 20, 0x5000, 0x11));
+
+    // The same parser either side of a milestone is doing different work, so
+    // the window's evidence starts over rather than the run's.
+    try std.testing.expect(runtime.noteStage(1, 30, "frame observed"));
+    try std.testing.expectEqualStrings("", runtime.attributedPhaseLabel());
+    try std.testing.expect(runtime.noteAttributedSite(profile, symbol, 40, 0x5000, 0x11));
+    try std.testing.expectEqual(@as(u64, 2), runtime.attributed_credits);
+}
+
+test "a phase cannot be doing work its own prerequisite has not enabled" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    runtime.noteExecutionSample(1, 0x4000, 0x11);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // `frame` has not landed, so nothing that depends on it can be running.
+    // Recording it anyway would let a live worker thread read as launch
+    // progress, which is the mistake this rule exists to prevent.
+    const premature = types.SiteAttribution{
+        .phase_id = 11,
+        .label = "phase=module-launch",
+        .owner = "guest:title",
+        .after_stage = "frame",
+    };
+    try std.testing.expect(!runtime.noteAttributedSite(premature, "__ZN2xe6kernel11KernelState12LaunchModuleE", 50, 0x5000, 0x11));
+    try std.testing.expectEqual(@as(u64, 1), runtime.attributed_rejected_stage);
+    try std.testing.expectEqualStrings("", runtime.attributedPhaseLabel());
+
+    // Once the edge lands, the same evidence is admissible.
+    try std.testing.expect(runtime.noteStage(1, 60, "frame observed"));
+    try std.testing.expect(runtime.noteAttributedSite(premature, "__ZN2xe6kernel11KernelState12LaunchModuleE", 70, 0x5000, 0x11));
+    try std.testing.expectEqualStrings("guest:title", runtime.attributedOwner());
+
+    // A stage name the contract does not declare is a build-time problem, not
+    // a runtime one; refusing it here as well would hide the build error.
+    const unknown_stage = types.SiteAttribution{
+        .phase_id = 12,
+        .label = "phase=elsewhere",
+        .owner = "guest:title",
+        .after_stage = "no_such_stage",
+    };
+    try std.testing.expect(runtime.noteAttributedSite(unknown_stage, "__ZN2xe6kernel7ElsewhereEv", 80, 0x5000, 0x11));
+}
+
+test "phase churn cannot refill the evidence budget" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+
+    // A loop that touches two subsystems in turn — reading a cvar and then the
+    // game database — switches phase on every sample. If the switch reset the
+    // evidence, this loop would credit progress forever and the gate could
+    // never stop a run that had genuinely stopped.
+    const config = types.SiteAttribution{ .phase_id = 6, .label = "phase=game-config", .owner = "xenia:config" };
+    const database = types.SiteAttribution{ .phase_id = 7, .label = "phase=title-metadata", .owner = "xenia:xam" };
+    var index: usize = 0;
+    while (index < 200) : (index += 1) {
+        _ = runtime.noteAttributedSite(config, "__ZN4cvar9ConfigVar9LoadValueEv", 10 + index * 2, 0x5000, 0x11);
+        _ = runtime.noteAttributedSite(database, "__ZN2xe6kernel4util16GameInfoDatabase7GetIconEv", 11 + index * 2, 0x5004, 0x11);
+    }
+    // Two distinct (phase, symbol) pairs, so two credits from four hundred
+    // samples.
+    try std.testing.expectEqual(@as(u64, 2), runtime.attributed_credits);
+
+    const quiet_step = runtime.lastNamedProgressStep() + 1000;
+    runtime.noteExecutionSample(quiet_step, 0x9000, 0x11);
+    try std.testing.expectEqual(types.Evaluation.failed, runtime.evaluate(quiet_step));
+}
+
+test "the same symbol in two phases is two pieces of evidence" {
+    var runtime = Runtime{};
+    attributionFixture(&runtime, &attribution_stages);
+    try std.testing.expect(runtime.noteStage(0, 1, "entry observed"));
+    // Reaching a shared helper from a second subsystem is new information
+    // about that subsystem, so the set is keyed by both.
+    const shared = "__ZN2xe11load_and_swapIjEET_PKv";
+    try std.testing.expect(runtime.noteAttributedSite(
+        .{ .phase_id = 6, .label = "phase=game-config", .owner = "xenia:config" },
+        shared,
+        10,
+        0x5000,
+        0x11,
+    ));
+    try std.testing.expect(runtime.noteAttributedSite(
+        .{ .phase_id = 7, .label = "phase=title-metadata", .owner = "xenia:xam" },
+        shared,
+        20,
+        0x5000,
+        0x11,
+    ));
+    try std.testing.expectEqual(@as(u64, 2), runtime.attributed_credits);
 }

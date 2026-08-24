@@ -34,6 +34,14 @@ pub const max_stall_threads: usize = 8;
 /// How many sample sites the report prints, hottest first. Printing every
 /// occupied slot buries the one that matters under single-sample noise.
 pub const reported_stall_sites: usize = 8;
+/// How many distinct symbols one attributed phase may credit as progress.
+///
+/// This is the bound that keeps symbol attribution from becoming a "never
+/// fail" switch. Reaching new code inside a subsystem is forward motion;
+/// revisiting code already seen is not, and a phase that has exhausted this
+/// many distinct symbols has said everything it can say. A run genuinely stuck
+/// inside one subsystem therefore goes quiet again and fails on schedule.
+pub const max_attributed_symbols: usize = 24;
 
 pub const Phase = enum(u8) {
     disabled,
@@ -41,6 +49,47 @@ pub const Phase = enum(u8) {
     activation,
     ready,
     failed,
+};
+
+/// What a route package can say about the code a sample landed in.
+///
+/// Deliberately all borrowed strings and one small integer: the gate never
+/// learns what a phase *means*, only that two samples in the same phase are
+/// the same kind of work and two in different phases are not. Keeping the
+/// vocabulary outside this library is what stops the generic gate from growing
+/// a guest-specific opinion.
+pub const SiteAttribution = struct {
+    /// Opaque to this library; only equality is used.
+    phase_id: u8 = 0,
+    /// Work-unit text recorded when the site counts as progress. Its first
+    /// whitespace-delimited token becomes the reported owner.
+    label: []const u8 = "",
+    /// Subsystem spelling for the report.
+    owner: []const u8 = "",
+    /// A contract stage this phase cannot precede, or empty for none. An
+    /// attribution that contradicts the stages actually reached is refused
+    /// rather than recorded: a subsystem cannot be doing work that its own
+    /// prerequisite has not enabled yet, and believing it could is how a live
+    /// worker thread gets mistaken for launch progress.
+    after_stage: []const u8 = "",
+    /// A second subsystem whose forward motion this phase's activity proves,
+    /// once `proxy_after_stage` has been reached. Empty for most phases.
+    ///
+    /// `owner` says whose code is running, which is what a report should print.
+    /// It is the wrong question when deciding whether the subsystem the
+    /// contract is *waiting on* is alive, because a subsystem can make its
+    /// progress through somebody else's code — an emulator that translates its
+    /// guest lazily only translates when the guest reaches new instructions.
+    /// The route package states that causal link per phase; nothing here
+    /// infers it.
+    proxy_owner: []const u8 = "",
+    /// The stage after which `proxy_owner` applies. A proxy claim that held
+    /// from the first instruction would be an unconditional second owner,
+    /// which is a different and much weaker assertion.
+    proxy_after_stage: []const u8 = "",
+    /// True when the symbol identifies no subsystem of its own and must
+    /// inherit the phase already established on this thread.
+    carrier: bool = false,
 };
 
 pub const CompileState = enum(u8) {
@@ -194,6 +243,10 @@ pub const ProgressClass = enum(u8) {
     /// No contract edge, but named sub-milestone work advanced. The startup
     /// step is long, not stuck.
     work_advancing,
+    /// No named work, but a counter the interpreter cannot manufacture kept
+    /// advancing: the guest asked the host for resources it did not already
+    /// have. See `ExternalProgress`.
+    external_advancing,
     /// Instructions retired across many sites with no named work at all. The
     /// guest is running; the gate simply cannot see what it is doing.
     executing_only,
@@ -207,6 +260,7 @@ pub const ProgressClass = enum(u8) {
             .unknown => "UNKNOWN",
             .milestone_advancing => "MILESTONE_ADVANCING",
             .work_advancing => "WORK_ADVANCING",
+            .external_advancing => "EXTERNAL_ADVANCING",
             .executing_only => "EXECUTING_ONLY",
             .spinning => "SPINNING",
             .frozen => "FROZEN",
@@ -217,6 +271,57 @@ pub const ProgressClass = enum(u8) {
     /// forward motion and must never be reported as a hang.
     pub fn isStalled(self: ProgressClass) bool {
         return self == .spinning or self == .frozen;
+    }
+};
+
+/// Counters that advance only when the guest obtains something from the host.
+///
+/// The symbol axis answers "did the guest reach code it had not reached
+/// before", and it saturates: the observer resolves *host* symbols, so an
+/// emulator translating an endless stream of its own guest's code revisits the
+/// same handful of translator functions forever. The axis goes quiet while the
+/// work it is measuring is at full speed, which is how a healthy run gets
+/// failed for silence.
+///
+/// These counters do not saturate, because each advance is a distinct request
+/// the host serviced. They are also the reason this is not simply "is the
+/// guest executing": retiring instructions is free, and a spin loop retires
+/// them as fast as forward progress does. Asking the host for a page of memory
+/// or crossing an import boundary is not free, and a loop that does neither is
+/// a loop that is not obtaining anything.
+///
+/// Nothing here is guest-specific. The admission rule is narrow and worth
+/// stating, because the obvious candidates fail it: a counter belongs only if a
+/// loop that achieves nothing cannot advance it. An import-call count fails —
+/// an emulator's frame limiter crosses the host boundary forever while its
+/// guest is dead, and adding it would have turned this gate into the never-fail
+/// switch the symbol budget exists to prevent. So does any counter the host
+/// advances on its own: a timer, a frame counter, a heartbeat.
+pub const ExternalProgress = struct {
+    /// High-water mark of the guest heap: the furthest the allocator has ever
+    /// had to reach. It rises only when the guest needs more memory than it has
+    /// ever simultaneously held.
+    ///
+    /// The high-water mark rather than a cumulative allocation count, and the
+    /// difference decides whether this axis is honest. A loop that mallocs and
+    /// frees the same block advances a cumulative counter forever while
+    /// achieving nothing; it moves this one exactly once.
+    heap_high_water: u64 = 0,
+    /// Live allocations the host is currently holding for the guest. Rises when
+    /// the guest retains more than it did, which a balanced loop does not do.
+    heap_live: u64 = 0,
+    /// Cumulative guest threads created. A spin loop does not create threads.
+    threads_created: u64 = 0,
+
+    /// Whether any counter is strictly greater than in `previous`.
+    ///
+    /// Strictly greater, and never merely different: these are monotonic or
+    /// high-water, so a decrease is a reset or a release rather than progress,
+    /// and counting it would let a shrinking heap read as work.
+    pub fn advancedFrom(self: ExternalProgress, previous: ExternalProgress) bool {
+        return self.heap_high_water > previous.heap_high_water or
+            self.heap_live > previous.heap_live or
+            self.threads_created > previous.threads_created;
     }
 };
 
@@ -333,6 +438,11 @@ pub const Diagnosis = struct {
     /// How long the gate has been without any named progress.
     quiet_steps: u64 = 0,
     quiet_budget_steps: u64 = 0,
+    /// How many times a host-serviced counter advanced during activation, and
+    /// the step of the last advance. Zero advances means the axis never had
+    /// anything to say — which is itself the finding when a guest is stuck.
+    external_progress_advances: u64 = 0,
+    external_progress_step: u64 = 0,
     activation_steps: u64 = 0,
     activation_budget_steps: u64 = 0,
     /// Where the guest spent the quiet window.
@@ -360,6 +470,27 @@ pub const Diagnosis = struct {
     /// the site attribution below is a sketch, not a measurement, and saying so
     /// is better than letting the reader over-trust it.
     stall_evictions: u64 = 0,
+    /// The startup region the executing symbol was attributed to, when a route
+    /// package could name one. Distinct from `missing_owner`: that is who owes
+    /// the next edge, this is who was observed running. A report where the two
+    /// disagree is the useful case, because it means the blocked line is
+    /// accusing a subsystem that had not been reached yet.
+    attributed_phase: []const u8 = "",
+    attributed_owner: []const u8 = "",
+    /// The last phase named anywhere in the run, even if a later contract edge
+    /// intentionally reset the current-window attribution. This prevents a
+    /// milestone from erasing the only useful historical owner in the final
+    /// report while keeping the current-window fields strict.
+    attributed_last_phase: []const u8 = "",
+    attributed_last_owner: []const u8 = "",
+    /// Distinct symbols credited inside that phase since the last contract
+    /// edge, against `max_attributed_symbols`. A count sitting at the cap means
+    /// the phase kept reaching new code until the budget ran out; a count well
+    /// under it means the phase stopped finding anything new on its own.
+    attributed_symbols: u64 = 0,
+    /// Credits across the whole run, so a report can tell a window that was
+    /// attributed once from one that was attributed continuously.
+    attributed_credits: u64 = 0,
 
     /// The single sentence a reader needs to know where to look next.
     ///
@@ -377,9 +508,18 @@ pub const Diagnosis = struct {
             .missing_milestone => return "an event named a stage this contract does not declare; the observer and the contract are out of sync",
             .entered_but_no_progress, .unexpected_exit, .none => {},
         }
+        // A window that was attributed and still went quiet is a different
+        // finding from one nothing could name. The first says a known
+        // subsystem stopped reaching new code; the second says the gate is
+        // blind. Sending both readers to "add a breadcrumb" wastes the half of
+        // the evidence the route package already supplied.
+        if (self.progress == .executing_only and self.attributed_phase.len != 0) {
+            return "the executing code was attributed to a known startup phase, but that phase stopped reaching new symbols; the owner named below is the one to look at, and it is not necessarily the owner of the missing edge";
+        }
         return switch (self.progress) {
             .milestone_advancing => "a contract edge landed inside the quiet window, so nothing here accuses the guest",
             .work_advancing => "the owning subsystem is still reporting named work, so this is a slow startup step and not a hang; raise the quiet budget rather than treating it as a defect",
+            .external_advancing => "no subsystem reported named work, but the guest kept obtaining resources from the host, which a spin cannot do; this is a long stretch of unnarrated work rather than a hang, and the breadcrumb that is missing is the owner's, not the evidence's",
             .executing_only => "the guest is executing across many sites without emitting named progress; add a work-unit breadcrumb inside the owning subsystem so the gate can see what it is doing",
             .spinning => "execution never left one site during the quiet window, so the hot site is the loop that is not terminating",
             .frozen => "no execution witness advanced; look for a wait that will never be signalled rather than for slow code",
