@@ -48,6 +48,17 @@ MACHO_PROCESSOR_SRC := $(ROOT_DIR)/lib/Mach-O/main.zig
 # Keep its route package selection aligned with the native host that is
 # compiling Rosette. The package contributes facts only; it is not executable
 # Xenia code.
+# Route-independent: this package describes the guest x86-64 SysV convention,
+# which does not change with the host Rosette is compiled for. It has no ARM64
+# mirror and therefore no entry in the `uname -m` block below.
+COMMON_RECEIVER_CLASSIFICATION_SRC := pkg/common/abi/receiver-classification/src/root.zig
+XENOS_REGISTER_MAP_SRC := pkg/common/xenos/register-map/src/root.zig
+NEAR_NULL_SHAPE_SRC := pkg/common/abi/near-null-shape/src/root.zig
+XENIA_LOG_PHRASE_MAP_SRC := pkg/common/xenia/log-phrase-map/src/root.zig
+HOST_CONTRACT_CATALOGUE_SRC := pkg/common/abi/host-contract-catalogue/src/root.zig
+LIBCPP_THREAD_ABI_SRC := pkg/common/abi/libcpp-thread-struct/src/root.zig
+PHRASE_FILTER_SRC := pkg/common/text/phrase-filter/src/root.zig
+XENIA_READY_PLAN_SRC := pkg/common/xenia/ready-plan/src/root.zig
 XENIA_GRAPHICS_CONTRACT_SRC := pkg/x86/xenia/graphics-contract/src/root.zig
 XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/x86/xenia/graphics/surface-path-contract/src/root.zig
 XENIA_SHADER_STORAGE_CONTRACT_SRC := pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig
@@ -57,6 +68,8 @@ XENIA_ABI_BRIDGE_SRC := pkg/x86/xenia/bridge/abi-bridge/src/root.zig
 XENIA_GUEST_BRIDGE_SRC := pkg/x86/xenia/runtime/guest-bridge/src/root.zig
 XENIA_CODEGEN_ACTIVATION_SRC := pkg/x86/xenia/runtime/codegen-activation/src/root.zig
 XENIA_WAIT_CONTRACT_SRC := pkg/x86/xenia/runtime/wait-contract/src/root.zig
+XENIA_TRANSLATION_PROGRESS_SRC := pkg/x86/xenia/runtime/translation-progress/src/root.zig
+XENIA_HEAP_RANGE_SRC := pkg/x86/xenia/memory/heap-range/src/root.zig
 # This package's module root is the evidence table, not a `root.zig`; the
 # `main.zig` beside it is the standalone CLI and is not linked here.
 XENIA_STARTUP_EVIDENCE_SRC := pkg/x86/xenia/diagnostics/startup-evidence/src/evidence.zig
@@ -70,9 +83,13 @@ XENIA_ABI_BRIDGE_SRC := pkg/ARM64/xenia/bridge/abi-bridge/src/root.zig
 XENIA_GUEST_BRIDGE_SRC := pkg/ARM64/xenia/runtime/guest-bridge/src/root.zig
 XENIA_CODEGEN_ACTIVATION_SRC := pkg/ARM64/xenia/runtime/codegen-activation/src/root.zig
 XENIA_WAIT_CONTRACT_SRC := pkg/ARM64/xenia/runtime/wait-contract/src/root.zig
+XENIA_TRANSLATION_PROGRESS_SRC := pkg/ARM64/xenia/runtime/translation-progress/src/root.zig
+XENIA_HEAP_RANGE_SRC := pkg/ARM64/xenia/memory/heap-range/src/root.zig
 XENIA_STARTUP_EVIDENCE_SRC := pkg/ARM64/xenia/diagnostics/startup-evidence/src/evidence.zig
 endif
 MACHO_NATIVE_WINDOW_OBJ := $(ROOT_DIR)/$(BP)macho_native_window_bridge.o
+XENIA_HEAP_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)xenia_heap_exports_anchor.o
+ROSETTE_PPC_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)rosette_ppc_exports_anchor.o
 DYLD_DYLIB := $(ZIG_OUT_DIR)/lib/rosette-exec.dylib
 SHELL_HELPER_SRC := $(ROOT_DIR)/src/shell/global_config/rosette_shell.zig
 SHELL_HELPER_BIN := $(ZIG_OUT_DIR)/bin/rosette-shell
@@ -184,7 +201,7 @@ OBJC_FRAMEWORKS := -framework Cocoa -framework Foundation
 ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -289,8 +306,7 @@ elf-processor-build:
 
 macho-processor-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
-	@"$(CC)" -fobjc-arc -fno-modules -Wall -Wextra -c "$(ROOT_DIR)/lib/Mach-O/native_window_bridge.m" -o "$(MACHO_NATIVE_WINDOW_OBJ)"
-	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -O "$(ROSETTE_RUNTIME_OPTIMIZE)" --stack 67108864 -lc --dep x64_decoder --dep x64_interpreter --dep macho_runtime --dep exit_diagnostics --dep contract --dep macho_compat_runtime --dep primitive --dep vtable --dep dyld --dep scheduler --dep jit --dep cleo_routing --dep cxx_abi --dep init --dep macho_core --dep process_core --dep sha1_tracer --dep diagnostics --dep memory --dep io --dep guest_abi --dep pthread --dep import_handler --dep guard_rollback --dep execution_history --dep ownership --dep guest_address_space --dep guest_structure --dep dispatch_table --dep dispatch_recovery --dep gpu --dep device_tree --dep preflight --dep ready_compiler -Mroot="$(MACHO_PROCESSOR_SRC)" --dep xenia_graphics_contract --dep xenia_surface_path_contract --dep xenia_shader_storage_contract --dep xenia_launch_phase_map --dep xenia_abi_bridge --dep xenia_guest_bridge --dep xenia_codegen_activation --dep xenia_wait_contract --dep xenia_startup_evidence -Mready_compiler=lib/ready-compiler/root.zig -Mxenia_graphics_contract="$(XENIA_GRAPHICS_CONTRACT_SRC)" -Mxenia_surface_path_contract="$(XENIA_SURFACE_PATH_CONTRACT_SRC)" -Mxenia_shader_storage_contract="$(XENIA_SHADER_STORAGE_CONTRACT_SRC)" -Mxenia_launch_phase_map="$(XENIA_LAUNCH_PHASE_MAP_SRC)" -Mxenia_abi_bridge="$(XENIA_ABI_BRIDGE_SRC)" -Mxenia_guest_bridge="$(XENIA_GUEST_BRIDGE_SRC)" -Mxenia_codegen_activation="$(XENIA_CODEGEN_ACTIVATION_SRC)" -Mxenia_wait_contract="$(XENIA_WAIT_CONTRACT_SRC)" -Mxenia_startup_evidence="$(XENIA_STARTUP_EVIDENCE_SRC)" -Mruntime_abi_handshake=src/tooling/runtime-abi-handshake/runtime.zig -Misa_highway=ISA/highway.zig -Misa_decode=ISA/decode/root.zig --dep runtime_abi_handshake -Misa_registry=ISA/root.zig --dep isa_highway --dep isa_registry --dep isa_decode --dep runtime_abi_handshake --dep flags --dep cpu_state --dep bit_test --dep capabilities -Mx64_decoder=ISA/decoding/root.zig --dep flags -Mcpu_state=src/x64-ASM/cpu_state.zig --dep flags -Mbit_test=src/x64-ASM/bit_test.zig -Mflags=src/x64-ASM/flags.zig -Mcapabilities=src/x64-ASM/capabilities.zig -Mx64_interpreter=src/x64-ASM/interpreter.zig -Mmacho_runtime=src/x64-ASM/macho_runtime.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -Mcontract=lib/Contract/root.zig -Mmacho_compat_runtime=lib/Mach-O/compat_runtime.zig -Mxenia_primitive_contract="$(XENIA_PRIMITIVE_CONTRACT_SRC)" --dep xenia_primitive_contract -Mprimitive=lib/runtime/primitive/root.zig -Mvtable=lib/runtime/vtable/root.zig -Mguard_rollback=lib/runtime/guard-rollback/root.zig --dep event_log --dep macho_compat_runtime --dep scheduler --dep gpu -Mdyld=lib/linker/dyld/root.zig -Mscheduler=lib/scheduler/root.zig -Mjit=lib/compiler/JIT/root.zig -Mcleo_routing=lib/CLEO/cleo_routing.zig --dep dyld --dep event_log --dep dynamic_cast -Mcxx_abi=lib/abi/cxx-abi/root.zig --dep event_log -Mdynamic_cast=lib/abi/dynamic-cast/root.zig --dep event_log -Minit=lib/runtime/init/root.zig --dep x64_decoder --dep dyld --dep macho_compat_runtime --dep exit_diagnostics --dep guest_abi -Mmacho_core=lib/Mach-O/shared_core.zig --dep macho_core --dep x64_decoder --dep dyld --dep macho_compat_runtime --dep exit_diagnostics --dep cxx_abi --dep event_log --dep scheduler --dep cleo_routing --dep init --dep macho_runtime --dep contract --dep diagnostics --dep memory --dep pthread --dep guest_abi --dep vtable --dep execution_history --dep ownership --dep guest_address_space --dep guest_structure --dep dispatch_table --dep byte_order --dep dispatch_recovery --dep gpu --dep device_tree --dep preflight -Mprocess_core=lib/runtime/process-core/root.zig -Mevent_log=lib/runtime/event-log/root.zig --dep event_log --dep macho_compat_runtime --dep xenia_shader_storage_contract -Mdiagnostics=lib/diagnostics/root.zig --dep dyld --dep event_log --dep ownership --dep guest_protection -Mmemory=lib/runtime/memory/root.zig --dep macho_compat_runtime --dep cxx_abi --dep event_log -Mio=lib/io/root.zig --dep event_log -Mguest_abi=lib/runtime/guest-abi/root.zig --dep scheduler --dep event_log -Mpthread=lib/runtime/pthread/root.zig -Msha1_tracer=lib/runtime/sha1-tracer/root.zig -Mexecution_history=lib/runtime/execution-history/root.zig -Mownership=lib/ownership/root.zig -Mguest_address_space=lib/runtime/guest-address-space/root.zig -Mguest_structure=lib/runtime/guest-structure/root.zig -Mdispatch_table=lib/runtime/dispatch-table/root.zig -Mbyte_order=lib/runtime/byte-order/root.zig -Mdispatch_recovery=lib/runtime/dispatch-recovery/root.zig -Mguest_protection=lib/runtime/guest-protection/root.zig -Mpreflight=lib/preflight/root.zig -Mdevice_tree=lib/device_tree/root.zig --dep device_tree -Mgpu=lib/gpu/root.zig --dep macho_core --dep x64_decoder --dep macho_compat_runtime --dep contract --dep dyld --dep exit_diagnostics --dep guest_abi --dep diagnostics --dep scheduler --dep execution_history -Mimport_handler=lib/runtime/import-handler/root.zig "$(MACHO_NATIVE_WINDOW_OBJ)" -framework AppKit -framework QuartzCore -framework Metal -femit-bin="$(MACHO_PROCESSOR_BIN)"
+	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build --build-file build/build.zig --prefix "$(ZIG_OUT_DIR)" -Doptimize="$(ROSETTE_RUNTIME_OPTIMIZE)" macho-processor
 
 elf-processor-dylib:
 	@mkdir -p "$(ZIG_OUT_DIR)/lib"
@@ -329,7 +345,10 @@ compat-router-build:
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_kernel_process_guard --dep exit_diagnostics -Mroot="$(COMPAT_ROUTER_SRC)" -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mexit_diagnostics=src/tooling/exit_diagnostics/root.zig -femit-bin="$(COMPAT_ROUTER_BIN)"
 
-shell-helper-build: c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
+pkg-boundary-audit:
+	@cd "$(ROOT_DIR)" && python3 tools/audit_pkg_boundary.py
+
+shell-helper-build: pkg-boundary-audit c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
