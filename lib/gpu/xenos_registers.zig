@@ -8,116 +8,107 @@
 
 const std = @import("std");
 
-pub const Register = u16;
-// The fetch-constant aperture begins above the ordinary render/CP registers
-// (Xenia exposes it around 0x4800). Retaining that range is required for
-// shader/resource binding packets; truncating at 0x4000 silently loses them.
-pub const register_count: usize = 0x5000;
+/// The Xenos register numbers and aperture bounds moved to
+/// `pkg/common/xenos/register-map`: they are console hardware facts, fixed
+/// when the silicon was, and they were sitting in the same file as the live
+/// register file below — an immutable table and mutable state one scroll
+/// apart. The names are re-exported so every consumer keeps spelling them
+/// `regs.CP_RB_BASE`, and so this file stays the one place that owns the
+/// *values* a register holds.
+const register_map = @import("xenos_register_map");
 
-pub const CP_RB_BASE: Register = 0x01C0;
-pub const CP_RB_CNTL: Register = 0x01C1;
-pub const CP_RB_RPTR_ADDR: Register = 0x01C3;
-pub const CP_RB_RPTR: Register = 0x01C4;
-pub const CP_RB_WPTR: Register = 0x01C5;
-pub const CP_RB_WPTR_DELAY: Register = 0x01C6;
-pub const CP_RB_RPTR_WR: Register = 0x01C7;
-pub const CP_IB1_BASE: Register = 0x01CC;
-pub const CP_IB1_BUFSZ: Register = 0x01CD;
-pub const CP_IB2_BASE: Register = 0x01CE;
-pub const CP_IB2_BUFSZ: Register = 0x01CF;
-/// The command processor's progress counter.  MEM_WRITE_CNTR snapshots this
-/// value for guest-side progress/fence diagnostics.
-pub const CP_PROG_COUNTER: Register = 0x044B;
+pub const Register = register_map.Register;
+pub const register_count = register_map.register_count;
+pub const CP_RB_BASE = register_map.CP_RB_BASE;
+pub const CP_RB_CNTL = register_map.CP_RB_CNTL;
+pub const CP_RB_RPTR_ADDR = register_map.CP_RB_RPTR_ADDR;
+pub const CP_RB_RPTR = register_map.CP_RB_RPTR;
+pub const CP_RB_WPTR = register_map.CP_RB_WPTR;
+pub const CP_RB_WPTR_DELAY = register_map.CP_RB_WPTR_DELAY;
+pub const CP_RB_RPTR_WR = register_map.CP_RB_RPTR_WR;
+pub const CP_IB1_BASE = register_map.CP_IB1_BASE;
+pub const CP_IB1_BUFSZ = register_map.CP_IB1_BUFSZ;
+pub const CP_IB2_BASE = register_map.CP_IB2_BASE;
+pub const CP_IB2_BUFSZ = register_map.CP_IB2_BUFSZ;
+pub const CP_PROG_COUNTER = register_map.CP_PROG_COUNTER;
+pub const SQ_PROGRAM_CNTL = register_map.SQ_PROGRAM_CNTL;
+pub const SQ_CONTEXT_MISC = register_map.SQ_CONTEXT_MISC;
+pub const SQ_INTERPOLATOR_CNTL = register_map.SQ_INTERPOLATOR_CNTL;
+pub const SQ_CF_RD_BASE = register_map.SQ_CF_RD_BASE;
+pub const SQ_PS_PROGRAM = register_map.SQ_PS_PROGRAM;
+pub const SQ_VS_PROGRAM = register_map.SQ_VS_PROGRAM;
+pub const VGT_EVENT_INITIATOR = register_map.VGT_EVENT_INITIATOR;
+pub const VGT_DMA_BASE = register_map.VGT_DMA_BASE;
+pub const VGT_DMA_SIZE = register_map.VGT_DMA_SIZE;
+pub const VGT_DRAW_INITIATOR = register_map.VGT_DRAW_INITIATOR;
+pub const VGT_IMMED_DATA = register_map.VGT_IMMED_DATA;
+pub const VGT_INDX_OFFSET = register_map.VGT_INDX_OFFSET;
+pub const RB_DEPTHCONTROL = register_map.RB_DEPTHCONTROL;
+pub const RB_BLENDCONTROL0 = register_map.RB_BLENDCONTROL0;
+pub const RB_COLORCONTROL = register_map.RB_COLORCONTROL;
+pub const PA_CL_CLIP_CNTL = register_map.PA_CL_CLIP_CNTL;
+pub const PA_SU_SC_MODE_CNTL = register_map.PA_SU_SC_MODE_CNTL;
+pub const PA_CL_VTE_CNTL = register_map.PA_CL_VTE_CNTL;
+pub const RB_MODECONTROL = register_map.RB_MODECONTROL;
+pub const RB_BLENDCONTROL1 = register_map.RB_BLENDCONTROL1;
+pub const RB_BLENDCONTROL2 = register_map.RB_BLENDCONTROL2;
+pub const RB_BLENDCONTROL3 = register_map.RB_BLENDCONTROL3;
+pub const PA_SU_POINT_SIZE = register_map.PA_SU_POINT_SIZE;
+pub const PA_SU_POINT_MINMAX = register_map.PA_SU_POINT_MINMAX;
+pub const PA_SU_LINE_CNTL = register_map.PA_SU_LINE_CNTL;
+pub const PA_SC_LINE_STIPPLE = register_map.PA_SC_LINE_STIPPLE;
+pub const VGT_OUTPUT_PATH_CNTL = register_map.VGT_OUTPUT_PATH_CNTL;
+pub const VGT_HOS_CNTL = register_map.VGT_HOS_CNTL;
+pub const VGT_HOS_MAX_TESS_LEVEL = register_map.VGT_HOS_MAX_TESS_LEVEL;
+pub const VGT_HOS_MIN_TESS_LEVEL = register_map.VGT_HOS_MIN_TESS_LEVEL;
+pub const PA_SC_MPASS_PS_CNTL = register_map.PA_SC_MPASS_PS_CNTL;
+pub const PA_SC_VIZ_QUERY = register_map.PA_SC_VIZ_QUERY;
+pub const PA_SC_VIZ_QUERY_STATUS_0 = register_map.PA_SC_VIZ_QUERY_STATUS_0;
+pub const PA_SC_VIZ_QUERY_STATUS_1 = register_map.PA_SC_VIZ_QUERY_STATUS_1;
+pub const PA_CL_VPORT_XSCALE = register_map.PA_CL_VPORT_XSCALE;
+pub const PA_CL_VPORT_XOFFSET = register_map.PA_CL_VPORT_XOFFSET;
+pub const PA_CL_VPORT_YSCALE = register_map.PA_CL_VPORT_YSCALE;
+pub const PA_CL_VPORT_YOFFSET = register_map.PA_CL_VPORT_YOFFSET;
+pub const PA_CL_VPORT_ZSCALE = register_map.PA_CL_VPORT_ZSCALE;
+pub const PA_CL_VPORT_ZOFFSET = register_map.PA_CL_VPORT_ZOFFSET;
+pub const PA_SC_SCREEN_SCISSOR_TL = register_map.PA_SC_SCREEN_SCISSOR_TL;
+pub const PA_SC_SCREEN_SCISSOR_BR = register_map.PA_SC_SCREEN_SCISSOR_BR;
+pub const PA_SC_WINDOW_OFFSET = register_map.PA_SC_WINDOW_OFFSET;
+pub const PA_SC_WINDOW_SCISSOR_TL = register_map.PA_SC_WINDOW_SCISSOR_TL;
+pub const PA_SC_WINDOW_SCISSOR_BR = register_map.PA_SC_WINDOW_SCISSOR_BR;
+pub const RB_SURFACE_INFO = register_map.RB_SURFACE_INFO;
+pub const RB_COLOR_INFO = register_map.RB_COLOR_INFO;
+pub const RB_DEPTH_INFO = register_map.RB_DEPTH_INFO;
+pub const RB_COLOR1_INFO = register_map.RB_COLOR1_INFO;
+pub const RB_COLOR2_INFO = register_map.RB_COLOR2_INFO;
+pub const RB_COLOR3_INFO = register_map.RB_COLOR3_INFO;
+pub const RB_COLOR_MASK = register_map.RB_COLOR_MASK;
+pub const RB_ALPHA_REF = register_map.RB_ALPHA_REF;
+pub const RB_STENCILREFMASK_BF = register_map.RB_STENCILREFMASK_BF;
+pub const RB_STENCILREFMASK = register_map.RB_STENCILREFMASK;
+pub const RB_COPY_CONTROL = register_map.RB_COPY_CONTROL;
+pub const RB_COPY_DEST_BASE = register_map.RB_COPY_DEST_BASE;
+pub const RB_COPY_DEST_PITCH = register_map.RB_COPY_DEST_PITCH;
+pub const RB_COPY_DEST_INFO = register_map.RB_COPY_DEST_INFO;
+pub const RB_SAMPLE_COUNT_ADDR = register_map.RB_SAMPLE_COUNT_ADDR;
+pub const WRITEBACK_START = register_map.WRITEBACK_START;
+pub const WRITEBACK_SIZE = register_map.WRITEBACK_SIZE;
+pub const SQ_VS_CONST = register_map.SQ_VS_CONST;
+pub const SQ_PS_CONST = register_map.SQ_PS_CONST;
+pub const PA_SU_POLY_OFFSET_FRONT_SCALE = register_map.PA_SU_POLY_OFFSET_FRONT_SCALE;
+pub const PA_SU_POLY_OFFSET_FRONT_OFFSET = register_map.PA_SU_POLY_OFFSET_FRONT_OFFSET;
+pub const PA_SU_POLY_OFFSET_BACK_SCALE = register_map.PA_SU_POLY_OFFSET_BACK_SCALE;
+pub const PA_SU_POLY_OFFSET_BACK_OFFSET = register_map.PA_SU_POLY_OFFSET_BACK_OFFSET;
+pub const PA_CL_POINT_SIZE = register_map.PA_CL_POINT_SIZE;
+pub const shader_constant_fetch_base = register_map.shader_constant_fetch_base;
+pub const shader_constant_fetch_count = register_map.shader_constant_fetch_count;
+pub const vertex_fetch_constant_count = register_map.vertex_fetch_constant_count;
+pub const shader_constant_alu_base = register_map.shader_constant_alu_base;
+pub const shader_constant_bool_base = register_map.shader_constant_bool_base;
+pub const shader_constant_loop_base = register_map.shader_constant_loop_base;
+pub const shader_constant_register_base = register_map.shader_constant_register_base;
+pub const vertex_fetch_register_base = register_map.vertex_fetch_register_base;
 
-pub const SQ_PROGRAM_CNTL: Register = 0x2180;
-pub const SQ_CONTEXT_MISC: Register = 0x2181;
-pub const SQ_INTERPOLATOR_CNTL: Register = 0x2182;
-pub const SQ_CF_RD_BASE: Register = 0x21F5;
-pub const SQ_PS_PROGRAM: Register = 0x21F6;
-pub const SQ_VS_PROGRAM: Register = 0x21F7;
-pub const VGT_EVENT_INITIATOR: Register = 0x21F9;
-pub const VGT_DMA_BASE: Register = 0x21FA;
-pub const VGT_DMA_SIZE: Register = 0x21FB;
-pub const VGT_DRAW_INITIATOR: Register = 0x21FC;
-pub const VGT_IMMED_DATA: Register = 0x21FD;
-// Base-vertex/index offset applied by the Xenos primitive processor.  Xenia
-// keeps the register's low 24 bits; the upper byte is padding and must not
-// leak into indexed vertex calculations.
-pub const VGT_INDX_OFFSET: Register = 0x2102;
-
-pub const RB_DEPTHCONTROL: Register = 0x2200;
-pub const RB_BLENDCONTROL0: Register = 0x2201;
-pub const RB_COLORCONTROL: Register = 0x2202;
-pub const PA_CL_CLIP_CNTL: Register = 0x2204;
-pub const PA_SU_SC_MODE_CNTL: Register = 0x2205;
-pub const PA_CL_VTE_CNTL: Register = 0x2206;
-pub const RB_MODECONTROL: Register = 0x2208;
-pub const RB_BLENDCONTROL1: Register = 0x2209;
-pub const RB_BLENDCONTROL2: Register = 0x220A;
-pub const RB_BLENDCONTROL3: Register = 0x220B;
-
-pub const PA_SU_POINT_SIZE: Register = 0x2280;
-pub const PA_SU_POINT_MINMAX: Register = 0x2281;
-pub const PA_SU_LINE_CNTL: Register = 0x2282;
-pub const PA_SC_LINE_STIPPLE: Register = 0x2283;
-pub const VGT_OUTPUT_PATH_CNTL: Register = 0x2284;
-pub const VGT_HOS_CNTL: Register = 0x2285;
-pub const VGT_HOS_MAX_TESS_LEVEL: Register = 0x2286;
-pub const VGT_HOS_MIN_TESS_LEVEL: Register = 0x2287;
-pub const PA_SC_MPASS_PS_CNTL: Register = 0x2292;
-pub const PA_SC_VIZ_QUERY: Register = 0x2293;
-pub const PA_SC_VIZ_QUERY_STATUS_0: Register = 0x0C44;
-pub const PA_SC_VIZ_QUERY_STATUS_1: Register = 0x0C45;
-
-pub const PA_CL_VPORT_XSCALE: Register = 0x210F;
-pub const PA_CL_VPORT_XOFFSET: Register = 0x2110;
-pub const PA_CL_VPORT_YSCALE: Register = 0x2111;
-pub const PA_CL_VPORT_YOFFSET: Register = 0x2112;
-pub const PA_CL_VPORT_ZSCALE: Register = 0x2113;
-pub const PA_CL_VPORT_ZOFFSET: Register = 0x2114;
-pub const PA_SC_SCREEN_SCISSOR_TL: Register = 0x200E;
-pub const PA_SC_SCREEN_SCISSOR_BR: Register = 0x200F;
-pub const PA_SC_WINDOW_OFFSET: Register = 0x2080;
-pub const PA_SC_WINDOW_SCISSOR_TL: Register = 0x2081;
-pub const PA_SC_WINDOW_SCISSOR_BR: Register = 0x2082;
-
-pub const RB_SURFACE_INFO: Register = 0x2000;
-pub const RB_COLOR_INFO: Register = 0x2001;
-pub const RB_DEPTH_INFO: Register = 0x2002;
-pub const RB_COLOR1_INFO: Register = 0x2003;
-pub const RB_COLOR2_INFO: Register = 0x2004;
-pub const RB_COLOR3_INFO: Register = 0x2005;
-pub const RB_COLOR_MASK: Register = 0x2104;
-pub const RB_ALPHA_REF: Register = 0x210E;
-pub const RB_STENCILREFMASK_BF: Register = 0x210C;
-pub const RB_STENCILREFMASK: Register = 0x210D;
-pub const RB_COPY_CONTROL: Register = 0x2318;
-pub const RB_COPY_DEST_BASE: Register = 0x2319;
-pub const RB_COPY_DEST_PITCH: Register = 0x231A;
-pub const RB_COPY_DEST_INFO: Register = 0x231B;
-pub const RB_SAMPLE_COUNT_ADDR: Register = 0x2325;
-pub const WRITEBACK_START: Register = 0x0A04;
-pub const WRITEBACK_SIZE: Register = 0x0A05;
-pub const SQ_VS_CONST: Register = 0x2307;
-pub const SQ_PS_CONST: Register = 0x2308;
-pub const PA_SU_POLY_OFFSET_FRONT_SCALE: Register = 0x2380;
-pub const PA_SU_POLY_OFFSET_FRONT_OFFSET: Register = 0x2381;
-pub const PA_SU_POLY_OFFSET_BACK_SCALE: Register = 0x2382;
-pub const PA_SU_POLY_OFFSET_BACK_OFFSET: Register = 0x2383;
-pub const PA_CL_POINT_SIZE: Register = 0x2386;
-
-pub const shader_constant_fetch_base: Register = 0x4800;
-pub const shader_constant_fetch_count: usize = 32;
-pub const vertex_fetch_constant_count: usize = shader_constant_fetch_count * 3;
-pub const shader_constant_alu_base: Register = 0x4000;
-// These are the PM4 constant-bank apertures used by Xenia's Mac command
-// processor.  They are distinct from the compact shader translator's private
-// metadata ranges; SET_CONSTANT and LOAD_ALU_CONSTANT address these registers
-// one dword at a time.
-pub const shader_constant_bool_base: Register = 0x4900;
-pub const shader_constant_loop_base: Register = 0x4908;
-pub const shader_constant_register_base: Register = 0x2000;
-pub const vertex_fetch_register_base: Register = shader_constant_fetch_base;
 
 pub const PrimitiveType = enum(u8) {
     point_list = 0,
@@ -775,8 +766,10 @@ pub const RegisterFile = struct {
     }
 };
 
+/// Bounds check against the retained aperture. Delegated so the window size
+/// and the test against it cannot drift apart.
 pub fn isRegisterAperture(register: u32) bool {
-    return register < register_count;
+    return register_map.isRegisterAperture(register);
 }
 
 test "draw initiator round-trips the Xenos bit fields" {
