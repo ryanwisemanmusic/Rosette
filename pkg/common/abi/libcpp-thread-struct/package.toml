@@ -1,0 +1,10 @@
+name = "common-abi-libcpp-thread-struct"
+version = "0.1.0-local"
+kind = "guest-abi-libcpp-thread-struct"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The libc++ object layout is a compile-time ABI fact. The runtime action that
+# initializes or destroys the object remains in lib/runtime/guest-abi.
