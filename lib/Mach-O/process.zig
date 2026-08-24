@@ -2630,6 +2630,20 @@ pub const MachOState = struct {
                 self.ready.activationBudgetMode(),
             },
         );
+        // The axis that answers "was the guest obtaining anything" separately
+        // from "was the guest executing". A reader who sees advances still
+        // climbing next to a stall verdict is looking at a gate that went blind,
+        // not at a guest that stopped.
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS external_progress advances={d} last_step={d} heap_high_water=0x{x} heap_live={d} threads_created={d}; these rise only when the guest needs more than it has ever held, so a loop that allocates and frees cannot produce them\n",
+            .{
+                diagnosis.external_progress_advances,
+                diagnosis.external_progress_step,
+                self.ready.external_progress.heap_high_water,
+                self.ready.external_progress.heap_live,
+                self.ready.external_progress.threads_created,
+            },
+        );
         machoCapturePrint(
             "macho-processor: READY COMPILER: DIAGNOSIS last_named_work={s} work_owner={s} work_thread=0x{x} work_rip=0x{x} at_step={d} work_units_since_milestone={d} total_work_units={d} slow_progress_notices={d}\n",
             .{
@@ -2641,6 +2655,24 @@ pub const MachOState = struct {
                 diagnosis.work_units_since_milestone,
                 self.ready.work_unit_count,
                 self.ready.slow_progress_reports,
+            },
+        );
+        // Who was observed running, next to who owes the next edge. When these
+        // disagree the blocked line above is naming a subsystem the launch had
+        // not reached yet, and chasing that owner is chasing the wrong code.
+        machoCapturePrint(
+            "macho-processor: READY COMPILER: DIAGNOSIS attributed_phase={s} attributed_owner={s} attributed_last_phase={s} attributed_last_owner={s} attributed_sites={d}/{d} attributed_credits={d} rejected(off_path_thread/stage_unreached/evidence_spent)={d}/{d}/{d}; attribution says which subsystem was executing, not that it was progressing\n",
+            .{
+                if (diagnosis.attributed_phase.len != 0) diagnosis.attributed_phase else "<unattributed>",
+                if (diagnosis.attributed_owner.len != 0) diagnosis.attributed_owner else "<unattributed>",
+                if (diagnosis.attributed_last_phase.len != 0) diagnosis.attributed_last_phase else "<none>",
+                if (diagnosis.attributed_last_owner.len != 0) diagnosis.attributed_last_owner else "<none>",
+                diagnosis.attributed_symbols,
+                ready_compiler.types.max_attributed_symbols,
+                diagnosis.attributed_credits,
+                self.ready.attributed_rejected_thread,
+                self.ready.attributed_rejected_stage,
+                self.ready.attributed_symbols_dropped,
             },
         );
         // When a total budget runs out, the contract did not fail: one stage
@@ -3113,14 +3145,32 @@ pub const MachOState = struct {
 
             var header: [16]u8 = @splat(0);
             var read: usize = 0;
-            if (std.Io.Dir.cwd().openFile(self.io, path, .{})) |opened| {
-                var file = opened;
+            const opened = if (std.fs.path.isAbsolute(path))
+                std.Io.Dir.openFileAbsolute(self.io, path, .{})
+            else
+                std.Io.Dir.cwd().openFile(self.io, path, .{});
+            if (opened) |file_handle| {
+                var file = file_handle;
                 defer file.close(self.io);
-                var buffer: [64]u8 = undefined;
-                var reader = file.readerStreaming(self.io, &buffer);
-                read = reader.interface.readSliceShort(&header) catch 0;
+                // The positional reader is the canonical path used by
+                // `readFileAlloc` throughout Rosette. The streaming reader
+                // is a separate host-I/O operation and is not guaranteed to
+                // be available for every forwarded file descriptor (notably
+                // large title assets opened through the Rosette route).
+                var reader = file.reader(self.io, &.{});
+                read = reader.interface.readSliceShort(&header) catch |err| blk: {
+                    machoCapturePrint(
+                        "macho-processor: READY COMPILER: asset probe read failed path={s} error={s} size={d}\n",
+                        .{ path, @errorName(err), stat.size },
+                    );
+                    break :blk 0;
+                };
                 verdict.readable = read != 0 or stat.size == 0;
-            } else |_| {
+            } else |err| {
+                machoCapturePrint(
+                    "macho-processor: READY COMPILER: asset probe open failed path={s} error={s} size={d}\n",
+                    .{ path, @errorName(err), stat.size },
+                );
                 verdict.readable = false;
                 return verdict;
             }
@@ -8060,7 +8110,69 @@ pub const MachOState = struct {
         // heartbeats, and a handful of samples cannot tell a loop from forward
         // motion; the sample itself is O(1), so the finer rate is affordable.
         self.ready.noteExecutionSample(steps, self.regs.rip, self.active_guest_thread);
+        // The symbol axis saturates against an emulator. Rosette resolves
+        // *host* symbols, so a guest that JITs its own guest forever revisits
+        // the same few translator functions: the axis goes quiet while the
+        // work it measures is at full speed. These counters do not saturate,
+        // because each advance is a request this process actually serviced.
+        //
+        // The failing run made the case: the gate declared no progress at step
+        // 900M while guest heap allocations were still climbing by tens of
+        // megabytes per hundred million steps.
+        self.ready.noteExternalProgress(.{
+            .heap_high_water = self.heap_next,
+            .heap_live = self.memory_forwarder.summary().live_allocations,
+            .threads_created = self.pthreads.created_threads,
+        }, steps);
         const symbol = self.metadata.nearestSymbol(self.regs.rip);
+        // The gate's blind spots are the stretches where Xenia logs nothing:
+        // the per-title config and XDBF block above the shader-storage
+        // request runs for hundreds of millions of instructions in silence,
+        // and used to end the run with the graphics owner blamed for work that
+        // had not been reached yet. The instruction pointer was never silent —
+        // it was only unnamed, and the symbol above already resolved it. The
+        // route package turns that symbol into a subsystem for free, because
+        // the mapping is fixed when Xenia is compiled.
+        if (symbol) |resolved| {
+            const direct = ready_compiler.xenia.launchPhaseFor(resolved.name);
+            const attribution = if (direct) |candidate| blk: {
+                // A generic carrier has no owner of its own. During the one
+                // source-ordered silent CompleteLaunch interval, the package
+                // can safely use the current frontier to recover that owner.
+                if (candidate.carrier) {
+                    break :blk ready_compiler.xenia.launchPhaseFallback(
+                        self.ready.frontierStageName(),
+                        resolved.name,
+                    ) orelse candidate;
+                }
+                break :blk candidate;
+            } else ready_compiler.xenia.launchPhaseFallback(
+                self.ready.frontierStageName(),
+                resolved.name,
+            );
+            if (attribution) |attribution_value| {
+                _ = self.ready.noteAttributedSite(
+                    .{
+                        .phase_id = @intFromEnum(attribution_value.phase),
+                        .label = attribution_value.label,
+                        .owner = attribution_value.owner,
+                        .after_stage = ready_compiler.xenia.launchPhaseAfterStage(attribution_value.phase),
+                        // Whose code is running and whose progress it proves
+                        // are different questions once the guest is executing:
+                        // Xenia's translator runs because the title reached
+                        // new code, so the blocked owner is reachable through
+                        // the emulator's own symbols.
+                        .proxy_owner = ready_compiler.xenia.launchPhaseProxyOwner(attribution_value.phase),
+                        .proxy_after_stage = ready_compiler.xenia.launchPhaseProxyAfterStage(attribution_value.phase),
+                        .carrier = attribution_value.carrier,
+                    },
+                    resolved.name,
+                    steps,
+                    self.regs.rip,
+                    self.active_guest_thread,
+                );
+            }
+        }
         const heap_summary = self.memory_forwarder.summary();
         const snapshot: startup_observer.Snapshot = .{
             .step = steps,
@@ -8229,7 +8341,29 @@ pub const MachOState = struct {
     noinline fn recoverZeroActiveGuestThread(self: *MachOState) bool {
         const started_idle = self.pendingIdleCallbackCount() != 0 and
             self.startNextIdleCallback("zero-active run guard", true);
-        if (started_idle or self.resumeSuspendedGuestThread()) return true;
+        if (started_idle) return true;
+
+        // A failed context publication must not strand a newly-created
+        // runnable worker merely because the deferred counter was already
+        // decremented. `takeNewestDeferred` also scans the table directly, so
+        // this repairs a stale counter as well as the ordinary deferred path.
+        if (self.pthreads.takeNewestDeferred()) |next| {
+            if (self.startDeferredGuestThread(next)) return true;
+            self.pthreads.requeueDeferred(next.handle);
+        }
+        if (self.resumeSuspendedGuestThread()) return true;
+
+        self.logThreadTable("zero-active run guard");
+        var orphaned_runnable: u32 = 0;
+        for (0..self.pthreads.tableCapacity()) |slot| {
+            const snapshot = self.pthreads.snapshotAt(slot) orelse continue;
+            if (snapshot.state != .runnable or self.contextContainsHandle(snapshot.handle)) continue;
+            orphaned_runnable += 1;
+            machoCapturePrint(
+                "macho-processor: scheduler orphaned runnable thread: handle=0x{x} numeric_id={d} started={} start=0x{x} no active or suspended context owns this runnable entry\n",
+                .{ snapshot.handle, snapshot.numeric_id, snapshot.started, snapshot.start_routine },
+            );
+        }
         self.scheduler_log.emit(.{
             .kind = .deadlock,
             .step = self.executed_steps,
@@ -8239,8 +8373,8 @@ pub const MachOState = struct {
             .reason = "zero_active_guest_thread",
         });
         machoCapturePrint(
-            "macho-processor: runtime invariant failure: no active or runnable guest thread; refusing stale-register execution rip=0x{x} suspended={d} blocked={d} pending_gtk={d}\n",
-            .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.blocked_threads, self.pendingIdleCallbackCount() },
+            "macho-processor: runtime invariant failure: no resumable guest context; refusing stale-register execution rip=0x{x} suspended={d} modeled_runnable={d} orphaned_runnable={d} deferred={d} blocked={d} pending_gtk={d}\n",
+            .{ self.regs.rip, self.suspended_guest_thread_count, self.pthreads.activeCount(), orphaned_runnable, self.pthreads.deferred_threads, self.pthreads.blocked_threads, self.pendingIdleCallbackCount() },
         );
         self.faulted = true;
         self.exit_code = 125;
