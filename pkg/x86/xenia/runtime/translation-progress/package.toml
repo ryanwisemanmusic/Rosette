@@ -1,0 +1,11 @@
+name = "xenia-x86-translation-progress"
+version = "0.1.0-local"
+kind = "successful-guest-translation-progress"
+role = "build-time"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
+
+# The package defines the text ABI between Xenia's PPC frontend and Rosetta's
+# readiness gate. A reported event is emitted only after a guest function has
+# been successfully assembled into host code; a heartbeat is not an event.
