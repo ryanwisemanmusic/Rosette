@@ -1,6 +1,7 @@
 name = "xenia-arm64-surface-path-contract"
 version = "0.1.0-local"
 kind = "vulkan-metal-surface-ordering"
+role = "build-time"
 architectures = ["arm64"]
 language = "zig"
 verification = "verify.sh"
