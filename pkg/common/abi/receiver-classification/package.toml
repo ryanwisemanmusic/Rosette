@@ -1,0 +1,14 @@
+name = "common-abi-receiver-classification"
+version = "0.1.0-local"
+kind = "guest-abi-argument-classification"
+role = "build-time"
+# Route-independent by construction: this describes the *guest* SysV x86-64
+# calling convention, which is the same whatever host Rosette was compiled for.
+# There is deliberately no ARM64/x86 mirror to keep in sync.
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package classifies what RDI holds at a call boundary. It never decides
+# that a real receiver may be null, and an unlisted symbol always keeps its
+# near-null finding.
