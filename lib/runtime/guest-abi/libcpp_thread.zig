@@ -7,6 +7,11 @@
 //! reports an error.
 
 const std = @import("std");
+const thread_struct_abi = @import("libcpp_thread_abi");
+
+pub const layout = thread_struct_abi.layout;
+pub const storage_size = thread_struct_abi.storage_size;
+pub const storage_alignment = thread_struct_abi.storage_alignment;
 
 pub const Operation = enum {
     construct,
