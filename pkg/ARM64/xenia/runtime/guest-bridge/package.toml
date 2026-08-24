@@ -1,0 +1,9 @@
+name = "xenia-arm64-guest-bridge"
+version = "0.1.0-local"
+kind = "arm64-guest-bridge-contract"
+architectures = ["arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# This package prepares the ARM64 route for an independent run. It does not
+# claim that the current x86 logs are ARM64 execution evidence.
