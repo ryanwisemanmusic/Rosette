@@ -7,6 +7,9 @@ const marshal = @import("gpu").vulkan.marshal;
 const tier_consistency = @import("gpu").vulkan.tier_consistency;
 const guest_memory_geometry = @import("guest_memory_geometry.zig");
 const machoCapturePrint = @import("event_log").machoCapturePrint;
+const xenia_heap_range = @import("xenia_heap_range");
+const ppc_runtime = @import("ppc_runtime");
+const ppc_host_symbols = @import("rosette_ppc_host_abi");
 
 const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
@@ -15,6 +18,10 @@ const MAX_GUEST_LIBRARIES = 32;
 pub const MAX_GUEST_SYMBOLS = 256;
 const GUEST_LIBRARY_HANDLE_BASE: u64 = 0xFFFF_FC00_0000_0000;
 pub const GUEST_SYMBOL_THUNK_BASE: u64 = 0xFFFF_FB00_0000_0000;
+// Darwin's RTLD_DEFAULT is (void *)-2. A translated Xenia call to dlsym uses
+// this handle when it asks Rosetta for an optional host ABI, so it must not be
+// mistaken for one of the guest dlopen tokens above.
+const RTLD_DEFAULT_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFFE;
 const SYNTHETIC_PHYSICAL_DEVICE_HANDLE: u64 = 0xFFFF_F600_0000_0011;
 /// The one VkDebugUtilsMessengerEXT the bridge hands out.  It is a
 /// non-dispatchable handle the guest only ever passes back to
@@ -184,6 +191,16 @@ const GuestSymbolKind = enum {
     create_debug_messenger,
     destroy_debug_messenger,
     debug_utils_success,
+    rosette_heap_allocator_abi_version,
+    rosette_heap_select,
+    rosette_ppc_host_available,
+    rosette_ppc_host_identity,
+    rosette_ppc_bind_context,
+    rosette_ppc_release_context,
+    rosette_ppc_set_recompiler_enabled,
+    rosette_ppc_recompiler_stats,
+    rosette_ppc_invalidate_range,
+    rosette_ppc_execute,
     @"opaque",
 };
 
@@ -1280,6 +1297,10 @@ pub const Forwarder = struct {
     vulkan_pipeline_cache_path_checked: bool = false,
     vulkan_pipeline_cache_loads: u64 = 0,
     vulkan_pipeline_cache_saves: u64 = 0,
+    /// Live adapter for Xenia's guest-addressed direct PPC provider. Static
+    /// symbol names live in pkg; this field owns bindings and callbacks.
+    ppc_guest_bridge: ppc_runtime.guest_bridge.Bridge = .{},
+    ppc_identity_guest: u64 = 0,
     considered: u64 = 0,
     forwarded: u64 = 0,
     rejected_not_allowlisted: u64 = 0,
@@ -1300,6 +1321,7 @@ pub const Forwarder = struct {
 
     pub fn deinit(self: *Forwarder) void {
         self.destroyNativeVulkanObjects();
+        self.ppc_guest_bridge.deinit();
         self.gpu_runtime.deinit();
         for (self.libraries[0..self.library_count]) |loaded_library| {
             if (loaded_library.handle) |handle| _ = dlclose(handle);
@@ -1312,6 +1334,20 @@ pub const Forwarder = struct {
     }
 
     pub fn lookupGuest(self: *Forwarder, library_token: u64, symbol: []const u8) u64 {
+        if (library_token == RTLD_DEFAULT_HANDLE) {
+            const kind = guestSymbolKind(symbol);
+            const is_heap = kind == .rosette_heap_allocator_abi_version or kind == .rosette_heap_select;
+            const is_ppc = ppc_host_symbols.Symbol.fromName(symbol) != null;
+            if (!is_heap and !is_ppc) {
+                return 0;
+            }
+            const token = self.allocateGuestSymbol(library_token, symbol);
+            machoCapturePrint(
+                "macho-processor: Rosette host ABI lookup: {s} -> 0x{x}\n",
+                .{ symbol, token },
+            );
+            return token;
+        }
         const entry = self.guestLibraryEntry(library_token) orelse return 0;
         if (entry.virtual_vulkan) {
             const token = self.allocateGuestSymbol(library_token, symbol);
@@ -1362,6 +1398,120 @@ pub const Forwarder = struct {
         return 0;
     }
 
+    fn readHostAbiStackWord(state: anytype, offset: u64) u64 {
+        const address = state.regs.rsp +| offset;
+        if (state.guestMemoryConst(address, 8) == null) return xenia_heap_range.no_page;
+        return state.read64(address);
+    }
+
+    /// Construct a checked guest-memory view for the direct PPC adapter. The
+    /// function is generic so dyld's small test state can exercise the same
+    /// boundary without importing MachOState and creating a module cycle.
+    fn ppcGuestMemory(state: anytype) ppc_runtime.guest_bridge.GuestMemory {
+        const State = @TypeOf(state.*);
+        return .{
+            .context = @ptrCast(state),
+            .read = struct {
+                fn read(context: *anyopaque, address: u64, output: []u8) bool {
+                    const inner: *State = @ptrCast(@alignCast(context));
+                    const bytes = inner.guestMemoryConst(address, @intCast(output.len)) orelse return false;
+                    @memcpy(output, bytes);
+                    return true;
+                }
+            }.read,
+            .write = struct {
+                fn write(context: *anyopaque, address: u64, input: []const u8) bool {
+                    const inner: *State = @ptrCast(@alignCast(context));
+                    if (comptime @hasDecl(State, "writeGuestBytes")) {
+                        return inner.writeGuestBytes(address, input);
+                    }
+                    const bytes = inner.guestMemory(address, @intCast(input.len)) orelse return false;
+                    @memcpy(bytes, input);
+                    return true;
+                }
+            }.write,
+            .read_ppc = struct {
+                fn read(context: *anyopaque, address: u64, output: []u8) bool {
+                    const inner: *State = @ptrCast(@alignCast(context));
+                    const host_address = if (comptime @hasField(State, "xenia_memory_views"))
+                        inner.xenia_memory_views.virtualHostAddress(address) orelse return false
+                    else
+                        address;
+                    const bytes = inner.guestMemoryConst(host_address, @intCast(output.len)) orelse return false;
+                    @memcpy(output, bytes);
+                    return true;
+                }
+            }.read,
+            .write_ppc = struct {
+                fn write(context: *anyopaque, address: u64, input: []const u8) bool {
+                    const inner: *State = @ptrCast(@alignCast(context));
+                    const host_address = if (comptime @hasField(State, "xenia_memory_views"))
+                        inner.xenia_memory_views.virtualHostAddress(address) orelse return false
+                    else
+                        address;
+                    if (comptime @hasDecl(State, "writeGuestBytes")) {
+                        return inner.writeGuestBytes(host_address, input);
+                    }
+                    const bytes = inner.guestMemory(host_address, @intCast(input.len)) orelse return false;
+                    @memcpy(bytes, input);
+                    return true;
+                }
+            }.write,
+            .alloc = struct {
+                fn alloc(context: *anyopaque, size: u64, alignment: u64) ?u64 {
+                    const inner: *State = @ptrCast(@alignCast(context));
+                    return inner.guestAlloc(size, alignment);
+                }
+            }.alloc,
+        };
+    }
+
+    fn ppcGuestCall(state: anytype) ppc_runtime.guest_bridge.GuestCall {
+        const State = @TypeOf(state.*);
+        return struct {
+            fn call(context: *anyopaque, address: u64, args: [6]u64) u64 {
+                const inner: *State = @ptrCast(@alignCast(context));
+                if (comptime @hasDecl(State, "callGuestFunction")) {
+                    return inner.callGuestFunction(address, args);
+                }
+                return 0;
+            }
+        }.call;
+    }
+
+    fn materializePpcIdentity(self: *Forwarder, state: anytype) u64 {
+        const text: []const u8 = ppc_runtime.host_abi.identity[0..];
+        const memory = ppcGuestMemory(state);
+        if (self.ppc_identity_guest != 0) {
+            var probe: [1]u8 = undefined;
+            if (memory.read(memory.context, self.ppc_identity_guest, &probe)) return self.ppc_identity_guest;
+        }
+        const address = memory.alloc(memory.context, @intCast(text.len + 1), 1) orelse return 0;
+        if (!memory.write(memory.context, address, text)) return 0;
+        if (!memory.write(memory.context, address + text.len, &[_]u8{0})) return 0;
+        self.ppc_identity_guest = address;
+        return address;
+    }
+
+    /// Xenia passes its PageEntry vector through the translated x86 ABI. The
+    /// value in RDI is therefore a guest address, not a native pointer that
+    /// the ARM64 provider may dereference directly. Resolve the complete
+    /// vector through Rosette's guest-memory view before handing it to the
+    /// package selector. A partial or unaligned range is rejected so the
+    /// optional accelerator can never turn a bad guest pointer into a host
+    /// crash; Xenia will fall back to its reference scan.
+    fn guestHeapEntries(state: anytype, guest_address: u64, total_page_count: u32) ?[*]const u64 {
+        const byte_count = std.math.mul(
+            u64,
+            @as(u64, total_page_count),
+            @as(u64, @sizeOf(u64)),
+        ) catch return null;
+        if (byte_count == 0) return null;
+        const bytes = state.guestMemoryConst(guest_address, byte_count) orelse return null;
+        if (@intFromPtr(bytes.ptr) % @alignOf(u64) != 0) return null;
+        return @ptrCast(@alignCast(bytes.ptr));
+    }
+
     pub fn dispatchGuestSymbol(self: *Forwarder, state: anytype, token: u64) bool {
         // Guest symbol tokens are laid out contiguously as
         // GUEST_SYMBOL_THUNK_BASE + index*16 + 1 (see allocateGuestSymbol), so
@@ -1374,9 +1524,98 @@ pub const Forwarder = struct {
         if (index >= MAX_GUEST_SYMBOLS) return false;
         const entry = &self.guest_symbols[index];
         if (entry.token != token) return false;
-        if (self.guestLibraryEntry(entry.library_token) == null) return false;
+        const is_rosette_host_abi = entry.library_token == RTLD_DEFAULT_HANDLE;
+        if (!is_rosette_host_abi and self.guestLibraryEntry(entry.library_token) == null) return false;
         self.guest_thunk_calls +|= 1;
         entry.calls +|= 1;
+        if (is_rosette_host_abi) {
+            switch (entry.kind) {
+                .rosette_heap_allocator_abi_version => {
+                    state.regs.rax = xenia_heap_range.abiVersion();
+                },
+                .rosette_heap_select => {
+                    if (state.regs.rsi > std.math.maxInt(u32)) {
+                        state.regs.rax = xenia_heap_range.no_page;
+                    } else {
+                        const total_page_count: u32 = @intCast(state.regs.rsi);
+                        const entries = guestHeapEntries(state, state.regs.rdi, total_page_count);
+                        state.regs.rax = if (entries) |page_entries|
+                            xenia_heap_range.selectC(
+                                page_entries,
+                                total_page_count,
+                                @truncate(state.regs.rdx),
+                                @truncate(state.regs.rcx),
+                                @truncate(state.regs.r8),
+                                @truncate(state.regs.r9),
+                                @truncate(readHostAbiStackWord(state, 8)),
+                                @truncate(readHostAbiStackWord(state, 16)),
+                            )
+                        else
+                            xenia_heap_range.no_page;
+                    }
+                },
+                .rosette_ppc_host_available => {
+                    state.regs.rax = 1;
+                },
+                .rosette_ppc_host_identity => {
+                    state.regs.rax = self.materializePpcIdentity(state);
+                },
+                .rosette_ppc_bind_context => {
+                    const State = @TypeOf(state.*);
+                    if (comptime @hasDecl(State, "callGuestFunction")) {
+                        const memory = ppcGuestMemory(state);
+                        const bound = self.ppc_guest_bridge.bind(
+                            state.regs.rdi,
+                            memory,
+                            @ptrCast(state),
+                            ppcGuestCall(state),
+                        );
+                        if (!bound) {
+                            machoCapturePrint(
+                                "macho-processor: PPC guest-state bind rejected: state=0x{x} reason={s}\n",
+                                .{ state.regs.rdi, @tagName(self.ppc_guest_bridge.last_bind_failure) },
+                            );
+                        }
+                        state.regs.rax = @intFromBool(bound);
+                    } else {
+                        state.regs.rax = 0;
+                    }
+                },
+                .rosette_ppc_release_context => {
+                    self.ppc_guest_bridge.release(state.regs.rdi);
+                    state.regs.rax = 0;
+                },
+                .rosette_ppc_set_recompiler_enabled => {
+                    const enabled: i32 = @bitCast(@as(u32, @truncate(state.regs.rdi)));
+                    const result: i32 = ppc_runtime.host_abi.rosette_ppc_set_recompiler_enabled(enabled);
+                    state.regs.rax = @intCast(@as(u32, @bitCast(result)));
+                },
+                .rosette_ppc_recompiler_stats => {
+                    state.regs.rax = @intFromBool(self.ppc_guest_bridge.stats(
+                        state.regs.rdi,
+                        state.regs.rsi,
+                        state.regs.rdx,
+                    ));
+                },
+                .rosette_ppc_invalidate_range => {
+                    self.ppc_guest_bridge.invalidateRange(
+                        @truncate(state.regs.rdi),
+                        @truncate(state.regs.rsi),
+                    );
+                    state.regs.rax = 0;
+                },
+                .rosette_ppc_execute => {
+                    state.regs.rax = @intFromBool(self.ppc_guest_bridge.execute(
+                        state.regs.rdi,
+                        @truncate(state.regs.rsi),
+                        @truncate(state.regs.rdx),
+                        state.regs.rcx,
+                    ));
+                },
+                else => return false,
+            }
+            return true;
+        }
         self.frame_provenance.noteGuestVulkanCall();
         switch (entry.kind) {
             .get_instance_proc_addr, .get_device_proc_addr => {
@@ -1626,6 +1865,7 @@ pub const Forwarder = struct {
                 state.regs.rax = 0;
             },
             .debug_utils_success => state.regs.rax = 0,
+            .rosette_heap_allocator_abi_version, .rosette_heap_select, .rosette_ppc_host_available, .rosette_ppc_host_identity, .rosette_ppc_bind_context, .rosette_ppc_release_context, .rosette_ppc_set_recompiler_enabled, .rosette_ppc_recompiler_stats, .rosette_ppc_invalidate_range, .rosette_ppc_execute => return false,
             // A non-null lookup remains useful for capability discovery,
             // but calling an untyped ARM64 function through x86 registers
             // is unsafe. Keep it contained until its Vulkan ABI signature
@@ -3883,6 +4123,7 @@ pub const Forwarder = struct {
     fn writeDeviceQueue(self: *Forwarder, state: anytype, output: u64, name: []const u8) u64 {
         if (output == 0 or state.guestMemory(output, 8) == null) return vkErrorInitializationFailed();
         var queue: u64 = VK_SYNTHETIC_QUEUE;
+        var native_queue: u64 = 0;
         var family_index: u32 = @truncate(state.regs.rsi);
         var queue_index: u32 = @truncate(state.regs.rdx);
         if (std.mem.eql(u8, name, "vkGetDeviceQueue2")) {
@@ -3897,7 +4138,8 @@ pub const Forwarder = struct {
                 var real_queue: abi.Queue = null;
                 get_queue(self.real_vulkan.device.?, family_index, queue_index, &real_queue);
                 if (real_queue != null) {
-                    queue = @intFromPtr(real_queue.?);
+                    native_queue = @intFromPtr(real_queue.?);
+                    queue = native_queue;
                     HandleMap.allocOrFind(&self.real_vulkan.queue_map, queue, queue);
                     if (family_index < self.real_vulkan.queue_family_count) {
                         if (self.real_vulkan.graphics_queue == null) self.real_vulkan.graphics_queue = real_queue;
@@ -3908,6 +4150,11 @@ pub const Forwarder = struct {
         }
         state.write64(output, queue);
         registerOpaqueHandle(state, queue, "Vulkan device queue");
+        const stored_queue = if (state.guestMemoryConst(output, 8) != null) state.read64(output) else 0;
+        machoCapturePrint(
+            "macho-processor: Vulkan queue contract: call={d} device=0x{x} family={d} index={d} output=0x{x} native=0x{x} written=0x{x} via={s}\n",
+            .{ self.vulkan_queues_acquired + 1, state.regs.rdi, family_index, queue_index, output, native_queue, stored_queue, name },
+        );
         self.vulkan_queues_acquired +|= 1;
         if (self.vulkan_queues_acquired == 1) {
             machoCapturePrint(
@@ -8679,6 +8926,16 @@ fn guestSymbolKind(symbol: []const u8) GuestSymbolKind {
     if (std.mem.eql(u8, symbol, "vkDestroyDebugUtilsMessengerEXT")) return .destroy_debug_messenger;
     if (std.mem.eql(u8, symbol, "vkSetDebugUtilsObjectNameEXT") or
         std.mem.eql(u8, symbol, "vkSetDebugUtilsObjectTagEXT")) return .debug_utils_success;
+    if (std.mem.eql(u8, symbol, "rosette_xenia_heap_allocator_abi_version")) return .rosette_heap_allocator_abi_version;
+    if (std.mem.eql(u8, symbol, "rosette_xenia_heap_select")) return .rosette_heap_select;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_host_available")) return .rosette_ppc_host_available;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_host_identity")) return .rosette_ppc_host_identity;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_bind_context")) return .rosette_ppc_bind_context;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_release_context")) return .rosette_ppc_release_context;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_set_recompiler_enabled")) return .rosette_ppc_set_recompiler_enabled;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_recompiler_stats")) return .rosette_ppc_recompiler_stats;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_invalidate_range")) return .rosette_ppc_invalidate_range;
+    if (std.mem.eql(u8, symbol, "rosette_ppc_execute")) return .rosette_ppc_execute;
     if (std.mem.eql(u8, symbol, "vkResetDescriptorPool")) return .reset_descriptor_pool;
     if (std.mem.eql(u8, symbol, "vkBindImageMemory")) return .bind_image_memory;
     if (std.mem.eql(u8, symbol, "vkBindBufferMemory")) return .bind_buffer_memory;
@@ -10076,6 +10333,43 @@ test "debug utils messenger is modeled and publishes a handle the guest can dest
     state.regs.rcx = 0;
     try std.testing.expect(forwarder.dispatchGuestSymbol(&state, create));
     try std.testing.expectEqual(vkErrorInitializationFailed(), state.regs.rax);
+}
+
+test "Rosette heap selector maps guest PageEntry vectors before reading them" {
+    var forwarder = Forwarder{};
+    defer forwarder.deinit();
+    var state = TestState{};
+
+    const selector = forwarder.lookupGuest(
+        RTLD_DEFAULT_HANDLE,
+        "rosette_xenia_heap_select",
+    );
+    try std.testing.expect(selector != 0);
+
+    // The selector receives a guest address in RDI. Rosetta must translate
+    // that address to a host slice before the ARM64 package reads it.
+    const entries_address: u64 = 0x2000;
+    state.write64(entries_address + 14 * 8, @as(u64, 1) << xenia_heap_range.page_state_shift);
+    state.regs.rdi = entries_address;
+    state.regs.rsi = 16;
+    state.regs.rdx = 0;
+    state.regs.rcx = 15;
+    state.regs.r8 = 1;
+    state.regs.r9 = 1;
+    state.regs.rsp = 0x1000;
+    state.write64(0x1008, 1); // top_down
+    state.write64(0x1010, xenia_heap_range.no_page);
+
+    try std.testing.expect(forwarder.dispatchGuestSymbol(&state, selector));
+    try std.testing.expectEqual(@as(u64, 13), state.regs.rax);
+
+    // An entry vector that extends outside the mapped guest address space is
+    // rejected and returns the package sentinel rather than faulting the
+    // native processor.
+    state.regs.rdi = state.mem.len - 8;
+    state.regs.rsi = 16;
+    try std.testing.expect(forwarder.dispatchGuestSymbol(&state, selector));
+    try std.testing.expectEqual(@as(u64, xenia_heap_range.no_page), state.regs.rax);
 }
 
 test "guest Vulkan create-info offsets match the ABI the bridge reads through" {
