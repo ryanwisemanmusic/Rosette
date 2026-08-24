@@ -1,0 +1,10 @@
+name = "xenia-arm64-startup-evidence"
+version = "0.1.0-local"
+kind = "log-contract-verifier"
+architectures = ["x86_64", "ppc64", "arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# The parser is architecture-neutral. The evidence it consumes is not: a
+# PPC64 or ARM64 run must be fed its own logs and must never inherit an x86
+# verdict merely because the stage names match. The route is ARM64.
