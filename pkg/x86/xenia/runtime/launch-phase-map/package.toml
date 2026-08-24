@@ -1,0 +1,9 @@
+name = "xenia-x86-launch-phase-map"
+version = "0.1.0-local"
+kind = "startup-symbol-attribution"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
+
+# Matching a symbol proves the guest is inside that subsystem's code. It does
+# not prove forward motion, and this package never decides that it does.
