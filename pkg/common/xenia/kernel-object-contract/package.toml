@@ -1,0 +1,7 @@
+name = "common-xenia-kernel-object-contract"
+version = "0.1.0-local"
+kind = "console-kernel-handle-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
