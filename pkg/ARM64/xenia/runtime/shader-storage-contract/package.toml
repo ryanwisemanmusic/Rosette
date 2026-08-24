@@ -1,0 +1,9 @@
+name = "xenia-arm64-shader-storage-contract"
+version = "0.1.0-local"
+kind = "shader-storage-handoff-contract"
+architectures = ["arm64"]
+language = "zig"
+verification = "verify.sh"
+
+# A timeout continuation is evidence that launch was allowed to continue, not
+# evidence that shader storage initialized successfully.
