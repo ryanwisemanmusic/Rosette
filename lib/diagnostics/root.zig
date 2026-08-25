@@ -19,6 +19,8 @@ pub const x64_backend_diagnostics = @import("x64_backend_diagnostics.zig");
 pub const xenia_pipeline_contracts = @import("xenia_pipeline_contracts.zig");
 pub const xenia_pipeline = @import("xenia_pipeline.zig");
 pub const xenia_gpu_handoff = @import("xenia_gpu_handoff.zig");
+pub const xenia_gpu_causal_trace = @import("xenia_gpu_causal_trace.zig");
+pub const xenia_pm4_walk = @import("xenia_pm4_walk.zig");
 pub const bringup_failure = @import("bringup_failure.zig");
 pub const deadlock_predictor = @import("deadlock_predictor.zig");
 pub const deferred_work = @import("deferred_work.zig");
@@ -56,6 +58,8 @@ test {
     _ = xenia_pipeline_contracts;
     _ = xenia_pipeline;
     _ = xenia_gpu_handoff;
+    _ = xenia_gpu_causal_trace;
+    _ = xenia_pm4_walk;
     _ = bringup_failure;
     _ = deadlock_predictor;
     _ = deferred_work;
