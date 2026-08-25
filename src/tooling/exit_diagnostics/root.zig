@@ -115,6 +115,12 @@ pub const MemoryAccessFailure = struct {
     access: []const u8 = "",
     fault: []const u8 = "",
     mapped: bool = false,
+    /// Registers captured before the faulting load/store was allowed to return
+    /// a diagnostic zero. Without this snapshot, `mov rax, [rax]` is reported
+    /// with rax=0 even when the invalid pointer in rax was the value that
+    /// actually caused the access failure.
+    fault_regs: TerminalRegs = .{},
+    fault_regs_valid: bool = false,
 };
 
 pub const SemanticFault = struct {
