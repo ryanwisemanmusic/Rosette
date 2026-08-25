@@ -137,6 +137,10 @@ const Mutex = struct {
     address: u64 = 0,
     depth: u32 = 0,
     owner_thread: u64 = 0,
+    /// libc++ recursive_mutex permits its owning thread to acquire the
+    /// object again. Keep that ABI property in the runtime model instead of
+    /// treating every C++ mutex as recursive (or, worse, as a no-op).
+    recursive: bool = false,
     contention_count: u64 = 0,
 };
 
@@ -269,6 +273,26 @@ pub const Runtime = struct {
         }
         if (std.mem.eql(u8, name, "__ZNSt3__119__shared_mutex_baseC1Ev")) {
             // __shared_mutex_base constructor is a no-op in single-threaded execution
+            return .handled_void;
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutexC1Ev") != null or
+            std.mem.indexOf(u8, name, "recursive_mutexC2Ev") != null)
+        {
+            return .{ .handled = self.recursiveMutexInit(state) };
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutex4lockEv") != null) {
+            return .{ .handled = self.mutexLockForThread(state.regs.rdi, owner) };
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutex6unlockEv") != null) {
+            return .{ .handled = self.mutexUnlockForThread(state.regs.rdi, owner) };
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutex8try_lockEv") != null) {
+            return .{ .handled = @intFromBool(self.mutexTryLockForThread(state.regs.rdi, owner) == 0) };
+        }
+        if (std.mem.indexOf(u8, name, "recursive_mutexD1Ev") != null or
+            std.mem.indexOf(u8, name, "recursive_mutexD2Ev") != null)
+        {
+            self.recursiveMutexDestroy(state.regs.rdi);
             return .handled_void;
         }
         if (std.mem.eql(u8, name, "__ZNSt3__15mutex4lockEv")) {
@@ -1085,6 +1109,21 @@ pub const Runtime = struct {
         return 0;
     }
 
+    fn recursiveMutexInit(self: *Runtime, state: anytype) u64 {
+        const result = self.mutexInit(state);
+        if (result != 0) return result;
+        const mutex = self.mutexForAddress(state.regs.rdi, false) orelse return 12;
+        mutex.recursive = true;
+        // C++ constructors are modeled as returning the object address in the
+        // import bridge, matching the legacy constructor shim and making the
+        // result useful to callers that chain the ABI operation.
+        return state.regs.rdi;
+    }
+
+    fn recursiveMutexDestroy(self: *Runtime, address: u64) void {
+        _ = self.mutexDestroy(address);
+    }
+
     fn mutexDestroy(self: *Runtime, address: u64) u64 {
         if (self.mutexForAddress(address, false)) |mutex| mutex.* = .{};
         return 0;
@@ -1137,6 +1176,11 @@ pub const Runtime = struct {
     fn mutexTryLockForThread(self: *Runtime, address: u64, owner: u64) u64 {
         const mutex = self.mutexForAddress(address, true) orelse return 12;
         if (mutex.depth != 0) {
+            if (mutex.recursive and mutex.owner_thread == owner) {
+                mutex.depth +|= 1;
+                self.mutex_locks +|= 1;
+                return 0;
+            }
             mutex.contention_count +|= 1;
             self.mutex_contentions +|= 1;
             return 16; // EBUSY
@@ -1546,6 +1590,58 @@ test "pthread mutex try-lock reports busy and succeeds after unlock" {
     try std.testing.expect(!runtime.cppMutexTryLock(address));
     try std.testing.expectEqual(@as(u64, 0), runtime.mutexUnlock(address));
     try std.testing.expect(runtime.cppMutexTryLock(address));
+}
+
+test "libc++ recursive mutex models reentrancy and ownership" {
+    const owner: u64 = SYNTHETIC_THREAD_BASE;
+    const other: u64 = SYNTHETIC_THREAD_BASE + 0x10;
+    const address: u64 = 0x20;
+    var runtime = Runtime{};
+    var state = struct {
+        memory: [128]u8 = [_]u8{0} ** 128,
+        active_guest_thread: u64 = owner,
+        regs: struct { rdi: u64 = address, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        fn guestMemory(self: *@This(), guest_address: u64, count: u64) ?[]u8 {
+            const start: usize = @intCast(guest_address);
+            const length: usize = @intCast(count);
+            if (start > self.memory.len or length > self.memory.len - start) return null;
+            return self.memory[start .. start + length];
+        }
+    }{};
+
+    const constructed = runtime.dispatchCppSynchronization(&state, "__ZNSt3__115recursive_mutexC1Ev") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(address, constructed.handled);
+    try std.testing.expect(runtime.mutexForAddress(address, false).?.recursive);
+
+    const lock_name = "__ZNSt3__115recursive_mutex4lockEv";
+    const try_lock_name = "__ZNSt3__115recursive_mutex8try_lockEv";
+    const unlock_name = "__ZNSt3__115recursive_mutex6unlockEv";
+    try std.testing.expectEqual(@as(u64, 0), (runtime.dispatchCppSynchronization(&state, lock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u64, 0), (runtime.dispatchCppSynchronization(&state, lock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u64, 1), (runtime.dispatchCppSynchronization(&state, try_lock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u32, 3), runtime.mutexForAddress(address, false).?.depth);
+
+    state.active_guest_thread = other;
+    try std.testing.expectEqual(@as(u64, 0), (runtime.dispatchCppSynchronization(&state, try_lock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u32, 3), runtime.mutexForAddress(address, false).?.depth);
+    try std.testing.expectEqual(@as(u64, 1), runtime.mutex_contentions);
+
+    state.active_guest_thread = owner;
+    try std.testing.expectEqual(@as(u64, 0), (runtime.dispatchCppSynchronization(&state, unlock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u64, 0), (runtime.dispatchCppSynchronization(&state, unlock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u64, 0), (runtime.dispatchCppSynchronization(&state, unlock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u32, 0), runtime.mutexForAddress(address, false).?.depth);
+
+    state.active_guest_thread = other;
+    try std.testing.expectEqual(@as(u64, 1), (runtime.dispatchCppSynchronization(&state, try_lock_name) orelse return error.TestUnexpectedResult).handled);
+    try std.testing.expectEqual(@as(u64, 0), (runtime.dispatchCppSynchronization(&state, unlock_name) orelse return error.TestUnexpectedResult).handled);
+
+    const destroyed = runtime.dispatchCppSynchronization(&state, "__ZNSt3__115recursive_mutexD1Ev") orelse return error.TestUnexpectedResult;
+    switch (destroyed) {
+        .handled_void => {},
+        .handled => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(runtime.mutexForAddress(address, false) == null);
 }
 
 test "cooperative condition wait releases and reacquires its mutex" {
