@@ -20,6 +20,27 @@ const MEMORY_TRACE_BUFFER_LEN = constants.MEMORY_TRACE_BUFFER_LEN;
 const IMPORT_TRACE_BUFFER_LEN = constants.IMPORT_TRACE_BUFFER_LEN;
 const IMPORT_ROUTE_CACHE_SIZE = constants.IMPORT_ROUTE_CACHE_SIZE;
 
+fn currentTerminalRegs(self: anytype) exit_diagnostics.TerminalRegs {
+    return .{
+        .rax = self.regs.rax,
+        .rbx = self.regs.rbx,
+        .rcx = self.regs.rcx,
+        .rdx = self.regs.rdx,
+        .rsi = self.regs.rsi,
+        .rdi = self.regs.rdi,
+        .rbp = self.regs.rbp,
+        .rsp = self.regs.rsp,
+        .r8 = self.regs.r8,
+        .r9 = self.regs.r9,
+        .r10 = self.regs.r10,
+        .r11 = self.regs.r11,
+        .r12 = self.regs.r12,
+        .r13 = self.regs.r13,
+        .r14 = self.regs.r14,
+        .r15 = self.regs.r15,
+    };
+}
+
 /// Report the window every guest-address decision was actually made against.
 ///
 /// This predicate had two owners: the model, derived from observed mappings,
@@ -562,24 +583,10 @@ pub fn logExitDiagnostics(self: anytype) void {
         .reason = reason,
         .faulted = self.faulted,
         .rip = self.regs.rip,
-        .regs = .{
-            .rax = self.regs.rax,
-            .rbx = self.regs.rbx,
-            .rcx = self.regs.rcx,
-            .rdx = self.regs.rdx,
-            .rsi = self.regs.rsi,
-            .rdi = self.regs.rdi,
-            .rbp = self.regs.rbp,
-            .rsp = self.regs.rsp,
-            .r8 = self.regs.r8,
-            .r9 = self.regs.r9,
-            .r10 = self.regs.r10,
-            .r11 = self.regs.r11,
-            .r12 = self.regs.r12,
-            .r13 = self.regs.r13,
-            .r14 = self.regs.r14,
-            .r15 = self.regs.r15,
-        },
+        .regs = if (self.terminal_memory_failure) |failure|
+            if (failure.fault_regs_valid) failure.fault_regs else currentTerminalRegs(self)
+        else
+            currentTerminalRegs(self),
         .unresolved_import_calls = self.unresolved_import_count,
         .attribution = attribution,
         .execution_authoritative = attribution.authority == .authoritative,
@@ -605,6 +612,7 @@ pub fn logExitDiagnostics(self: anytype) void {
     }
 
     if (self.terminal_memory_failure) |failure| {
+        const fault_regs = if (failure.fault_regs_valid) failure.fault_regs else report.regs;
         const instruction_in_generated_code = self.sparse_memory.isExecutable(failure.instruction_address, 1);
         const terminal_symbol = if (instruction_in_generated_code)
             null
@@ -614,8 +622,8 @@ pub fn logExitDiagnostics(self: anytype) void {
         const fault_policy = self.pointer_firewall.policyAt(failure.address);
         var vtable_header_mapped = true;
         var typeinfo_mapped = true;
-        if (self.guestMemoryConst(self.regs.rdi, 8) != null) {
-            const vptr = self.read64(self.regs.rdi);
+        if (self.guestMemoryConst(fault_regs.rdi, 8) != null) {
+            const vptr = self.read64(fault_regs.rdi);
             if (vptr == 0 or vptr < 16 or self.guestMemoryConst(vptr - 16, 16) == null) {
                 vtable_header_mapped = false;
             } else {
@@ -627,21 +635,21 @@ pub fn logExitDiagnostics(self: anytype) void {
             .instruction = failure.instruction,
             .symbol = symbol_name,
             .address = failure.address,
-            .rdi = self.regs.rdi,
-            .rsi = self.regs.rsi,
-            .rdx = self.regs.rdx,
-            .rsp = self.regs.rsp,
-            .rbp = self.regs.rbp,
-            .rdi_mapped = self.guestMemoryConst(self.regs.rdi, 1) != null,
-            .rsi_mapped = self.guestMemoryConst(self.regs.rsi, 1) != null,
-            .rdx_mapped = self.guestMemoryConst(self.regs.rdx, 1) != null,
-            .stack_mapped = self.guestMemoryConst(self.regs.rsp, 1) != null and
-                (self.regs.rbp == 0 or self.guestMemoryConst(self.regs.rbp, 1) != null),
+            .rdi = fault_regs.rdi,
+            .rsi = fault_regs.rsi,
+            .rdx = fault_regs.rdx,
+            .rsp = fault_regs.rsp,
+            .rbp = fault_regs.rbp,
+            .rdi_mapped = self.guestMemoryConst(fault_regs.rdi, 1) != null,
+            .rsi_mapped = self.guestMemoryConst(fault_regs.rsi, 1) != null,
+            .rdx_mapped = self.guestMemoryConst(fault_regs.rdx, 1) != null,
+            .stack_mapped = self.guestMemoryConst(fault_regs.rsp, 1) != null and
+                (fault_regs.rbp == 0 or self.guestMemoryConst(fault_regs.rbp, 1) != null),
             .pointer_opaque = if (fault_policy) |policy| policy.kind == .opaque_identity and !policy.may_dereference else false,
             .pointer_owner = if (fault_policy) |policy| policy.owner else "",
             .vtable_header_mapped = vtable_header_mapped,
             .typeinfo_mapped = typeinfo_mapped,
-            .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(self.regs.rdi),
+            .live_allocation_vtable_history = self.hasLiveAllocationVtableHistory(fault_regs.rdi),
             .instruction_in_generated_code = instruction_in_generated_code,
         });
         report.semantic_fault = .{
@@ -664,8 +672,8 @@ pub fn logExitDiagnostics(self: anytype) void {
             => true,
             else => false,
         };
-        if (pointer_attribution and provenance == null) provenance = self.memory_regions.find(self.regs.rdi, 1);
-        if (pointer_attribution and provenance == null) provenance = self.memory_regions.find(self.regs.rsi, 1);
+        if (pointer_attribution and provenance == null) provenance = self.memory_regions.find(fault_regs.rdi, 1);
+        if (pointer_attribution and provenance == null) provenance = self.memory_regions.find(fault_regs.rsi, 1);
         if (provenance) |region| {
             report.semantic_fault.?.region_kind = @tagName(region.kind);
             report.semantic_fault.?.region_owner = region.owner;
@@ -677,8 +685,8 @@ pub fn logExitDiagnostics(self: anytype) void {
             report.semantic_fault.?.region_synthetic = region.isSynthetic();
         }
         var diagnostic_policy = fault_policy;
-        if (pointer_attribution and diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rdi);
-        if (pointer_attribution and diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(self.regs.rsi);
+        if (pointer_attribution and diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(fault_regs.rdi);
+        if (pointer_attribution and diagnostic_policy == null) diagnostic_policy = self.pointer_firewall.policyAt(fault_regs.rsi);
         if (diagnostic_policy) |policy| {
             report.semantic_fault.?.pointer_kind = @tagName(policy.kind);
             report.semantic_fault.?.pointer_owner = policy.owner;
@@ -807,7 +815,7 @@ pub fn logExitDiagnostics(self: anytype) void {
 
     var stack_buf: [16]exit_diagnostics.StackEntry = undefined;
     var stack_count: usize = 0;
-    var stack_address = self.regs.rsp;
+    var stack_address = report.regs.rsp;
     while (stack_count < stack_buf.len) : (stack_address +%= 8) {
         const offset = self.addrToOffset(stack_address) orelse break;
         if (offset + 8 > self.mem.len) break;

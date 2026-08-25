@@ -18,6 +18,7 @@ const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
 const deferred_work = @import("diagnostics").deferred_work;
 const deadlock_predictor = @import("diagnostics").deadlock_predictor;
 const bringup_failure = @import("diagnostics").bringup_failure;
+const xenia_gpu_causal_trace = @import("diagnostics").xenia_gpu_causal_trace;
 const wait_audit = @import("diagnostics").wait_audit;
 const guest_exception_ledger = @import("diagnostics").guest_exception_ledger;
 const preflight_lib = @import("preflight");
@@ -180,6 +181,7 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     observeXeniaPipelineGuestLog(self, message);
     observeGpuBootstrapGuestLog(self, message);
     observeXeniaGpuHandoffGuestLog(self, message);
+    observeXeniaGpuCausalTraceGuestLog(self, message);
     observeImportBindingAudit(self, message);
     observeGuestEventSignal(self, message);
     observeLivelockWaits(self, message);
@@ -1059,6 +1061,17 @@ pub fn observeXeniaGpuHandoffGuestLog(self: anytype, message: []const u8) void {
         "macho-processor: Xenia GPU handoff advanced: {s} -> {s} at step={d}\n",
         .{ @tagName(observation.previous), @tagName(observation.current), self.executed_steps },
     );
+}
+
+/// Feed the causal GPU observer from Xenia's own structured breadcrumbs.  The
+/// observer is intentionally separate from the older handoff ledger: its
+/// first-draw stage and bounded wait/signal tail answer why a title can submit
+/// PM4 state and still never reach VdSwap.
+pub fn observeXeniaGpuCausalTraceGuestLog(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "xenia_gpu_causal_trace")) return;
+    _ = xenia_gpu_causal_trace;
+    _ = self.xenia_gpu_causal_trace.observeLine(message, self.executed_steps);
 }
 
 /// One candidate writer found by sweeping the lock's aliases, with enough

@@ -146,6 +146,11 @@ pub fn deliverGuestSignal(
     frame.fault_instruction = fault_instruction;
     frame.assertion_context = assertion_context;
     frame.saved_assertion_context = self.last_guest_assertion;
+    // Keep a scalar snapshot in the frame as well as the Darwin mcontext.
+    // The handler may edit mcontext before returning; if it fails to resolve
+    // the fault, diagnostics must still describe the interrupted instruction's
+    // operands rather than the handler's working registers.
+    frame.saved_regs = self.regs;
     frame.saved_xmm = self.xmm;
     frame.saved_ymm_hi = self.ymm_hi;
     frame.saved_k = self.k;
@@ -340,6 +345,25 @@ pub fn finishGuestSignalReturn(self: anytype) bool {
                 .access = if (frame.fault_access) |access| @tagName(access) else "unknown",
                 .fault = "permission_denied",
                 .mapped = true,
+                .fault_regs = .{
+                    .rax = frame.saved_regs.rax,
+                    .rbx = frame.saved_regs.rbx,
+                    .rcx = frame.saved_regs.rcx,
+                    .rdx = frame.saved_regs.rdx,
+                    .rsi = frame.saved_regs.rsi,
+                    .rdi = frame.saved_regs.rdi,
+                    .rbp = frame.saved_regs.rbp,
+                    .rsp = frame.saved_regs.rsp,
+                    .r8 = frame.saved_regs.r8,
+                    .r9 = frame.saved_regs.r9,
+                    .r10 = frame.saved_regs.r10,
+                    .r11 = frame.saved_regs.r11,
+                    .r12 = frame.saved_regs.r12,
+                    .r13 = frame.saved_regs.r13,
+                    .r14 = frame.saved_regs.r14,
+                    .r15 = frame.saved_regs.r15,
+                },
+                .fault_regs_valid = true,
             };
         } else {
             machoCapturePrint(

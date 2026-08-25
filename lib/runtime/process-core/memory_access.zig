@@ -5072,6 +5072,28 @@ pub fn ensureGuestAccess(self: anytype, address: u64, bytes: u8, access: GuestAc
 
 pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: GuestAccess, instruction: []const u8) void {
     if (self.terminal_memory_failure != null) return;
+    // Capture the architectural state before any recovery, signal delivery, or
+    // the scalar load's diagnostic-zero return can change it. In particular,
+    // an interpreted `mov rax, [rax]` otherwise overwrites the evidence in
+    // rax before the exit report is assembled.
+    const fault_regs = exit_diagnostics.TerminalRegs{
+        .rax = self.regs.rax,
+        .rbx = self.regs.rbx,
+        .rcx = self.regs.rcx,
+        .rdx = self.regs.rdx,
+        .rsi = self.regs.rsi,
+        .rdi = self.regs.rdi,
+        .rbp = self.regs.rbp,
+        .rsp = self.regs.rsp,
+        .r8 = self.regs.r8,
+        .r9 = self.regs.r9,
+        .r10 = self.regs.r10,
+        .r11 = self.regs.r11,
+        .r12 = self.regs.r12,
+        .r13 = self.regs.r13,
+        .r14 = self.regs.r14,
+        .r15 = self.regs.r15,
+    };
     if (tryQuarantineOpaqueDestructor(self, address)) return;
     if (tryRepairStringBufferNullTerminator(self, address, bytes, access)) return;
     const description = describeGuestAccess(self, address, bytes, access);
@@ -5211,6 +5233,8 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
         .access = @tagName(access),
         .fault = fault,
         .mapped = description.mapped,
+        .fault_regs = fault_regs,
+        .fault_regs_valid = true,
     };
     // Check for heap corruption when the access involves reading a pointer
     // that looks like function prologue bytes — a common symptom of buffer
@@ -5218,7 +5242,7 @@ pub fn terminateForGuestAccess(self: anytype, address: u64, bytes: u8, access: G
     if (bytes == 8 or bytes == 4) {
         // The offending value may be in rax (if this was a dereference of
         // a computed address), or we check the fault address itself.
-        dumpHeapCorruptionDiagnostics(self, self.regs.rax, self.regs.rip);
+        dumpHeapCorruptionDiagnostics(self, fault_regs.rax, self.regs.rip);
     }
     dumpStepTraceBuffer(self);
     self.dumpCoopBootstrapTrace();
