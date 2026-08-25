@@ -967,12 +967,6 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if ((name_hash == importNameHash("__ZNSt3__16chrono12system_clock3nowEv") and std.mem.eql(u8, name, "__ZNSt3__16chrono12system_clock3nowEv"))) {
         return .{ .handled = self.guest_time.wallNow() };
     }
-    if (std.mem.indexOf(u8, name, "recursive_mutexC1Ev") != null or
-        std.mem.indexOf(u8, name, "recursive_mutexC2Ev") != null)
-    {
-        _ = self.fillGuestMemory(self.regs.rdi, 64, 0);
-        return .{ .handled = self.regs.rdi };
-    }
     if (libcpp_thread.classify(name)) |operation| {
         if (self.write_diagnostics_armed) {
             const caller = importCallerAddress(self);
@@ -2416,12 +2410,14 @@ pub fn handleCooperativeWaitImport(self: anytype, imported: macho_metadata.Impor
 // Unlike condition waits, keep the guest call frame intact so resuming the
 // worker re-enters pthread_mutex_lock rather than falsely reporting that
 // it acquired the mutex.
+fn isCooperativeMutexLockSymbol(name: []const u8) bool {
+    return std.mem.eql(u8, name, "_pthread_mutex_lock") or
+        std.mem.eql(u8, name, "__ZNSt3__15mutex4lockEv") or
+        std.mem.indexOf(u8, name, "recursive_mutex4lockEv") != null;
+}
+
 pub fn handleCooperativeMutexContention(self: anytype, imported: macho_metadata.ImportedSymbol) bool {
-    if (!std.mem.eql(u8, imported.name, "_pthread_mutex_lock") and
-        !std.mem.eql(u8, imported.name, "__ZNSt3__15mutex4lockEv"))
-    {
-        return false;
-    }
+    if (!isCooperativeMutexLockSymbol(imported.name)) return false;
     const owner = self.pthreads.currentThreadHandle(self);
     if (!self.pthreads.mutexWouldBlock(self.regs.rdi, owner)) return false;
     self.pthreads.collapsed_waits +|= 1;
