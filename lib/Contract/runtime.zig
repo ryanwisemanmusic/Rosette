@@ -329,8 +329,6 @@ test "dispatchContract handles all trivially-dispatchable contracts" {
         "__ZNSt3__16threadD1Ev",
         "__ZNSt3__15mutex4lockEv",
         "__ZNSt3__15mutex6unlockEv",
-        "recursive_mutex4lockEv",
-        "recursive_mutex6unlockEv",
         "_gtk_dialog_run",
         "_gtk_widget_destroy",
         "_localtime",
@@ -347,7 +345,6 @@ test "dispatchContract handles all trivially-dispatchable contracts" {
         .{ .name = "_gtk_init_check", .expected = 1 },
         .{ .name = "_gtk_message_dialog_new", .expected = 1 },
         .{ .name = "_gtk_dialog_get_type", .expected = 1 },
-        .{ .name = "recursive_mutex8try_lockEv", .expected = 1 },
     };
     for (synthesized) |pair| {
         const result = dispatchContract(&registry, pair.name, 0);
@@ -356,6 +353,23 @@ test "dispatchContract handles all trivially-dispatchable contracts" {
             return error.TestUnexpectedResult;
         }
         try std.testing.expectEqual(pair.expected, result.?.handled);
+    }
+}
+
+test "recursive mutex contracts defer to the stateful pthread runtime" {
+    const symbols = [_][]const u8{
+        "recursive_mutexC1Ev",
+        "recursive_mutexC2Ev",
+        "recursive_mutex4lockEv",
+        "recursive_mutex6unlockEv",
+        "recursive_mutex8try_lockEv",
+        "recursive_mutexD1Ev",
+        "recursive_mutexD2Ev",
+    };
+    for (symbols) |symbol| {
+        const resolved = resolveFromAllFamilies(symbol) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(ResolutionStrategy.custom_handler, resolved.strategy);
+        try std.testing.expect(dispatchFromAllFamilies(symbol, 0) == null);
     }
 }
 
