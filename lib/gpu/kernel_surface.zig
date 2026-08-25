@@ -37,6 +37,7 @@
 //! reported separately so it cannot be mistaken for a cause.
 
 const std = @import("std");
+const kernel_export_map = @import("xenia_kernel_export_map");
 
 /// The GPU-facing kernel exports, function and variable alike, in the order a
 /// title's display bring-up touches them.
@@ -167,6 +168,64 @@ pub const Population = enum {
         };
     }
 };
+
+/// The name of *any* xboxkrnl ordinal, not only the video ones above.
+///
+/// `Export` deliberately carries just the sixteen exports the GPU bring-up
+/// path touches, because those are the ones this module reasons about. But a
+/// title imports by ordinal across the whole 922-entry kernel, and a
+/// diagnostic that can only name sixteen of them prints a bare number for the
+/// rest — which is what made the kernel-export layer unreadable and left
+/// "kernel export binding" reported as untested.
+///
+/// `pkg/common/xenia/kernel-export-map` carries the full table transcribed
+/// from the console's own export tables, so every ordinal a title can import
+/// resolves here. Null still means "the kernel does not publish this", which
+/// is a real and useful answer — a fabricated `ordinal_258` would read as a
+/// genuine export and send someone looking for one.
+pub fn nameOfOrdinal(ordinal: u16) ?[]const u8 {
+    return kernel_export_map.nameOf(.xboxkrnl, ordinal);
+}
+
+/// Whether an ordinal names a variable export, across the whole kernel.
+///
+/// The distinction matters at the import boundary: binding a variable as
+/// though it were code produces a jump into data the moment the title
+/// dereferences it.
+pub fn ordinalIsVariable(ordinal: u16) bool {
+    return kernel_export_map.isVariable(.xboxkrnl, ordinal);
+}
+
+test "any kernel ordinal resolves, not just the video ones" {
+    // The sixteen this module knows still resolve...
+    try std.testing.expectEqualStrings(
+        "VdInitializeRingBuffer",
+        nameOfOrdinal(@intFromEnum(Export.vd_initialize_ring_buffer)).?,
+    );
+    // ...and so does the rest of the kernel, which previously printed as a
+    // bare number.
+    try std.testing.expectEqualStrings("DbgBreakPoint", nameOfOrdinal(0x0001).?);
+    try std.testing.expectEqualStrings("KeTlsAlloc", nameOfOrdinal(0x0152).?);
+    // The call that produces the pointer VdInitializeRingBuffer is handed.
+    // Being able to name it is the difference between "the title called 0xBE"
+    // and "the title asked for a physical address for its ring".
+    try std.testing.expectEqualStrings("MmGetPhysicalAddress", nameOfOrdinal(0x00BE).?);
+    // An unpublished ordinal is reported as absent rather than invented.
+    try std.testing.expect(nameOfOrdinal(0xFFFF) == null);
+}
+
+test "the enum's own names agree with the full table" {
+    // Two independently maintained lists of the same facts: if lib's hand
+    // written sixteen ever drift from the console's table, this names the one
+    // that moved instead of letting a wrong name reach a report.
+    for (std.enums.values(Export)) |entry| {
+        const from_table = nameOfOrdinal(entry.ordinal()) orelse {
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqualStrings(entry.name(), from_table);
+        try std.testing.expectEqual(entry.isVariable(), ordinalIsVariable(entry.ordinal()));
+    }
+}
 
 const Entry = struct {
     /// Whether the title's import table references this export at all.
