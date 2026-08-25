@@ -42,9 +42,11 @@ const foreign_object_runtime = @import("guest_abi").foreign_object_runtime;
 const native_window_runtime = @import("guest_abi").native_window_runtime;
 const sdl_runtime = @import("guest_abi").sdl_runtime;
 const logging_runtime = @import("diagnostics").logging_runtime;
+const rosette_pkg_log = @import("diagnostics").rosette_pkg_log;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const xenia_pipeline = @import("diagnostics").xenia_pipeline;
 const xenia_gpu_handoff = @import("diagnostics").xenia_gpu_handoff;
+const xenia_gpu_causal_trace = @import("diagnostics").xenia_gpu_causal_trace;
 const xenia_memory_views = @import("diagnostics").xenia_memory_views;
 const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
 const deadlock_predictor = @import("diagnostics").deadlock_predictor;
@@ -675,6 +677,11 @@ pub const MachOState = struct {
     executable_section_high: u64 = 0,
     executable_section_verdict: bool = false,
     xenia_gpu_handoff: xenia_gpu_handoff.Ledger = .{},
+    /// Unified producer-to-present causal evidence. Unlike the handoff ledger
+    /// this includes the first-draw boundary and a bounded wait/signal tail,
+    /// so a run that submits state but never draws points at the title's next
+    /// owner instead of collapsing everything into "VdSwap missing".
+    xenia_gpu_causal_trace: xenia_gpu_causal_trace.Ledger = .{},
     /// Translation between the Xbox addresses Xenia prints and the host-view
     /// addresses Rosette actually interprets. Learned from Xenia's mmap rather
     /// than hardcoded to this process run.
@@ -999,6 +1006,8 @@ pub const MachOState = struct {
     graphics_last_role_mask: u8 = 0,
     graphics_last_ring_published: bool = false,
     graphics_last_anomaly_count: usize = std.math.maxInt(usize),
+    graphics_last_causal_events: u64 = std.math.maxInt(u64),
+    graphics_last_causal_mask: u16 = std.math.maxInt(u16),
     /// Guest anomalies with what happened after each. A count alone has been
     /// non-zero in every run of this investigation and has therefore stopped
     /// being read; a disposition is what makes one actionable or dismissible.
@@ -4201,6 +4210,13 @@ pub const MachOState = struct {
         if (survey.best()) |chosen| {
             if (self.guestMemoryConst(chosen.address, self.gpu_ring_watch_size)) |bytes| {
                 const summary = gpu.ring_scan.scan(bytes, geometry.read_pointer, span, ring_dwords);
+                self.xenia_gpu_causal_trace.observeRingPayload(
+                    summary.packets,
+                    summary.draw_packets,
+                    summary.swap_packets,
+                    self.executed_steps,
+                    self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.advances != 0,
+                );
                 machoCapturePrint(
                     "  outstanding span: projection={s} read={d} write={d} span={d} examined={d} walked={d} packets={d} draws={d} swaps={d} truncated={s} desync={s}; {s}\n",
                     .{
@@ -4229,6 +4245,24 @@ pub const MachOState = struct {
                     );
                     if (self.gpu_xenos_runtime.executeRingBytes(bytes, geometry.read_pointer, span, ring_dwords)) |execution| {
                         if (execution.draws != 0) self.gpu_ring_draws_seen = true;
+                        _ = self.xenia_gpu_causal_trace.observePm4SpanWithIndirects(
+                            bytes,
+                            geometry.read_pointer,
+                            span,
+                            ring_dwords,
+                            self.executed_steps,
+                            true,
+                            self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.advances != 0,
+                            self,
+                            xenosMemoryRead,
+                        );
+                        self.xenia_gpu_causal_trace.observeConsumedBatch(
+                            @intCast(execution.packets_after - execution.packets_before),
+                            @intCast(execution.draws),
+                            @intCast(execution.swaps),
+                            self.executed_steps,
+                            self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.advances != 0,
+                        );
                         machoCapturePrint(
                             "macho-processor: XENOS PM4 execution: batches={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s}; state_draws={d} state_swaps={d}\n",
                             .{
@@ -4382,6 +4416,68 @@ pub const MachOState = struct {
         // emulator's largest size is half a million dwords, and this runs on a
         // heartbeat in a ReleaseFast build where nothing else caps it.
         const written = gpu.ring_payload.digest(bytes, ring_dwords, gpu.ring_scan.max_search_dwords);
+        self.xenia_gpu_causal_trace.observeRingPayload(
+            written.real_packets,
+            written.draws,
+            written.swaps,
+            self.executed_steps,
+            self.gpu_ring_injection.injections == 0,
+        );
+        if (written.run_count != 0) {
+            // A drained primary span has equal read/write pointers, but the
+            // retained ring still contains the exact batch the command
+            // processor consumed.  Build the smallest envelope around the
+            // written runs so a root INDIRECT_BUFFER packet can be followed
+            // without pretending the whole ring is a live outstanding span.
+            const root_start = written.runs[0].start;
+            var root_end: u32 = root_start;
+            var run_index: u32 = 0;
+            while (run_index < written.run_count) : (run_index += 1) {
+                const written_run = written.runs[run_index];
+                const end = written_run.start +| written_run.length;
+                if (end > root_end) root_end = end;
+            }
+            if (root_end > root_start and root_start < ring_dwords) {
+                const root_count = @min(root_end - root_start, ring_dwords - root_start);
+                const consumed = self.xenia_gpu_handoff.pm4_packets != 0 or
+                    self.execution_tracepoints.roleEntered(.command_processor);
+                const authentic = self.gpu_ring_injection.injections == 0 and
+                    self.gpu_ring_publication.published();
+                const indirect = self.xenia_gpu_causal_trace.observePm4SpanWithIndirects(
+                    bytes,
+                    root_start,
+                    root_count,
+                    ring_dwords,
+                    self.executed_steps,
+                    consumed,
+                    authentic,
+                    self,
+                    xenosMemoryRead,
+                );
+                machoCapturePrint(
+                    "macho-processor: PM4 INDIRECT WALK: root_start={d} root_dwords={d} consumed={s} authentic={s} root_packets={d} nested_packets={d} refs={d} readable={d} unreadable={d} draws(root/nested/total)={d}/{d}/{d} swaps(root/nested/total)={d}/{d}/{d} cycles={d} truncated={s}\n",
+                    .{
+                        root_start,
+                        root_count,
+                        if (consumed) "YES" else "NO",
+                        if (authentic) "YES" else "NO",
+                        indirect.root_packets,
+                        indirect.nested_packets,
+                        indirect.indirect_references,
+                        indirect.readable_references,
+                        indirect.unreadable_references,
+                        indirect.root_draw_packets,
+                        indirect.nested_draw_packets,
+                        indirect.draw_packets,
+                        indirect.root_swap_packets,
+                        indirect.nested_swap_packets,
+                        indirect.swap_packets,
+                        indirect.cycle_references,
+                        if (indirect.root_truncated) "YES" else "NO",
+                    },
+                );
+            }
+        }
         machoCapturePrint(
             "macho-processor: RING PAYLOAD: projection={s} nonzero_dwords={d} runs={d} (dropped={d}) real_packets={d} draws={d} swaps={d} scanned={d}; {s}\n",
             .{
@@ -5630,9 +5726,40 @@ pub const MachOState = struct {
         );
     }
 
+    /// Print the producer-to-present causal trace.  This stays separate from
+    /// the graphics contract because the contract is a current frontier while
+    /// this ledger retains the bounded history needed to explain a repeated
+    /// wait or a state-only PM4 batch.
+    pub fn logXeniaGpuCausalTrace(self: *MachOState, force: bool) void {
+        self.xenia_gpu_causal_trace.logSummary(self.executed_steps, force);
+    }
+
+    /// Join execution-boundary facts into the causal ledger before deciding
+    /// whether a graphics checkpoint changed. This keeps tracepoint evidence
+    /// visible even when Xenia's own breadcrumb was split across a log write.
+    fn refreshXeniaGpuCausalTrace(self: *MachOState) void {
+        const at = self.executed_steps;
+        if (self.execution_tracepoints.roleEntered(.swap)) {
+            self.xenia_gpu_causal_trace.observeStage(.guest_vdswap_entered, at);
+        }
+        if (self.guest_vdswap_packet_encoded) {
+            self.xenia_gpu_causal_trace.observeStage(.swap_packet_encoded, at);
+        }
+        if (self.guest_vdswap_entry_completed) {
+            self.xenia_gpu_causal_trace.observeStage(.guest_vdswap_completed, at);
+        }
+        if (self.gpu_bootstrap.seen(.pm4_packet_consumed)) {
+            self.xenia_gpu_causal_trace.observeEvidence(.pm4_packet_consumed, at);
+        }
+        if (self.gpu_bootstrap.seen(.swap)) {
+            self.xenia_gpu_causal_trace.observeEvidence(.authentic_swap_consumed, at);
+        }
+    }
+
     /// emitted periodically and again at exit.
     pub fn logGraphicsFrontier(self: *MachOState, force: bool) void {
         self.graphics_summary_emissions +|= 1;
+        self.refreshXeniaGpuCausalTrace();
         const tracepoints = &self.execution_tracepoints;
         const frontier = self.gpu_bootstrap.frontier();
         const frontier_tag = if (frontier.step) |frontier_step|
@@ -5647,17 +5774,23 @@ pub const MachOState = struct {
             }
         }
         const ring_published = self.gpu_ring_publication.published();
+        const causal_changed =
+            self.xenia_gpu_causal_trace.total_events != self.graphics_last_causal_events or
+            self.xenia_gpu_causal_trace.observed_mask != self.graphics_last_causal_mask;
         const state_changed =
             frontier_tag != self.graphics_last_frontier_tag or
             frontier.reached != self.graphics_last_frontier_reached or
             role_mask != self.graphics_last_role_mask or
             ring_published != self.graphics_last_ring_published or
-            self.anomalies.count != self.graphics_last_anomaly_count;
+            self.anomalies.count != self.graphics_last_anomaly_count or
+            causal_changed;
         self.graphics_last_frontier_tag = frontier_tag;
         self.graphics_last_frontier_reached = frontier.reached;
         self.graphics_last_role_mask = role_mask;
         self.graphics_last_ring_published = ring_published;
         self.graphics_last_anomaly_count = self.anomalies.count;
+        self.graphics_last_causal_events = self.xenia_gpu_causal_trace.total_events;
+        self.graphics_last_causal_mask = self.xenia_gpu_causal_trace.observed_mask;
 
         // The ring is read whether or not the frontier moved.
         //
@@ -5731,6 +5864,7 @@ pub const MachOState = struct {
                 },
             );
             self.logSwapHealth();
+            self.logXeniaGpuCausalTrace(false);
             return;
         }
         machoCapturePrint(
@@ -5744,6 +5878,7 @@ pub const MachOState = struct {
             },
         );
         self.logSwapHealth();
+        self.logXeniaGpuCausalTrace(force);
         self.logGraphicsContract();
         self.logKernelSurface();
         self.logKernelVariables();
@@ -9406,6 +9541,12 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         .step = 0,
         .reason = options.path,
     });
+    // Package contract verification: checks all Xenia contracts at startup
+    // and writes results to .rosette/rosette-pkg.log. Failures are also
+    // piped to stderr (rosette-runtime.log) for immediate visibility.
+    var pkg_log = rosette_pkg_log.Logger{};
+    pkg_log.open(allocator);
+    defer pkg_log.close();
     output.human("Loading imports...\n", .{});
     state.cpu_profile = selectedCpuProfile();
     state.verbose_trace = options.trace or environmentFlag("ROSETTE_MACHO_VERBOSE_TRACE");

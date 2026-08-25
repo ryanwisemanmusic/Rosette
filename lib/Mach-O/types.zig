@@ -787,6 +787,11 @@ pub const GuestSignalFrame = struct {
     /// nearby-UD2 provenance.
     assertion_context: GuestAssertionContext = .{},
     saved_assertion_context: GuestAssertionContext = .{},
+    /// The complete scalar register state at the fault boundary. A guest
+    /// signal handler is allowed to rewrite its mcontext, so the live
+    /// `self.regs` value after an unresolved return is not necessarily the
+    /// state that caused the protection fault.
+    saved_regs: Regs = .{},
     saved_xmm: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     saved_ymm_hi: [16][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 16,
     saved_k: [8]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 8,
