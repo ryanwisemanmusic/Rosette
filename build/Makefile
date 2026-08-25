@@ -220,7 +220,7 @@ OBJC_FRAMEWORKS := -framework Cocoa -framework Foundation
 ISO_BIN := $(ZIG_OUT_DIR)/bin/rosette-iso
 ISO_SRC := $(ROOT_DIR)/src/tooling/iso/main.zig
 
-.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
+.PHONY: all help check clean zig-build run prodder prodder-all prodder-build window-lib cli-lib snake-window elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build assembler-runner-build compat-router-build link-audit-build pkg-boundary-audit vendor-library-audit vendor-audit shell-helper-build shell shell-update shell-uninstall shell-clean-state exe-list exe-runner-build exe-runner-cleanup exe-run exe-export app-exe-builder-build app-suite-binary app-exe bundled-app-exes app-exe-run app-exe-parse iso-build iso-run app-wrapper installer uninstaller app-all release notarize-installer notarize-uninstaller notarize-app-all c-fix c-fix-build
 
 all: headers-check zig-build test-run
 
@@ -244,6 +244,7 @@ help:
 		'  make snake-window Build snake game with native Cocoa window' \
 		'  make shell       Install transparent Rosette make-time shell checks' \
 		'  make shell-update Refresh the Rosette shell helper/snippet/wrappers' \
+		'  make vendor-audit Audit vendored library sources, target records, and host providers' \
 		'  make shell-uninstall Remove Rosette shell integration' \
 		'  make shell-clean-state Kill stale Rosette shell/ELF helper processes' \
 		'  make c-fix        Run C transpiler on C sources to fix implicit narrowing conversions' \
@@ -367,7 +368,12 @@ compat-router-build:
 pkg-boundary-audit:
 	@cd "$(ROOT_DIR)" && python3 tools/audit_pkg_boundary.py
 
-shell-helper-build: pkg-boundary-audit c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
+vendor-library-audit:
+	@cd "$(ROOT_DIR)" && python3 tools/check_vendor_libraries.py $(if $(XENIA_ROOT),--xenia-root "$(XENIA_ROOT)",)
+
+vendor-audit: vendor-library-audit
+
+shell-helper-build: pkg-boundary-audit vendor-library-audit c-fix-build assembler-runner-build elf-processor-build macho-processor-build elf-processor-dylib avx-shim-build compat-router-build
 	@mkdir -p "$(ZIG_CACHE_DIR)/global"
 	@cd "$(ROOT_DIR)" && ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_DIR)" ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)" zig build-exe -lc --dep entrypoint_alignment --dep entrypoint_kernel_process_guard --dep compat_source_include_compat --dep compat_third_party_include_compat -Mroot="$(SHELL_HELPER_SRC)" -Mentrypoint_alignment=src/entrypoint/alignment/root.zig -Mentrypoint_kernel_process_guard=src/entrypoint/kernel/process_guard.zig -Mcompat_source_include_compat=src/compat/source/include_compat.zig -Mcompat_third_party_include_compat=src/compat/third_party/include_compat.zig -femit-bin="$(SHELL_HELPER_BIN)"
 
