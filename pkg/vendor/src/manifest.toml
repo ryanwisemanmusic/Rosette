@@ -1,0 +1,92 @@
+schema_version = 1
+catalogue = "rosette-vendored-library-catalogue"
+source_root = "../sources"
+target_root = ".."
+source_hash_algorithm = "sha256(path-and-content-v1)"
+
+# These are the facts that are allowed to be shared by every host route. The
+# target.toml files below contain only ABI/provider choices for one
+# architecture/platform pair; they deliberately do not repeat versions.
+[matrix]
+architectures = ["x86_64", "aarch64", "powerpc64"]
+platforms = ["windows", "macOS", "linux"]
+expected_target_count = 9
+
+# Xenia's source dependency and runtime requirement are different contracts.
+# It builds against the header snapshot below, starts instance negotiation at
+# Vulkan 1.0, and requires only a Vulkan 1.0-capable runtime. A newer loader
+# or ICD may be selected at runtime after capability negotiation.
+[xenia]
+vulkan_header_version = "1.4.313"
+vulkan_header_commit = "409c16be502e39fe70dd6fe2d9ad4842ef2c9a53"
+vulkan_instance_default_api = "1.0.0"
+vulkan_runtime_minimum_api = "1.0.0"
+sdl_version = "2.32.2"
+vma_version = "3.2.1"
+moltenvk_version = "1.4.2"
+package_log = ".rosette/rosette-pkg.log"
+
+[[libraries]]
+id = "vulkan-headers"
+version = "1.4.313"
+kind = "header-source"
+role = "build-time"
+upstream = "https://github.com/KhronosGroup/Vulkan-Headers.git"
+release_tag = "v1.4.313"
+commit = "409c16be502e39fe70dd6fe2d9ad4842ef2c9a53"
+xenia_submodule = "third_party/Vulkan-Headers"
+source_dir = "sources/vulkan-headers/1.4.313"
+source_tree_sha256 = "cec66cb2dace902ce889e24d8564e4bee3d59ab5c651f6f1f7ab5c03d7d2b76b"
+license_file = "LICENSE.md"
+
+[[libraries]]
+id = "vulkan-loader"
+version = "1.4.313"
+kind = "runtime-loader-source"
+role = "source-mirror"
+upstream = "https://github.com/KhronosGroup/Vulkan-Loader.git"
+release_tag = "v1.4.313"
+commit = "fb78607414e154c7a5c01b23177ba719c8a44909"
+xenia_submodule = ""
+source_dir = "sources/vulkan-loader/1.4.313"
+source_tree_sha256 = "e84b25f900797590568fb71fa830cfcc28d4556e0cf07c844cee363767ff7a9e"
+license_file = "LICENSE.txt"
+
+[[libraries]]
+id = "moltenvk"
+version = "1.4.2"
+kind = "metal-vulkan-icd-source"
+role = "source-mirror"
+upstream = "https://github.com/KhronosGroup/MoltenVK.git"
+release_tag = "v1.4.2"
+commit = "db66022459ffb663aa2b50f6b018bc2e124f5edf"
+xenia_submodule = ""
+source_dir = "sources/moltenvk/1.4.2"
+source_tree_sha256 = "8f77437f9e040da227c0093a6051fb96b13ed6989164ab05bce4d679dc3eb7fb"
+license_file = "LICENSE"
+
+[[libraries]]
+id = "sdl2"
+version = "2.32.2"
+kind = "windowing-input-audio-source"
+role = "source-mirror"
+upstream = "https://github.com/libsdl-org/SDL.git"
+release_tag = "release-2.32.2"
+commit = "e11183ea6caa3ae4895f4bc54cad2bbb0e365417"
+xenia_submodule = "third_party/SDL2"
+source_dir = "sources/sdl2/2.32.2"
+source_tree_sha256 = "9d72b72f89bc769f290eb2293dc3b41791de3cf5a04ba1756a018b615f00b9a4"
+license_file = "LICENSE.txt"
+
+[[libraries]]
+id = "vulkan-memory-allocator"
+version = "3.2.1"
+kind = "vulkan-allocation-source"
+role = "source-mirror"
+upstream = "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git"
+release_tag = "v3.2.1"
+commit = "c788c52156f3ef7bc7ab769cb03c110a53ac8fcb"
+xenia_submodule = "third_party/VulkanMemoryAllocator"
+source_dir = "sources/vulkan-memory-allocator/3.2.1"
+source_tree_sha256 = "94e5ed936098eb02dced4a3473d027b3feb6054543e24d442be57b68ed7af390"
+license_file = "LICENSE.txt"

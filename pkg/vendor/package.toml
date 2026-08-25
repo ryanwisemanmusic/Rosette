@@ -1,0 +1,11 @@
+name = "rosette-vendored-library-catalogue"
+version = "0.1.0-local"
+kind = "vendored-library-catalogue-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# The package root is pkg/vendor so its Zig contract can embed the adjacent
+# manifest.toml without copying or re-expressing version truth. The source
+# mirrors and target records remain data owned by that same catalogue.

@@ -1,0 +1,9 @@
+target_id = "powerpc64-linux"
+architecture = "powerpc64"
+platform = "linux"
+abi = "powerpc64-linux-gnu"
+source_root = "../../sources"
+libraries = ["vulkan-headers", "vulkan-loader", "sdl2", "vulkan-memory-allocator", "moltenvk"]
+vulkan_provider = "libvulkan.so.1 (source contract; no host binary assumed)"
+sdl_provider = "vendored-source-cross-build"
+assembly_probe = "powerpc64-linux-gnu"

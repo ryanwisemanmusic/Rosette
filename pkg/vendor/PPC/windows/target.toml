@@ -1,0 +1,9 @@
+target_id = "powerpc64-windows"
+architecture = "powerpc64"
+platform = "windows"
+abi = "powerpc64-pc-windows-msvc"
+source_root = "../../sources"
+libraries = ["vulkan-headers", "vulkan-loader", "sdl2", "vulkan-memory-allocator", "moltenvk"]
+vulkan_provider = "vulkan-1.dll (source contract; no host binary assumed)"
+sdl_provider = "vendored-source-build"
+assembly_probe = "powerpc64-windows-cross"

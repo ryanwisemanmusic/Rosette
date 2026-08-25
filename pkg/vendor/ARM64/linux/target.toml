@@ -1,0 +1,9 @@
+target_id = "aarch64-linux"
+architecture = "aarch64"
+platform = "linux"
+abi = "aarch64-linux-gnu"
+source_root = "../../sources"
+libraries = ["vulkan-headers", "vulkan-loader", "sdl2", "vulkan-memory-allocator", "moltenvk"]
+vulkan_provider = "libvulkan.so.1"
+sdl_provider = "pkg-config-or-vendored-source"
+assembly_probe = "aarch64-linux-gnu"

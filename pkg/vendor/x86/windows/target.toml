@@ -1,0 +1,9 @@
+target_id = "x86_64-windows"
+architecture = "x86_64"
+platform = "windows"
+abi = "x86_64-pc-windows-msvc"
+source_root = "../../sources"
+libraries = ["vulkan-headers", "vulkan-loader", "sdl2", "vulkan-memory-allocator", "moltenvk"]
+vulkan_provider = "vulkan-1.dll"
+sdl_provider = "vendored-source-build"
+assembly_probe = "x86_64-msvc"

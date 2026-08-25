@@ -1,0 +1,9 @@
+target_id = "powerpc64-macOS"
+architecture = "powerpc64"
+platform = "macOS"
+abi = "powerpc64-apple-macos-cross"
+source_root = "../../sources"
+libraries = ["vulkan-headers", "vulkan-loader", "sdl2", "vulkan-memory-allocator", "moltenvk"]
+vulkan_provider = "libvulkan.1.dylib (source contract; no host binary assumed)"
+sdl_provider = "vendored-source-cross-build"
+assembly_probe = "powerpc64-darwin-cross"

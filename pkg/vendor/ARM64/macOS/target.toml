@@ -1,0 +1,9 @@
+target_id = "aarch64-macOS"
+architecture = "aarch64"
+platform = "macOS"
+abi = "aarch64-apple-macos"
+source_root = "../../sources"
+libraries = ["vulkan-headers", "vulkan-loader", "sdl2", "vulkan-memory-allocator", "moltenvk"]
+vulkan_provider = "libvulkan.1.dylib + MoltenVK ICD"
+sdl_provider = "system-framework-or-vendored-source"
+assembly_probe = "aarch64-darwin"
