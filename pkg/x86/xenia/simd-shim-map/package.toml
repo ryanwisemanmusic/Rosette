@@ -1,0 +1,7 @@
+name = "xenia-x86-simd-shim-map"
+version = "0.1.0-local"
+kind = "host-simd-translation-shim-map"
+role = "build-time"
+architectures = ["x86_64"]
+language = "zig"
+verification = "verify.sh"
