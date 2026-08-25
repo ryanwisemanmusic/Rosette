@@ -1,0 +1,7 @@
+name = "common-xenia-log-ring-contract"
+version = "0.1.0-local"
+kind = "emulator-log-ring-sequence-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
