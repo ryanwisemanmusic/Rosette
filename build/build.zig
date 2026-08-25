@@ -2050,6 +2050,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        const vendor_library_contract_mod = b.createModule(.{
+            .root_source_file = b.path("../pkg/vendor/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         const diagnostics_mod = b.createModule(.{
             .root_source_file = b.path("../lib/diagnostics/root.zig"),
             .target = target,
@@ -2059,6 +2064,62 @@ pub fn build(b: *std.Build) void {
         diagnostics_mod.addImport("xenia_shader_storage_contract", xenia_shader_storage_contract_mod);
         xenia_log_phrase_map_mod.addImport("phrase_filter", phrase_filter_mod);
         diagnostics_mod.addImport("xenia_log_phrase_map", xenia_log_phrase_map_mod);
+        diagnostics_mod.addImport("vendor_library_contract", vendor_library_contract_mod);
+        // Package contract checks: rosette_pkg_log calls contractIsWellFormed()
+        // on each at startup and writes results to .rosette/rosette-pkg.log.
+        diagnostics_mod.addImport("xenia_mount_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/mount-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_kernel_object_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/kernel-object-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_texture_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/texture-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_io_completion_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/io-completion-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_user_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/user-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_shader_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/shader-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_render_target_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/render-target-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_audio_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/audio-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_input_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/input-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_timer_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/timer-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenos_register_map", xenos_register_map_mod);
+        diagnostics_mod.addImport("xenia_graphics_contract", xenia_graphics_contract_mod);
+        diagnostics_mod.addImport("xenia_surface_path_contract", xenia_surface_path_contract_mod);
         const diagnostics_test = b.addTest(.{ .root_module = diagnostics_mod });
         check_step.dependOn(&b.addRunArtifact(diagnostics_test).step);
         diagnostics_mod.addImport("macho_compat_runtime", macho_compat_runtime_mod);
