@@ -1,0 +1,7 @@
+name = "common-xenia-xex-format"
+version = "0.1.0-local"
+kind = "console-xex-module-format"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
