@@ -853,9 +853,9 @@ pub const CxxContracts = struct {
             },
             Contract{
                 .name = "recursive_mutex_construct",
-                .description = "libc++ recursive_mutex constructor",
+                .description = "Stateful libc++ recursive_mutex constructor handled by the Rosette pthread runtime",
                 .kind = .cxx_mutex,
-                .strategy = .forward_to_host,
+                .strategy = .custom_handler,
                 .matches = &.{
                     MatchPattern{ .contains = "recursive_mutexC1Ev" },
                     MatchPattern{ .contains = "recursive_mutexC2Ev" },
@@ -863,17 +863,16 @@ pub const CxxContracts = struct {
             },
             Contract{
                 .name = "recursive_mutex_try_lock",
-                .description = "libc++ recursive_mutex::try_lock",
+                .description = "Stateful libc++ recursive_mutex::try_lock with owner-aware reentrancy",
                 .kind = .cxx_mutex,
-                .strategy = .synthesize,
+                .strategy = .custom_handler,
                 .matches = &.{MatchPattern{ .contains = "recursive_mutex8try_lockEv" }},
-                .returns = .{ .fixed = 1 },
             },
             Contract{
-                .name = "recursive_mutex_stub",
-                .description = "libc++ recursive_mutex lock/unlock/destroy",
+                .name = "recursive_mutex_runtime",
+                .description = "Stateful libc++ recursive_mutex lock/unlock/destroy lifecycle",
                 .kind = .cxx_mutex,
-                .strategy = .stub,
+                .strategy = .custom_handler,
                 .matches = &.{
                     MatchPattern{ .contains = "recursive_mutex4lockEv" },
                     MatchPattern{ .contains = "recursive_mutex6unlockEv" },
@@ -1296,4 +1295,19 @@ test "the catalogue is internally consistent" {
     try std.testing.expect(contractIsWellFormed());
     try std.testing.expect(contract_count > 100);
     try std.testing.expectEqual(@as(usize, 8), allFamilies().len);
+}
+
+test "recursive mutex symbols require the stateful runtime handler" {
+    for ([_][]const u8{
+        "recursive_mutexC1Ev",
+        "recursive_mutexC2Ev",
+        "recursive_mutex4lockEv",
+        "recursive_mutex6unlockEv",
+        "recursive_mutex8try_lockEv",
+        "recursive_mutexD1Ev",
+        "recursive_mutexD2Ev",
+    }) |symbol| {
+        const resolved = resolve(symbol) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(ResolutionStrategy.custom_handler, resolved.strategy);
+    }
 }
