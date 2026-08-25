@@ -41,6 +41,16 @@ const audio_contract = @import("xenia_audio_contract");
 const input_contract = @import("xenia_input_contract");
 const timer_contract = @import("xenia_timer_contract");
 const register_map = @import("xenos_register_map");
+const kernel_export_map = @import("xenia_kernel_export_map");
+const vd_ring_contract = @import("xenia_vd_ring_contract");
+const pm4_contract = @import("xenia_pm4_contract");
+const xex_format = @import("xenia_xex_format");
+const notification_contract = @import("xenia_notification_contract");
+const log_ring_contract = @import("xenia_log_ring_contract");
+const xthread_contract = @import("xenia_xthread_contract");
+const vfs_device_contract = @import("xenia_vfs_device_contract");
+const ob_contract = @import("xenia_ob_contract");
+const config_schema = @import("xenia_config_schema");
 const vendor_library_contract = @import("vendor_library_contract");
 
 // ── Route-specific contract imports ────────────────────────────────────────
@@ -66,6 +76,16 @@ const all_contracts = [_]ContractCheck{
     .{ .name = "input-contract", .checkFn = input_contract.contractIsWellFormed },
     .{ .name = "timer-contract", .checkFn = timer_contract.contractIsWellFormed },
     .{ .name = "register-map", .checkFn = register_map.contractIsWellFormed },
+    .{ .name = "kernel-export-map", .checkFn = kernel_export_map.contractIsWellFormed },
+    .{ .name = "vd-ring-contract", .checkFn = vd_ring_contract.contractIsWellFormed },
+    .{ .name = "pm4-contract", .checkFn = pm4_contract.contractIsWellFormed },
+    .{ .name = "xex-format", .checkFn = xex_format.contractIsWellFormed },
+    .{ .name = "notification-contract", .checkFn = notification_contract.contractIsWellFormed },
+    .{ .name = "log-ring-contract", .checkFn = log_ring_contract.contractIsWellFormed },
+    .{ .name = "xthread-contract", .checkFn = xthread_contract.contractIsWellFormed },
+    .{ .name = "vfs-device-contract", .checkFn = vfs_device_contract.contractIsWellFormed },
+    .{ .name = "ob-contract", .checkFn = ob_contract.contractIsWellFormed },
+    .{ .name = "config-schema", .checkFn = config_schema.contractIsWellFormed },
     .{ .name = "graphics-contract", .checkFn = graphics_contract.contractIsWellFormed },
     .{ .name = "surface-path-contract", .checkFn = surface_path_contract.contractIsWellFormed },
     .{ .name = "vendor-library-contract", .checkFn = vendor_library_contract.contractIsWellFormed },
@@ -122,6 +142,8 @@ pub const Logger = struct {
             }
         }
 
+        self.writeKernelExportSurface();
+
         self.writeAll("\n");
         var summary_buf: [256]u8 = undefined;
         const summary = std.fmt.bufPrint(
@@ -130,6 +152,63 @@ pub const Logger = struct {
             .{ all_contracts.len, self.failure_count },
         ) catch return;
         self.writeAll(summary);
+    }
+
+    /// Record that the kernel export tables are present and resolvable.
+    ///
+    /// A `contractIsWellFormed()` pass says the tables are sorted; it does not
+    /// say the binary actually carries 2913 entries or that a lookup returns a
+    /// name. This section performs real lookups so the log answers "does this
+    /// build know the kernel ordinals" directly, rather than by inference.
+    ///
+    /// The ordinals chosen are the ones the GPU bring-up frontier depends on:
+    /// if `VdInitializeRingBuffer` cannot be named here, nothing downstream can
+    /// name it either.
+    fn writeKernelExportSurface(self: *Logger) void {
+        self.writeAll("\n=== Kernel Export Surface ===\n\n");
+
+        var line_buf: [256]u8 = undefined;
+        const totals = std.fmt.bufPrint(
+            &line_buf,
+            "[INFO] ordinals resolvable: xboxkrnl={d} xam={d} xbdm={d} total={d}\n",
+            .{
+                kernel_export_map.xboxkrnl_exports.len,
+                kernel_export_map.xam_exports.len,
+                kernel_export_map.xbdm_exports.len,
+                kernel_export_map.xboxkrnl_exports.len +
+                    kernel_export_map.xam_exports.len +
+                    kernel_export_map.xbdm_exports.len,
+            },
+        ) catch return;
+        self.writeAll(totals);
+
+        // Live lookups, not a claim about the table's size.
+        const probes = [_]struct { ordinal: u16, expected: []const u8 }{
+            .{ .ordinal = 0x1C2, .expected = "VdInitializeEngines" },
+            .{ .ordinal = 0x1C3, .expected = "VdInitializeRingBuffer" },
+            .{ .ordinal = 0x1B6, .expected = "VdEnableRingBufferRPtrWriteBack" },
+            .{ .ordinal = 0x1D5, .expected = "VdSetGraphicsInterruptCallback" },
+            .{ .ordinal = 0x25B, .expected = "VdSwap" },
+        };
+        for (probes) |probe| {
+            const resolved = kernel_export_map.nameOf(.xboxkrnl, probe.ordinal);
+            const ok = resolved != null and std.mem.eql(u8, resolved.?, probe.expected);
+            var probe_buf: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(
+                &probe_buf,
+                "[{s}] xboxkrnl 0x{X:0>4} -> {s}\n",
+                .{
+                    if (ok) "PASS" else "FAIL",
+                    probe.ordinal,
+                    resolved orelse "<unpublished>",
+                },
+            ) catch continue;
+            self.writeAll(line);
+            if (!ok) {
+                self.failure_count +|= 1;
+                self.emitFailureToStderr("kernel-export-map lookup");
+            }
+        }
     }
 
     fn writeContractResult(self: *Logger, name: []const u8, passed: bool) void {
