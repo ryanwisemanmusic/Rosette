@@ -41,6 +41,7 @@ pub const launch_argument_accelerator = @import("launch_argument_accelerator.zig
 pub const startup_observer = @import("startup_observer.zig");
 pub const logging_runtime = @import("logging_runtime.zig");
 pub const runtime_output = @import("runtime_output.zig");
+pub const rosette_pkg_log = @import("rosette_pkg_log.zig");
 
 // Rooted in build.zig so these run rather than merely compile: three modules so
 // far turned out to have tests that were never executed, and one of them had
@@ -77,4 +78,5 @@ test {
     _ = startup_observer;
     _ = logging_runtime;
     _ = runtime_output;
+    _ = rosette_pkg_log;
 }
