@@ -226,6 +226,20 @@ pub fn validate(config: Config) ?ValidationFailure {
     return null;
 }
 
+/// The standard package entry point.
+///
+/// A default set that fails its own validator is a build that cannot start
+/// from an empty config file, and the key registry being empty would mean
+/// every typo silently keeps its default. Both are startup-fatal in practice
+/// and neither is visible without checking.
+pub fn contractIsWellFormed() bool {
+    if (validate(defaults) != null) return false;
+    if (keys.len == 0) return false;
+    if (!isKnownKey("gpu.backend")) return false;
+    if (isKnownKey("gpu.backends")) return false;
+    return true;
+}
+
 test "the defaults are valid" {
     // A default set that does not pass its own validator is a build that
     // cannot start with an empty config file.
