@@ -1,0 +1,10 @@
+name = "common-application-framework-contract"
+version = "0.1.0-local"
+kind = "callable-application-framework-abi-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
+
+# Vocabulary and fixed C-compatible records only. Runtime event retention,
+# request policy, and process ownership live in lib/framework.
