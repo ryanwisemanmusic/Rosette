@@ -497,6 +497,58 @@ pub fn build(b: *std.Build) void {
     });
     ready_compiler_mod.addImport("xenia_graphics_contract", xenia_graphics_contract_mod);
 
+    // VdSwap/PM4 handoff facts are route-independent.  The live ledger is in
+    // lib/gpu; this package owns only the immutable stage vocabulary, packet
+    // shape and provenance rules shared by every host route.
+    const xenia_vd_swap_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/vd-swap-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The complete graphics health schema is route-independent.  It owns the
+    // immutable stage vocabulary and the alternative host/Vulkan/Xenos/VdSwap
+    // paths; the mutable evidence ledger remains in lib/diagnostics.
+    const xenia_graphics_health_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/graphics-health-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Application-control policy is also immutable and route-independent.  It
+    // defines safe host directives and explicit no-fabrication invariants; the
+    // runtime state machine lives in lib/diagnostics.
+    const xenia_application_controller_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/application-controller-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The application framework is deliberately application-generic rather
+    // than Xenia-specific. Its package owns only the fixed C ABI/schema; the
+    // bounded mutable ledger lives in lib/framework and is bound to the live
+    // Mach-O process when an image runs.
+    const application_framework_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/application-framework-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const application_framework_mod = b.createModule(.{
+        .root_source_file = b.path("../lib/framework/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    application_framework_mod.addImport("application_framework_contract", application_framework_contract_mod);
+
+    // Who owns a piece of console platform state, when they took it, and
+    // whether the handoff between the harness and the emulator held. Console
+    // facts, so route-independent like the contracts above.
+    const xenia_provisioning_contract_mod = b.createModule(.{
+        .root_source_file = b.path("../pkg/common/xenia/provisioning-contract/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Guest-endian facts are mirrored per host route and cross-checked below.
     // These are immutable source-derived values: the PPC guest word order is
     // identical on every route, while host codegen and host byte order remain
@@ -1047,6 +1099,8 @@ pub fn build(b: *std.Build) void {
         .root_module = zig_module,
     });
     check_step.dependOn(&zig_tests.step);
+    const application_framework_test = b.addTest(.{ .root_module = application_framework_mod });
+    check_step.dependOn(&b.addRunArtifact(application_framework_test).step);
 
     const third_party_test_files = [_][]const u8{
         "crypto/sha.zig",
@@ -1159,6 +1213,21 @@ pub fn build(b: *std.Build) void {
         });
         const xex_check = b.addTest(.{ .root_module = xex_module });
         check_step.dependOn(&b.addRunArtifact(xex_check).step);
+    }
+
+    {
+        // The PowerPC encoder, and the exhaustive round trip that is its
+        // specification. The decoder could already recognise every opcode;
+        // until this existed nothing could produce one, which is the half of
+        // the ISA layer that was actually missing.
+        const ppc_encode_mod = b.createModule(.{
+            .root_source_file = b.path("../ISA/ppc/encode/encoder.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        ppc_encode_mod.addImport("ppc_decode", ppc_decode_module);
+        const ppc_encode_test = b.addTest(.{ .root_module = ppc_encode_mod });
+        check_step.dependOn(&b.addRunArtifact(ppc_encode_test).step);
     }
 
     {
@@ -1794,6 +1863,19 @@ pub fn build(b: *std.Build) void {
             "../pkg/common/xenia/ob-contract/src/root.zig",
             "../pkg/common/xenia/mount-contract/src/root.zig",
             "../pkg/common/xenia/kernel-object-contract/src/root.zig",
+            // Facts transcribed from Xenia's own tables and headers. They
+            // describe the console and its kernel, so they are route
+            // independent like the rest of this list.
+            "../pkg/common/xenia/kernel-export-map/src/root.zig",
+            "../pkg/common/xenia/vd-ring-contract/src/root.zig",
+            "../pkg/common/xenia/vd-swap-contract/src/root.zig",
+            "../pkg/common/xenia/provisioning-contract/src/root.zig",
+            "../pkg/common/xenia/pm4-contract/src/root.zig",
+            "../pkg/common/xenia/xex-format/src/root.zig",
+            "../pkg/common/xenia/notification-contract/src/root.zig",
+            "../pkg/common/xenia/log-ring-contract/src/root.zig",
+            "../pkg/common/xenia/xthread-contract/src/root.zig",
+            "../pkg/common/xenia/vfs-device-contract/src/root.zig",
         };
         inline for (common_package_roots) |package_root| {
             const package_mod = b.createModule(.{
@@ -1831,6 +1913,7 @@ pub fn build(b: *std.Build) void {
             "../pkg/x86/xenia/memory/heap-range/src/root.zig",
             "../pkg/x86/xenia/audio-driver/src/root.zig",
             "../pkg/x86/xenia/input-driver/src/root.zig",
+            "../pkg/x86/xenia/simd-shim-map/src/root.zig",
             "../pkg/ARM64/xenia/graphics-contract/src/root.zig",
             "../pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig",
             "../pkg/ARM64/xenia/bridge/abi-bridge/src/root.zig",
@@ -1846,6 +1929,7 @@ pub fn build(b: *std.Build) void {
             "../pkg/ARM64/xenia/memory/heap-range/src/root.zig",
             "../pkg/ARM64/xenia/audio-driver/src/root.zig",
             "../pkg/ARM64/xenia/input-driver/src/root.zig",
+            "../pkg/ARM64/xenia/simd-shim-map/src/root.zig",
             "../pkg/x86/xenia/guest-endian/src/root.zig",
             "../pkg/ARM64/xenia/guest-endian/src/root.zig",
             "../pkg/PPC/xenia/guest-endian/src/root.zig",
@@ -1960,6 +2044,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        const xenia_kernel_export_map_mod = b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/kernel-export-map/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         const gpu_mod = b.createModule(.{
             .root_source_file = b.path("../lib/gpu/root.zig"),
             .target = target,
@@ -1967,6 +2056,13 @@ pub fn build(b: *std.Build) void {
         });
         gpu_mod.addImport("device_tree", device_tree_mod);
         gpu_mod.addImport("xenos_register_map", xenos_register_map_mod);
+        gpu_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
+        gpu_mod.addImport("xenia_provisioning_contract", xenia_provisioning_contract_mod);
+        // The full kernel export table, so lib/gpu/kernel_surface.zig can name
+        // any ordinal a title imports rather than only the sixteen video ones
+        // it models. Declared once and shared: two copies of 2913 entries in
+        // one binary would be a pointless size cost.
+        gpu_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
         const gpu_test = b.addTest(.{ .root_module = gpu_mod });
         check_step.dependOn(&b.addRunArtifact(gpu_test).step);
         const dyld_mod = b.createModule(.{
@@ -2114,6 +2210,56 @@ pub fn build(b: *std.Build) void {
         }));
         diagnostics_mod.addImport("xenia_timer_contract", b.createModule(.{
             .root_source_file = b.path("../pkg/common/xenia/timer-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_kernel_export_map", xenia_kernel_export_map_mod);
+        diagnostics_mod.addImport("xenia_vd_ring_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/vd-ring-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_pm4_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/pm4-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_vd_swap_contract", xenia_vd_swap_contract_mod);
+        diagnostics_mod.addImport("xenia_graphics_health_contract", xenia_graphics_health_contract_mod);
+        diagnostics_mod.addImport("xenia_application_controller_contract", xenia_application_controller_contract_mod);
+        diagnostics_mod.addImport("application_framework_contract", application_framework_contract_mod);
+        diagnostics_mod.addImport("xenia_xex_format", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/xex-format/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_notification_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/notification-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_log_ring_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/log-ring-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_xthread_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/xthread-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_vfs_device_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/vfs-device-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_ob_contract", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/ob-contract/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+        diagnostics_mod.addImport("xenia_config_schema", b.createModule(.{
+            .root_source_file = b.path("../pkg/common/xenia/config-schema/src/root.zig"),
             .target = target,
             .optimize = optimize,
         }));
@@ -2454,6 +2600,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_mod.addImport("ready_compiler", ready_compiler_mod);
         macho_processor_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
         macho_processor_mod.addImport("ppc_runtime", ppc_runtime_module);
+        macho_processor_mod.addImport("application_framework", application_framework_mod);
         macho_processor_mod.addImport("diagnostics", diagnostics_mod);
         macho_processor_mod.addImport("memory", memory_mod);
         macho_processor_mod.addImport("io", io_mod);
@@ -2481,6 +2628,10 @@ pub fn build(b: *std.Build) void {
             });
             macho_processor_mod.addCSourceFile(.{
                 .file = b.path("../lib/Mach-O/rosette_ppc_exports_anchor.c"),
+                .flags = &.{ "-Wall", "-Wextra" },
+            });
+            macho_processor_mod.addCSourceFile(.{
+                .file = b.path("../lib/Mach-O/application_framework_exports_anchor.c"),
                 .flags = &.{ "-Wall", "-Wextra" },
             });
             macho_processor_mod.linkFramework("AppKit", .{});
@@ -2541,6 +2692,7 @@ pub fn build(b: *std.Build) void {
         macho_processor_test_mod.addImport("preflight", preflight_mod);
         macho_processor_test_mod.addImport("ready_compiler", ready_compiler_mod);
         macho_processor_test_mod.addImport("xenia_heap_range", xenia_heap_range_mod);
+        macho_processor_test_mod.addImport("application_framework", application_framework_mod);
         macho_processor_test_mod.addImport("diagnostics", diagnostics_mod);
         macho_processor_test_mod.addImport("memory", memory_mod);
         macho_processor_test_mod.addImport("io", io_mod);
