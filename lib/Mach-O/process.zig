@@ -47,6 +47,9 @@ const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const xenia_pipeline = @import("diagnostics").xenia_pipeline;
 const xenia_gpu_handoff = @import("diagnostics").xenia_gpu_handoff;
 const xenia_gpu_causal_trace = @import("diagnostics").xenia_gpu_causal_trace;
+const graphics_health_contract = @import("diagnostics").graphics_health_contract;
+const application_controller = @import("diagnostics").application_controller;
+const application_framework = @import("application_framework");
 const xenia_memory_views = @import("diagnostics").xenia_memory_views;
 const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
 const deadlock_predictor = @import("diagnostics").deadlock_predictor;
@@ -57,6 +60,7 @@ const wait_audit = @import("diagnostics").wait_audit;
 const host_contract_coverage = @import("diagnostics").host_contract_coverage;
 const stall_release = @import("diagnostics").stall_release;
 const bringup_failure = @import("diagnostics").bringup_failure;
+const run_horizon = @import("diagnostics").run_horizon;
 const event_identity = @import("diagnostics").event_identity;
 const execution_tracepoints = @import("diagnostics").execution_tracepoints;
 const anomaly_ledger = @import("diagnostics").anomaly_ledger;
@@ -799,12 +803,44 @@ pub const MachOState = struct {
     /// clause is Rosette's to supply and which must not be supplied at all.
     /// See `lib/gpu/contract.zig`.
     graphics_contract: gpu.ContractLedger = .{},
+    /// Cross-layer graphics evidence. This is deliberately broader than the
+    /// graphics/VdSwap ladders: a native Cocoa/Vulkan presenter can be healthy
+    /// while the Xenos producer is stalled, and the report must keep those
+    /// paths independent.
+    graphics_health: graphics_health_contract.Ledger = .{},
+    /// Host-owned coordination policy at the guest/GPU/presenter seam. It
+    /// returns directives and evidence only; it cannot synthesize a guest
+    /// VdSwap, advance a guest ring pointer or release a guest wait.
+    application_controller: application_controller.Controller = .{},
+    /// Callable application-framework ledger. The exported C ABI is bound to
+    /// this process-owned instance while the translated image is running, so
+    /// Xenia observes the same state that the frontier report prints.
+    application_framework: application_framework.Framework = .{},
+    application_controller_host_drains: u64 = 0,
+    application_controller_host_refreshes: u64 = 0,
+    application_framework_last_sequence: u64 = std.math.maxInt(u64),
+    graphics_health_last_fingerprint: u64 = std.math.maxInt(u64),
+    application_controller_last_fingerprint: u64 = std.math.maxInt(u64),
     /// The GPU-facing kernel exports a title reads before it will present, and
     /// whether anything supplied them. See `lib/gpu/kernel_surface.zig`: the
     /// ladder can only see calls, and an unpopulated *variable* export stops a
     /// title without ever producing one.
     gpu_kernel_surface: gpu.KernelSurface = .{},
     gpu_kernel_surface_addresses: gpu.kernel_surface.AddressTable = .{},
+    /// When each piece of platform state was provisioned, by whom, and whether
+    /// its owner later agreed. The kernel-variable surface answers "is it
+    /// populated"; by the time anything asks that, it is. This answers "was it
+    /// there before the title read it", which is the question a late write
+    /// fails and every other counter hides. See `lib/gpu/custody.zig`.
+    gpu_provisioning_custody: gpu.CustodyLedger = .{},
+    gpu_provisioning_early_attempts: u64 = 0,
+    /// Whether the run ended because the guest stopped or because the run did.
+    /// Rosette counted guest steps and host seconds and never knew how much of
+    /// the *title's* own timeline a run had covered, which is the variable that
+    /// decides whether "never happened" means "broken" or "not yet".
+    run_horizon: run_horizon.Ledger = .{},
+    run_started_at_ns: u64 = 0,
+    run_horizon_vdswap_mask: u32 = 0,
     /// The same exports, read the way the title reads them: slot first, then
     /// the storage the slot points at. See `lib/gpu/kernel_variables.zig`. The
     /// surface above treats the slot's contents as the value, which cannot tell
@@ -812,6 +848,10 @@ pub const MachOState = struct {
     /// tell a variable the *kernel* failed to write from one the *title* has
     /// not written yet. Those have opposite owners.
     gpu_kernel_variables: gpu.KernelVariableSurface = .{},
+    /// Strict VdSwap -> PM4_XE_SWAP evidence. This is deliberately separate
+    /// from the broad graphics contract: a generic PM4 batch or a retained
+    /// nested draw cannot satisfy authentic swap consumption.
+    gpu_vd_swap_contract: gpu.VdSwapContract = .{},
     /// Whether the harness stood in for a step the title never took, and at
     /// which tier. See `lib/gpu/swap_substitution.zig`. Kept separate from
     /// every authentic counter in the subsystem, permanently: a frame the
@@ -844,6 +884,21 @@ pub const MachOState = struct {
     /// resolve exists, so an incomplete shader path cannot erase title pixels.
     gpu_xenos_resolve_scratch: []u8 = &.{},
     gpu_xenos_last_ring_epoch: u64 = std.math.maxInt(u64),
+    /// Publication epoch of the last retained batch handed to the stateful
+    /// command processor.  Separate from `gpu_xenos_last_ring_epoch` because
+    /// the two paths select different extents: that one uses the span the ring
+    /// pointers describe, this one the envelope of the dwords still present in
+    /// ring memory after the command processor drained them.
+    gpu_xenos_last_payload_epoch: u64 = std.math.maxInt(u64),
+    gpu_xenos_retained_executions: u64 = 0,
+    gpu_xenos_retained_refusals: u64 = 0,
+    /// Diagnostics for the physical-to-Xenos callback boundary. The physical
+    /// projection is authoritative; A/C/E aliases are used only when that
+    /// projection is unreadable, and disagreement is fail-closed.
+    gpu_xenos_memory_physical_misses: u64 = 0,
+    gpu_xenos_memory_alias_fallbacks: u64 = 0,
+    gpu_xenos_memory_alias_disagreements: u64 = 0,
+    gpu_xenos_memory_alias_log_count: u64 = 0,
     /// Guest-owned callback installed by VdSetGraphicsInterruptCallback.
     /// PM4 completion is queued into the cooperative scheduler; it is never
     /// invoked from the ring decoder's synchronous memory walk.
@@ -852,6 +907,13 @@ pub const MachOState = struct {
     gpu_interrupt_callback_registrations: u64 = 0,
     gpu_interrupt_dispatches: u64 = 0,
     gpu_interrupt_dispatch_failures: u64 = 0,
+    /// Draw-completion events are tracked separately from the aggregate
+    /// interrupt counter.  A command processor can queue a completion while
+    /// the guest callback is absent or rejected; those are different breaks
+    /// in the PM4 -> VdSwap handoff.
+    gpu_draw_completion_dispatch_attempts: u64 = 0,
+    gpu_draw_completion_dispatches: u64 = 0,
+    gpu_draw_completion_dispatch_failures: u64 = 0,
     /// Persistent system command buffer returned by VdGetSystemCommandBuffer.
     /// Xenia's Mac video layer allocates this from the physical system heap
     /// and reuses it for the lifetime of the graphics system. Keeping the
@@ -859,10 +921,11 @@ pub const MachOState = struct {
     /// a retry from exposing a different command buffer to the guest.
     gpu_system_command_buffer: u64 = 0,
     gpu_system_command_buffer_size: u64 = 0,
-    /// Whether a draw packet has ever been found in ring memory. Latched: a
-    /// drained ring holds an empty span, so a title that rendered a frame and
-    /// had it consumed is indistinguishable through the pointers alone from one
-    /// that never drew, and those are opposite findings.
+    /// Whether a draw packet has ever been found in ring memory, including a
+    /// draw reached through an INDIRECT_BUFFER packet. Latched: a drained ring
+    /// holds an empty span, so a title that rendered a frame and had it
+    /// consumed is indistinguishable through the pointers alone from one that
+    /// never drew, and those are opposite findings.
     gpu_ring_draws_seen: bool = false,
     gpu_ring_draws_last_count: u32 = 0,
     /// The emulator's own applied-update counter for the ring write pointer,
@@ -1314,6 +1377,10 @@ pub const MachOState = struct {
             .executable_max = executable_max,
         };
         errdefer result.deinit();
+        // The host clock the horizon ledger measures emulated time against.
+        // Without it the run knows how many instructions it executed and not
+        // how long that took, and the ratio is the whole point.
+        result.run_started_at_ns = startup_observer.monotonicNanoseconds();
         result.gpu_xenos_edram = try allocator.alloc(u8, gpu.edram.size_bytes);
         @memset(result.gpu_xenos_edram, 0);
         result.gpu_xenos_runtime.attachEdram(result.gpu_xenos_edram);
@@ -3730,8 +3797,1081 @@ pub const MachOState = struct {
         if (self.gpu_bootstrap.seen(.pm4_packet_consumed)) ledger.observe(.guest_pm4_consumed, at);
         if (tracepoints.roleEntered(.swap)) ledger.observe(.guest_swap_entered, at);
         if (self.guest_vdswap_packet_encoded) ledger.observe(.swap_packet_encoded, at);
-        if (tracepoints.roleEntered(.xe_swap_decode)) ledger.observe(.swap_consumed_by_command_processor, at);
+        if (self.gpu_vd_swap_contract.authentic_consumptions != 0) ledger.observe(.swap_consumed_by_command_processor, at);
         if (tracepoints.roleEntered(.presenter)) ledger.observe(.presenter_output_refreshed, at);
+
+        self.refreshVdSwapContract();
+    }
+
+    /// Add one observation to the cross-layer graphics ledger.  Keeping this
+    /// tiny adapter beside the process state makes ownership explicit at every
+    /// call site and leaves the package/runtime ledger independent of Mach-O.
+    fn recordGraphicsHealth(
+        self: *MachOState,
+        stage: graphics_health_contract.Stage,
+        state: graphics_health_contract.State,
+        source: graphics_health_contract.Source,
+        count: u64,
+        note: []const u8,
+    ) void {
+        self.graphics_health.record(stage, state, self.executed_steps, source, count, note);
+    }
+
+    /// Map the native presenter state to the health schema without weakening
+    /// its failure semantics.  In particular, a `surface_not_presentable`
+    /// result is backpressure (degraded swapchain use), not a successful frame,
+    /// and `device_lost` never gets reported as a healthy device.
+    fn recordNativePresenterPrerequisites(self: *MachOState, state: graphics_health_contract.State, note: []const u8) void {
+        self.recordGraphicsHealth(.vulkan_loader_resolved, state, .native_presenter, 1, note);
+        self.recordGraphicsHealth(.vulkan_instance_ready, state, .native_presenter, 1, note);
+        self.recordGraphicsHealth(.vulkan_surface_ready, state, .native_presenter, 1, note);
+        self.recordGraphicsHealth(.physical_adapter_ready, state, .native_presenter, 1, note);
+        self.recordGraphicsHealth(.logical_device_ready, state, .native_presenter, 1, note);
+        self.recordGraphicsHealth(.graphics_queue_ready, state, .native_presenter, 1, note);
+        self.recordGraphicsHealth(.swapchain_ready, state, .native_presenter, 1, note);
+        self.recordGraphicsHealth(.frame_resources_ready, state, .native_presenter, 1, note);
+    }
+
+    fn refreshNativePresenterHealth(self: *MachOState) void {
+        const stage = self.dynamic_forwarder.nativePresenterStage();
+        if (self.dynamic_forwarder.native_presenter_attempts == 0) return;
+
+        switch (stage) {
+            .unstarted => {},
+            .loader_unavailable => self.recordGraphicsHealth(.vulkan_loader_resolved, .blocked, .native_presenter, 1, stage.label()),
+            .instance_extensions_missing, .instance_failed => {
+                self.recordGraphicsHealth(.vulkan_loader_resolved, .satisfied, .native_presenter, 1, "vkGetInstanceProcAddr resolved");
+                self.recordGraphicsHealth(.vulkan_instance_ready, .blocked, .native_presenter, 1, stage.label());
+            },
+            .surface_failed => {
+                self.recordGraphicsHealth(.vulkan_loader_resolved, .satisfied, .native_presenter, 1, "Vulkan loader resolved");
+                self.recordGraphicsHealth(.vulkan_instance_ready, .satisfied, .native_presenter, 1, "native instance created");
+                self.recordGraphicsHealth(.vulkan_surface_ready, .blocked, .native_presenter, 1, stage.label());
+            },
+            .no_supported_physical_device => {
+                self.recordGraphicsHealth(.vulkan_loader_resolved, .satisfied, .native_presenter, 1, "Vulkan loader resolved");
+                self.recordGraphicsHealth(.vulkan_instance_ready, .satisfied, .native_presenter, 1, "native instance created");
+                self.recordGraphicsHealth(.vulkan_surface_ready, .satisfied, .native_presenter, 1, "Metal surface created");
+                self.recordGraphicsHealth(.physical_adapter_ready, .blocked, .native_presenter, 1, stage.label());
+            },
+            .device_failed => {
+                self.recordNativePresenterPrerequisites(.satisfied, "native loader, instance, surface and adapter reached");
+                self.recordGraphicsHealth(.logical_device_ready, .blocked, .native_presenter, 1, stage.label());
+            },
+            .frame_resources_failed => {
+                self.recordNativePresenterPrerequisites(.satisfied, "native device and graphics queue reached");
+                self.recordGraphicsHealth(.frame_resources_ready, .blocked, .native_presenter, 1, stage.label());
+            },
+            .swapchain_failed => {
+                self.recordNativePresenterPrerequisites(.satisfied, "native frame prerequisites reached");
+                self.recordGraphicsHealth(.swapchain_ready, .blocked, .native_presenter, 1, stage.label());
+            },
+            .surface_not_presentable => {
+                self.recordNativePresenterPrerequisites(.satisfied, "native presenter exists; surface is temporarily unavailable");
+                self.recordGraphicsHealth(.swapchain_ready, .degraded, .native_presenter, 1, stage.label());
+            },
+            .ready => {
+                self.recordNativePresenterPrerequisites(.satisfied, "native presenter instance/surface/device/queue/swapchain are live");
+            },
+            .device_lost => {
+                self.recordGraphicsHealth(.vulkan_loader_resolved, .satisfied, .native_presenter, 1, "Vulkan loader resolved before device loss");
+                self.recordGraphicsHealth(.vulkan_instance_ready, .satisfied, .native_presenter, 1, "native instance existed before device loss");
+                self.recordGraphicsHealth(.vulkan_surface_ready, .satisfied, .native_presenter, 1, "native surface existed before device loss");
+                self.recordGraphicsHealth(.physical_adapter_ready, .satisfied, .native_presenter, 1, "physical adapter existed before device loss");
+                self.recordGraphicsHealth(.logical_device_ready, .blocked, .native_presenter, 1, stage.label());
+                self.recordGraphicsHealth(.graphics_queue_ready, .blocked, .native_presenter, 1, stage.label());
+                self.recordGraphicsHealth(.swapchain_ready, .blocked, .native_presenter, 1, stage.label());
+                self.recordGraphicsHealth(.frame_resources_ready, .blocked, .native_presenter, 1, stage.label());
+            },
+        }
+    }
+
+    /// Refresh the broad graphics-health ledger from the owners that already
+    /// hold the evidence.  This is intentionally a join, not a second runtime
+    /// implementation: every count below is read from an existing subsystem,
+    /// and a missing count stays untested rather than becoming a guessed pass.
+    pub fn refreshGraphicsHealthContract(self: *MachOState) void {
+        const at = self.executed_steps;
+
+        if (self.event_stream.run_id != 0 or at != 0)
+            self.recordGraphicsHealth(.application_started, .satisfied, .process, 1, "event stream has a run identity");
+        if (at != 0)
+            self.recordGraphicsHealth(.guest_image_mapped, .satisfied, .process, at, "translated guest instructions executed");
+        if (self.pthreads.created_threads != 0)
+            self.recordGraphicsHealth(.guest_scheduler_running, .satisfied, .scheduler, self.pthreads.created_threads, "guest threads have been created and rotated");
+
+        const exports = self.gpu_kernel_surface.finding();
+        if (exports.imported_count != 0) {
+            self.recordGraphicsHealth(
+                .kernel_graphics_exports_resolved,
+                if (exports.blocking == null) .satisfied else .blocked,
+                .kernel_surface,
+                exports.usable_count,
+                if (exports.blocking) |which| which.guidance() else "imported graphics exports are bound and usable",
+            );
+        }
+        const variables = self.gpu_kernel_variables.finding();
+        if (variables.imported_count != 0) {
+            self.recordGraphicsHealth(
+                .kernel_graphics_variables_populated,
+                if (variables.blocking == null) .satisfied else .blocked,
+                .kernel_surface,
+                variables.usable_count,
+                if (variables.blocking) |which| which.meaning() else "imported graphics variables resolve through slot and storage",
+            );
+        }
+
+        const native_window_state = &self.native_window;
+        if (native_window_state.application_ensure_attempts != 0)
+            self.recordGraphicsHealth(
+                .native_application_ready,
+                if (native_window_state.window_ready_logged or native_window_state.layer_attachments != 0) .satisfied else .degraded,
+                .native_window,
+                native_window_state.application_ensure_attempts,
+                if (native_window_state.window_ready_logged) "NSApplication and its window status were observed" else "application ensure was attempted; native status is not yet complete",
+            );
+        if (native_window_state.window_ready_logged or native_window_state.surface_bindings != 0) {
+            self.recordGraphicsHealth(.native_window_ready, .satisfied, .native_window, native_window_state.window_ensure_attempts, "NSWindow/NSView status was observed");
+        } else if (native_window_state.window_ensure_attempts != 0) {
+            self.recordGraphicsHealth(.native_window_ready, if (native_window_state.window_ensure_failures != 0) .blocked else .degraded, .native_window, native_window_state.window_ensure_attempts, "window ensure has not produced a ready status");
+        }
+        if (native_window_state.layer_attachments != 0) {
+            self.recordGraphicsHealth(.native_layer_attached, .satisfied, .native_window, native_window_state.layer_attachments, "CAMetalLayer attachment succeeded");
+        } else if (native_window_state.layer_requests != 0) {
+            self.recordGraphicsHealth(.native_layer_attached, if (native_window_state.layer_attachment_failures != 0) .blocked else .degraded, .native_window, native_window_state.layer_requests, "CAMetalLayer was requested but attachment is not proven");
+        }
+
+        if (self.dynamic_forwarder.native_vulkan_loader_attempts != 0)
+            self.recordGraphicsHealth(
+                .vulkan_loader_resolved,
+                if (self.dynamic_forwarder.native_vulkan_loader_failures == 0) .satisfied else .blocked,
+                .vulkan_forwarder,
+                self.dynamic_forwarder.native_vulkan_loader_attempts,
+                if (self.dynamic_forwarder.native_vulkan_loader_failures == 0) "native Vulkan loader attempts resolved" else "native Vulkan loader resolution failed",
+            );
+        self.refreshNativePresenterHealth();
+
+        const observed_commands = self.dynamic_forwarder.guestVulkanObservedCommands();
+        const real_commands = self.dynamic_forwarder.guestVulkanCommandsForwarded();
+        const real_submits = self.dynamic_forwarder.guestVulkanQueueSubmits();
+        const real_presents = self.dynamic_forwarder.guestVulkanPresents();
+        if (observed_commands != 0 or real_submits != 0 or real_presents != 0)
+            self.recordGraphicsHealth(.guest_vulkan_activity_observed, .satisfied, .vulkan_forwarder, observed_commands +| real_submits +| real_presents, "guest Vulkan calls reached the forwarding surface");
+        if (real_commands != 0) {
+            self.recordGraphicsHealth(.guest_vulkan_commands_forwarded, .satisfied, .vulkan_forwarder, real_commands, "guest Vulkan command calls reached native forwarding");
+        } else if (observed_commands != 0) {
+            self.recordGraphicsHealth(.guest_vulkan_commands_forwarded, .degraded, .vulkan_forwarder, observed_commands, "guest Vulkan commands were observed without native command forwarding");
+        }
+        if (real_submits != 0) {
+            self.recordGraphicsHealth(.guest_vulkan_submission_forwarded, .satisfied, .vulkan_forwarder, real_submits, "guest queue submissions reached the native driver");
+        } else if (observed_commands != 0) {
+            self.recordGraphicsHealth(.guest_vulkan_submission_forwarded, .degraded, .vulkan_forwarder, observed_commands, "guest command activity has no native queue submission");
+        }
+
+        if (self.gpu_bootstrap.seen(.initialize_engines))
+            self.recordGraphicsHealth(.xenos_engines_initialized, .satisfied, .xenos_runtime, 1, "VdInitializeEngines was observed");
+        if (self.gpu_interrupt_callback != 0)
+            self.recordGraphicsHealth(.xenos_interrupt_callback_registered, .satisfied, .kernel_surface, self.gpu_interrupt_callback_registrations, "VdSetGraphicsInterruptCallback installed a guest callback");
+        if (self.gpu_bootstrap.seen(.ring_buffer) or self.gpu_ring_watch_base != 0)
+            self.recordGraphicsHealth(.xenos_ring_initialized, .satisfied, .ring_publication, 1, "ring base/size state is available");
+        if (self.gpu_ring_publication.published())
+            self.recordGraphicsHealth(.ring_publication_observed, .satisfied, .ring_publication, self.gpu_ring_publication.advances, "guest publication is latched by a pointer change or non-empty span");
+        if (self.gpu_ring_publication.geometry != null)
+            self.recordGraphicsHealth(.ring_geometry_observed, .satisfied, .ring_publication, 1, "ring read/write geometry was captured");
+
+        const vd = &self.gpu_vd_swap_contract;
+        const runtime = &self.gpu_xenos_runtime;
+        const target = runtime.renderTargetEvidence();
+        const pm4_observed = runtime.batches != 0 or vd.observed(.pm4_stream_observed);
+        if (pm4_observed)
+            self.recordGraphicsHealth(.pm4_stream_observed, .satisfied, if (runtime.batches != 0) .xenos_runtime else .vd_swap_contract, runtime.batches, "PM4 dwords/packets were observed");
+        if (vd.observed(.pm4_stream_validated))
+            self.recordGraphicsHealth(.pm4_stream_validated, .satisfied, .vd_swap_contract, 1, "PM4 framing passed the bounded validator");
+        if (pm4_observed) {
+            const indirect_bad = runtime.indirect_unreadable +| runtime.indirect_truncated +| runtime.indirect_invalid +| runtime.indirect_depth_limited +| runtime.indirect_budget_limited;
+            if (runtime.indirect_buffers == 0 or indirect_bad == 0) {
+                self.recordGraphicsHealth(.pm4_indirects_resolved, .satisfied, .xenos_runtime, runtime.indirect_buffers, if (runtime.indirect_buffers == 0) "no indirect buffers were required" else "all observed indirect buffers were readable and bounded");
+            } else {
+                self.recordGraphicsHealth(.pm4_indirects_resolved, .blocked, .xenos_runtime, indirect_bad, "one or more indirect buffers were unreadable, truncated or over budget");
+            }
+        }
+        if (vd.observed(.pm4_state_programmed) or runtime.executor.register_file.write_count != 0)
+            self.recordGraphicsHealth(.pm4_state_programmed, .satisfied, .xenos_runtime, runtime.executor.register_file.write_count, "Xenos register state was programmed");
+        if (runtime.draw_count != 0 or vd.observed(.draw_submitted))
+            self.recordGraphicsHealth(.draw_submitted, .satisfied, .xenos_runtime, runtime.draw_count, "draw packets were submitted to the stateful runtime");
+        if (runtime.draw_count != 0 or vd.observed(.draw_consumed) or self.gpu_ring_publication.consumerSawBatch())
+            self.recordGraphicsHealth(.draw_consumed, .satisfied, .xenos_runtime, runtime.draw_count, "the command processor consumed draw work");
+        if (target.state_observed)
+            self.recordGraphicsHealth(.render_target_state_observed, if (target.plausible) .satisfied else .degraded, .xenos_runtime, 1, "RB_COLOR_INFO/RB_DEPTH_INFO/RB_SURFACE_INFO state was observed");
+        if (runtime.color_resolve_observations != 0)
+            self.recordGraphicsHealth(.render_target_memory_observed, .satisfied, .xenos_runtime, runtime.color_resolve_observations, "EDRAM color resolve produced readable output");
+        if (runtime.draw_completion_signals != 0)
+            self.recordGraphicsHealth(.draw_completion_signaled, .satisfied, .xenos_runtime, runtime.draw_completion_signals, "draw completion events were queued");
+        if (runtime.draw_completion_signals != 0)
+            self.recordGraphicsHealth(
+                .draw_completion_dispatched,
+                if (self.gpu_draw_completion_dispatches != 0) .satisfied else .blocked,
+                .scheduler,
+                self.gpu_draw_completion_dispatches,
+                if (self.gpu_draw_completion_dispatches != 0) "draw completion reached the guest callback scheduler" else "draw completion is queued but no callback dispatch is proven",
+            );
+
+        const waits = self.guest_wait_liveness.aggregateVerdict();
+        if (self.guest_wait_liveness.total_waits != 0)
+            self.recordGraphicsHealth(.guest_wait_progressed, if (waits.healthy()) .satisfied else .degraded, .guest_log, self.guest_wait_liveness.total_waits, waits.label());
+        if (self.gpu_ring_publication.advances != 0) {
+            const quiet = self.gpu_ring_publication.stalledSteps(at) orelse 0;
+            self.recordGraphicsHealth(
+                .guest_producer_progressed,
+                if (quiet < application_controller.ring_quiet_threshold_steps) .satisfied else .blocked,
+                .ring_publication,
+                self.gpu_ring_publication.advances,
+                if (quiet < application_controller.ring_quiet_threshold_steps) "ring producer advanced within the controller window" else "ring producer is quiet beyond the controller window",
+            );
+        }
+        if (self.execution_tracepoints.roleEntered(.swap))
+            self.recordGraphicsHealth(.guest_vdswap_entered, .satisfied, .causal_trace, 1, "execution tracepoint reached the guest VdSwap role");
+        if (self.guest_vdswap_packet_encoded)
+            self.recordGraphicsHealth(.guest_swap_encoded, .satisfied, .vd_swap_contract, 1, "guest-origin XE_SWAP encoding was observed");
+        if (vd.authentic_consumptions != 0)
+            self.recordGraphicsHealth(.authentic_swap_consumed, .satisfied, .vd_swap_contract, vd.authentic_consumptions, "authentic XE_SWAP reached the command processor");
+        if (vd.observed(.issue_swap_entered))
+            self.recordGraphicsHealth(.issue_swap_entered, .satisfied, .vd_swap_contract, 1, "Xenia presenter IssueSwap boundary was observed");
+
+        const guest_output_frames = self.dynamic_forwarder.native_presenter.ledger.guest_output_frames_presented;
+        if (guest_output_frames != 0) {
+            self.recordGraphicsHealth(.guest_output_refreshed, .satisfied, .native_presenter, guest_output_frames, "guest-produced pixels reached the presenter source");
+        } else if (self.dynamic_forwarder.guestFrontBufferAvailable()) {
+            self.recordGraphicsHealth(.guest_output_refreshed, .degraded, .native_presenter, 1, "a guest output source was discovered, but no guest-produced frame has been refreshed");
+        }
+        const native_frames = self.dynamic_forwarder.nativePresenterFramesPresented();
+        if (native_frames != 0)
+            self.recordGraphicsHealth(.native_present_completed, .satisfied, .native_presenter, native_frames, "the native presenter completed a frame (classification is logged separately)");
+    }
+
+    /// Feed the controller from the independent ledgers.  The controller may
+    /// authorize only host-owned work; the guest VdSwap and producer fields are
+    /// observations that remain outside Rosette's mutation authority.
+    pub fn refreshApplicationController(self: *MachOState) application_controller.Decision {
+        const guest_output_frames = self.dynamic_forwarder.native_presenter.ledger.guest_output_frames_presented;
+        const deadlocked = self.deadlock_predictor.worst().finding.deadlocked();
+        return self.application_controller.observe(.{
+            .step = self.executed_steps,
+            .guest_progress_step = if (self.xenia_gpu_causal_trace.last_progress_step != 0) self.xenia_gpu_causal_trace.last_progress_step else null,
+            .ring_progress_step = if (self.gpu_ring_publication.last_advance_step != 0) self.gpu_ring_publication.last_advance_step else null,
+            .pm4_progress_step = if (self.gpu_ring_publication.last_consumed_step != 0) self.gpu_ring_publication.last_consumed_step else null,
+            .guest_vdswap_entered = self.execution_tracepoints.roleEntered(.swap),
+            .guest_swap_encoded = self.guest_vdswap_packet_encoded,
+            .authentic_swap_consumed = self.gpu_vd_swap_contract.authentic_consumptions != 0,
+            .guest_output_available = guest_output_frames != 0 or self.dynamic_forwarder.guestFrontBufferAvailable(),
+            .native_present_completed = guest_output_frames != 0,
+            .ring_published = self.gpu_ring_publication.published(),
+            .pm4_stream_observed = self.gpu_xenos_runtime.batches != 0 or self.gpu_vd_swap_contract.observed(.pm4_stream_observed),
+            .pm4_stream_consumed = self.gpu_xenos_runtime.draw_count != 0 or self.gpu_ring_publication.consumerSawBatch(),
+            .render_target_state_observed = self.gpu_xenos_runtime.renderTargetEvidence().state_observed,
+            .render_target_memory_observed = self.gpu_xenos_runtime.color_resolve_observations != 0,
+            .draw_completion_signaled = self.gpu_xenos_runtime.draw_completion_signals,
+            .draw_completion_dispatched = self.gpu_draw_completion_dispatches,
+            .pending_gpu_interrupts = self.gpu_xenos_runtime.interrupts.pending_count,
+            .interrupt_callback_registered = self.gpu_interrupt_callback != 0,
+            .presenter_ready = self.dynamic_forwarder.nativePresenterStage().isReady(),
+            .presenter_device_lost = self.dynamic_forwarder.nativePresenterStage() == .device_lost,
+            .guest_wait_deadlocked = deadlocked,
+            .guest_waiting = self.pthreads.blocked_threads != 0,
+            .guest_runnable = self.pthreads.activeCount() != 0,
+        });
+    }
+
+    /// Apply only directives whose owner is Rosette.  The guest-facing actions
+    /// intentionally have no implementation here: reporting an open VdSwap
+    /// boundary is the safety mechanism that prevents a diagnostic frame from
+    /// erasing the actual producer defect.
+    fn applyApplicationController(self: *MachOState, decision: application_controller.Decision) void {
+        switch (decision.action) {
+            .drain_gpu_interrupts => {
+                if (self.gpu_interrupt_callback == 0 or self.gpu_xenos_runtime.interrupts.pending_count == 0) return;
+                const delivered = self.gpu_xenos_runtime.drainInterrupts(deliverGpuInterrupt, self, 32);
+                if (delivered != 0) self.application_controller_host_drains +|= delivered;
+            },
+            .refresh_discovered_output => {
+                if (!decision.host_action_authorized) return;
+                if (self.dynamic_forwarder.attemptScheduledRefresh(self)) self.application_controller_host_refreshes +|= 1;
+            },
+            else => {},
+        }
+    }
+
+    /// Drain requests made through the exported framework ABI. Requests are
+    /// processed at the same safe frontier as the existing controller, never
+    /// from an arbitrary Xenia callback or from the instruction hot path.
+    /// Guest calls and memory writes are rejected by the framework policy
+    /// before they reach this method; unsupported host requests are completed
+    /// explicitly so a caller can distinguish "not implemented" from "never
+    /// observed".
+    fn serviceApplicationFrameworkRequests(self: *MachOState) void {
+        const ServiceResult = struct {
+            status: application_framework.contract.RequestStatus,
+            reason: u64,
+        };
+        var request: application_framework.contract.Request = .{};
+        var serviced: usize = 0;
+        while (serviced < 8 and self.application_framework.takePending(&request)) : (serviced += 1) {
+            const command = if (request.command <= @intFromEnum(application_framework.contract.Command.write_host_state))
+                @as(application_framework.contract.Command, @enumFromInt(request.command))
+            else
+                null;
+            const result = if (command) |resolved| blk: {
+                switch (resolved) {
+                    .snapshot => break :blk ServiceResult{ .status = application_framework.contract.RequestStatus.applied, .reason = 0 },
+                    .enable_trace => {
+                        self.application_framework.enableTraceMask(request.argument0);
+                        break :blk ServiceResult{ .status = application_framework.contract.RequestStatus.applied, .reason = 0 };
+                    },
+                    .disable_trace => {
+                        self.application_framework.clearTraceFlags();
+                        break :blk ServiceResult{ .status = application_framework.contract.RequestStatus.applied, .reason = 0 };
+                    },
+                    .drain_gpu_interrupts => {
+                        if (self.gpu_interrupt_callback == 0 or self.gpu_xenos_runtime.interrupts.pending_count == 0)
+                            break :blk ServiceResult{ .status = application_framework.contract.RequestStatus.not_ready, .reason = 0x4750_5549_4e54_0001 };
+                        const delivered = self.gpu_xenos_runtime.drainInterrupts(deliverGpuInterrupt, self, 32);
+                        break :blk ServiceResult{
+                            .status = if (delivered != 0) application_framework.contract.RequestStatus.applied else application_framework.contract.RequestStatus.not_ready,
+                            .reason = delivered,
+                        };
+                    },
+                    .refresh_output => {
+                        if (!self.dynamic_forwarder.guestFrontBufferAvailable())
+                            break :blk ServiceResult{ .status = application_framework.contract.RequestStatus.not_ready, .reason = 0x4652_4f4e_5400_0001 };
+                        break :blk ServiceResult{
+                            .status = if (self.dynamic_forwarder.attemptScheduledRefresh(self)) application_framework.contract.RequestStatus.applied else application_framework.contract.RequestStatus.not_ready,
+                            .reason = 0,
+                        };
+                    },
+                    .pause_guest, .resume_guest, .set_breakpoint, .inspect_guest_memory => break :blk ServiceResult{ .status = application_framework.contract.RequestStatus.unsupported, .reason = 0x4652_414d_455f_0001 },
+                    .invoke_guest_api, .write_guest_memory, .write_host_state => break :blk ServiceResult{ .status = application_framework.contract.RequestStatus.denied, .reason = 0x4755_4553_545f_0002 },
+                }
+            } else ServiceResult{ .status = application_framework.contract.RequestStatus.invalid, .reason = 0 };
+            _ = self.application_framework.complete(request.request_id, result.status, result.reason);
+        }
+    }
+
+    pub fn logGraphicsHealthContract(self: *MachOState) void {
+        const H = graphics_health_contract;
+        const ledger = &self.graphics_health;
+        const report = ledger.report();
+        machoCapturePrint(
+            "macho-processor: GRAPHICS HEALTH CONTRACT: schema={d} satisfied={d} degraded={d} blocked={d} untested={d} observed={d}/{d} step={d} fingerprint=0x{x}; {s}\n",
+            .{
+                @as(u16, graphics_health_contract.schema_version),
+                report.satisfied,
+                report.degraded,
+                report.blocked,
+                report.untested,
+                report.satisfied + report.degraded + report.blocked,
+                report.total,
+                self.executed_steps,
+                ledger.fingerprint(),
+                ledger.verdict(),
+            },
+        );
+        inline for (@typeInfo(H.Path).@"enum".fields) |field| {
+            const path: H.Path = @enumFromInt(field.value);
+            const path_report = ledger.pathReport(path);
+            machoCapturePrint(
+                "  health path={s: <16} complete={s} progress={d}/{d} satisfied={d} degraded={d} blocked={d} untested={d} first_missing={s}\n",
+                .{
+                    path.label(),
+                    if (path_report.complete()) "YES" else "NO",
+                    path_report.percent(),
+                    path_report.total,
+                    path_report.satisfied,
+                    path_report.degraded,
+                    path_report.blocked,
+                    path_report.untested,
+                    if (path_report.first_missing) |missing| missing.label() else "<none>",
+                },
+            );
+        }
+        inline for (@typeInfo(H.Layer).@"enum".fields) |field| {
+            const layer: H.Layer = @enumFromInt(field.value);
+            const layer_report = ledger.layerReport(layer);
+            machoCapturePrint(
+                "  health layer={s: <16} progress={d}% satisfied={d} degraded={d} blocked={d} untested={d}\n",
+                .{ layer.label(), layer_report.percent(), layer_report.satisfied, layer_report.degraded, layer_report.blocked, layer_report.untested },
+            );
+        }
+        inline for (@typeInfo(H.Stage).@"enum".fields) |field| {
+            const stage: H.Stage = @enumFromInt(field.value);
+            const entry = ledger.entry(stage);
+            machoCapturePrint(
+                "  health stage={s: <38} state={s: <9} owner={s: <16} layer={s: <14} count={d} first={d} last={d} source_mask=0x{x} note={s}\n",
+                .{ stage.label(), entry.state.label(), stage.owner().label(), stage.layer().label(), entry.count, entry.first_step, entry.last_step, entry.source_mask, entry.note() },
+            );
+        }
+    }
+
+    pub fn logApplicationController(self: *MachOState, decision: application_controller.Decision) void {
+        machoCapturePrint(
+            "macho-processor: APPLICATION CONTROLLER: epoch={d} observations={d} transitions={d} phase={s} action={s} blocker={s} secondary={s} domain={s} step={d} quiet(guest/ring/pm4/presenter)={d}/{d}/{d}/{d} host_action_authorized={s} host_drains={d} host_refreshes={d} guest_boundary_refusals={d}; guest-owned decisions remain observational\n",
+            .{
+                self.application_controller.run_epoch,
+                self.application_controller.observations,
+                self.application_controller.transitions,
+                decision.phase.label(),
+                decision.action.label(),
+                decision.blocker.label(),
+                decision.secondary_blocker.label(),
+                decision.domain.label(),
+                decision.step,
+                decision.guest_quiet_steps,
+                decision.ring_quiet_steps,
+                decision.pm4_quiet_steps,
+                decision.presenter_quiet_steps,
+                if (decision.host_action_authorized) "YES" else "NO",
+                self.application_controller_host_drains,
+                self.application_controller_host_refreshes,
+                self.application_controller.guest_boundary_refusals,
+            },
+        );
+    }
+
+    pub fn logApplicationFramework(self: *MachOState) void {
+        const snapshot = self.application_framework.snapshot();
+        const mode: application_framework.contract.Mode = @enumFromInt(snapshot.mode);
+        machoCapturePrint(
+            "macho-processor: APPLICATION FRAMEWORK: mode={s} sequence={d} events(retained/total/dropped)={d}/{d}/{d} requests(total/queued/applied/denied)={d}/{d}/{d}/{d} equivalence(checks/matches/mismatches)={d}/{d}/{d} last_guest(step/rip)=({d},0x{x}) application_id=0x{x}\n",
+            .{
+                mode.label(),
+                snapshot.sequence,
+                snapshot.events_retained,
+                snapshot.events_total,
+                snapshot.events_dropped,
+                snapshot.requests_total,
+                snapshot.requests_queued,
+                snapshot.requests_applied,
+                snapshot.requests_denied,
+                snapshot.equivalence_checks,
+                snapshot.equivalence_matches,
+                snapshot.equivalence_mismatches,
+                snapshot.last_guest_step,
+                snapshot.last_guest_rip,
+                snapshot.application_id,
+            },
+        );
+        const retained: usize = @intCast(@min(snapshot.events_retained, 8));
+        if (retained == 0) return;
+        const first = snapshot.events_retained - retained;
+        var ordinal: usize = @intCast(first);
+        while (ordinal < @as(usize, @intCast(snapshot.events_retained))) : (ordinal += 1) {
+            var event: application_framework.contract.Event = .{};
+            if (!self.application_framework.readEvent(ordinal, &event)) continue;
+            const name = std.mem.sliceTo(event.name[0..], 0);
+            const detail = std.mem.sliceTo(event.detail[0..], 0);
+            machoCapturePrint(
+                "  app-event seq={d} kind={d} truth={d} owner={d} domain={d} step={d} rip=0x{x} subject=0x{x} expected=0x{x} actual=0x{x} eq={d} name={s} detail={s}\n",
+                .{ event.sequence, event.kind, event.truth, event.owner, event.domain, event.guest_step, event.guest_rip, event.subject, event.expected, event.actual, event.equivalence, name, detail },
+            );
+        }
+    }
+
+    /// Join execution-boundary facts into the strict VdSwap ledger.  This is
+    /// intentionally conservative: entering the generic PM4 decoder is not
+    /// authentic swap consumption, and a presenter frame is not guest output
+    /// unless an authentic XE_SWAP has already been proven.
+    fn refreshVdSwapContract(self: *MachOState) void {
+        const at = self.executed_steps;
+        const ledger = &self.gpu_vd_swap_contract;
+        defer self.noteVdSwapMilestones();
+        const tracepoints = &self.execution_tracepoints;
+
+        // The producer probes.  Each is recorded on every refresh, found or
+        // not, because "the tracepoint watched this export for four billion
+        // steps and it never fired" and "nobody was watching" are the two
+        // readings the report has to be able to tell apart — and they send a
+        // reader to opposite ends of the system.
+        const swap_watched = tracepoints.roleEntered(.swap);
+        ledger.observeProbe(.guest_vdswap_entered, .guest_export_tracepoint, swap_watched, ledger.vdswap_calls, at);
+        ledger.observeProbe(.guest_vdswap_entered, .guest_log_breadcrumb, ledger.vdswap_calls != 0, ledger.vdswap_calls, at);
+        ledger.observeProbe(.vdswap_arguments_captured, .vdswap_argument_capture, ledger.arguments_observed != 0, ledger.arguments_observed, at);
+        ledger.observeProbe(.guest_xe_swap_encoded, .guest_log_breadcrumb, self.guest_vdswap_packet_encoded, ledger.guest_packet_encodes, at);
+        ledger.observeProbe(.vdswap_completed, .guest_log_breadcrumb, self.guest_vdswap_entry_completed, ledger.vdswap_completions, at);
+        ledger.observeProbe(.fetch_constant_encoded, .guest_log_breadcrumb, ledger.fetch_observations != 0, ledger.fetch_observations, at);
+        ledger.observeProbe(.ring_write_pointer_published, .ring_geometry_capture, self.gpu_ring_publication.advances != 0, self.gpu_ring_publication.advances, at);
+        ledger.observeProbe(.ring_geometry_observed, .ring_geometry_capture, self.gpu_ring_publication.geometry != null, self.gpu_ring_watch_size, at);
+
+        if (swap_watched) {
+            ledger.observeVdSwapEntered(at, .guest_tracepoint);
+        }
+        if (self.guest_vdswap_packet_encoded) {
+            ledger.observeGuestPacketEncoded(at, .guest_log);
+        }
+        if (self.guest_vdswap_entry_completed) {
+            ledger.observeVdSwapCompleted(at, .guest_log);
+        }
+        if (self.gpu_ring_publication.advances != 0) {
+            ledger.observePublication(at, .guest_publication);
+        }
+        if (self.gpu_ring_watch_base != 0 and self.gpu_ring_watch_size != 0 and
+            self.gpu_ring_publication.geometry != null)
+        {
+            ledger.observeRingGeometry(at, .memory_mapping);
+        }
+
+        // The PM4/indirect walk now has an explicit post-consumption section.
+        // These observations are deliberately sourced from the causal ledger
+        // and the stateful Xenos runtime independently: seeing 24 draw
+        // packets in retained memory is not the same thing as observing a
+        // programmed target, a completion signal, or a guest continuation.
+        const causal = &self.xenia_gpu_causal_trace;
+        ledger.observeIntermediary(.{
+            .pm4_state_programmed = causal.observed(.pm4_state_programmed),
+            .draw_submitted = causal.observed(.first_draw_submitted),
+            .draw_consumed = causal.observed(.first_draw_consumed),
+            .guest_wait_observed_after_draw = causal.postDrawWaitObserved(),
+        }, at, .causal_trace);
+        ledger.observeProbe(.pm4_state_programmed, .causal_event_ledger, causal.observed(.pm4_state_programmed), 0, at);
+        ledger.observeProbe(.draw_submitted, .causal_event_ledger, causal.observed(.first_draw_submitted), 0, at);
+        ledger.observeProbe(.draw_consumed, .causal_event_ledger, causal.observed(.first_draw_consumed), 0, at);
+        ledger.observeProbe(.guest_wait_observed_after_draw, .causal_event_ledger, causal.postDrawWaitObserved(), causal.wait_events_after_draw, at);
+
+        const target = self.gpu_xenos_runtime.renderTargetEvidence();
+        ledger.observeIntermediary(.{
+            .render_target_state_observed = target.state_observed,
+            .render_target_memory_observed = self.gpu_xenos_runtime.color_resolve_observations != 0,
+            .draw_completion_signaled = self.gpu_xenos_runtime.draw_completion_signals != 0,
+        }, at, .xenos_runtime);
+        ledger.observeIntermediary(.{
+            .draw_completion_dispatched = self.gpu_draw_completion_dispatches != 0,
+        }, at, .interrupt_dispatch);
+        if (causal.firstDrawConsumedStep()) |draw_step| {
+            const progressed = self.gpu_ring_publication.advances > 1 and
+                self.gpu_ring_publication.last_advance_step > draw_step;
+            if (progressed) {
+                ledger.observeIntermediary(.{
+                    .guest_producer_progressed_after_draw = true,
+                }, at, .guest_progress);
+            }
+            // The counter is live and the producer has not moved: a finding
+            // about the title, not a missing observer.
+            ledger.observeProbe(
+                .guest_producer_progressed_after_draw,
+                .guest_progress_counter,
+                progressed,
+                self.gpu_ring_publication.advances,
+                at,
+            );
+        } else {
+            // Nothing has consumed a draw yet, so there is no "after" to
+            // measure progress against.
+            ledger.recordProbe(.guest_producer_progressed_after_draw, .guest_progress_counter, .input_unavailable, 0, at);
+        }
+
+        // The tracepoint says the decoder ran, not that the packet came from
+        // VdSwap.  It closes only the packet readability/shape observations;
+        // the authentic-consumption stage remains closed until a provenance-
+        // bearing milestone or the stateful executor proves the source.
+        if (tracepoints.roleEntered(.xe_swap_decode)) {
+            ledger.observePacket(.{
+                .candidate_seen = true,
+                .decoded = true,
+                .stream_observed = true,
+                .stream_validated = true,
+            }, at, .command_processor_tracepoint);
+        }
+
+        if (ledger.authentic_consumptions != 0 and tracepoints.roleEntered(.command_swap)) {
+            ledger.observeIssueSwap(at, .issue_swap_tracepoint);
+        }
+        if (ledger.authentic_consumptions != 0 and tracepoints.roleEntered(.presenter)) {
+            ledger.observeOutputRefresh(at, .output_refresh_tracepoint);
+        }
+        // The presenter probes are gated on an authentic consumption by owner
+        // rule: entering IssueSwap for a swap the command processor never
+        // consumed would present a frame the title did not draw.  That is a
+        // refusal, and it is recorded as one — a policy decision a reader can
+        // act on, not a capability Rosette lacks.
+        if (ledger.authentic_consumptions == 0) {
+            for ([_]gpu.VdSwapStage{ .issue_swap_entered, .output_refresh_succeeded }) |stage| {
+                ledger.recordProbe(stage, .presenter_tracepoint, .refused_by_owner, 0, at);
+            }
+            ledger.recordProbe(.native_presented, .native_presenter_counter, .refused_by_owner, 0, at);
+        } else {
+            ledger.observeProbe(.issue_swap_entered, .presenter_tracepoint, tracepoints.roleEntered(.command_swap), 0, at);
+            ledger.observeProbe(.output_refresh_succeeded, .presenter_tracepoint, tracepoints.roleEntered(.presenter), 0, at);
+            ledger.observeProbe(
+                .native_presented,
+                .native_presenter_counter,
+                self.dynamic_forwarder.nativePresenterFramesPresented() != 0,
+                self.dynamic_forwarder.nativePresenterFramesPresented(),
+                at,
+            );
+        }
+        ledger.observeProbe(
+            .authentic_xe_swap_consumed,
+            .command_processor_tracepoint,
+            ledger.authentic_consumptions != 0,
+            ledger.authentic_consumptions,
+            at,
+        );
+        if (ledger.authentic_consumptions != 0 and
+            self.dynamic_forwarder.nativePresenterFramesPresented() != 0 and
+            self.gpu_ring_injection.injections == 0)
+        {
+            ledger.observeNativePresent(at, .native_present_tracepoint);
+        }
+        if (self.gpu_xenos_runtime.last_swap) |swap| {
+            if (self.gpu_xenos_runtime.swap_count != 0 and
+                self.gpu_ring_injection.injections == 0 and
+                self.gpu_ring_publication.published())
+            {
+                ledger.observeAuthenticConsumption(
+                    swap,
+                    self.gpu_xenos_runtime.frontBufferFetch(),
+                    at,
+                    .stateful_pm4_executor,
+                );
+            }
+        }
+    }
+
+    /// Feed first-time contract arrivals to the horizon ledger.
+    ///
+    /// A milestone is a boundary reached for the first time, never a counter
+    /// ticking: a spin loop advances counters, and only real progress arrives
+    /// somewhere it has never been. The contract mask is exactly that — a bit
+    /// per boundary, set once — so the newly-set bits since the last check are
+    /// the milestones and nothing else has to be inferred.
+    fn noteVdSwapMilestones(self: *MachOState) void {
+        const mask = self.gpu_vd_swap_contract.observed_mask;
+        const fresh = mask & ~self.run_horizon_vdswap_mask;
+        if (fresh == 0) return;
+        self.run_horizon_vdswap_mask = mask;
+        self.run_horizon.observe(.{
+            .step = self.executed_steps,
+            .emulated_ms = self.run_horizon.latest.emulated_ms,
+            .vblanks = self.run_horizon.latest.vblanks,
+            .host_seconds = self.elapsedHostSeconds(),
+        });
+        inline for (@typeInfo(gpu.VdSwapStage).@"enum".fields) |field| {
+            const stage: gpu.VdSwapStage = @enumFromInt(field.value);
+            if (fresh & gpu.vd_swap_contract.stageBit(stage) != 0) {
+                self.run_horizon.noteMilestone(stage.label());
+            }
+        }
+    }
+
+    fn elapsedHostSeconds(self: *const MachOState) u64 {
+        // The same monotonic source the heartbeat throughput uses, so the two
+        // rates in the report cannot disagree about how long the run has been
+        // going.
+        const now = startup_observer.monotonicNanoseconds();
+        if (self.run_started_at_ns == 0 or now <= self.run_started_at_ns) return 0;
+        return (now - self.run_started_at_ns) / std.time.ns_per_s;
+    }
+
+    /// Print whether the run stopped because the guest stopped, or because the
+    /// run did.
+    ///
+    /// Every other verdict in this subsystem is built on "X has not happened",
+    /// and none of them knew how much of the guest's own timeline the run
+    /// covered. A title that reached its newest milestone at 93% of the way
+    /// through a run has not stalled; it ran out of wall clock, and a longer
+    /// run is the entire fix. Reading that as a stall costs weeks.
+    pub fn logRunHorizon(self: *MachOState) void {
+        const ledger = &self.run_horizon;
+        ledger.observe(.{
+            .step = self.executed_steps,
+            .emulated_ms = ledger.latest.emulated_ms,
+            .vblanks = ledger.latest.vblanks,
+            .host_seconds = self.elapsedHostSeconds(),
+        });
+
+        // The independent axis: the producer's own publication counter. A
+        // frozen axis alone never convicts — the verdict requires a long quiet
+        // tail as well — but without one a quiet run cannot be called dead.
+        const axis_frozen = self.gpu_ring_publication.advances != 0 and
+            self.gpu_vd_swap_contract.observed(.draw_consumed) and
+            !self.gpu_vd_swap_contract.observed(.guest_producer_progressed_after_draw);
+        const verdict = ledger.verdict(axis_frozen);
+
+        machoCapturePrint(
+            "macho-processor: RUN HORIZON: verdict={s} milestones={d} last={s} progress={d}% quiet_tail={d}% step={d} emulated_ms={d} vblanks={d} host_s={d} rate={d}ms/s axis_frozen={s}; {s}\n",
+            .{
+                verdict.label(),
+                ledger.milestones_reached,
+                if (ledger.last_milestone_name.len != 0) ledger.last_milestone_name else "<none>",
+                ledger.progressPercent(),
+                ledger.quietTailPercent(),
+                ledger.latest.step,
+                ledger.latest.emulated_ms,
+                ledger.latest.vblanks,
+                ledger.latest.host_seconds,
+                ledger.emulatedMsPerHostSecond(),
+                if (axis_frozen) "YES" else "NO",
+                verdict.guidance(),
+            },
+        );
+
+        // The projection is what turns "run longer" from advice into a
+        // decision. Four minutes and nine hours are different conversations,
+        // and until the number is on the page the choice is made blind.
+        inline for (.{ @as(u64, 10_000), @as(u64, 30_000), @as(u64, 60_000) }) |target| {
+            const projection = ledger.project(target);
+            if (projection.known()) {
+                machoCapturePrint(
+                    "  horizon projection: reaching emulated {d}ms needs about {d} more host seconds at the {d}ms/s this run achieved\n",
+                    .{ target, projection.host_seconds_required orelse 0, projection.emulated_ms_per_host_second },
+                );
+            } else {
+                machoCapturePrint(
+                    "  horizon projection: emulated {d}ms is unprojectable — the run produced no measurable emulated-time rate, so run length cannot be reasoned about yet\n",
+                    .{target},
+                );
+            }
+        }
+
+        for (ledger.milestones[0..ledger.milestone_count]) |milestone| {
+            machoCapturePrint(
+                "  milestone {s: <38} step={d: <14} emulated_ms={d: <8} vblanks={d}\n",
+                .{ milestone.name, milestone.step, milestone.emulated_ms, milestone.vblanks },
+            );
+        }
+        if (ledger.milestones_dropped != 0) {
+            machoCapturePrint(
+                "  RUN HORIZON: {d} milestones past the retained window; the verdict still uses the newest, the list above does not show it\n",
+                .{ledger.milestones_dropped},
+            );
+        }
+    }
+
+    /// Print why each unmet stage is unmet, one line per stage.
+    ///
+    /// `logVdSwapContract` prints *what* is observed and names a single linear
+    /// frontier.  On a run whose producer never presents, that frontier is
+    /// always `guest VdSwap entered`, and the other eighteen unmet stages print
+    /// as an undifferentiated wall of `state=NO count=0`.  Some of those are
+    /// genuinely downstream of the producer.  Some are independent findings
+    /// against the command processor.  Some are Rosette's own blind spots.
+    /// They are three different pieces of work for three different owners, and
+    /// nothing in the existing report distinguishes them.
+    ///
+    /// This does.  Every unmet stage is classified against its real causal
+    /// prerequisites rather than its position in the total order, and against
+    /// what its probes actually achieved rather than what they found.
+    pub fn logVdSwapTrace(self: *MachOState) void {
+        self.refreshVdSwapContract();
+        const ledger = &self.gpu_vd_swap_contract;
+        const totals = ledger.diagnosisSummary();
+        const actionable = ledger.actionableMask();
+
+        machoCapturePrint(
+            "macho-processor: VD SWAP TRACE: met={d}/{d} walls={d} (findings={d} starved={d} unprobed={d}) downstream={d} probe_records={d} unlisted={d} step={d}; {s}\n",
+            .{
+                totals.met,
+                gpu.vd_swap_contract.stage_count,
+                totals.actionable + totals.starved + totals.unprobed,
+                totals.actionable,
+                totals.starved,
+                totals.unprobed,
+                totals.blocked_upstream,
+                ledger.probes.records,
+                ledger.probes.unlisted_probe_records,
+                self.executed_steps,
+                totals.verdict(),
+            },
+        );
+
+        if (ledger.primaryWall()) |wall| {
+            machoCapturePrint(
+                "  VD SWAP PRIMARY WALL: stage={s} chain={s} owner={s} attribution={s} decided_by={s}/{s} detail={d}; {s}\n",
+                .{
+                    wall.stage.label(),
+                    wall.chain.label(),
+                    wall.stage.owner().label(),
+                    wall.attribution.label(),
+                    if (wall.decided_by) |which| which.label() else "<none>",
+                    wall.decided_outcome.label(),
+                    wall.detail,
+                    wall.attribution.guidance(),
+                },
+            );
+        }
+
+        // Per-chain frontiers.  A stalled producer and a fully reached
+        // transport chain are both true at once, and one linear frontier can
+        // only ever report the first.
+        inline for (@typeInfo(gpu.VdSwapChain).@"enum".fields) |field| {
+            const chain: gpu.VdSwapChain = @enumFromInt(field.value);
+            const met = ledger.chainMet(chain);
+            const total = gpu.vd_swap_contract.chainStageCount(chain);
+            machoCapturePrint(
+                "  vd-swap chain {s: <13} met={d}/{d} frontier={s: <38} owner={s: <24}; {s}\n",
+                .{
+                    chain.label(),
+                    met,
+                    total,
+                    if (ledger.chainFrontier(chain)) |stage| stage.label() else "<complete>",
+                    if (ledger.chainFrontier(chain)) |stage| stage.owner().label() else "-",
+                    chain.meaning(),
+                },
+            );
+        }
+
+        // One line per unmet stage, in contract order, with the probes that
+        // decided it.  A met stage is already covered by the stage table in
+        // `logVdSwapContract`; repeating it here would bury the nineteen lines
+        // this report exists to make readable.
+        inline for (@typeInfo(gpu.VdSwapStage).@"enum".fields) |field| {
+            const stage: gpu.VdSwapStage = @enumFromInt(field.value);
+            const diagnosis = ledger.diagnose(stage);
+            if (diagnosis.attribution != .met) {
+                machoCapturePrint(
+                    "  vd-swap gap {s: <38} chain={s: <13} {s: <16} owner={s: <24} wall={s: <3} blocked_by={s: <38} probes={d}/{d} evidence={d} starved={d} decided={s}/{s} detail={d}\n",
+                    .{
+                        stage.label(),
+                        diagnosis.chain.label(),
+                        diagnosis.attribution.label(),
+                        stage.owner().label(),
+                        if (actionable & gpu.vd_swap_contract.stageBit(stage) != 0) "YES" else "NO",
+                        if (diagnosis.blocked_by) |prerequisite| prerequisite.label() else "-",
+                        diagnosis.probes_attempted,
+                        diagnosis.probes_total,
+                        diagnosis.probes_with_evidence,
+                        diagnosis.probes_starved,
+                        if (diagnosis.decided_by) |which| which.label() else "<none>",
+                        diagnosis.decided_outcome.label(),
+                        diagnosis.detail,
+                    },
+                );
+            }
+        }
+
+        // The probe grid for the walls only.  Thirteen downstream stages times
+        // sixteen probes is noise; the walls are where a reader has to know
+        // exactly which evidence path came back with what.
+        inline for (@typeInfo(gpu.VdSwapStage).@"enum".fields) |field| {
+            const stage: gpu.VdSwapStage = @enumFromInt(field.value);
+            const diagnosis = ledger.diagnose(stage);
+            if (diagnosis.actionable()) {
+                inline for (@typeInfo(gpu.VdSwapProbe).@"enum".fields) |probe_field| {
+                    const which: gpu.VdSwapProbe = @enumFromInt(probe_field.value);
+                    {
+                        if (probeSuppliesStage(stage, which)) {
+                            const cell = ledger.probes.cell(stage, which);
+                            machoCapturePrint(
+                                "    probe {s: <38} {s: <30} {s: <18} latest={s: <18} attempts={d} evidence={d} starved={d} detail={d} first={d} last={d}\n",
+                                .{
+                                    stage.label(),
+                                    which.label(),
+                                    cell.outcome.label(),
+                                    cell.latest.label(),
+                                    cell.attempts,
+                                    cell.evidence_attempts,
+                                    cell.starved_attempts,
+                                    cell.detail,
+                                    cell.first_step,
+                                    cell.last_step,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        machoCapturePrint(
+            "  VD SWAP EXECUTOR: retained(executions/refusals)={d}/{d} span_epoch={d} payload_epoch={d} publication_advances={d} batches={d} ring_dwords_consumed={d} packet_errors={d}; the stateful command processor is the only source of render-target registers, EDRAM resolves and draw-completion events. Zero executions means every stage below it is unobserved rather than false\n",
+            .{
+                self.gpu_xenos_retained_executions,
+                self.gpu_xenos_retained_refusals,
+                self.gpu_xenos_last_ring_epoch,
+                self.gpu_xenos_last_payload_epoch,
+                self.gpu_ring_publication.advances,
+                self.gpu_xenos_runtime.batches,
+                self.gpu_xenos_runtime.ring_dwords_consumed,
+                self.gpu_xenos_runtime.packet_errors,
+            },
+        );
+    }
+
+    fn probeSuppliesStage(stage: gpu.VdSwapStage, which: gpu.VdSwapProbe) bool {
+        for (gpu.vd_swap_contract.probesFor(stage)) |listed| {
+            if (listed == which) return true;
+        }
+        return false;
+    }
+
+    /// Print the complete VdSwap/PM4 ledger.  The broad graphics ladder still
+    /// has value for window/bootstrap work; this report is the packet-level
+    /// evidence needed to decide whether a front-buffer substitution is even
+    /// legal.
+    pub fn logVdSwapContract(self: *MachOState) void {
+        self.refreshVdSwapContract();
+        const ledger = &self.gpu_vd_swap_contract;
+        const frontier = ledger.frontier();
+        var source_buffer: [512]u8 = undefined;
+        const sources = ledger.sourceNames(&source_buffer);
+        var offset_buffer: [32]u8 = undefined;
+        const packet_offset = if (ledger.last_packet_offset) |offset|
+            std.fmt.bufPrint(&offset_buffer, "{d}", .{offset}) catch "?"
+        else
+            "<none>";
+        machoCapturePrint(
+            "macho-processor: VD SWAP CONTRACT: met={d}/{d} frontier={s} owner={s} blocker={s} sources={s} step={d} calls={d} args={d} candidates={d} invalid={d} conflicts={d} support(geometry/projection/stream/validated/indirects/candidates)={d}/{d}/{d}/{d}/{d}/{d} packets(readable/decoded/authentic/malformed)={d}/{d}/{d}/{d} packet_candidates(seen/readable/decoded/fetch_decoded/auth_missing)={d}/{d}/{d}/{d}/{d}\n",
+            .{
+                frontier.met,
+                frontier.total,
+                if (frontier.stage) |stage| stage.label() else "<complete>",
+                frontier.owner.label(),
+                frontier.blocker.label(),
+                if (sources.len != 0) sources else "<none>",
+                self.executed_steps,
+                ledger.vdswap_calls,
+                ledger.arguments_observed,
+                ledger.candidate_count,
+                ledger.invalid_candidate_count,
+                ledger.frontbuffer_conflicts,
+                ledger.ring_geometry_observations,
+                ledger.projection_readable_observations,
+                ledger.stream_observations,
+                ledger.stream_validation_observations,
+                ledger.indirect_resolution_observations,
+                ledger.candidate_observations,
+                ledger.readable_packet_observations,
+                ledger.decoded_packet_observations,
+                ledger.authentic_consumptions,
+                ledger.malformed_packets,
+                ledger.candidate_observations,
+                ledger.readable_packet_observations,
+                ledger.decoded_packet_observations,
+                ledger.fetch_decoded_observations,
+                ledger.authentic_missing_descriptions,
+            },
+        );
+        machoCapturePrint(
+            "  VD SWAP CONTRACT DETAIL: packet_anomalies(truncated/desync)={d}/{d} PM4(root/nested/indirect/draw/swap)={d}/{d}/{d}/{d}/{d} dwords(examined/scanned/span)={d}/{d}/{d} packet_offset={s}; {s}\n",
+            .{
+                ledger.truncated_observations,
+                ledger.desynchronised_observations,
+                ledger.root_packets,
+                ledger.nested_packets,
+                ledger.indirect_packets,
+                ledger.draw_packets,
+                ledger.swap_packets,
+                ledger.dwords_examined,
+                ledger.dwords_scanned,
+                ledger.span_dwords,
+                packet_offset,
+                frontier.blocker.guidance(),
+            },
+        );
+        machoCapturePrint(
+            "  VD SWAP INTERMEDIARY: PM4(state/submitted/consumed)={s}/{s}/{s} render_target(state/memory)={s}/{s} completion(signaled/dispatched)={s}/{s} guest(wait_after_draw/progress_after_draw)={s}/{s} observations={d}\n",
+            .{
+                if (ledger.observed(.pm4_state_programmed)) "YES" else "NO",
+                if (ledger.observed(.draw_submitted)) "YES" else "NO",
+                if (ledger.observed(.draw_consumed)) "YES" else "NO",
+                if (ledger.observed(.render_target_state_observed)) "YES" else "NO",
+                if (ledger.observed(.render_target_memory_observed)) "YES" else "NO",
+                if (ledger.observed(.draw_completion_signaled)) "YES" else "NO",
+                if (ledger.observed(.draw_completion_dispatched)) "YES" else "NO",
+                if (ledger.observed(.guest_wait_observed_after_draw)) "YES" else "NO",
+                if (ledger.observed(.guest_producer_progressed_after_draw)) "YES" else "NO",
+                ledger.intermediary_observations,
+            },
+        );
+        const target = self.gpu_xenos_runtime.renderTargetEvidence();
+        machoCapturePrint(
+            "  XENOS TARGET EVIDENCE: state={s} plausible={s} color(base_tile/format)={d}/{d} depth(base_tile/format)={d}/{d} surface(pitch/msaa/mask)={d}/{d}/{d} raw(color/depth/surface)=0x{x:0>8}/0x{x:0>8}/0x{x:0>8}\n",
+            .{
+                if (target.state_observed) "YES" else "NO",
+                if (target.plausible) "YES" else "NO",
+                target.color_base_tiles,
+                target.color_format,
+                target.depth_base_tiles,
+                target.depth_format,
+                target.surface_pitch_pixels,
+                target.msaa_mode,
+                target.color_mask,
+                target.raw_color_info,
+                target.raw_depth_info,
+                target.raw_surface_info,
+            },
+        );
+        machoCapturePrint(
+            "  XENOS COMPLETION EVIDENCE: draw_signals={d} draw_dispatch(attempts/success/failures)={d}/{d}/{d} color_resolves={d} causal_post_draw(wait/signal)={d}/{d}; a draw packet is not a frame until these owner boundaries are observed\n",
+            .{
+                self.gpu_xenos_runtime.draw_completion_signals,
+                self.gpu_draw_completion_dispatch_attempts,
+                self.gpu_draw_completion_dispatches,
+                self.gpu_draw_completion_dispatch_failures,
+                self.gpu_xenos_runtime.color_resolve_observations,
+                self.xenia_gpu_causal_trace.wait_events_after_draw,
+                self.xenia_gpu_causal_trace.signal_events_after_draw,
+            },
+        );
+        machoCapturePrint(
+            "  vd-swap provenance: entry_buffer_ptr=0x{x:0>8} entry_fetch_ptr=0x{x:0>8} entry_frontbuffer_ptr=0x{x:0>8} encoded_buffer_phys=0x{x:0>8} encoded_packet_dword={d} encoded_packet_dwords={d} encoded_geometry={s} encoding_mismatches={d}\n",
+            .{
+                ledger.arguments.command_buffer,
+                ledger.arguments.fetch_pointer,
+                ledger.arguments.frontbuffer_pointer,
+                ledger.encoded_command_buffer,
+                ledger.encoded_packet_offset,
+                ledger.encoded_packet_dwords,
+                if (ledger.encoded_packet_geometry_observed) "YES" else "NO",
+                ledger.packet_encoding_mismatches,
+            },
+        );
+        inline for (@typeInfo(gpu.VdSwapStage).@"enum".fields) |field| {
+            const stage: gpu.VdSwapStage = @enumFromInt(field.value);
+            const record = ledger.observation(stage);
+            machoCapturePrint(
+                "  vd-swap stage={s: <38} state={s: <3} owner={s: <28} count={d} first={d} last={d} source_mask=0x{x}\n",
+                .{
+                    stage.label(),
+                    if (record.seen) "YES" else "NO",
+                    stage.owner().label(),
+                    record.count,
+                    record.first_step,
+                    record.last_step,
+                    record.source_mask,
+                },
+            );
+        }
+        if (ledger.active_frontbuffer) |swap| {
+            machoCapturePrint(
+                "  vd-swap frontbuffer active=0x{x:0>8} extent={d}x{d} source={s} plausible={s} packet_offset={s}\n",
+                .{
+                    swap.frontbuffer_physical_address,
+                    swap.width,
+                    swap.height,
+                    ledger.active_frontbuffer_source.label(),
+                    if (ledger.frontbufferKnown()) "YES" else "NO",
+                    packet_offset,
+                },
+            );
+        } else {
+            machoCapturePrint(
+                "  vd-swap frontbuffer active=<none> arguments={s} fetch={s}\n",
+                .{ if (ledger.arguments.frontbuffer != null) "YES" else "NO", if (ledger.arguments.fetch != null) "YES" else "NO" },
+            );
+        }
+        for (ledger.candidates[0..ledger.candidate_count]) |candidate| {
+            if (candidate.description) |swap| machoCapturePrint(
+                "  vd-swap candidate source={s} address=0x{x:0>8} extent={d}x{d} plausible={s} observations={d} first_step={d}\n",
+                .{
+                    candidate.source.label(),
+                    swap.frontbuffer_physical_address,
+                    swap.width,
+                    swap.height,
+                    if (candidate.plausible) "YES" else "NO",
+                    candidate.observations,
+                    candidate.first_step,
+                },
+            );
+        }
     }
 
     /// The kernel surface: what a title reads before it will present, and
@@ -3839,12 +4979,30 @@ pub const MachOState = struct {
     /// ran, and supplying it is the entire job of a harness.
     pub fn refreshKernelVariables(self: *MachOState) void {
         const surface = &self.gpu_kernel_variables;
+        const custody = &self.gpu_provisioning_custody;
+        const at = self.executed_steps;
+
+        // The boundary a provisioning write has to beat.  `VdInitializeEngines`
+        // is the first display bring-up export the title enters, and it is the
+        // point past which these variables have been read and the decision made
+        // against whatever they held.  A write after this step is correct and
+        // changes nothing.
+        const engines = self.gpu_bootstrap.observations[@intFromEnum(gpu.Step.initialize_engines)];
+        if (engines.seen) custody.noteConsumerForAll(engines.first_step);
+
         inline for (.{
             gpu.KernelVariable.global_device,    gpu.KernelVariable.global_xam_device,
             gpu.KernelVariable.gpu_clock_in_mhz, gpu.KernelVariable.hsio_calibration_lock,
         }) |which| {
+            _ = custody.track(
+                which.ordinal(),
+                which.name(),
+                if (which.writer().harnessMayWrite()) .console_kernel else .guest_title,
+            );
             const slot_address = self.gpu_kernel_surface_addresses.lookup(which.ordinal()) orelse 0;
-            if (slot_address != 0) {
+            if (slot_address == 0) {
+                custody.noteRefusal(which.ordinal(), .address_unknown);
+            } else {
                 surface.observeImport(which, true, slot_address);
                 if (self.readConsoleDword(slot_address)) |slot_value| {
                     surface.observeSlot(which, slot_value);
@@ -3853,6 +5011,11 @@ pub const MachOState = struct {
                     {
                         if (self.readConsoleDword(slot_value)) |storage| {
                             surface.observeStorage(which, storage);
+                            // Anything in there the harness did not write came
+                            // from somewhere else.  That is how adoption and
+                            // divergence are detected without a write hook on
+                            // the address.
+                            custody.observeStorage(which.ordinal(), storage, at);
                         }
                     }
                 }
@@ -3861,13 +5024,37 @@ pub const MachOState = struct {
         }
     }
 
+    /// Provision platform state at the earliest moment its address exists.
+    ///
+    /// This used to happen only from a diagnostic heartbeat, and the heartbeat
+    /// interval is a hundred million guest steps.  The title reads these
+    /// variables during display bring-up, orders of magnitude earlier, gets a
+    /// zero and takes its early-return path — permanently, because nothing
+    /// re-reads them.  By the first heartbeat the values were written, the
+    /// variables reported `populated`, no ladder rung was blocked, and the
+    /// title had been wedged for the entire run.
+    ///
+    /// The earliest possible moment is when the emulator dumps its export
+    /// table: before that the slot address does not exist, so there is nowhere
+    /// to write.  Calling this then is what makes the write early enough to
+    /// matter.  It is cheap, idempotent, and refuses by the same owner rule as
+    /// every other path — a title-owned variable is still never written.
+    pub fn provisionPlatformStateNow(self: *MachOState) void {
+        self.gpu_provisioning_early_attempts +|= 1;
+        self.refreshKernelVariables();
+    }
+
     /// Supply one kernel-owned variable, if the owner rule allows it and the
     /// storage is reachable.
     fn provisionKernelVariable(self: *MachOState, which: gpu.KernelVariable) void {
+        const custody = &self.gpu_provisioning_custody;
         switch (self.gpu_kernel_variables.writeDecision(which)) {
+            .refused_title_owned => custody.noteRefusal(which.ordinal(), .not_harness_owned),
+            .refused_already_populated => custody.noteRefusal(which.ordinal(), .already_present),
             .allowed => |value| {
                 const slot_value = self.gpu_kernel_variables.entry(which).slot_value;
                 if (!self.writeConsoleDword(slot_value, value)) {
+                    custody.noteRefusal(which.ordinal(), .storage_unwritable);
                     self.gpu_kernel_variable_write_failures +|= 1;
                     machoCapturePrint(
                         "macho-processor: KERNEL VARIABLES: could not write {s} = 0x{x} at console 0x{x:0>8}; the storage the slot points at is not writable from here, so the platform state stays unsupplied and the title will read whatever is there\n",
@@ -3877,12 +5064,102 @@ pub const MachOState = struct {
                 }
                 _ = self.gpu_kernel_variables.noteHarnessWrite(which);
                 self.gpu_kernel_variable_writes +|= 1;
+                custody.noteHarnessWrite(which.ordinal(), value, self.executed_steps);
+                const record = custody.entry(which.ordinal());
                 machoCapturePrint(
-                    "macho-processor: KERNEL VARIABLES: supplied {s} = 0x{x} at console 0x{x:0>8} (harness write #{d}). This is platform state the real kernel established before the title ran; the title owns nothing here and nothing about its behaviour has been fabricated — {s}\n",
-                    .{ which.name(), value, slot_value, self.gpu_kernel_variable_writes, which.meaning() },
+                    "macho-processor: KERNEL VARIABLES: supplied {s} = 0x{x} at console 0x{x:0>8} (harness write #{d}) timing={s} guest_steps={d}. This is platform state the real kernel established before the title ran; the title owns nothing here and nothing about its behaviour has been fabricated — {s}\n",
+                    .{
+                        which.name(),
+                        value,
+                        slot_value,
+                        self.gpu_kernel_variable_writes,
+                        if (record) |entry| entry.timing().label() else "unknown",
+                        self.executed_steps,
+                        which.meaning(),
+                    },
                 );
             },
             else => {},
+        }
+    }
+
+    /// Print who provisioned each piece of platform state and whether it was
+    /// in time.
+    ///
+    /// `KERNEL VARIABLES` answers whether a value is present. That question is
+    /// always answered "yes" by the time anyone asks it, which is exactly why
+    /// a late write survives every check in the subsystem. This answers the two
+    /// questions that outlive it: did the write beat the consumer, and did the
+    /// resource's real owner ever agree.
+    pub fn logProvisioningCustody(self: *MachOState) void {
+        const custody = &self.gpu_provisioning_custody;
+        const totals = custody.summary();
+        const finding = totals.finding();
+        machoCapturePrint(
+            "macho-processor: PROVISIONING CUSTODY: finding={s} tracked={d} provisioned={d} preboot={d} in_time={d} LATE={d} unknown={d} adopted={d} load_bearing={d} contested={d} diverged={d} unprovisioned={d} refusals={d} address_unknown_attempts={d} early_attempts={d} step={d}; {s}\n",
+            .{
+                finding.label(),
+                totals.tracked,
+                totals.provisioned,
+                totals.preboot,
+                totals.provisioned -| (totals.preboot + totals.late + totals.unknown_timing),
+                totals.late,
+                totals.unknown_timing,
+                totals.adopted,
+                totals.load_bearing,
+                totals.contested,
+                totals.diverged,
+                totals.unprovisioned,
+                totals.refusals,
+                totals.address_unknown_attempts,
+                self.gpu_provisioning_early_attempts,
+                self.executed_steps,
+                finding.guidance(),
+            },
+        );
+        if (custody.blocking()) |record| {
+            machoCapturePrint(
+                "  PROVISIONING BLOCKER: {s} owner={s} custody={s} timing={s} divergence={s}; {s}\n",
+                .{
+                    record.name,
+                    record.owner.label(),
+                    record.custody().label(),
+                    record.timing().label(),
+                    record.divergence().label(),
+                    if (record.timing().missedItsConsumer())
+                        record.timing().guidance()
+                    else if (record.divergence() == .diverged)
+                        record.divergence().guidance()
+                    else
+                        record.last_refusal.guidance(),
+                },
+            );
+        }
+        for (custody.records[0..custody.count]) |record| {
+            machoCapturePrint(
+                "  custody {s: <24} owner={s: <16} {s: <20} timing={s: <16} {s: <12} harness(value/step/writes)=0x{x:0>8}/{d}/{d} owner_write(value/step)=0x{x:0>8}/{d} consumer_step={d} refusal={s} refusals={d}\n",
+                .{
+                    record.name,
+                    record.owner.label(),
+                    record.custody().label(),
+                    record.timing().label(),
+                    record.divergence().label(),
+                    record.harness_value,
+                    record.harness_step,
+                    record.harness_writes,
+                    record.owner_value,
+                    record.owner_step,
+                    record.consumer_step orelse 0,
+                    record.last_refusal.label(),
+                    record.refusals,
+                },
+            );
+        }
+        if (custody.dropped != 0) {
+            machoCapturePrint(
+                "  PROVISIONING CUSTODY: {d} resources did not fit the retained window; the list above is not the whole picture\n",
+                .{custody.dropped},
+            );
         }
     }
 
@@ -4168,22 +5445,27 @@ pub const MachOState = struct {
 
         const publication = &self.gpu_ring_publication;
         const published = publication.advances != 0;
+        if (publication.geometry != null) {
+            self.gpu_vd_swap_contract.observeRingGeometry(self.executed_steps, .memory_mapping);
+        }
         self.gpu_ring_scan_reports +|= 1;
         machoCapturePrint(
-            "macho-processor: RING CONTENTS: base=0x{x} dwords={d} size=0x{x} projections(readable/written)={d}/{d} aliases_disagree={s}; {s}\n",
+            "macho-processor: RING CONTENTS: base=0x{x} dwords={d} size=0x{x} projections(readable/written/candidates/payload_readable)={d}/{d}/{d}/{d} aliases_disagree={s}; {s}\n",
             .{
                 self.gpu_ring_watch_base,
                 ring_dwords,
                 self.gpu_ring_watch_size,
                 survey.readableCount(),
                 survey.writtenCount(),
+                survey.swapCandidateCount(),
+                survey.readableSwapCandidateCount(),
                 if (survey.aliasesDisagree()) "YES" else "NO",
                 survey.verdict(published),
             },
         );
         for (survey.readings) |reading| {
             machoCapturePrint(
-                "  projection {s: <16} host=0x{x:0>9} readable={s: <3} nonzero_dwords={d: <6} packets={d: <5} draws={d: <4} swap={s}; {s}\n",
+                "  projection {s: <16} host=0x{x:0>9} readable={s: <3} nonzero_dwords={d: <6} packets={d: <5} draws={d: <4} stream_validated={s: <3} swap_candidates={d} payload_readable={d} malformed={d} truncated={d} swap={s}; {s}\n",
                 .{
                     reading.projection.label(),
                     reading.address,
@@ -4191,6 +5473,11 @@ pub const MachOState = struct {
                     reading.nonzero_dwords,
                     reading.packets,
                     reading.draws,
+                    if (reading.stream_validated) "YES" else "NO",
+                    reading.swap_candidates,
+                    reading.swap_payload_readable,
+                    reading.swap_malformed_candidates,
+                    reading.swap_truncated_candidates,
                     if (reading.swap != null) "YES" else "NO",
                     reading.projection.meaning(),
                 },
@@ -4202,14 +5489,69 @@ pub const MachOState = struct {
         // the emulator reports them through a path this process does not see;
         // an empty span is therefore not evidence, and the whole-ring walk
         // above is what the verdict is built on.
-        const geometry = publication.geometry orelse gpu.RingGeometry{};
+        const geometry = publication.geometry orelse blk: {
+            for ([_]gpu.VdSwapStage{ .ring_geometry_observed, .ring_projection_readable }) |stage| {
+                self.gpu_vd_swap_contract.recordProbe(stage, .ring_geometry_capture, .input_unavailable, 0, self.executed_steps);
+            }
+            break :blk gpu.RingGeometry{};
+        };
         const span: u32 = if (geometry.write_pointer >= geometry.read_pointer)
             geometry.write_pointer - geometry.read_pointer
         else
             ring_dwords - (geometry.read_pointer - geometry.write_pointer);
+        // The stages the outstanding-span walk can supply.  It is recorded
+        // against every one of them on every heartbeat, including the
+        // heartbeats where it reads nothing: a span of zero is the normal
+        // state of a drained ring, and sixteen consecutive empty walks are not
+        // sixteen pieces of evidence that the producer wrote no swap.
+        const span_stages = [_]gpu.VdSwapStage{
+            .ring_projection_readable,
+            .pm4_stream_observed,
+            .pm4_stream_validated,
+            .xe_swap_candidate_seen,
+            .xe_swap_packet_readable,
+            .xe_swap_packet_decoded,
+            .fetch_constant_decoded,
+        };
         if (survey.best()) |chosen| {
             if (self.guestMemoryConst(chosen.address, self.gpu_ring_watch_size)) |bytes| {
                 const summary = gpu.ring_scan.scan(bytes, geometry.read_pointer, span, ring_dwords);
+                if (summary.dwords_examined == 0) {
+                    for (span_stages) |stage| {
+                        self.gpu_vd_swap_contract.recordProbe(stage, .outstanding_span_scan, .input_empty, 0, self.executed_steps);
+                    }
+                } else {
+                    self.gpu_vd_swap_contract.observeProbe(.ring_projection_readable, .outstanding_span_scan, chosen.readable, summary.dwords_examined, self.executed_steps);
+                    self.gpu_vd_swap_contract.observeProbe(.pm4_stream_observed, .outstanding_span_scan, summary.packets != 0, summary.dwords_examined, self.executed_steps);
+                    self.gpu_vd_swap_contract.observeProbe(.pm4_stream_validated, .outstanding_span_scan, !summary.truncated and !summary.desynchronised and summary.malformed_packets == 0, summary.dwords_scanned, self.executed_steps);
+                    self.gpu_vd_swap_contract.observeProbe(.xe_swap_candidate_seen, .outstanding_span_scan, summary.swap_candidates != 0, summary.dwords_examined, self.executed_steps);
+                    self.gpu_vd_swap_contract.observeProbe(.xe_swap_packet_readable, .outstanding_span_scan, summary.swap_payload_readable != 0, summary.swap_candidates, self.executed_steps);
+                    self.gpu_vd_swap_contract.observeProbe(.xe_swap_packet_decoded, .outstanding_span_scan, summary.swap != null, summary.swap_candidates, self.executed_steps);
+                    self.gpu_vd_swap_contract.observeProbe(.fetch_constant_decoded, .outstanding_span_scan, summary.fetch != null, summary.dwords_examined, self.executed_steps);
+                }
+                self.gpu_vd_swap_contract.observePacket(.{
+                    .projection_readable = chosen.readable,
+                    .stream_observed = summary.dwords_examined != 0 and summary.zero_dwords < summary.dwords_examined,
+                    .stream_validated = summary.dwords_examined != 0 and summary.zero_dwords < summary.dwords_examined and
+                        !summary.truncated and !summary.desynchronised and summary.malformed_packets == 0,
+                    .candidate_seen = summary.swap_candidates != 0,
+                    .readable = summary.swap_payload_readable != 0,
+                    .decoded = summary.swap != null,
+                    .swap = summary.swap,
+                    .fetch = summary.fetch,
+                    .fetch_decoded = summary.fetch != null,
+                    .root_packets = summary.packets,
+                    .draw_packets = summary.draw_packets,
+                    .swap_packets = summary.swap_packets,
+                    .malformed_packets = summary.malformed_packets,
+                    .truncated = summary.truncated,
+                    .desynchronised = summary.desynchronised,
+                    .zero_dwords = summary.zero_dwords,
+                    .dwords_examined = summary.dwords_examined,
+                    .dwords_scanned = summary.dwords_scanned,
+                    .span_dwords = summary.span_dwords,
+                    .packet_offset = summary.swap_offset,
+                }, self.executed_steps, .ring_memory_scan);
                 self.xenia_gpu_causal_trace.observeRingPayload(
                     summary.packets,
                     summary.draw_packets,
@@ -4218,13 +5560,15 @@ pub const MachOState = struct {
                     self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.advances != 0,
                 );
                 machoCapturePrint(
-                    "  outstanding span: projection={s} read={d} write={d} span={d} examined={d} walked={d} packets={d} draws={d} swaps={d} truncated={s} desync={s}; {s}\n",
+                    "  outstanding span: projection={s} read={d} write={d} span={d} examined={d} walked={d} packets={d} draws={d} swaps={d} candidates={d} payload_readable={d} decoded={s} fetch_decoded={s} truncated={s} desync={s}; {s}\n",
                     .{
                         chosen.projection.label(),                   geometry.read_pointer,
                         geometry.write_pointer,                      span,
                         summary.dwords_examined,                     summary.dwords_scanned,
                         summary.packets,                             summary.draw_packets,
-                        summary.swap_packets,                        if (summary.truncated) "YES" else "NO",
+                        summary.swap_packets,                        summary.swap_candidates,
+                        summary.swap_payload_readable,               if (summary.swap != null) "YES" else "NO",
+                        if (summary.fetch != null) "YES" else "NO",  if (summary.truncated) "YES" else "NO",
                         if (summary.desynchronised) "YES" else "NO", summary.verdict(),
                     },
                 );
@@ -4244,8 +5588,7 @@ pub const MachOState = struct {
                         xenosMemoryWrite,
                     );
                     if (self.gpu_xenos_runtime.executeRingBytes(bytes, geometry.read_pointer, span, ring_dwords)) |execution| {
-                        if (execution.draws != 0) self.gpu_ring_draws_seen = true;
-                        _ = self.xenia_gpu_causal_trace.observePm4SpanWithIndirects(
+                        const indirect = self.xenia_gpu_causal_trace.observePm4SpanWithIndirects(
                             bytes,
                             geometry.read_pointer,
                             span,
@@ -4256,15 +5599,67 @@ pub const MachOState = struct {
                             self,
                             xenosMemoryRead,
                         );
+                        const indirect_packets: u64 = @as(u64, indirect.root_packets) + @as(u64, indirect.nested_packets);
+                        const indirect_draws: u64 = indirect.draw_packets;
+                        const indirect_swaps: u64 = indirect.swap_packets;
+                        const executed_packets = execution.packets_after - execution.packets_before;
+                        const indirects_resolved = indirect.unreadable_references == 0 and
+                            indirect.invalid_references == 0 and
+                            indirect.cycle_references == 0 and
+                            indirect.depth_limited_references == 0 and
+                            indirect.truncated_references == 0 and
+                            indirect.budget_limited_references == 0;
+                        const stream_observed = execution.dwords != 0 or executed_packets != 0;
+                        const stream_validated = stream_observed and !execution.truncated;
+                        const runtime_fetch = self.gpu_xenos_runtime.frontBufferFetch();
+                        const execution_runtime_swap = self.gpu_xenos_runtime.last_swap;
+                        self.gpu_vd_swap_contract.observePacket(.{
+                            .projection_readable = true,
+                            .stream_observed = stream_observed,
+                            .stream_validated = stream_validated,
+                            .indirects_resolved = indirects_resolved,
+                            .candidate_seen = execution.swaps != 0 or execution_runtime_swap != null,
+                            .readable = execution_runtime_swap != null,
+                            .decoded = execution_runtime_swap != null,
+                            .swap = execution_runtime_swap,
+                            .fetch = runtime_fetch,
+                            .fetch_decoded = runtime_fetch != null,
+                            .root_packets = executed_packets,
+                            .nested_packets = indirect.nested_packets,
+                            .indirect_packets = indirect.indirect_packets,
+                            .draw_packets = execution.draws,
+                            .swap_packets = execution.swaps,
+                            .truncated = execution.truncated,
+                            .unknown_opcodes = execution.unknown_opcodes,
+                            .unreadable_references = indirect.unreadable_references,
+                            .authentic_consumption = execution_runtime_swap != null and
+                                self.gpu_ring_injection.injections == 0 and
+                                self.gpu_ring_publication.published(),
+                        }, self.executed_steps, .stateful_pm4_executor);
+                        const consumed_packets = if (executed_packets > indirect_packets) executed_packets else indirect_packets;
+                        const consumed_draws = if (execution.draws > indirect_draws) execution.draws else indirect_draws;
+                        const consumed_swaps = if (execution.swaps > indirect_swaps) execution.swaps else indirect_swaps;
+                        if (consumed_draws != 0) {
+                            self.gpu_ring_draws_seen = true;
+                            const draw_count: u32 = @intCast(@min(consumed_draws, @as(u64, std.math.maxInt(u32))));
+                            if (draw_count > self.gpu_ring_draws_last_count) self.gpu_ring_draws_last_count = draw_count;
+                        }
+                        self.gpu_ring_publication.observeConsumedBatch(
+                            span,
+                            consumed_packets,
+                            consumed_draws,
+                            consumed_swaps,
+                            self.executed_steps,
+                        );
                         self.xenia_gpu_causal_trace.observeConsumedBatch(
-                            @intCast(execution.packets_after - execution.packets_before),
-                            @intCast(execution.draws),
-                            @intCast(execution.swaps),
+                            @intCast(@min(consumed_packets, @as(u64, std.math.maxInt(u32)))),
+                            @intCast(@min(consumed_draws, @as(u64, std.math.maxInt(u32)))),
+                            @intCast(@min(consumed_swaps, @as(u64, std.math.maxInt(u32)))),
                             self.executed_steps,
                             self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.advances != 0,
                         );
                         machoCapturePrint(
-                            "macho-processor: XENOS PM4 execution: batches={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s}; state_draws={d} state_swaps={d}\n",
+                            "macho-processor: XENOS PM4 execution: batches={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s}; observed_packets={d} observed_draws={d} observed_swaps={d} indirect_buffers={d} indirect_read={d}/{d} indirect_status={s} indirect_address=0x{x:0>8} indirect_missing=0x{x:0>8}; state_draws={d} state_swaps={d}\n",
                             .{
                                 self.gpu_xenos_runtime.batches,
                                 execution.dwords,
@@ -4274,6 +5669,15 @@ pub const MachOState = struct {
                                 execution.swaps,
                                 execution.unknown_opcodes,
                                 if (execution.truncated) "YES" else "NO",
+                                consumed_packets,
+                                consumed_draws,
+                                consumed_swaps,
+                                execution.indirect_buffers,
+                                execution.indirect_dwords_read,
+                                execution.indirect_dwords_requested,
+                                execution.indirect_last_status.label(),
+                                execution.indirect_last_address,
+                                execution.indirect_last_missing_address orelse 0,
                                 self.gpu_xenos_runtime.draw_count,
                                 self.gpu_xenos_runtime.swap_count,
                             },
@@ -4282,6 +5686,11 @@ pub const MachOState = struct {
                             if (self.gpu_xenos_runtime.last_swap) |runtime_swap| {
                                 if (runtime_swap.plausible()) {
                                     self.gpu_frontbuffer = runtime_swap;
+                                    self.gpu_vd_swap_contract.observeFrontBuffer(
+                                        runtime_swap,
+                                        .stateful_pm4_executor,
+                                        self.executed_steps,
+                                    );
                                     self.offerGuestFrontBuffer(runtime_swap, self.gpu_xenos_runtime.frontBufferFetch());
                                     machoCapturePrint(
                                         "macho-processor: XENOS PM4 present handoff: frontbuffer=0x{x:0>8} extent={d}x{d} fetch={s}; stateful command processing supplied the presenter even when the generic ring scanner did not decode the swap\n",
@@ -4316,13 +5725,61 @@ pub const MachOState = struct {
 
         if (survey.best()) |chosen| {
             if (chosen.draws != 0) self.gpu_ring_draws_seen = true;
-            self.gpu_ring_draws_last_count = chosen.draws;
+            if (chosen.draws > self.gpu_ring_draws_last_count) self.gpu_ring_draws_last_count = chosen.draws;
             self.gpu_ring_nonzero_dwords = chosen.nonzero_dwords;
+            // The whole-ring survey is the strongest negative evidence the
+            // subsystem has: it reads every dword of a readable projection,
+            // drained or outstanding.  When it finds no XE_SWAP the title
+            // really did not write one, and that is a finding against the
+            // producer rather than a hole in the observer.  When the projection
+            // holds nothing at all the reverse is true, so the two are recorded
+            // as different outcomes.
+            const survey_stages = [_]gpu.VdSwapStage{
+                .xe_swap_candidate_seen,
+                .xe_swap_packet_readable,
+                .xe_swap_packet_decoded,
+            };
+            if (!chosen.readable) {
+                for (survey_stages) |stage| {
+                    self.gpu_vd_swap_contract.recordProbe(stage, .ring_projection_survey, .input_unavailable, 0, self.executed_steps);
+                }
+                self.gpu_vd_swap_contract.recordProbe(.ring_projection_readable, .ring_projection_survey, .input_unavailable, 0, self.executed_steps);
+            } else if (chosen.nonzero_dwords == 0) {
+                for (survey_stages) |stage| {
+                    self.gpu_vd_swap_contract.recordProbe(stage, .ring_projection_survey, .input_empty, 0, self.executed_steps);
+                }
+                self.gpu_vd_swap_contract.observeProbe(.ring_projection_readable, .ring_projection_survey, true, 0, self.executed_steps);
+            } else {
+                self.gpu_vd_swap_contract.observeProbe(.ring_projection_readable, .ring_projection_survey, true, chosen.nonzero_dwords, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.pm4_stream_observed, .ring_projection_survey, chosen.packets != 0, chosen.nonzero_dwords, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.pm4_stream_validated, .ring_projection_survey, chosen.stream_validated, chosen.packets, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.xe_swap_candidate_seen, .ring_projection_survey, chosen.swap_candidates != 0, chosen.nonzero_dwords, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.xe_swap_packet_readable, .ring_projection_survey, chosen.swap_payload_readable != 0, chosen.swap_candidates, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.xe_swap_packet_decoded, .ring_projection_survey, chosen.swap != null, chosen.swap_candidates, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.frontbuffer_validated, .retained_batch_scan, chosen.swap != null, chosen.nonzero_dwords, self.executed_steps);
+            }
+            self.gpu_vd_swap_contract.observePacket(.{
+                .projection_readable = chosen.readable,
+                .stream_observed = chosen.nonzero_dwords != 0 and chosen.packets != 0,
+                .stream_validated = chosen.stream_validated,
+                .candidate_seen = chosen.swap_candidates != 0,
+                .readable = chosen.swap_payload_readable != 0,
+                .decoded = chosen.swap != null,
+                .swap = chosen.swap,
+                .fetch = chosen.fetch,
+                .fetch_decoded = chosen.fetch != null,
+                .root_packets = chosen.packets,
+                .draw_packets = chosen.draws,
+                .swap_packets = chosen.swap_candidates,
+                .malformed_packets = chosen.swap_malformed_candidates,
+                .truncated = chosen.swap_truncated_candidates != 0,
+                .packet_offset = chosen.swap_offset,
+            }, self.executed_steps, .ring_memory_scan);
             self.logRingPayload(chosen);
         }
         self.logSubmissionProvenance();
         machoCapturePrint(
-            "  whole-ring draw search: draws={d} ever_seen={s}; the outstanding span is what the pointers describe, and a batch the command processor already drained is still in the ring. Absence here is weak evidence and presence is strong\n",
+            "  whole-ring draw search: effective_draws(root_or_nested)={d} ever_seen={s}; the outstanding span is what the pointers describe, and a batch the command processor already drained is still in the ring. Absence here is weak evidence and presence is strong\n",
             .{ self.gpu_ring_draws_last_count, if (self.gpu_ring_draws_seen) "YES" else "NO" },
         );
 
@@ -4340,6 +5797,7 @@ pub const MachOState = struct {
             );
             if (swap.plausible()) {
                 self.gpu_frontbuffer = swap;
+                self.gpu_vd_swap_contract.observeFrontBuffer(swap, .ring_memory_scan, self.executed_steps);
                 self.offerGuestFrontBuffer(swap, if (survey.best()) |chosen| chosen.fetch else null);
             }
         } else {
@@ -4353,7 +5811,12 @@ pub const MachOState = struct {
     fn deliverGpuInterrupt(context: *anyopaque, event: gpu.interrupt_controller.Event) void {
         const self: *MachOState = @ptrCast(@alignCast(context));
         self.gpu_interrupt_dispatches +|= 1;
-        if (self.gpu_interrupt_callback == 0) return;
+        const is_draw_completion = event.kind == .draw_complete;
+        if (is_draw_completion) self.gpu_draw_completion_dispatch_attempts +|= 1;
+        if (self.gpu_interrupt_callback == 0) {
+            if (is_draw_completion) self.gpu_draw_completion_dispatch_failures +|= 1;
+            return;
+        }
         const source = self.scheduleSignalCallback(
             self.gpu_interrupt_callback,
             self.gpu_interrupt_callback_arg,
@@ -4363,12 +5826,14 @@ pub const MachOState = struct {
         );
         if (source == 0) {
             self.gpu_interrupt_dispatch_failures +|= 1;
+            if (is_draw_completion) self.gpu_draw_completion_dispatch_failures +|= 1;
             machoCapturePrint(
                 "macho-processor: XENOS GPU interrupt callback rejected: callback=0x{x} event={s} id=0x{x} value=0x{x}; guest execution was not fabricated\n",
                 .{ self.gpu_interrupt_callback, @tagName(event.kind), event.id, event.value },
             );
             return;
         }
+        if (is_draw_completion) self.gpu_draw_completion_dispatches +|= 1;
         self.gpu_bootstrap.observe(.graphics_interrupt_dispatch, self.executed_steps);
     }
 
@@ -4381,26 +5846,348 @@ pub const MachOState = struct {
         };
     }
 
-    fn xenosPhysicalHostAddress(self: *MachOState, address: u32) ?u64 {
+    fn xenosProjectionHostAddress(
+        self: *MachOState,
+        address: u32,
+        projection: xenia_memory_views.PhysicalProjection,
+    ) ?u64 {
         const aligned = address & ~@as(u32, 3);
-        return self.xenia_memory_views.physicalHostAddress(aligned) orelse
-            self.xenia_memory_views.virtualHostAddress(aligned);
+        return self.xenia_memory_views.physicalProjectionHostAddress(aligned, projection);
+    }
+
+    fn xenosReadProjection(
+        self: *MachOState,
+        address: u32,
+        projection: xenia_memory_views.PhysicalProjection,
+    ) ?u32 {
+        const host = self.xenosProjectionHostAddress(address, projection) orelse return null;
+        const bytes = self.guestMemoryConst(host, 4) orelse return null;
+        // Xenia's TranslatePhysical backing stores Xbox words in big-endian
+        // memory. This is the direct equivalent of Xenia's
+        // load_and_swap<uint32_t> on a little-endian macOS host.
+        const raw = std.mem.readInt(u32, bytes[0..4], .big);
+        return xenosGpuSwap(raw, @truncate(address));
+    }
+
+    fn xenosWriteProjection(
+        self: *MachOState,
+        address: u32,
+        value: u32,
+        endian: u2,
+        projection: xenia_memory_views.PhysicalProjection,
+    ) bool {
+        const host = self.xenosProjectionHostAddress(address, projection) orelse return false;
+        const bytes = self.guestMemory(host, 4) orelse return false;
+        std.mem.writeInt(u32, bytes[0..4], xenosGpuSwap(value, endian), .big);
+        return true;
+    }
+
+    fn noteXenosAliasFallback(self: *MachOState, address: u32, disagreement: bool) void {
+        self.gpu_xenos_memory_alias_fallbacks +|= 1;
+        if (disagreement) self.gpu_xenos_memory_alias_disagreements +|= 1;
+        self.gpu_xenos_memory_alias_log_count +|= 1;
+        const count = self.gpu_xenos_memory_alias_log_count;
+        if (count <= 8 or (count % 256) == 0) {
+            machoCapturePrint(
+                "macho-processor: XENOS MEMORY projection fallback #{d}: physical=UNREADABLE address=0x{x:0>8} aliases_disagree={s}; {s}\n",
+                .{
+                    count,
+                    address,
+                    if (disagreement) "YES" else "NO",
+                    if (disagreement) "read refused (zero-trust)" else "alias value accepted",
+                },
+            );
+        }
     }
 
     fn xenosMemoryRead(context: *anyopaque, address: u32) ?u32 {
         const self: *MachOState = @ptrCast(@alignCast(context));
-        const host = self.xenosPhysicalHostAddress(address) orelse return null;
-        const bytes = self.guestMemoryConst(host, 4) orelse return null;
-        const raw = std.mem.readInt(u32, bytes[0..4], .little);
-        return xenosGpuSwap(raw, @truncate(address));
+        if (self.xenosReadProjection(address, .physical)) |value| return value;
+        self.gpu_xenos_memory_physical_misses +|= 1;
+
+        var fallback: ?u32 = null;
+        var disagreement = false;
+        inline for ([_]xenia_memory_views.PhysicalProjection{ .a_virtual, .c_virtual, .e_virtual }) |projection| {
+            if (self.xenosReadProjection(address, projection)) |value| {
+                if (fallback) |existing| {
+                    if (existing != value) disagreement = true;
+                } else {
+                    fallback = value;
+                }
+            }
+        }
+        if (disagreement) {
+            self.noteXenosAliasFallback(address, true);
+            return null;
+        }
+        if (fallback != null) self.noteXenosAliasFallback(address, false);
+        return fallback;
     }
 
     fn xenosMemoryWrite(context: *anyopaque, address: u32, value: u32, endian: u2) bool {
         const self: *MachOState = @ptrCast(@alignCast(context));
-        const host = self.xenosPhysicalHostAddress(address) orelse return false;
-        const bytes = self.guestMemory(host, 4) orelse return false;
-        std.mem.writeInt(u32, bytes[0..4], xenosGpuSwap(value, endian), .little);
-        return true;
+        if (self.xenosWriteProjection(address, value, endian, .physical)) return true;
+        self.gpu_xenos_memory_physical_misses +|= 1;
+
+        var wrote_alias = false;
+        inline for ([_]xenia_memory_views.PhysicalProjection{ .a_virtual, .c_virtual, .e_virtual }) |projection| {
+            if (self.xenosWriteProjection(address, value, endian, projection)) wrote_alias = true;
+        }
+        if (wrote_alias) self.noteXenosAliasFallback(address, false);
+        return wrote_alias;
+    }
+
+    /// Execute the batch that is still present in ring memory after the
+    /// command processor drained it.
+    ///
+    /// The stateful Xenos runtime is the only source in the subsystem for
+    /// render-target registers, EDRAM resolves, draw-completion events and a
+    /// decoded front-buffer fetch constant.  Until this existed it ran from one
+    /// place only: the branch guarded by `span != 0`, where `span` is the
+    /// distance between the ring's read and write pointers.  A title that
+    /// publishes once during bring-up and is then drained has `read == write`
+    /// forever, so on the run this was written against that branch never fired,
+    /// the register file was never written, and six contract stages read zero
+    /// because nothing had ever executed a packet — not because the title
+    /// failed to program its GPU.
+    ///
+    /// Replaying the retained batch is not a substitution.  These are dwords
+    /// the producer actually wrote, framed by the same walk that reports them,
+    /// decoded by Rosette's own command processor rather than invented by it.
+    /// It runs at most once per publication epoch, so a drained ring is never
+    /// replayed into a second frame's worth of state, and it cannot close
+    /// `authentic_xe_swap_consumed` unless the batch really carries a swap —
+    /// `observeAuthenticConsumption` refuses a null description.
+    fn executeRetainedBatch(
+        self: *MachOState,
+        bytes: []const u8,
+        root_start: u32,
+        root_dwords: u32,
+        ring_dwords: u32,
+        authentic: bool,
+    ) void {
+        const at = self.executed_steps;
+        const ledger = &self.gpu_vd_swap_contract;
+        const executor_stages = [_]gpu.VdSwapStage{
+            .pm4_state_programmed,
+            .draw_submitted,
+            .draw_consumed,
+            .render_target_state_observed,
+            .render_target_memory_observed,
+            .draw_completion_signaled,
+            .fetch_constant_decoded,
+            .xe_swap_candidate_seen,
+        };
+
+        if (root_dwords == 0) {
+            for (executor_stages) |stage| {
+                ledger.recordProbe(stage, .stateful_pm4_execution, .input_empty, 0, at);
+            }
+            return;
+        }
+        if (self.gpu_xenos_last_payload_epoch == self.gpu_ring_publication.advances) return;
+        self.gpu_xenos_last_payload_epoch = self.gpu_ring_publication.advances;
+
+        // Read-only replay, and this is not a detail.
+        //
+        // The batch has already been consumed by the emulator's own command
+        // processor, which means its MEM_WRITE and EVENT_WRITE_SHD packets have
+        // already landed in guest memory.  Replaying them would make Rosette
+        // write stale fence and progress values over addresses the guest has
+        // since advanced — Rosette would become the corrupting writer, and the
+        // corruption would look like a title bug.  The span-gated path can
+        // safely attach the write callback because it executes an *outstanding*
+        // span whose writes have not happened yet; this path cannot.
+        //
+        // Nothing needed here is lost.  The register file, draw state, EDRAM
+        // resolves and completion events all live in Rosette's own storage, and
+        // suppressed writes are counted rather than dropped silently, so the
+        // batch's memory-write content stays visible as a number.
+        const deferred_before = self.gpu_xenos_runtime.executor.deferred_memory_count;
+        self.gpu_xenos_runtime.attachMemory(self, xenosMemoryRead, self, null);
+        // Restored on every exit path.  Leaving the runtime read-only would
+        // silently suppress the writes of the outstanding-span path, whose
+        // batch has not been consumed yet and whose writes must land — and a
+        // suppressed write there would look like a title that stopped
+        // signalling rather than a callback this function unhooked.
+        defer self.gpu_xenos_runtime.attachMemory(self, xenosMemoryRead, self, xenosMemoryWrite);
+        const execution = self.gpu_xenos_runtime.executeRingBytes(
+            bytes,
+            root_start,
+            root_dwords,
+            ring_dwords,
+        ) catch |err| {
+            self.gpu_xenos_retained_refusals +|= 1;
+            // A refusal is not an empty input: the walk had dwords and the
+            // decoder rejected them.  Recording it as unavailable keeps the
+            // stages honest about which of the two happened.
+            for (executor_stages) |stage| {
+                ledger.recordProbe(stage, .stateful_pm4_execution, .input_unavailable, root_dwords, at);
+            }
+            machoCapturePrint(
+                "macho-processor: XENOS RETAINED BATCH refused: error={s} start={d} dwords={d} ring_dwords={d}; the producer's retained dwords exist and the command processor could not decode them, which is a framing defect rather than an absent batch\n",
+                .{ @errorName(err), root_start, root_dwords, ring_dwords },
+            );
+            return;
+        };
+        const deferred_writes = self.gpu_xenos_runtime.executor.deferred_memory_count - deferred_before;
+
+        self.gpu_xenos_retained_executions +|= 1;
+        const executed_packets = execution.packets_after - execution.packets_before;
+        const target = self.gpu_xenos_runtime.renderTargetEvidence();
+        const runtime_fetch = self.gpu_xenos_runtime.frontBufferFetch();
+        const runtime_swap = self.gpu_xenos_runtime.last_swap;
+
+        // Each of these is recorded whether or not it was found.  The negative
+        // outcome is the valuable one: it is the difference between "the
+        // command processor executed this batch and it programmed no colour
+        // target" and "nothing ever looked at the colour target".
+        ledger.observeProbe(.pm4_state_programmed, .stateful_pm4_execution, executed_packets != 0, executed_packets, at);
+        ledger.observeProbe(.draw_submitted, .stateful_pm4_execution, execution.draws != 0, execution.draws, at);
+        ledger.observeProbe(.draw_consumed, .stateful_pm4_execution, execution.draws != 0, execution.draws, at);
+        ledger.observeProbe(.render_target_state_observed, .xenos_register_file, target.state_observed, target.raw_color_info, at);
+        ledger.observeProbe(
+            .render_target_memory_observed,
+            .xenos_register_file,
+            self.gpu_xenos_runtime.color_resolve_observations != 0,
+            self.gpu_xenos_runtime.color_resolve_observations,
+            at,
+        );
+        ledger.observeProbe(
+            .draw_completion_signaled,
+            .stateful_pm4_execution,
+            self.gpu_xenos_runtime.draw_completion_signals != 0,
+            self.gpu_xenos_runtime.draw_completion_signals,
+            at,
+        );
+        ledger.observeProbe(.fetch_constant_decoded, .xenos_register_file, runtime_fetch != null, execution.dwords, at);
+        ledger.observeProbe(.xe_swap_candidate_seen, .stateful_pm4_execution, execution.swaps != 0, execution.dwords, at);
+
+        ledger.observePacket(.{
+            .projection_readable = true,
+            .stream_observed = execution.dwords != 0 or executed_packets != 0,
+            .stream_validated = (execution.dwords != 0 or executed_packets != 0) and !execution.truncated,
+            .candidate_seen = execution.swaps != 0 or runtime_swap != null,
+            .readable = runtime_swap != null,
+            .decoded = runtime_swap != null,
+            .swap = runtime_swap,
+            .fetch = runtime_fetch,
+            .fetch_decoded = runtime_fetch != null,
+            .root_packets = executed_packets,
+            .draw_packets = execution.draws,
+            .swap_packets = execution.swaps,
+            .truncated = execution.truncated,
+            .unknown_opcodes = execution.unknown_opcodes,
+            .dwords_examined = execution.dwords,
+            .dwords_scanned = execution.dwords,
+            .span_dwords = root_dwords,
+            .authentic_consumption = runtime_swap != null and
+                authentic and
+                self.gpu_ring_injection.injections == 0,
+        }, at, .stateful_pm4_executor);
+
+        ledger.observeIntermediary(.{
+            .render_target_state_observed = target.state_observed,
+            .render_target_memory_observed = self.gpu_xenos_runtime.color_resolve_observations != 0,
+            .draw_completion_signaled = self.gpu_xenos_runtime.draw_completion_signals != 0,
+        }, at, .xenos_runtime);
+
+        machoCapturePrint(
+            "macho-processor: XENOS RETAINED BATCH: epoch={d} start={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s} indirect(buffers/read/requested)={d}/{d}/{d} status={s}; target(state/color/depth/surface)={s}/0x{x:0>8}/0x{x:0>8}/0x{x:0>8} resolves={d} completions={d} fetch={s} guest_writes_suppressed={d}; the command processor executed the dwords the producer left in the ring, so every register-derived stage below is now a reading rather than a blank. The replay is read-only: this batch was already drained, so its memory writes are counted and not reapplied\n",
+            .{
+                self.gpu_ring_publication.advances,
+                root_start,
+                root_dwords,
+                executed_packets,
+                execution.draws,
+                execution.events,
+                execution.swaps,
+                execution.unknown_opcodes,
+                if (execution.truncated) "YES" else "NO",
+                execution.indirect_buffers,
+                execution.indirect_dwords_read,
+                execution.indirect_dwords_requested,
+                execution.indirect_last_status.label(),
+                if (target.state_observed) "YES" else "NO",
+                target.raw_color_info,
+                target.raw_depth_info,
+                target.raw_surface_info,
+                self.gpu_xenos_runtime.color_resolve_observations,
+                self.gpu_xenos_runtime.draw_completion_signals,
+                if (runtime_fetch != null) "decoded" else "absent",
+                deferred_writes,
+            },
+        );
+
+        if (runtime_swap) |swap| {
+            if (swap.plausible()) {
+                self.gpu_frontbuffer = swap;
+                ledger.observeFrontBuffer(swap, .stateful_pm4_executor, at);
+                self.offerGuestFrontBuffer(swap, runtime_fetch);
+                machoCapturePrint(
+                    "macho-processor: XENOS RETAINED BATCH present handoff: frontbuffer=0x{x:0>8} extent={d}x{d} fetch={s}\n",
+                    .{
+                        swap.frontbuffer_physical_address,
+                        swap.width,
+                        swap.height,
+                        if (runtime_fetch != null) "observed" else "absent (defaults apply)",
+                    },
+                );
+            }
+        }
+
+        // A queued completion the guest callback never receives is a different
+        // defect from one that was never queued, and the contract keeps them as
+        // separate stages.  Draining here is what makes the second one
+        // reachable at all.
+        if (self.gpu_interrupt_callback != 0) {
+            const delivered = self.gpu_xenos_runtime.drainInterrupts(deliverGpuInterrupt, self, 32);
+            ledger.observeProbe(
+                .draw_completion_dispatched,
+                .interrupt_dispatch,
+                self.gpu_draw_completion_dispatches != 0,
+                delivered,
+                at,
+            );
+            if (delivered != 0) {
+                machoCapturePrint(
+                    "macho-processor: XENOS RETAINED BATCH interrupts: delivered={d} callback=0x{x} arg=0x{x} draw_completions={d}\n",
+                    .{ delivered, self.gpu_interrupt_callback, self.gpu_interrupt_callback_arg, self.gpu_draw_completion_dispatches },
+                );
+            }
+        } else {
+            // No callback has been registered, so nothing could be delivered.
+            // That is an absent consumer, not a failed dispatch.
+            ledger.recordProbe(.draw_completion_dispatched, .interrupt_dispatch, .input_unavailable, 0, at);
+        }
+    }
+
+    /// Record that every probe fed by the retained batch was starved, and how.
+    ///
+    /// The whole reason this exists is that these stages have exactly one
+    /// evidence path between them.  When that path cannot run, thirteen
+    /// contract stages read zero at once, and without this they would all read
+    /// as findings against the command processor.
+    fn recordRetainedBatchStarvation(self: *MachOState, outcome: gpu.VdSwapProbeOutcome) void {
+        const at = self.executed_steps;
+        const ledger = &self.gpu_vd_swap_contract;
+        const starved = [_]struct { stage: gpu.VdSwapStage, probe: gpu.VdSwapProbe }{
+            .{ .stage = .pm4_state_programmed, .probe = .stateful_pm4_execution },
+            .{ .stage = .draw_submitted, .probe = .stateful_pm4_execution },
+            .{ .stage = .draw_consumed, .probe = .stateful_pm4_execution },
+            .{ .stage = .render_target_state_observed, .probe = .stateful_pm4_execution },
+            .{ .stage = .render_target_state_observed, .probe = .xenos_register_file },
+            .{ .stage = .render_target_memory_observed, .probe = .stateful_pm4_execution },
+            .{ .stage = .render_target_memory_observed, .probe = .xenos_register_file },
+            .{ .stage = .draw_completion_signaled, .probe = .stateful_pm4_execution },
+            .{ .stage = .fetch_constant_decoded, .probe = .stateful_pm4_execution },
+            .{ .stage = .fetch_constant_decoded, .probe = .xenos_register_file },
+            .{ .stage = .xe_swap_candidate_seen, .probe = .stateful_pm4_execution },
+            .{ .stage = .xe_swap_packet_readable, .probe = .retained_batch_scan },
+            .{ .stage = .xe_swap_packet_decoded, .probe = .retained_batch_scan },
+            .{ .stage = .frontbuffer_validated, .probe = .retained_batch_scan },
+        };
+        for (starved) |entry| ledger.recordProbe(entry.stage, entry.probe, outcome, 0, at);
     }
 
     /// Print the dwords the producer actually wrote.
@@ -4410,12 +6197,22 @@ pub const MachOState = struct {
     /// counter in the subsystem can say what the producer submitted; this can,
     /// and the batch is small enough to read.
     fn logRingPayload(self: *MachOState, chosen: gpu.ring_view.Reading) void {
-        const bytes = self.guestMemoryConst(chosen.address, self.gpu_ring_watch_size) orelse return;
+        const bytes = self.guestMemoryConst(chosen.address, self.gpu_ring_watch_size) orelse {
+            // The projection the survey chose cannot be read back.  Every
+            // retained-batch probe is unavailable rather than empty, and the
+            // difference decides whether the gaps below belong to Rosette's
+            // memory mapping or to the title.
+            self.recordRetainedBatchStarvation(.input_unavailable);
+            return;
+        };
         const ring_dwords: u32 = @intCast(@min(self.gpu_ring_watch_size / 4, std.math.maxInt(u32)));
         // Bounded like every other checkpoint walk. A ring configured at the
         // emulator's largest size is half a million dwords, and this runs on a
         // heartbeat in a ReleaseFast build where nothing else caps it.
         const written = gpu.ring_payload.digest(bytes, ring_dwords, gpu.ring_scan.max_search_dwords);
+        var indirect_packets: u64 = 0;
+        var indirect_draws: u64 = 0;
+        var indirect_swaps: u64 = 0;
         self.xenia_gpu_causal_trace.observeRingPayload(
             written.real_packets,
             written.draws,
@@ -4423,6 +6220,11 @@ pub const MachOState = struct {
             self.executed_steps,
             self.gpu_ring_injection.injections == 0,
         );
+        if (written.run_count == 0) {
+            // A readable ring holding no written run at all.  The walk had
+            // somewhere to look and nothing to look at.
+            self.recordRetainedBatchStarvation(.input_empty);
+        }
         if (written.run_count != 0) {
             // A drained primary span has equal read/write pointers, but the
             // retained ring still contains the exact batch the command
@@ -4436,6 +6238,9 @@ pub const MachOState = struct {
                 const written_run = written.runs[run_index];
                 const end = written_run.start +| written_run.length;
                 if (end > root_end) root_end = end;
+            }
+            if (root_end <= root_start or root_start >= ring_dwords) {
+                self.recordRetainedBatchStarvation(.input_empty);
             }
             if (root_end > root_start and root_start < ring_dwords) {
                 const root_count = @min(root_end - root_start, ring_dwords - root_start);
@@ -4454,8 +6259,74 @@ pub const MachOState = struct {
                     self,
                     xenosMemoryRead,
                 );
+                indirect_packets = @as(u64, indirect.root_packets) + @as(u64, indirect.nested_packets);
+                indirect_draws = indirect.draw_packets;
+                indirect_swaps = indirect.swap_packets;
+                // The walker gives us stream and indirect-reference truth, but
+                // it does not retain a contiguous payload for every indirect
+                // address. In particular, seeing an XE_SWAP opcode here must
+                // never be promoted to "packet readable" or "decoded".
+                self.gpu_vd_swap_contract.observePacket(.{
+                    .projection_readable = true,
+                    .stream_observed = indirect.packets_walked != 0,
+                    .stream_validated = indirect.packets_walked != 0 and
+                        !indirect.root_truncated and
+                        !indirect.packet_budget_exhausted and
+                        indirect.invalid_references == 0 and
+                        indirect.cycle_references == 0 and
+                        indirect.depth_limited_references == 0 and
+                        indirect.truncated_references == 0 and
+                        indirect.budget_limited_references == 0,
+                    .indirects_resolved = indirect.unreadable_references == 0 and
+                        indirect.invalid_references == 0 and
+                        indirect.cycle_references == 0 and
+                        indirect.depth_limited_references == 0 and
+                        indirect.truncated_references == 0 and
+                        indirect.budget_limited_references == 0,
+                    .candidate_seen = indirect_swaps != 0,
+                    .nested_packets = indirect.nested_packets,
+                    .indirect_packets = indirect.indirect_packets,
+                    .draw_packets = indirect.draw_packets,
+                    .swap_packets = indirect_swaps,
+                    .truncated = indirect.root_truncated or indirect.truncated_references != 0,
+                    .unreadable_references = indirect.unreadable_references,
+                    .dwords_examined = root_count,
+                    .span_dwords = root_count,
+                }, self.executed_steps, .nested_pm4_walk);
+                const walked = indirect.packets_walked;
+                self.gpu_vd_swap_contract.observeProbe(.pm4_stream_observed, .nested_indirect_walk, walked != 0, root_count, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.pm4_indirects_resolved, .nested_indirect_walk, indirect.unreadable_references == 0 and indirect.invalid_references == 0 and indirect.cycle_references == 0, indirect.indirect_references, self.executed_steps);
+                self.gpu_vd_swap_contract.observeProbe(.draw_submitted, .nested_indirect_walk, indirect_draws != 0, indirect_draws, self.executed_steps);
+                // The walk follows every indirect buffer the batch names, so a
+                // zero here means no XE_SWAP exists anywhere the producer
+                // pointed — the strongest form this absence takes.
+                self.gpu_vd_swap_contract.observeProbe(.xe_swap_candidate_seen, .nested_indirect_walk, indirect_swaps != 0, walked, self.executed_steps);
+                // The nested walk has told us what the batch contains.  Hand
+                // the same envelope to the stateful command processor so the
+                // register file, the completion queue and the fetch constant
+                // are readings rather than blanks.  Without this the executor
+                // only ever runs on an outstanding span, which a drained ring
+                // never has.
+                self.executeRetainedBatch(bytes, root_start, root_count, ring_dwords, authentic);
+                if (indirect_draws != 0) {
+                    self.gpu_ring_draws_seen = true;
+                    const draw_count: u32 = @intCast(@min(indirect_draws, @as(u64, std.math.maxInt(u32))));
+                    if (draw_count > self.gpu_ring_draws_last_count) self.gpu_ring_draws_last_count = draw_count;
+                }
+                if (consumed) {
+                    const consumed_packets = if (indirect_packets > @as(u64, written.real_packets)) indirect_packets else @as(u64, written.real_packets);
+                    const consumed_draws = if (indirect_draws > @as(u64, written.draws)) indirect_draws else @as(u64, written.draws);
+                    const consumed_swaps = if (indirect_swaps > @as(u64, written.swaps)) indirect_swaps else @as(u64, written.swaps);
+                    self.gpu_ring_publication.observeConsumedBatch(
+                        root_count,
+                        consumed_packets,
+                        consumed_draws,
+                        consumed_swaps,
+                        self.executed_steps,
+                    );
+                }
                 machoCapturePrint(
-                    "macho-processor: PM4 INDIRECT WALK: root_start={d} root_dwords={d} consumed={s} authentic={s} root_packets={d} nested_packets={d} refs={d} readable={d} unreadable={d} draws(root/nested/total)={d}/{d}/{d} swaps(root/nested/total)={d}/{d}/{d} cycles={d} truncated={s}\n",
+                    "macho-processor: PM4 INDIRECT WALK: root_start={d} root_dwords={d} consumed={s} authentic={s} root_packets={d} nested_packets={d} refs={d} readable={d} unreadable={d} truncated_refs={d} budget_refs={d} draws(root/nested/total)={d}/{d}/{d} swaps(root/nested/total)={d}/{d}/{d} cycles={d} truncated={s}\n",
                     .{
                         root_start,
                         root_count,
@@ -4466,6 +6337,8 @@ pub const MachOState = struct {
                         indirect.indirect_references,
                         indirect.readable_references,
                         indirect.unreadable_references,
+                        indirect.truncated_references,
+                        indirect.budget_limited_references,
                         indirect.root_draw_packets,
                         indirect.nested_draw_packets,
                         indirect.draw_packets,
@@ -4478,8 +6351,23 @@ pub const MachOState = struct {
                 );
             }
         }
+        const walked_draws: u32 = @intCast(@min(indirect_draws, @as(u64, std.math.maxInt(u32))));
+        const walked_swaps: u32 = @intCast(@min(indirect_swaps, @as(u64, std.math.maxInt(u32))));
+        // The indirect walk includes root packets as well as nested packets;
+        // it is therefore a complete walked total, not an increment to add to
+        // the root-only digest. Taking the maximum avoids counting a root
+        // draw twice while still retaining nested draws the root digest could
+        // not see.
+        const effective_draws: u32 = if (written.draws > walked_draws) written.draws else walked_draws;
+        const effective_swaps: u32 = if (written.swaps > walked_swaps) written.swaps else walked_swaps;
+        const payload_verdict = if (effective_swaps != 0)
+            "the payload contains a present request"
+        else if (effective_draws != 0)
+            "the payload contains draws, including indirect buffers, but no present request"
+        else
+            "the retained payload contains no decoded draw or present request";
         machoCapturePrint(
-            "macho-processor: RING PAYLOAD: projection={s} nonzero_dwords={d} runs={d} (dropped={d}) real_packets={d} draws={d} swaps={d} scanned={d}; {s}\n",
+            "macho-processor: RING PAYLOAD: projection={s} nonzero_dwords={d} runs={d} (dropped={d}) real_packets={d} root_draws={d} root_swaps={d} indirect_packets={d} indirect_draws={d} indirect_swaps={d} total_draws={d} total_swaps={d} scanned={d}; {s}; {s}\n",
             .{
                 chosen.projection.label(),
                 written.nonzero_dwords,
@@ -4488,8 +6376,14 @@ pub const MachOState = struct {
                 written.real_packets,
                 written.draws,
                 written.swaps,
+                indirect_packets,
+                indirect_draws,
+                indirect_swaps,
+                effective_draws,
+                effective_swaps,
                 written.scanned_dwords,
                 written.verdict(),
+                payload_verdict,
             },
         );
         var run_index: u32 = 0;
@@ -4572,15 +6466,27 @@ pub const MachOState = struct {
             else
                 .running;
             if (parked and object != 0) ledger.observeObject(object, kind);
-            ledger.observeThread(thread.handle, state, object, thread.blocked_since_step);
+            ledger.observeThreadContext(.{
+                .handle = thread.handle,
+                .state = state,
+                .waiting_on = object,
+                .blocked_since_step = thread.blocked_since_step,
+                .blocked_rip = thread.blocked_rip,
+                .start_routine = thread.start_routine,
+                .waiting_mutex = thread.waiting_mutex,
+                .wait_generation = thread.wait_generation,
+                .notified_generation = thread.notified_generation,
+                .blocked_reason = thread.blocked_reason,
+            });
         }
         for (&self.pthreads.waits.objects) |*object| {
             if (!object.active) continue;
             if (object.notifications != 0) {
-                ledger.observeNotify(
+                ledger.observeNotifyAt(
                     object.address,
                     .condvar,
                     object.last_notify_thread,
+                    object.last_notify_pc,
                     object.last_notify_step,
                 );
             }
@@ -5153,7 +7059,7 @@ pub const MachOState = struct {
         );
         if (worst.object) |object| {
             machoCapturePrint(
-                "  blocking object=0x{x} kind={s} waiters={d} notifiers={d} notifications={d} repairs={d} longest_park_steps={d} last_notify_step={d}\n",
+                "  blocking object=0x{x} kind={s} waiters={d} notifiers={d} notifications={d} repairs={d} longest_park_steps={d} last_notify(step={d} thread=0x{x} pc=0x{x})\n",
                 .{
                     object.address,
                     object.kind.label(),
@@ -5163,8 +7069,33 @@ pub const MachOState = struct {
                     object.repair_attempts,
                     object.longest_park_steps,
                     object.last_notify_step,
+                    object.last_notify_thread,
+                    object.last_notify_pc,
                 },
             );
+            var waiters: [deadlock_predictor.max_threads]deadlock_predictor.Thread = undefined;
+            for (ledger.waitersFor(object.address, &waiters)) |waiter| {
+                machoCapturePrint(
+                    "  blocking waiter thread=0x{x} start=0x{x} wait_rip=0x{x} mutex=0x{x} generation={d}/{d} blocked_since_step={d} age_steps={d} reason={s}\n",
+                    .{
+                        waiter.handle,
+                        waiter.start_routine,
+                        waiter.blocked_rip,
+                        waiter.waiting_mutex,
+                        waiter.wait_generation,
+                        waiter.notified_generation,
+                        waiter.blocked_since_step,
+                        self.executed_steps -| waiter.blocked_since_step,
+                        if (waiter.blocked_reason.len != 0) waiter.blocked_reason else "unknown",
+                    },
+                );
+                if (waiter.blocked_rip != 0) {
+                    machoCapturePrint(
+                        "    blocking waiter symbol={s} start_symbol={s}; this is the last guest/host boundary retained for the parked context\n",
+                        .{ self.metadata.symbolLabel(waiter.blocked_rip), self.metadata.symbolLabel(waiter.start_routine) },
+                    );
+                }
+            }
             if (object.repair_attempts != 0) {
                 machoCapturePrint(
                     "  repair note: a bounded spurious wake was granted {d} time(s) and the waiter re-parked — the predicate is genuinely unsatisfied, so this is a guest-side deadlock (the creator never published the state it waits on), not a lost wakeup. Find the code that should have published it and confirm it ran; the once-per-generation guard stops further wakes\n",
@@ -5324,6 +7255,23 @@ pub const MachOState = struct {
                 finding.meaning(),
             },
         );
+        const consumer_observed = self.gpu_ring_publication.consumerSawBatch() or
+            self.gpu_xenos_runtime.batches != 0 or
+            self.xenia_gpu_handoff.pm4_packets != 0;
+        machoCapturePrint(
+            "  consumer evidence: observed={s} stateful_batches={d} handoff_packets={d} consumed_dwords={d} root_or_nested_packets={d} root_or_nested_draws={d} swaps={d} first_step={d} last_step={d}; this is independent of pointer provenance\n",
+            .{
+                if (consumer_observed) "YES" else "NO",
+                self.gpu_xenos_runtime.batches,
+                self.xenia_gpu_handoff.pm4_packets,
+                self.gpu_ring_publication.consumed_batch_dwords,
+                self.gpu_ring_publication.consumed_batch_packets,
+                self.gpu_ring_publication.consumed_batch_draws,
+                self.gpu_ring_publication.consumed_batch_swaps,
+                self.gpu_ring_publication.first_consumed_step,
+                self.gpu_ring_publication.last_consumed_step,
+            },
+        );
         inline for (.{
             gpu.submission_provenance.Source.emulator_log_line,
             gpu.submission_provenance.Source.emulator_counter,
@@ -5435,18 +7383,28 @@ pub const MachOState = struct {
 
     /// Whether the harness stood in for the title, and if not, what stopped it.
     pub fn logSwapSubstitution(self: *MachOState) void {
+        self.refreshVdSwapContract();
         const publication = &self.gpu_ring_publication;
         const stalled = publication.last_advance_step != 0 and
             self.executed_steps > publication.last_advance_step;
         const evidence = gpu.SubstitutionEvidence{
             .ring_published = publication.advances != 0,
-            .pm4_consumed = self.execution_tracepoints.roleEntered(.command_processor),
+            // The tracepoint is useful when Xenia's own command-processor
+            // symbol is reached, but the stateful Rosette consumer can prove
+            // the same boundary by draining the retained ring before that
+            // symbol is visible. Keep both sources: substitution must not
+            // call a consumed batch "unconsumed" merely because the generic
+            // tracepoint missed an indirect-buffer route.
+            .pm4_consumed = self.execution_tracepoints.roleEntered(.command_processor) or
+                publication.consumerSawBatch() or
+                self.gpu_xenos_runtime.batches != 0 or
+                self.xenia_gpu_handoff.pm4_packets != 0,
             .draws_issued = self.gpu_ring_draws_seen,
-            .authentic_swap_seen = self.execution_tracepoints.roleEntered(.swap),
+            .authentic_swap_seen = self.gpu_vd_swap_contract.authentic_consumptions != 0,
             .steps_since_publish = if (stalled) self.executed_steps - publication.last_advance_step else 0,
             .ring_geometry_known = self.gpu_ring_watch_base != 0,
             .ring_drained = publication.drained_observations != 0,
-            .frontbuffer_known = self.gpu_frontbuffer != null,
+            .frontbuffer_known = self.gpu_vd_swap_contract.frontbufferKnown(),
             .discovered_output_available = self.dynamic_forwarder.guestFrontBufferAvailable(),
             // The channel is open when the ring's host projections are writable
             // from here: the packet, and the write-pointer value it implies,
@@ -5511,6 +7469,19 @@ pub const MachOState = struct {
         if (decision.tier.fabricatesGuestBehaviour()) {
             _ = self.graphics_contract.substitute(.guest_swap_entered, self.executed_steps);
         }
+        const vd_frontier = self.gpu_vd_swap_contract.frontier();
+        machoCapturePrint(
+            "macho-processor: SWAP SUBSTITUTION CONTRACT: frontier={s} owner={s} blocker={s} frontbuffer={s} packet_seen={s} authentic_consumed={s}; {s}\n",
+            .{
+                if (vd_frontier.stage) |stage| stage.label() else "<complete>",
+                vd_frontier.owner.label(),
+                vd_frontier.blocker.label(),
+                if (self.gpu_vd_swap_contract.frontbufferKnown()) "YES" else "NO",
+                if (self.gpu_vd_swap_contract.packetSeen()) "YES" else "NO",
+                if (self.gpu_vd_swap_contract.authentic_consumptions != 0) "YES" else "NO",
+                vd_frontier.blocker.guidance(),
+            },
+        );
     }
 
     /// Perform the tier the substitution authorised: write the swap packet the
@@ -5691,9 +7662,7 @@ pub const MachOState = struct {
     /// signal that says the title is stuck.
     pub fn logSwapHealth(self: *MachOState) void {
         const publication = &self.gpu_ring_publication;
-        const swap_seen = self.execution_tracepoints.roleEntered(.swap) or
-            self.execution_tracepoints.roleEntered(.command_swap) or
-            self.execution_tracepoints.roleEntered(.xe_swap_decode);
+        const swap_seen = self.gpu_vd_swap_contract.authentic_consumptions != 0;
         const livelocked = if (comptime @hasField(MachOState, "guest_log_cycles"))
             self.guest_log_cycles.active()
         else
@@ -5707,7 +7676,7 @@ pub const MachOState = struct {
             swap_seen,
         );
         machoCapturePrint(
-            "macho-processor: SWAP HEALTH: blocker={s} producer={s} step={d} wptr(writes/advances/repeats)={d}/{d}/{d} published={s} last_advance_step={d} quiet_for={d} largest_span_dwords={d} guest_livelocked={s} swap_seen={s}; {s}\n",
+            "macho-processor: SWAP HEALTH: blocker={s} producer={s} step={d} wptr(writes/advances/repeats)={d}/{d}/{d} published={s} last_advance_step={d} quiet_for={d} largest_span_dwords={d} consumed_batch(dwords/packets/draws/swaps)={d}/{d}/{d}/{d} consumed_steps={d}/{d} guest_livelocked={s} swap_seen={s}; {s}\n",
             .{
                 assessment.blocker.label(),
                 @tagName(assessment.producer),
@@ -5719,6 +7688,12 @@ pub const MachOState = struct {
                 publication.last_advance_step,
                 assessment.stalled_steps orelse 0,
                 publication.largest_span_dwords,
+                publication.consumed_batch_dwords,
+                publication.consumed_batch_packets,
+                publication.consumed_batch_draws,
+                publication.consumed_batch_swaps,
+                publication.first_consumed_step,
+                publication.last_consumed_step,
                 if (assessment.guest_livelocked) "YES" else "NO",
                 if (assessment.swap_seen) "YES" else "NO",
                 assessment.blocker.guidance(),
@@ -5751,7 +7726,7 @@ pub const MachOState = struct {
         if (self.gpu_bootstrap.seen(.pm4_packet_consumed)) {
             self.xenia_gpu_causal_trace.observeEvidence(.pm4_packet_consumed, at);
         }
-        if (self.gpu_bootstrap.seen(.swap)) {
+        if (self.gpu_vd_swap_contract.observed(.authentic_xe_swap_consumed)) {
             self.xenia_gpu_causal_trace.observeEvidence(.authentic_swap_consumed, at);
         }
     }
@@ -5760,6 +7735,49 @@ pub const MachOState = struct {
     pub fn logGraphicsFrontier(self: *MachOState, force: bool) void {
         self.graphics_summary_emissions +|= 1;
         self.refreshXeniaGpuCausalTrace();
+        // Refresh the cross-layer ledgers before deciding whether this
+        // checkpoint is interesting.  The controller is deliberately sampled
+        // at the same boundary as the reports: this makes its quiet windows
+        // and host-only directives correlate with the exact PM4/VdSwap state
+        // printed below instead of with a neighboring heartbeat.
+        self.refreshGraphicsContract();
+        self.refreshGraphicsHealthContract();
+        const controller_decision = self.refreshApplicationController();
+        self.applyApplicationController(controller_decision);
+        self.serviceApplicationFrameworkRequests();
+        // Interrupt delivery is a host-owned action and may make a queued
+        // completion visible immediately.  Re-join the health ledger so the
+        // same report cannot say both "completion dispatched=0" and "drain
+        // authorized" after the controller has acted.
+        self.refreshGraphicsHealthContract();
+        // Publish the same seam through the callable framework. These are
+        // deliberately paired observations: entering VdSwap, consuming an
+        // authentic XE_SWAP, reaching IssueSwap, and refreshing guest output
+        // are separate facts. The equivalence records make a successful call
+        // with an absent downstream effect visible as a mismatch.
+        self.application_framework.observeController(
+            @intFromEnum(controller_decision.phase),
+            @intFromEnum(controller_decision.action),
+            @intFromEnum(controller_decision.blocker),
+            self.executed_steps,
+            "controller decision sampled at graphics frontier",
+        );
+        const guest_vdswap_entered = @intFromBool(self.execution_tracepoints.roleEntered(.swap));
+        const authentic_swap_consumed = @intFromBool(self.gpu_vd_swap_contract.authentic_consumptions != 0);
+        const issue_swap_entered = @intFromBool(self.gpu_vd_swap_contract.observed(.issue_swap_entered));
+        const guest_output_refreshed = @intFromBool(self.dynamic_forwarder.native_presenter.ledger.guest_output_frames_presented != 0);
+        self.application_framework.observeValue(.xenia_kernel, .vd_swap, 1, guest_vdswap_entered, self.executed_steps, self.regs.rip, "guest-vdswap-entered", "guest execution boundary");
+        self.application_framework.observeValue(.xenia_gpu, .vd_swap, 2, authentic_swap_consumed, self.executed_steps, self.regs.rip, "authentic-xe-swap-consumed", "command processor boundary");
+        self.application_framework.observeValue(.xenia_presenter, .presenter, 3, issue_swap_entered, self.executed_steps, self.regs.rip, "issue-swap-entered", "native presenter boundary");
+        self.application_framework.observeValue(.xenia_presenter, .presenter, 4, guest_output_refreshed, self.executed_steps, self.regs.rip, "guest-output-refreshed", "guest-produced frame evidence");
+        if (self.application_framework.isEnabled()) {
+            _ = self.application_framework.compareValue(.xenia_gpu, .vd_swap, 2, guest_vdswap_entered, authentic_swap_consumed, 1, self.executed_steps, self.regs.rip, "vdswap-to-authentic-xe-swap");
+            _ = self.application_framework.compareValue(.xenia_presenter, .presenter, 3, authentic_swap_consumed, issue_swap_entered, 1, self.executed_steps, self.regs.rip, "xe-swap-to-issue-swap");
+            _ = self.application_framework.compareValue(.rosette, .presenter, 4, issue_swap_entered, guest_output_refreshed, 1, self.executed_steps, self.regs.rip, "issue-swap-to-guest-output");
+        }
+        const health_fingerprint = self.graphics_health.fingerprint();
+        const controller_fingerprint = controller_decision.fingerprint();
+        const framework_sequence = self.application_framework.currentSequence();
         const tracepoints = &self.execution_tracepoints;
         const frontier = self.gpu_bootstrap.frontier();
         const frontier_tag = if (frontier.step) |frontier_step|
@@ -5783,7 +7801,10 @@ pub const MachOState = struct {
             role_mask != self.graphics_last_role_mask or
             ring_published != self.graphics_last_ring_published or
             self.anomalies.count != self.graphics_last_anomaly_count or
-            causal_changed;
+            causal_changed or
+            health_fingerprint != self.graphics_health_last_fingerprint or
+            controller_fingerprint != self.application_controller_last_fingerprint or
+            framework_sequence != self.application_framework_last_sequence;
         self.graphics_last_frontier_tag = frontier_tag;
         self.graphics_last_frontier_reached = frontier.reached;
         self.graphics_last_role_mask = role_mask;
@@ -5791,6 +7812,10 @@ pub const MachOState = struct {
         self.graphics_last_anomaly_count = self.anomalies.count;
         self.graphics_last_causal_events = self.xenia_gpu_causal_trace.total_events;
         self.graphics_last_causal_mask = self.xenia_gpu_causal_trace.observed_mask;
+        self.graphics_health_last_fingerprint = health_fingerprint;
+        self.application_controller_last_fingerprint = controller_fingerprint;
+        self.application_framework_last_sequence = framework_sequence;
+        if (force or state_changed) self.logApplicationFramework();
 
         // The ring is read whether or not the frontier moved.
         //
@@ -5815,6 +7840,7 @@ pub const MachOState = struct {
             // Provisioning remains owner-gated: title-owned pointers are never
             // fabricated, and structured HSIO state is not synthesized here.
             self.refreshKernelVariables();
+            self.logProvisioningCustody();
             self.logPreinitialization();
             self.logGuestWaitLiveness();
             self.logImportBinding();
@@ -5826,13 +7852,22 @@ pub const MachOState = struct {
             // unchanged, so this cannot invent a picture — it only ensures the
             // scan runs, which is the difference between "we tried and the
             // guest had nothing" and "nobody ever looked".
-            _ = self.dynamic_forwarder.attemptScheduledRefresh(self);
+            // The controller owns the discovered-guest-output refresh when it
+            // has proven that a guest source exists.  Keep the historical
+            // diagnostic cadence for all other states, including a completely
+            // empty source, so "no source" remains an observed result rather
+            // than an unattempted path.
+            if (controller_decision.action != .refresh_discovered_output)
+                _ = self.dynamic_forwarder.attemptScheduledRefresh(self);
             self.dynamic_forwarder.logScheduledRefresh();
             self.logWaitAudit();
             self.logDeadlockPredictor();
             self.logDeferredWork();
             self.logGuestExceptions();
             self.logSwapSubstitution();
+            self.refreshGraphicsHealthContract();
+            self.logGraphicsHealthContract();
+            self.logApplicationController(controller_decision);
         }
 
         // Heartbeats already say that execution is alive. The complete report
@@ -5854,8 +7889,8 @@ pub const MachOState = struct {
                     if (tracepoints.roleEntered(.swap)) "YES" else "NO",
                     if (self.guest_vdswap_entry_completed) "YES" else "NO",
                     if (self.guest_vdswap_packet_encoded) "YES" else "NO",
-                    if (self.gpu_bootstrap.seen(.swap)) "YES" else "NO",
-                    if (self.gpu_bootstrap.seen(.swap)) "YES" else "NO",
+                    if (self.gpu_vd_swap_contract.observed(.ring_write_pointer_published)) "YES" else "NO",
+                    if (self.gpu_vd_swap_contract.observed(.authentic_xe_swap_consumed)) "YES" else "NO",
                     if (tracepoints.roleEntered(.xe_swap_decode)) "YES" else "NO",
                     if (tracepoints.roleEntered(.command_swap)) "YES" else "NO",
                     if (tracepoints.roleEntered(.diagnostic_swap)) "YES" else "NO",
@@ -5865,6 +7900,11 @@ pub const MachOState = struct {
             );
             self.logSwapHealth();
             self.logXeniaGpuCausalTrace(false);
+            self.logVdSwapContract();
+            self.logVdSwapTrace();
+            self.refreshGraphicsHealthContract();
+            self.logGraphicsHealthContract();
+            self.logApplicationController(controller_decision);
             return;
         }
         machoCapturePrint(
@@ -5877,9 +7917,15 @@ pub const MachOState = struct {
                 tracepoints.verdict(.swap),
             },
         );
+        self.logRunHorizon();
         self.logSwapHealth();
         self.logXeniaGpuCausalTrace(force);
         self.logGraphicsContract();
+        self.refreshGraphicsHealthContract();
+        self.logGraphicsHealthContract();
+        self.logApplicationController(controller_decision);
+        self.logVdSwapContract();
+        self.logVdSwapTrace();
         self.logKernelSurface();
         self.logKernelVariables();
         for (tracepoints.entries[0..tracepoints.count]) |entry| {
@@ -7933,6 +9979,23 @@ pub const MachOState = struct {
         return false;
     }
 
+    fn observeApplicationControlTransfer(self: *MachOState, decoded: DecodedInsn, source: u64) void {
+        if (!self.application_framework.controlFlowTracingEnabled()) return;
+        if (!isApplicationControlFlow(decoded.op)) return;
+
+        const fallthrough = source +% decoded.len;
+        const target = self.regs.rip;
+        self.application_framework.observeControlTransfer(
+            .guest,
+            source,
+            target,
+            self.executed_steps,
+            self.active_guest_thread,
+            !self.terminated and target != fallthrough,
+            @tagName(decoded.op),
+        );
+    }
+
     pub fn step(self: *MachOState) bool {
         if (@import("builtin").mode != .ReleaseFast) self.observeProfileAccountFlow();
         if (self.regs.rip == GUEST_ATEXIT_RETURN_SENTINEL) {
@@ -8078,6 +10141,7 @@ pub const MachOState = struct {
         if (!self.terminated and self.regs.rip == old_rip) {
             self.regs.rip +%= decoded.len;
         }
+        self.observeApplicationControlTransfer(decoded, old_rip);
         if (!self.terminated and
             self.step_tracing_active and
             self.sha1_tracer.enabled and
@@ -9521,6 +11585,11 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
 
     var state = try MachOState.init(io, allocator, slice);
     defer state.deinit();
+    // The exported application-framework ABI must point at the live process
+    // ledger, not a detached diagnostic singleton. Register the binding after
+    // state construction and clear it before state.deinit releases resources.
+    application_framework.activateDefault(&state.application_framework);
+    defer application_framework.deactivateDefault(&state.application_framework);
     var host_termination_scope = host_termination.Scope.install();
     defer host_termination_scope.deinit();
     state.concise_output = output.concise;
@@ -9710,6 +11779,39 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     const image_is_xenia = has_xbdm_diagnostics or
         std.mem.indexOf(u8, options.path, "xenia") != null or
         std.mem.indexOf(u8, slice, "VdSwap") != null;
+    // Xenia gets the framework by default because its native host callbacks
+    // are the exact boundary this ledger is meant to make observable. Other
+    // translated applications opt in explicitly to avoid paying for extra
+    // event retention. Fine-grained control-flow tracing remains opt-in even
+    // for Xenia because it is much more expensive than boundary sampling.
+    state.application_framework.configureForProcess(
+        image_is_xenia or environmentFlag("ROSETTE_APPLICATION_FRAMEWORK"),
+        environmentFlag("ROSETTE_APPLICATION_FRAMEWORK_TRACE"),
+        environmentFlag("ROSETTE_APPLICATION_FRAMEWORK_MEMORY_TRACE"),
+        image_is_xenia or environmentFlag("ROSETTE_APPLICATION_FRAMEWORK_GRAPHICS"),
+    );
+    state.application_framework.registerApplication(options.path, image_fingerprint);
+    _ = state.application_framework.registerAdapter(
+        "xenia",
+        application_framework.contract.capabilityBit(.observe_events) |
+            application_framework.contract.capabilityBit(.inspect_control_flow) |
+            application_framework.contract.capabilityBit(.inspect_memory) |
+            application_framework.contract.capabilityBit(.inspect_graphics) |
+            application_framework.contract.capabilityBit(.inspect_backend),
+    );
+    const application_framework_config = state.application_framework.configuration();
+    const application_framework_mode: application_framework.contract.Mode = @enumFromInt(application_framework_config.mode);
+    machoCapturePrint(
+        "macho-processor: APPLICATION FRAMEWORK: enabled={} mode={s} trace_control_flow={} trace_memory={} trace_graphics={} abi=0x{x}\n",
+        .{
+            application_framework_mode != .disabled,
+            application_framework_mode.label(),
+            application_framework_config.trace_control_flow != 0,
+            application_framework_config.trace_memory != 0,
+            application_framework_config.trace_graphics != 0,
+            application_framework.contract.abi_version,
+        },
+    );
     const ready_gate_requested = environmentFlag("ROSETTE_MACHO_READY_GATE") or image_is_xenia;
     const ready_gate_enabled = ready_gate_requested and
         !environmentFlag("ROSETTE_MACHO_READY_GATE_OFF");
@@ -10015,8 +12117,36 @@ fn extractX8664Slice(allocator: std.mem.Allocator, data: []const u8) ![]const u8
     };
 }
 
+fn isApplicationControlFlow(op: Op) bool {
+    return switch (op) {
+        .call_rel32,
+        .call_mem64,
+        .call_reg64,
+        .ret,
+        .jmp_rel8,
+        .jcc_rel8,
+        .jcc_rel32,
+        .jmp_mem64,
+        .jmp_reg64,
+        .syscall,
+        .ud2,
+        .hlt,
+        => true,
+        else => false,
+    };
+}
+
 const decodeInsn = macho_core.decoder.decodeInsn;
 const decodeInsnCompat = macho_core.decoder.decodeInsnCompat;
+
+test "application control-flow trace classifier covers direct and indirect transfers" {
+    try std.testing.expect(isApplicationControlFlow(.call_rel32));
+    try std.testing.expect(isApplicationControlFlow(.call_mem64));
+    try std.testing.expect(isApplicationControlFlow(.jmp_reg64));
+    try std.testing.expect(isApplicationControlFlow(.jcc_rel32));
+    try std.testing.expect(isApplicationControlFlow(.ret));
+    try std.testing.expect(!isApplicationControlFlow(.mov_reg64_reg64));
+}
 
 test {
     _ = @import("decoder_tests.zig");
