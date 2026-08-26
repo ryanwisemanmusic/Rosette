@@ -74,6 +74,16 @@ XENIA_TIMER_CONTRACT_SRC := pkg/common/xenia/timer-contract/src/root.zig
 XENIA_OB_CONTRACT_SRC := pkg/common/xenia/ob-contract/src/root.zig
 XENIA_MOUNT_CONTRACT_SRC := pkg/common/xenia/mount-contract/src/root.zig
 XENIA_KERNEL_OBJECT_CONTRACT_SRC := pkg/common/xenia/kernel-object-contract/src/root.zig
+# Transcribed from Xenia's own export tables, packet enums and container
+# headers. Console/kernel facts, so route independent like the rest above.
+XENIA_KERNEL_EXPORT_MAP_SRC := pkg/common/xenia/kernel-export-map/src/root.zig
+XENIA_VD_RING_CONTRACT_SRC := pkg/common/xenia/vd-ring-contract/src/root.zig
+XENIA_PM4_CONTRACT_SRC := pkg/common/xenia/pm4-contract/src/root.zig
+XENIA_XEX_FORMAT_SRC := pkg/common/xenia/xex-format/src/root.zig
+XENIA_NOTIFICATION_CONTRACT_SRC := pkg/common/xenia/notification-contract/src/root.zig
+XENIA_LOG_RING_CONTRACT_SRC := pkg/common/xenia/log-ring-contract/src/root.zig
+XENIA_XTHREAD_CONTRACT_SRC := pkg/common/xenia/xthread-contract/src/root.zig
+XENIA_VFS_DEVICE_CONTRACT_SRC := pkg/common/xenia/vfs-device-contract/src/root.zig
 XENIA_GRAPHICS_CONTRACT_SRC := pkg/x86/xenia/graphics-contract/src/root.zig
 XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/x86/xenia/graphics/surface-path-contract/src/root.zig
 XENIA_SHADER_STORAGE_CONTRACT_SRC := pkg/x86/xenia/runtime/shader-storage-contract/src/root.zig
@@ -90,6 +100,7 @@ XENIA_HEAP_RANGE_SRC := pkg/x86/xenia/memory/heap-range/src/root.zig
 XENIA_STARTUP_EVIDENCE_SRC := pkg/x86/xenia/diagnostics/startup-evidence/src/evidence.zig
 XENIA_AUDIO_DRIVER_SRC := pkg/x86/xenia/audio-driver/src/root.zig
 XENIA_INPUT_DRIVER_SRC := pkg/x86/xenia/input-driver/src/root.zig
+XENIA_SIMD_SHIM_MAP_SRC := pkg/x86/xenia/simd-shim-map/src/root.zig
 ifeq ($(shell uname -m),arm64)
 XENIA_GRAPHICS_CONTRACT_SRC := pkg/ARM64/xenia/graphics-contract/src/root.zig
 XENIA_SURFACE_PATH_CONTRACT_SRC := pkg/ARM64/xenia/graphics/surface-path-contract/src/root.zig
@@ -105,6 +116,7 @@ XENIA_HEAP_RANGE_SRC := pkg/ARM64/xenia/memory/heap-range/src/root.zig
 XENIA_STARTUP_EVIDENCE_SRC := pkg/ARM64/xenia/diagnostics/startup-evidence/src/evidence.zig
 XENIA_AUDIO_DRIVER_SRC := pkg/ARM64/xenia/audio-driver/src/root.zig
 XENIA_INPUT_DRIVER_SRC := pkg/ARM64/xenia/input-driver/src/root.zig
+XENIA_SIMD_SHIM_MAP_SRC := pkg/ARM64/xenia/simd-shim-map/src/root.zig
 endif
 MACHO_NATIVE_WINDOW_OBJ := $(ROOT_DIR)/$(BP)macho_native_window_bridge.o
 XENIA_HEAP_ANCHOR_OBJ := $(ROOT_DIR)/$(BP)xenia_heap_exports_anchor.o
