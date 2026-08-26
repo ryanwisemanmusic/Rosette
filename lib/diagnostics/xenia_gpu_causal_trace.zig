@@ -113,6 +113,10 @@ pub const Ledger = struct {
     pm4_consumption_observations: u64 = 0,
     draw_observations: u64 = 0,
     swap_observations: u64 = 0,
+    first_draw_consumed_step: u64 = 0,
+    first_draw_consumed_recorded: bool = false,
+    wait_events_after_draw: u64 = 0,
+    signal_events_after_draw: u64 = 0,
 
     out_of_order: u64 = 0,
     last_progress_step: u64 = 0,
@@ -137,6 +141,18 @@ pub const Ledger = struct {
     pub fn noProgressSteps(self: *const Ledger, current_step: u64) ?u64 {
         if (self.last_progress_step == 0) return null;
         return current_step -| self.last_progress_step;
+    }
+
+    /// The first consumed draw is the anchor for the producer-to-VdSwap
+    /// handoff.  A wait observed before that point belongs to bring-up and
+    /// cannot explain why the title failed to request its next frame.
+    pub fn postDrawWaitObserved(self: *const Ledger) bool {
+        return self.wait_events_after_draw != 0;
+    }
+
+    pub fn firstDrawConsumedStep(self: *const Ledger) ?u64 {
+        if (!self.first_draw_consumed_recorded) return null;
+        return self.first_draw_consumed_step;
     }
 
     /// Observe a stage owned by the supplied producer.  The stage is recorded
@@ -176,6 +192,10 @@ pub const Ledger = struct {
         record.last_step = step;
         record.last_value = value;
         if (first_observation) {
+            if (stage == .first_draw_consumed) {
+                self.first_draw_consumed_recorded = true;
+                self.first_draw_consumed_step = step;
+            }
             self.recordEvent(.{
                 .kind = kind,
                 .stage = stage,
@@ -578,7 +598,7 @@ pub const Ledger = struct {
         if (self.total_events == 0 and !force) return;
         const gap = self.firstGap();
         machoCapturePrint(
-            "macho-processor: XENIA GPU CAUSAL TRACE: observed_mask=0x{x:0>4} frontier={s} owner={s} events={d} dropped={d} out_of_order={d} cycles={d} cycle_repetitions={d} last_progress_step={d} quiet_steps={d} verdict={s}\n",
+            "macho-processor: XENIA GPU CAUSAL TRACE: observed_mask=0x{x:0>4} frontier={s} owner={s} events={d} dropped={d} out_of_order={d} cycles={d} cycle_repetitions={d} last_progress_step={d} quiet_steps={d} post_draw_waits={d} post_draw_signals={d} verdict={s}\n",
             .{
                 self.observed_mask,
                 if (gap) |stage| stage.label() else "<complete>",
@@ -590,6 +610,8 @@ pub const Ledger = struct {
                 self.cycle_repetitions,
                 self.last_progress_step,
                 self.noProgressSteps(current_step) orelse 0,
+                self.wait_events_after_draw,
+                self.signal_events_after_draw,
                 self.verdict(),
             },
         );
@@ -606,7 +628,7 @@ pub const Ledger = struct {
         if (force or self.indirect_walk_observations != 0) {
             const indirect = self.last_indirect_summary;
             machoCapturePrint(
-                "macho-processor: XENIA PM4 INDIRECT WALK: observations={d} root_packets={d} nested_packets={d} indirect_packets={d} refs={d} readable={d} unreadable={d} draws(root/nested/total)={d}/{d}/{d} swaps(root/nested/total)={d}/{d}/{d} waits={d} unknown={d} cycles={d} truncated={s} budget={s}\n",
+                "macho-processor: XENIA PM4 INDIRECT WALK: observations={d} root_packets={d} nested_packets={d} indirect_packets={d} refs={d} readable={d} unreadable={d} truncated_refs={d} budget_refs={d} draws(root/nested/total)={d}/{d}/{d} swaps(root/nested/total)={d}/{d}/{d} waits={d} unknown={d} cycles={d} truncated={s} budget={s}\n",
                 .{
                     self.indirect_walk_observations,
                     indirect.root_packets,
@@ -615,6 +637,8 @@ pub const Ledger = struct {
                     indirect.indirect_references,
                     indirect.readable_references,
                     indirect.unreadable_references,
+                    indirect.truncated_references,
+                    indirect.budget_limited_references,
                     indirect.root_draw_packets,
                     indirect.nested_draw_packets,
                     indirect.draw_packets,
@@ -630,13 +654,14 @@ pub const Ledger = struct {
             );
             for (self.last_indirect_references[0..self.last_indirect_reference_count]) |reference| {
                 machoCapturePrint(
-                    "  pm4 indirect depth={d} opcode=0x{x:0>2} address=0x{x:0>8} size_dwords={d} status={s} packets={d} draws={d} swaps={d} words_read={d}\n",
+                    "  pm4 indirect depth={d} opcode=0x{x:0>2} address=0x{x:0>8} size_dwords={d} status={s} missing_address=0x{x:0>8} packets={d} draws={d} swaps={d} words_read={d}\n",
                     .{
                         reference.depth,
                         reference.opcode,
                         reference.address,
                         reference.size_dwords,
                         reference.status.label(),
+                        reference.missing_address orelse 0,
                         reference.packets,
                         reference.draws,
                         reference.swaps,
@@ -723,6 +748,15 @@ pub const Ledger = struct {
             .value = recorded.value,
             .opcode = recorded.opcode orelse 0xFF,
         }, event.step);
+        if (recorded.kind == .wait and self.first_draw_consumed_recorded and
+            recorded.step >= self.first_draw_consumed_step)
+        {
+            self.wait_events_after_draw +|= 1;
+        } else if (recorded.kind == .signal and self.first_draw_consumed_recorded and
+            recorded.step >= self.first_draw_consumed_step)
+        {
+            self.signal_events_after_draw +|= 1;
+        }
     }
 
     fn retainedEvent(self: *const Ledger, ordinal: usize) Event {
@@ -794,6 +828,8 @@ fn indirectFingerprint(summary: pm4_walk.Summary, references: []const pm4_walk.R
         summary.nested_swap_packets,
         summary.indirect_references,
         summary.unreadable_references,
+        summary.truncated_references,
+        summary.budget_limited_references,
         summary.cycle_references,
         if (summary.root_truncated) 1 else 0,
     };
@@ -802,6 +838,7 @@ fn indirectFingerprint(summary: pm4_walk.Summary, references: []const pm4_walk.R
         hash = (hash ^ reference.address) *% 0x100000001b3;
         hash = (hash ^ reference.size_dwords) *% 0x100000001b3;
         hash = (hash ^ @intFromEnum(reference.status)) *% 0x100000001b3;
+        hash = (hash ^ (reference.missing_address orelse 0)) *% 0x100000001b3;
         hash = (hash ^ reference.packets) *% 0x100000001b3;
         hash = (hash ^ reference.draws) *% 0x100000001b3;
         hash = (hash ^ reference.swaps) *% 0x100000001b3;
@@ -859,6 +896,17 @@ test "a consumed draw advances the draw boundary but not VdSwap" {
     try std.testing.expect(ledger.observed(.first_draw_consumed));
     try std.testing.expectEqual(vd_ring.CausalStage.guest_vdswap_entered, ledger.firstGap().?);
     try std.testing.expect(!vd_ring.handoffReady(ledger.observed_mask, .title_to_command_processor));
+}
+
+test "post-draw wait and signal evidence is anchored after draw consumption" {
+    var ledger = Ledger{};
+    ledger.observeConsumedBatch(8, 1, 0, 100, true);
+    _ = ledger.observeLine("KeWaitForSingleObject guest_obj=827CEC14 result=00000000 wait=0", 101);
+    _ = ledger.observeLine("KeReleaseSemaphore guest_obj=827CEC14 result=00000000", 102);
+    try std.testing.expectEqual(@as(?u64, 100), ledger.firstDrawConsumedStep());
+    try std.testing.expect(ledger.postDrawWaitObserved());
+    try std.testing.expectEqual(@as(u64, 1), ledger.wait_events_after_draw);
+    try std.testing.expectEqual(@as(u64, 1), ledger.signal_events_after_draw);
 }
 
 test "diagnostic PM4 execution never becomes authentic evidence" {

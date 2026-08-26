@@ -45,6 +45,10 @@ pub const Reference = struct {
     address: u32 = 0,
     size_dwords: u32 = 0,
     status: ReferenceStatus = .observed,
+    /// The first dword address that could not be read while following this
+    /// reference.  A missing address is different from a readable buffer
+    /// whose contents contain only filler, so keep the boundary explicit.
+    missing_address: ?u32 = null,
     packets: u32 = 0,
     draws: u32 = 0,
     swaps: u32 = 0,
@@ -109,6 +113,23 @@ const MemorySource = struct {
     address: u32,
 };
 
+const SourceRead = union(enum) {
+    value: u32,
+    unavailable: u32,
+};
+
+const SourceStatus = enum {
+    complete,
+    unreadable,
+    truncated,
+    budget_limit,
+};
+
+const SourceWalk = struct {
+    status: SourceStatus,
+    missing_address: ?u32 = null,
+};
+
 const Source = union(enum) {
     ring: RingSource,
     memory: MemorySource,
@@ -149,7 +170,7 @@ pub const Walker = struct {
             self.result.root_truncated = true;
             return;
         }
-        self.walkSource(.{ .ring = .{
+        _ = self.walkSource(.{ .ring = .{
             .bytes = bytes,
             .start_dword = start_dword,
             .ring_dwords = ring_dwords,
@@ -168,36 +189,47 @@ pub const Walker = struct {
         return self.references_dropped;
     }
 
-    fn readSource(self: *Walker, source: Source, index: u32) ?u32 {
+    fn readSource(self: *Walker, source: Source, index: u32) SourceRead {
         switch (source) {
             .ring => |ring| {
-                if (ring.ring_dwords == 0 or index >= ring.ring_dwords) return null;
+                if (ring.ring_dwords == 0 or index >= ring.ring_dwords) {
+                    return .{ .unavailable = index };
+                }
                 const ring_index: u32 = @intCast((@as(u64, ring.start_dword) + index) % ring.ring_dwords);
                 const offset = @as(usize, ring_index) * 4;
-                if (offset + 4 > ring.bytes.len) return null;
+                if (offset + 4 > ring.bytes.len) return .{ .unavailable = ring_index * 4 };
                 self.result.words_read +|= 1;
-                return std.mem.readInt(u32, ring.bytes[offset..][0..4], .big);
+                return .{ .value = std.mem.readInt(u32, ring.bytes[offset..][0..4], .big) };
             },
             .memory => |memory| {
                 const address = @as(u64, memory.address) + @as(u64, index) * 4;
-                if (address > std.math.maxInt(u32)) return null;
-                self.result.words_read +|= 1;
-                return memory.callback(memory.context, @intCast(address));
+                if (address > std.math.maxInt(u32)) return .{ .unavailable = std.math.maxInt(u32) };
+                if (memory.callback(memory.context, @intCast(address))) |value| {
+                    self.result.words_read +|= 1;
+                    return .{ .value = value };
+                }
+                return .{ .unavailable = @intCast(address) };
             },
         }
     }
 
-    fn walkSource(self: *Walker, source: Source, depth: u8, root: bool, available_dwords: u32) void {
+    fn walkSource(self: *Walker, source: Source, depth: u8, root: bool, available_dwords: u32) SourceWalk {
         const limit = if (root) available_dwords else @min(available_dwords, pm4.max_indirect_dwords);
         var cursor: u32 = 0;
         while (cursor < limit) {
             if (self.result.packets_walked >= max_packet_budget) {
                 self.result.packet_budget_exhausted = true;
-                break;
+                return .{ .status = .budget_limit };
             }
-            const header = self.readSource(source, cursor) orelse {
-                if (!root) self.result.truncated_references +|= 1;
-                break;
+            const header = switch (self.readSource(source, cursor)) {
+                .value => |value| value,
+                .unavailable => |address| {
+                    if (root) self.result.root_truncated = true;
+                    return .{
+                        .status = if (!root and cursor == 0) .unreadable else .truncated,
+                        .missing_address = if (root) null else address,
+                    };
+                },
             };
             if (pm4.isLikelyEmptyRing(header)) {
                 cursor += 1;
@@ -208,10 +240,8 @@ pub const Walker = struct {
             if (advance == 0 or advance > limit - cursor) {
                 if (root) {
                     self.result.root_truncated = true;
-                } else {
-                    self.result.truncated_references +|= 1;
                 }
-                break;
+                return .{ .status = .truncated };
             }
 
             self.result.packets_walked +|= 1;
@@ -244,41 +274,51 @@ pub const Walker = struct {
             }
             cursor += advance;
         }
+        return .{ .status = .complete };
     }
 
     fn followIndirect(self: *Walker, source: Source, packet_offset: u32, packet: pm4.Packet, depth: u8) void {
         var payload: [2]u32 = undefined;
-        payload[0] = self.readSource(source, packet_offset + 1) orelse {
-            _ = self.recordReference(.{
-                .opcode = @enumFromInt(packet.opcode),
-                .address = 0,
-                .size_dwords = 0,
-                .control = 0,
-            }, depth, .unreadable);
-            return;
+        payload[0] = switch (self.readSource(source, packet_offset + 1)) {
+            .value => |value| value,
+            .unavailable => |address| {
+                const reference_index = self.recordReference(.{
+                    .opcode = @enumFromInt(packet.opcode),
+                    .address = 0,
+                    .size_dwords = 0,
+                    .control = 0,
+                }, depth, .unreadable, address);
+                if (reference_index != null) self.result.unreadable_references +|= 1;
+                return;
+            },
         };
-        payload[1] = self.readSource(source, packet_offset + 2) orelse {
-            _ = self.recordReference(.{
-                .opcode = @enumFromInt(packet.opcode),
-                .address = payload[0],
-                .size_dwords = 0,
-                .control = 0,
-            }, depth, .unreadable);
-            return;
+        payload[1] = switch (self.readSource(source, packet_offset + 2)) {
+            .value => |value| value,
+            .unavailable => |address| {
+                const reference_index = self.recordReference(.{
+                    .opcode = @enumFromInt(packet.opcode),
+                    .address = payload[0],
+                    .size_dwords = 0,
+                    .control = 0,
+                }, depth, .unreadable, address);
+                if (reference_index != null) self.result.unreadable_references +|= 1;
+                return;
+            },
         };
         const descriptor = pm4.decodeIndirectBuffer(
             0xC000_0000 | (@as(u32, packet.body_dwords - 1) << pm4.count_shift) | (@as(u32, packet.opcode) << pm4.opcode_shift),
             &payload,
         ) orelse {
-            _ = self.recordReference(.{
+            const reference_index = self.recordReference(.{
                 .opcode = @enumFromInt(packet.opcode),
                 .address = payload[0],
                 .size_dwords = payload[1] & pm4.indirect_size_mask,
                 .control = payload[1] & ~pm4.indirect_size_mask,
-            }, depth, .invalid);
+            }, depth, .invalid, null);
+            if (reference_index != null) self.result.invalid_references +|= 1;
             return;
         };
-        const reference_index = self.recordReference(descriptor, depth, .observed);
+        const reference_index = self.recordReference(descriptor, depth, .observed, null) orelse return;
         if (!descriptor.aligned() or descriptor.size_dwords == 0) {
             self.setReferenceStatus(reference_index, .invalid);
             self.result.invalid_references +|= 1;
@@ -318,7 +358,7 @@ pub const Walker = struct {
         self.active_ranges[self.active_count] = .{ .address = descriptor.address, .size_dwords = walk_dwords };
         self.active_count += 1;
         defer self.active_count -= 1;
-        self.walkSource(.{ .memory = .{
+        const walk = self.walkSource(.{ .memory = .{
             .context = self.memory_context.?,
             .callback = self.memory_callback.?,
             .address = descriptor.address,
@@ -331,10 +371,33 @@ pub const Walker = struct {
             self.result.unknown_packets - before_unknown,
             self.result.words_read - before_words,
         );
-        if (self.referenceStatus(reference_index) == .observed) self.result.readable_references +|= 1;
+        self.setReferenceMissingAddress(reference_index, walk.missing_address);
+        if (self.referenceStatus(reference_index) == .observed) {
+            switch (walk.status) {
+                .complete => self.result.readable_references +|= 1,
+                .unreadable => {
+                    self.setReferenceStatus(reference_index, .unreadable);
+                    self.result.unreadable_references +|= 1;
+                },
+                .truncated => {
+                    self.setReferenceStatus(reference_index, .truncated);
+                    self.result.truncated_references +|= 1;
+                },
+                .budget_limit => {
+                    self.setReferenceStatus(reference_index, .budget_limit);
+                    self.result.budget_limited_references +|= 1;
+                },
+            }
+        }
     }
 
-    fn recordReference(self: *Walker, descriptor: pm4.IndirectBuffer, depth: u8, status: ReferenceStatus) ?usize {
+    fn recordReference(
+        self: *Walker,
+        descriptor: pm4.IndirectBuffer,
+        depth: u8,
+        status: ReferenceStatus,
+        missing_address: ?u32,
+    ) ?usize {
         self.result.indirect_references +|= 1;
         if (self.reference_count == self.references.len) {
             self.references_dropped +|= 1;
@@ -349,6 +412,7 @@ pub const Walker = struct {
             .address = descriptor.address,
             .size_dwords = descriptor.size_dwords,
             .status = status,
+            .missing_address = missing_address,
         };
         return index;
     }
@@ -359,6 +423,12 @@ pub const Walker = struct {
 
     fn referenceStatus(self: *const Walker, index: ?usize) ReferenceStatus {
         return if (index) |value| self.references[value].status else .budget_limit;
+    }
+
+    fn setReferenceMissingAddress(self: *Walker, index: ?usize, address: ?u32) void {
+        if (index) |value| {
+            if (address) |missing| self.references[value].missing_address = missing;
+        }
     }
 
     fn setReferenceCounts(
@@ -438,13 +508,16 @@ test "an unreadable indirect buffer is reported without claiming a draw" {
     writeBig(&root, 1, 0x0000_0300);
     writeBig(&root, 2, 4);
 
-    var walker = Walker.init(null, null);
+    var memory = MemoryFixture{};
+    var walker = Walker.init(&memory, MemoryFixture.read);
     walker.walkRoot(&root, 0, 4, 4);
     const result = walker.summary();
     try std.testing.expectEqual(@as(u32, 1), result.indirect_references);
     try std.testing.expectEqual(@as(u32, 1), result.unreadable_references);
     try std.testing.expectEqual(@as(u32, 0), result.draw_packets);
     try std.testing.expectEqual(ReferenceStatus.unreadable, walker.referenceSlice()[0].status);
+    try std.testing.expectEqual(@as(u32, 0), walker.referenceSlice()[0].words_read);
+    try std.testing.expectEqual(@as(?u32, 0x0000_0300), walker.referenceSlice()[0].missing_address);
 }
 
 test "overlapping indirect ranges are stopped as cycles" {

@@ -143,6 +143,15 @@ pub const Thread = struct {
     state: ThreadState = .running,
     waiting_on: u64 = 0,
     blocked_since_step: u64 = 0,
+    /// The instruction boundary that entered the wait. A parked thread has
+    /// no later instruction samples, so this is the most useful answer to
+    /// "where did it stop?" without a host debugger.
+    blocked_rip: u64 = 0,
+    start_routine: u64 = 0,
+    waiting_mutex: u64 = 0,
+    wait_generation: u64 = 0,
+    notified_generation: u64 = 0,
+    blocked_reason: []const u8 = "",
 };
 
 pub const Object = struct {
@@ -155,6 +164,8 @@ pub const Object = struct {
     notifiers: [4]u64 = [_]u64{0} ** 4,
     notifier_count: u32 = 0,
     last_notify_step: u64 = 0,
+    last_notify_thread: u64 = 0,
+    last_notify_pc: u64 = 0,
     /// The longest any current waiter has been parked here.
     longest_park_steps: u64 = 0,
     /// How many times a bounded spurious wake was granted to this object's
@@ -172,6 +183,23 @@ pub const Object = struct {
         self.notifiers[self.notifier_count] = thread;
         self.notifier_count += 1;
     }
+};
+
+/// Optional context attached to a scheduler observation. The original
+/// four-argument observer remains below for small callers and tests; the
+/// richer form is what the Mach-O runtime uses when it can preserve the wait
+/// boundary.
+pub const ThreadObservation = struct {
+    handle: u64,
+    state: ThreadState,
+    waiting_on: u64,
+    blocked_since_step: u64,
+    blocked_rip: u64 = 0,
+    start_routine: u64 = 0,
+    waiting_mutex: u64 = 0,
+    wait_generation: u64 = 0,
+    notified_generation: u64 = 0,
+    blocked_reason: []const u8 = "",
 };
 
 pub const Ledger = struct {
@@ -217,11 +245,27 @@ pub const Ledger = struct {
         waiting_on: u64,
         blocked_since_step: u64,
     ) void {
+        self.observeThreadContext(.{
+            .handle = handle,
+            .state = state,
+            .waiting_on = waiting_on,
+            .blocked_since_step = blocked_since_step,
+        });
+    }
+
+    pub fn observeThreadContext(self: *Ledger, observation: ThreadObservation) void {
+        const handle = observation.handle;
         if (handle == 0) return;
         const thread = self.threadSlot(handle) orelse return;
-        thread.state = state;
-        thread.waiting_on = if (state == .waiting) waiting_on else 0;
-        thread.blocked_since_step = blocked_since_step;
+        thread.state = observation.state;
+        thread.waiting_on = if (observation.state == .waiting) observation.waiting_on else 0;
+        thread.blocked_since_step = observation.blocked_since_step;
+        thread.blocked_rip = observation.blocked_rip;
+        thread.start_routine = observation.start_routine;
+        thread.waiting_mutex = if (observation.state == .waiting) observation.waiting_mutex else 0;
+        thread.wait_generation = if (observation.state == .waiting) observation.wait_generation else 0;
+        thread.notified_generation = if (observation.state == .waiting) observation.notified_generation else 0;
+        thread.blocked_reason = if (observation.state == .waiting) observation.blocked_reason else "";
     }
 
     pub fn observeNotify(self: *Ledger, address: u64, kind: ObjectKind, notifier: u64, step: u64) void {
@@ -230,7 +274,25 @@ pub const Ledger = struct {
         if (object.kind == .unknown) object.kind = kind;
         object.notifications +|= 1;
         object.last_notify_step = step;
+        object.last_notify_thread = notifier;
+        object.last_notify_pc = 0;
         object.addNotifier(notifier);
+    }
+
+    /// Record the notifier's call-site PC when the caller has it. Kept
+    /// separate from `observeNotify` so the compatibility observer above can
+    /// remain address-only without inventing a program counter.
+    pub fn observeNotifyAt(
+        self: *Ledger,
+        address: u64,
+        kind: ObjectKind,
+        notifier: u64,
+        program_counter: u64,
+        step: u64,
+    ) void {
+        self.observeNotify(address, kind, notifier, step);
+        if (address == 0) return;
+        if (self.objectSlot(address)) |object| object.last_notify_pc = program_counter;
     }
 
     /// Declare an object exists and what kind it is, without a notification.
@@ -421,6 +483,21 @@ pub const Ledger = struct {
         return count;
     }
 
+    /// Copy the current waiters for one object into caller-owned storage. A
+    /// report should name the actual waiter, not merely repeat the object's
+    /// address; returning copies keeps this diagnostic bounded and avoids
+    /// exposing mutable ledger storage to formatters.
+    pub fn waitersFor(self: *const Ledger, address: u64, out: []Thread) []const Thread {
+        var count: usize = 0;
+        for (self.threads[0..self.thread_count]) |thread| {
+            if (thread.state != .waiting or thread.waiting_on != address) continue;
+            if (count == out.len) break;
+            out[count] = thread;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
     pub fn verdict(self: *const Ledger) []const u8 {
         if (self.thread_count == 0)
             return "no thread state has been observed, so nothing can be said about deadlock either way";
@@ -457,6 +534,33 @@ test "a waiter on an object nobody ever signalled is a deadlock with no cycle" {
     try std.testing.expect(worst.finding.deadlocked());
     try std.testing.expectEqual(@as(u64, 0x15cd8140), worst.object.?.address);
     try std.testing.expect(std.mem.indexOf(u8, worst.finding.meaning(), "has not been reached") != null);
+}
+
+test "a blocker report retains the wait boundary and waiter identity" {
+    var ledger = Ledger{};
+    ledger.observeObject(0x14ce9fd0, .condvar);
+    ledger.observeThreadContext(.{
+        .handle = 0x7fff2090,
+        .state = .waiting,
+        .waiting_on = 0x14ce9fd0,
+        .blocked_since_step = 65_112_171,
+        .blocked_rip = 0x1d3a60,
+        .start_routine = 0x1d3a60,
+        .waiting_mutex = 0x14ce9f90,
+        .wait_generation = 0,
+        .notified_generation = 0,
+        .blocked_reason = "pthread_cond_wait",
+    });
+    ledger.refresh(65_112_171 + long_park);
+
+    var waiters: [max_threads]Thread = undefined;
+    const matching = ledger.waitersFor(0x14ce9fd0, &waiters);
+    try std.testing.expectEqual(@as(usize, 1), matching.len);
+    try std.testing.expectEqual(@as(u64, 0x7fff2090), matching[0].handle);
+    try std.testing.expectEqual(@as(u64, 0x1d3a60), matching[0].blocked_rip);
+    try std.testing.expectEqual(@as(u64, 0x14ce9f90), matching[0].waiting_mutex);
+    try std.testing.expectEqualStrings("pthread_cond_wait", matching[0].blocked_reason);
+    try std.testing.expectEqual(Finding.never_notified, ledger.worst().finding);
 }
 
 test "a producer that exited leaves its consumers parked forever" {
@@ -664,7 +768,7 @@ test "every finding names a different owner and only some are deadlocks" {
     try std.testing.expect(Finding.wait_cycle.deadlocked());
 
     inline for (.{
-        ObjectKind.event, ObjectKind.semaphore, ObjectKind.mutex,
+        ObjectKind.event,   ObjectKind.semaphore,        ObjectKind.mutex,
         ObjectKind.condvar, ObjectKind.critical_section, ObjectKind.thread_join,
     }) |kind| try std.testing.expect(kind.label().len > 0);
 }

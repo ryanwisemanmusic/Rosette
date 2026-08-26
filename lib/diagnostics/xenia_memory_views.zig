@@ -28,6 +28,15 @@ pub const Discovery = enum(u8) {
     conflicting,
 };
 
+/// Host projection used by Xenia's physical memory and physical-alias views.
+/// The physical view is canonical; A/C/E aliases are fallback probes only.
+pub const PhysicalProjection = enum(u8) {
+    physical,
+    a_virtual,
+    c_virtual,
+    e_virtual,
+};
+
 pub const Model = struct {
     mapping_base: u64 = 0,
     observations: u64 = 0,
@@ -89,6 +98,28 @@ pub const Model = struct {
         const physical = physical_address & physical_mask;
         const base = std.math.add(u64, self.mapping_base, physical_view_offset) catch return null;
         return std.math.add(u64, base, physical) catch return null;
+    }
+
+    /// Resolve a physical byte address through one of Xenia's host-visible
+    /// projections. Keep this conversion here so GPU handoff code cannot
+    /// accidentally treat an Xbox physical address as a Rosetta host pointer.
+    /// The E000 projection is expressed through virtualHostAddress so its
+    /// documented 4 KiB macOS bias is applied exactly once.
+    pub fn physicalProjectionHostAddress(
+        self: *const Model,
+        physical_address: u64,
+        projection: PhysicalProjection,
+    ) ?u64 {
+        const physical = physical_address & physical_mask;
+        return switch (projection) {
+            .physical => self.physicalHostAddress(physical),
+            .a_virtual => self.virtualHostAddress(0xA000_0000 + physical),
+            .c_virtual => self.virtualHostAddress(0xC000_0000 + physical),
+            .e_virtual => if (physical < physical_4k_bias)
+                null
+            else
+                self.virtualHostAddress(physical_4k_virtual_base + physical - physical_4k_bias),
+        };
     }
 
     /// Convert an E000 virtual alias to the physical address it represents.
@@ -161,6 +192,31 @@ test "ordinary virtual addresses have no physical-view bias" {
         model.virtualHostAddress(0x30002000),
     );
     try std.testing.expect(Model.physicalAddressForVirtual(0x30002000) == null);
+}
+
+test "resolves physical memory through Xenia's canonical and alias projections" {
+    var model: Model = .{};
+    _ = model.observeFixedFileView(0x34D890000, primary_view_length, 0, false);
+    const physical = 0x0510_C040;
+    try std.testing.expectEqual(
+        @as(?u64, 0x4529_9C040),
+        model.physicalProjectionHostAddress(physical, .physical),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 0x3F29_9C040),
+        model.physicalProjectionHostAddress(physical, .a_virtual),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 0x4129_9C040),
+        model.physicalProjectionHostAddress(physical, .c_virtual),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 0x4329_9C040),
+        model.physicalProjectionHostAddress(physical, .e_virtual),
+    );
+    try std.testing.expect(
+        model.physicalProjectionHostAddress(0xFFF, .e_virtual) == null,
+    );
 }
 
 test "a conflicting primary view fails closed" {

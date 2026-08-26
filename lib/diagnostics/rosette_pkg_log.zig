@@ -44,6 +44,10 @@ const register_map = @import("xenos_register_map");
 const kernel_export_map = @import("xenia_kernel_export_map");
 const vd_ring_contract = @import("xenia_vd_ring_contract");
 const pm4_contract = @import("xenia_pm4_contract");
+const vd_swap_contract = @import("xenia_vd_swap_contract");
+const graphics_health_contract = @import("xenia_graphics_health_contract");
+const application_controller_contract = @import("xenia_application_controller_contract");
+const application_framework_contract = @import("application_framework_contract");
 const xex_format = @import("xenia_xex_format");
 const notification_contract = @import("xenia_notification_contract");
 const log_ring_contract = @import("xenia_log_ring_contract");
@@ -79,6 +83,10 @@ const all_contracts = [_]ContractCheck{
     .{ .name = "kernel-export-map", .checkFn = kernel_export_map.contractIsWellFormed },
     .{ .name = "vd-ring-contract", .checkFn = vd_ring_contract.contractIsWellFormed },
     .{ .name = "pm4-contract", .checkFn = pm4_contract.contractIsWellFormed },
+    .{ .name = "vd-swap-contract", .checkFn = vd_swap_contract.contractIsWellFormed },
+    .{ .name = "graphics-health-contract", .checkFn = graphics_health_contract.contractIsWellFormed },
+    .{ .name = "application-controller-contract", .checkFn = application_controller_contract.contractIsWellFormed },
+    .{ .name = "application-framework-contract", .checkFn = application_framework_contract.contractIsWellFormed },
     .{ .name = "xex-format", .checkFn = xex_format.contractIsWellFormed },
     .{ .name = "notification-contract", .checkFn = notification_contract.contractIsWellFormed },
     .{ .name = "log-ring-contract", .checkFn = log_ring_contract.contractIsWellFormed },
