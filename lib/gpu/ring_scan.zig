@@ -64,6 +64,11 @@ pub const Summary = struct {
     /// Distinct from truncation — this one means the dwords are not a packet
     /// stream at the offset the reader started from.
     desynchronised: bool = false,
+    /// A packet header or payload failed a strict PM4/XE_SWAP check.  Unknown
+    /// opcodes are not counted here: they are valid type-3 packets that this
+    /// observer does not interpret, while a malformed XE_SWAP is evidence
+    /// against the VdSwap handoff itself.
+    malformed_packets: u32 = 0,
 
     packets: u32 = 0,
     type0_packets: u32 = 0,
@@ -71,6 +76,14 @@ pub const Summary = struct {
     type3_packets: u32 = 0,
     draw_packets: u32 = 0,
     swap_packets: u32 = 0,
+    /// XE_SWAP headers found, including candidates whose payload is truncated
+    /// or whose signature/shape fails strict decoding.
+    swap_candidates: u32 = 0,
+    /// Candidates for which the complete five-dword packet payload was within
+    /// the observed span. This says nothing about its signature.
+    swap_payload_readable: u32 = 0,
+    swap_malformed_candidates: u32 = 0,
+    swap_truncated_candidates: u32 = 0,
     /// Dwords that were zero rather than a packet. A ring nobody has written
     /// reads as zeros, and zero decodes as a type-0 write of one dword to
     /// register zero — a real-looking packet that never existed.
@@ -79,6 +92,10 @@ pub const Summary = struct {
     /// The swap, if the span holds one. This is the fact the whole graphics
     /// ladder turns on, so it is returned rather than counted.
     swap: ?pm4.SwapDescription = null,
+    /// Dword offset of the first XE_SWAP header in the ring.  This remains
+    /// useful when the payload is malformed: the failure report can name the
+    /// exact candidate instead of only saying that a swap was absent.
+    swap_offset: ?u32 = null,
     /// The texture fetch constant the swap packet was preceded by. The swap
     /// itself carries only an address and an extent; tiling, byte order and
     /// pixel format live here, and without them the front buffer converts into
@@ -111,6 +128,8 @@ pub const Summary = struct {
             return "the span holds only filler: the ring was published with no commands in it, which is a producer that advanced the write pointer without writing a batch";
         if (self.swap != null)
             return "the span contains an XE_SWAP packet: the title asked to present, so anything still missing downstream is the command processor's or the presenter's";
+        if (self.swap_candidates != 0)
+            return "the span contains XE_SWAP candidate headers, but none passed strict payload decoding. The producer reached the handoff shape and the failure is in packet extent, signature or publication stability";
         if (self.draw_packets != 0)
             return "the span contains draws and no swap: the title rendered and did not present. The frontier is whatever the title does between its last draw and its present call, not the GPU path";
         return "the span contains state and no draws: the title programmed the GPU and never asked it to render, so it has not reached its rendering path at all";
@@ -155,6 +174,42 @@ pub fn scan(bytes: []const u8, start_dword: u32, count_dwords: u32, ring_dwords:
         const raw = readDwordBig(bytes, (start_dword + offset) % ring_dwords);
         const header = pm4.decodeHeader(raw);
         const total = header.totalDwords();
+
+        // Inspect XE_SWAP before applying the generic stream-boundary check.
+        // A candidate at the end of the published span is the evidence we
+        // need most: the producer named the handoff, but publication exposed
+        // only part of its five-dword payload.
+        if (header.kind == .type3 and header.opcode == .xe_swap) {
+            summary.swap_candidates += 1;
+            summary.swap_packets += 1;
+            if (summary.swap_offset == null) {
+                summary.swap_offset = (start_dword + offset) % ring_dwords;
+            }
+            if (offset + 5 > limit) {
+                summary.swap_truncated_candidates += 1;
+            } else {
+                summary.swap_payload_readable += 1;
+                var index: u32 = 0;
+                while (index < 5) : (index += 1) {
+                    scratch[index] = readDwordBig(bytes, (start_dword + offset + index) % ring_dwords);
+                }
+                if (header.count != 4) {
+                    summary.swap_malformed_candidates += 1;
+                    summary.malformed_packets += 1;
+                } else {
+                    const decoded = pm4.decodeSwapSequence(scratch[0..5]);
+                    if (decoded) |swap| {
+                        if (summary.swap == null) {
+                            summary.fetch = readFetchBefore(bytes, start_dword + offset, ring_dwords);
+                            summary.swap = swap;
+                        }
+                    } else {
+                        summary.swap_malformed_candidates += 1;
+                        summary.malformed_packets += 1;
+                    }
+                }
+            }
+        }
         if (offset + total > limit) {
             // Distinguish "the producer is mid-write" from "this is not a
             // packet stream". A packet whose declared length overruns the whole
@@ -172,19 +227,6 @@ pub fn scan(bytes: []const u8, start_dword: u32, count_dwords: u32, ring_dwords:
                 if (summary.first_opcode == null) summary.first_opcode = header.opcode;
                 summary.last_opcode = header.opcode;
                 if (header.opcode.isDraw()) summary.draw_packets += 1;
-                if (header.opcode == .xe_swap) {
-                    summary.swap_packets += 1;
-                    if (summary.swap == null and header.count >= 4) {
-                        summary.fetch = readFetchBefore(bytes, start_dword + offset, ring_dwords);
-                        // Copy the packet out of the ring so the decoder sees a
-                        // contiguous span even when the packet wrapped.
-                        var index: u32 = 0;
-                        while (index < 5) : (index += 1) {
-                            scratch[index] = readDwordBig(bytes, (start_dword + offset + index) % ring_dwords);
-                        }
-                        summary.swap = pm4.decodeSwapSequence(scratch[0..5]);
-                    }
-                }
             },
         }
         offset += total;
@@ -218,7 +260,68 @@ fn readFetchBefore(bytes: []const u8, swap_header_dword: u32, ring_dwords: u32) 
 pub const FoundSwap = struct {
     swap: pm4.SwapDescription,
     fetch: ?pm4.FetchConstant = null,
+    /// Header dword offset in the ring, not the signature payload offset.
+    offset: u32,
 };
+
+/// Evidence from a bounded whole-ring search. Unlike `findAnySwap`, this keeps
+/// malformed and incomplete XE_SWAP candidates instead of collapsing them into
+/// "no swap". That distinction is what lets the contract separate a producer
+/// that never wrote the handoff from one that wrote a handoff the consumer
+/// could not decode.
+pub const SwapEvidence = struct {
+    candidates: u32 = 0,
+    payload_readable: u32 = 0,
+    decoded: u32 = 0,
+    malformed: u32 = 0,
+    truncated: u32 = 0,
+    first_offset: ?u32 = null,
+    first_decoded: ?FoundSwap = null,
+};
+
+/// Search the retained ring image for XE_SWAP headers and retain every useful
+/// boundary fact. The ring image is complete, so a candidate's five dwords can
+/// wrap from the final slot back to slot zero; a candidate is "truncated" here
+/// only when the image itself is too small to hold a packet.
+pub fn findSwapEvidence(bytes: []const u8, ring_dwords: u32) SwapEvidence {
+    var evidence = SwapEvidence{};
+    if (ring_dwords < 5 or bytes.len < @as(usize, ring_dwords) * 4) return evidence;
+    const limit = @min(ring_dwords, max_search_dwords);
+    if (limit == 0) return evidence;
+
+    var scratch: [5]u32 = undefined;
+    var index: u32 = 0;
+    while (index < limit) : (index += 1) {
+        const header = pm4.decodeHeader(readDwordBig(bytes, index));
+        if (header.kind != .type3 or header.opcode != .xe_swap) continue;
+
+        evidence.candidates += 1;
+        if (evidence.first_offset == null) evidence.first_offset = index;
+        evidence.payload_readable += 1;
+        var payload_index: u32 = 0;
+        while (payload_index < 5) : (payload_index += 1) {
+            scratch[payload_index] = readDwordBig(bytes, (index + payload_index) % ring_dwords);
+        }
+        if (header.count != 4) {
+            evidence.malformed += 1;
+        } else {
+            const swap = pm4.decodeSwapSequence(scratch[0..]);
+            if (swap) |description| {
+                evidence.decoded += 1;
+                if (evidence.first_decoded == null) {
+                    evidence.first_decoded = .{
+                        .swap = description,
+                        .fetch = readFetchBefore(bytes, index, ring_dwords),
+                        .offset = index,
+                    };
+                }
+            } else {
+                evidence.malformed += 1;
+            }
+        }
+    }
+    return evidence;
+}
 
 /// Count draw packets anywhere in the ring, ignoring the pointers.
 ///
@@ -256,30 +359,7 @@ pub fn countDraws(bytes: []const u8, ring_dwords: u32) u32 {
 /// upstream means the packet was written and not decoded, which is a completely
 /// different bug from a packet that was never written.
 pub fn findAnySwap(bytes: []const u8, ring_dwords: u32) ?FoundSwap {
-    if (ring_dwords < 5 or bytes.len < @as(usize, ring_dwords) * 4) return null;
-    var index: u32 = 0;
-    // Bounded like the span walk. A ring configured at the emulator's largest
-    // size is two megabytes, and this runs on a checkpoint: unbounded, the
-    // search becomes the dominant cost of the diagnostic it belongs to.
-    const limit = @min(ring_dwords, max_search_dwords) - 4;
-    while (index < limit) : (index += 1) {
-        if (readDwordBig(bytes, index) != pm4.swap_signature) continue;
-        // The signature is the packet's first payload dword, so the header sits
-        // immediately before it. Checking it rejects a coincidental 'SWAP' in
-        // texture data, which is otherwise a very plausible false positive.
-        if (index == 0) continue;
-        const header = pm4.decodeHeader(readDwordBig(bytes, index - 1));
-        if (header.kind != .type3 or header.opcode != .xe_swap) continue;
-        return .{
-            .swap = .{
-                .frontbuffer_physical_address = readDwordBig(bytes, index + 1),
-                .width = readDwordBig(bytes, index + 2),
-                .height = readDwordBig(bytes, index + 3),
-            },
-            .fetch = readFetchBefore(bytes, index - 1, ring_dwords),
-        };
-    }
-    return null;
+    return findSwapEvidence(bytes, ring_dwords).first_decoded;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +387,7 @@ test "a span of zeros is reported as a ring nobody ever wrote" {
 // owners.
 test "state without draws and draws without a swap are different findings" {
     const state = ringImage(64, &.{
-        pm4.packetType3(.set_constant, 2, false).?, 0, 0,
+        pm4.packetType3(.set_constant, 2, false).?,     0, 0,
         pm4.packetType3(.invalidate_state, 1, false).?, 0,
     });
     const state_summary = scan(&state, 0, 5, 64);
@@ -316,7 +396,7 @@ test "state without draws and draws without a swap are different findings" {
 
     const drew = ringImage(64, &.{
         pm4.packetType3(.set_constant, 2, false).?, 0, 0,
-        pm4.packetType3(.draw_indx_2, 2, false).?, 0, 0,
+        pm4.packetType3(.draw_indx_2, 2, false).?,  0, 0,
     });
     const drew_summary = scan(&drew, 0, 6, 64);
     try std.testing.expectEqual(@as(u32, 1), drew_summary.draw_packets);
@@ -337,6 +417,7 @@ test "a swap in the span is returned rather than counted" {
 
     const summary = scan(&bytes, 0, 12, 64);
     try std.testing.expectEqual(@as(u32, 1), summary.swap_packets);
+    try std.testing.expectEqual(@as(u32, 7), summary.swap_offset.?);
     try std.testing.expectEqual(@as(u32, 1280), summary.swap.?.width);
     try std.testing.expectEqual(@as(u32, 0x1F80_0000), summary.swap.?.frontbuffer_physical_address);
     try std.testing.expect(std.mem.indexOf(u8, summary.verdict(), "asked to present") != null);
@@ -404,6 +485,7 @@ test "a consumed swap is still found by a whole-ring search" {
     const found = findAnySwap(&bytes, 64).?;
     try std.testing.expectEqual(@as(u32, 1152), found.swap.width);
     try std.testing.expectEqual(@as(u32, 0x1FC0_0000), found.swap.frontbuffer_physical_address);
+    try std.testing.expectEqual(@as(u32, 7), found.offset);
 }
 
 // The swap carries an address and an extent; everything that decides how to
@@ -459,8 +541,8 @@ test "stale dwords before a swap are not mistaken for a fetch constant" {
 // consumed looks through the pointers exactly like one that never drew.
 test "draws consumed before the scan are still found in the ring" {
     const bytes = ringImage(64, &.{
-        pm4.packetType3(.set_constant, 2, false).?, 0,                                    0,
-        pm4.packetType3(.draw_indx_2, 2, false).?,  0,                                    0,
+        pm4.packetType3(.set_constant, 2, false).?, 0, 0,
+        pm4.packetType3(.draw_indx_2, 2, false).?,  0, 0,
         pm4.packetType3(.draw_indx, 1, false).?,    0,
     });
     // Nothing outstanding, and the draws are still there.
@@ -471,6 +553,41 @@ test "draws consumed before the scan are still found in the ring" {
 test "a bare signature without a swap header is not mistaken for a swap" {
     const bytes = ringImage(64, &.{ 0x11223344, pm4.swap_signature, 0x1000, 640, 480 });
     try std.testing.expect(findAnySwap(&bytes, 64) == null);
+}
+
+test "ordinary PM4 never satisfies XE_SWAP candidate evidence" {
+    const bytes = ringImage(64, &.{
+        pm4.packetType3(.set_constant, 2, false).?, 0x11, 0x22,
+        pm4.packetType3(.draw_indx_2, 2, false).?,  0x33, 0x44,
+    });
+    const summary = scan(&bytes, 0, 6, 64);
+    try std.testing.expectEqual(@as(u32, 0), summary.swap_candidates);
+    try std.testing.expectEqual(@as(u32, 0), summary.swap_payload_readable);
+    try std.testing.expect(summary.swap == null);
+}
+
+test "a malformed XE_SWAP candidate is retained as evidence without decoding" {
+    const bytes = ringImage(64, &.{
+        pm4.packetType3(.xe_swap, 4, false).?, 0x4E4F_5357, 0x1FC0_0000, 1280, 720,
+    });
+    const summary = scan(&bytes, 0, 5, 64);
+    try std.testing.expectEqual(@as(u32, 1), summary.swap_candidates);
+    try std.testing.expectEqual(@as(u32, 1), summary.swap_payload_readable);
+    try std.testing.expectEqual(@as(u32, 1), summary.swap_malformed_candidates);
+    try std.testing.expectEqual(@as(u32, 0), summary.swap_truncated_candidates);
+    try std.testing.expect(summary.swap == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.verdict(), "candidate headers") != null);
+}
+
+test "a partial XE_SWAP candidate is distinguishable from a malformed payload" {
+    const bytes = ringImage(64, &.{
+        pm4.packetType3(.xe_swap, 4, false).?, pm4.swap_signature,
+    });
+    const summary = scan(&bytes, 0, 2, 64);
+    try std.testing.expectEqual(@as(u32, 1), summary.swap_candidates);
+    try std.testing.expectEqual(@as(u32, 0), summary.swap_payload_readable);
+    try std.testing.expectEqual(@as(u32, 1), summary.swap_truncated_candidates);
+    try std.testing.expect(summary.swap == null);
 }
 
 test "the scan is bounded so a large ring cannot stall the heartbeat" {

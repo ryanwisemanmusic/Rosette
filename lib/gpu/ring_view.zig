@@ -78,8 +78,16 @@ pub const Reading = struct {
     /// Packets a walk from the ring's origin recognised.
     packets: u32 = 0,
     draws: u32 = 0,
+    stream_validated: bool = false,
     swap: ?pm4.SwapDescription = null,
     fetch: ?pm4.FetchConstant = null,
+    swap_candidates: u32 = 0,
+    swap_payload_readable: u32 = 0,
+    swap_malformed_candidates: u32 = 0,
+    swap_truncated_candidates: u32 = 0,
+    /// Header dword offset of a retained XE_SWAP candidate.  The offset is
+    /// retained even though this view is not the authoritative consumer.
+    swap_offset: ?u32 = null,
 
     /// Whether this projection holds something a producer wrote. Deliberately
     /// weaker than "parses as a packet stream": a ring written from an offset
@@ -103,6 +111,7 @@ pub const Reading = struct {
         if (self.nonzero_dwords != 0) value += 1;
         if (self.packets != 0) value += 2;
         if (self.draws != 0) value += 4;
+        if (self.swap_candidates != 0) value += 4;
         if (self.swap != null) value += 8;
         return value;
     }
@@ -143,6 +152,18 @@ pub const Survey = struct {
         for (self.readings) |reading| {
             if (reading.written()) count += 1;
         }
+        return count;
+    }
+
+    pub fn swapCandidateCount(self: *const Survey) u32 {
+        var count: u32 = 0;
+        for (self.readings) |reading| count += reading.swap_candidates;
+        return count;
+    }
+
+    pub fn readableSwapCandidateCount(self: *const Survey) u32 {
+        var count: u32 = 0;
+        for (self.readings) |reading| count += reading.swap_payload_readable;
         return count;
     }
 
@@ -194,9 +215,18 @@ pub fn examine(projection: Projection, address: u64, bytes: ?[]const u8, ring_dw
     const written = ring_payload.digest(data, ring_dwords, limit);
     reading.packets = written.real_packets;
     reading.draws = written.draws;
-    if (ring_scan.findAnySwap(data, ring_dwords)) |found| {
+    reading.stream_validated = written.stream_validated;
+    const evidence = ring_scan.findSwapEvidence(data, ring_dwords);
+    reading.swap_candidates = evidence.candidates;
+    reading.swap_payload_readable = evidence.payload_readable;
+    reading.swap_malformed_candidates = evidence.malformed;
+    reading.swap_truncated_candidates = evidence.truncated;
+    if (evidence.first_decoded) |found| {
         reading.swap = found.swap;
         reading.fetch = found.fetch;
+        reading.swap_offset = found.offset;
+    } else {
+        reading.swap_offset = evidence.first_offset;
     }
     return reading;
 }
@@ -248,6 +278,19 @@ test "an alias holding packets and one holding zeros is reported as a disagreeme
     const best = survey.best().?;
     try std.testing.expectEqual(Projection.virtual_biased, best.projection);
     try std.testing.expectEqual(@as(u32, 1), best.draws);
+}
+
+test "a readable projection does not imply a readable XE_SWAP payload" {
+    const bytes = ringImage(64, &.{
+        pm4.packetType3(.set_constant, 2, false).?, 0x11, 0x22,
+        pm4.packetType3(.draw_indx_2, 2, false).?,  0x33, 0x44,
+    });
+    const reading = examine(.physical, 0x1000, &bytes, 64);
+    try std.testing.expect(reading.readable);
+    try std.testing.expect(reading.packets != 0);
+    try std.testing.expectEqual(@as(u32, 0), reading.swap_candidates);
+    try std.testing.expectEqual(@as(u32, 0), reading.swap_payload_readable);
+    try std.testing.expect(reading.swap == null);
 }
 
 // The other half of the same question, and the one a single-address read can
@@ -312,6 +355,7 @@ test "a swap outranks a draw which outranks bare data when choosing an alias" {
     survey.record(examine(.virtual_unbiased, 3, &with_swap, 64));
     try std.testing.expectEqual(Projection.virtual_unbiased, survey.best().?.projection);
     try std.testing.expectEqual(@as(u32, 1280), survey.best().?.swap.?.width);
+    try std.testing.expectEqual(@as(u32, 7), survey.best().?.swap_offset.?);
 }
 
 test "every projection names where it looked rather than which slot it was" {

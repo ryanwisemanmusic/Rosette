@@ -83,6 +83,19 @@ pub const Tracker = struct {
     /// The largest outstanding span ever observed. Retained because a span the
     /// command processor has since drained still proves the producer published.
     largest_span_dwords: u32 = 0,
+    /// High-water evidence from a command processor that actually consumed a
+    /// batch. This is deliberately separate from `largest_span_dwords`: a
+    /// fast consumer can drain a batch before a heartbeat samples a non-empty
+    /// pointer span, so an empty *current* span must not erase proof that work
+    /// was consumed. The values are high-water marks because the same retained
+    /// ring image may be inspected on several later checkpoints.
+    consumed_batch_dwords: u32 = 0,
+    consumed_batch_packets: u64 = 0,
+    consumed_batch_draws: u64 = 0,
+    consumed_batch_swaps: u64 = 0,
+    consumed_batch_observations: u64 = 0,
+    first_consumed_step: u64 = 0,
+    last_consumed_step: u64 = 0,
     /// Times geometry was reported with the pointers equal.
     drained_observations: u64 = 0,
     /// Executed-step stamps for the first and most recent pointer change.
@@ -146,6 +159,34 @@ pub const Tracker = struct {
             if (outstanding > self.largest_span_dwords) self.largest_span_dwords = outstanding;
             if (outstanding == 0) self.drained_observations +|= 1;
         }
+    }
+
+    /// Retain direct consumer evidence even when pointer sampling only ever
+    /// sees the drained state. This does not manufacture a publication or
+    /// alter pointer provenance; it answers the independent question "did a
+    /// command processor consume a batch?".
+    pub fn observeConsumedBatch(
+        self: *Tracker,
+        dwords: u32,
+        packets: u64,
+        draws: u64,
+        swaps: u64,
+        executed_steps: u64,
+    ) void {
+        if (dwords == 0 and packets == 0 and draws == 0 and swaps == 0) return;
+        self.consumed_batch_observations +|= 1;
+        if (dwords > self.consumed_batch_dwords) self.consumed_batch_dwords = dwords;
+        if (packets > self.consumed_batch_packets) self.consumed_batch_packets = packets;
+        if (draws > self.consumed_batch_draws) self.consumed_batch_draws = draws;
+        if (swaps > self.consumed_batch_swaps) self.consumed_batch_swaps = swaps;
+        if (executed_steps != 0) {
+            if (self.first_consumed_step == 0) self.first_consumed_step = executed_steps;
+            self.last_consumed_step = executed_steps;
+        }
+    }
+
+    pub fn consumerSawBatch(self: *const Tracker) bool {
+        return self.consumed_batch_observations != 0;
     }
 
     pub fn span(self: *const Tracker) Span {
@@ -227,6 +268,20 @@ test "a drained ring still counts as having been published to" {
     try std.testing.expect(tracker.published());
     try std.testing.expectEqual(@as(u32, 0x19), tracker.largest_span_dwords);
     try std.testing.expectEqual(@as(u64, 1), tracker.drained_observations);
+}
+
+test "a fast consumer is retained separately from the sampled outstanding span" {
+    var tracker = Tracker{};
+    tracker.observeGeometry(.{ .size_bytes = 0x8000, .read_pointer = 0x19, .write_pointer = 0x19 });
+    tracker.observeConsumedBatch(25, 3, 24, 0, 4_000);
+
+    try std.testing.expectEqual(@as(u32, 0), tracker.largest_span_dwords);
+    try std.testing.expectEqual(@as(u32, 25), tracker.consumed_batch_dwords);
+    try std.testing.expectEqual(@as(u64, 3), tracker.consumed_batch_packets);
+    try std.testing.expectEqual(@as(u64, 24), tracker.consumed_batch_draws);
+    try std.testing.expect(tracker.consumerSawBatch());
+    try std.testing.expectEqual(@as(u64, 4_000), tracker.first_consumed_step);
+    try std.testing.expectEqual(@as(u64, 4_000), tracker.last_consumed_step);
 }
 
 test "a wrapped write pointer is a span, not a negative one" {

@@ -26,6 +26,28 @@ pub const ExecuteError = error{
     PacketError,
 };
 
+pub const IndirectStatus = enum(u8) {
+    not_attempted,
+    complete,
+    unreadable,
+    truncated,
+    invalid,
+    depth_limit,
+    budget_limit,
+
+    pub fn label(self: IndirectStatus) []const u8 {
+        return switch (self) {
+            .not_attempted => "not-attempted",
+            .complete => "complete",
+            .unreadable => "unreadable",
+            .truncated => "truncated",
+            .invalid => "invalid",
+            .depth_limit => "depth-limit",
+            .budget_limit => "budget-limit",
+        };
+    }
+};
+
 pub const Report = struct {
     dwords: u32 = 0,
     packets_before: u64 = 0,
@@ -35,12 +57,43 @@ pub const Report = struct {
     swaps: u64 = 0,
     unknown_opcodes: u64 = 0,
     truncated: bool = false,
+    indirect_buffers: u64 = 0,
+    indirect_dwords_requested: u64 = 0,
+    indirect_dwords_read: u64 = 0,
+    indirect_unreadable: u64 = 0,
+    indirect_truncated: u64 = 0,
+    indirect_invalid: u64 = 0,
+    indirect_depth_limited: u64 = 0,
+    indirect_budget_limited: u64 = 0,
+    indirect_last_status: IndirectStatus = .not_attempted,
+    indirect_last_address: u32 = 0,
+    indirect_last_missing_address: ?u32 = null,
 };
 
 pub const TextureBinding = struct {
     binding: u8,
     fetch_constant: u8,
     fetch: registers.TextureFetch,
+};
+
+/// Register-backed surface evidence.  `renderTargets()` always returns a
+/// primary target, including immediately after reset, so callers must not use
+/// that non-null result as proof that a title selected a render target.  This
+/// record only reports evidence when a relevant Xenos register contains a
+/// non-default value after the register file has received writes.
+pub const RenderTargetEvidence = struct {
+    state_observed: bool = false,
+    plausible: bool = false,
+    color_base_tiles: u32 = 0,
+    color_format: u32 = 0,
+    depth_base_tiles: u32 = 0,
+    depth_format: u32 = 0,
+    surface_pitch_pixels: u32 = 0,
+    msaa_mode: u2 = 0,
+    color_mask: u8 = 0,
+    raw_color_info: u32 = 0,
+    raw_depth_info: u32 = 0,
+    raw_surface_info: u32 = 0,
 };
 
 pub const Runtime = struct {
@@ -51,9 +104,22 @@ pub const Runtime = struct {
     draw_count: u64 = 0,
     event_count: u64 = 0,
     swap_count: u64 = 0,
+    draw_completion_signals: u64 = 0,
+    color_resolve_observations: u64 = 0,
     packet_errors: u64 = 0,
     truncated_rings: u64 = 0,
     indirect_depth: u8 = 0,
+    indirect_buffers: u64 = 0,
+    indirect_dwords_requested: u64 = 0,
+    indirect_dwords_read: u64 = 0,
+    indirect_unreadable: u64 = 0,
+    indirect_truncated: u64 = 0,
+    indirect_invalid: u64 = 0,
+    indirect_depth_limited: u64 = 0,
+    indirect_budget_limited: u64 = 0,
+    indirect_last_status: IndirectStatus = .not_attempted,
+    indirect_last_address: u32 = 0,
+    indirect_last_missing_address: ?u32 = null,
     last_swap: ?pm4.SwapDescription = null,
     last_draw: ?executor_module.Draw = null,
     shader_cache: shader.Cache = .{},
@@ -162,6 +228,17 @@ pub const Runtime = struct {
         const draws_before = self.executor.draw_count;
         const events_before = self.executor.event_count;
         const swaps_before = self.executor.swap_count;
+        const indirect_buffers_before = self.indirect_buffers;
+        const indirect_requested_before = self.indirect_dwords_requested;
+        const indirect_read_before = self.indirect_dwords_read;
+        const indirect_unreadable_before = self.indirect_unreadable;
+        const indirect_truncated_before = self.indirect_truncated;
+        const indirect_invalid_before = self.indirect_invalid;
+        const indirect_depth_limited_before = self.indirect_depth_limited;
+        const indirect_budget_limited_before = self.indirect_budget_limited;
+        self.indirect_last_status = .not_attempted;
+        self.indirect_last_address = 0;
+        self.indirect_last_missing_address = null;
         if (span_dwords > ring_dwords) report.truncated = true;
         if (span_dwords > max_ring_dwords) {
             report.dwords = max_ring_dwords;
@@ -195,6 +272,17 @@ pub const Runtime = struct {
         report.events = self.executor.event_count - events_before;
         report.swaps = self.executor.swap_count - swaps_before;
         report.unknown_opcodes = self.executor.unknown_opcode_count;
+        report.indirect_buffers = self.indirect_buffers - indirect_buffers_before;
+        report.indirect_dwords_requested = self.indirect_dwords_requested - indirect_requested_before;
+        report.indirect_dwords_read = self.indirect_dwords_read - indirect_read_before;
+        report.indirect_unreadable = self.indirect_unreadable - indirect_unreadable_before;
+        report.indirect_truncated = self.indirect_truncated - indirect_truncated_before;
+        report.indirect_invalid = self.indirect_invalid - indirect_invalid_before;
+        report.indirect_depth_limited = self.indirect_depth_limited - indirect_depth_limited_before;
+        report.indirect_budget_limited = self.indirect_budget_limited - indirect_budget_limited_before;
+        report.indirect_last_status = self.indirect_last_status;
+        report.indirect_last_address = self.indirect_last_address;
+        report.indirect_last_missing_address = self.indirect_last_missing_address;
         self.draw_count = self.executor.draw_count;
         self.event_count = self.executor.event_count;
         self.swap_count = self.executor.swap_count;
@@ -272,6 +360,34 @@ pub const Runtime = struct {
 
     pub fn outputPath(self: *const Runtime) registers.OutputPathState {
         return self.executor.register_file.outputPath();
+    }
+
+    /// Return only register evidence that can identify a programmed Xenos
+    /// surface.  The default `RenderTargetState` is not evidence: target 0 is
+    /// structurally present even when the title never touched RB_COLOR_INFO or
+    /// RB_SURFACE_INFO.
+    pub fn renderTargetEvidence(self: *const Runtime) RenderTargetEvidence {
+        const color_info = self.executor.register_file.peek(registers.RB_COLOR_INFO);
+        const depth_info = self.executor.register_file.peek(registers.RB_DEPTH_INFO);
+        const surface_info = self.executor.register_file.peek(registers.RB_SURFACE_INFO);
+        const color_mask = self.executor.register_file.peek(registers.RB_COLOR_MASK);
+        const target = self.executor.register_file.renderTargets();
+        const state_observed = self.executor.register_file.write_count != 0 and
+            (color_info != 0 or depth_info != 0 or surface_info != 0 or color_mask != 0);
+        return .{
+            .state_observed = state_observed,
+            .plausible = state_observed and target.surface_pitch_pixels != 0,
+            .color_base_tiles = target.color_base_tiles,
+            .color_format = target.color_format,
+            .depth_base_tiles = target.depth_base_tiles,
+            .depth_format = target.depth_format,
+            .surface_pitch_pixels = target.surface_pitch_pixels,
+            .msaa_mode = target.msaa_mode,
+            .color_mask = target.color_mask,
+            .raw_color_info = color_info,
+            .raw_depth_info = depth_info,
+            .raw_surface_info = surface_info,
+        };
     }
 
     /// Drain completion events through a caller-owned boundary.  The runtime
@@ -385,7 +501,7 @@ pub const Runtime = struct {
     /// EDRAM backing.  A caller may still pass an explicit Store to
     /// `resolveColor` when replaying a capture; this method is the live-path
     /// convenience used by the Mach-O presenter/readback boundary.
-    pub fn resolveCurrentColor(self: *const Runtime, width: u32, height: u32, destination: []u8, pitch: u32) edram.Error!void {
+    pub fn resolveCurrentColor(self: *Runtime, width: u32, height: u32, destination: []u8, pitch: u32) edram.Error!void {
         const store = self.edram_store orelse return error.BufferTooSmall;
         const targets = self.executor.register_file.renderTargets();
         const format: edram.Format = if (targets.color_format == 5 or targets.color_format == 7 or targets.color_format == 15)
@@ -404,12 +520,14 @@ pub const Runtime = struct {
             },
             .format = format,
         };
-        return store.resolveColor(surface, destination, pitch);
+        try store.resolveColor(surface, destination, pitch);
+        self.color_resolve_observations +|= 1;
     }
 
     fn onDraw(context: *anyopaque, draw: executor_module.Draw) void {
         const self: *Runtime = @ptrCast(@alignCast(context));
         self.last_draw = draw;
+        self.draw_completion_signals +|= 1;
         self.interrupts.publish(.draw_complete, registers.VGT_DRAW_INITIATOR, draw.count);
     }
 
@@ -444,19 +562,91 @@ pub const Runtime = struct {
 
     fn onIndirectBuffer(context: *anyopaque, address: u32, size_dwords: u32) void {
         const self: *Runtime = @ptrCast(@alignCast(context));
-        if (size_dwords == 0 or size_dwords > max_ring_dwords or self.indirect_depth >= 8) return;
-        const read_callback = self.executor.memory_read_callback orelse return;
-        const read_context = self.executor.memory_read_context orelse return;
-        var words: [max_ring_dwords]u32 = undefined;
-        for (0..@as(usize, @intCast(size_dwords))) |index| {
-            const byte_address = address +% @as(u32, @intCast(index * 4));
-            words[index] = read_callback(read_context, byte_address) orelse return;
+        self.indirect_buffers +|= 1;
+        self.indirect_dwords_requested +|= size_dwords;
+        self.indirect_last_address = address;
+        self.indirect_last_missing_address = null;
+        if (size_dwords == 0) {
+            self.indirect_invalid +|= 1;
+            self.indirect_last_status = .invalid;
+            return;
         }
+        if (size_dwords > max_ring_dwords) {
+            self.indirect_budget_limited +|= 1;
+            self.indirect_last_status = .budget_limit;
+            return;
+        }
+        if (self.indirect_depth >= 8) {
+            self.indirect_depth_limited +|= 1;
+            self.indirect_last_status = .depth_limit;
+            return;
+        }
+        const read_callback = self.executor.memory_read_callback orelse {
+            self.indirect_unreadable +|= 1;
+            self.indirect_last_status = .unreadable;
+            self.indirect_last_missing_address = address;
+            return;
+        };
+        const read_context = self.executor.memory_read_context orelse {
+            self.indirect_unreadable +|= 1;
+            self.indirect_last_status = .unreadable;
+            self.indirect_last_missing_address = address;
+            return;
+        };
+        var words: [max_ring_dwords]u32 = undefined;
+        var words_read: u32 = 0;
+        for (0..@as(usize, @intCast(size_dwords))) |index| {
+            const offset = std.math.mul(u32, @intCast(index), 4) catch {
+                self.indirect_truncated +|= 1;
+                self.indirect_last_status = .truncated;
+                self.indirect_last_missing_address = std.math.maxInt(u32);
+                return;
+            };
+            const byte_address = std.math.add(u32, address, offset) catch {
+                self.indirect_truncated +|= 1;
+                self.indirect_last_status = .truncated;
+                self.indirect_last_missing_address = std.math.maxInt(u32);
+                return;
+            };
+            words[index] = read_callback(read_context, byte_address) orelse {
+                if (words_read == 0) {
+                    self.indirect_unreadable +|= 1;
+                    self.indirect_last_status = .unreadable;
+                } else {
+                    self.indirect_truncated +|= 1;
+                    self.indirect_last_status = .truncated;
+                }
+                self.indirect_last_missing_address = byte_address;
+                return;
+            };
+            words_read += 1;
+            self.indirect_dwords_read +|= 1;
+        }
+        self.indirect_last_status = .complete;
         self.indirect_depth += 1;
         defer self.indirect_depth -= 1;
         self.executor.execute(words[0..@as(usize, @intCast(size_dwords))]) catch {
             self.packet_errors +|= 1;
         };
+    }
+};
+
+const IndirectMemoryFixture = struct {
+    words: [128]u32 = [_]u32{0} ** 128,
+    readable_until: u32 = std.math.maxInt(u32),
+
+    fn read(context: *anyopaque, address: u32) ?u32 {
+        const self: *IndirectMemoryFixture = @ptrCast(@alignCast(context));
+        if ((address & 3) != 0 or address >= self.readable_until or address / 4 >= self.words.len) return null;
+        return self.words[address / 4];
+    }
+
+    fn write(context: *anyopaque, address: u32, value: u32, endian: u2) bool {
+        _ = endian;
+        const self: *IndirectMemoryFixture = @ptrCast(@alignCast(context));
+        if ((address & 3) != 0 or address / 4 >= self.words.len) return false;
+        self.words[address / 4] = value;
+        return true;
     }
 };
 
@@ -469,6 +659,7 @@ test "Xenos runtime consumes big-endian ring words and derives pipeline state" {
     const report = try runtime.executeRingBytes(&bytes, 0, 2, 16);
     try std.testing.expectEqual(@as(u64, 1), report.draws);
     try std.testing.expectEqual(@as(u32, 3), runtime.last_draw.?.count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.draw_completion_signals);
     try std.testing.expectEqual(pipeline.Topology.triangle_list, runtime.pipelineState().topology);
 }
 
@@ -479,6 +670,52 @@ test "Xenos runtime reports a bounded truncated ring" {
     var runtime = Runtime.init();
     try std.testing.expectError(error.TruncatedRing, runtime.executeRingBytes(&bytes, 0, 2, 2));
     try std.testing.expectEqual(@as(u64, 1), runtime.truncated_rings);
+}
+
+test "Xenos runtime reports the indirect read boundary and executes a readable buffer" {
+    var bytes = [_]u8{0} ** 64;
+    const packet = pm4.packetType3(.indirect_buffer, 2, false).?;
+    std.mem.writeInt(u32, bytes[0..4], packet, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x100, .big);
+    std.mem.writeInt(u32, bytes[8..12], 2, .big);
+
+    var memory = IndirectMemoryFixture{};
+    memory.words[0x100 / 4] = pm4.packetType3(.draw_indx_2, 1, false).?;
+    memory.words[0x104 / 4] = (registers.DrawInitiator{
+        .primitive = .triangle_list,
+        .source = .auto_index,
+        .major_mode_explicit = false,
+        .index_format = .uint16,
+        .not_end_of_pipe = false,
+        .index_count = 3,
+    }).encode();
+
+    var runtime = Runtime.init();
+    runtime.attachMemory(&memory, IndirectMemoryFixture.read, &memory, null);
+    const report = try runtime.executeRingBytes(&bytes, 0, 3, 16);
+    try std.testing.expectEqual(@as(u64, 1), report.indirect_buffers);
+    try std.testing.expectEqual(@as(u64, 2), report.indirect_dwords_requested);
+    try std.testing.expectEqual(@as(u64, 2), report.indirect_dwords_read);
+    try std.testing.expectEqual(IndirectStatus.complete, report.indirect_last_status);
+    try std.testing.expectEqual(@as(u64, 1), report.draws);
+}
+
+test "Xenos runtime distinguishes an unreadable indirect buffer from a zero-filled one" {
+    var bytes = [_]u8{0} ** 64;
+    const packet = pm4.packetType3(.indirect_buffer, 2, false).?;
+    std.mem.writeInt(u32, bytes[0..4], packet, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x200, .big);
+    std.mem.writeInt(u32, bytes[8..12], 1, .big);
+
+    var memory = IndirectMemoryFixture{ .readable_until = 0x200 };
+    var runtime = Runtime.init();
+    runtime.attachMemory(&memory, IndirectMemoryFixture.read, &memory, null);
+    const report = try runtime.executeRingBytes(&bytes, 0, 3, 16);
+    try std.testing.expectEqual(IndirectStatus.unreadable, report.indirect_last_status);
+    try std.testing.expectEqual(@as(u64, 1), report.indirect_unreadable);
+    try std.testing.expectEqual(@as(u64, 0), report.indirect_dwords_read);
+    try std.testing.expectEqual(@as(?u32, 0x200), report.indirect_last_missing_address);
+    try std.testing.expectEqual(@as(u64, 0), report.draws);
 }
 
 test "Xenos runtime exposes native Vulkan fence completion as a guest event" {
@@ -497,6 +734,18 @@ test "Xenos runtime preserves programmed MRT color targets" {
     try std.testing.expectEqual(@as(u8, 2), state.color_target_count);
     try std.testing.expect(state.color_targets[0].format != 0);
     try std.testing.expect(state.color_targets[1].format != 0);
+}
+
+test "Xenos runtime distinguishes default target structure from programmed target evidence" {
+    var runtime = Runtime.init();
+    try std.testing.expect(!runtime.renderTargetEvidence().state_observed);
+    runtime.executor.register_file.write(registers.RB_SURFACE_INFO, 1280);
+    runtime.executor.register_file.write(registers.RB_COLOR_INFO, 0x101 | (6 << 16));
+    const evidence = runtime.renderTargetEvidence();
+    try std.testing.expect(evidence.state_observed);
+    try std.testing.expect(evidence.plausible);
+    try std.testing.expectEqual(@as(u32, 1280), evidence.surface_pitch_pixels);
+    try std.testing.expectEqual(@as(u32, 6), evidence.color_format);
 }
 
 test "Xenos runtime exposes typed resource and pipeline state" {
@@ -547,4 +796,77 @@ test "Xenos runtime caches a shader loaded by IM_LOAD_IMMEDIATE" {
     try std.testing.expect(runtime.last_shader_source_hash != 0);
     try std.testing.expectEqual(shader.ShaderType.vertex, runtime.last_shader_type);
     try std.testing.expectEqual(@as(u64, 1), runtime.shader_cache.misses);
+}
+
+test "a read-only replay programs registers and signals draws without writing guest memory" {
+    // The retained-batch path replays a batch the emulator's command processor
+    // has already drained, so its MEM_WRITE packets have already landed in
+    // guest memory.  Re-applying them would make Rosette overwrite fence and
+    // progress values the guest has since advanced.  Attaching a null write
+    // callback is what prevents that, and this proves the price is only the
+    // writes: register state, draw completion and target evidence all survive.
+    var bytes = [_]u8{0} ** 128;
+    var offset: usize = 0;
+
+    // Program the colour target through a type-0 register write.
+    const reg_header = pm4.packetType0(registers.RB_COLOR_INFO, 1, false).?;
+    std.mem.writeInt(u32, bytes[offset..][0..4], reg_header, .big);
+    std.mem.writeInt(u32, bytes[offset + 4 ..][0..4], 0x101 | (6 << 16), .big);
+    offset += 8;
+
+    // A memory write the drained batch already performed.
+    const mem_header = pm4.packetType3(.mem_write, 2, false).?;
+    std.mem.writeInt(u32, bytes[offset..][0..4], mem_header, .big);
+    std.mem.writeInt(u32, bytes[offset + 4 ..][0..4], 0x100, .big);
+    std.mem.writeInt(u32, bytes[offset + 8 ..][0..4], 0xDEAD_BEEF, .big);
+    offset += 12;
+
+    // A draw, so completion evidence exists.
+    const draw_header = pm4.packetType3(.draw_indx_2, 1, false).?;
+    std.mem.writeInt(u32, bytes[offset..][0..4], draw_header, .big);
+    std.mem.writeInt(u32, bytes[offset + 4 ..][0..4], (registers.DrawInitiator{
+        .primitive = .triangle_list,
+        .source = .auto_index,
+        .major_mode_explicit = false,
+        .index_format = .uint16,
+        .not_end_of_pipe = false,
+        .index_count = 3,
+    }).encode(), .big);
+    offset += 8;
+
+    var memory = IndirectMemoryFixture{};
+    var runtime = Runtime.init();
+    runtime.attachMemory(&memory, IndirectMemoryFixture.read, &memory, null);
+    const report = try runtime.executeRingBytes(&bytes, 0, @intCast(offset / 4), 32);
+
+    try std.testing.expectEqual(@as(u64, 1), report.draws);
+    try std.testing.expectEqual(@as(u64, 1), runtime.draw_completion_signals);
+
+    // The register file carries the programmed target, which is the whole
+    // reason the retained batch is replayed at all.
+    const evidence = runtime.renderTargetEvidence();
+    try std.testing.expect(evidence.state_observed);
+    try std.testing.expect(evidence.raw_color_info != 0);
+
+    // The guest write was counted, not applied.
+    try std.testing.expectEqual(@as(u64, 1), runtime.executor.deferred_memory_count);
+}
+
+test "the same batch with a write callback attached does apply its guest writes" {
+    // The counterpart to the read-only replay: the outstanding-span path
+    // executes a batch whose writes have *not* happened yet, and there the
+    // callback must fire.  Keeping both tests side by side makes the choice a
+    // decision rather than an oversight.
+    var bytes = [_]u8{0} ** 64;
+    const mem_header = pm4.packetType3(.mem_write, 2, false).?;
+    std.mem.writeInt(u32, bytes[0..4], mem_header, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x100, .big);
+    std.mem.writeInt(u32, bytes[8..12], 0xDEAD_BEEF, .big);
+
+    var memory = IndirectMemoryFixture{};
+    var runtime = Runtime.init();
+    runtime.attachMemory(&memory, IndirectMemoryFixture.read, &memory, IndirectMemoryFixture.write);
+    _ = try runtime.executeRingBytes(&bytes, 0, 3, 16);
+    try std.testing.expectEqual(@as(u64, 0), runtime.executor.deferred_memory_count);
+    try std.testing.expectEqual(@as(u32, 0xDEAD_BEEF), memory.words[0x100 / 4]);
 }

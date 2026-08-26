@@ -67,6 +67,9 @@ pub const Digest = struct {
     real_packets: u32 = 0,
     draws: u32 = 0,
     swaps: u32 = 0,
+    /// Every retained non-zero run was framed from its first dword through its
+    /// end. This is stream evidence, not XE_SWAP evidence.
+    stream_validated: bool = false,
 
     pub fn empty(self: Digest) bool {
         return self.nonzero_dwords == 0;
@@ -125,9 +128,11 @@ pub fn digest(bytes: []const u8, ring_dwords: u32, limit_dwords: u32) Digest {
 
     // Packets counted only inside written runs, which is what excludes the
     // thousands a zero-filled ring manufactures.
+    var all_runs_clean = result.run_count != 0 and result.runs_dropped == 0;
     var run_index: u32 = 0;
     while (run_index < result.run_count) : (run_index += 1) {
         const run = result.runs[run_index];
+        if (!run.frames_cleanly) all_runs_clean = false;
         var at: u32 = 0;
         while (at < run.length) {
             const header = pm4.decodeHeader(readDwordBig(bytes, run.start + at));
@@ -139,10 +144,15 @@ pub fn digest(bytes: []const u8, ring_dwords: u32, limit_dwords: u32) Digest {
                     if (header.opcode == .xe_swap) result.swaps += 1;
                 }
             }
-            if (total == 0 or at + total > run.length) break;
+            if (total == 0 or at + total > run.length) {
+                all_runs_clean = false;
+                break;
+            }
             at += total;
         }
+        if (at != run.length) all_runs_clean = false;
     }
+    result.stream_validated = all_runs_clean and result.real_packets != 0;
     return result;
 }
 
@@ -210,7 +220,7 @@ test "unframed payload is a framing defect rather than an absent producer" {
 
 test "a batch of state without draws is distinguished from one with them" {
     const state = ringImage(256, 0, &.{
-        pm4.packetType3(.set_constant, 2, false).?, 0x1, 0x2,
+        pm4.packetType3(.set_constant, 2, false).?,     0x1, 0x2,
         pm4.packetType3(.invalidate_state, 1, false).?, 0x3,
     });
     const state_digest = digest(&state, 256, 256);
