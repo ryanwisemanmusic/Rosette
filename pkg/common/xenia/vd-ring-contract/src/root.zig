@@ -215,6 +215,275 @@ pub fn prerequisitesMet(reached: u8, step: BringupStep) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Causal graphics path
+// ---------------------------------------------------------------------------
+
+/// The finer-grained path after video bring-up.  The old `BringupStep` ladder
+/// answers whether the title reached the ring; this path answers what the
+/// ring and its consumers did with the work afterwards.
+///
+/// These are evidence stages, not actions.  In particular, no function in
+/// this package can register a callback, publish a write pointer, inject a
+/// packet, or present a frame.  A runtime may advance a stage only when it has
+/// observed the corresponding owner perform the operation, or when a later
+/// authentic stage logically proves an earlier one.
+pub const CausalStage = enum(u8) {
+    ring_payload_prepared,
+    ring_write_pointer_published,
+    pm4_packet_consumed,
+    /// Optional because a title may begin with a control or draw packet whose
+    /// state was programmed before the retained observation window.
+    pm4_state_programmed,
+    first_draw_submitted,
+    first_draw_consumed,
+    frontbuffer_selected,
+    guest_vdswap_entered,
+    swap_packet_encoded,
+    guest_vdswap_completed,
+    swap_published,
+    authentic_swap_consumed,
+    issue_swap,
+    output_refresh,
+    native_presented,
+
+    pub fn label(self: CausalStage) []const u8 {
+        return switch (self) {
+            .ring_payload_prepared => "ring payload prepared",
+            .ring_write_pointer_published => "guest write pointer published",
+            .pm4_packet_consumed => "PM4 packet consumed",
+            .pm4_state_programmed => "PM4 state programmed",
+            .first_draw_submitted => "first draw submitted",
+            .first_draw_consumed => "first draw consumed",
+            .frontbuffer_selected => "front buffer selected",
+            .guest_vdswap_entered => "guest VdSwap entered",
+            .swap_packet_encoded => "swap packet encoded",
+            .guest_vdswap_completed => "guest VdSwap completed",
+            .swap_published => "swap packet published",
+            .authentic_swap_consumed => "authentic XE_SWAP consumed",
+            .issue_swap => "IssueSwap entered",
+            .output_refresh => "guest output refreshed",
+            .native_presented => "authentic native presentation",
+        };
+    }
+
+    pub fn owner(self: CausalStage) []const u8 {
+        return switch (self) {
+            .ring_payload_prepared,
+            .ring_write_pointer_published,
+            .first_draw_submitted,
+            .guest_vdswap_entered,
+            .swap_packet_encoded,
+            .guest_vdswap_completed,
+            .swap_published,
+            => "guest:title",
+            .pm4_packet_consumed,
+            .pm4_state_programmed,
+            .first_draw_consumed,
+            .frontbuffer_selected,
+            .authentic_swap_consumed,
+            .issue_swap,
+            => "xenia:command_processor",
+            .output_refresh => "xenia:presenter",
+            .native_presented => "rosette:presenter",
+        };
+    }
+
+    pub fn required(self: CausalStage) bool {
+        return self != .pm4_state_programmed;
+    }
+
+    /// The immediate causal predecessor.  This is intentionally a chain of
+    /// *evidence* rather than a claim that every title executes the same
+    /// source-level call sequence.  `pm4_state_programmed` is optional and is
+    /// therefore not a hard predecessor of the first draw.
+    pub fn predecessor(self: CausalStage) ?CausalStage {
+        return switch (self) {
+            .ring_payload_prepared => null,
+            .ring_write_pointer_published => .ring_payload_prepared,
+            .pm4_packet_consumed => .ring_write_pointer_published,
+            .pm4_state_programmed => .pm4_packet_consumed,
+            // Submission is a producer event.  It precedes command-processor
+            // consumption, so making it depend on `pm4_packet_consumed` would
+            // erase the exact producer/consumer boundary this contract is
+            // meant to expose.
+            .first_draw_submitted => .ring_write_pointer_published,
+            .first_draw_consumed => .first_draw_submitted,
+            // Front-buffer selection is an independent fact: it may be
+            // observed from VdSwap's arguments, from the encoded fetch
+            // constant, or from command-processor decode.  Likewise, a title
+            // is allowed to enter VdSwap before a retained PM4 scan has found
+            // its earlier draw.  Keep both facts independent so an observation
+            // window cannot manufacture an ordering violation.
+            .frontbuffer_selected => null,
+            .guest_vdswap_entered => null,
+            .swap_packet_encoded => .guest_vdswap_entered,
+            .guest_vdswap_completed => .swap_packet_encoded,
+            .swap_published => .guest_vdswap_completed,
+            .authentic_swap_consumed => .swap_published,
+            .issue_swap => .authentic_swap_consumed,
+            .output_refresh => .issue_swap,
+            .native_presented => .output_refresh,
+        };
+    }
+
+    pub fn guidance(self: CausalStage) []const u8 {
+        return switch (self) {
+            .ring_payload_prepared => "the ring is configured but no guest command payload has been observed",
+            .ring_write_pointer_published => "payload exists but the guest has not published a changed write pointer",
+            .pm4_packet_consumed => "the guest published work but the command processor has not consumed it",
+            .pm4_state_programmed => "PM4 arrived without a retained state-programming packet; treat this as an observation gap, not a handoff failure",
+            .first_draw_submitted => "PM4 state/control work was observed, but the title has not submitted a draw packet",
+            .first_draw_consumed => "the title submitted a draw packet, but command-processor consumption is unproven",
+            .frontbuffer_selected => "a draw was consumed, but no valid front-buffer selection has been observed",
+            .guest_vdswap_entered => "the title has not entered VdSwap; presentation consumers are downstream of this guest-owned gap",
+            .swap_packet_encoded => "VdSwap entry was observed, but its PM4_XE_SWAP encoding is unproven",
+            .guest_vdswap_completed => "the swap packet was encoded, but VdSwap completion is unproven",
+            .swap_published => "VdSwap completed, but the title has not published the caller-owned swap packet",
+            .authentic_swap_consumed => "the title published a swap packet, but authentic command-processor consumption is unproven",
+            .issue_swap => "authentic XE_SWAP was consumed, but CommandProcessor::IssueSwap is unproven",
+            .output_refresh => "IssueSwap was observed, but guest-output refresh is unproven",
+            .native_presented => "guest output refreshed, but authentic native presentation is unproven",
+        };
+    }
+};
+
+pub const causal_stage_count: usize = @typeInfo(CausalStage).@"enum".fields.len;
+pub const causal_required_stage_count = countCausalRequiredStages();
+
+fn countCausalRequiredStages() usize {
+    var count: usize = 0;
+    inline for (@typeInfo(CausalStage).@"enum".fields) |field| {
+        if (@as(CausalStage, @enumFromInt(field.value)).required()) count += 1;
+    }
+    return count;
+}
+
+pub const causal_order = [_]CausalStage{
+    .ring_payload_prepared,
+    .ring_write_pointer_published,
+    .pm4_packet_consumed,
+    .pm4_state_programmed,
+    .first_draw_submitted,
+    .first_draw_consumed,
+    .guest_vdswap_entered,
+    .swap_packet_encoded,
+    .guest_vdswap_completed,
+    .frontbuffer_selected,
+    .swap_published,
+    .authentic_swap_consumed,
+    .issue_swap,
+    .output_refresh,
+    .native_presented,
+};
+
+pub fn causalStageBit(stage: CausalStage) u16 {
+    return @as(u16, 1) << @as(u4, @intCast(@intFromEnum(stage)));
+}
+
+pub fn causalPrerequisitesMet(observed: u16, stage: CausalStage) bool {
+    var predecessor = stage.predecessor();
+    while (predecessor) |required| {
+        if (required.required() and observed & causalStageBit(required) == 0) return false;
+        predecessor = required.predecessor();
+    }
+    return true;
+}
+
+/// The first missing required evidence stage.  Optional PM4 state evidence is
+/// deliberately skipped so a title cannot be misclassified merely because a
+/// bounded packet capture began after its state setup.
+pub fn firstCausalGap(observed: u16) ?CausalStage {
+    for (causal_order) |stage| {
+        if (stage.required() and observed & causalStageBit(stage) == 0) return stage;
+    }
+    return null;
+}
+
+/// A handoff is a permission boundary, not an instruction to perform it.  A
+/// caller may use this predicate to decide whether it is allowed to forward
+/// already-observed data; a false result must leave the guest untouched.
+pub const HandoffBoundary = enum(u2) {
+    title_to_command_processor,
+    command_processor_to_presenter,
+    presenter_to_native,
+
+    pub fn label(self: HandoffBoundary) []const u8 {
+        return switch (self) {
+            .title_to_command_processor => "title -> command processor",
+            .command_processor_to_presenter => "command processor -> presenter",
+            .presenter_to_native => "presenter -> native window",
+        };
+    }
+
+    pub fn prerequisite(self: HandoffBoundary) CausalStage {
+        return switch (self) {
+            .title_to_command_processor => .swap_published,
+            .command_processor_to_presenter => .issue_swap,
+            .presenter_to_native => .output_refresh,
+        };
+    }
+
+    pub fn owner(self: HandoffBoundary) []const u8 {
+        return switch (self) {
+            .title_to_command_processor => "guest:title",
+            .command_processor_to_presenter => "xenia:command_processor",
+            .presenter_to_native => "rosette:presenter",
+        };
+    }
+};
+
+pub fn handoffReady(observed: u16, boundary: HandoffBoundary) bool {
+    const prerequisite = boundary.prerequisite();
+    return observed & causalStageBit(prerequisite) != 0 and
+        causalPrerequisitesMet(observed, prerequisite);
+}
+
+test "the causal path keeps the first draw separate from VdSwap" {
+    var observed: u16 = 0;
+    observed |= causalStageBit(.ring_payload_prepared);
+    observed |= causalStageBit(.ring_write_pointer_published);
+    observed |= causalStageBit(.pm4_packet_consumed);
+    observed |= causalStageBit(.pm4_state_programmed);
+
+    try std.testing.expectEqual(CausalStage.first_draw_submitted, firstCausalGap(observed).?);
+    try std.testing.expect(!handoffReady(observed, .title_to_command_processor));
+    try std.testing.expect(std.mem.indexOf(u8, CausalStage.first_draw_submitted.guidance(), "draw packet") != null);
+}
+
+test "authentic downstream evidence closes only its proven prefix" {
+    var observed: u16 = 0;
+    observed |= causalStageBit(.ring_payload_prepared);
+    observed |= causalStageBit(.ring_write_pointer_published);
+    observed |= causalStageBit(.pm4_packet_consumed);
+    observed |= causalStageBit(.first_draw_submitted);
+    observed |= causalStageBit(.first_draw_consumed);
+    observed |= causalStageBit(.frontbuffer_selected);
+    observed |= causalStageBit(.guest_vdswap_entered);
+    observed |= causalStageBit(.swap_packet_encoded);
+    observed |= causalStageBit(.guest_vdswap_completed);
+    observed |= causalStageBit(.swap_published);
+
+    try std.testing.expect(handoffReady(observed, .title_to_command_processor));
+    try std.testing.expectEqual(CausalStage.authentic_swap_consumed, firstCausalGap(observed).?);
+    try std.testing.expect(!handoffReady(observed, .command_processor_to_presenter));
+}
+
+test "handoff readiness never fabricates a later stage" {
+    var observed: u16 = 0;
+    inline for (causal_order) |stage| observed |= causalStageBit(stage);
+    try std.testing.expectEqual(causal_required_stage_count, causal_stage_count - 1);
+    try std.testing.expect(handoffReady(observed, .title_to_command_processor));
+    try std.testing.expect(handoffReady(observed, .command_processor_to_presenter));
+    try std.testing.expect(handoffReady(observed, .presenter_to_native));
+
+    const missing_native = observed & ~causalStageBit(.native_presented);
+    // The boundary is ready to *attempt* native presentation once refresh is
+    // proven; the missing native stage remains the first causal gap.
+    try std.testing.expect(handoffReady(missing_native, .presenter_to_native));
+    try std.testing.expectEqual(CausalStage.native_presented, firstCausalGap(missing_native).?);
+}
+
+// ---------------------------------------------------------------------------
 // Graphics interrupt
 // ---------------------------------------------------------------------------
 
@@ -248,6 +517,13 @@ pub fn contractIsWellFormed() bool {
     if (readPointerUpdateFrequency(2) != 1) return false;
     if (bringup_order.len != 7) return false;
     if (takesEdramInitializationPath(reported_asic_id)) return false;
+    if (causal_order.len != causal_stage_count) return false;
+    if (causal_required_stage_count + 1 != causal_stage_count) return false;
+    if (firstCausalGap(0) != .ring_payload_prepared) return false;
+    inline for (@typeInfo(HandoffBoundary).@"enum".fields) |field| {
+        const boundary: HandoffBoundary = @enumFromInt(field.value);
+        if (!boundary.prerequisite().required()) return false;
+    }
     return true;
 }
 
