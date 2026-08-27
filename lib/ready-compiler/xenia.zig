@@ -22,6 +22,7 @@ const startup_evidence_runtime = @import("startup_evidence_runtime");
 const translation_progress = @import("xenia_translation_progress");
 const wait_runtime = @import("wait_runtime");
 const jit_label_ledger = @import("jit_label_ledger");
+const rosette_root = @import("rosette_root");
 
 /// The package owns the stage vocabulary; this alias keeps the existing
 /// Ready Compiler API stable for runtime observers and Mach-O adapters.
@@ -59,6 +60,18 @@ fn makeRuntimeSpecs() [xenia_ready_plan.specs.len]types.StageSpec {
 const specs = makeRuntimeSpecs();
 
 comptime {
+    if (rosette_root.gpu_profile.max_ring_dwords == 0 or
+        rosette_root.gpu_profile.max_indirect_depth == 0 or
+        rosette_root.gpu_profile.max_indirect_dwords == 0 or
+        rosette_root.gpu_profile.max_indirect_references == 0 or
+        rosette_root.gpu_profile.max_indirect_execution_dwords == 0 or
+        rosette_root.gpu_profile.packet_timeline_capacity == 0 or
+        rosette_root.gpu_profile.xe_swap_opcode != 0x64 or
+        rosette_root.gpu_profile.xe_swap_signature != 0x5357_4150 or
+        rosette_root.gpu_profile.pm4_dword_bytes != 4)
+    {
+        @compileError("Rosette root GPU profile drifted from the Ready Compiler handoff facts");
+    }
     if (!graphics_contract.contractIsWellFormed()) {
         @compileError("xenia graphics handoff package is internally inconsistent");
     }
