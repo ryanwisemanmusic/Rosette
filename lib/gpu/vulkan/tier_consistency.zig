@@ -257,6 +257,23 @@ pub const Ledger = struct {
     pub fn verdict(self: *const Ledger) []const u8 {
         return self.finding().meaning();
     }
+
+    /// True when every facet is served real and none of them has ever been
+    /// answered the other way.
+    ///
+    /// This is the condition under which the per-facet list carries nothing the
+    /// header does not: there is no seam to locate, so nineteen lines saying
+    /// `real` are the success case printing itself out. A facet that flipped
+    /// tiers at any point is excluded even though its current tier is real —
+    /// that is the caller-dependent case, and it is precisely what the list
+    /// exists to show.
+    pub fn whollyReal(self: *const Ledger) bool {
+        for (self.tiers, 0..) |value, index| {
+            if (value != .real) return false;
+            if (self.modelled_serves[index] != 0) return false;
+        }
+        return true;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -363,4 +380,26 @@ test "every facet, tier and pair explains itself" {
         try std.testing.expect(pair.consequence.len > 60);
         try std.testing.expect(pair.left != pair.right);
     }
+}
+
+test "a wholly real stack has no seam to print" {
+    var ledger = Ledger{};
+    try std.testing.expect(!ledger.whollyReal());
+    inline for (@typeInfo(Facet).@"enum".fields) |field| {
+        ledger.note(@enumFromInt(field.value), .real);
+    }
+    try std.testing.expect(ledger.whollyReal());
+    try std.testing.expectEqual(@as(u32, facet_count), ledger.realCount());
+}
+
+test "a facet that flipped tiers is never collapsed away" {
+    var ledger = Ledger{};
+    inline for (@typeInfo(Facet).@"enum".fields) |field| {
+        ledger.note(@enumFromInt(field.value), .real);
+    }
+    ledger.note(.queue, .modelled);
+    ledger.note(.queue, .real);
+    try std.testing.expectEqual(Tier.real, ledger.tier(.queue));
+    try std.testing.expect(ledger.servedBothWays(.queue));
+    try std.testing.expect(!ledger.whollyReal());
 }

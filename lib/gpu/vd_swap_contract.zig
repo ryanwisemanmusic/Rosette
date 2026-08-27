@@ -718,7 +718,7 @@ pub const Ledger = struct {
     }
 };
 
-fn sourceBit(source: Source) u32 {
+pub fn sourceBit(source: Source) u32 {
     return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(source)));
 }
 

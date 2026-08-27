@@ -65,6 +65,33 @@ pub const Fit = enum(u8) {
     center,
 };
 
+/// Where a frame's pixels come from.
+///
+/// The distinction is not cosmetic. A guest-memory frame can be validated
+/// against a byte range, so it must be; a host-generated frame has no source
+/// buffer at all, and requiring one of it was the reason Rosette's own
+/// presentations never entered custody. Both take custody; only one of them can
+/// ever carry guest pixels.
+pub const Payload = enum(u8) {
+    /// Pixels read out of guest-visible memory at `source_address`.
+    guest_memory,
+    /// Pixels the host drew on the window's own drawable. `source_address` is
+    /// the sink identity that produced them — the layer, the swapchain — and
+    /// there is no byte range to check.
+    host_generated,
+
+    pub fn label(self: Payload) []const u8 {
+        return switch (self) {
+            .guest_memory => "guest-memory",
+            .host_generated => "host-generated",
+        };
+    }
+
+    pub fn mayCarryGuestPixels(self: Payload) bool {
+        return self == .guest_memory;
+    }
+};
+
 pub const Identity = struct {
     run: u64 = 0,
     source: u64 = 0,
@@ -83,6 +110,7 @@ pub const Identity = struct {
 
 pub const Descriptor = struct {
     identity: Identity = .{},
+    payload: Payload = .guest_memory,
     source_address: u64 = 0,
     source_length: u64 = 0,
     width: u32 = 0,
@@ -110,9 +138,23 @@ pub const Descriptor = struct {
     }
 
     pub fn valid(self: Descriptor) bool {
-        if (!self.identity.valid() or self.source_address == 0 or self.source_length == 0) return false;
-        const required = self.requiredBytes() orelse return false;
-        if (self.source_length < required) return false;
+        if (!self.identity.valid() or self.source_address == 0) return false;
+        if (self.guest_pixels and !self.payload.mayCarryGuestPixels()) return false;
+        switch (self.payload) {
+            .guest_memory => {
+                if (self.source_length == 0) return false;
+                const required = self.requiredBytes() orelse return false;
+                if (self.source_length < required) return false;
+            },
+            .host_generated => {
+                // Nothing is claimed about a buffer, so nothing about one may
+                // be asserted here either.
+                if (self.source_length != 0) return false;
+                if (self.content_digest != 0) return false;
+                if (self.guest_requested_present) return false;
+                if (self.width == 0 or self.height == 0 or self.format == .unknown) return false;
+            },
+        }
         if (self.guest_pixels and self.content_digest == 0) return false;
         if (self.guest_pixels and self.producer != .guest_title and
             self.producer != .xenia_host and self.producer != .xenia_vulkan)
@@ -123,6 +165,7 @@ pub const Descriptor = struct {
 
     pub fn samePayload(self: Descriptor, other: Descriptor) bool {
         return self.identity.eql(other.identity) and
+            self.payload == other.payload and
             self.source_address == other.source_address and
             self.source_length == other.source_length and
             self.width == other.width and self.height == other.height and
@@ -414,13 +457,15 @@ pub const Ledger = struct {
 };
 
 pub fn validate(descriptor: Descriptor) Rejection {
-    if (!descriptor.identity.valid() or descriptor.source_address == 0 or descriptor.source_length == 0)
-        return .malformed_identity;
+    if (!descriptor.identity.valid() or descriptor.source_address == 0) return .malformed_identity;
+    if (descriptor.payload == .guest_memory and descriptor.source_length == 0) return .malformed_identity;
     if (descriptor.width == 0 or descriptor.height == 0 or descriptor.row_pitch != 0 and descriptor.row_pitch < @as(u64, descriptor.width) * 4)
         return .malformed_extent;
     if (descriptor.format == .unknown) return .unsupported_format;
-    const required = descriptor.requiredBytes() orelse return .malformed_extent;
-    if (descriptor.source_length < required) return .truncated_source;
+    if (descriptor.payload == .guest_memory) {
+        const required = descriptor.requiredBytes() orelse return .malformed_extent;
+        if (descriptor.source_length < required) return .truncated_source;
+    }
     if (descriptor.guest_pixels and descriptor.content_digest == 0) return .missing_content_digest;
     if (!descriptor.valid()) return .wrong_actor;
     return .none;
@@ -501,4 +546,75 @@ test "guest pixels require a content generation rather than only an address" {
     descriptor.content_digest = 0;
     try std.testing.expectEqual(OfferResult.rejected, ledger.offer(descriptor, 1));
     try std.testing.expectEqual(Rejection.missing_content_digest, ledger.records[0].rejection);
+}
+
+fn diagnosticDescriptor() Descriptor {
+    return .{
+        .identity = .{ .run = 1, .source = 0x4000, .generation = 1, .serial = 7 },
+        .payload = .host_generated,
+        .source_address = 0x4000,
+        .source_length = 0,
+        .width = 1280,
+        .height = 720,
+        .format = .bgra8_unorm,
+        .producer = .rosette_runtime,
+    };
+}
+
+test "a host clear takes custody without a source buffer" {
+    var ledger = Ledger{};
+    const descriptor = diagnosticDescriptor();
+    try std.testing.expectEqual(Rejection.none, validate(descriptor));
+    try std.testing.expectEqual(OfferResult.accepted, ledger.offer(descriptor, 10));
+    try std.testing.expect(ledger.validateFrame(descriptor.identity, .rosette_runtime, 11));
+    try std.testing.expect(ledger.acquire(descriptor.identity, .rosette_runtime, 12));
+    try std.testing.expect(ledger.submit(descriptor.identity, .rosette_runtime, 13));
+    const class = ledger.present(descriptor.identity, .rosette_runtime, true, 14);
+    try std.testing.expectEqual(FrameClass.diagnostic_host, class);
+    try std.testing.expect(!class.countsGuestPixels());
+    try std.testing.expect(!class.closesAuthenticSwap());
+    try std.testing.expectEqual(@as(u64, 1), ledger.summary().diagnostic);
+}
+
+test "a host-generated frame may not claim guest pixels" {
+    var descriptor = diagnosticDescriptor();
+    descriptor.guest_pixels = true;
+    descriptor.content_digest = 0xABCD;
+    descriptor.producer = .xenia_host;
+    try std.testing.expect(!descriptor.valid());
+    try std.testing.expectEqual(Rejection.wrong_actor, validate(descriptor));
+}
+
+test "a host-generated frame may not describe a source range" {
+    var descriptor = diagnosticDescriptor();
+    descriptor.source_length = 1280 * 720 * 4;
+    try std.testing.expect(!descriptor.valid());
+}
+
+test "a host-generated frame still needs an extent and a format" {
+    var descriptor = diagnosticDescriptor();
+    descriptor.format = .unknown;
+    try std.testing.expectEqual(Rejection.unsupported_format, validate(descriptor));
+    descriptor = diagnosticDescriptor();
+    descriptor.height = 0;
+    try std.testing.expectEqual(Rejection.malformed_extent, validate(descriptor));
+}
+
+test "guest-memory frames keep their byte-range check" {
+    var descriptor = guestDescriptor();
+    descriptor.source_length = 16;
+    try std.testing.expectEqual(Rejection.truncated_source, validate(descriptor));
+    descriptor = guestDescriptor();
+    descriptor.source_length = 0;
+    try std.testing.expectEqual(Rejection.malformed_identity, validate(descriptor));
+}
+
+test "one identity cannot describe a host clear and a guest buffer" {
+    var ledger = Ledger{};
+    const descriptor = diagnosticDescriptor();
+    try std.testing.expectEqual(OfferResult.accepted, ledger.offer(descriptor, 1));
+    var reinterpreted = descriptor;
+    reinterpreted.payload = .guest_memory;
+    reinterpreted.source_length = 1280 * 720 * 4;
+    try std.testing.expectEqual(OfferResult.conflict, ledger.offer(reinterpreted, 2));
 }

@@ -39,6 +39,13 @@ pub const NativeSnapshot = struct {
     layer_attached: bool = false,
     diagnostic_frames: u64 = 0,
     guest_frames: u64 = 0,
+    /// The drawable Rosette's own presentations land on. Custody needs an
+    /// extent and a format for every frame it holds, including the ones the
+    /// host drew, and inventing them at the custody boundary would make the
+    /// ledger describe a surface nobody looked at.
+    drawable_width: u32 = 0,
+    drawable_height: u32 = 0,
+    drawable_format: u32 = 0,
 };
 
 pub const SdlSnapshot = struct {
@@ -139,6 +146,16 @@ pub const FrameOrigin = enum(u8) {
     pub fn carriesGuestPixels(self: FrameOrigin) bool {
         return self != .diagnostic;
     }
+
+    /// A diagnostic frame has no source buffer: it is a clear the host drew on
+    /// the window's own drawable. Deriving this from the origin rather than
+    /// accepting it as a field means the pair cannot be set inconsistently.
+    pub fn payload(self: FrameOrigin) frame_handoff.Payload {
+        return switch (self) {
+            .diagnostic => .host_generated,
+            .xenia_host, .guest_title => .guest_memory,
+        };
+    }
 };
 
 pub const FrameSnapshot = struct {
@@ -169,6 +186,7 @@ pub const FrameSnapshot = struct {
     pub fn descriptor(self: FrameSnapshot, run: u64) frame_handoff.Descriptor {
         return .{
             .identity = self.identity(run),
+            .payload = self.origin.payload(),
             .source_address = self.source_address,
             .source_length = self.source_length,
             .width = self.width,
@@ -213,6 +231,9 @@ pub const Outcome = struct {
     frame_offer: frame_handoff.OfferResult = .overflow,
     frame_class: contract.FrameClass = .none,
     frame_identity: frame_handoff.Identity = .{},
+    /// True when the frame taken into custody this reconcile was Rosette's own
+    /// diagnostic presentation rather than anything the emulator produced.
+    diagnostic_custody: bool = false,
     /// True only while the selected direct Metal route owns a validated,
     /// submitted frame that the native bridge has not completed. Keeping this
     /// separate from `route` lets the route remain observable after completion
@@ -240,6 +261,10 @@ pub const Runtime = struct {
     last_rosette_guest_frames: u64 = 0,
     last_cocoa_diagnostic_frames: u64 = 0,
     last_cocoa_guest_frames: u64 = 0,
+    /// Serial of the newest diagnostic presentation already in custody. Frames
+    /// are credited on advance, so re-reading the same counter on a hundred
+    /// heartbeats still describes the frames that were actually drawn.
+    last_diagnostic_custody: u64 = 0,
     last_xenia_submissions: u64 = 0,
     last_xenia_presents: u64 = 0,
     last_frame_serial: u64 = 0,
@@ -287,6 +312,18 @@ pub const Runtime = struct {
                 result.frame_delivery_pending = route == .cocoa_metal_guest_copy and
                     !frame.consumed and record.state == .submitted;
             }
+        } else if (self.diagnosticFrame(source)) |frame| {
+            // Rosette's own presentations are the only pixels on this window
+            // for the whole of a run where the title never swaps, and they used
+            // to reach the drawable without any custody record at all. A window
+            // that shows pixels nothing took custody of cannot answer who put
+            // them there. They enter as `host_generated`, so they are counted,
+            // classified `diagnostic-host`, and can never be mistaken for guest
+            // output.
+            result.frame_observed = true;
+            result.diagnostic_custody = true;
+            result.frame_identity = frame.identity(run);
+            result.frame_offer = self.reconcileFrame(frame, run, route, source.step, &result.frame_class);
         }
         const credit_summary = self.credits.summary();
         result.new_work_claims = credit_summary.unique_claims;
@@ -617,6 +654,44 @@ pub const Runtime = struct {
         _ = self.control.acquirePresenter(requested_holder, requested_generation, step);
     }
 
+    /// Rosette's newest diagnostic presentation, once, at the moment its
+    /// counter advances.
+    ///
+    /// Returns null when nothing new was presented, when the window has no
+    /// drawable facts to describe the frame with, or when a guest frame is
+    /// available — a guest frame always takes the custody slot, because that is
+    /// the frame anybody reading the ledger is looking for.
+    fn diagnosticFrame(self: *Runtime, source: Snapshot) ?FrameSnapshot {
+        const presented = source.rosette_vulkan.diagnostic_frames +| source.native.diagnostic_frames;
+        if (presented == 0 or presented <= self.last_diagnostic_custody) return null;
+        if (source.native.drawable_width == 0 or source.native.drawable_height == 0) return null;
+        const format = PixelFormat.fromVulkan(source.native.drawable_format);
+        if (format == .unknown) return null;
+        // Whichever presenter drew it names the sink. A zero swapchain means the
+        // Vulkan presenter never came up and the clear went through Metal.
+        const through_vulkan = source.rosette_vulkan.diagnostic_frames != 0 and
+            source.rosette_vulkan.swapchain != 0;
+        const sink = if (through_vulkan) source.rosette_vulkan.swapchain else source.native.metal_layer;
+        if (sink == 0) return null;
+        self.last_diagnostic_custody = presented;
+        return .{
+            .source_address = sink,
+            .source_length = 0,
+            .width = source.native.drawable_width,
+            .height = source.native.drawable_height,
+            .row_pitch = 0,
+            .format = format,
+            .origin = .diagnostic,
+            .generation = if (through_vulkan) nonzero(source.rosette_vulkan.generation) else 1,
+            .serial = presented,
+            .content_digest = 0,
+            .guest_swap_observed = false,
+            // The counter only advances when a present completed, so the frame
+            // is consumed by construction.
+            .consumed = true,
+        };
+    }
+
     fn reconcileFrame(
         self: *Runtime,
         frame: FrameSnapshot,
@@ -691,6 +766,12 @@ pub const Runtime = struct {
     }
 
     fn claimFrame(self: *Runtime, descriptor: frame_handoff.Descriptor, step: u64) void {
+        // `guest_frame` credit means the guest produced a frame. A host clear
+        // taking custody is a fact about the window, not about the title, and
+        // crediting it here would put Rosette's own output into the counter a
+        // reader consults to find out whether the title ever drew anything.
+        // The native-present counter already accounts for it.
+        if (!descriptor.guest_pixels) return;
         const digest = if (descriptor.content_digest != 0)
             descriptor.content_digest
         else
@@ -851,6 +932,9 @@ fn completeSnapshot() Snapshot {
             .application_ready = true,
             .window_ready = true,
             .layer_attached = true,
+            .drawable_width = 1280,
+            .drawable_height = 720,
+            .drawable_format = 44,
         },
         .sdl = .{
             .event_loop = 0x600,
@@ -1033,4 +1117,85 @@ test "PowerPC and translated x86 callback credits remain separate" {
         .owner = .xenia_powerpc,
         .evidence = .completed_call,
     }));
+}
+
+test "Rosette's own diagnostic presentations take custody" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    snapshot.rosette_vulkan.diagnostic_frames = 3;
+    const result = runtime.reconcile(snapshot);
+    try std.testing.expect(result.diagnostic_custody);
+    try std.testing.expectEqual(frame_handoff.OfferResult.accepted, result.frame_offer);
+    try std.testing.expectEqual(contract.FrameClass.diagnostic_host, result.frame_class);
+    const summary = runtime.frames.summary();
+    try std.testing.expectEqual(@as(u64, 1), summary.offered);
+    try std.testing.expectEqual(@as(u64, 1), summary.presented);
+    try std.testing.expectEqual(@as(u64, 1), summary.diagnostic);
+    try std.testing.expectEqual(@as(u64, 0), summary.authentic_guest);
+    try std.testing.expectEqual(@as(u64, 0), summary.guest_pixels_host_cadence);
+    try std.testing.expectEqual(@as(u64, 0), summary.rejected);
+}
+
+test "a diagnostic frame is credited once however often the counter is re-read" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    snapshot.rosette_vulkan.diagnostic_frames = 5;
+    _ = runtime.reconcile(snapshot);
+    var repeat: usize = 0;
+    while (repeat < 8) : (repeat += 1) {
+        const result = runtime.reconcile(snapshot);
+        try std.testing.expect(!result.diagnostic_custody);
+    }
+    try std.testing.expectEqual(@as(u64, 1), runtime.frames.summary().presented);
+    snapshot.rosette_vulkan.diagnostic_frames = 6;
+    _ = runtime.reconcile(snapshot);
+    try std.testing.expectEqual(@as(u64, 2), runtime.frames.summary().presented);
+}
+
+test "a diagnostic frame never earns guest-frame work credit" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    snapshot.rosette_vulkan.diagnostic_frames = 2;
+    _ = runtime.reconcile(snapshot);
+    try std.testing.expectEqual(@as(u64, 0), runtime.credits.units(.guest_frame));
+    try std.testing.expectEqual(@as(u64, 1), runtime.frames.summary().diagnostic);
+}
+
+test "a guest frame always takes the custody slot over a diagnostic one" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    snapshot.rosette_vulkan.diagnostic_frames = 4;
+    snapshot.latest_frame = .{
+        .source_address = 0x8000,
+        .source_length = 640 * 480 * 4,
+        .width = 640,
+        .height = 480,
+        .row_pitch = 640 * 4,
+        .format = .bgra8_unorm,
+        .origin = .xenia_host,
+        .serial = 11,
+        .content_digest = 0xFEED,
+        .consumed = true,
+    };
+    const result = runtime.reconcile(snapshot);
+    try std.testing.expect(!result.diagnostic_custody);
+    try std.testing.expectEqual(@as(u64, 1), runtime.frames.summary().guest_pixels_host_cadence);
+    try std.testing.expectEqual(@as(u64, 0), runtime.frames.summary().diagnostic);
+}
+
+test "a window with no drawable facts refuses custody rather than inventing them" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    snapshot.rosette_vulkan.diagnostic_frames = 3;
+    snapshot.native.drawable_format = 0;
+    try std.testing.expect(!runtime.reconcile(snapshot).diagnostic_custody);
+    snapshot.native.drawable_format = 44;
+    snapshot.native.drawable_width = 0;
+    try std.testing.expect(!runtime.reconcile(snapshot).diagnostic_custody);
+    try std.testing.expectEqual(@as(u64, 0), runtime.frames.summary().offered);
 }
