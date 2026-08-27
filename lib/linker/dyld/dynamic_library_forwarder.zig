@@ -1137,6 +1137,33 @@ fn linkFeatureChain(scratch: *FeatureChainScratch) void {
     }
 }
 
+/// One ownership-oriented graphics snapshot. Handles stay separated by
+/// producer: Rosette's presenter and Xenia's real Vulkan device may both be
+/// healthy, but they are never the same object merely because both end at the
+/// same CAMetalLayer.
+pub const GraphicsOwnershipSnapshot = struct {
+    rosette_presenter_ready: bool = false,
+    rosette_metal_layer: u64 = 0,
+    rosette_instance: u64 = 0,
+    rosette_surface: u64 = 0,
+    rosette_device: u64 = 0,
+    rosette_queue: u64 = 0,
+    rosette_swapchain: u64 = 0,
+    rosette_generation: u64 = 0,
+    rosette_diagnostic_frames: u64 = 0,
+    rosette_host_frames: u64 = 0,
+    rosette_guest_output_frames: u64 = 0,
+    xenia_instance: u64 = 0,
+    xenia_surface: u64 = 0,
+    xenia_device: u64 = 0,
+    xenia_queue: u64 = 0,
+    xenia_swapchain: u64 = 0,
+    xenia_submissions: u64 = 0,
+    xenia_presents: u64 = 0,
+    latest_frame: ?rosette_gpu.FrameSource = null,
+    latest_frame_consumed: bool = false,
+};
+
 pub const Forwarder = struct {
     libraries: [MAX_LIBRARIES]Library = [_]Library{.{}} ** MAX_LIBRARIES,
     library_count: usize = 0,
@@ -1231,6 +1258,9 @@ pub const Forwarder = struct {
     frame_inbox: rosette_gpu.FrameInbox = .{},
     frame_source_scans: u64 = 0,
     frame_source_discoveries: u64 = 0,
+    cocoa_fallback_attempts: u64 = 0,
+    cocoa_fallback_successes: u64 = 0,
+    cocoa_fallback_failures: u64 = 0,
     /// The console front buffer the guest's own swap packet named, translated
     /// into an address this process can read. Supplied from outside because the
     /// two address-space translations that produce it belong to the process
@@ -6193,19 +6223,14 @@ pub const Forwarder = struct {
         }
         // An allocated, mapped, never-written image is zero throughout.
         // Presenting it would put a black frame on the window and label it
-        // guest output, which is worse than showing nothing.
-        var written = false;
-        for (readable.?) |byte| {
-            if (byte != 0) {
-                written = true;
-                break;
-            }
-        }
-        if (!written) {
+        // guest output, which is worse than showing nothing. The digest also
+        // prevents a retained image from becoming a new frame on every scan.
+        const content = rosette_gpu.frame_source.inspectContent(readable.?);
+        if (!content.nonzero) {
             self.frame_inbox.noteUnusable(.never_published);
             return;
         }
-        const serial = self.frame_inbox.publish(.{
+        const publication = self.frame_inbox.publishIfChanged(.{
             .source_address = address,
             .source_length = required,
             .width = chosen.width,
@@ -6218,8 +6243,9 @@ pub const Forwarder = struct {
             // Only the bootstrap's own swap observation may set this, and it is
             // supplied by the caller rather than inferred from a frame arriving.
             .guest_swap_observed = false,
-        });
-        if (serial == 0) return;
+        }, chosen.handle, content.digest);
+        if (publication.disposition != .published) return;
+        const serial = publication.serial;
         self.frame_source_discoveries +|= 1;
         if (self.frame_source_discoveries == 1) {
             machoCapturePrint(
@@ -8099,17 +8125,26 @@ pub const Forwarder = struct {
         guest_swap_observed: bool,
     ) rosette_gpu.FrameClassification {
         if (!self.native_presenter.stage.isReady()) return .rejected;
-        const report = self.native_presenter.present(.{ .cpu_image = .{
-            .pixels = pixels,
-            .width = width,
-            .height = height,
-            .format = self.native_presenter.surface_format.format,
-            .row_pitch_bytes = row_pitch_bytes,
-            .orientation = orientation,
-            .fit = .letterbox,
-            .producer = .xenia_host,
-            .guest_swap_observed = guest_swap_observed,
-        } });
+        const report = self.native_presenter.present(.{
+            .cpu_image = .{
+                .pixels = pixels,
+                .width = width,
+                .height = height,
+                // The converted scratch is always BGRA8. When Vulkan never came
+                // up there is no negotiated surface format to borrow, so state the
+                // conversion's actual format instead of publishing zero and
+                // making the independent Cocoa fallback reject valid pixels.
+                .format = if (self.native_presenter.surface_format.format != 0)
+                    self.native_presenter.surface_format.format
+                else
+                    44, // VK_FORMAT_B8G8R8A8_UNORM
+                .row_pitch_bytes = row_pitch_bytes,
+                .orientation = orientation,
+                .fit = .letterbox,
+                .producer = .xenia_host,
+                .guest_swap_observed = guest_swap_observed,
+            },
+        });
         self.observeNativePresenterReport(report);
         return report.classification;
     }
@@ -8186,36 +8221,37 @@ pub const Forwarder = struct {
         }
         self.guest_frontbuffer_conversions +|= 1;
 
-        var written = false;
-        for (destination) |byte| {
-            if (byte != 0) {
-                written = true;
-                break;
-            }
-        }
-        if (!written) {
+        const content = rosette_gpu.frame_source.inspectContent(destination);
+        if (!content.nonzero) {
             // Named precisely: the buffer exists, is mapped, converted cleanly,
             // and holds no picture. That is a statement about the emulator's
             // rendering, not about this path.
             self.frame_inbox.noteUnusable(.never_published);
             return false;
         }
-        self.guest_frontbuffer_nonzero_frames +|= 1;
-
-        const serial = self.frame_inbox.publish(.{
+        const publication = self.frame_inbox.publishIfChanged(.{
             .source_address = self.guest_frontbuffer_scratch,
             .source_length = needed,
             .width = surface.width,
             .height = surface.height,
-            .format = self.native_presenter.surface_format.format,
+            // `convertToBgra8` defines the bytes independently of Vulkan. If
+            // the native presenter never initialized, no surface format was
+            // negotiated; publish the conversion's actual format explicitly.
+            .format = if (self.native_presenter.surface_format.format != 0)
+                self.native_presenter.surface_format.format
+            else
+                44, // VK_FORMAT_B8G8R8A8_UNORM
             .row_pitch_bytes = @as(u64, surface.width) * 4,
             .orientation = .top_down,
             .fit = .letterbox,
             .producer = .xenia_host,
             // Set by the swap observation, never by a frame having arrived.
             .guest_swap_observed = false,
-        });
-        if (serial == 0) return false;
+        }, self.guest_frontbuffer_source, content.digest);
+        if (publication.disposition == .rejected) return false;
+        if (publication.disposition == .unchanged) return true;
+        self.guest_frontbuffer_nonzero_frames +|= 1;
+        const serial = publication.serial;
         if (self.guest_frontbuffer_nonzero_frames == 1) {
             machoCapturePrint(
                 "macho-processor: GUEST FRONT BUFFER PRESENTED: extent={d}x{d} tiled={s} endian={s} source=0x{x} bytes={d} serial={d}; these are the console's own pixels, converted from its framebuffer rather than from an emulator Vulkan image\n",
@@ -8276,6 +8312,51 @@ pub const Forwarder = struct {
         return presented;
     }
 
+    /// Populate the descriptor inbox even when Vulkan presentation is down.
+    /// Discovery is read-only and remains subject to the same non-zero pixel,
+    /// mapping, extent and format checks as the Vulkan presenter path.
+    pub fn refreshCocoaFallbackSource(self: *Forwarder, state: anytype) void {
+        if (self.native_presenter.stage.isReady()) return;
+        self.discoverGuestFrameSource(state);
+    }
+
+    /// Present one verified descriptor through the direct Cocoa/Metal copy.
+    /// This is called only after the Cocoa control plane selected the fallback
+    /// under an exclusive Rosette presenter lease. A missing or unusable source
+    /// remains unconsumed so a later corrected descriptor can be retried.
+    pub fn attemptCocoaFrameFallback(self: *Forwarder, state: anytype) bool {
+        if (self.native_presenter.stage.isReady()) return false;
+        self.cocoa_fallback_attempts +|= 1;
+        const descriptor = self.frame_inbox.acquire() orelse {
+            self.cocoa_fallback_failures +|= 1;
+            return false;
+        };
+        const pixels = state.guestMemoryConst(descriptor.source_address, descriptor.source_length) orelse {
+            self.frame_inbox.release(false);
+            self.frame_inbox.noteUnusable(.source_unmapped);
+            self.cocoa_fallback_failures +|= 1;
+            return false;
+        };
+        const presented = state.native_window.presentVerifiedFrame(
+            descriptor.serial,
+            pixels,
+            descriptor.width,
+            descriptor.height,
+            descriptor.row_pitch_bytes,
+            descriptor.format,
+            @intFromEnum(descriptor.orientation),
+            @intFromEnum(descriptor.fit),
+            descriptor.guest_swap_observed,
+        );
+        self.frame_inbox.release(presented);
+        if (!presented) {
+            self.cocoa_fallback_failures +|= 1;
+            return false;
+        }
+        self.cocoa_fallback_successes +|= 1;
+        return true;
+    }
+
     pub fn logScheduledRefresh(self: *const Forwarder) void {
         if (self.scheduled_refresh_attempts == 0) return;
         machoCapturePrint(
@@ -8302,6 +8383,34 @@ pub const Forwarder = struct {
         return ledger.diagnostic_frames_presented +|
             ledger.host_frames_presented +|
             ledger.guest_output_frames_presented;
+    }
+
+    pub fn graphicsOwnershipSnapshot(self: *const Forwarder) GraphicsOwnershipSnapshot {
+        const presenter = &self.native_presenter;
+        const xenia = &self.real_vulkan;
+        const latest = self.frame_inbox.latest();
+        return .{
+            .rosette_presenter_ready = presenter.stage.isReady(),
+            .rosette_metal_layer = presenter.metal_layer,
+            .rosette_instance = if (presenter.instance) |value| @intFromPtr(value) else 0,
+            .rosette_surface = presenter.surface,
+            .rosette_device = if (presenter.device) |value| @intFromPtr(value) else 0,
+            .rosette_queue = if (presenter.graphics_queue) |value| @intFromPtr(value) else 0,
+            .rosette_swapchain = presenter.swapchain,
+            .rosette_generation = @as(u64, presenter.ring.generation) + 1,
+            .rosette_diagnostic_frames = presenter.ledger.diagnostic_frames_presented,
+            .rosette_host_frames = presenter.ledger.host_frames_presented,
+            .rosette_guest_output_frames = presenter.ledger.guest_output_frames_presented,
+            .xenia_instance = if (xenia.instance) |value| @intFromPtr(value) else 0,
+            .xenia_surface = xenia.surface,
+            .xenia_device = if (xenia.device) |value| @intFromPtr(value) else 0,
+            .xenia_queue = if (xenia.graphics_queue) |value| @intFromPtr(value) else 0,
+            .xenia_swapchain = xenia.swapchain,
+            .xenia_submissions = self.vulkan_real_queue_submits,
+            .xenia_presents = self.vulkan_real_presents,
+            .latest_frame = latest,
+            .latest_frame_consumed = if (latest) |frame_value| self.frame_inbox.consumed_serial >= frame_value.serial else false,
+        };
     }
 
     /// Real guest Vulkan progress, kept separate from Rosette's presenter
@@ -8523,7 +8632,7 @@ pub const Forwarder = struct {
             return;
         }
         machoCapturePrint(
-            "macho-processor: GUEST FRONT BUFFER: source=0x{x} bytes={d} extent={d}x{d} tiled={s} endian={s} conversions={d} failures={d} nonzero_frames={d} last_failure={s}; {s}\n",
+            "macho-processor: GUEST FRONT BUFFER: source=0x{x} bytes={d} extent={d}x{d} tiled={s} endian={s} conversions={d} failures={d} unique_nonzero_generations={d} retained_observations={d} last_failure={s}; {s}\n",
             .{
                 self.guest_frontbuffer_source,
                 self.guest_frontbuffer_bytes,
@@ -8534,6 +8643,7 @@ pub const Forwarder = struct {
                 self.guest_frontbuffer_conversions,
                 self.guest_frontbuffer_conversion_failures,
                 self.guest_frontbuffer_nonzero_frames,
+                self.frame_inbox.unchanged_observations,
                 if (self.guest_frontbuffer_last_failure) |failure| failure.label() else "-",
                 if (self.guest_frontbuffer_nonzero_frames != 0)
                     "the console's framebuffer holds a picture and it is reaching the window"
@@ -8554,7 +8664,7 @@ pub const Forwarder = struct {
             // The counters the audit requires never to be conflated. Each
             // answers a different question and none is a sum of the others.
             machoCapturePrint(
-                "macho-processor: PRESENTATION PROVENANCE: guest_vulkan_calls_seen={d} native_driver_calls={d} native_submissions={d} native_present_requests={d} diagnostic_metal_frames={d} native_diagnostic_frames={d} xenia_host_frames={d} guest_output_frames={d} claims_demoted={d} guest_ring_packets={d}\n",
+                "macho-processor: PRESENTATION PROVENANCE: guest_vulkan_calls_seen={d} native_driver_calls={d} native_submissions={d} native_present_requests={d} diagnostic_metal_frames={d} native_diagnostic_frames={d} xenia_host_frames={d} guest_output_frames={d} cocoa_verified_guest_frames={d} claims_demoted={d} guest_ring_packets={d}\n",
                 .{
                     self.frame_provenance.guest_vulkan_calls_seen,
                     presenter_ledger.native_driver_calls,
@@ -8564,6 +8674,7 @@ pub const Forwarder = struct {
                     presenter_ledger.diagnostic_frames_presented,
                     presenter_ledger.host_frames_presented,
                     presenter_ledger.guest_output_frames_presented,
+                    self.cocoa_fallback_successes,
                     presenter_ledger.claims_demoted + self.frame_provenance.claims_demoted,
                     presenter_ledger.guest_ring_packets,
                 },
@@ -8571,16 +8682,23 @@ pub const Forwarder = struct {
             // The Phase 5 handoff, reported as a chain so the first broken link
             // is visible rather than inferred from a frame count of zero.
             machoCapturePrint(
-                "macho-processor: GUEST FRAME SOURCE: images_tracked={d} image_bindings={d} resource_overflow={d} scans={d} discoveries={d} published={d} consumed={d} dropped={d} blit_supported={s} filter={d} absence={s}\n",
+                "macho-processor: GUEST FRAME SOURCE: images_tracked={d} image_bindings={d} resource_overflow={d} scans={d} discoveries={d} content_observations={d} published_generations={d} unchanged_observations={d} content_changes={d} source_changes={d} consumed={d} dropped={d} cocoa_fallback(attempts/successes/failures)={d}/{d}/{d} blit_supported={s} filter={d} absence={s}\n",
                 .{
                     self.trackedImageCount(),
                     self.vulkan_image_bindings,
                     self.vulkan_resource_overflow,
                     self.frame_source_scans,
                     self.frame_source_discoveries,
+                    self.frame_inbox.content_observations,
                     self.frame_inbox.published,
+                    self.frame_inbox.unchanged_observations,
+                    self.frame_inbox.content_changes,
+                    self.frame_inbox.source_changes,
                     self.frame_inbox.consumed,
                     self.frame_inbox.dropped,
+                    self.cocoa_fallback_attempts,
+                    self.cocoa_fallback_successes,
+                    self.cocoa_fallback_failures,
                     if (presenter.report.blit_supported) "YES" else "NO",
                     presenter.report.blit_filter,
                     self.frame_inbox.absence().label(),
@@ -8589,7 +8707,9 @@ pub const Forwarder = struct {
             machoCapturePrint(
                 "macho-processor: graphics visibility: guest_output={s} first_non_native_pixel_stage={s} next={s} display_note={s}\n",
                 .{
-                    if (presenter_ledger.guest_output_frames_presented != 0) "YES" else "NO",
+                    if (presenter_ledger.host_frames_presented != 0 or
+                        presenter_ledger.guest_output_frames_presented != 0 or
+                        self.cocoa_fallback_successes != 0) "YES" else "NO",
                     if (self.forwarding_contract.firstNonNativePixelStage()) |stage| stage.label() else "none",
                     presenter.blockingReason(),
                     presenter_ledger.displayNote(),
