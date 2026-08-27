@@ -64,6 +64,12 @@ const maxSignedDwords = packed_ops.maxSignedDwords;
 const shufflePackedDwords = packed_ops.shufflePackedDwords;
 const shufflePackedSingles = packed_ops.shufflePackedSingles;
 const unpackLowQwords = packed_ops.unpackLowQwords;
+const unpackLowBytes = packed_ops.unpackLowBytes;
+const unpackLowWords = packed_ops.unpackLowWords;
+const unpackHighBytes = packed_ops.unpackHighBytes;
+const unpackHighWords = packed_ops.unpackHighWords;
+const unpackHighDwords = packed_ops.unpackHighDwords;
+const unpackHighQwords = packed_ops.unpackHighQwords;
 const blendPackedWords = packed_ops.blendPackedWords;
 const blendPackedElements = packed_ops.blendPackedElements;
 const shiftPackedBytes = packed_ops.shiftPackedBytes;
@@ -2273,15 +2279,29 @@ pub fn execute(self: anytype, initial_d: DecodedInsn) void {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },
-        .vpunpckhbw, .vpunpckhwd, .vpunpckhdq, .vpunpcklbw, .vpunpcklwd => {
-            // VPUNPCK unpack operations - no-op for now
-            // TODO: Implement actual unpack semantics
-            if (d.is_reg_form) {
-                self.xmm[d.xmm_dst] = self.xmm[d.xmm_src];
-            } else {
-                self.xmm[d.xmm_dst] = self.readMem128(d.addr);
-            }
+        .vpunpckhbw, .vpunpckhwd, .vpunpckhdq, .vpunpcklbw, .vpunpcklwd, .vpunpckhqdq => {
+            const rhs_low = if (d.is_reg_form) self.xmm[d.xmm_src2] else self.readMem128(d.addr);
+            self.xmm[d.xmm_dst] = switch (d.op) {
+                .vpunpcklbw => unpackLowBytes(self.xmm[d.xmm_src], rhs_low),
+                .vpunpcklwd => unpackLowWords(self.xmm[d.xmm_src], rhs_low),
+                .vpunpckhbw => unpackHighBytes(self.xmm[d.xmm_src], rhs_low),
+                .vpunpckhwd => unpackHighWords(self.xmm[d.xmm_src], rhs_low),
+                .vpunpckhdq => unpackHighDwords(self.xmm[d.xmm_src], rhs_low),
+                .vpunpckhqdq => unpackHighQwords(self.xmm[d.xmm_src], rhs_low),
+                else => unreachable,
+            };
             if (d.vector_256) {
+                const rhs_high = if (d.is_reg_form) self.ymm_hi[d.xmm_src2] else self.readMem128(d.addr + 16);
+                self.ymm_hi[d.xmm_dst] = switch (d.op) {
+                    .vpunpcklbw => unpackLowBytes(self.ymm_hi[d.xmm_src], rhs_high),
+                    .vpunpcklwd => unpackLowWords(self.ymm_hi[d.xmm_src], rhs_high),
+                    .vpunpckhbw => unpackHighBytes(self.ymm_hi[d.xmm_src], rhs_high),
+                    .vpunpckhwd => unpackHighWords(self.ymm_hi[d.xmm_src], rhs_high),
+                    .vpunpckhdq => unpackHighDwords(self.ymm_hi[d.xmm_src], rhs_high),
+                    .vpunpckhqdq => unpackHighQwords(self.ymm_hi[d.xmm_src], rhs_high),
+                    else => unreachable,
+                };
+            } else {
                 @memset(&self.ymm_hi[d.xmm_dst], 0);
             }
         },

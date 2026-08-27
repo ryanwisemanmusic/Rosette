@@ -1112,6 +1112,18 @@ pub fn logCooperativeSchedulerSummary(self: anytype) void {
         "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/rotated_without_dispatch/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} ui_handoff_completions_abandoned={d}\n",
         .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.idle_scheduled, self.idle_started, self.idle_completed, self.idle_removed, self.pendingIdleCallbackCount(), self.idle_wakeups, self.idle_wakes_without_dispatch, self.idle_dispatch_failures, self.idle_starvation_warnings, self.ui_handoff.completions_abandoned },
     );
+    machoCapturePrint(
+        "macho-processor: UI COMPLETION OWNERSHIP: total={d} terminal(resumed/abandoned/inherited_abandonment/ownerless)={d}/{d}/{d}/{d} pending={d} invariant={s}; inherited abandonment is an intentional terminal disposition, not a missing scheduling-thread resolution\n",
+        .{
+            self.ui_handoff.completions_total,
+            self.ui_handoff.completions_resumed,
+            self.ui_handoff.completions_abandoned,
+            self.ui_handoff.completions_inherited_abandonment,
+            self.ui_handoff.completions_ownerless,
+            self.ui_handoff.pendingCompletions(),
+            if (self.ui_handoff.terminalInvariantHolds()) "YES" else "NO",
+        },
+    );
     self.logAudioCallbackSchedulerState();
 }
 

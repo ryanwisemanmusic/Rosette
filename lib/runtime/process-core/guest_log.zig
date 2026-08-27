@@ -12,6 +12,8 @@ const machoCapturePrint = macho_log.machoCapturePrint;
 /// deciding what a matched line *means* stays here.
 const phrase_filter = @import("phrase_filter");
 const startup_observer = @import("diagnostics").startup_observer;
+const claim_reconciliation = @import("diagnostics").claim_reconciliation;
+const wait_graph = @import("diagnostics").wait_graph;
 const guest_critical_section = @import("diagnostics").guest_critical_section;
 const guest_module_map = @import("diagnostics").guest_module_map;
 const guest_wait_liveness = @import("diagnostics").guest_wait_liveness;
@@ -185,6 +187,9 @@ pub fn emitGuestLog(self: anytype, prefix_char_raw: u64, address: u64, length_ra
     observeImportBindingAudit(self, message);
     observeGuestEventSignal(self, message);
     observeLivelockWaits(self, message);
+    observeRunHorizonClock(self, message);
+    observeReconciledClaims(self, message);
+    observeInterruptCallbackTransaction(self, message);
     observeKernelSurfaceAddress(self, message);
     observeKernelSurfaceReport(self, message);
     observeGuestWaitLiveness(self, message);
@@ -471,6 +476,33 @@ pub fn observeLivelockWaits(self: anytype, message: []const u8) void {
     // thread is the one that performed the operation. Naming it is what makes
     // "find who waits on it" answerable.
     self.livelock_predictor.note(self, operation.op, operation.object, self.active_guest_thread, livelockRingStalled(self));
+
+    // The same event, recorded as a graph edge. The predictor answers "is this
+    // signature repeating"; the graph answers "who is on each end and is the
+    // pair going anywhere", which is the question a matched handshake needs and
+    // a repetition count cannot reach.
+    if (comptime @hasField(State, "wait_graph")) {
+        const role: wait_graph.Role = switch (operation.op) {
+            .wait, .wait_timeout => .waiter,
+            .set_event, .release_semaphore => .signaller,
+        };
+        self.wait_graph.observe(
+            role,
+            operation.object,
+            self.active_guest_thread,
+            guestProgramCounter(self),
+            self.executed_steps,
+        );
+    }
+}
+
+/// The guest program counter, when the state carries one. Recorded with each
+/// edge so a stalled handshake names the call site rather than only the object,
+/// which is the difference between a finding and a search.
+fn guestProgramCounter(self: anytype) u64 {
+    const State = @TypeOf(self.*);
+    if (comptime @hasField(State, "regs")) return self.regs.rip;
+    return 0;
 }
 
 /// Fold a synchronisation object's address onto the one a reader can act on.
@@ -909,25 +941,36 @@ pub fn observeImportBindingProbe(self: anytype, message: []const u8) void {
 
 /// Join the emulator's wait and set logging into the wait-liveness ledger.
 ///
-/// `KeWaitForSingleObject result=00000000` is the single most common line in a
-/// stalled run and the least informative one: it is returned both by a wait
-/// that blocked and was released, and by a wait that was satisfied on arrival
-/// and never blocked at all. The first is a working handshake; the second is a
-/// spin that looks like a stall in whichever subsystem it belongs to. Only the
-/// ratio separates them, so the ratio is what gets counted.
-///
-/// The emulator logs the result without the object's handle, so most waits
-/// arrive unattributed and the ledger says so rather than inventing an owner
-/// for them. Set lines do carry a handle and are recorded against it.
+/// A result code is outcome evidence, not timing evidence. New Xenia records
+/// carry identity, event mode, entry state, duration and `wait_disposition` on
+/// the same line. Legacy result-only lines remain unknown rather than being
+/// mislabelled as immediate returns.
 pub fn observeGuestWaitLiveness(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "guest_wait_liveness")) return;
     if (std.mem.indexOf(u8, message, "KeWaitForSingleObject result=")) |_| {
         const code = parseHexAfter(message, "KeWaitForSingleObject result=") orelse return;
-        self.guest_wait_liveness.observeWait(
-            0,
-            guest_wait_liveness.WaitStatus.fromCode(@truncate(code)),
-        );
+        const handle = parseFixedWidthHexAfter(message, "guest_obj=", sync_object_field_width) orelse
+            parseFixedWidthHexAfter(message, "handle=", sync_object_field_width) orelse 0;
+        const timing: guest_wait_liveness.TimingEvidence = if (std.mem.indexOf(u8, message, "wait_disposition=ready_on_entry") != null)
+            .ready_on_entry
+        else if (std.mem.indexOf(u8, message, "wait_disposition=blocked") != null or
+            std.mem.indexOf(u8, message, "wait_disposition=timed_out") != null)
+            .blocked
+        else
+            .unknown;
+        const event_mode: guest_wait_liveness.EventMode = if (std.mem.indexOf(u8, message, "event_mode=manual_reset") != null)
+            .manual_reset
+        else if (std.mem.indexOf(u8, message, "event_mode=auto_reset") != null)
+            .auto_reset
+        else
+            .unknown;
+        self.guest_wait_liveness.observeWait(.{
+            .handle = handle,
+            .status = guest_wait_liveness.WaitStatus.fromCode(@truncate(code)),
+            .timing = timing,
+            .event_mode = event_mode,
+        });
         return;
     }
     if (std.mem.indexOf(u8, message, "xeKeSetEvent:") != null) {
@@ -951,6 +994,176 @@ pub fn observeGuestWaitLiveness(self: anytype, message: []const u8) void {
 ///
 /// So the message is split first and each line examined. Cheap, because the
 /// leading-character test rejects a line in one comparison.
+/// Recover the guest's own clock from the emulator's vblank reporting.
+///
+/// Rosette counted guest instructions and host seconds and never knew how much
+/// of the *title's* timeline a run had covered. Without that, "X never
+/// happened" cannot be told apart from "the run ended before X was due", and
+/// the two call for opposite responses. The emulator states it plainly and
+/// nothing was reading it.
+fn observeRunHorizonClock(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "run_horizon")) return;
+    const vblank = parseDecimalAfter(message, "vblank_id=") orelse return;
+    const emulated = parseDecimalAfter(message, "since_first_vblank=") orelse
+        parseDecimalAfter(message, "since_first_vblank_ms=") orelse 0;
+    self.run_horizon.observe(.{
+        .step = self.executed_steps,
+        .emulated_ms = emulated,
+        .vblanks = vblank,
+        .host_seconds = elapsedHostSeconds(self),
+    });
+}
+
+fn elapsedHostSeconds(self: anytype) u64 {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "run_started_at_ns")) return 0;
+    const now = startup_observer.monotonicNanoseconds();
+    if (self.run_started_at_ns == 0 or now <= self.run_started_at_ns) return 0;
+    return (now - self.run_started_at_ns) / std.time.ns_per_s;
+}
+
+/// Feed the emulator's own disagreeing statements to the reconciliation ledger.
+///
+/// Each of these lines carries a snapshot of the same handful of facts, taken
+/// at the moment that code path ran, and none of them is ever retracted. The
+/// bring-up diagnostics keep saying `ring_init=NO rb_base=00000000` long after
+/// the startup watch has reported the ring configured, and the first of those
+/// is the one a reader finds. Recording which emitter said what, and when, is
+/// what lets the report name the current value instead of the loudest one.
+fn observeReconciledClaims(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "claim_reconciliation")) return;
+    const step = self.executed_steps;
+    const ledger = &self.claim_reconciliation;
+
+    const source: claim_reconciliation.Source =
+        if (std.mem.indexOf(u8, message, "gpu_startup_watch") != null)
+            .xenia_startup_watch
+        else if (std.mem.indexOf(u8, message, "no-swap diagnosis") != null)
+            .xenia_no_swap_diagnosis
+        else if (std.mem.indexOf(u8, message, "CALLBACK WATCHDOG") != null)
+            .xenia_callback_watchdog
+        else if (std.mem.indexOf(u8, message, "GPU FALLBACK PROBE INPUTS") != null)
+            .xenia_fallback_probe
+        else if (std.mem.indexOf(u8, message, "callback-exec timing") != null or
+        std.mem.indexOf(u8, message, "VdSetGraphicsInterruptCallback execution") != null)
+            .xenia_callback_exec_timing
+        else
+            return;
+
+    if (parseFlagAfter(message, "ring_init=")) |value| {
+        ledger.stateBool(.ring_initialised, source, value, step);
+    }
+    if (parseFlagAfter(message, "init_ack=")) |value| {
+        ledger.stateBool(.ring_init_acknowledged, source, value, step);
+    }
+    if (parseFlagAfter(message, "callback_set=")) |value| {
+        ledger.stateBool(.interrupt_callback_set, source, value, step);
+    }
+    if (parseFlagAfter(message, "interrupt_callback_set=")) |value| {
+        ledger.stateBool(.interrupt_callback_set, source, value, step);
+    }
+    if (parseFlagAfter(message, "guest_main_ready=")) |value| {
+        ledger.stateBool(.guest_main_ready, source, value, step);
+    }
+    if (parseHexAfter(message, "rb_base=")) |value| {
+        ledger.state(.ring_base_address, source, value, step);
+    }
+    if (parseHexAfter(message, "rb_size=")) |value| {
+        ledger.state(.ring_size_bytes, source, value, step);
+    }
+    if (parseHexAfter(message, "read_ptr=")) |value| {
+        ledger.state(.ring_read_pointer, source, value, step);
+    }
+    if (parseHexAfter(message, "write_ptr=")) |value| {
+        ledger.state(.ring_write_pointer, source, value, step);
+    }
+    if (parseHexAfter(message, "callback=")) |value| {
+        ledger.state(.interrupt_callback_address, source, value, step);
+    }
+    if (parseDecimalAfter(message, "callback_completions=")) |value| {
+        ledger.state(.callback_completions, source, value, step);
+    }
+    if (parseDecimalAfter(message, "swap_packets=")) |value| {
+        ledger.state(.swap_packets_consumed, source, value, step);
+    }
+}
+
+/// Build one execution-domain-correct transaction from Xenia's callback logs.
+/// Completion lines are self-contained and carry monotonic attempts/returns,
+/// so a dropped or torn earlier dispatch line cannot manufacture a missing
+/// callback. Rosette's model callback counters never enter this ledger.
+fn observeInterruptCallbackTransaction(self: anytype, message: []const u8) void {
+    const State = @TypeOf(self.*);
+    if (comptime !@hasField(State, "interrupt_callback_transaction")) return;
+    const ledger = &self.interrupt_callback_transaction;
+    const step = self.executed_steps;
+
+    if (std.mem.indexOf(u8, message, "GPU callback set: count=") != null) {
+        const count = parseDecimalAfter(message, "GPU callback set: count=") orelse return;
+        const callback = parseHexAfter(message, "callback=") orelse 0;
+        const user_data = parseHexAfter(message, "user_data=") orelse 0;
+        ledger.observeRegistration(count, @truncate(callback), @truncate(user_data), step);
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "GPU callback dispatch completed:") != null) {
+        const id = parseDecimalAfter(message, "id=") orelse return;
+        const attempts = parseDecimalAfter(message, "attempts=") orelse id;
+        const completions = parseDecimalAfter(message, "completions=") orelse id;
+        ledger.observeCompletion(
+            id,
+            attempts,
+            completions,
+            @truncate(parseHexAfter(message, "callback=") orelse 0),
+            @truncate(parseDecimalAfter(message, "source=") orelse 0),
+            @truncate(parseDecimalAfter(message, "cpu=") orelse 0),
+            parseDecimalAfter(message, "duration_ms=") orelse 0,
+            parseFlagAfter(message, "payload_before=") orelse false,
+            parseFlagAfter(message, "payload_after=") orelse false,
+            parseFlagAfter(message, "payload_changed=") orelse false,
+            step,
+        );
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "GPU callback dispatch: count=") != null) {
+        const count = parseDecimalAfter(message, "GPU callback dispatch: count=") orelse return;
+        ledger.observeDispatch(
+            count,
+            @truncate(parseDecimalAfter(message, "source=") orelse 0),
+            @truncate(parseDecimalAfter(message, "cpu=") orelse 0),
+            step,
+        );
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "GPU callback dispatch skipped:") != null) {
+        ledger.observeSkip();
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "GPU interrupt dispatch deferred") != null) {
+        ledger.observeDeferral(parseDecimalAfter(message, "count=") orelse 1);
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "GPU callback context before:") != null) {
+        ledger.observeContextBefore();
+        return;
+    }
+    if (std.mem.indexOf(u8, message, "GPU callback context after:") != null) {
+        ledger.observeContextAfter(parseFlagAfter(message, "context_changed=") orelse false);
+    }
+}
+
+/// `YES`/`NO` as the emulator writes them. Deliberately strict: a key whose
+/// value is neither must not be guessed, because a guess here becomes a claim
+/// that contradicts a real observation.
+fn parseFlagAfter(message: []const u8, key: []const u8) ?bool {
+    const at = std.mem.indexOf(u8, message, key) orelse return null;
+    const rest = message[at + key.len ..];
+    if (std.mem.startsWith(u8, rest, "YES")) return true;
+    if (std.mem.startsWith(u8, rest, "NO")) return false;
+    return null;
+}
+
 pub fn observeKernelSurfaceAddress(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "gpu_kernel_surface_addresses")) return;
@@ -973,6 +1186,24 @@ fn observeKernelSurfaceAddressLine(self: anytype, line: []const u8) void {
             // the slot address is known here and whether the title imports it
             // is settled separately by the emulator's own ordinal report.
             self.gpu_kernel_variables.observeImport(which, true, address);
+
+            // Provision now, not on the next diagnostic heartbeat.
+            //
+            // This line is the first moment the slot's address exists — before
+            // it there is nowhere to write — and the heartbeat that used to be
+            // the only provisioning path is a hundred million guest steps away.
+            // The title reads these during display bring-up, long before then,
+            // and a zero sends it down an early-return branch it never
+            // revisits. A correct value that arrives afterwards makes every
+            // counter read healthy and changes nothing about the run.
+            //
+            // Owner rules are unchanged: `writeDecision` still refuses
+            // title-owned variables and structured initialisers, so this is
+            // earlier provisioning of exactly the same platform state, not more
+            // of it.
+            if (comptime @hasDecl(@TypeOf(self.*), "provisionPlatformStateNow")) {
+                self.provisionPlatformStateNow();
+            }
         }
     }
 }
@@ -988,6 +1219,14 @@ fn parseDecimalAfter(message: []const u8, key: []const u8) ?u64 {
 pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "gpu_bootstrap")) return;
+    // Feed the strict VdSwap ledger from provenance-bearing breadcrumbs before
+    // the broad bootstrap ladder is updated.  The two ledgers answer different
+    // questions: bootstrap says where graphics stopped, while this observer
+    // distinguishes a guest encoder, a retained ring packet and authentic CP
+    // consumption.  A generic PM4 line must never close the XE_SWAP stage.
+    if (comptime @hasField(State, "gpu_vd_swap_contract")) {
+        _ = self.gpu_vd_swap_contract.observeLogLine(message, self.executed_steps);
+    }
     const steps = [_]struct { marker: []const u8, step: gpu.Step, export_call: bool = false }{
         .{ .marker = "VdInitializeEngines", .step = .initialize_engines, .export_call = true },
         .{ .marker = "VdGetSystemCommandBuffer", .step = .system_command_buffer, .export_call = true },
@@ -1022,6 +1261,17 @@ pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
         self.guest_vdswap_entry_completed = true;
     }
     for (steps) |candidate| {
+        if (candidate.step == .swap) {
+            if (comptime @hasField(State, "gpu_vd_swap_contract")) {
+                if (!self.gpu_vd_swap_contract.observed(.authentic_xe_swap_consumed)) {
+                    // The strict ledger is authoritative for the final
+                    // bootstrap step. A generic PM4 line or a decoder mention
+                    // must not make the bootstrap claim authentic XE_SWAP
+                    // consumed.
+                    continue;
+                }
+            }
+        }
         // The export-verification lines name these symbols without calling
         // them, so a bare occurrence is not evidence. Only the call-trace form
         // `Name(` counts.
@@ -1493,6 +1743,9 @@ fn observeRingWritePointer(self: anytype, message: []const u8) void {
     );
     if (outcome == .advanced) {
         self.gpu_bootstrap.observe(.ring_write_pointer, self.executed_steps);
+        if (comptime @hasField(@TypeOf(self.*), "gpu_vd_swap_contract")) {
+            self.gpu_vd_swap_contract.observePublication(self.executed_steps, .guest_publication);
+        }
         return;
     }
     if (outcome == .repeated and tracker.repeats == 1) {

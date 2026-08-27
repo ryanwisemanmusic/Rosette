@@ -254,9 +254,7 @@ pub fn handleInternalCompatibility(self: anytype) bool {
         self.startup.enter(.logging, self.executed_steps);
         const app_name = self.guestMemoryConst(self.regs.rdi, @min(self.regs.rsi, 1024)) orelse "";
         if (self.logging.initialize(app_name)) {
-            if (self.guest_log_buffer_address == 0) {
-                self.guest_log_buffer_address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return false;
-            }
+            _ = ensureGuestLogChannel(self) orelse return false;
             self.regs.rip = self.pop();
             self.startup.enter(.logging_ready, self.executed_steps);
             return true;
@@ -416,14 +414,7 @@ pub fn handleGuestLogBridge(self: anytype) bool {
     if (self.internal_targets.guest_log_get_thread_buffer != 0 and
         self.regs.rip == self.internal_targets.guest_log_get_thread_buffer)
     {
-        if (self.guest_log_buffer_address == 0) {
-            self.guest_log_buffer_address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return false;
-            machoCapturePrint(
-                "macho-processor: synchronous Xenia log bridge enabled at buffer=0x{x}\n",
-                .{self.guest_log_buffer_address},
-            );
-        }
-        self.regs.rax = self.guest_log_buffer_address;
+        self.regs.rax = ensureGuestLogChannel(self) orelse return false;
         self.regs.rdx = GUEST_LOG_BUFFER_SIZE;
         self.regs.rip = self.pop();
         return true;
@@ -431,9 +422,18 @@ pub fn handleGuestLogBridge(self: anytype) bool {
     if (self.internal_targets.guest_log_append_formatted != 0 and
         self.regs.rip == self.internal_targets.guest_log_append_formatted)
     {
+        const thread = self.active_guest_thread;
         var emitted = false;
-        if (self.guest_log_buffer_address != 0) {
-            emitted = self.emitGuestLog(self.regs.rsi, self.guest_log_buffer_address, self.regs.rdx);
+        if (self.guest_log_channels.addressForAppend(thread)) |address| {
+            emitted = self.emitGuestLog(self.regs.rsi, address, self.regs.rdx);
+            self.guest_log_channels.noteEmission(thread, emitted);
+        } else if (self.guest_log_channels.missing_appends <= 8 or
+            self.guest_log_channels.missing_appends % 256 == 0)
+        {
+            machoCapturePrint(
+                "macho-processor: synchronous Xenia log append rejected: thread=0x{x} has no formatting channel missing_appends={d}; refusing to parse a buffer owned by another thread\n",
+                .{ thread, self.guest_log_channels.missing_appends },
+            );
         }
         self.logging.recordEmission(self.regs.rdx, emitted);
         self.regs.rip = self.pop();
@@ -448,6 +448,24 @@ pub fn handleGuestLogBridge(self: anytype) bool {
         return true;
     }
     return false;
+}
+
+fn ensureGuestLogChannel(self: anytype) ?u64 {
+    const thread = self.active_guest_thread;
+    if (self.guest_log_channels.lookupForGet(thread)) |address| return address;
+    const address = self.guestAlloc(GUEST_LOG_BUFFER_SIZE, 16) orelse return null;
+    if (!self.guest_log_channels.bind(thread, address)) {
+        machoCapturePrint(
+            "macho-processor: synchronous Xenia log channel table exhausted: thread=0x{x} address=0x{x} channels={d} overflow={d}; formatted append will be rejected rather than aliased\n",
+            .{ thread, address, self.guest_log_channels.channel_count, self.guest_log_channels.overflow },
+        );
+        return null;
+    }
+    machoCapturePrint(
+        "macho-processor: synchronous Xenia log channel enabled: thread=0x{x} buffer=0x{x} bytes={d} channels={d}; formatted records are isolated per guest thread\n",
+        .{ thread, address, GUEST_LOG_BUFFER_SIZE, self.guest_log_channels.channel_count },
+    );
+    return address;
 }
 
 pub fn handleCxxoptsSplitOptionNames(self: anytype) bool {

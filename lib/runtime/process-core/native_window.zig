@@ -46,6 +46,12 @@ pub fn showNativeWindow(self: anytype) bool {
     return ready;
 }
 
+pub fn hideNativeWindow(self: anytype) bool {
+    const ready = self.native_window.hide();
+    if (ready) registerNativeWindowHandles(self);
+    return ready;
+}
+
 pub fn setNativeWindowFullscreen(self: anytype, fullscreen: bool) bool {
     return self.native_window.setFullscreen(fullscreen);
 }
@@ -54,6 +60,11 @@ pub fn nativeViewToken(self: anytype) u64 {
     const token = self.native_window.viewToken();
     if (token != 0) registerNativeWindowHandles(self);
     return token;
+}
+
+pub fn nativeWindowToken(self: anytype) u64 {
+    if (!ensureNativeWindow(self)) return 0;
+    return native_window_runtime.WINDOW_TOKEN;
 }
 
 pub fn nativeWindowWidth(self: anytype) u32 {

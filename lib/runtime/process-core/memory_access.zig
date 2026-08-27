@@ -3743,11 +3743,26 @@ inline fn vtableRecoveryWanted(self: anytype, address: u64, value: u64) bool {
     // never had a vptr written to it.
     //
     // A tracked vptr lives either in a live heap allocation or in the modelled
-    // stack registry. Both answer "definitely not here" in two comparisons.
+    // stack registry. Both answer "definitely not here" without a hash
+    // lookup: the forwarder's arena range gate, then — for the heap side, the
+    // tracker's append-only Bloom filter, whose bits survive retirement so a
+    // false answer is authoritative and never risks skipping a real repair.
     // This is the same range-gate-before-lookup shape already used by
-    // `withinArena` and `execution_tracepoints.Set.mightMatch`.
-    return self.memory_forwarder.withinArena(address) or
-        self.vtable_stack_registry.mightContain(address);
+    // `withinArena` and `execution_tracepoints.Set.mightMatch`, extended one
+    // level so the `recoverLiveAllocationVtable` hash probes run only for
+    // addresses the Bloom filter says could actually carry a tracked vptr.
+    // Stack-registry records are range-gated (two comparisons, no hash); keep
+    // that check first because a modelled object can live at any address and
+    // the heap Bloom filter below must not hide it.
+    if (self.vtable_stack_registry.mightContain(address)) return true;
+    if (!self.memory_forwarder.withinArena(address)) return false;
+    // Heap records: the tracker's append-only Bloom filter. Bits survive
+    // retirement, so "no" here is authoritative — the address never had a
+    // tracked vptr and the hash probes inside `recoverLiveAllocationVtable`
+    // could not have found one. This is the gate that keeps the observer's
+    // per-load cost to a shift, a mask and two bit tests instead of two
+    // AutoHashMap probes on every small-value heap load.
+    return self.vtable_tracker.mightContain(address);
 }
 
 /// Whether the memory-access ring can possibly want this access.
@@ -5749,15 +5764,30 @@ pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
     const first_candidate = address -| (maximum_instruction_length - 1);
     const last_candidate = end - 1;
     const candidate_count = last_candidate - first_candidate + 1;
+    // Large unmaps and protection changes used to flush the entire cache
+    // before asking whether the range overlapped even one cached page. The
+    // observed run discarded 10.27 GiB of address ranges this way while
+    // recording zero precise executable rewrites. A word-level bitmap query
+    // rejects unrelated ranges first, so address-space housekeeping cannot
+    // evict immutable Xenia text.
+    if (!self.decode_cache_pages.anyInRange(first_candidate, last_candidate)) return;
     if (candidate_count >= @as(u64, @intCast(self.decode_cache.len))) {
-        // F3: the *only* place the generation moves. A wholesale flush cannot
-        // name which entries it invalidated, so every surviving entry has to
-        // re-prove itself by byte comparison — which is exactly what a
-        // generation mismatch asks for.
-        self.code_generation +%= 1;
-        if (self.code_generation == 0) self.code_generation = 1;
-        @memset(self.decode_cache, .{});
-        self.decode_cache_pages.reset();
+        // Candidate-address probing is O(range * ways), so a large range scans
+        // the resident table once instead. This is still precise: only entries
+        // whose instruction bytes overlap are cleared. No generation bump and
+        // no wholesale memset are needed, which preserves every unrelated
+        // decode and keeps the generation-keyed hit path armed.
+        for (self.decode_cache) |*entry| {
+            if (entry.rip == std.math.maxInt(u64)) continue;
+            const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+            const instruction_end = entry.rip +| instruction_length;
+            if (entry.rip < end and instruction_end > address) {
+                if (comptime @hasField(@TypeOf(self.*), "translation_economics")) {
+                    self.translation_economics.notePreciseInvalidation(entry.rip, end -| address);
+                }
+                entry.* = .{};
+            }
+        }
         return;
     }
     // F4: a code-cache page is written far more often than it is executed
@@ -5766,8 +5796,6 @@ pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
     // what the JIT emitter does. The bit is set in `decodeWithLiveOperands`
     // when an entry is populated, so a set bit means "an entry may exist
     // here", never the reverse.
-    if (!self.decode_cache_pages.anyCoveringRange(first_candidate, last_candidate)) return;
-
     // Any x86 instruction overlapping this write must begin between
     // address-14 and end-1. Probe exact candidate starts with the same hash as
     // decodeWithLiveOperands; this preserves precise invalidation without reverting to a
@@ -5792,6 +5820,9 @@ pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
             const instruction_length = @max(@as(u64, entry.decoded.len), 1);
             const instruction_end = entry.rip +| instruction_length;
             if (entry.rip < end and instruction_end > address) {
+                if (comptime @hasField(@TypeOf(self.*), "translation_economics")) {
+                    self.translation_economics.notePreciseInvalidation(entry.rip, end -| address);
+                }
                 entry.* = .{};
             }
         }

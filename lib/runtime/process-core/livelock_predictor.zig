@@ -67,6 +67,10 @@ const Signature = struct {
     object: u64 = 0,
     /// Last thread seen performing this operation (0 if unknown).
     thread: u64 = 0,
+    /// Guest PC where the operation was last observed, when the observing
+    /// state exposes a register file. Named because "find who waits on it"
+    /// needs a place to look: the symbol at this PC is where the cycle spins.
+    pc: u64 = 0,
     count: u32 = 0,
     emissions: u32 = 0,
     first_seen_step: u64 = 0,
@@ -103,6 +107,13 @@ pub const Predictor = struct {
         self.observations +|= 1;
         const signature = self.findOrInsert(op, object) orelse return;
         if (thread != 0) signature.thread = thread;
+        // S2 (audit): capture where in the guest the operation ran. The
+        // guest-log bridge runs on the thread that wrote the line, so the
+        // active register file's RIP is the guest's own site. Test states
+        // expose only `executed_steps`; only real states have `regs`.
+        if (comptime @hasField(@TypeOf(state.*), "regs")) {
+            signature.pc = state.regs.rip;
+        }
         self.pushRecent(op, object, state.executed_steps);
 
         const step = state.executed_steps;
@@ -138,11 +149,12 @@ pub const Predictor = struct {
             if (!signature.valid) continue;
             retained += 1;
             machoCapturePrint(
-                "LIVELOCK PREDICTOR: signature op={s} object=0x{x} thread=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d}\n",
+                "LIVELOCK PREDICTOR: signature op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d}\n",
                 .{
                     signature.op.label(),
                     signature.object,
                     signature.thread,
+                    signature.pc,
                     signature.count,
                     signature.first_seen_step,
                     signature.last_seen_step,
@@ -217,12 +229,13 @@ pub const Predictor = struct {
         else
             "recurrence";
         machoCapturePrint(
-            "LIVELOCK PREDICTOR: {s} op={s} object=0x{x} thread=0x{x} count={d} first_seen_step={d} last_seen_step={d} ring_stalled=YES step={d}; {s}\n",
+            "LIVELOCK PREDICTOR: {s} op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} ring_stalled=YES step={d}; {s}\n",
             .{
                 kind,
                 signature.op.label(),
                 signature.object,
                 signature.thread,
+                signature.pc,
                 signature.count,
                 signature.first_seen_step,
                 signature.last_seen_step,
@@ -282,6 +295,7 @@ pub const Predictor = struct {
             .op = op,
             .object = object,
             .thread = 0,
+            .pc = 0,
             .count = 0,
             .emissions = 0,
             .first_seen_step = 0,
@@ -352,6 +366,21 @@ test "wait cycle on a live object with a stalled ring is predicted" {
     // The thread that performed the operation is named, so the guidance
     // "find who waits on it" has an answer.
     try std.testing.expectEqual(@as(u64, 0x7fff2110), signature.thread);
+}
+
+// The emitted line names where in the guest the cycle spins, so a reader can
+// resolve the symbol at that PC instead of staring at an object address.
+test "the guest PC of the operation is captured when the state has registers" {
+    const TestState = struct {
+        executed_steps: u64 = 0,
+        regs: struct { rip: u64 = 0 } = .{ .rip = 0x82581ad0 },
+    };
+    var predictor = Predictor{};
+    var state = TestState{};
+    state.executed_steps = 100;
+    state.regs.rip = 0x82581ad0;
+    predictor.note(&state, .set_event, 0x827CEC28, 0x7fff2080, true);
+    try std.testing.expectEqual(@as(u64, 0x82581ad0), predictor.findOrInsert(.set_event, 0x827CEC28).?.pc);
 }
 
 test "the last observed thread is retained per signature" {
