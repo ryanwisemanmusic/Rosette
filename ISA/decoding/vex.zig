@@ -508,27 +508,39 @@ pub fn decodeVexInstruction(bytes: []const u8) ?DecodedInsn {
             return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpacksswb else return null, modrm_decoded);
         },
         0x64 => {
-            // VPUNPCKHBW (VEX.66.0F 64 /r) — unpack high bytes
-            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpckhbw else return null, modrm_decoded);
+            // VPCMPGTB (VEX.66.0F 64 /r) — packed signed greater-than, bytes
+            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpcmpgtb else return null, modrm_decoded);
         },
         0x65 => {
-            // VPUNPCKHWD (VEX.66.0F 65 /r) — unpack high words
-            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpckhwd else return null, modrm_decoded);
+            // VPCMPGTW (VEX.66.0F 65 /r) — packed signed greater-than, words
+            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpcmpgtw else return null, modrm_decoded);
         },
         0x66 => {
-            // VPUNPCKHDQ (VEX.66.0F 66 /r) — unpack high dwords
-            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpckhdq else return null, modrm_decoded);
+            // VPCMPGTD (VEX.66.0F 66 /r) — packed signed greater-than, dwords
+            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpcmpgtd else return null, modrm_decoded);
         },
         0x67 => {
             // VPACKUSWB (VEX.66.0F 67 /r) — pack with unsigned saturation
             return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpackuswb else return null, modrm_decoded);
         },
         0x68 => {
-            // VPUNPCKLQDQ (VEX.66.0F 68 /r) — unpack low qwords
-            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpcklqdq else return null, modrm_decoded);
+            // VPUNPCKHBW (VEX.66.0F 68 /r) — unpack high bytes
+            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpckhbw else return null, modrm_decoded);
         },
         0x69 => {
-            // VPUNPCKHQDQ (VEX.66.0F 69 /r) — unpack high qwords
+            // VPUNPCKHWD (VEX.66.0F 69 /r) — unpack high words
+            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpckhwd else return null, modrm_decoded);
+        },
+        0x6A => {
+            // VPUNPCKHDQ (VEX.66.0F 6A /r) — unpack high dwords
+            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpckhdq else return null, modrm_decoded);
+        },
+        0x6C => {
+            // VPUNPCKLQDQ (VEX.66.0F 6C /r) — unpack low qwords
+            return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpcklqdq else return null, modrm_decoded);
+        },
+        0x6D => {
+            // VPUNPCKHQDQ (VEX.66.0F 6D /r) — unpack high qwords
             return decodeVexReturn(vex, pos, if (vex.has_66_prefix) .vpunpckhqdq else return null, modrm_decoded);
         },
         0x6E => {
@@ -1468,8 +1480,8 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
         return decoded;
     }
 
-    // VPUNPCKHBW/HDQ/HWD: VEX.NDS.128.66.0F.WIG 68/69/6A /r
-    if ((opcode == 0x68 or opcode == 0x69 or opcode == 0x6A) and prefix == 1) {
+    // VPUNPCKHBW/HDQ/HWD/HQDQ: VEX.NDS.128.66.0F.WIG 68/69/6A/6D /r
+    if ((opcode == 0x68 or opcode == 0x69 or opcode == 0x6A or opcode == 0x6D) and prefix == 1) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
         var pos = start_pos + 3;
         const is_mem = bytes[pos] < 0xC0;
@@ -1486,6 +1498,7 @@ pub fn decodeVex2(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x68 => .vpunpckhbw,
             0x69 => .vpunpckhwd,
             0x6A => .vpunpckhdq,
+            0x6D => .vpunpckhqdq,
             else => unreachable,
         };
         decoded.len = @intCast(pos);
@@ -1831,7 +1844,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
     // The three-operand integer forms: VEX.NDS.128.66.0F <op> /r, destination
     // in ModRM.reg, first source in VEX.vvvv, second in ModRM.r/m.
     if (opcode_map == 1 and prefix == 1 and switch (opcode) {
-        0x60, 0x61, 0x68, 0x69, 0x6A => true,
+        0x60, 0x61, 0x68, 0x69, 0x6A, 0x6D => true,
         else => false,
     }) {
         var decoded = DecodedInsn{ .vector_256 = vector_256 };
@@ -1852,6 +1865,7 @@ pub fn decodeVex3(bytes: []const u8, start_pos: usize) DecodedInsn {
             0x68 => .vpunpckhbw,
             0x69 => .vpunpckhwd,
             0x6A => .vpunpckhdq,
+            0x6D => .vpunpckhqdq,
             else => unreachable,
         };
         decoded.len = @intCast(pos);

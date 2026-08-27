@@ -164,6 +164,51 @@ test "VEX packed min/max decodes through the production three-byte path" {
     }
 }
 
+test "VPUNPCK unpack family decodes in both VEX forms with correct opcodes" {
+    // The unpack family spans 66.0F 60-6D: LBW/LWD/LDQ at 60-62, HBW/HWD/HDQ
+    // at 68-6A, LQDQ at 6C, HQDQ at 6D. Regression: 0x6D (VPUNPCKHQDQ) was
+    // absent from both decodeVex2 and decodeVex3, so the op had an execution
+    // arm it could never reach and any byte sequence it should decode fell
+    // through as invalid; and the test-only decodeVexInstruction table mapped
+    // 0x68/0x69 to the qword ops and 0x64-0x66 to unpack instead of the
+    // packed compares, contradicting Intel SDM and the x86 .inc tables.
+    const two_byte = [_]struct { bytes: [4]u8, want: types.Op }{
+        .{ .bytes = .{ 0xC5, 0xF9, 0x60, 0xC1 }, .want = .vpunpcklbw },
+        .{ .bytes = .{ 0xC5, 0xF9, 0x61, 0xC1 }, .want = .vpunpcklwd },
+        .{ .bytes = .{ 0xC5, 0xF9, 0x68, 0xC1 }, .want = .vpunpckhbw },
+        .{ .bytes = .{ 0xC5, 0xF9, 0x69, 0xC1 }, .want = .vpunpckhwd },
+        .{ .bytes = .{ 0xC5, 0xF9, 0x6A, 0xC1 }, .want = .vpunpckhdq },
+        .{ .bytes = .{ 0xC5, 0xF9, 0x6C, 0xC1 }, .want = .vpunpcklqdq },
+        .{ .bytes = .{ 0xC5, 0xF9, 0x6D, 0xC1 }, .want = .vpunpckhqdq },
+    };
+    for (two_byte) |c| {
+        const decoded = vex.decodeVex2(&c.bytes, 0);
+        try std.testing.expectEqual(c.want, decoded.op);
+        // Both sources are live: VEX.vvvv lands in xmm_src, ModRM.rm in xmm_src2.
+        try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src2);
+    }
+
+    const three_byte = [_]struct { bytes: [5]u8, want: types.Op }{
+        .{ .bytes = .{ 0xC4, 0xE1, 0x79, 0x60, 0xC1 }, .want = .vpunpcklbw },
+        .{ .bytes = .{ 0xC4, 0xE1, 0x79, 0x61, 0xC1 }, .want = .vpunpcklwd },
+        .{ .bytes = .{ 0xC4, 0xE1, 0x79, 0x68, 0xC1 }, .want = .vpunpckhbw },
+        .{ .bytes = .{ 0xC4, 0xE1, 0x79, 0x69, 0xC1 }, .want = .vpunpckhwd },
+        .{ .bytes = .{ 0xC4, 0xE1, 0x79, 0x6A, 0xC1 }, .want = .vpunpckhdq },
+        .{ .bytes = .{ 0xC4, 0xE1, 0x79, 0x6C, 0xC1 }, .want = .vpunpcklqdq },
+        .{ .bytes = .{ 0xC4, 0xE1, 0x79, 0x6D, 0xC1 }, .want = .vpunpckhqdq },
+    };
+    for (three_byte) |c| {
+        const decoded = vex.decodeVex3(&c.bytes, 0);
+        try std.testing.expectEqual(c.want, decoded.op);
+        try std.testing.expectEqual(@as(u8, 1), decoded.xmm_src2);
+    }
+
+    // 0x64-0x66 are the packed signed compares, not unpack ops.
+    try std.testing.expectEqual(types.Op.vpcmpgtb, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x64, 0xC1 }, 0).op);
+    try std.testing.expectEqual(types.Op.vpcmpgtw, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x65, 0xC1 }, 0).op);
+    try std.testing.expectEqual(types.Op.vpcmpgtd, vex.decodeVex2(&[_]u8{ 0xC5, 0xF9, 0x66, 0xC1 }, 0).op);
+}
+
 test "every decoder family analyzes cleanly (refAllDecls)" {
     std.testing.refAllDecls(types);
     std.testing.refAllDecls(prefix);
