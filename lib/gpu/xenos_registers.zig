@@ -16,6 +16,7 @@ const std = @import("std");
 /// `regs.CP_RB_BASE`, and so this file stays the one place that owns the
 /// *values* a register holds.
 const register_map = @import("xenos_register_map");
+const journal_module = @import("register_journal.zig");
 
 pub const Register = register_map.Register;
 pub const register_count = register_map.register_count;
@@ -519,6 +520,15 @@ pub const RegisterFile = struct {
     read_count: u64 = 0,
     unknown_write_count: u64 = 0,
     last_register: Register = 0,
+    /// Which registers the writes actually addressed.
+    ///
+    /// `write_count` alone cannot separate a title that programmed forty
+    /// shader constants from one that programmed a colour target, and that
+    /// distinction is the difference between a guest fact and a harness
+    /// defect. Journalled here rather than at the executor because this is the
+    /// one place every write funnels through, including the range writes that
+    /// a per-call-site hook would miss.
+    journal: journal_module.Journal = .{},
 
     pub fn read(self: *RegisterFile, register: Register) u32 {
         self.read_count +%= 1;
@@ -534,6 +544,7 @@ pub const RegisterFile = struct {
     pub fn write(self: *RegisterFile, register: Register, value: u32) void {
         self.write_count +%= 1;
         self.last_register = register;
+        self.journal.record(register, value, self.write_count);
         if (register >= register_count) {
             self.unknown_write_count +%= 1;
             return;
@@ -888,4 +899,39 @@ test "register indices match the Xenos register aperture" {
     try std.testing.expectEqual(@as(Register, 0x2114), PA_CL_VPORT_ZOFFSET);
     try std.testing.expectEqual(@as(Register, 0x2102), VGT_INDX_OFFSET);
     try std.testing.expectEqual(@as(Register, 0x231B), RB_COPY_DEST_INFO);
+}
+
+test "the register file journals which registers a write addressed" {
+    // `write_count` cannot tell forty shader constants from a colour target,
+    // and that difference decides whether a missing render target is the
+    // title's doing or the harness losing the write.
+    var regs = RegisterFile{};
+    var index: u32 = 0;
+    while (index < 40) : (index += 1) {
+        regs.write(@intCast(0x4000 + index), 1 + index);
+    }
+    try std.testing.expectEqual(@as(u64, 40), regs.write_count);
+    try std.testing.expectEqual(journal_module.Verdict.target_never_addressed, regs.journal.verdict());
+    try std.testing.expect(regs.journal.block(.shader_constants).touched());
+    try std.testing.expect(!regs.journal.block(.render_backend).touched());
+
+    regs.write(RB_COLOR_INFO, 0x101 | (6 << 16));
+    try std.testing.expectEqual(journal_module.Verdict.target_programmed, regs.journal.verdict());
+    try std.testing.expect(regs.journal.target(RB_COLOR_INFO).?.ever_nonzero);
+}
+
+test "a range write is journalled register by register" {
+    var regs = RegisterFile{};
+    const values = [_]u32{ 1280 | (2 << 16), 0x101 | (6 << 16), 0x1 };
+    regs.writeRange(RB_SURFACE_INFO, &values);
+    try std.testing.expectEqual(@as(u64, 3), regs.journal.writes);
+    try std.testing.expectEqual(@as(usize, 3), regs.journal.summary().target_nonzero);
+}
+
+test "an out-of-range write is journalled as well as dropped" {
+    var regs = RegisterFile{};
+    regs.write(0xFFFF, 1);
+    try std.testing.expectEqual(@as(u64, 1), regs.unknown_write_count);
+    try std.testing.expectEqual(@as(u64, 1), regs.journal.out_of_range_writes);
+    try std.testing.expectEqual(@as(u32, 0), regs.peek(0xFFFF));
 }

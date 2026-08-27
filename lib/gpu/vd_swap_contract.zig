@@ -32,6 +32,7 @@ pub const probesFor = contract.probesFor;
 pub const dependencies = contract.dependencies;
 pub const chainStageCount = contract.chainStageCount;
 pub const chainOf = contract.chainOf;
+pub const observedCount = contract.observedCount;
 
 pub const max_frontbuffer_candidates: usize = 8;
 

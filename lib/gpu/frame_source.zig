@@ -152,6 +152,11 @@ pub const Descriptor = struct {
     /// Monotonic, assigned by the inbox. Distinguishes a new frame from the
     /// same frame presented again, which is otherwise invisible.
     serial: u64 = 0,
+    /// Digest of the complete readable payload at publication time. A pointer
+    /// to a reused buffer is not a frame generation: content changing under
+    /// the same pointer must create a generation, while an unchanged buffer
+    /// observed on 148 heartbeats must remain one frame.
+    content_digest: u64 = 0,
 
     pub fn valid(self: Descriptor) bool {
         return self.source_address != 0 and self.source_length != 0 and
@@ -167,6 +172,82 @@ pub const Descriptor = struct {
             self.row_pitch_bytes;
         return pitch * self.height;
     }
+};
+
+pub const ContentObservation = struct {
+    digest: u64,
+    nonzero: bool,
+};
+
+/// Inspect a candidate once for frame-generation identity. Wyhash gives the
+/// full byte payload a stable 64-bit identity; the explicit non-zero fact keeps
+/// an allocated-but-unwritten image from being advertised as guest output.
+pub fn inspectContent(bytes: []const u8) ContentObservation {
+    var nonzero = false;
+    for (bytes) |byte| {
+        if (byte != 0) {
+            nonzero = true;
+            break;
+        }
+    }
+    const raw = std.hash.Wyhash.hash(0x524F_5345_5454_4533, bytes);
+    return .{ .digest = if (raw == 0) 1 else raw, .nonzero = nonzero };
+}
+
+pub const ContentStamp = struct {
+    producer_source: u64 = 0,
+    source_length: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    format: u32 = 0,
+    row_pitch_bytes: u64 = 0,
+    orientation: Orientation = .top_down,
+    fit: Fit = .letterbox,
+    producer: provenance.Producer = .xenia_host,
+    guest_swap_observed: bool = false,
+    digest: u64 = 0,
+
+    fn fromDescriptor(descriptor: Descriptor, producer_source: u64, digest: u64) ContentStamp {
+        return .{
+            .producer_source = producer_source,
+            .source_length = descriptor.source_length,
+            .width = descriptor.width,
+            .height = descriptor.height,
+            .format = descriptor.format,
+            .row_pitch_bytes = descriptor.row_pitch_bytes,
+            .orientation = descriptor.orientation,
+            .fit = descriptor.fit,
+            .producer = descriptor.producer,
+            .guest_swap_observed = descriptor.guest_swap_observed,
+            .digest = digest,
+        };
+    }
+
+    fn sameSource(self: ContentStamp, other: ContentStamp) bool {
+        return self.producer_source == other.producer_source and
+            self.source_length == other.source_length and
+            self.width == other.width and self.height == other.height and
+            self.format == other.format and
+            self.row_pitch_bytes == other.row_pitch_bytes and
+            self.orientation == other.orientation and self.fit == other.fit and
+            self.producer == other.producer and
+            self.guest_swap_observed == other.guest_swap_observed;
+    }
+
+    fn eql(self: ContentStamp, other: ContentStamp) bool {
+        return self.sameSource(other) and self.digest == other.digest;
+    }
+};
+
+pub const PublicationDisposition = enum(u8) {
+    published,
+    unchanged,
+    rejected,
+};
+
+pub const Publication = struct {
+    disposition: PublicationDisposition,
+    serial: u64 = 0,
 };
 
 /// Why the presenter had no frame to show. Each value is a different thing to
@@ -217,6 +298,11 @@ pub const Inbox = struct {
     /// error — but a rate worth knowing.
     dropped: u64 = 0,
     last_absence: ?Absence = .never_published,
+    content_observations: u64 = 0,
+    unchanged_observations: u64 = 0,
+    content_changes: u64 = 0,
+    source_changes: u64 = 0,
+    last_content: ?ContentStamp = null,
 
     pub fn publish(self: *Inbox, descriptor: Descriptor) u64 {
         if (!descriptor.valid()) {
@@ -240,6 +326,44 @@ pub const Inbox = struct {
         self.published +|= 1;
         self.last_absence = null;
         return stored.serial;
+    }
+
+    /// Publish only a genuinely new source generation. This is the ingress
+    /// equivalent of the GPU work-credit ledger: polling and heartbeat logs
+    /// may observe a frame repeatedly, but only a descriptor or byte-content
+    /// change earns a new serial.
+    pub fn publishIfChanged(
+        self: *Inbox,
+        descriptor: Descriptor,
+        producer_source: u64,
+        content_digest: u64,
+    ) Publication {
+        self.content_observations +|= 1;
+        if (!descriptor.valid() or producer_source == 0 or content_digest == 0) {
+            self.last_absence = .malformed_descriptor;
+            return .{ .disposition = .rejected };
+        }
+
+        const stamp = ContentStamp.fromDescriptor(descriptor, producer_source, content_digest);
+        if (self.last_content) |previous| {
+            if (previous.eql(stamp)) {
+                self.unchanged_observations +|= 1;
+                return .{ .disposition = .unchanged, .serial = self.latest_serial };
+            }
+            if (previous.sameSource(stamp))
+                self.content_changes +|= 1
+            else
+                self.source_changes +|= 1;
+        } else {
+            self.source_changes +|= 1;
+        }
+
+        var stamped = descriptor;
+        stamped.content_digest = content_digest;
+        const serial = self.publish(stamped);
+        if (serial == 0) return .{ .disposition = .rejected };
+        self.last_content = stamp;
+        return .{ .disposition = .published, .serial = serial };
     }
 
     /// Take the newest unconsumed frame, if there is one. The returned
@@ -272,6 +396,17 @@ pub const Inbox = struct {
 
     pub fn absence(self: *const Inbox) Absence {
         return self.last_absence orelse .already_consumed;
+    }
+
+    /// Newest descriptor whether or not it has already been consumed. This is
+    /// observation-only: ownership remains with `acquire`/`release`.
+    pub fn latest(self: *const Inbox) ?Descriptor {
+        var best: ?Descriptor = null;
+        for (self.slots) |slot| {
+            if (slot.serial == 0) continue;
+            if (best == null or slot.serial > best.?.serial) best = slot;
+        }
+        return best;
     }
 
     pub fn noteUnusable(self: *Inbox, reason: Absence) void {
@@ -394,6 +529,7 @@ test "the newest frame wins and overwritten ones are counted, not hidden" {
     const newest = inbox.acquire().?;
     try std.testing.expectEqual(@as(u64, 3), newest.serial);
     try std.testing.expectEqual(@as(u64, 0x3000), newest.source_address);
+    try std.testing.expectEqual(@as(u64, 3), inbox.latest().?.serial);
 }
 
 test "a malformed descriptor is refused and named" {
@@ -401,6 +537,64 @@ test "a malformed descriptor is refused and named" {
     try std.testing.expectEqual(@as(u64, 0), inbox.publish(.{ .width = 4, .height = 4 }));
     try std.testing.expectEqual(Absence.malformed_descriptor, inbox.absence());
     try std.testing.expectEqual(@as(u64, 0), inbox.published);
+}
+
+test "retained pixels observed repeatedly earn one frame serial" {
+    var inbox = Inbox{};
+    const descriptor = Descriptor{
+        .source_address = 0x2000,
+        .source_length = 16,
+        .width = 2,
+        .height = 2,
+        .format = 44,
+        .row_pitch_bytes = 8,
+    };
+    const first = inbox.publishIfChanged(descriptor, 0x1000, 0xAAAA);
+    try std.testing.expectEqual(PublicationDisposition.published, first.disposition);
+    try std.testing.expectEqual(@as(u64, 1), first.serial);
+
+    var heartbeat: usize = 0;
+    while (heartbeat < 147) : (heartbeat += 1) {
+        const repeated = inbox.publishIfChanged(descriptor, 0x1000, 0xAAAA);
+        try std.testing.expectEqual(PublicationDisposition.unchanged, repeated.disposition);
+        try std.testing.expectEqual(@as(u64, 1), repeated.serial);
+    }
+    try std.testing.expectEqual(@as(u64, 1), inbox.published);
+    try std.testing.expectEqual(@as(u64, 147), inbox.unchanged_observations);
+}
+
+test "content and semantic presentation changes create new generations" {
+    var inbox = Inbox{};
+    var descriptor = Descriptor{
+        .source_address = 0x2000,
+        .source_length = 16,
+        .width = 2,
+        .height = 2,
+        .format = 44,
+        .row_pitch_bytes = 8,
+    };
+    _ = inbox.publishIfChanged(descriptor, 0x1000, 0xAAAA);
+    const changed = inbox.publishIfChanged(descriptor, 0x1000, 0xBBBB);
+    try std.testing.expectEqual(PublicationDisposition.published, changed.disposition);
+    try std.testing.expectEqual(@as(u64, 1), inbox.content_changes);
+
+    descriptor.guest_swap_observed = true;
+    const requested = inbox.publishIfChanged(descriptor, 0x1000, 0xBBBB);
+    try std.testing.expectEqual(PublicationDisposition.published, requested.disposition);
+    try std.testing.expectEqual(@as(u64, 2), inbox.source_changes);
+    try std.testing.expectEqual(@as(u64, 3), inbox.published);
+}
+
+test "content inspection distinguishes empty and written frames" {
+    const empty = [_]u8{0} ** 64;
+    var written = empty;
+    written[31] = 1;
+    const empty_result = inspectContent(&empty);
+    const written_result = inspectContent(&written);
+    try std.testing.expect(!empty_result.nonzero);
+    try std.testing.expect(written_result.nonzero);
+    try std.testing.expect(empty_result.digest != 0);
+    try std.testing.expect(written_result.digest != empty_result.digest);
 }
 
 test "every absence names a different thing to fix" {

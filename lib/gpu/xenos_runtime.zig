@@ -11,19 +11,51 @@
 const std = @import("std");
 const edram = @import("edram.zig");
 const interrupt = @import("interrupt_controller.zig");
+const observation_contract = @import("xenia_gpu_observation_contract");
 const pipeline = @import("pipeline_state.zig");
 const pm4 = @import("pm4.zig");
+const pm4_contract = @import("xenia_pm4_contract");
 const executor_module = @import("pm4_executor.zig");
+const packet_trace = @import("packet_trace.zig");
 const registers = @import("xenos_registers.zig");
 const formats = @import("xenos_formats.zig");
 const shader = @import("xenos_shader.zig");
 
-pub const max_ring_dwords: usize = 16 * 1024;
+pub const max_ring_dwords: usize = observation_contract.max_ring_dwords;
+
+comptime {
+    if (observation_contract.max_indirect_depth != pm4_contract.max_indirect_depth or
+        observation_contract.max_indirect_dwords != pm4_contract.max_indirect_dwords or
+        observation_contract.max_indirect_references != pm4_contract.max_indirect_references)
+    {
+        @compileError("GPU observation and PM4 packages disagree on indirect-buffer bounds");
+    }
+}
 
 pub const ExecuteError = error{
     InvalidRing,
     TruncatedRing,
     PacketError,
+};
+
+/// Whether command execution owns guest-visible effects or is reconstructing
+/// state from a batch Xenia already consumed. Retained inspection may update
+/// Rosette's register/draw evidence, but it must never publish a second
+/// interrupt, satisfy a wait twice, or overwrite guest memory.
+pub const ExecutionDisposition = enum(u8) {
+    live,
+    retained_observation,
+
+    pub fn publishesEffects(self: ExecutionDisposition) bool {
+        return self == .live;
+    }
+
+    pub fn label(self: ExecutionDisposition) []const u8 {
+        return switch (self) {
+            .live => "live",
+            .retained_observation => "retained-observation",
+        };
+    }
 };
 
 pub const IndirectStatus = enum(u8) {
@@ -34,6 +66,7 @@ pub const IndirectStatus = enum(u8) {
     invalid,
     depth_limit,
     budget_limit,
+    cycle,
 
     pub fn label(self: IndirectStatus) []const u8 {
         return switch (self) {
@@ -44,17 +77,21 @@ pub const IndirectStatus = enum(u8) {
             .invalid => "invalid",
             .depth_limit => "depth-limit",
             .budget_limit => "budget-limit",
+            .cycle => "cycle",
         };
     }
 };
 
 pub const Report = struct {
+    disposition: ExecutionDisposition = .live,
     dwords: u32 = 0,
     packets_before: u64 = 0,
     packets_after: u64 = 0,
     draws: u64 = 0,
     events: u64 = 0,
     swaps: u64 = 0,
+    draw_completion_observations: u64 = 0,
+    draw_completion_signals: u64 = 0,
     unknown_opcodes: u64 = 0,
     truncated: bool = false,
     indirect_buffers: u64 = 0,
@@ -65,9 +102,11 @@ pub const Report = struct {
     indirect_invalid: u64 = 0,
     indirect_depth_limited: u64 = 0,
     indirect_budget_limited: u64 = 0,
+    indirect_cycles: u64 = 0,
     indirect_last_status: IndirectStatus = .not_attempted,
     indirect_last_address: u32 = 0,
     indirect_last_missing_address: ?u32 = null,
+    packet_summary: packet_trace.Summary = .{},
 };
 
 pub const TextureBinding = struct {
@@ -96,6 +135,11 @@ pub const RenderTargetEvidence = struct {
     raw_surface_info: u32 = 0,
 };
 
+const ActiveIndirectRange = struct {
+    address: u32 = 0,
+    size_dwords: u32 = 0,
+};
+
 pub const Runtime = struct {
     executor: executor_module.Executor = .{},
     interrupts: interrupt.Controller = .{},
@@ -105,6 +149,10 @@ pub const Runtime = struct {
     event_count: u64 = 0,
     swap_count: u64 = 0,
     draw_completion_signals: u64 = 0,
+    draw_completion_observations: u64 = 0,
+    retained_draw_observations: u64 = 0,
+    retained_event_observations: u64 = 0,
+    execution_disposition: ExecutionDisposition = .live,
     color_resolve_observations: u64 = 0,
     packet_errors: u64 = 0,
     truncated_rings: u64 = 0,
@@ -117,6 +165,10 @@ pub const Runtime = struct {
     indirect_invalid: u64 = 0,
     indirect_depth_limited: u64 = 0,
     indirect_budget_limited: u64 = 0,
+    indirect_cycles: u64 = 0,
+    indirect_execution_dwords: u64 = 0,
+    active_indirect_ranges: [observation_contract.max_indirect_references]ActiveIndirectRange = [_]ActiveIndirectRange{.{}} ** observation_contract.max_indirect_references,
+    active_indirect_count: usize = 0,
     indirect_last_status: IndirectStatus = .not_attempted,
     indirect_last_address: u32 = 0,
     indirect_last_missing_address: ?u32 = null,
@@ -127,6 +179,7 @@ pub const Runtime = struct {
     last_shader_type: shader.ShaderType = .unknown,
     shader_parse_failures: u64 = 0,
     shader_translation_observations: u64 = 0,
+    packet_timeline: packet_trace.Timeline = .{},
     /// Host-owned EDRAM backing supplied by the process.  Keeping it as a
     /// slice makes the 10 MiB allocation lazy and keeps Runtime cheap to copy
     /// in tests and in the Mach-O state object.
@@ -147,6 +200,8 @@ pub const Runtime = struct {
         self.executor.callback_context = @ptrCast(self);
         self.executor.event_callback = onEvent;
         self.executor.draw_callback = onDraw;
+        self.executor.packet_callback_context = @ptrCast(self);
+        self.executor.packet_callback = onPacket;
     }
 
     /// Attach the process-owned console memory view to the command processor.
@@ -221,13 +276,23 @@ pub const Runtime = struct {
     pub fn executeRingBytes(self: *Runtime, bytes: []const u8, read_pointer: u32, span_dwords: u32, ring_dwords: u32) ExecuteError!Report {
         if (ring_dwords == 0 or ring_dwords > max_ring_dwords or @as(u64, ring_dwords) * 4 > bytes.len) return error.InvalidRing;
         self.activate();
+        const packet_before = self.packet_timeline.snapshot();
+        // These are per-root-execution guards. They are reset only here, never
+        // by a nested callback, so a cyclic indirect stream is bounded across
+        // the entire batch rather than receiving a fresh budget at each edge.
+        self.indirect_depth = 0;
+        self.indirect_execution_dwords = 0;
+        self.active_indirect_count = 0;
         var report = Report{
+            .disposition = self.execution_disposition,
             .packets_before = self.executor.packet_count,
             .dwords = @min(span_dwords, ring_dwords),
         };
         const draws_before = self.executor.draw_count;
         const events_before = self.executor.event_count;
         const swaps_before = self.executor.swap_count;
+        const draw_observations_before = self.draw_completion_observations;
+        const draw_signals_before = self.draw_completion_signals;
         const indirect_buffers_before = self.indirect_buffers;
         const indirect_requested_before = self.indirect_dwords_requested;
         const indirect_read_before = self.indirect_dwords_read;
@@ -236,6 +301,7 @@ pub const Runtime = struct {
         const indirect_invalid_before = self.indirect_invalid;
         const indirect_depth_limited_before = self.indirect_depth_limited;
         const indirect_budget_limited_before = self.indirect_budget_limited;
+        const indirect_cycles_before = self.indirect_cycles;
         self.indirect_last_status = .not_attempted;
         self.indirect_last_address = 0;
         self.indirect_last_missing_address = null;
@@ -271,6 +337,8 @@ pub const Runtime = struct {
         report.draws = self.executor.draw_count - draws_before;
         report.events = self.executor.event_count - events_before;
         report.swaps = self.executor.swap_count - swaps_before;
+        report.draw_completion_observations = self.draw_completion_observations - draw_observations_before;
+        report.draw_completion_signals = self.draw_completion_signals - draw_signals_before;
         report.unknown_opcodes = self.executor.unknown_opcode_count;
         report.indirect_buffers = self.indirect_buffers - indirect_buffers_before;
         report.indirect_dwords_requested = self.indirect_dwords_requested - indirect_requested_before;
@@ -280,15 +348,26 @@ pub const Runtime = struct {
         report.indirect_invalid = self.indirect_invalid - indirect_invalid_before;
         report.indirect_depth_limited = self.indirect_depth_limited - indirect_depth_limited_before;
         report.indirect_budget_limited = self.indirect_budget_limited - indirect_budget_limited_before;
+        report.indirect_cycles = self.indirect_cycles - indirect_cycles_before;
         report.indirect_last_status = self.indirect_last_status;
         report.indirect_last_address = self.indirect_last_address;
         report.indirect_last_missing_address = self.indirect_last_missing_address;
+        report.packet_summary = self.packet_timeline.snapshot().delta(packet_before);
         self.draw_count = self.executor.draw_count;
         self.event_count = self.executor.event_count;
         self.swap_count = self.executor.swap_count;
         self.last_draw = self.executor.last_draw;
         self.last_swap = self.executor.last_swap;
         return report;
+    }
+
+    /// Decode a retained, already-consumed batch into Rosette-owned state
+    /// without replaying any guest-visible completion or interrupt effect.
+    pub fn inspectRetainedRingBytes(self: *Runtime, bytes: []const u8, read_pointer: u32, span_dwords: u32, ring_dwords: u32) ExecuteError!Report {
+        const previous = self.execution_disposition;
+        self.execution_disposition = .retained_observation;
+        defer self.execution_disposition = previous;
+        return self.executeRingBytes(bytes, read_pointer, span_dwords, ring_dwords);
     }
 
     fn cacheLastShader(self: *Runtime) void {
@@ -527,12 +606,30 @@ pub const Runtime = struct {
     fn onDraw(context: *anyopaque, draw: executor_module.Draw) void {
         const self: *Runtime = @ptrCast(@alignCast(context));
         self.last_draw = draw;
+        self.draw_completion_observations +|= 1;
+        if (!self.execution_disposition.publishesEffects()) {
+            self.retained_draw_observations +|= 1;
+            return;
+        }
         self.draw_completion_signals +|= 1;
         self.interrupts.publish(.draw_complete, registers.VGT_DRAW_INITIATOR, draw.count);
     }
 
+    fn onPacket(context: *anyopaque, observation: packet_trace.Observation) void {
+        const self: *Runtime = @ptrCast(@alignCast(context));
+        self.packet_timeline.record(observation);
+    }
+
     fn onEvent(context: *anyopaque, event: executor_module.Event) void {
         const self: *Runtime = @ptrCast(@alignCast(context));
+        if (!self.execution_disposition.publishesEffects()) {
+            self.retained_event_observations +|= 1;
+            switch (event) {
+                .swap => |value| self.last_swap = value,
+                else => {},
+            }
+            return;
+        }
         switch (event) {
             .event_write => |value| self.interrupts.publish(.fence, value.event_id, value.value),
             .event_write_shd => |value| self.interrupts.publish(.custom, value.event_id, value.value),
@@ -571,16 +668,45 @@ pub const Runtime = struct {
             self.indirect_last_status = .invalid;
             return;
         }
-        if (size_dwords > max_ring_dwords) {
+        if ((address & 3) != 0) {
+            self.indirect_invalid +|= 1;
+            self.indirect_last_status = .invalid;
+            self.indirect_last_missing_address = address;
+            return;
+        }
+        if (size_dwords > observation_contract.max_indirect_dwords) {
             self.indirect_budget_limited +|= 1;
             self.indirect_last_status = .budget_limit;
             return;
         }
-        if (self.indirect_depth >= 8) {
+        if (self.indirect_depth >= observation_contract.max_indirect_depth) {
             self.indirect_depth_limited +|= 1;
             self.indirect_last_status = .depth_limit;
             return;
         }
+        if (self.indirectRangeActive(address, size_dwords)) {
+            self.indirect_cycles +|= 1;
+            self.indirect_last_status = .cycle;
+            self.indirect_last_missing_address = address;
+            return;
+        }
+        const requested = @as(u64, size_dwords);
+        if (self.indirect_execution_dwords > observation_contract.max_indirect_execution_dwords or
+            requested > observation_contract.max_indirect_execution_dwords - self.indirect_execution_dwords)
+        {
+            self.indirect_budget_limited +|= 1;
+            self.indirect_last_status = .budget_limit;
+            return;
+        }
+        if (self.active_indirect_count >= self.active_indirect_ranges.len) {
+            self.indirect_budget_limited +|= 1;
+            self.indirect_last_status = .budget_limit;
+            return;
+        }
+        self.indirect_execution_dwords += requested;
+        self.active_indirect_ranges[self.active_indirect_count] = .{ .address = address, .size_dwords = size_dwords };
+        self.active_indirect_count += 1;
+        defer self.active_indirect_count -= 1;
         const read_callback = self.executor.memory_read_callback orelse {
             self.indirect_unreadable +|= 1;
             self.indirect_last_status = .unreadable;
@@ -593,7 +719,7 @@ pub const Runtime = struct {
             self.indirect_last_missing_address = address;
             return;
         };
-        var words: [max_ring_dwords]u32 = undefined;
+        var words: [observation_contract.max_indirect_dwords]u32 = undefined;
         var words_read: u32 = 0;
         for (0..@as(usize, @intCast(size_dwords))) |index| {
             const offset = std.math.mul(u32, @intCast(index), 4) catch {
@@ -625,9 +751,24 @@ pub const Runtime = struct {
         self.indirect_last_status = .complete;
         self.indirect_depth += 1;
         defer self.indirect_depth -= 1;
-        self.executor.execute(words[0..@as(usize, @intCast(size_dwords))]) catch {
+        self.executor.executeNested(
+            words[0..@as(usize, @intCast(size_dwords))],
+            self.indirect_depth,
+            address,
+        ) catch {
             self.packet_errors +|= 1;
         };
+    }
+
+    fn indirectRangeActive(self: *const Runtime, address: u32, size_dwords: u32) bool {
+        const start = @as(u64, address);
+        const end = start + @as(u64, size_dwords) * 4;
+        for (self.active_indirect_ranges[0..self.active_indirect_count]) |active| {
+            const active_start = @as(u64, active.address);
+            const active_end = active_start + @as(u64, active.size_dwords) * 4;
+            if (start < active_end and active_start < end) return true;
+        }
+        return false;
     }
 };
 
@@ -698,6 +839,60 @@ test "Xenos runtime reports the indirect read boundary and executes a readable b
     try std.testing.expectEqual(@as(u64, 2), report.indirect_dwords_read);
     try std.testing.expectEqual(IndirectStatus.complete, report.indirect_last_status);
     try std.testing.expectEqual(@as(u64, 1), report.draws);
+    try std.testing.expectEqual(@as(u64, 2), report.packet_summary.packets);
+    try std.testing.expectEqual(@as(u64, 1), report.packet_summary.root_packets);
+    try std.testing.expectEqual(@as(u64, 1), report.packet_summary.nested_packets);
+    try std.testing.expectEqual(@as(u64, 1), report.packet_summary.classCount(.indirect));
+    try std.testing.expectEqual(@as(u64, 1), report.packet_summary.classCount(.draw));
+    try std.testing.expectEqual(@as(u64, 1), report.packet_summary.executedClassCount(.draw));
+    try std.testing.expectEqual(packet_trace.Source.indirect, report.packet_summary.last.?.source);
+    try std.testing.expectEqual(@as(u32, 0x100), report.packet_summary.last.?.stream_address);
+}
+
+test "Xenos runtime stops a cyclic indirect stream and records its provenance" {
+    var bytes = [_]u8{0} ** 64;
+    const packet = pm4.packetType3(.indirect_buffer, 2, false).?;
+    std.mem.writeInt(u32, bytes[0..4], packet, .big);
+    std.mem.writeInt(u32, bytes[4..8], 0x100, .big);
+    std.mem.writeInt(u32, bytes[8..12], 3, .big);
+
+    var memory = IndirectMemoryFixture{};
+    memory.words[0x100 / 4] = packet;
+    memory.words[0x104 / 4] = 0x100;
+    memory.words[0x108 / 4] = 3;
+
+    var runtime = Runtime.init();
+    runtime.attachMemory(&memory, IndirectMemoryFixture.read, &memory, null);
+    const report = try runtime.executeRingBytes(&bytes, 0, 3, 16);
+
+    try std.testing.expectEqual(@as(u64, 2), report.indirect_buffers);
+    try std.testing.expectEqual(@as(u64, 1), report.indirect_cycles);
+    try std.testing.expectEqual(IndirectStatus.cycle, report.indirect_last_status);
+    try std.testing.expectEqual(@as(?u32, 0x100), report.indirect_last_missing_address);
+    try std.testing.expectEqual(@as(u64, 2), report.packet_summary.packets);
+    try std.testing.expectEqual(@as(u64, 2), report.packet_summary.executedClassCount(.indirect));
+    try std.testing.expectEqual(@as(u8, 1), report.packet_summary.max_depth);
+}
+
+test "Xenos runtime distinguishes a framed predicated draw from submitted work" {
+    var bytes = [_]u8{0} ** 64;
+    const packet = pm4.packetType3(.draw_indx_2, 1, true).?;
+    std.mem.writeInt(u32, bytes[0..4], packet, .big);
+    std.mem.writeInt(u32, bytes[4..8], (registers.DrawInitiator{
+        .primitive = .triangle_list,
+        .source = .auto_index,
+        .major_mode_explicit = false,
+        .index_format = .uint16,
+        .not_end_of_pipe = false,
+        .index_count = 3,
+    }).encode(), .big);
+
+    var runtime = Runtime.init();
+    const report = try runtime.executeRingBytes(&bytes, 0, 2, 16);
+    try std.testing.expectEqual(@as(u64, 0), report.draws);
+    try std.testing.expectEqual(@as(u64, 1), report.packet_summary.classCount(.draw));
+    try std.testing.expectEqual(@as(u64, 0), report.packet_summary.executedClassCount(.draw));
+    try std.testing.expectEqual(@as(u64, 1), runtime.executor.predicated_skip_count);
 }
 
 test "Xenos runtime distinguishes an unreadable indirect buffer from a zero-filled one" {
@@ -798,13 +993,14 @@ test "Xenos runtime caches a shader loaded by IM_LOAD_IMMEDIATE" {
     try std.testing.expectEqual(@as(u64, 1), runtime.shader_cache.misses);
 }
 
-test "a read-only replay programs registers and signals draws without writing guest memory" {
+test "retained inspection programs state without publishing duplicate effects" {
     // The retained-batch path replays a batch the emulator's command processor
     // has already drained, so its MEM_WRITE packets have already landed in
     // guest memory.  Re-applying them would make Rosette overwrite fence and
     // progress values the guest has since advanced.  Attaching a null write
     // callback is what prevents that, and this proves the price is only the
-    // writes: register state, draw completion and target evidence all survive.
+    // writes: register state, draw observation and target evidence all survive,
+    // while completion publication remains owned by the original execution.
     var bytes = [_]u8{0} ** 128;
     var offset: usize = 0;
 
@@ -837,10 +1033,15 @@ test "a read-only replay programs registers and signals draws without writing gu
     var memory = IndirectMemoryFixture{};
     var runtime = Runtime.init();
     runtime.attachMemory(&memory, IndirectMemoryFixture.read, &memory, null);
-    const report = try runtime.executeRingBytes(&bytes, 0, @intCast(offset / 4), 32);
+    const report = try runtime.inspectRetainedRingBytes(&bytes, 0, @intCast(offset / 4), 32);
 
     try std.testing.expectEqual(@as(u64, 1), report.draws);
-    try std.testing.expectEqual(@as(u64, 1), runtime.draw_completion_signals);
+    try std.testing.expectEqual(ExecutionDisposition.retained_observation, report.disposition);
+    try std.testing.expectEqual(@as(u64, 1), report.draw_completion_observations);
+    try std.testing.expectEqual(@as(u64, 0), report.draw_completion_signals);
+    try std.testing.expectEqual(@as(u64, 1), runtime.retained_draw_observations);
+    try std.testing.expectEqual(@as(u64, 0), runtime.draw_completion_signals);
+    try std.testing.expectEqual(@as(u8, 0), runtime.interrupts.pending_count);
 
     // The register file carries the programmed target, which is the whole
     // reason the retained batch is replayed at all.

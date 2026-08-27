@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const pm4 = @import("pm4.zig");
+const pm4_fault_journal = @import("pm4_fault_journal.zig");
+const packet_trace = @import("packet_trace.zig");
 const regs = @import("xenos_registers.zig");
 
 pub const Failure = enum(u8) {
@@ -66,10 +68,24 @@ pub const DrawCallback = *const fn (context: *anyopaque, draw: Draw) void;
 pub const MemoryReadCallback = *const fn (context: *anyopaque, address: u32) ?u32;
 pub const MemoryWriteCallback = *const fn (context: *anyopaque, address: u32, value: u32, endian: u2) bool;
 pub const IndirectBufferCallback = *const fn (context: *anyopaque, address: u32, size_dwords: u32) void;
+pub const PacketCallback = *const fn (context: *anyopaque, observation: packet_trace.Observation) void;
+
+const FaultContext = struct {
+    source: packet_trace.Source,
+    depth: u8,
+    base_address: u32,
+    dword_offset: u32,
+    header: pm4.Header,
+    available_dwords: u32,
+};
 
 pub const Executor = struct {
     register_file: regs.RegisterFile = .{},
     packet_count: u64 = 0,
+    /// Sequence of successfully framed packets. `packet_count` retains its
+    /// historical meaning and includes a packet header before a truncation is
+    /// returned; this sequence is the stable key for the packet timeline.
+    packet_sequence: u64 = 0,
     type0_count: u64 = 0,
     type2_count: u64 = 0,
     type3_count: u64 = 0,
@@ -128,6 +144,8 @@ pub const Executor = struct {
     occlusion_samples: u32 = 100,
     completion_counter: u32 = 0,
     last_error: ?Failure = null,
+    fault_journal: pm4_fault_journal.Journal = .{},
+    active_fault_context: ?FaultContext = null,
     last_draw: ?Draw = null,
     last_swap: ?pm4.SwapDescription = null,
     callback_context: ?*anyopaque = null,
@@ -139,8 +157,30 @@ pub const Executor = struct {
     memory_write_callback: ?MemoryWriteCallback = null,
     indirect_buffer_context: ?*anyopaque = null,
     indirect_buffer_callback: ?IndirectBufferCallback = null,
+    packet_callback_context: ?*anyopaque = null,
+    packet_callback: ?PacketCallback = null,
 
     pub fn execute(self: *Executor, dwords: []const u32) Error!void {
+        return self.executeWithContext(dwords, .root, 0, 0);
+    }
+
+    /// Execute an already validated indirect buffer while preserving its
+    /// provenance in the packet timeline. The old implementation recursively
+    /// called `execute`, which made all nested packets look like root-ring
+    /// packets and hid where the draw or wait actually lived.
+    pub fn executeNested(self: *Executor, dwords: []const u32, depth: u8, base_address: u32) Error!void {
+        return self.executeWithContext(dwords, .indirect, depth, base_address);
+    }
+
+    fn executeWithContext(
+        self: *Executor,
+        dwords: []const u32,
+        source: packet_trace.Source,
+        depth: u8,
+        base_address: u32,
+    ) Error!void {
+        const parent_fault_context = self.active_fault_context;
+        defer self.active_fault_context = parent_fault_context;
         var index: usize = 0;
         while (index < dwords.len) {
             self.program_counter +%= 1;
@@ -148,12 +188,49 @@ pub const Executor = struct {
             const header = pm4.decodeHeader(dwords[index]);
             self.packet_count +%= 1;
             const total = header.totalDwords();
-            if (total == 0 or index + total > dwords.len) {
+            const total_usize: usize = @intCast(total);
+            if (total == 0 or total_usize > dwords.len - index) {
                 self.invalid_packet_count +%= 1;
                 self.last_error = .truncated_packet;
+                self.fault_journal.record(
+                    .truncated_packet,
+                    self.packet_sequence +| 1,
+                    source,
+                    depth,
+                    base_address,
+                    @intCast(index),
+                    header,
+                    @intCast(dwords.len - index),
+                );
                 return error.truncated_packet;
             }
-            const payload = dwords[index + 1 .. index + total];
+            self.active_fault_context = .{
+                .source = source,
+                .depth = depth,
+                .base_address = base_address,
+                .dword_offset = @intCast(index),
+                .header = header,
+                .available_dwords = total,
+            };
+            const executes = self.packetWillExecute(header);
+            self.packet_sequence +|= 1;
+            if (self.packet_callback) |callback| {
+                if (self.packet_callback_context) |callback_context| {
+                    callback(
+                        callback_context,
+                        packet_trace.fromHeader(
+                            self.packet_sequence,
+                            source,
+                            depth,
+                            base_address +% (@as(u32, @intCast(index)) *% 4),
+                            @intCast(index),
+                            header,
+                            executes,
+                        ),
+                    );
+                }
+            }
+            const payload = dwords[index + 1 .. index + total_usize];
             switch (header.kind) {
                 .type0 => self.executeType0(header, payload),
                 .type1 => {
@@ -162,9 +239,9 @@ pub const Executor = struct {
                     self.register_file.write(header.register_index_2, payload[1]);
                 },
                 .type2 => self.type2_count +%= 1,
-                .type3 => try self.executeType3(header.opcode, payload, dwords[index .. index + total], header.predicated),
+                .type3 => try self.executeType3(header.opcode, payload, dwords[index .. index + total_usize], header.predicated),
             }
-            index += total;
+            index += total_usize;
             if (self.conditional_skip_dwords != 0) {
                 const skip = @min(self.conditional_skip_dwords, @as(u32, @intCast(dwords.len - index)));
                 index += @as(usize, @intCast(skip));
@@ -172,6 +249,12 @@ pub const Executor = struct {
             }
         }
         self.last_error = null;
+    }
+
+    fn packetWillExecute(self: *const Executor, header: pm4.Header) bool {
+        if (header.kind != .type3) return true;
+        const raw = @as(u32, @intFromEnum(header.opcode));
+        return !(header.predicated and (raw == 0x64 or (self.bin_select & self.bin_mask) == 0));
     }
 
     fn executeType0(self: *Executor, header: pm4.Header, payload: []const u32) void {
@@ -781,6 +864,7 @@ pub const Executor = struct {
     fn fail(self: *Executor, err: Failure) Error {
         self.invalid_packet_count +%= 1;
         self.last_error = err;
+        self.recordFault(err);
         return switch (err) {
             .truncated_packet => error.truncated_packet,
             .invalid_packet => error.invalid_packet,
@@ -791,6 +875,26 @@ pub const Executor = struct {
     fn recordInvalidPacket(self: *Executor) void {
         self.invalid_packet_count +%= 1;
         self.last_error = .invalid_packet;
+        self.recordFault(.invalid_packet);
+    }
+
+    fn recordFault(self: *Executor, failure: Failure) void {
+        const context = self.active_fault_context orelse return;
+        const reason: pm4_fault_journal.Reason = switch (failure) {
+            .truncated_packet => .truncated_packet,
+            .invalid_packet => .invalid_packet,
+            .wait_condition_failed => .wait_condition_failed,
+        };
+        self.fault_journal.record(
+            reason,
+            self.packet_sequence,
+            context.source,
+            context.depth,
+            context.base_address,
+            context.dword_offset,
+            context.header,
+            context.available_dwords,
+        );
     }
 };
 
@@ -1121,6 +1225,12 @@ test "PM4 executor refuses a packet whose count walks past the ring span" {
     var executor: Executor = .{};
     try std.testing.expectError(Error.truncated_packet, executor.execute(&.{ header, 0 }));
     try std.testing.expectEqual(@as(u64, 1), executor.invalid_packet_count);
+    const fault = executor.fault_journal.latest().?;
+    try std.testing.expectEqual(pm4_fault_journal.Reason.truncated_packet, fault.reason);
+    try std.testing.expectEqual(header, fault.raw_header);
+    try std.testing.expectEqual(@as(u32, 5), fault.required_total_dwords);
+    try std.testing.expectEqual(@as(u32, 2), fault.available_dwords);
+    try std.testing.expectEqual(@as(u32, 3), fault.missingDwords());
 }
 
 test "PM4 executor recognizes the authentic XE_SWAP message" {
