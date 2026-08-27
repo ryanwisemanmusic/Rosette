@@ -100,6 +100,8 @@ pub const Ledger = struct {
 
     packet_classes: [packet_class_count]u64 = [_]u64{0} ** packet_class_count,
     indirect_walk_observations: u64 = 0,
+    indirect_walk_unique: u64 = 0,
+    indirect_walk_repeats: u64 = 0,
     indirect_draw_observations: u64 = 0,
     indirect_swap_observations: u64 = 0,
     indirect_unreadable_observations: u64 = 0,
@@ -393,6 +395,7 @@ pub const Ledger = struct {
         start_dword: u32,
         count_dwords: u32,
         ring_dwords: u32,
+        publication_generation: u64,
         step: u64,
         consumed: bool,
         authentic_guest_publication: bool,
@@ -403,19 +406,23 @@ pub const Ledger = struct {
         walker.walkRoot(bytes, start_dword, count_dwords, ring_dwords);
         const summary = walker.summary();
         const references = walker.referenceSlice();
-        const fingerprint = indirectFingerprint(summary, references);
+        var fingerprint = indirectFingerprint(summary, references);
+        fingerprint = (fingerprint ^ publication_generation) *% 0x100000001b3;
+        fingerprint = (fingerprint ^ @intFromBool(consumed)) *% 0x100000001b3;
+        fingerprint = (fingerprint ^ @intFromBool(authentic_guest_publication)) *% 0x100000001b3;
         const changed = self.indirect_walk_observations == 0 or fingerprint != self.last_indirect_fingerprint;
 
         self.indirect_walk_observations +|= 1;
-        if (summary.nested_draw_packets != 0) self.indirect_draw_observations +|= 1;
-        if (summary.nested_swap_packets != 0) self.indirect_swap_observations +|= 1;
-        if (summary.unreadable_references != 0) self.indirect_unreadable_observations +|= 1;
-        if (summary.cycle_references != 0) self.indirect_cycle_observations +|= 1;
-        for (summary.packet_class_counts, 0..) |count, index| {
-            self.packet_classes[index] +|= count;
-        }
+        if (changed) self.indirect_walk_unique +|= 1 else self.indirect_walk_repeats +|= 1;
 
         if (changed) {
+            if (summary.nested_draw_packets != 0) self.indirect_draw_observations +|= 1;
+            if (summary.nested_swap_packets != 0) self.indirect_swap_observations +|= 1;
+            if (summary.unreadable_references != 0) self.indirect_unreadable_observations +|= 1;
+            if (summary.cycle_references != 0) self.indirect_cycle_observations +|= 1;
+            for (summary.packet_class_counts, 0..) |count, index| {
+                self.packet_classes[index] +|= count;
+            }
             self.last_indirect_fingerprint = fingerprint;
             self.last_indirect_summary = summary;
             self.last_indirect_reference_count = @min(references.len, self.last_indirect_references.len);
@@ -435,7 +442,10 @@ pub const Ledger = struct {
             }
         }
 
-        if (!authentic_guest_publication or summary.packets_walked == 0) return summary;
+        // Re-reading the same publication is a diagnostic observation, not a
+        // second PM4 submission. Only a new content/generation/disposition key
+        // may advance semantic stages or packet-class totals.
+        if (!changed or !authentic_guest_publication or summary.packets_walked == 0) return summary;
         if (summary.draw_packets != 0) {
             self.draw_observations +|= 1;
             if (consumed) self.observeEvidence(.first_draw_consumed, step) else self.observeStage(.first_draw_submitted, step);
@@ -628,9 +638,11 @@ pub const Ledger = struct {
         if (force or self.indirect_walk_observations != 0) {
             const indirect = self.last_indirect_summary;
             machoCapturePrint(
-                "macho-processor: XENIA PM4 INDIRECT WALK: observations={d} root_packets={d} nested_packets={d} indirect_packets={d} refs={d} readable={d} unreadable={d} truncated_refs={d} budget_refs={d} draws(root/nested/total)={d}/{d}/{d} swaps(root/nested/total)={d}/{d}/{d} waits={d} unknown={d} cycles={d} truncated={s} budget={s}\n",
+                "macho-processor: XENIA PM4 INDIRECT WALK: observations={d} unique={d} repeats={d} root_packets={d} nested_packets={d} indirect_packets={d} refs={d} readable={d} unreadable={d} truncated_refs={d} budget_refs={d} draws(root/nested/total)={d}/{d}/{d} swaps(root/nested/total)={d}/{d}/{d} waits={d} unknown={d} cycles={d} truncated={s} budget={s}\n",
                 .{
                     self.indirect_walk_observations,
+                    self.indirect_walk_unique,
+                    self.indirect_walk_repeats,
                     indirect.root_packets,
                     indirect.nested_packets,
                     indirect.indirect_packets,
@@ -831,6 +843,7 @@ fn indirectFingerprint(summary: pm4_walk.Summary, references: []const pm4_walk.R
         summary.truncated_references,
         summary.budget_limited_references,
         summary.cycle_references,
+        summary.content_fingerprint,
         if (summary.root_truncated) 1 else 0,
     };
     for (values) |value| hash = (hash ^ value) *% 0x100000001b3;
@@ -962,6 +975,7 @@ test "causal trace promotes a draw found in an indirect buffer" {
         0,
         4,
         4,
+        1,
         100,
         true,
         true,
@@ -972,6 +986,39 @@ test "causal trace promotes a draw found in an indirect buffer" {
     try std.testing.expect(ledger.observed(.first_draw_consumed));
     try std.testing.expectEqual(@as(usize, 1), ledger.last_indirect_reference_count);
     try std.testing.expectEqual(@as(u32, 1), ledger.last_indirect_references[0].draws);
+
+    const draw_classes = ledger.packet_classes[@intFromEnum(pm4.PacketClass.draw)];
+    _ = ledger.observePm4SpanWithIndirects(
+        &bytes,
+        0,
+        4,
+        4,
+        1,
+        101,
+        true,
+        true,
+        &memory,
+        Memory.read,
+    );
+    try std.testing.expectEqual(@as(u64, 2), ledger.indirect_walk_observations);
+    try std.testing.expectEqual(@as(u64, 1), ledger.indirect_walk_unique);
+    try std.testing.expectEqual(@as(u64, 1), ledger.indirect_walk_repeats);
+    try std.testing.expectEqual(draw_classes, ledger.packet_classes[@intFromEnum(pm4.PacketClass.draw)]);
+
+    _ = ledger.observePm4SpanWithIndirects(
+        &bytes,
+        0,
+        4,
+        4,
+        2,
+        102,
+        true,
+        true,
+        &memory,
+        Memory.read,
+    );
+    try std.testing.expectEqual(@as(u64, 2), ledger.indirect_walk_unique);
+    try std.testing.expect(ledger.packet_classes[@intFromEnum(pm4.PacketClass.draw)] > draw_classes);
 }
 
 test "repeated wait and signal semantics are retained as a bounded cycle" {

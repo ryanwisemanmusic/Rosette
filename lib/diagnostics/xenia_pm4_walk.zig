@@ -72,6 +72,10 @@ pub const Summary = struct {
     unknown_packets: u32 = 0,
     packets_walked: u32 = 0,
     words_read: u32 = 0,
+    /// Ordered fingerprint of every readable root and nested dword, including
+    /// packet bodies. Two publications with the same opcode counts but
+    /// different register values or draw parameters are not the same work.
+    content_fingerprint: u64 = 0,
     packet_class_counts: [packet_class_count]u32 = [_]u32{0} ** packet_class_count,
     indirect_references: u32 = 0,
     readable_references: u32 = 0,
@@ -198,19 +202,29 @@ pub const Walker = struct {
                 const ring_index: u32 = @intCast((@as(u64, ring.start_dword) + index) % ring.ring_dwords);
                 const offset = @as(usize, ring_index) * 4;
                 if (offset + 4 > ring.bytes.len) return .{ .unavailable = ring_index * 4 };
-                self.result.words_read +|= 1;
-                return .{ .value = std.mem.readInt(u32, ring.bytes[offset..][0..4], .big) };
+                const value = std.mem.readInt(u32, ring.bytes[offset..][0..4], .big);
+                self.noteReadableWord(value);
+                return .{ .value = value };
             },
             .memory => |memory| {
                 const address = @as(u64, memory.address) + @as(u64, index) * 4;
                 if (address > std.math.maxInt(u32)) return .{ .unavailable = std.math.maxInt(u32) };
                 if (memory.callback(memory.context, @intCast(address))) |value| {
-                    self.result.words_read +|= 1;
+                    self.noteReadableWord(value);
                     return .{ .value = value };
                 }
                 return .{ .unavailable = @intCast(address) };
             },
         }
+    }
+
+    fn noteReadableWord(self: *Walker, value: u32) void {
+        self.result.words_read +|= 1;
+        const seed = if (self.result.content_fingerprint == 0)
+            @as(u64, 0xcbf29ce484222325)
+        else
+            self.result.content_fingerprint;
+        self.result.content_fingerprint = (seed ^ value) *% 0x100000001b3;
     }
 
     fn walkSource(self: *Walker, source: Source, depth: u8, root: bool, available_dwords: u32) SourceWalk {
@@ -242,6 +256,24 @@ pub const Walker = struct {
                     self.result.root_truncated = true;
                 }
                 return .{ .status = .truncated };
+            }
+
+            // Classification uses the header, but publication identity must
+            // include the packet body. Validate and fingerprint every dword so
+            // a register-value-only change is unique and an unreadable body is
+            // reported as truncation rather than a complete packet.
+            var body = cursor + 1;
+            while (body < cursor + advance) : (body += 1) {
+                _ = switch (self.readSource(source, body)) {
+                    .value => |value| value,
+                    .unavailable => |address| {
+                        if (root) self.result.root_truncated = true;
+                        return .{
+                            .status = .truncated,
+                            .missing_address = if (root) null else address,
+                        };
+                    },
+                };
             }
 
             self.result.packets_walked +|= 1;

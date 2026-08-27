@@ -2,10 +2,58 @@ const std = @import("std");
 
 const c = @cImport({
     @cInclude("fcntl.h");
+    @cInclude("stdio.h");
     @cInclude("stdlib.h");
     @cInclude("sys/stat.h");
     @cInclude("unistd.h");
 });
+
+
+/// How many previous runs are kept. Bounded on purpose: unbounded retention of
+/// a log that reaches tens of megabytes fills a disk, and the run before last
+/// is almost always enough to compare against.
+pub const retained_runs: usize = 3;
+
+/// Shift `name` -> `name.1` -> `name.2` -> `name.3`, dropping the oldest.
+///
+/// `rename` rather than copy: it is atomic, costs nothing for a large file, and
+/// cannot leave a half-written archive if the process dies mid-rotation.
+/// Returns the number of archives that now exist.
+fn rotateRuntimeLogs(allocator: std.mem.Allocator, path: []const u8) usize {
+    // Nothing to keep. A zero-length file from a run that never started is not
+    // evidence, and rotating it would push a real archive off the end.
+    // `stat` through libc rather than std.fs: this module already speaks to the
+    // C layer for every other file operation, and mixing the two here would
+    // mean two error models for one decision.
+    const probe = allocator.dupeZ(u8, path) catch return 0;
+    defer allocator.free(probe);
+    var info: c.struct_stat = undefined;
+    if (c.stat(probe.ptr, &info) != 0) return 0;
+    if (info.st_size == 0) return 0;
+
+    var kept: usize = 0;
+    var index: usize = retained_runs;
+    while (index >= 1) : (index -= 1) {
+        const older = std.fmt.allocPrintSentinel(allocator, "{s}.{d}", .{ path, index }, 0) catch return kept;
+        defer allocator.free(older);
+        if (index == retained_runs) {
+            // The oldest archive falls off the end.
+            _ = c.unlink(older.ptr);
+            continue;
+        }
+        const newer = std.fmt.allocPrintSentinel(allocator, "{s}.{d}", .{ path, index }, 0) catch return kept;
+        defer allocator.free(newer);
+        const target = std.fmt.allocPrintSentinel(allocator, "{s}.{d}", .{ path, index + 1 }, 0) catch return kept;
+        defer allocator.free(target);
+        if (c.rename(newer.ptr, target.ptr) == 0) kept += 1;
+    }
+    const first = std.fmt.allocPrintSentinel(allocator, "{s}.1", .{path}, 0) catch return kept;
+    defer allocator.free(first);
+    const current = allocator.dupeZ(u8, path) catch return kept;
+    defer allocator.free(current);
+    if (c.rename(current.ptr, first.ptr) == 0) kept += 1;
+    return kept;
+}
 
 /// Keeps the interactive console concise while preserving the complete
 /// diagnostic stream in `.rosette/rosette-runtime.log`. Set
@@ -25,6 +73,15 @@ pub const Controller = struct {
         makePathRecursive(allocator, directory) catch return .{};
         const path_z = allocator.dupeZ(u8, path) catch return .{};
         defer allocator.free(path_z);
+        // Keep the previous run before truncating this one.
+        //
+        // A rare late fault — one that needs ten billion instructions to
+        // reach — cannot be reproduced on demand, and the run that finally
+        // caught it destroyed its own evidence the next time anything started.
+        // That has already happened once here. Rotation is cheap, bounded, and
+        // it is the difference between an investigation that resumes and one
+        // that restarts.
+        const retained = rotateRuntimeLogs(allocator, path);
         const detail_fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c_uint, 0o644));
         if (detail_fd < 0) return .{};
         var summary_fd: i32 = -1;
@@ -42,12 +99,29 @@ pub const Controller = struct {
             if (summary_fd >= 0) _ = c.close(summary_fd);
             return .{};
         }
+        if (detail_fd >= 0 and retained != 0) {
+            // Stated in the new log so a reader knows the previous run is not
+            // gone, and where it went.
+            writeAll(detail_fd, "macho-processor: RUNTIME LOG RETENTION: the previous run's log was kept as rosette-runtime.log.1 (older runs shift to .log.2 and .log.3). A rare late fault cannot be reproduced on demand, so the run that catches one must not erase it\n");
+        }
         if (summary_fd >= 0) {
             writeAll(summary_fd, "# Rosette Runtime Summary\n");
             writeAll(summary_fd, "# Selected Xenia lifecycle/errors and periodic translated-execution heartbeats.\n");
             writeAll(summary_fd, "# Full diagnostics remain in rosette-runtime.log.\n");
         }
         return .{ .concise = true, .saved_stderr = saved_stderr, .detail_fd = detail_fd, .summary_fd = summary_fd };
+    }
+
+    /// The runtime-log descriptor, so an alternative transport can write to
+    /// the same file rather than opening a second one and interleaving.
+    pub fn detailFd(self: *const Controller) i32 {
+        return self.detail_fd;
+    }
+
+    /// Whether stderr was redirected into the runtime log. When it was, an
+    /// async writer must not also echo to stderr or every line lands twice.
+    pub fn capturedStderr(self: *const Controller) bool {
+        return self.concise;
     }
 
     pub fn deinit(self: *Controller) void {

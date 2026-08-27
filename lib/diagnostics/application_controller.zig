@@ -47,7 +47,13 @@ pub const Sample = struct {
     draw_completion_signaled: u64 = 0,
     draw_completion_dispatched: u64 = 0,
     pending_gpu_interrupts: u32 = 0,
+    /// Callback registered in Rosette's translated-x86 model. Only this field
+    /// authorizes `drain_gpu_interrupts` into `scheduleSignalCallback`.
     interrupt_callback_registered: bool = false,
+    /// Xenia's real callback lives in its PowerPC CPU engine. It proves that
+    /// Xenia's callback channel exists, but cannot receive model-x86 events.
+    powerpc_callback_registered: bool = false,
+    powerpc_callback_returned: bool = false,
 
     presenter_ready: bool = false,
     presenter_device_lost: bool = false,
@@ -182,44 +188,46 @@ pub const Controller = struct {
             decision.domain = .presenter;
             return decision;
         }
+        // A consumed draw with no target is causally upstream of callback and
+        // wait symptoms. Lead with the first missing rendering fact even when
+        // a heuristic wait detector also calls the cycling guest deadlocked.
+        if (target_missing or memory_missing) {
+            decision.phase = .waiting_render_target;
+            decision.action = .await_render_target;
+            decision.blocker = .render_target_missing;
+            decision.domain = .pm4;
+            if (sample.guest_wait_deadlocked) decision.secondary_blocker = .guest_wait_deadlock;
+            if (producer_stalled) decision.secondary_blocker = .guest_producer_quiet;
+            return decision;
+        }
+        if ((completion_pending or sample.pending_gpu_interrupts != 0) and sample.interrupt_callback_registered) {
+            decision.phase = .gpu_pending;
+            decision.action = .drain_gpu_interrupts;
+            if (completion_pending) decision.blocker = .completion_not_dispatched;
+            decision.domain = .pm4;
+            decision.host_action_authorized = true;
+            if (producer_stalled) decision.secondary_blocker = .guest_producer_quiet;
+            return decision;
+        }
+        if ((completion_pending or sample.pending_gpu_interrupts != 0) and sample.powerpc_callback_registered) {
+            decision.phase = .gpu_pending;
+            decision.action = .yield_guest_for_gpu;
+            decision.blocker = .callback_domain_bridge_missing;
+            decision.domain = .pm4;
+            decision.host_action_authorized = false;
+            if (sample.powerpc_callback_returned) {
+                // The real PowerPC route is alive. The pending count belongs to
+                // the parallel model route and must not be interpreted as a
+                // failure of Xenia's callback consumer.
+                decision.secondary_blocker = .completion_not_dispatched;
+            } else if (producer_stalled) decision.secondary_blocker = .guest_producer_quiet;
+            return decision;
+        }
         if (sample.guest_wait_deadlocked) {
             decision.phase = .stalled;
             decision.action = .report_stall;
             decision.blocker = .guest_wait_deadlock;
             decision.domain = .guest;
-            return decision;
-        }
-        if (completion_pending and sample.interrupt_callback_registered) {
-            decision.phase = .gpu_pending;
-            decision.action = .drain_gpu_interrupts;
-            decision.blocker = .completion_not_dispatched;
-            decision.domain = .pm4;
-            decision.host_action_authorized = true;
-            if (producer_stalled) decision.secondary_blocker = .guest_producer_quiet;
-            return decision;
-        }
-        if (sample.pending_gpu_interrupts != 0 and sample.interrupt_callback_registered) {
-            decision.phase = .gpu_pending;
-            decision.action = .drain_gpu_interrupts;
-            decision.domain = .pm4;
-            decision.host_action_authorized = true;
-            if (producer_stalled) decision.secondary_blocker = .guest_producer_quiet;
-            return decision;
-        }
-        if (target_missing) {
-            decision.phase = .waiting_render_target;
-            decision.action = .await_render_target;
-            decision.blocker = .render_target_missing;
-            decision.domain = .pm4;
-            if (producer_stalled) decision.secondary_blocker = .guest_producer_quiet;
-            return decision;
-        }
-        if (memory_missing) {
-            decision.phase = .waiting_render_target;
-            decision.action = .await_render_target;
-            decision.blocker = .render_target_missing;
-            decision.domain = .pm4;
-            if (producer_stalled) decision.secondary_blocker = .guest_producer_quiet;
             return decision;
         }
         if (sample.guest_output_available and sample.presenter_ready and !sample.authentic_swap_consumed) {
@@ -279,6 +287,7 @@ test "the controller prioritizes a queued completion for a real callback" {
         .pm4_progress_step = 90,
         .pm4_stream_consumed = true,
         .render_target_state_observed = true,
+        .render_target_memory_observed = true,
         .draw_completion_signaled = 4,
         .draw_completion_dispatched = 1,
         .interrupt_callback_registered = true,
@@ -316,6 +325,32 @@ test "a consumed draw with no target is not allowed to look like a presentation"
     try std.testing.expectEqual(Action.await_render_target, decision.action);
     try std.testing.expectEqual(Blocker.render_target_missing, decision.blocker);
     try std.testing.expect(!decision.host_action_authorized);
+}
+
+test "PowerPC callback cannot drain translated x86 model completions" {
+    var controller = Controller{};
+    const decision = controller.observe(.{
+        .step = 100,
+        .draw_completion_signaled = 24,
+        .powerpc_callback_registered = true,
+        .powerpc_callback_returned = true,
+        .presenter_ready = true,
+    });
+    try std.testing.expectEqual(Action.yield_guest_for_gpu, decision.action);
+    try std.testing.expectEqual(Blocker.callback_domain_bridge_missing, decision.blocker);
+    try std.testing.expect(!decision.host_action_authorized);
+}
+
+test "render target gap outranks a coincident wait diagnosis" {
+    var controller = Controller{};
+    const decision = controller.observe(.{
+        .step = 100,
+        .pm4_stream_consumed = true,
+        .guest_wait_deadlocked = true,
+        .presenter_ready = true,
+    });
+    try std.testing.expectEqual(Blocker.render_target_missing, decision.blocker);
+    try std.testing.expectEqual(Blocker.guest_wait_deadlock, decision.secondary_blocker);
 }
 
 test "discovered guest pixels may be refreshed without fabricating VdSwap" {
