@@ -60,19 +60,22 @@ pub const COOPERATIVE_SCHEDULER_SCAN_INTERVAL: u64 = 256;
 pub const IDLE_STARVATION_STEPS: u64 = 100_000;
 pub const INITIALIZER_STEP_LIMIT: u64 = 2_000_000;
 pub const GUEST_LOG_BUFFER_SIZE: u64 = 64 * 1024;
-pub const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 16;
-/// Ways per set. The table stays the same size; it is only reinterpreted as
-/// `DECODE_CACHE_ENTRY_COUNT / DECODE_CACHE_WAYS` sets of this many entries.
-///
-/// Direct-mapped, two instructions whose addresses hash to the same slot evict
-/// each other on every execution — forever, because the mapping is fixed. That
-/// is a *conflict* miss, and unlike a compulsory miss (the first execution of
-/// newly emitted code, which no cache can avoid) it is pure loss. Two ways
-/// removes the pathological pair case for the same memory and the same number
-/// of entries.
-pub const DECODE_CACHE_WAYS: usize = 2;
+/// The Xenia image alone has substantially more than 65,536 hot instruction
+/// starts.  With the old 64K / two-way table, a steady-state Halo 3 interval
+/// reported 1,506,110 live-entry evictions for only 30 vacant fills: the cache
+/// was decoding immutable Mach-O text again because unrelated instructions
+/// competed for two slots.  Four times the capacity is about 23 MiB at the
+/// current entry size, small beside the translated process heap and large
+/// enough to retain the host-side compiler passes that dominate the trace.
+pub const DECODE_CACHE_ENTRY_COUNT: usize = 1 << 18;
+/// Eight-way set associativity keeps the same 32,768 sets as the previous 64K
+/// two-way layout while giving each colliding working set four times the room.
+/// Replacement uses second-chance reference bits in `process.zig`; unlike the
+/// old two-way-only MRU bit, every way is eligible and no fixed final way
+/// absorbs all evictions.
+pub const DECODE_CACHE_WAYS: usize = 8;
 pub const DECODE_CACHE_SET_COUNT: usize = DECODE_CACHE_ENTRY_COUNT / DECODE_CACHE_WAYS;
-pub const DECODE_CACHE_HASH_SHIFT: u6 = 48;
+pub const DECODE_CACHE_HASH_SHIFT: u6 = 46;
 /// 64 - log2(DECODE_CACHE_SET_COUNT).
 pub const DECODE_CACHE_SET_SHIFT: u6 = 49;
 pub const DECODE_CACHE_HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;

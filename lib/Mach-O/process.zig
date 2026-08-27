@@ -61,6 +61,12 @@ const host_contract_coverage = @import("diagnostics").host_contract_coverage;
 const stall_release = @import("diagnostics").stall_release;
 const bringup_failure = @import("diagnostics").bringup_failure;
 const run_horizon = @import("diagnostics").run_horizon;
+const claim_reconciliation = @import("diagnostics").claim_reconciliation;
+const interrupt_callback_transaction = @import("diagnostics").interrupt_callback_transaction;
+const async_log = @import("diagnostics").async_log;
+const translation_economics = @import("diagnostics").translation_economics;
+const guest_log_channels = @import("diagnostics").guest_log_channels;
+const wait_graph = @import("diagnostics").wait_graph;
 const event_identity = @import("diagnostics").event_identity;
 const execution_tracepoints = @import("diagnostics").execution_tracepoints;
 const anomaly_ledger = @import("diagnostics").anomaly_ledger;
@@ -626,7 +632,10 @@ pub const MachOState = struct {
     guest_stdin_pointer_address: u64 = 0,
     guest_stdout_pointer_address: u64 = 0,
     guest_stderr_pointer_address: u64 = 0,
-    guest_log_buffer_address: u64 = 0,
+    /// Xenia's formatting buffer is thread-local by contract. A process-global
+    /// address allowed cooperative guest threads to splice two records into a
+    /// false wait/PM4 line before either append completed.
+    guest_log_channels: guest_log_channels.Registry = .{},
     guest_log_mirror_fd: i32 = -1,
     /// Collapses consecutive identical mirrored guest lines. A guest loop that
     /// logs is the guest's defect, but a runtime whose diagnostics become
@@ -821,6 +830,13 @@ pub const MachOState = struct {
     application_framework_last_sequence: u64 = std.math.maxInt(u64),
     graphics_health_last_fingerprint: u64 = std.math.maxInt(u64),
     application_controller_last_fingerprint: u64 = std.math.maxInt(u64),
+    /// Canonical Cocoa graphics truth. This reconciles identities and custody
+    /// across AppKit, SDL, Rosette Vulkan, Xenia Vulkan, Xenos and completed
+    /// frames without making any of those producers share an owner merely
+    /// because they end at the same window.
+    cocoa_graphics: gpu.CocoaGraphicsRuntime = .{},
+    cocoa_graphics_last_fingerprint: u64 = std.math.maxInt(u64),
+    cocoa_graphics_last_outcome: gpu.CocoaGraphicsOutcome = .{},
     /// The GPU-facing kernel exports a title reads before it will present, and
     /// whether anything supplied them. See `lib/gpu/kernel_surface.zig`: the
     /// ladder can only see calls, and an unpopulated *variable* export stops a
@@ -841,6 +857,44 @@ pub const MachOState = struct {
     run_horizon: run_horizon.Ledger = .{},
     run_started_at_ns: u64 = 0,
     run_horizon_vdswap_mask: u32 = 0,
+    /// Delivering queued GPU completions when nothing else will, and supplying
+    /// the front buffer substitution is blocked on.
+    ///
+    /// Off by default. A completion nobody delivers is indistinguishable from
+    /// one nobody generated, and those have opposite causes — so delivering one
+    /// and watching what changes is the only way to tell them apart. Everything
+    /// it does is recorded as a substitution and can never close an authentic
+    /// stage. Selected with ROSETTE_DRAW_DISPATCH.
+    gpu_draw_dispatch: gpu.DrawDispatchLedger = .{},
+    gpu_draw_dispatch_configured: bool = false,
+    /// Checkpoints at which a complete contract's per-element detail was
+    /// suppressed. Counted rather than silent: a reader has to be able to tell
+    /// a collapsed report from one that stopped being emitted.
+    gpu_preinitialization_collapsed: u64 = 0,
+    /// Who waits on what and whether the handshake is going anywhere.
+    ///
+    /// The livelock predictor answers "is this signature repeating"; a matched
+    /// wait/signal pair cycling twelve hundred times passes every deadlock
+    /// check because nothing is parked and nothing is unsignalled. This answers
+    /// the other half: which thread waits, which feeds it, and whether anything
+    /// outside the pair moved while it cycled.
+    wait_graph: wait_graph.Ledger = .{},
+    /// Whether translation cost ends or repeats.
+    ///
+    /// The decode-cache hit rate says how well the cache works; it cannot say
+    /// whether the same code is being decoded over and over because an emitter
+    /// keeps reusing its addresses. "Still compiling after four billion steps"
+    /// fits a large title compiled once and a small one compiled forever, and
+    /// those have opposite remedies.
+    translation_economics: translation_economics.Ledger = .{},
+    /// Which of several disagreeing statements about the same fact is current.
+    /// The emulator never retracts a bring-up snapshot, so its loudest claim
+    /// about the ring or the interrupt callback is routinely not its truest.
+    claim_reconciliation: claim_reconciliation.Ledger = .{},
+    /// Xenia's PowerPC graphics callback transaction. Kept distinct from the
+    /// Rosette-model callback fields below so equal names cannot create a false
+    /// cross-domain reconciliation failure.
+    interrupt_callback_transaction: interrupt_callback_transaction.Ledger = .{},
     /// The same exports, read the way the title reads them: slot first, then
     /// the storage the slot points at. See `lib/gpu/kernel_variables.zig`. The
     /// surface above treats the slot's contents as the value, which cannot tell
@@ -875,6 +929,12 @@ pub const MachOState = struct {
     /// backend-neutral state machine that a real Vulkan command recorder can
     /// consume once the guest publishes a batch.
     gpu_xenos_runtime: gpu.XenosRuntime = .{},
+    /// Earliest bounded GPU frontier. This is intentionally separate from the
+    /// broad graphics/VdSwap ledgers: it records the first observable edge in
+    /// the live route, including edges that occur before a full contract report
+    /// is emitted, without treating a guest-owned edge as host-authorized.
+    gpu_early_frontier: gpu.GpuEarlyFrontier = .{},
+    gpu_early_frontier_last_fingerprint: u64 = 0,
     /// Lazy, process-owned Xenos EDRAM backing.  It is allocated after the
     /// Mach-O state exists so a run that never reaches GPU setup pays no inline
     /// struct cost, while every live PM4 runtime still has a real resolve store.
@@ -892,6 +952,7 @@ pub const MachOState = struct {
     gpu_xenos_last_payload_epoch: u64 = std.math.maxInt(u64),
     gpu_xenos_retained_executions: u64 = 0,
     gpu_xenos_retained_refusals: u64 = 0,
+    gpu_pm4_last_fault_logged: u64 = 0,
     /// Diagnostics for the physical-to-Xenos callback boundary. The physical
     /// projection is authoritative; A/C/E aliases are used only when that
     /// projection is unreadable, and disagreement is fail-closed.
@@ -1177,6 +1238,14 @@ pub const MachOState = struct {
     // so the fast path is a direct slice read; enable with
     // ROSETTE_MACHO_MEMORY_TRACE=1 when diagnosing faults/near-null causality.
     memory_trace_enabled: bool = false,
+    // S6 (perf audit): the per-instruction CMPXCHG diagnostic (CMPXCHG#N
+    // lines) costs a formatted capture on every atomic op and runs even in
+    // healthy runs, where a CAS-heavy guest like Xenia's own JIT produces
+    // thousands of uncontended compares. Off by default; enable with
+    // ROSETTE_MACHO_CMPXCHG_TRACE=1 when diagnosing CAS-contention or
+    // lock-state divergence. The atomic_cmpxchg counters still accumulate
+    // regardless, so the summary's operations/mismatch totals stay intact.
+    cmpxchg_trace_enabled: bool = false,
     // A waiter that has never been notified is not, by itself, a lost-wakeup
     // proof. Long-lived host workers (for example Xenia's idle audio media
     // player) legitimately park on a POSIX condition variable until work is
@@ -1243,7 +1312,7 @@ pub const MachOState = struct {
     decode_cache_misses: u64 = 0,
     /// A miss that filled a way nothing had occupied — the first execution of
     /// newly emitted code. Irreducible: there is nothing to cache yet.
-    decode_cache_compulsory_misses: u64 = 0,
+    decode_cache_vacant_misses: u64 = 0,
     /// A miss that evicted a live decode. This is the addressable kind.
     decode_cache_conflict_misses: u64 = 0,
     decode_cache_stale_rejections: u64 = 0,
@@ -2058,11 +2127,33 @@ pub const MachOState = struct {
 
     fn isBridgedLibcppDataSymbol(symbol_name: []const u8) bool {
         if (!isAbiDataSymbol(symbol_name)) return false;
-        return std.mem.indexOf(u8, symbol_name, "basic_ifstream") != null or
-            std.mem.indexOf(u8, symbol_name, "basic_istream") != null or
-            std.mem.indexOf(u8, symbol_name, "basic_filebuf") != null or
-            std.mem.indexOf(u8, symbol_name, "basic_ios") != null or
-            std.mem.indexOf(u8, symbol_name, "ios_base") != null;
+        // Rosette owns the runtime for every stream class the bridge models:
+        // constructors, base inits, methods, manipulators and destructors are
+        // all intercepted, and the bridge installs its own synthetic vtables
+        // (`cxx_object_model.ensureType`) instead of reading dyld-bound ones.
+        // Routing their vtable/VTT/typeinfo bindings through the deferred
+        // materializer instead would hand the guest zeroed synthetic records
+        // (or, for the ostringstream family, a VTT whose slots are all zero)
+        // that the *bridge's* object model then has to fight. The ostringstream
+        // complete-object destructor in particular loads its hidden VTT before
+        // entering D2, so its `__ZTT` data must follow the bridge, not dyld.
+        const families = [_][]const u8{
+            "basic_ifstream",
+            "basic_istream",
+            "basic_ostream",
+            "basic_ostringstream",
+            "basic_istringstream",
+            "basic_stringstream",
+            "basic_stringbuf",
+            "basic_streambuf",
+            "basic_filebuf",
+            "basic_ios",
+            "ios_base",
+        };
+        for (families) |family| {
+            if (std.mem.indexOf(u8, symbol_name, family) != null) return true;
+        }
+        return false;
     }
 
     fn bindingRequiresBoundThunk(section: macho_metadata.Section, is_runtime_callback: bool) bool {
@@ -2166,11 +2257,17 @@ pub const MachOState = struct {
     pub fn showNativeWindow(self: *MachOState) bool {
         return native_window.showNativeWindow(self);
     }
+    pub fn hideNativeWindow(self: *MachOState) bool {
+        return native_window.hideNativeWindow(self);
+    }
     pub fn setNativeWindowFullscreen(self: *MachOState, fullscreen: bool) bool {
         return native_window.setNativeWindowFullscreen(self, fullscreen);
     }
     pub fn nativeViewToken(self: *MachOState) u64 {
         return native_window.nativeViewToken(self);
+    }
+    pub fn nativeWindowToken(self: *MachOState) u64 {
+        return native_window.nativeWindowToken(self);
     }
     pub fn nativeWindowWidth(self: *MachOState) u32 {
         return native_window.nativeWindowWidth(self);
@@ -2301,6 +2398,13 @@ pub const MachOState = struct {
             }
         }
         self.execution_tracepoints.seal();
+        if (self.execution_tracepoints.count != 0) {
+            self.observeGpuEarlyBoundary(
+                .tracepoint_armed,
+                .startup,
+                self.execution_tracepoints.count,
+            );
+        }
         machoCapturePrint(
             "macho-processor: graphics tracepoints sealed: armed={d} unresolved={d} range=0x{x}..0x{x} executable=0x{x}..0x{x}; whether VdSwap executes is now read from the instruction pointer rather than inferred from a log line\n",
             .{
@@ -2327,6 +2431,7 @@ pub const MachOState = struct {
             self.active_guest_thread,
             caller,
         ) orelse return;
+        self.observeGpuEarlyTracepoint(hit.role, hit.address);
         self.ready.noteEntered(hit.address, self.executed_steps, self.active_guest_thread, caller);
         if (self.ready.enabled()) {
             machoCapturePrint(
@@ -2355,6 +2460,52 @@ pub const MachOState = struct {
                 caller,
                 if (caller_symbol) |resolved| resolved.name else "<unknown>",
                 if (caller_symbol) |resolved| resolved.offset else 0,
+            },
+        );
+    }
+
+    /// Publish a tracepoint hit into the earliest GPU frontier immediately,
+    /// before the normal heartbeat/report cadence. Tracepoints are execution
+    /// evidence, not permission to execute the next edge, so only the exact
+    /// boundary represented by the function entry is observed here.
+    fn observeGpuEarlyTracepoint(self: *MachOState, role: execution_tracepoints.Role, address: u64) void {
+        const boundary: ?gpu.GpuEarlyBoundary = switch (role) {
+            .swap => .guest_vdswap_entered,
+            .ring_publication => .ring_publication,
+            .command_processor => .command_processor_entered,
+            .command_swap => .presenter_entered,
+            .xe_swap_decode => .xe_swap_decoder_entered,
+            .presenter => .presenter_entered,
+            .diagnostic_swap, .other => null,
+        };
+        if (boundary) |which| self.observeGpuEarlyBoundary(which, .tracepoint, address);
+        if (role == .command_swap) self.observeGpuEarlyBoundary(.issue_swap_entered, .tracepoint, address);
+    }
+
+    /// The first observation of a boundary is printed synchronously with the
+    /// event. This keeps the exact handoff location visible even if a later
+    /// guest livelock prevents another graphics heartbeat from being emitted.
+    fn observeGpuEarlyBoundary(
+        self: *MachOState,
+        boundary: gpu.GpuEarlyBoundary,
+        source: gpu.GpuEarlySource,
+        value: u64,
+    ) void {
+        const was_observed = self.gpu_early_frontier.observed(boundary);
+        self.gpu_early_frontier.observe(boundary, self.executed_steps, source, value);
+        if (was_observed) return;
+        const next_label = if (self.gpu_early_frontier.firstActionable()) |next| next.label() else "none";
+        machoCapturePrint(
+            "macho-processor: GPU EARLY EDGE: boundary={s} owner={s} source={s} value=0x{x} step={d} observed=0x{x:0>8} actionable=0x{x:0>8} next={s}\n",
+            .{
+                boundary.label(),
+                boundary.owner().label(),
+                source.label(),
+                value,
+                self.executed_steps,
+                self.gpu_early_frontier.observed_mask,
+                self.gpu_early_frontier.actionableMask(),
+                next_label,
             },
         );
     }
@@ -3575,12 +3726,13 @@ pub const MachOState = struct {
             notifier_liveness.default_stall_steps,
         );
         const notifier_symbol = self.metadata.nearestSymbol(object.last_notify_pc);
+        const waiter_symbol = self.metadata.nearestSymbol(object.last_waiter_pc);
         // A granted repair that ended in a re-park is a stronger statement
         // than "nobody ever signalled it": the waiter's predicate was checked
         // and found false, so this is a guest-side deadlock, not a lost wake.
         const repaired = object.repair_attempts != 0;
         machoCapturePrint(
-            "macho-processor: NOTIFIER LIVENESS: object=0x{x} state={s} waiters={d} distinct_notifiers={d} notifications={d} repairs={d} steps_since_notify={d} waiting_since_step={d} last_notify(step={d} thread=0x{x} pc=0x{x} symbol={s}+0x{x})\n",
+            "macho-processor: NOTIFIER LIVENESS: object=0x{x} state={s} waiters={d} distinct_notifiers={d} notifications={d} repairs={d} steps_since_notify={d} waiting_since_step={d} last_notify(step={d} thread=0x{x} pc=0x{x} symbol={s}+0x{x}) waiter(thread=0x{x} pc=0x{x} symbol={s}+0x{x})\n",
             .{
                 object.address,
                 progress.label(),
@@ -3595,6 +3747,10 @@ pub const MachOState = struct {
                 object.last_notify_pc,
                 if (notifier_symbol) |resolved| resolved.name else "<unknown>",
                 if (notifier_symbol) |resolved| resolved.offset else 0,
+                object.last_waiter_thread,
+                object.last_waiter_pc,
+                if (waiter_symbol) |resolved| resolved.name else "<unknown>",
+                if (waiter_symbol) |resolved| resolved.offset else 0,
             },
         );
         if (repaired) {
@@ -3769,17 +3925,9 @@ pub const MachOState = struct {
         {
             _ = ledger.satisfy(.presentation_capability_negotiated, at);
         }
-        // Event handshake activity proves the guest's wait primitives are being
-        // driven. Deliberately keyed on call volume and not on `was_signalled`,
-        // which is a compile-time constant in the emulator and proves nothing.
-        // Keyed on whether waits actually block, not on whether sets happen.
-        // A run where every wait is satisfied on arrival has sets in abundance
-        // and consumes nothing, which is the exact failure this clause exists
-        // to catch — so counting sets satisfied it in precisely the case it was
-        // written to detect.
-        if (self.guest_wait_liveness.aggregateVerdict().healthy() and
-            self.guest_wait_liveness.total_waits >= guest_wait_liveness.minimum_sample)
-        {
+        // Only typed wait evidence satisfies this boundary. A success result
+        // by itself cannot distinguish ready-on-entry from block-and-release.
+        if (self.guest_wait_liveness.provesSignalConsumption()) {
             _ = ledger.satisfy(.wait_primitives_consume_signals, at);
         }
 
@@ -3815,6 +3963,17 @@ pub const MachOState = struct {
         note: []const u8,
     ) void {
         self.graphics_health.record(stage, state, self.executed_steps, source, count, note);
+    }
+
+    /// Count only completed presentations whose payload came from Xenia or
+    /// guest memory. Rosette's diagnostic clears intentionally live in a
+    /// different counter so a working Cocoa sink cannot be mistaken for a
+    /// working emulator producer.
+    fn guestOutputFramesPresented(self: *const MachOState) u64 {
+        const ledger = &self.dynamic_forwarder.native_presenter.ledger;
+        return ledger.host_frames_presented +|
+            ledger.guest_output_frames_presented +|
+            self.native_window.guest_frames_presented;
     }
 
     /// Map the native presenter state to the health schema without weakening
@@ -3955,6 +4114,16 @@ pub const MachOState = struct {
         const real_commands = self.dynamic_forwarder.guestVulkanCommandsForwarded();
         const real_submits = self.dynamic_forwarder.guestVulkanQueueSubmits();
         const real_presents = self.dynamic_forwarder.guestVulkanPresents();
+        if (self.dynamic_forwarder.native_presenter.stage == .ready) {
+            self.observeGpuEarlyBoundary(.native_presenter_ready, .presenter, 1);
+        }
+        if (observed_commands != 0 or real_submits != 0 or real_presents != 0) {
+            self.observeGpuEarlyBoundary(
+                .guest_vulkan_activity,
+                .presenter,
+                observed_commands +| real_submits +| real_presents,
+            );
+        }
         if (observed_commands != 0 or real_submits != 0 or real_presents != 0)
             self.recordGraphicsHealth(.guest_vulkan_activity_observed, .satisfied, .vulkan_forwarder, observed_commands +| real_submits +| real_presents, "guest Vulkan calls reached the forwarding surface");
         if (real_commands != 0) {
@@ -3970,18 +4139,34 @@ pub const MachOState = struct {
 
         if (self.gpu_bootstrap.seen(.initialize_engines))
             self.recordGraphicsHealth(.xenos_engines_initialized, .satisfied, .xenos_runtime, 1, "VdInitializeEngines was observed");
-        if (self.gpu_interrupt_callback != 0)
+        if (self.gpu_interrupt_callback != 0) {
             self.recordGraphicsHealth(.xenos_interrupt_callback_registered, .satisfied, .kernel_surface, self.gpu_interrupt_callback_registrations, "VdSetGraphicsInterruptCallback installed a guest callback");
+        } else if (self.interrupt_callback_transaction.registrations != 0) {
+            self.recordGraphicsHealth(
+                .xenos_interrupt_callback_registered,
+                .satisfied,
+                .causal_trace,
+                self.interrupt_callback_transaction.registrations,
+                "Xenia registered its PowerPC graphics callback; this is healthy in its own executor domain and is not a translated-x86 callback",
+            );
+        }
         if (self.gpu_bootstrap.seen(.ring_buffer) or self.gpu_ring_watch_base != 0)
             self.recordGraphicsHealth(.xenos_ring_initialized, .satisfied, .ring_publication, 1, "ring base/size state is available");
         if (self.gpu_ring_publication.published())
             self.recordGraphicsHealth(.ring_publication_observed, .satisfied, .ring_publication, self.gpu_ring_publication.advances, "guest publication is latched by a pointer change or non-empty span");
         if (self.gpu_ring_publication.geometry != null)
             self.recordGraphicsHealth(.ring_geometry_observed, .satisfied, .ring_publication, 1, "ring read/write geometry was captured");
+        if (self.gpu_ring_publication.published()) {
+            self.observeGpuEarlyBoundary(.ring_publication, .ring, self.gpu_ring_publication.advances);
+            self.observeGpuEarlyBoundary(.guest_producer_progressed, .ring, self.gpu_ring_publication.advances);
+        }
 
         const vd = &self.gpu_vd_swap_contract;
         const runtime = &self.gpu_xenos_runtime;
         const target = runtime.renderTargetEvidence();
+        if (self.guest_wait_liveness.total_waits != 0) {
+            self.observeGpuEarlyBoundary(.guest_wait_progressed, .scheduler, self.guest_wait_liveness.total_waits);
+        }
         const pm4_observed = runtime.batches != 0 or vd.observed(.pm4_stream_observed);
         if (pm4_observed)
             self.recordGraphicsHealth(.pm4_stream_observed, .satisfied, if (runtime.batches != 0) .xenos_runtime else .vd_swap_contract, runtime.batches, "PM4 dwords/packets were observed");
@@ -4007,18 +4192,37 @@ pub const MachOState = struct {
             self.recordGraphicsHealth(.render_target_memory_observed, .satisfied, .xenos_runtime, runtime.color_resolve_observations, "EDRAM color resolve produced readable output");
         if (runtime.draw_completion_signals != 0)
             self.recordGraphicsHealth(.draw_completion_signaled, .satisfied, .xenos_runtime, runtime.draw_completion_signals, "draw completion events were queued");
-        if (runtime.draw_completion_signals != 0)
+        if (runtime.draw_completion_signals != 0) {
+            const dispatch_state: graphics_health_contract.State = if (self.gpu_draw_completion_dispatches != 0)
+                .satisfied
+            else if (self.interrupt_callback_transaction.callback_returns != 0)
+                .degraded
+            else
+                .blocked;
+            const dispatch_count = if (self.gpu_draw_completion_dispatches != 0)
+                self.gpu_draw_completion_dispatches
+            else
+                self.interrupt_callback_transaction.callback_returns;
             self.recordGraphicsHealth(
                 .draw_completion_dispatched,
-                if (self.gpu_draw_completion_dispatches != 0) .satisfied else .blocked,
+                dispatch_state,
                 .scheduler,
-                self.gpu_draw_completion_dispatches,
-                if (self.gpu_draw_completion_dispatches != 0) "draw completion reached the guest callback scheduler" else "draw completion is queued but no callback dispatch is proven",
+                dispatch_count,
+                if (self.gpu_draw_completion_dispatches != 0)
+                    "model draw completion reached the translated-x86 callback scheduler"
+                else if (self.interrupt_callback_transaction.callback_returns != 0)
+                    "Xenia's PowerPC callback returned, but model completion signals belong to the translated-x86 route and cannot be summed with it"
+                else
+                    "draw completion is queued but no callback dispatch is proven in either executor domain",
             );
+        }
 
         const waits = self.guest_wait_liveness.aggregateVerdict();
-        if (self.guest_wait_liveness.total_waits != 0)
-            self.recordGraphicsHealth(.guest_wait_progressed, if (waits.healthy()) .satisfied else .degraded, .guest_log, self.guest_wait_liveness.total_waits, waits.label());
+        if (self.guest_wait_liveness.provesSignalConsumption()) {
+            self.recordGraphicsHealth(.guest_wait_progressed, .satisfied, .guest_log, self.guest_wait_liveness.total_waits, waits.label());
+        } else if (waits.isDefect()) {
+            self.recordGraphicsHealth(.guest_wait_progressed, .degraded, .guest_log, self.guest_wait_liveness.total_waits, waits.label());
+        }
         if (self.gpu_ring_publication.advances != 0) {
             const quiet = self.gpu_ring_publication.stalledSteps(at) orelse 0;
             self.recordGraphicsHealth(
@@ -4038,22 +4242,38 @@ pub const MachOState = struct {
         if (vd.observed(.issue_swap_entered))
             self.recordGraphicsHealth(.issue_swap_entered, .satisfied, .vd_swap_contract, 1, "Xenia presenter IssueSwap boundary was observed");
 
-        const guest_output_frames = self.dynamic_forwarder.native_presenter.ledger.guest_output_frames_presented;
+        const guest_output_frames = self.guestOutputFramesPresented();
+        if (self.guest_vdswap_packet_encoded) {
+            self.observeGpuEarlyBoundary(.guest_swap_encoded, .tracepoint, @intFromBool(self.guest_vdswap_packet_encoded));
+        }
+        if (vd.authentic_consumptions != 0) {
+            self.observeGpuEarlyBoundary(.authentic_xe_swap_consumed, .pm4, vd.authentic_consumptions);
+        }
+        if (vd.observed(.issue_swap_entered)) {
+            self.observeGpuEarlyBoundary(.issue_swap_entered, .tracepoint, 1);
+        }
         if (guest_output_frames != 0) {
+            self.observeGpuEarlyBoundary(.guest_output_refreshed, .presenter, guest_output_frames);
             self.recordGraphicsHealth(.guest_output_refreshed, .satisfied, .native_presenter, guest_output_frames, "guest-produced pixels reached the presenter source");
         } else if (self.dynamic_forwarder.guestFrontBufferAvailable()) {
             self.recordGraphicsHealth(.guest_output_refreshed, .degraded, .native_presenter, 1, "a guest output source was discovered, but no guest-produced frame has been refreshed");
         }
-        const native_frames = self.dynamic_forwarder.nativePresenterFramesPresented();
-        if (native_frames != 0)
-            self.recordGraphicsHealth(.native_present_completed, .satisfied, .native_presenter, native_frames, "the native presenter completed a frame (classification is logged separately)");
+        const native_ledger = &self.dynamic_forwarder.native_presenter.ledger;
+        const rendered_frames = guest_output_frames;
+        const diagnostic_frames = native_ledger.diagnostic_frames_presented +| self.native_window.diagnostic_frames_presented;
+        if (rendered_frames != 0) {
+            self.observeGpuEarlyBoundary(.native_present_completed, .presenter, rendered_frames);
+            self.recordGraphicsHealth(.native_present_completed, .satisfied, .native_presenter, rendered_frames, "Xenia/guest pixels completed a native presentation; diagnostic clears are counted separately");
+        } else if (diagnostic_frames != 0) {
+            self.recordGraphicsHealth(.native_present_completed, .degraded, .native_presenter, diagnostic_frames, "only Rosette diagnostic frames completed; the Cocoa sink is alive but no Xenia/guest pixels have been presented");
+        }
     }
 
     /// Feed the controller from the independent ledgers.  The controller may
     /// authorize only host-owned work; the guest VdSwap and producer fields are
     /// observations that remain outside Rosette's mutation authority.
     pub fn refreshApplicationController(self: *MachOState) application_controller.Decision {
-        const guest_output_frames = self.dynamic_forwarder.native_presenter.ledger.guest_output_frames_presented;
+        const guest_output_frames = self.guestOutputFramesPresented();
         const deadlocked = self.deadlock_predictor.worst().finding.deadlocked();
         return self.application_controller.observe(.{
             .step = self.executed_steps,
@@ -4074,6 +4294,8 @@ pub const MachOState = struct {
             .draw_completion_dispatched = self.gpu_draw_completion_dispatches,
             .pending_gpu_interrupts = self.gpu_xenos_runtime.interrupts.pending_count,
             .interrupt_callback_registered = self.gpu_interrupt_callback != 0,
+            .powerpc_callback_registered = self.interrupt_callback_transaction.registrations != 0,
+            .powerpc_callback_returned = self.interrupt_callback_transaction.callback_returns != 0,
             .presenter_ready = self.dynamic_forwarder.nativePresenterStage().isReady(),
             .presenter_device_lost = self.dynamic_forwarder.nativePresenterStage() == .device_lost,
             .guest_wait_deadlocked = deadlocked,
@@ -4098,6 +4320,428 @@ pub const MachOState = struct {
                 if (self.dynamic_forwarder.attemptScheduledRefresh(self)) self.application_controller_host_refreshes +|= 1;
             },
             else => {},
+        }
+    }
+
+    /// Reconcile every graphics owner at one checkpoint.  This is intentionally
+    /// observation-only: it can transfer custody of an already completed frame
+    /// in the ledger, but it never creates a Cocoa object, submits a Vulkan
+    /// command, advances Xenos state, or calls guest code.
+    fn refreshCocoaGraphicsControl(self: *MachOState) gpu.CocoaGraphicsOutcome {
+        if (!self.cocoa_graphics.configured) {
+            const policy = cocoaGraphicsPolicyFromEnvironment();
+            self.cocoa_graphics.configure(policy);
+            machoCapturePrint(
+                "macho-processor: COCOA GRAPHICS CONTROL: schema={d} policy={s} (verified-guest-fallback is default; ROSETTE_COCOA_GRAPHICS_CONTROL=observe disables active fallback); raw-machine-code-to-Cocoa=REFUSED, semantic-boundaries-only=YES. The control plane may classify and route an already verified frame, but cannot fabricate VdSwap, XE_SWAP, render-target state or a callback transition\n",
+                .{ gpu.cocoa_runtime.schema_version, policy.label() },
+            );
+        }
+
+        if (self.cocoa_graphics.control.policy == .verified_guest_fallback and
+            !self.dynamic_forwarder.nativePresenterStage().isReady())
+        {
+            self.dynamic_forwarder.refreshCocoaFallbackSource(self);
+        }
+
+        const native = self.native_window.snapshot();
+        const ownership = self.dynamic_forwarder.graphicsOwnershipSnapshot();
+        const target = self.gpu_xenos_runtime.renderTargetEvidence();
+        const run_identity = if (self.event_stream.run_id == 0) @as(u64, 1) else self.event_stream.run_id;
+        const ring_generation = @max(self.gpu_ring_publication.advances, 1);
+        const command_generation = @max(self.gpu_xenos_last_payload_epoch, 1);
+        const vdswap_entries = if (self.execution_tracepoints.byRole(.swap)) |entry| entry.hits else 0;
+        const issue_swap_entries: u64 = @intFromBool(self.gpu_vd_swap_contract.observed(.issue_swap_entered));
+
+        var target_identity: u64 = 0;
+        if (target.state_observed) {
+            target_identity = (@as(u64, target.raw_color_info) << 32) ^
+                (@as(u64, target.raw_depth_info) << 1) ^
+                @as(u64, target.raw_surface_info);
+            if (target_identity == 0) target_identity = 1;
+        }
+        const command_stream_identity = if (self.gpu_xenos_runtime.batches != 0 or
+            self.gpu_ring_publication.consumerSawBatch())
+            (if (self.gpu_ring_watch_base != 0) self.gpu_ring_watch_base else @as(u64, 1))
+        else
+            0;
+        const front_buffer_identity: u64 = if (self.gpu_frontbuffer) |front|
+            front.frontbuffer_physical_address
+        else if (self.gpu_vd_swap_contract.active_frontbuffer) |front|
+            front.frontbuffer_physical_address
+        else
+            0;
+
+        var xenia_generation = ownership.xenia_instance ^
+            std.math.rotl(u64, ownership.xenia_surface, 7) ^
+            std.math.rotl(u64, ownership.xenia_device, 17) ^
+            std.math.rotl(u64, ownership.xenia_swapchain, 29);
+        if (xenia_generation == 0) xenia_generation = 1;
+
+        var latest_frame: ?gpu.cocoa_runtime.FrameSnapshot = null;
+        if (ownership.latest_frame) |frame| {
+            latest_frame = .{
+                .source_address = frame.source_address,
+                .source_length = frame.source_length,
+                .width = frame.width,
+                .height = frame.height,
+                .row_pitch = frame.row_pitch_bytes,
+                .format = gpu.cocoa_runtime.PixelFormat.fromVulkan(frame.format),
+                .orientation = switch (frame.orientation) {
+                    .top_down => .top_down,
+                    .bottom_up => .bottom_up,
+                },
+                .fit = switch (frame.fit) {
+                    .stretch => .stretch,
+                    .letterbox => .letterbox,
+                    .center => .center,
+                },
+                .origin = switch (frame.producer) {
+                    .diagnostic => .diagnostic,
+                    .xenia_host => .xenia_host,
+                    .guest => .guest_title,
+                },
+                .generation = ownership.rosette_generation,
+                .serial = frame.serial,
+                .content_digest = frame.content_digest,
+                .guest_swap_observed = frame.guest_swap_observed,
+                .consumed = ownership.latest_frame_consumed,
+            };
+        }
+
+        const sdl_graphics = self.sdl.graphicsSnapshot();
+        const sdl_native_tokens_match = sdl_graphics.native_window_token == native_window_runtime.WINDOW_TOKEN and
+            sdl_graphics.native_view_token == native_window_runtime.VIEW_TOKEN;
+        const sdl_window_bound = sdl_graphics.window_bound and sdl_native_tokens_match and
+            native.window != 0 and native.view != 0;
+        const snapshot = gpu.CocoaGraphicsSnapshot{
+            .run = run_identity,
+            .step = self.executed_steps,
+            .native = .{
+                .application = native.application,
+                .window = native.window,
+                .content_view = native.view,
+                .metal_layer = native.metal_layer,
+                .metal_device = native.metal_device,
+                .application_ready = native.application_ready != 0,
+                .window_ready = native.window_ready != 0,
+                .layer_attached = native.layer_attached != 0,
+                .diagnostic_frames = self.native_window.diagnostic_frames_presented,
+                .guest_frames = self.native_window.guest_frames_presented,
+            },
+            .sdl = .{
+                .event_loop = if (self.sdl.calls != 0 or self.sdl.initialized_mask != 0 or self.sdl.event_pumps != 0)
+                    @intFromPtr(&self.sdl)
+                else
+                    0,
+                .window_binding = sdl_graphics.window_token,
+                .binding_generation = sdl_graphics.generation,
+                .cocoa_window = if (sdl_window_bound) native.window else 0,
+                .cocoa_content_view = if (sdl_window_bound) native.view else 0,
+                .initialized = sdl_graphics.initialized,
+                .window_bound = sdl_window_bound,
+            },
+            .rosette_vulkan = .{
+                .metal_layer = ownership.rosette_metal_layer,
+                .instance = ownership.rosette_instance,
+                .surface = ownership.rosette_surface,
+                .device = ownership.rosette_device,
+                .queue = ownership.rosette_queue,
+                .swapchain = ownership.rosette_swapchain,
+                .generation = ownership.rosette_generation,
+                .ready = ownership.rosette_presenter_ready,
+                .diagnostic_frames = ownership.rosette_diagnostic_frames,
+                .host_frames = ownership.rosette_host_frames,
+                .guest_output_frames = ownership.rosette_guest_output_frames,
+            },
+            .xenia_vulkan = .{
+                .instance = ownership.xenia_instance,
+                .surface = ownership.xenia_surface,
+                .device = ownership.xenia_device,
+                .queue = ownership.xenia_queue,
+                .swapchain = ownership.xenia_swapchain,
+                .generation = xenia_generation,
+                .ready = self.dynamic_forwarder.guestVulkanDeviceReady(),
+                .submissions = ownership.xenia_submissions,
+                .presents = ownership.xenia_presents,
+            },
+            .xenos = .{
+                .ring = self.gpu_ring_watch_base,
+                .ring_generation = ring_generation,
+                .ring_publications = self.gpu_ring_publication.advances,
+                .command_stream = command_stream_identity,
+                .command_generation = command_generation,
+                .batches = self.gpu_xenos_runtime.batches,
+                .packets = self.gpu_xenos_runtime.executor.packet_count,
+                .draws = self.gpu_xenos_runtime.draw_count,
+                .completion_signals = self.gpu_xenos_runtime.draw_completion_signals,
+                .render_target = target_identity,
+                .render_target_state = target.state_observed,
+                .render_target_memory = self.gpu_xenos_runtime.color_resolve_observations != 0,
+                .front_buffer = front_buffer_identity,
+                .guest_vdswap_entries = vdswap_entries,
+                .guest_xe_swap_encoded = self.guest_vdswap_packet_encoded,
+                .authentic_xe_swap_consumed = self.gpu_vd_swap_contract.authentic_consumptions,
+                .issue_swap_entries = issue_swap_entries,
+            },
+            .callbacks = .{
+                .powerpc_address = self.interrupt_callback_transaction.callback_address,
+                .powerpc_registrations = self.interrupt_callback_transaction.registrations,
+                .powerpc_returns = self.interrupt_callback_transaction.callback_returns,
+                .translated_x86_address = self.gpu_interrupt_callback,
+                .translated_x86_registrations = self.gpu_interrupt_callback_registrations,
+                .translated_x86_dispatches = self.gpu_draw_completion_dispatches,
+            },
+            .latest_frame = latest_frame,
+            .diagnostic_requested = self.native_window.diagnostic_frame_attempts != 0,
+            .metal_guest_copy_ready = native.window_ready != 0 and
+                native.layer_attached != 0 and native.metal_layer != 0 and
+                native.metal_device != 0,
+        };
+        const outcome = self.cocoa_graphics.reconcile(snapshot);
+        self.cocoa_graphics_last_outcome = outcome;
+        return outcome;
+    }
+
+    /// Journal SDL graphics calls at the import boundary. The SDL runtime has
+    /// already validated the ABI and updated its generation counters before
+    /// this hook runs, so these records carry semantic meaning rather than raw
+    /// x86 instruction bytes.
+    pub fn observeSdlGraphicsImport(self: *MachOState, symbol: []const u8) void {
+        const name = if (symbol.len != 0 and symbol[0] == '_') symbol[1..] else symbol;
+        const function: gpu.graphics_intent.Import = if (std.mem.eql(u8, name, "SDL_CreateWindow"))
+            .sdl_create_window
+        else if (std.mem.eql(u8, name, "SDL_PumpEvents") or std.mem.eql(u8, name, "SDL_PollEvent"))
+            .sdl_pump_events
+        else
+            return;
+        const sequence = switch (function) {
+            .sdl_create_window => self.sdl.window_create_attempts,
+            .sdl_pump_events => self.sdl.event_pumps,
+            else => unreachable,
+        };
+        if (sequence == 0) return;
+        var source_identity = std.hash.Wyhash.hash(0x5344_4C32, name);
+        if (source_identity == 0) source_identity = 1;
+        const run_identity = if (self.event_stream.run_id == 0) @as(u64, 1) else self.event_stream.run_id;
+        _ = self.cocoa_graphics.observeIntent(.{
+            .run = run_identity,
+            .boundary = .{ .intercepted_import = .{
+                .function = function,
+                .address = self.regs.rip,
+                .space = .translated_x86,
+            } },
+            .producer = .sdl,
+            .evidence = .completed_call,
+            .source_identity = source_identity,
+            .generation = @max(@as(u64, self.sdl.window_generation), 1),
+            .sequence = sequence,
+        });
+    }
+
+    fn cocoaGraphicsPolicyFromEnvironment() gpu.cocoa_runtime.RoutePolicy {
+        // A verified frame copy is the useful default for this compatibility
+        // layer: it acts only after a complete, non-zero, content-digested
+        // frame exists and the native Vulkan presenter is unavailable. It
+        // never fabricates VdSwap/XE_SWAP and yields as soon as Xenia presents.
+        const raw = std.c.getenv("ROSETTE_COCOA_GRAPHICS_CONTROL") orelse return .verified_guest_fallback;
+        const value = std.mem.span(raw);
+        if (std.mem.eql(u8, value, "observe") or
+            std.mem.eql(u8, value, "audit") or
+            std.mem.eql(u8, value, "off") or
+            std.mem.eql(u8, value, "0")) return .observe_only;
+        if (std.mem.eql(u8, value, "diagnostic")) return .diagnostic_only;
+        if (std.mem.eql(u8, value, "fallback") or
+            std.mem.eql(u8, value, "verified") or
+            std.mem.eql(u8, value, "guest")) return .verified_guest_fallback;
+        return .observe_only;
+    }
+
+    /// Emit the complete ownership map only when its semantic fingerprint
+    /// changes. Repeated observations and presenter-lease renewals are counted
+    /// internally but do not reprint the map or masquerade as new GPU work.
+    fn logCocoaGraphicsControl(self: *MachOState, force: bool) void {
+        const runtime = &self.cocoa_graphics;
+        const fingerprint = runtime.fingerprint();
+        if (!force and fingerprint == self.cocoa_graphics_last_fingerprint) return;
+        self.cocoa_graphics_last_fingerprint = fingerprint;
+        const control = &runtime.control;
+        const summary = control.summary();
+        const frames = runtime.frames.summary();
+        const intents = runtime.intents.summary();
+        const work = runtime.credits.summary();
+        const outcome = self.cocoa_graphics_last_outcome;
+        const frame_offer_label = if (outcome.frame_observed) @tagName(outcome.frame_offer) else "none";
+
+        machoCapturePrint(
+            "macho-processor: COCOA GRAPHICS CONTROL: schema={d} run=0x{x} step={d} fingerprint=0x{x} policy={s} route={s} resources_ready={d}/{d} contested={d} stages_ready={d}/{d} failed={d} ownership_conflicts={d} presenter_lease={s}@{d} handoffs(offered/completed/refused)={d}/{d}/{d} frame_offer={s} frame_class={s} frame_delivery_pending={} semantic_intents(observed/admitted/rejected/duplicates/conflicts)={d}/{d}/{d}/{d}/{d}; raw_machine_code_to_cocoa=REFUSED semantic_boundaries_only=YES\n",
+            .{
+                gpu.cocoa_runtime.schema_version,
+                runtime.run,
+                self.executed_steps,
+                fingerprint,
+                control.policy.label(),
+                summary.route.label(),
+                summary.ready_resources,
+                control.resources.len,
+                summary.contested_resources,
+                summary.ready_stages,
+                control.stages.len,
+                summary.failed_stages,
+                summary.ownership_conflicts,
+                summary.lease_holder.label(),
+                control.presenter.generation,
+                summary.handoffs_offered,
+                summary.handoffs_completed,
+                summary.handoffs_refused,
+                frame_offer_label,
+                outcome.frame_class.label(),
+                outcome.frame_delivery_pending,
+                intents.observations,
+                intents.admitted,
+                intents.rejected,
+                intents.duplicates,
+                intents.conflicts,
+            },
+        );
+        for (intents.operations, 0..) |unique, index| {
+            if (unique == 0) continue;
+            const operation: gpu.graphics_intent.Operation = @enumFromInt(index);
+            machoCapturePrint(
+                "  cocoa-intent operation={s} unique={d}\n",
+                .{ operation.label(), unique },
+            );
+        }
+        for (intents.rejections, 0..) |unique, index| {
+            if (unique == 0) continue;
+            const rejection: gpu.graphics_intent.Rejection = @enumFromInt(index);
+            machoCapturePrint(
+                "  cocoa-intent-rejection reason={s} unique={d}\n",
+                .{ rejection.label(), unique },
+            );
+        }
+        for (control.resources) |resource| {
+            machoCapturePrint(
+                "  cocoa-resource name={s} state={s} identity=0x{x} generation={d} canonical_owner={s} custodian={s} evidence={s} providers=0x{x:0>4} borrowers=0x{x:0>4} observers=0x{x:0>4} observations={d} conflicts={d}\n",
+                .{
+                    resource.resource.label(),
+                    resource.state.label(),
+                    resource.identity,
+                    resource.generation,
+                    resource.canonical_owner.label(),
+                    resource.custodian.label(),
+                    resource.evidence.label(),
+                    resource.providers,
+                    resource.borrowers,
+                    resource.observers,
+                    resource.observations,
+                    resource.conflicts,
+                },
+            );
+        }
+        inline for (@typeInfo(gpu.cocoa_runtime.Stage).@"enum".fields) |field| {
+            const stage: gpu.cocoa_runtime.Stage = @enumFromInt(field.value);
+            const record = control.stages[field.value];
+            machoCapturePrint(
+                "  cocoa-stage owner={s: <16} state={s: <8} stage={s} identity=0x{x} generation={d} evidence={s} observations={d} owner_conflicts={d}\n",
+                .{
+                    stage.expectedOwner().label(),
+                    record.state.label(),
+                    stage.label(),
+                    record.identity,
+                    record.generation,
+                    record.evidence.label(),
+                    record.observations,
+                    record.owner_conflicts,
+                },
+            );
+        }
+        for (control.conflicts[0..control.conflict_count]) |conflict| {
+            machoCapturePrint(
+                "  cocoa-conflict sequence={d} kind={s} resource={s} expected_owner={s} actor={s} expected_identity=0x{x} observed_identity=0x{x} generation={d} step={d}\n",
+                .{
+                    conflict.sequence,
+                    conflict.kind.label(),
+                    conflict.resource.label(),
+                    conflict.expected_owner.label(),
+                    conflict.actor.label(),
+                    conflict.expected_identity,
+                    conflict.observed_identity,
+                    conflict.generation,
+                    conflict.step,
+                },
+            );
+        }
+        for (control.handoffs[0..control.handoff_count]) |handoff| {
+            machoCapturePrint(
+                "  cocoa-handoff token={d} state={s} resource={s} identity=0x{x} generation={d} from={s} to={s} offered={d} accepted={d} completed={d}\n",
+                .{
+                    handoff.token,
+                    handoff.state.label(),
+                    handoff.resource.label(),
+                    handoff.identity,
+                    handoff.generation,
+                    handoff.from.label(),
+                    handoff.to.label(),
+                    handoff.offered_step,
+                    handoff.accepted_step,
+                    handoff.completed_step,
+                },
+            );
+        }
+        machoCapturePrint(
+            "macho-processor: COCOA FRAME CUSTODY: offered={d} duplicates={d} rejected={d} conflicts={d} acquired={d} submitted={d} presented={d} classes(authentic/host_cadence/diagnostic/synthetic)={d}/{d}/{d}/{d} last={s}\n",
+            .{
+                frames.offered,
+                frames.duplicates,
+                frames.rejected,
+                frames.conflicts,
+                frames.acquired,
+                frames.submitted,
+                frames.presented,
+                frames.authentic_guest,
+                frames.guest_pixels_host_cadence,
+                frames.diagnostic,
+                frames.synthetic_guest_control,
+                frames.last_class.label(),
+            },
+        );
+        var latest: ?*const gpu.frame_handoff.Record = null;
+        for (runtime.frames.records[0..runtime.frames.count]) |*record| {
+            if (latest == null or record.descriptor.identity.serial > latest.?.descriptor.identity.serial)
+                latest = record;
+        }
+        if (latest) |record| {
+            const frame = record.descriptor;
+            machoCapturePrint(
+                "  cocoa-frame run=0x{x} serial={d} generation={d} source=0x{x}+0x{x} extent={d}x{d} pitch={d} format={s} orientation={s} producer={s} guest_pixels={s} guest_swap={s} state={s} custodian={s} class={s} rejection={s}\n",
+                .{
+                    frame.identity.run,
+                    frame.identity.serial,
+                    frame.identity.generation,
+                    frame.source_address,
+                    frame.source_length,
+                    frame.width,
+                    frame.height,
+                    frame.row_pitch,
+                    frame.format.label(),
+                    frame.orientation.label(),
+                    frame.producer.label(),
+                    if (frame.guest_pixels) "YES" else "NO",
+                    if (frame.guest_requested_present) "YES" else "NO",
+                    record.state.label(),
+                    record.custodian.label(),
+                    record.frame_class.label(),
+                    record.rejection.label(),
+                },
+            );
+        }
+        machoCapturePrint(
+            "macho-processor: GPU WORK CREDIT: observations={d} unique_claims={d} duplicates={d} conflicts={d} malformed={d} credited_units={d}; repeated logs and heartbeats never add units\n",
+            .{ work.observations, work.unique_claims, work.duplicates, work.conflicts, work.malformed, work.credited_units },
+        );
+        inline for (@typeInfo(gpu.work_credit.Kind).@"enum".fields) |field| {
+            const kind: gpu.work_credit.Kind = @enumFromInt(field.value);
+            machoCapturePrint("  gpu-work kind={s: <20} unique_units={d}\n", .{ kind.label(), work.units(kind) });
         }
     }
 
@@ -4470,6 +5114,630 @@ pub const MachOState = struct {
         return (now - self.run_started_at_ns) / std.time.ns_per_s;
     }
 
+    /// State the harness's own view of the facts the emulator also reports.
+    ///
+    /// Recorded on every checkpoint rather than on change: the reconciliation
+    /// rule reads how many times a source repeated a value *after* being
+    /// contradicted, and a change-only feed erases exactly that signal.
+    fn stateHarnessClaims(self: *MachOState) void {
+        const at = self.executed_steps;
+        const ledger = &self.claim_reconciliation;
+        const publication = &self.gpu_ring_publication;
+
+        if (self.gpu_ring_watch_base != 0) {
+            ledger.state(.ring_base_address, .rosette_ring_publication, self.gpu_ring_watch_base, at);
+            ledger.state(.ring_size_bytes, .rosette_ring_publication, self.gpu_ring_watch_size, at);
+            ledger.stateBool(.ring_initialised, .rosette_kernel_import, true, at);
+        }
+        if (publication.geometry) |geometry| {
+            ledger.state(.ring_read_pointer, .rosette_ring_publication, geometry.read_pointer, at);
+            ledger.state(.ring_write_pointer, .rosette_ring_publication, geometry.write_pointer, at);
+        }
+        // Xenia's interrupt callback is a PowerPC title callback registered and
+        // executed inside Xenia's CPU engine. `gpu_interrupt_callback` is a
+        // separate Rosette-model callback used by the fallback Xenos runtime.
+        // They are different objects and execution domains, so they must not be
+        // entered under the same callback claims. The Xenia claims are fed only
+        // by Xenia's self-contained log records; this claim names only the
+        // modelled-runtime stage.
+        ledger.state(
+            .draw_completion_dispatches,
+            .rosette_interrupt_dispatch,
+            self.gpu_draw_completion_dispatches,
+            at,
+        );
+        ledger.state(
+            .swap_packets_consumed,
+            .rosette_xenos_runtime,
+            self.gpu_xenos_runtime.swap_count,
+            at,
+        );
+    }
+
+    /// Print which of several disagreeing statements about the same fact is
+    /// current, and which sources are still asserting a contradicted one.
+    ///
+    /// This report exists because the log's loudest statement about a fact is
+    /// routinely not its truest. `ring_init=NO rb_base=00000000` appears four
+    /// times during bring-up and is contradicted 1.7 seconds later by a
+    /// different line that appears three times. Both remain in the log. Two
+    /// separate investigations in this project were spent on the stale one.
+    pub fn logClaimReconciliation(self: *MachOState) void {
+        self.stateHarnessClaims();
+        const ledger = &self.claim_reconciliation;
+        const totals = ledger.summary();
+        const finding = totals.finding();
+
+        machoCapturePrint(
+            "macho-processor: CLAIM RECONCILIATION: finding={s} observed={d}/{d} corroborated={d} agreed={d} superseded={d} contested={d} crosses_sides={s} statements={d} step={d}; {s}\n",
+            .{
+                finding.label(),
+                totals.observed,
+                claim_reconciliation.claim_count,
+                totals.corroborated,
+                totals.agreed,
+                totals.superseded,
+                totals.contested,
+                if (totals.crosses_sides) "YES" else "NO",
+                totals.statements,
+                self.executed_steps,
+                finding.guidance(),
+            },
+        );
+
+        if (ledger.blocking()) |result| {
+            machoCapturePrint(
+                "  CLAIM BLOCKER: {s} agreement={s} current={s}=0x{x} (step {d}) losing={s}=0x{x} (step {d}) crosses_sides={s}; {s}\n",
+                .{
+                    result.claim.label(),
+                    result.agreement.label(),
+                    if (result.current_source) |which| which.label() else "<none>",
+                    result.current_value,
+                    result.current_step,
+                    if (result.losing_source) |which| which.label() else "<none>",
+                    result.losing_value,
+                    result.losing_step,
+                    if (result.crosses_sides) "YES" else "NO",
+                    result.agreement.guidance(),
+                },
+            );
+        }
+
+        inline for (@typeInfo(claim_reconciliation.Claim).@"enum".fields) |field| {
+            const claim: claim_reconciliation.Claim = @enumFromInt(field.value);
+            const result = ledger.reconcile(claim);
+            if (result.agreement != .unobserved) {
+                machoCapturePrint(
+                    "  claim {s: <34} {s: <14} observers={d} current={s: <28}=0x{x:0>8} losing={s: <28}=0x{x:0>8} crosses={s} counter={s}\n",
+                    .{
+                        claim.label(),
+                        result.agreement.label(),
+                        result.observers,
+                        if (result.current_source) |which| which.label() else "-",
+                        result.current_value,
+                        if (result.losing_source) |which| which.label() else "-",
+                        result.losing_value,
+                        if (result.crosses_sides) "YES" else "NO",
+                        if (claim.isCounter()) "YES" else "NO",
+                    },
+                );
+            }
+        }
+    }
+
+    /// Report Xenia's PowerPC callback transaction independently of Rosette's
+    /// fallback-model interrupt callback. A return is the authoritative
+    /// execution fact; absence of a sampled ring mutation remains advisory.
+    pub fn logInterruptCallbackTransaction(self: *MachOState) void {
+        const ledger = &self.interrupt_callback_transaction;
+        const finding = ledger.finding();
+        const gap = ledger.firstGap();
+        machoCapturePrint(
+            "macho-processor: XENIA INTERRUPT CALLBACK: domain={s} finding={s} first_gap={s} owner={s} registered={d} attempts={d} returns={d} skips={d} deferrals={d} callback=0x{x:0>8} user_data=0x{x:0>8} last(id/source/cpu/duration_ms)={d}/{d}/{d}/{d} context(before/after/changed)={d}/{d}/{d} payload(samples/changed/appeared)={d}/{d}/{d} effect={s} counters_valid={s} first_step={d} last_step={d}; {s}\n",
+            .{
+                ledger.domain.label(),
+                finding.label(),
+                if (gap) |stage| stage.label() else "<complete>",
+                if (gap) |stage| stage.owner() else "-",
+                ledger.registrations,
+                ledger.dispatch_attempts,
+                ledger.callback_returns,
+                ledger.dispatch_skips,
+                ledger.dispatch_deferrals,
+                ledger.callback_address,
+                ledger.user_data,
+                ledger.last_dispatch_id,
+                ledger.last_source,
+                ledger.last_cpu,
+                ledger.last_duration_ms,
+                ledger.context_before_samples,
+                ledger.context_after_samples,
+                ledger.context_changes,
+                ledger.payload_samples,
+                ledger.payload_changes,
+                ledger.payload_appearances,
+                ledger.effect().label(),
+                if (ledger.counterInvariantHolds()) "YES" else "NO",
+                ledger.first_step,
+                ledger.last_step,
+                finding.guidance(),
+            },
+        );
+    }
+
+    /// Print which Xenos registers the executed PM4 stream actually wrote.
+    ///
+    /// Forty state packets executed with every render-target register reading
+    /// zero is either a title that has not chosen a target or a harness losing
+    /// the write, and a count of state packets cannot tell those apart. The
+    /// register indices can.
+    pub fn logRegisterJournal(self: *MachOState) void {
+        const journal = &self.gpu_xenos_runtime.executor.register_file.journal;
+        const totals = journal.summary();
+
+        machoCapturePrint(
+            "macho-processor: XENOS REGISTER JOURNAL: verdict={s} writes={d} out_of_range={d} blocks_touched={d}/{d} target_writes={d} target_nonzero={d}/{d} step={d}; {s}\n",
+            .{
+                totals.verdict.label(),
+                totals.writes,
+                totals.unknown_writes,
+                totals.blocks_touched,
+                gpu.register_journal.block_count,
+                totals.target_writes,
+                totals.target_nonzero,
+                gpu.register_journal.target_registers.len,
+                self.executed_steps,
+                totals.verdict.guidance(),
+            },
+        );
+        machoCapturePrint("  REGISTER JOURNAL OWNER: {s}\n", .{totals.verdict.owner()});
+
+        // The register aperture and this journal count different things, and a
+        // reader who sees only the first concludes the title never touched its
+        // GPU. The aperture counts MMIO stores into the register window; this
+        // journal counts registers written by PM4 packets the command processor
+        // executed. A title that programs its GPU through the ring — which is
+        // the normal path — leaves the aperture at zero forever while writing
+        // hundreds of registers. Printed together so the zero cannot be read as
+        // an absence of register programming.
+        const aperture_accesses = self.gpu_register_aperture.total_reads +
+            self.gpu_register_aperture.total_writes;
+        machoCapturePrint(
+            "  REGISTER PATH SPLIT: mmio_aperture(reads+writes)={d} pm4_journal_writes={d}; {s}\n",
+            .{
+                aperture_accesses,
+                totals.writes,
+                if (aperture_accesses == 0 and totals.writes != 0)
+                    "the aperture is untouched and the PM4 path is busy, which is the normal shape for a title that programs its GPU through the command ring. An aperture verdict of never_accessed is not evidence that registers were not programmed"
+                else if (aperture_accesses == 0 and totals.writes == 0)
+                    "neither path has carried a register write, so no register programming has been observed by any route"
+                else if (aperture_accesses != 0 and totals.writes == 0)
+                    "the title stores directly into the register aperture and no PM4 packet has programmed a register; this is the reverse of the usual shape and worth confirming against the ring"
+                else
+                    "both paths carry register writes; state may be programmed from either, so a register's final value is whichever path wrote last",
+            },
+        );
+
+        inline for (@typeInfo(gpu.RegisterBlock).@"enum".fields) |field| {
+            const which: gpu.RegisterBlock = @enumFromInt(field.value);
+            const record = journal.block(which);
+            machoCapturePrint(
+                "  register block {s: <20} writes={d: <8} groups={d: <5} first=0x{x:0>4} last=0x{x:0>4} last_value=0x{x:0>8}; {s}\n",
+                .{
+                    which.label(),
+                    record.writes,
+                    record.distinct_sampled,
+                    record.first_register,
+                    record.last_register,
+                    record.last_value,
+                    which.meaning(),
+                },
+            );
+        }
+        for (gpu.register_journal.target_registers) |register| {
+            const record = journal.target(register).?;
+            machoCapturePrint(
+                "  target register 0x{x:0>4} writes={d} last_value=0x{x:0>8} ever_nonzero={s} last_write_seq={d}\n",
+                .{ record.register, record.writes, record.last_value, if (record.ever_nonzero) "YES" else "NO", record.last_step },
+            );
+        }
+    }
+
+    /// Learn the callback address from every source, keeping how much each
+    /// one assumes, and select the dispatch policy this run asked for.
+    ///
+    /// The live gap this closes: the callback address `0x821951f8` is printed
+    /// in one report while the dispatcher holds zero and makes no attempt. Both
+    /// are correct — the address was parsed from a diagnostic line and nothing
+    /// intercepted a registration — and the run is stuck between them.
+    fn refreshDrawDispatch(self: *MachOState) void {
+        const scaffold = &self.gpu_draw_dispatch;
+        const at = self.executed_steps;
+
+        if (!self.gpu_draw_dispatch_configured) {
+            self.gpu_draw_dispatch_configured = true;
+            scaffold.policy = drawDispatchPolicyFromEnvironment();
+            if (scaffold.policy != .observe_only) {
+                machoCapturePrint(
+                    "macho-processor: DRAW DISPATCH: policy={s} selected by ROSETTE_DRAW_DISPATCH. Rosette may now deliver queued GPU completions the emulator did not. Every delivery is recorded as a substitution and none of them closes the authentic dispatch stage, so a run that only advanced because of this still reads as a title that never received its own completion\n",
+                    .{scaffold.policy.label()},
+                );
+            }
+        }
+
+        // The strongest source: Rosette intercepted the registration call and
+        // watched the guest hand the address over.
+        if (self.gpu_interrupt_callback != 0) {
+            scaffold.observeCallback(
+                self.gpu_interrupt_callback,
+                self.gpu_interrupt_callback_arg,
+                .intercepted_binding,
+                .translated_x86,
+                at,
+            );
+        }
+        // The weakest: parsed out of an emulator diagnostic line. Recorded at
+        // its true strength so a policy can refuse it.
+        const transaction = &self.interrupt_callback_transaction;
+        if (transaction.callback_address != 0) {
+            scaffold.observeCallback(
+                transaction.callback_address,
+                transaction.user_data,
+                .emulator_log_claim,
+                .xenia_powerpc,
+                at,
+            );
+        }
+        scaffold.observeQueued(self.gpu_xenos_runtime.draw_completion_signals);
+
+        // Supply a front buffer when nothing else can name one. The address is
+        // the guest front-buffer window the console reserves; the extent is the
+        // mode this display path negotiates. Refused if implausible, because
+        // the command processor asserts on an extent it cannot use.
+        if (scaffold.policy != .observe_only and
+            scaffold.suppliedSurface() == null and
+            self.gpu_frontbuffer == null and
+            !self.gpu_vd_swap_contract.frontbufferKnown())
+        {
+            if (self.gpu_ring_watch_base != 0) {
+                if (scaffold.supplySurface(
+                    gpu.draw_dispatch.default_frontbuffer_address,
+                    gpu.draw_dispatch.default_width,
+                    gpu.draw_dispatch.default_height,
+                    .frontbuffer_never_named,
+                    at,
+                )) {
+                    machoCapturePrint(
+                        "macho-processor: DRAW DISPATCH: supplied a front buffer at 0x{x:0>8} {d}x{d} because no source ever named one. This surface is Rosette's and is tagged as such permanently: a frame presented from it is never guest output, and the substitution ladder can now take its lowest rung without inventing a swap\n",
+                        .{
+                            gpu.draw_dispatch.default_frontbuffer_address,
+                            gpu.draw_dispatch.default_width,
+                            gpu.draw_dispatch.default_height,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Attribute an effect to the most recent delivery. Only a delivery can
+        // carry one, and only once.
+        if (scaffold.last.outcome == .delivered and scaffold.last.effect == .unmeasured) {
+            const contract_ledger = &self.gpu_vd_swap_contract;
+            const effect: gpu.DrawDispatchEffect = if (contract_ledger.observed(.authentic_xe_swap_consumed))
+                .present_reached
+            else if (self.gpu_ring_publication.advances > 1 and
+                self.gpu_ring_publication.last_advance_step > scaffold.last.step)
+                .producer_published
+            else if (contract_ledger.observed(.guest_producer_progressed_after_draw))
+                .guest_progressed
+            else if (self.executed_steps -| scaffold.last.step > effect_settle_steps)
+                .no_observable_change
+            else
+                .unmeasured;
+            if (effect != .unmeasured) scaffold.noteEffect(effect);
+        }
+    }
+
+    /// How long after a delivery before "nothing changed" is a conclusion
+    /// rather than impatience. A hundred million steps is a full heartbeat
+    /// interval, so a consumer that was going to act has had a turn.
+    const effect_settle_steps: u64 = 100_000_000;
+
+    fn drawDispatchPolicyFromEnvironment() gpu.DrawDispatchPolicy {
+        const raw = std.c.getenv("ROSETTE_DRAW_DISPATCH") orelse return .observe_only;
+        const value = std.mem.span(raw);
+        if (std.mem.eql(u8, value, "bound")) return .bound_callbacks_only;
+        if (std.mem.eql(u8, value, "guest")) return .guest_addressed;
+        if (std.mem.eql(u8, value, "any")) return .any_known_address;
+        return .observe_only;
+    }
+
+    /// Print what the dispatch scaffold knows, what it did, and what it
+    /// refused.
+    pub fn logDrawDispatch(self: *MachOState) void {
+        self.refreshDrawDispatch();
+        const scaffold = &self.gpu_draw_dispatch;
+        const totals = scaffold.summary();
+        const finding = totals.finding();
+
+        machoCapturePrint(
+            "macho-processor: DRAW DISPATCH: finding={s} policy={s} callback=0x{x:0>8} address_space={s} executor=translated-x86 provenance={s} upgrades={d} conflicts={d} queued_signals={d} attempts={d} delivered={d} failures={d} refused(no_callback/unverified/cross_domain/policy)={d}/{d}/{d}/{d} completions_delivered={d} effects(inert/advancing)={d}/{d} surface_supplied={s} step={d}; {s}\n",
+            .{
+                finding.label(),
+                totals.policy.label(),
+                totals.callback.address,
+                totals.callback.address_space.label(),
+                totals.callback.provenance.label(),
+                totals.callback.upgrades,
+                totals.callback.conflicts,
+                self.gpu_xenos_runtime.draw_completion_signals,
+                totals.attempts,
+                totals.delivered,
+                totals.failures,
+                totals.refused_no_callback,
+                totals.refused_unverified,
+                totals.refused_cross_domain,
+                totals.refused_by_policy,
+                totals.completions_delivered,
+                totals.inert_deliveries,
+                totals.advancing_deliveries,
+                if (totals.surface_supplied) "YES" else "NO",
+                self.executed_steps,
+                finding.guidance(),
+            },
+        );
+        const authentic = &self.interrupt_callback_transaction;
+        machoCapturePrint(
+            "  CALLBACK DOMAIN SPLIT: retained_draws_observed={d} model_signals_published={d} model_executor=translated-x86; xenia_powerpc(callback/registrations/attempts/returns/skips/deferrals)=0x{x:0>8}/{d}/{d}/{d}/{d}/{d} counters_valid={s}. Xenia's returning PowerPC callback is healthy in its own executor domain and is never entered or credited by Rosette's translated-x86 scaffold\n",
+            .{
+                self.gpu_xenos_runtime.retained_draw_observations,
+                self.gpu_xenos_runtime.draw_completion_signals,
+                authentic.callback_address,
+                authentic.registrations,
+                authentic.dispatch_attempts,
+                authentic.callback_returns,
+                authentic.dispatch_skips,
+                authentic.dispatch_deferrals,
+                if (authentic.counterInvariantHolds()) "YES" else "NO",
+            },
+        );
+
+        if (scaffold.suppliedSurface()) |surface| {
+            machoCapturePrint(
+                "  DRAW DISPATCH SURFACE: harness_supplied=YES address=0x{x:0>8} extent={d}x{d} reason={s} step={d}; a frame presented from this surface is Rosette's and is never counted as guest output\n",
+                .{
+                    surface.description.frontbuffer_physical_address,
+                    surface.description.width,
+                    surface.description.height,
+                    surface.reason.label(),
+                    surface.supplied_step,
+                },
+            );
+        }
+
+        for (scaffold.recent[0..scaffold.recent_count]) |attempt| {
+            machoCapturePrint(
+                "  dispatch attempt outcome={s: <20} provenance={s: <20} effect={s: <22} queued_before={d} delivered={d} step={d}\n",
+                .{
+                    attempt.outcome.label(),
+                    attempt.provenance.label(),
+                    attempt.effect.label(),
+                    attempt.queued_before,
+                    attempt.delivered_count,
+                    attempt.step,
+                },
+            );
+        }
+    }
+
+    /// Print who waits on what and whether the handshake is going anywhere.
+    ///
+    /// Read this when the deadlock predictor says nothing is wrong and the run
+    /// is still not moving. A matched pair cycling with nothing else advancing
+    /// is invisible to every check that asks "is something parked", because
+    /// nothing is.
+    pub fn logWaitGraph(self: *MachOState) void {
+        const graph = &self.wait_graph;
+        // `livelockOperation` resolves each object through the process-owned
+        // sync identity table before it reaches the graph. Do not fold it a
+        // second time here: almost every console address is a plausible u32,
+        // so the former second opinion could neither recognise a truncated host
+        // pointer nor prove that an already canonical value was safe to fold.
+
+        // The independent progress axis. Deliberately a counter a spin cannot
+        // advance: contract stages are reached once each, so a handshake going
+        // round in circles cannot move it. Without this gate every healthy
+        // worker loop in the process reads as a livelock.
+        graph.noteProgress(
+            @as(u64, gpu.vd_swap_contract.observedCount(self.gpu_vd_swap_contract.observed_mask)) +|
+                self.gpu_ring_publication.advances +|
+                self.run_horizon.milestones_reached,
+        );
+
+        const totals = graph.summary();
+        const verdict = totals.verdict();
+        machoCapturePrint(
+            "macho-processor: WAIT GRAPH: verdict={s} self_resolving={s} objects={d} events={d} orphan(wait/signal)={d}/{d} handshakes(stalled/progressing)={d}/{d} insufficient={d} cycles={d} folds={d} dropped_objects={d} step={d}; {s}\n",
+            .{
+                verdict.label(),
+                if (verdict.selfResolving()) "YES" else "NO",
+                totals.objects,
+                totals.events,
+                totals.orphan_waits,
+                totals.orphan_signals,
+                totals.stalled_handshakes,
+                totals.progressing_handshakes,
+                totals.insufficient,
+                totals.cycles,
+                totals.canonical_folds,
+                totals.dropped_objects,
+                self.executed_steps,
+                verdict.guidance(),
+            },
+        );
+
+        if (totals.cycle) |cycle| {
+            machoCapturePrint(
+                "  WAIT CYCLE: thread 0x{x} waits on 0x{x} which only thread 0x{x} signals, and thread 0x{x} waits on 0x{x} which only thread 0x{x} signals. Neither can proceed and neither is idle\n",
+                .{
+                    cycle.first_thread,
+                    cycle.first_object,
+                    cycle.second_thread,
+                    cycle.second_thread,
+                    cycle.second_object,
+                    cycle.first_thread,
+                },
+            );
+        }
+
+        if (graph.blocking()) |record| {
+            machoCapturePrint(
+                "  WAIT GRAPH BLOCKER: object=0x{x:0>8} state={s} waits={d} signals={d} waiters={d} signallers={d} first_step={d} last_step={d}; {s}\n",
+                .{
+                    record.address,
+                    record.state().label(),
+                    record.waits,
+                    record.signals,
+                    record.waiter_count,
+                    record.signaller_count,
+                    record.first_step,
+                    record.last_step,
+                    record.state().guidance(),
+                },
+            );
+            if (record.soleWaiter()) |waiter| {
+                machoCapturePrint(
+                    "    waiter    thread=0x{x} pc=0x{x} events={d} first_step={d} last_step={d}\n",
+                    .{ waiter.thread, waiter.pc, waiter.events, waiter.first_step, waiter.last_step },
+                );
+            }
+            if (record.soleSignaller()) |signaller| {
+                machoCapturePrint(
+                    "    signaller thread=0x{x} pc=0x{x} events={d} first_step={d} last_step={d}\n",
+                    .{ signaller.thread, signaller.pc, signaller.events, signaller.first_step, signaller.last_step },
+                );
+            }
+        }
+
+        for (graph.objects) |record| {
+            if (!record.occupied) continue;
+            if (!record.state().isFinding()) continue;
+            machoCapturePrint(
+                "  wait object 0x{x:0>8} {s: <22} waits={d: <6} signals={d: <6} waiters={d} signallers={d} dropped={d} last_step={d}\n",
+                .{
+                    record.address,
+                    record.state().label(),
+                    record.waits,
+                    record.signals,
+                    record.waiter_count,
+                    record.signaller_count,
+                    record.participants_dropped,
+                    record.last_step,
+                },
+            );
+        }
+    }
+
+    /// Print the cause the cache fill path proved for every decode miss.
+    ///
+    /// A repeated page is not evidence that an emitter rewrote it. The 6.2B
+    /// run's hottest pages were immutable Xenia image text and precise byte
+    /// invalidation was effectively absent; the repeated work was eviction.
+    /// Preserve the fill cause here so cache pressure and executable mutation
+    /// can never collapse into the same diagnosis again.
+    pub fn logTranslationEconomics(self: *MachOState) void {
+        const totals = self.translation_economics.summary();
+        const verdict = totals.verdict();
+
+        machoCapturePrint(
+            "macho-processor: TRANSLATION ECONOMICS: verdict={s} converges={s} fills={d} causes(vacant/conflict/stale/flush)={d}/{d}/{d}/{d} conflict={d}% recoverable={d} invalidations(precise/wholesale)={d}/{d} invalidated_bytes={d} sampled_pages={d} unsampled_events={d} sample_complete={s} step={d}; {s}\n",
+            .{
+                verdict.label(),
+                if (verdict.converges()) "YES" else "NO",
+                totals.decodes,
+                totals.vacant_fills,
+                totals.conflict_fills,
+                totals.stale_refills,
+                totals.flush_refills,
+                totals.conflictPercent(),
+                totals.recoverableDecodes(),
+                totals.precise_invalidations,
+                totals.wholesale_flushes,
+                totals.invalidated_bytes,
+                totals.sampled_pages,
+                totals.unsampled_events,
+                if (totals.sampleComplete()) "YES" else "NO",
+                self.executed_steps,
+                verdict.guidance(),
+            },
+        );
+
+        // The hit rate is independent of why the misses occurred. Keep it next
+        // to the cause ledger, but do not infer mutation from either number.
+        const cache_total = self.decode_cache_hits + self.decode_cache_misses;
+        const hit_percent: u64 = if (cache_total == 0) 0 else (self.decode_cache_hits * 100) / cache_total;
+        machoCapturePrint(
+            "  translation cache: entries={d} ways={d} sets={d} hits={d} misses={d} hit_rate={d}% miss(vacant/conflict)={d}/{d} stale_byte_rejections={d}\n",
+            .{
+                self.decode_cache.len,
+                constants.DECODE_CACHE_WAYS,
+                constants.DECODE_CACHE_SET_COUNT,
+                self.decode_cache_hits,
+                self.decode_cache_misses,
+                hit_percent,
+                self.decode_cache_vacant_misses,
+                self.decode_cache_conflict_misses,
+                self.decode_cache_stale_rejections,
+            },
+        );
+
+        if (totals.hottest_recurring != 0) {
+            var hottest: [8]translation_economics.PageRecord = undefined;
+            const found = self.translation_economics.hottestPages(&hottest);
+            machoCapturePrint(
+                "  TRANSLATION PRESSURE HOTSPOTS: {d} sampled page(s) with recurring fill cost; conflicts are eviction evidence, stale refills are byte-change evidence\n",
+                .{found},
+            );
+            for (hottest[0..found]) |record| {
+                machoCapturePrint(
+                    "  cache-pressure page=0x{x:0>12} fills={d} vacant={d} conflicts={d} stale={d} flush={d} first_step={d} last_step={d}\n",
+                    .{
+                        record.page << translation_economics.page_shift,
+                        record.decodes,
+                        record.vacant_fills,
+                        record.conflict_fills,
+                        record.stale_refills,
+                        record.flush_refills,
+                        record.first_step,
+                        record.last_step,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Prove that formatted Xenia records stayed isolated across cooperative
+    /// guest threads. A missing append is deliberately rejected; accepting it
+    /// from another thread's buffer would turn corrupted text into false PM4
+    /// and scheduling evidence.
+    pub fn logGuestLogChannels(self: *MachOState) void {
+        const totals = self.guest_log_channels.summary();
+        machoCapturePrint(
+            "macho-processor: GUEST LOG CHANNELS: channels={d} gets={d} hits={d} appends={d} emitted={d} failed={d} missing_appends={d} overflow={d} isolated={s}; one 64-KiB formatting buffer is owned by each observed guest thread\n",
+            .{
+                totals.channels,
+                totals.get_requests,
+                totals.get_hits,
+                totals.append_requests,
+                totals.emissions,
+                totals.failed_emissions,
+                totals.missing_appends,
+                totals.overflow,
+                if (totals.isolated()) "YES" else "NO",
+            },
+        );
+    }
+
     /// Print whether the run stopped because the guest stopped, or because the
     /// run did.
     ///
@@ -4691,6 +5959,41 @@ pub const MachOState = struct {
                 self.gpu_xenos_runtime.batches,
                 self.gpu_xenos_runtime.ring_dwords_consumed,
                 self.gpu_xenos_runtime.packet_errors,
+            },
+        );
+        self.logNewPm4Fault();
+    }
+
+    /// Emit each PM4 failure once with enough context to reproduce its framing
+    /// decision. The bounded journal remains available for later summaries;
+    /// this changed-sequence gate keeps periodic health reports from repeating
+    /// the same fault indefinitely.
+    fn logNewPm4Fault(self: *MachOState) void {
+        const fault = self.gpu_xenos_runtime.executor.fault_journal.latest() orelse return;
+        if (fault.sequence <= self.gpu_pm4_last_fault_logged) return;
+        self.gpu_pm4_last_fault_logged = fault.sequence;
+        machoCapturePrint(
+            "macho-processor: PM4 FAULT: sequence={d} packet_sequence={d} reason={s} source={s} depth={d} base=0x{x:0>8} address=0x{x:0>8} dword_offset={d} header=0x{x:0>8} kind={s} opcode={s}(0x{x:0>2}) declared_payload={d} required={d} available={d} missing={d} journal(total/retained/overwritten)={d}/{d}/{d}\n",
+            .{
+                fault.sequence,
+                fault.packet_sequence,
+                fault.reason.label(),
+                fault.source.label(),
+                fault.depth,
+                fault.base_address,
+                fault.address,
+                fault.dword_offset,
+                fault.raw_header,
+                @tagName(fault.kind),
+                fault.opcodeLabel(),
+                @intFromEnum(fault.opcode),
+                fault.declared_payload_dwords,
+                fault.required_total_dwords,
+                fault.available_dwords,
+                fault.missingDwords(),
+                self.gpu_xenos_runtime.executor.fault_journal.total,
+                self.gpu_xenos_runtime.executor.fault_journal.count,
+                self.gpu_xenos_runtime.executor.fault_journal.overwritten,
             },
         );
     }
@@ -5296,13 +6599,18 @@ pub const MachOState = struct {
     pub fn logGuestWaitLiveness(self: *MachOState) void {
         const ledger = &self.guest_wait_liveness;
         machoCapturePrint(
-            "macho-processor: GUEST WAIT LIVENESS: waits={d} signalled={d} timed_out={d} immediate={d}% aggregate={s} objects={d} unattributed={d} untracked={d} step={d}; {s}\n",
+            "macho-processor: GUEST WAIT LIVENESS: waits={d} signalled={d} timed_out={d} timing_samples={d} blocked_released={d} ready_on_entry={d} ready={d}% unknown_timing={d} aggregate={s} consumption_proven={s} objects={d} unattributed={d} untracked={d} step={d}; {s}\n",
             .{
                 ledger.total_waits,
                 ledger.total_signalled,
                 ledger.total_timed_out,
-                ledger.aggregateImmediatePercent(),
+                ledger.aggregateTimingSamples(),
+                ledger.total_blocked_signalled,
+                ledger.total_ready_on_entry,
+                ledger.aggregateReadyPercent(),
+                ledger.total_unknown_timing,
                 ledger.aggregateVerdict().label(),
+                if (ledger.provesSignalConsumption()) "YES" else "NO",
                 ledger.count,
                 ledger.unattributed_waits,
                 ledger.untracked_waits,
@@ -5312,15 +6620,22 @@ pub const MachOState = struct {
         );
         for (ledger.objects[0..ledger.count]) |object| {
             machoCapturePrint(
-                "  wait object handle=0x{x:0>8} waits={d} signalled={d} timed_out={d} immediate={d}% sets={d} sets_already_signalled={d} verdict={s}\n",
+                "  wait object handle=0x{x:0>8} mode={s} mode_conflicts={d} waits={d} signalled={d} timed_out={d} timing_samples={d} blocked_released={d} ready_on_entry={d} ready={d}% unknown_timing={d} sets={d} sets_already_signalled={d} consumption_proven={s} verdict={s}\n",
                 .{
                     object.handle,
+                    object.event_mode.label(),
+                    object.event_mode_conflicts,
                     object.waits,
                     object.signalled,
                     object.timed_out,
-                    object.immediateRatioPercent(),
+                    object.timingSamples(),
+                    object.blocked_signalled,
+                    object.ready_on_entry,
+                    object.readyRatioPercent(),
+                    object.unknown_timing,
                     object.sets,
                     object.sets_already_signalled,
+                    if (object.provesSignalConsumption()) "YES" else "NO",
                     object.verdict().label(),
                 },
             );
@@ -5336,6 +6651,16 @@ pub const MachOState = struct {
         self.refreshPreinitialization();
         const ledger = &self.gpu_preinitialization;
         const gap = ledger.firstGap();
+        const collapsible = gap == null and ledger.inversion_count == 0 and ledger.inversions_dropped == 0;
+        // Once the immutable 13/13 startup contract has been printed, later
+        // checkpoints add no information. Suppress the summary as well as the
+        // rows; otherwise a completed startup remains one of the loudest lines
+        // in a run whose actual frontier is render-target state.
+        if (collapsible and self.gpu_preinitialization_collapsed != 0) {
+            self.gpu_preinitialization_collapsed +|= 1;
+            return;
+        }
+        if (!collapsible) self.gpu_preinitialization_collapsed = 0;
         machoCapturePrint(
             "macho-processor: GPU PRE-INITIALIZATION: established={d}/{d} first_gap={s} owner={s} inversions={d} (dropped={d}) refused_supplies={d} step={d}; {s}\n",
             .{
@@ -5350,6 +6675,25 @@ pub const MachOState = struct {
                 ledger.verdict(),
             },
         );
+        // A complete contract has nothing left to say element by element.
+        // Reprinting thirteen established lines on every checkpoint buries the
+        // reports that still have a gap, and a reader scanning for the frontier
+        // has to skip them every time. The summary above already carries the
+        // count, the ordering check and the refusal count, so the detail is
+        // emitted only while it can still name something outstanding.
+        //
+        // Deliberately keyed on inversions as well as completeness: an
+        // out-of-order establishment is a finding even when every element is
+        // present, and collapsing it away would hide the one class of defect
+        // this ledger exists to catch.
+        if (collapsible) {
+            self.gpu_preinitialization_collapsed = 1;
+            machoCapturePrint(
+                "  GPU PRE-INITIALIZATION: complete and in order, so the summary and per-element detail are collapsed from here on. They return automatically if an element is ever lost or an inversion appears\n",
+                .{},
+            );
+            return;
+        }
         inline for (@typeInfo(gpu.PreinitElement).@"enum".fields) |field| {
             const element: gpu.PreinitElement = @enumFromInt(field.value);
             const entry = ledger.entries[field.value];
@@ -5515,6 +6859,9 @@ pub const MachOState = struct {
         };
         if (survey.best()) |chosen| {
             if (self.guestMemoryConst(chosen.address, self.gpu_ring_watch_size)) |bytes| {
+                if (chosen.readable) {
+                    self.observeGpuEarlyBoundary(.ring_payload_readable, .ring, chosen.nonzero_dwords);
+                }
                 const summary = gpu.ring_scan.scan(bytes, geometry.read_pointer, span, ring_dwords);
                 if (summary.dwords_examined == 0) {
                     for (span_stages) |stage| {
@@ -5588,11 +6935,16 @@ pub const MachOState = struct {
                         xenosMemoryWrite,
                     );
                     if (self.gpu_xenos_runtime.executeRingBytes(bytes, geometry.read_pointer, span, ring_dwords)) |execution| {
+                        self.observeGpuEarlyPacketExecution(
+                            execution,
+                            self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.published(),
+                        );
                         const indirect = self.xenia_gpu_causal_trace.observePm4SpanWithIndirects(
                             bytes,
                             geometry.read_pointer,
                             span,
                             ring_dwords,
+                            @max(self.gpu_ring_publication.advances, 1),
                             self.executed_steps,
                             true,
                             self.gpu_ring_injection.injections == 0 and self.gpu_ring_publication.advances != 0,
@@ -5709,6 +7061,7 @@ pub const MachOState = struct {
                             "macho-processor: XENOS PM4 execution refused: error={s} read={d} write={d} span={d} ring_dwords={d}\n",
                             .{ @errorName(err), geometry.read_pointer, geometry.write_pointer, span, ring_dwords },
                         );
+                        self.logNewPm4Fault();
                     }
                     if (self.gpu_interrupt_callback != 0) {
                         const delivered = self.gpu_xenos_runtime.drainInterrupts(deliverGpuInterrupt, self, 32);
@@ -5813,13 +7166,35 @@ pub const MachOState = struct {
         self.gpu_interrupt_dispatches +|= 1;
         const is_draw_completion = event.kind == .draw_complete;
         if (is_draw_completion) self.gpu_draw_completion_dispatch_attempts +|= 1;
-        if (self.gpu_interrupt_callback == 0) {
+        // The authentic binding first. Only when there is none does the
+        // dispatch scaffold offer an address it resolved from a weaker source,
+        // and only when policy admits that source. The two are never merged:
+        // `gpu_interrupt_callback` stays the binding so every existing report
+        // that reads it keeps meaning what it meant.
+        var callback = self.gpu_interrupt_callback;
+        var callback_arg = self.gpu_interrupt_callback_arg;
+        var substituted = false;
+        if (callback == 0) {
+            const scaffold = &self.gpu_draw_dispatch;
+            if (scaffold.wouldDispatch(1) == .delivered) {
+                callback = scaffold.callback.address;
+                callback_arg = scaffold.callback.user_data;
+                substituted = true;
+            }
+        }
+        if (callback == 0) {
             if (is_draw_completion) self.gpu_draw_completion_dispatch_failures +|= 1;
+            self.gpu_draw_dispatch.recordAttempt(
+                self.gpu_draw_dispatch.wouldDispatch(1),
+                1,
+                0,
+                self.executed_steps,
+            );
             return;
         }
         const source = self.scheduleSignalCallback(
-            self.gpu_interrupt_callback,
-            self.gpu_interrupt_callback_arg,
+            callback,
+            callback_arg,
             event.id,
             event.value,
             "xenia_gpu_interrupt",
@@ -5827,14 +7202,29 @@ pub const MachOState = struct {
         if (source == 0) {
             self.gpu_interrupt_dispatch_failures +|= 1;
             if (is_draw_completion) self.gpu_draw_completion_dispatch_failures +|= 1;
+            if (substituted) self.gpu_draw_dispatch.recordAttempt(.failed, 1, 0, self.executed_steps);
             machoCapturePrint(
-                "macho-processor: XENOS GPU interrupt callback rejected: callback=0x{x} event={s} id=0x{x} value=0x{x}; guest execution was not fabricated\n",
-                .{ self.gpu_interrupt_callback, @tagName(event.kind), event.id, event.value },
+                "macho-processor: XENOS GPU interrupt callback rejected: callback=0x{x} substituted={s} event={s} id=0x{x} value=0x{x}; guest execution was not fabricated\n",
+                .{ callback, if (substituted) "YES" else "NO", @tagName(event.kind), event.id, event.value },
             );
             return;
         }
         if (is_draw_completion) self.gpu_draw_completion_dispatches +|= 1;
-        self.gpu_bootstrap.observe(.graphics_interrupt_dispatch, self.executed_steps);
+        if (substituted) {
+            self.gpu_draw_dispatch.recordAttempt(.delivered, 1, 1, self.executed_steps);
+            machoCapturePrint(
+                "macho-processor: DRAW DISPATCH: delivered a completion to callback=0x{x} provenance={s} event={s} id=0x{x}; Rosette originated this, so it is a substitution and can never close the authentic dispatch stage\n",
+                .{
+                    callback,
+                    self.gpu_draw_dispatch.callback.provenance.label(),
+                    @tagName(event.kind),
+                    event.id,
+                },
+            );
+        } else {
+            // The emulator's own binding carried it. This is the authentic path.
+            self.gpu_bootstrap.observe(.graphics_interrupt_dispatch, self.executed_steps);
+        }
     }
 
     fn xenosGpuSwap(value: u32, endian: u2) u32 {
@@ -5940,9 +7330,118 @@ pub const MachOState = struct {
     /// Execute the batch that is still present in ring memory after the
     /// command processor drained it.
     ///
-    /// The stateful Xenos runtime is the only source in the subsystem for
-    /// render-target registers, EDRAM resolves, draw-completion events and a
-    /// decoded front-buffer fetch constant.  Until this existed it ran from one
+    /// Join the stateful executor's packet summary into the earliest frontier.
+    /// This is called at the moment a batch finishes, rather than waiting for a
+    /// periodic graphics report, so a guest that immediately parks after its
+    /// draw still leaves a causally ordered record in the log.
+    fn observeGpuEarlyPacketExecution(
+        self: *MachOState,
+        execution: gpu.xenos_runtime.Report,
+        authentic: bool,
+    ) void {
+        const summary = execution.packet_summary;
+        if (summary.packets != 0) {
+            self.observeGpuEarlyBoundary(.command_processor_entered, .xenos, summary.packets);
+        }
+        if (summary.root_packets != 0) {
+            self.observeGpuEarlyBoundary(.root_pm4_consumed, .pm4, summary.root_packets);
+        }
+        if (summary.nested_packets != 0) {
+            self.observeGpuEarlyBoundary(.nested_pm4_consumed, .pm4, summary.nested_packets);
+        }
+        if (summary.hasExecuted(.state)) {
+            self.observeGpuEarlyBoundary(.pm4_state_programmed, .pm4, summary.executedClassCount(.state));
+        }
+        if (summary.hasExecuted(.draw)) {
+            self.observeGpuEarlyBoundary(.draw_submitted, .xenos, summary.executedClassCount(.draw));
+        }
+        const target = self.gpu_xenos_runtime.renderTargetEvidence();
+        if (target.state_observed) {
+            self.observeGpuEarlyBoundary(.render_target_state_observed, .xenos, target.raw_color_info);
+        }
+        if (self.gpu_xenos_runtime.color_resolve_observations != 0) {
+            self.observeGpuEarlyBoundary(
+                .render_target_memory_observed,
+                .xenos,
+                self.gpu_xenos_runtime.color_resolve_observations,
+            );
+        }
+        if (execution.draw_completion_signals != 0) {
+            self.observeGpuEarlyBoundary(.draw_completion_signaled, .xenos, execution.draw_completion_signals);
+        }
+        if (self.gpu_draw_completion_dispatches != 0) {
+            self.observeGpuEarlyBoundary(
+                .draw_completion_dispatched,
+                .scheduler,
+                self.gpu_draw_completion_dispatches,
+            );
+        }
+        if (summary.has(.emulator_extension)) {
+            self.observeGpuEarlyBoundary(
+                .xe_swap_candidate_seen,
+                .pm4,
+                summary.classCount(.emulator_extension),
+            );
+        }
+        if (execution.swaps != 0 and authentic) {
+            self.observeGpuEarlyBoundary(.authentic_xe_swap_consumed, .pm4, execution.swaps);
+        }
+        if (self.guest_vdswap_packet_encoded) {
+            self.observeGpuEarlyBoundary(.guest_swap_encoded, .tracepoint, @intFromBool(self.guest_vdswap_packet_encoded));
+        }
+        const last_class = if (summary.last) |last| last.class.label() else "none";
+        const last_opcode = if (summary.last) |last|
+            if (last.opcode) |opcode| @intFromEnum(opcode) else 0
+        else
+            0;
+        machoCapturePrint(
+            "macho-processor: XENOS PACKET TRACE: root={d} nested={d} executed={d} executed(root/nested)={d}/{d} dwords(root/nested)={d}/{d} depth={d} classes(state/draw/wait/indirect/memory/event/control/extension/unknown/filler)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} indirect(cycles/budget)={d}/{d}\n",
+            .{
+                summary.root_packets,
+                summary.nested_packets,
+                summary.executed_packets,
+                summary.executed_root_packets,
+                summary.executed_nested_packets,
+                summary.root_dwords,
+                summary.nested_dwords,
+                summary.max_depth,
+                summary.classCount(.state),
+                summary.classCount(.draw),
+                summary.classCount(.wait),
+                summary.classCount(.indirect),
+                summary.classCount(.memory),
+                summary.classCount(.event),
+                summary.classCount(.control),
+                summary.classCount(.emulator_extension),
+                summary.classCount(.unknown),
+                summary.classCount(.filler),
+                execution.indirect_cycles,
+                execution.indirect_budget_limited,
+            },
+        );
+        machoCapturePrint(
+            "macho-processor: XENOS PACKET TRACE EXECUTED: classes(state/draw/wait/indirect/memory/event/control/extension/unknown/filler)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} last={s}/0x{x} last_source={s} last_offset={d} last_executed={s}\n",
+            .{
+                summary.executedClassCount(.state),
+                summary.executedClassCount(.draw),
+                summary.executedClassCount(.wait),
+                summary.executedClassCount(.indirect),
+                summary.executedClassCount(.memory),
+                summary.executedClassCount(.event),
+                summary.executedClassCount(.control),
+                summary.executedClassCount(.emulator_extension),
+                summary.executedClassCount(.unknown),
+                summary.executedClassCount(.filler),
+                last_class,
+                last_opcode,
+                if (summary.last) |last| last.source.label() else "none",
+                if (summary.last) |last| last.dword_offset else 0,
+                if (summary.last) |last| if (last.executed) "YES" else "NO" else "NO",
+            },
+        );
+    }
+
+    /// Print the decoded front-buffer fetch constant.  Until this existed it ran from one
     /// place only: the branch guarded by `span != 0`, where `span` is the
     /// distance between the ring's read and write pointers.  A title that
     /// publishes once during bring-up and is then drained has `read == write`
@@ -6011,7 +7510,7 @@ pub const MachOState = struct {
         // suppressed write there would look like a title that stopped
         // signalling rather than a callback this function unhooked.
         defer self.gpu_xenos_runtime.attachMemory(self, xenosMemoryRead, self, xenosMemoryWrite);
-        const execution = self.gpu_xenos_runtime.executeRingBytes(
+        const execution = self.gpu_xenos_runtime.inspectRetainedRingBytes(
             bytes,
             root_start,
             root_dwords,
@@ -6033,10 +7532,86 @@ pub const MachOState = struct {
         const deferred_writes = self.gpu_xenos_runtime.executor.deferred_memory_count - deferred_before;
 
         self.gpu_xenos_retained_executions +|= 1;
+        self.observeGpuEarlyPacketExecution(execution, authentic);
         const executed_packets = execution.packets_after - execution.packets_before;
+        // Credit the execution once under the retained root's stable identity.
+        // Every later frontier report is only another observation of these
+        // units, so it cannot turn this run's 24 draws into 148×24 draws.
+        const root_byte_start = @as(usize, root_start) * 4;
+        const root_byte_length = @as(usize, root_dwords) * 4;
+        var payload_digest: u64 = if (root_byte_start <= bytes.len and
+            root_byte_length <= bytes.len - root_byte_start)
+            std.hash.Wyhash.hash(0, bytes[root_byte_start .. root_byte_start + root_byte_length])
+        else
+            std.hash.Wyhash.hash(0, std.mem.asBytes(&root_dwords));
+        if (payload_digest == 0) payload_digest = 1;
+        const credit_run = if (self.event_stream.run_id == 0) @as(u64, 1) else self.event_stream.run_id;
+        const credit_stream = if (self.gpu_ring_watch_base != 0) self.gpu_ring_watch_base else @as(u64, root_start) + 1;
+        const credit_generation = @max(self.gpu_ring_publication.advances, 1);
+        const credit_sequence = @max(self.gpu_xenos_retained_executions, 1);
+        const Work = struct {
+            kind: gpu.work_credit.Kind,
+            units: u64,
+        };
+        const executed_work = [_]Work{
+            .{ .kind = .pm4_batch, .units = execution.dwords },
+            .{ .kind = .pm4_packet, .units = executed_packets },
+            .{ .kind = .draw_submission, .units = execution.draws },
+            .{ .kind = .completion_signal, .units = execution.draw_completion_signals },
+        };
+        for (executed_work) |work| {
+            if (work.units == 0) continue;
+            _ = self.cocoa_graphics.claimExecutedWork(.{
+                .key = .{
+                    .run = credit_run,
+                    .producer = .xenia_host,
+                    .stream = credit_stream,
+                    .generation = credit_generation,
+                    .sequence = credit_sequence,
+                    .kind = work.kind,
+                },
+                .units = work.units,
+                .payload_digest = payload_digest,
+                .step = at,
+            });
+        }
         const target = self.gpu_xenos_runtime.renderTargetEvidence();
         const runtime_fetch = self.gpu_xenos_runtime.frontBufferFetch();
         const runtime_swap = self.gpu_xenos_runtime.last_swap;
+        const semantic_sequence_base = credit_sequence *% 4;
+        if (execution.draws != 0) {
+            _ = self.cocoa_graphics.observeIntent(.{
+                .run = credit_run,
+                .boundary = .{ .decoded_pm4 = .{ .packet_class = .draw, .header = 0 } },
+                .producer = .xenia_host,
+                .evidence = .completed_call,
+                .source_identity = credit_stream,
+                .generation = credit_generation,
+                .sequence = semantic_sequence_base +% 1,
+            });
+        }
+        if (target.state_observed) {
+            _ = self.cocoa_graphics.observeIntent(.{
+                .run = credit_run,
+                .boundary = .{ .decoded_pm4 = .{ .packet_class = .register_write, .header = 0 } },
+                .producer = .xenia_host,
+                .evidence = .completed_call,
+                .source_identity = credit_stream,
+                .generation = credit_generation,
+                .sequence = semantic_sequence_base +% 2,
+            });
+        }
+        if (execution.swaps != 0) {
+            _ = self.cocoa_graphics.observeIntent(.{
+                .run = credit_run,
+                .boundary = .{ .decoded_pm4 = .{ .packet_class = .xe_swap, .header = 0 } },
+                .producer = .guest_title,
+                .evidence = .completed_call,
+                .source_identity = credit_stream,
+                .generation = credit_generation,
+                .sequence = semantic_sequence_base +% 3,
+            });
+        }
 
         // Each of these is recorded whether or not it was found.  The negative
         // outcome is the valuable one: it is the difference between "the
@@ -6056,8 +7631,8 @@ pub const MachOState = struct {
         ledger.observeProbe(
             .draw_completion_signaled,
             .stateful_pm4_execution,
-            self.gpu_xenos_runtime.draw_completion_signals != 0,
-            self.gpu_xenos_runtime.draw_completion_signals,
+            execution.draw_completion_signals != 0,
+            execution.draw_completion_signals,
             at,
         );
         ledger.observeProbe(.fetch_constant_decoded, .xenos_register_file, runtime_fetch != null, execution.dwords, at);
@@ -6089,12 +7664,13 @@ pub const MachOState = struct {
         ledger.observeIntermediary(.{
             .render_target_state_observed = target.state_observed,
             .render_target_memory_observed = self.gpu_xenos_runtime.color_resolve_observations != 0,
-            .draw_completion_signaled = self.gpu_xenos_runtime.draw_completion_signals != 0,
+            .draw_completion_signaled = execution.draw_completion_signals != 0,
         }, at, .xenos_runtime);
 
         machoCapturePrint(
-            "macho-processor: XENOS RETAINED BATCH: epoch={d} start={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s} indirect(buffers/read/requested)={d}/{d}/{d} status={s}; target(state/color/depth/surface)={s}/0x{x:0>8}/0x{x:0>8}/0x{x:0>8} resolves={d} completions={d} fetch={s} guest_writes_suppressed={d}; the command processor executed the dwords the producer left in the ring, so every register-derived stage below is now a reading rather than a blank. The replay is read-only: this batch was already drained, so its memory writes are counted and not reapplied\n",
+            "macho-processor: XENOS RETAINED BATCH: disposition={s} epoch={d} start={d} dwords={d} packets={d} draws={d} events={d} swaps={d} unknown={d} truncated={s} indirect(buffers/read/requested)={d}/{d}/{d} status={s}; target(state/color/depth/surface)={s}/0x{x:0>8}/0x{x:0>8}/0x{x:0>8} resolves={d} draw_completions(observed/published)={d}/{d} fetch={s} guest_writes_suppressed={d}; retained PM4 reconstructs Rosette-owned state only. The emulator already consumed this batch, so interrupts, waits and guest memory are not replayed\n",
             .{
+                execution.disposition.label(),
                 self.gpu_ring_publication.advances,
                 root_start,
                 root_dwords,
@@ -6113,7 +7689,8 @@ pub const MachOState = struct {
                 target.raw_depth_info,
                 target.raw_surface_info,
                 self.gpu_xenos_runtime.color_resolve_observations,
-                self.gpu_xenos_runtime.draw_completion_signals,
+                execution.draw_completion_observations,
+                execution.draw_completion_signals,
                 if (runtime_fetch != null) "decoded" else "absent",
                 deferred_writes,
             },
@@ -6136,30 +7713,16 @@ pub const MachOState = struct {
             }
         }
 
-        // A queued completion the guest callback never receives is a different
-        // defect from one that was never queued, and the contract keeps them as
-        // separate stages.  Draining here is what makes the second one
-        // reachable at all.
-        if (self.gpu_interrupt_callback != 0) {
-            const delivered = self.gpu_xenos_runtime.drainInterrupts(deliverGpuInterrupt, self, 32);
-            ledger.observeProbe(
-                .draw_completion_dispatched,
-                .interrupt_dispatch,
-                self.gpu_draw_completion_dispatches != 0,
-                delivered,
-                at,
-            );
-            if (delivered != 0) {
-                machoCapturePrint(
-                    "macho-processor: XENOS RETAINED BATCH interrupts: delivered={d} callback=0x{x} arg=0x{x} draw_completions={d}\n",
-                    .{ delivered, self.gpu_interrupt_callback, self.gpu_interrupt_callback_arg, self.gpu_draw_completion_dispatches },
-                );
-            }
-        } else {
-            // No callback has been registered, so nothing could be delivered.
-            // That is an absent consumer, not a failed dispatch.
-            ledger.recordProbe(.draw_completion_dispatched, .interrupt_dispatch, .input_unavailable, 0, at);
-        }
+        // This batch was already consumed by Xenia. Observing its draw packets
+        // does not grant Rosette ownership to publish or dispatch a second
+        // completion, regardless of which callback domains are registered.
+        ledger.recordProbe(
+            .draw_completion_dispatched,
+            .interrupt_dispatch,
+            if (execution.draw_completion_observations != 0) .refused_by_owner else .input_empty,
+            execution.draw_completion_observations,
+            at,
+        );
     }
 
     /// Record that every probe fed by the retained batch was starved, and how.
@@ -6253,6 +7816,7 @@ pub const MachOState = struct {
                     root_start,
                     root_count,
                     ring_dwords,
+                    @max(self.gpu_ring_publication.advances, 1),
                     self.executed_steps,
                     consumed,
                     authentic,
@@ -7037,8 +8601,8 @@ pub const MachOState = struct {
         // two, so it is reported alongside rather than buried.
         const identity = &self.sync_object_identity;
         if (identity.count != 0 or identity.rewrites != 0) machoCapturePrint(
-            "macho-processor: SYNC OBJECT IDENTITY: pairs={d} rewrites={d} conflicts={d} dropped={d} mapping_base=0x{x}; {s}\n",
-            .{ identity.count, identity.rewrites, identity.conflicts, identity.dropped, identity.mapping_base, identity.verdict() },
+            "macho-processor: SYNC OBJECT IDENTITY: pairs={d} rewrites={d} conflicts={d} dropped={d} rejected(truncated/spliced)={d}/{d} mapping_base=0x{x}; {s}\n",
+            .{ identity.count, identity.rewrites, identity.conflicts, identity.dropped, identity.truncated_reads, identity.spliced_pairs, identity.mapping_base, identity.verdict() },
         );
         self.refreshDeadlockPredictor();
         const ledger = &self.deadlock_predictor;
@@ -7709,6 +9273,48 @@ pub const MachOState = struct {
         self.xenia_gpu_causal_trace.logSummary(self.executed_steps, force);
     }
 
+    /// Emit the bounded early frontier only when it changes. The per-edge rows
+    /// intentionally include negative space (untested edges) so the next run
+    /// can distinguish “no observer looked” from “the observer looked and the
+    /// guest never crossed this boundary.”
+    fn logGpuEarlyFrontier(self: *MachOState, force: bool) void {
+        const fingerprint = self.gpu_early_frontier.fingerprint();
+        if (!force and fingerprint == self.gpu_early_frontier_last_fingerprint) return;
+        self.gpu_early_frontier_last_fingerprint = fingerprint;
+        const next_label = if (self.gpu_early_frontier.firstActionable()) |next| next.label() else "none";
+        const first_unmet = if (self.gpu_early_frontier.firstUnmet()) |unmet| unmet.label() else "none";
+        machoCapturePrint(
+            "macho-processor: GPU EARLY FRONTIER: step={d} fingerprint=0x{x} observed=0x{x:0>8} actionable=0x{x:0>8} next={s} first_unmet={s} quiet={d}\n",
+            .{
+                self.executed_steps,
+                fingerprint,
+                self.gpu_early_frontier.observed_mask,
+                self.gpu_early_frontier.actionableMask(),
+                next_label,
+                first_unmet,
+                self.gpu_early_frontier.quietSteps(self.executed_steps) orelse 0,
+            },
+        );
+        inline for (@typeInfo(gpu.GpuEarlyBoundary).@"enum".fields) |field| {
+            const boundary: gpu.GpuEarlyBoundary = @enumFromInt(field.value);
+            const edge = self.gpu_early_frontier.edge(boundary);
+            machoCapturePrint(
+                "  gpu-edge boundary={s} owner={s} state={s} count={d} first_step={d} last_step={d} first_value=0x{x} last_value=0x{x} source_mask=0x{x:0>4}\n",
+                .{
+                    boundary.label(),
+                    boundary.owner().label(),
+                    if (edge.seen) "YES" else "NO",
+                    edge.count,
+                    edge.first_step,
+                    edge.last_step,
+                    edge.first_value,
+                    edge.last_value,
+                    edge.source_mask,
+                },
+            );
+        }
+    }
+
     /// Join execution-boundary facts into the causal ledger before deciding
     /// whether a graphics checkpoint changed. This keeps tracepoint evidence
     /// visible even when Xenia's own breadcrumb was split across a log write.
@@ -7750,6 +9356,28 @@ pub const MachOState = struct {
         // same report cannot say both "completion dispatched=0" and "drain
         // authorized" after the controller has acted.
         self.refreshGraphicsHealthContract();
+        const cocoa_outcome = self.refreshCocoaGraphicsControl();
+        if (cocoa_outcome.route == .cocoa_metal_guest_copy and cocoa_outcome.frame_delivery_pending) {
+            if (self.dynamic_forwarder.attemptCocoaFrameFallback(self)) {
+                _ = self.cocoa_graphics.observeIntent(.{
+                    .run = cocoa_outcome.frame_identity.run,
+                    .boundary = .{ .native_event = .guest_frame_presented },
+                    .producer = .rosette_runtime,
+                    .evidence = .completed_call,
+                    .source_identity = cocoa_outcome.frame_identity.source,
+                    .generation = cocoa_outcome.frame_identity.generation,
+                    .sequence = cocoa_outcome.frame_identity.serial,
+                });
+                // Reconcile the completed native command in the same checkpoint
+                // so the log never advertises a route without its result.
+                _ = self.refreshCocoaGraphicsControl();
+            }
+        }
+        const cocoa_fingerprint = self.cocoa_graphics.fingerprint();
+        const cocoa_changed = cocoa_fingerprint != self.cocoa_graphics_last_fingerprint;
+        const early_frontier_fingerprint = self.gpu_early_frontier.fingerprint();
+        const early_frontier_changed = early_frontier_fingerprint != self.gpu_early_frontier_last_fingerprint;
+        self.logGpuEarlyFrontier(force);
         // Publish the same seam through the callable framework. These are
         // deliberately paired observations: entering VdSwap, consuming an
         // authentic XE_SWAP, reaching IssueSwap, and refreshing guest output
@@ -7765,7 +9393,7 @@ pub const MachOState = struct {
         const guest_vdswap_entered = @intFromBool(self.execution_tracepoints.roleEntered(.swap));
         const authentic_swap_consumed = @intFromBool(self.gpu_vd_swap_contract.authentic_consumptions != 0);
         const issue_swap_entered = @intFromBool(self.gpu_vd_swap_contract.observed(.issue_swap_entered));
-        const guest_output_refreshed = @intFromBool(self.dynamic_forwarder.native_presenter.ledger.guest_output_frames_presented != 0);
+        const guest_output_refreshed = @intFromBool(self.guestOutputFramesPresented() != 0);
         self.application_framework.observeValue(.xenia_kernel, .vd_swap, 1, guest_vdswap_entered, self.executed_steps, self.regs.rip, "guest-vdswap-entered", "guest execution boundary");
         self.application_framework.observeValue(.xenia_gpu, .vd_swap, 2, authentic_swap_consumed, self.executed_steps, self.regs.rip, "authentic-xe-swap-consumed", "command processor boundary");
         self.application_framework.observeValue(.xenia_presenter, .presenter, 3, issue_swap_entered, self.executed_steps, self.regs.rip, "issue-swap-entered", "native presenter boundary");
@@ -7804,7 +9432,9 @@ pub const MachOState = struct {
             causal_changed or
             health_fingerprint != self.graphics_health_last_fingerprint or
             controller_fingerprint != self.application_controller_last_fingerprint or
-            framework_sequence != self.application_framework_last_sequence;
+            framework_sequence != self.application_framework_last_sequence or
+            cocoa_changed or
+            early_frontier_changed;
         self.graphics_last_frontier_tag = frontier_tag;
         self.graphics_last_frontier_reached = frontier.reached;
         self.graphics_last_role_mask = role_mask;
@@ -7816,6 +9446,7 @@ pub const MachOState = struct {
         self.application_controller_last_fingerprint = controller_fingerprint;
         self.application_framework_last_sequence = framework_sequence;
         if (force or state_changed) self.logApplicationFramework();
+        self.logCocoaGraphicsControl(force or cocoa_changed);
 
         // The ring is read whether or not the frontier moved.
         //
@@ -7843,6 +9474,7 @@ pub const MachOState = struct {
             self.logProvisioningCustody();
             self.logPreinitialization();
             self.logGuestWaitLiveness();
+            self.logInterruptCallbackTransaction();
             self.logImportBinding();
             self.logHostCoverage();
             self.logBringupFailures();
@@ -7918,6 +9550,13 @@ pub const MachOState = struct {
             },
         );
         self.logRunHorizon();
+        self.logWaitGraph();
+        self.logDrawDispatch();
+        self.logTranslationEconomics();
+        self.logGuestLogChannels();
+        self.logClaimReconciliation();
+        self.logInterruptCallbackTransaction();
+        self.logRegisterJournal();
         self.logSwapHealth();
         self.logXeniaGpuCausalTrace(force);
         self.logGraphicsContract();
@@ -9561,12 +11200,17 @@ pub const MachOState = struct {
             decoded.segment == .fs or decoded.segment == .gs;
     }
 
-    /// Exact LRU for a two-way set: the way just used becomes the survivor and
-    /// the other becomes the eviction candidate. Written only when it changes,
-    /// so a repeatedly hit entry stores nothing on the hot path.
+    /// Give a used way a second chance.
+    ///
+    /// The former rule cleared every other way when one was touched. That was
+    /// exact enough for two ways, but with a wider set it made the last
+    /// unmarked array element absorb nearly every eviction. Reference bits
+    /// retain all recently used ways; the miss path clears a set only after
+    /// every resident earned a chance. A hot hit that is already marked still
+    /// performs no store.
     inline fn noteDecodeCacheUse(ways: []DecodeCacheEntry, used: *DecodeCacheEntry) void {
         if (used.recently_used) return;
-        for (ways) |*way| way.recently_used = false;
+        _ = ways;
         used.recently_used = true;
     }
 
@@ -9702,35 +11346,62 @@ pub const MachOState = struct {
             }
             return decoded;
         }
+        var stale_rejected = false;
         if (entry.rip == fetch_address) {
             // Never execute a cached decode whose source bytes changed. This
             // catches JIT publication paths that did not pass through the
             // normal guest write boundary without flushing unrelated code.
             self.decode_cache_stale_rejections +|= 1;
+            stale_rejected = true;
             entry.* = .{};
         }
         self.decode_cache_misses +|= 1;
-        // Which kind of miss this is, because the two have different remedies
-        // and only one of them is fixable. A compulsory miss fills a way that
-        // was never occupied — the first execution of code that has just been
-        // emitted, which no cache can avoid. A conflict miss evicts a live
-        // decode, which is capacity the cache could have kept.
+        // Select the victim before recording economics: this is the only point
+        // where the runtime can prove vacancy versus eviction. A byte mismatch
+        // takes precedence because it proves executable mutation even though
+        // clearing the stale entry also creates a vacant way.
         entry = &ways[0];
         var victim_is_empty = false;
+        var victim_selected = false;
         for (ways) |*candidate| {
             if (candidate.rip == std.math.maxInt(u64)) {
                 entry = candidate;
                 victim_is_empty = true;
+                victim_selected = true;
                 break;
             }
-            if (!candidate.recently_used) entry = candidate;
+        }
+        if (!victim_selected) {
+            for (ways) |*candidate| {
+                if (candidate.recently_used) continue;
+                entry = candidate;
+                victim_selected = true;
+                break;
+            }
+        }
+        if (!victim_selected) {
+            // Every resident has been referenced since the previous sweep.
+            // Clear the clock and evict one way; subsequent misses consume the
+            // remaining unmarked ways instead of hammering a fixed tail slot.
+            for (ways) |*candidate| candidate.recently_used = false;
+            entry = &ways[0];
         }
         if (victim_is_empty) {
-            self.decode_cache_compulsory_misses +|= 1;
+            self.decode_cache_vacant_misses +|= 1;
         } else {
             self.decode_cache_conflict_misses +|= 1;
         }
+        const fill_cause: translation_economics.Cause = if (stale_rejected)
+            .stale_bytes
+        else if (victim_is_empty)
+            .vacant_fill
+        else
+            .capacity_conflict;
         const bytes = fetched_bytes orelse self.executableInstructionBytesAt(fetch_address) orelse return null;
+        // Economics describes cache fills, not failed fetch attempts. Keep the
+        // proven cause local until source bytes exist and a decode can actually
+        // be installed in the selected way.
+        self.translation_economics.noteDecode(fetch_address, self.executed_steps, fill_cause);
         var decoded = decodeInsn(bytes);
         if (decoded.op == .invalid and self.sparse_memory.containsMapped(fetch_address, 1)) {
             decoded = decodeInsnCompat(bytes);
@@ -11569,11 +13240,114 @@ const VexDecoderAudit = utils.VexDecoderAudit;
 const MachORunOptions = utils.MachORunOptions;
 const auditVexDecoder = utils.auditVexDecoder;
 
+/// Start the asynchronous diagnostic transport when this run selected it.
+///
+/// Reported either way: a run whose logging model changed must say so in its
+/// own log, or two runs become incomparable for a reason nothing records.
+fn startAsyncDiagnosticTransport(
+    allocator: std.mem.Allocator,
+    output: *runtime_output.Controller,
+) bool {
+    if (!environmentFlagEnabled("ROSETTE_ASYNC_LOG")) return false;
+    const fd = output.detailFd();
+    if (fd < 0) {
+        machoCapturePrint(
+            "macho-processor: ASYNC LOG: refused — no runtime-log descriptor is open, so a ring would have nowhere to drain and would drop every line after the first {d}. Staying synchronous\n",
+            .{async_log.slot_count},
+        );
+        return false;
+    }
+    // When the controller redirected stderr into the runtime log, mirroring
+    // would write every line twice into the same file.
+    const mirror = !output.capturedStderr();
+    if (!async_log.startTransport(allocator, fd, mirror, asyncTransportWrite, asyncTransportSleep)) {
+        machoCapturePrint(
+            "macho-processor: ASYNC LOG: refused — the writer thread could not start. A ring with no writer fills once and drops forever, which is worse than the synchronous path it would replace. Staying synchronous\n",
+            .{},
+        );
+        return false;
+    }
+    macho_log.installAsyncTransport(
+        async_log.offerLine,
+        async_log.flushTransport,
+        async_log.lineIsCritical,
+    );
+    machoCapturePrint(
+        "macho-processor: ASYNC LOG: enabled slots={d} slot_bytes={d} ring_bytes={d} mirror_stderr={s}; diagnostic writes now happen on a writer thread. Producers never block: a full ring drops and counts rather than pausing the translated guest, so the log may have counted gaps and the program's timing stays its own\n",
+        .{
+            async_log.slot_count,
+            async_log.slot_bytes,
+            async_log.slot_count * async_log.slot_bytes,
+            if (mirror) "YES" else "NO",
+        },
+    );
+    return true;
+}
+
+fn stopAsyncDiagnosticTransport() void {
+    const totals = async_log.transportStats();
+    machoCapturePrint(
+        "macho-processor: ASYNC LOG: integrity={s} accepted={d} dropped={d} truncated={d} written={d} queued={d} write_calls={d} batch_factor={d} bytes={d} synchronous_criticals={d}; {s}\n",
+        .{
+            totals.integrity().label(),
+            totals.accepted,
+            totals.dropped,
+            totals.truncated,
+            totals.written,
+            totals.queued,
+            totals.write_calls,
+            totals.batchFactor(),
+            totals.bytes_written,
+            totals.synchronous_criticals,
+            totals.integrity().guidance(),
+        },
+    );
+    macho_log.clearAsyncTransport();
+    async_log.stopTransport();
+}
+
+fn asyncTransportWrite(fd: i32, bytes: []const u8) void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = std.c.write(fd, bytes.ptr + offset, bytes.len - offset);
+        if (written <= 0) return;
+        offset += @intCast(written);
+    }
+}
+
+fn asyncTransportSleep(nanoseconds: u64) void {
+    var request = std.c.timespec{
+        .sec = @intCast(nanoseconds / std.time.ns_per_s),
+        .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+    };
+    var remaining: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&request, &remaining);
+}
+
+fn environmentFlagEnabled(name: [*:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const value = std.mem.span(raw);
+    if (value.len == 0) return false;
+    return !std.mem.eql(u8, value, "0") and
+        !std.mem.eql(u8, value, "false") and
+        !std.mem.eql(u8, value, "no");
+}
+
 pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOptions) !u64 {
     native_crash.recordPhase("load");
     var output = runtime_output.Controller.init(allocator);
     defer output.deinit();
     output.human("Loading Mach-O...\n", .{});
+
+    // The diagnostic transport, if this run asked for it.
+    //
+    // Synchronous by default. `ROSETTE_ASYNC_LOG=1` moves every diagnostic
+    // write off the translated guest threads and onto one writer thread, so
+    // observing the guest stops changing the guest's scheduling. It is opt-in
+    // because it trades a counted gap under load for that property, and a run
+    // that is not investigating timing would rather have the complete log.
+    const async_started = startAsyncDiagnosticTransport(allocator, &output);
+    defer if (async_started) stopAsyncDiagnosticTransport();
 
     const file_data = try std.Io.Dir.cwd().readFileAlloc(io, options.path, allocator, .unlimited);
     defer allocator.free(file_data);
@@ -11630,6 +13404,9 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     state.startup.enabled = environmentFlag("ROSETTE_MACHO_STARTUP_TRACE");
     state.contract_verification = environmentFlag("ROSETTE_CONTRACT_VERIFICATION");
     state.memory_trace_enabled = environmentFlag("ROSETTE_MACHO_MEMORY_TRACE");
+    // S6 (perf audit): per-instruction CMPXCHG capture is off unless asked
+    // for; see the field comment on `cmpxchg_trace_enabled`.
+    state.cmpxchg_trace_enabled = environmentFlag("ROSETTE_MACHO_CMPXCHG_TRACE");
     // The instruction tape records generated code only, because host-image code
     // outruns it by orders of magnitude — 662 million filtered steps against a
     // few hundred recorded in a recorded run. That is the right default and the
@@ -11887,6 +13664,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.symbol_assembly.logSummary();
         state.logDecodeCacheSummary();
         state.logPerformanceAccelerationSummary();
+        state.logGuestLogChannels();
         machoCapturePrint("macho-processor: initializer phase failed: exit_code={d}\n", .{state.exit_code});
         return state.exit_code;
     }
@@ -11954,6 +13732,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
         state.sdl.logSummary();
         state.pthreads.logSummary();
         state.logCooperativeSchedulerSummary();
+        state.logGuestLogChannels();
         machoCapturePrint(
             "macho-processor: graceful host-termination diagnostics complete; returning signal-compatible status={d} without classifying the live guest RIP as a crash\n",
             .{state.exit_code},
@@ -11963,6 +13742,7 @@ pub fn loadAndRun(io: std.Io, allocator: std.mem.Allocator, options: MachORunOpt
     }
     state.logDecodeCacheSummary();
     state.logPerformanceAccelerationSummary();
+    state.logGuestLogChannels();
     state.import_resolver.logSummary();
     state.foreign_objects.logSummary();
     state.sdl.logSummary();
@@ -12182,7 +13962,18 @@ test "dyld data bindings materialize callable constant and GOT slots" {
     try std.testing.expect(!MachOState.isCallableConstantBinding(got_section, "___stack_chk_guard", false));
     try std.testing.expect(MachOState.isAbiDataSymbol("__ZTTNSt3__114basic_ifstreamIcNS_11char_traitsIcEEEE"));
     try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__19basic_iosIcNS_11char_traitsIcEEEE"));
+    // The ostringstream/stringstream family is fully modeled by the bridge
+    // (constructors, base inits, destructors, synthetic vtables), so its VTT
+    // and vtable ABI data must route through the bridge classification rather
+    // than the deferred materializer — the D1 destructor loads its hidden VTT
+    // before entering D2, and a zeroed VTT is exactly the ostringstream crash.
+    try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTTNSt3__124basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE"));
+    try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__115basic_stringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE"));
+    try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEEE"));
+    try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__113basic_ostreamIcNS_11char_traitsIcEEE"));
+    try std.testing.expect(MachOState.isBridgedLibcppDataSymbol("__ZTVNSt3__115basic_streambufIcNS_11char_traitsIcEEE"));
     try std.testing.expect(!MachOState.isBridgedLibcppDataSymbol("__ZTVN10__cxxabiv117__class_type_infoE"));
+    try std.testing.expect(!MachOState.isBridgedLibcppDataSymbol("__ZTVN3xen3ui3d3D11TextureCacheE"));
     try std.testing.expect(MachOState.bindingRequiresBoundThunk(got_section, false));
     try std.testing.expect(!MachOState.bindingRequiresBoundThunk(constant_section, false));
     try std.testing.expect(MachOState.bindingRequiresBoundThunk(constant_section, true));

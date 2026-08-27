@@ -265,8 +265,10 @@ pub const DecodeCacheEntry = struct {
     /// guard against a missed JIT publication or an alternate write route.
     instruction_bytes: [15]u8 = [_]u8{0} ** 15,
     instruction_byte_count: u8 = 0,
-    /// Which way of the set survives the next eviction. Exact LRU for two
-    /// ways; see `MachOState.noteDecodeCacheUse`.
+    /// Second-chance reference bit. A hit marks its way; a miss chooses an
+    /// unmarked way, clearing the set only after every way has earned a second
+    /// chance. This scales beyond the old two-way-only MRU rule without a
+    /// per-hit age write to every way.
     recently_used: bool = false,
     /// The fill that produced this entry ran the full validation gate chain
     /// and it declined: the RIP is not a special-RIP target (table, stub
@@ -302,7 +304,9 @@ pub const DecodeCacheEntry = struct {
 /// whose bytes a store touched. An x86 instruction is at most 15 bytes, so a
 /// 1-byte store has 15 possible starts, and probing them meant 15 multiplicative
 /// hashes into a ~5.8 MB table — 15 uncorrelated cache misses — for *every*
-/// byte Xenia's JIT emits.
+/// byte Xenia's JIT emits. The table is now larger than the original 5.8 MiB,
+/// but the bitmap still removes those uncorrelated probes from the emitter's
+/// common path.
 ///
 /// The asymmetry this exploits: the emitter writes a code page many times
 /// before anything executes from it, and writes plenty of pages nothing ever
@@ -344,6 +348,47 @@ pub const DecodeCachePageSet = struct {
         return (self.words[last_page / 64] >> @truncate(last_page % 64)) & 1 != 0;
     }
 
+    fn anyPageInterval(self: *const DecodeCachePageSet, first_page: usize, last_page: usize) bool {
+        if (first_page > last_page) return false;
+        const first_word = first_page / 64;
+        const last_word = last_page / 64;
+        const first_bit: u6 = @truncate(first_page % 64);
+        const last_bit: u6 = @truncate(last_page % 64);
+        if (first_word == last_word) {
+            const low_mask = @as(u64, std.math.maxInt(u64)) << first_bit;
+            const high_mask = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(63 - last_bit));
+            return self.words[first_word] & low_mask & high_mask != 0;
+        }
+        if (self.words[first_word] & (@as(u64, std.math.maxInt(u64)) << first_bit) != 0) return true;
+        var word = first_word + 1;
+        while (word < last_word) : (word += 1) {
+            if (self.words[word] != 0) return true;
+        }
+        const high_mask = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(63 - last_bit));
+        return self.words[last_word] & high_mask != 0;
+    }
+
+    /// Whether any page in an arbitrary inclusive address range may contain a
+    /// cached decode. Unlike `anyCoveringRange`, this is intended for large
+    /// unmap/protection ranges and scans bitmap words, not every candidate RIP.
+    /// Addresses above 4 GiB fold onto the bitmap; a range spanning a complete
+    /// fold checks the whole set, preserving the bitmap's no-false-negative
+    /// guarantee.
+    pub fn anyInRange(self: *const DecodeCachePageSet, first: u64, last: u64) bool {
+        if (last < first) return false;
+        const first_absolute_page = first >> 12;
+        const last_absolute_page = last >> 12;
+        const pages = last_absolute_page - first_absolute_page +| 1;
+        if (pages >= page_count) {
+            for (self.words) |word| if (word != 0) return true;
+            return false;
+        }
+        const first_page = pageIndex(first);
+        const last_page = pageIndex(last);
+        if (first_page <= last_page) return self.anyPageInterval(first_page, last_page);
+        return self.anyPageInterval(first_page, page_count - 1) or self.anyPageInterval(0, last_page);
+    }
+
     pub fn reset(self: *DecodeCachePageSet) void {
         @memset(&self.words, 0);
     }
@@ -359,6 +404,17 @@ test "decode-cache page set answers per page and never under-reports a noted pag
     try std.testing.expect(set.anyCoveringRange(0x9FFF_FFF9, 0xA000_0007));
     set.reset();
     try std.testing.expect(!set.anyCoveringRange(0xA000_0000, 0xA000_000F));
+}
+
+test "decode-cache page set rejects unrelated large invalidation ranges" {
+    var set = DecodeCachePageSet{};
+    set.note(0xA000_0800);
+    try std.testing.expect(!set.anyInRange(0x1000_0000, 0x1FFF_FFFF));
+    try std.testing.expect(set.anyInRange(0x9FFF_0000, 0xA001_0000));
+    // A range covering the whole folded address space must find any bit.
+    try std.testing.expect(set.anyInRange(0, 0x1_0000_0000));
+    set.reset();
+    try std.testing.expect(!set.anyInRange(0, 0x1_0000_0000));
 }
 
 pub const PROGRESS_REPORT_INTERVAL: u64 = 500_000;
@@ -386,7 +442,7 @@ pub const PerformanceSample = struct {
     decode_cache_hits: u64 = 0,
     decode_cache_misses: u64 = 0,
     decode_cache_stale_rejections: u64 = 0,
-    decode_cache_compulsory_misses: u64 = 0,
+    decode_cache_vacant_misses: u64 = 0,
     decode_cache_conflict_misses: u64 = 0,
     code_generation: u64 = 0,
     import_route_cache_hits: u64 = 0,
@@ -450,6 +506,12 @@ pub const ImportRoute = enum(u8) {
     chkstk,
     sysconf,
     strtoul,
+    /// S4 (perf audit): the filesystem-forwarder family. These ~40 symbols
+    /// (_open, _read, _write, _stat, _fopen, ...) used to resolve through the
+    /// `.legacy` slow path, so every cache hit re-ran the entire ~120-name
+    /// compare chain even though the symbol was already known. A dedicated
+    /// route lets `dispatchImportRoute` jump straight to the forwarder.
+    fs_forwarder,
 };
 
 pub fn isGtkIdleAddImport(name: []const u8) bool {

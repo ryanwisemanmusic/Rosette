@@ -5,6 +5,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <dispatch/dispatch.h>
 #include <stdio.h>
+#include <string.h>
 
 @interface RosetteMachOMetalView : NSView
 @end
@@ -29,6 +30,7 @@ static uint32_t g_events_pumped;
 static BOOL g_fullscreen;
 static BOOL g_reported_off_main_thread;
 static uint64_t g_diagnostic_frames_presented;
+static uint64_t g_guest_frames_presented;
 
 static void RosetteMachORunOnMainThreadSync(dispatch_block_t block) {
   if (![NSThread isMainThread]) {
@@ -225,6 +227,19 @@ int rosette_macho_native_window_show(void) {
   return result ? 1 : 0;
 }
 
+int rosette_macho_native_window_hide(void) {
+  __block BOOL result = NO;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      if (RosetteMachOEnsureWindowOnMainThread(g_width, g_height, nil)) {
+        [g_window orderOut:nil];
+        result = YES;
+      }
+    });
+  }
+  return result ? 1 : 0;
+}
+
 int rosette_macho_native_window_set_fullscreen(int fullscreen) {
   __block BOOL result = NO;
   @autoreleasepool {
@@ -306,6 +321,177 @@ uint64_t rosette_macho_native_window_present_diagnostic_frame(
   return presented;
 }
 
+uint64_t rosette_macho_native_window_present_frame(
+    uint64_t serial, const uint8_t *pixels, uint64_t source_length,
+    uint32_t source_width, uint32_t source_height, uint64_t row_pitch,
+    uint32_t format, uint8_t orientation, uint8_t fit) {
+  if (!serial || !pixels || !source_width || !source_height ||
+      source_width > 8192u || source_height > 8192u) {
+    return 0;
+  }
+  const BOOL source_is_rgba = format == 37u || format == 43u;
+  const BOOL source_is_bgra = format == 44u || format == 50u;
+  if (!source_is_rgba && !source_is_bgra) {
+    return 0;
+  }
+  const uint64_t tight_pitch = (uint64_t)source_width * 4u;
+  const uint64_t effective_pitch = row_pitch ? row_pitch : tight_pitch;
+  if (effective_pitch < tight_pitch ||
+      source_height > UINT64_MAX / effective_pitch ||
+      source_length < effective_pitch * source_height) {
+    return 0;
+  }
+
+  __block uint64_t presented = 0;
+  @autoreleasepool {
+    RosetteMachORunOnMainThreadSync(^{
+      if (!RosetteMachOEnsureWindowOnMainThread(g_width, g_height, nil)) {
+        return;
+      }
+      RosetteMachOUpdateMetalDrawable();
+      id<CAMetalDrawable> drawable = [g_metal_layer nextDrawable];
+      id<MTLCommandBuffer> command_buffer =
+          [g_metal_command_queue commandBuffer];
+      if (!drawable || !command_buffer) {
+        return;
+      }
+      const NSUInteger destination_width = drawable.texture.width;
+      const NSUInteger destination_height = drawable.texture.height;
+      if (!destination_width || !destination_height ||
+          destination_width > 8192u || destination_height > 8192u ||
+          destination_height > NSUIntegerMax / destination_width / 4u) {
+        return;
+      }
+      const NSUInteger destination_length =
+          destination_width * destination_height * 4u;
+      NSMutableData *converted =
+          [NSMutableData dataWithLength:destination_length];
+      if (!converted) {
+        return;
+      }
+      uint8_t *destination = converted.mutableBytes;
+      memset(destination, 0, destination_length);
+
+      uint32_t output_x = 0;
+      uint32_t output_y = 0;
+      uint32_t output_width = (uint32_t)destination_width;
+      uint32_t output_height = (uint32_t)destination_height;
+      uint32_t source_x = 0;
+      uint32_t source_y = 0;
+      BOOL scale = YES;
+      if (fit == 2u) {
+        // Centre without scaling. A source larger than the drawable is cropped
+        // symmetrically instead of being read past either edge.
+        scale = NO;
+        output_width = MIN(source_width, (uint32_t)destination_width);
+        output_height = MIN(source_height, (uint32_t)destination_height);
+        output_x = ((uint32_t)destination_width - output_width) / 2u;
+        output_y = ((uint32_t)destination_height - output_height) / 2u;
+        source_x = (source_width - output_width) / 2u;
+        source_y = (source_height - output_height) / 2u;
+      } else if (fit == 1u) {
+        // Letterbox with integer cross-products. This preserves 4:3 exactly
+        // and leaves the zeroed staging texture visible as bars.
+        const uint64_t source_product =
+            (uint64_t)source_width * destination_height;
+        const uint64_t destination_product =
+            (uint64_t)destination_width * source_height;
+        if (source_product > destination_product) {
+          output_width = (uint32_t)destination_width;
+          output_height = MAX(
+              1u, (uint32_t)((uint64_t)destination_width * source_height /
+                             source_width));
+          output_y = ((uint32_t)destination_height - output_height) / 2u;
+        } else {
+          output_height = (uint32_t)destination_height;
+          output_width = MAX(
+              1u, (uint32_t)((uint64_t)destination_height * source_width /
+                             source_height));
+          output_x = ((uint32_t)destination_width - output_width) / 2u;
+        }
+      } else if (fit != 0u) {
+        return;
+      }
+
+      for (uint32_t y = 0; y < output_height; ++y) {
+        uint32_t sampled_y = scale
+                                 ? (uint32_t)((uint64_t)y * source_height /
+                                              output_height)
+                                 : source_y + y;
+        if (orientation == 1u) {
+          sampled_y = source_height - 1u - sampled_y;
+        } else if (orientation != 0u) {
+          return;
+        }
+        const uint8_t *source_row =
+            pixels + (uint64_t)sampled_y * effective_pitch;
+        uint8_t *destination_row =
+            destination +
+            ((uint64_t)(output_y + y) * destination_width + output_x) * 4u;
+        for (uint32_t x = 0; x < output_width; ++x) {
+          const uint32_t sampled_x = scale
+                                         ? (uint32_t)((uint64_t)x *
+                                                      source_width /
+                                                      output_width)
+                                         : source_x + x;
+          const uint8_t *source_pixel = source_row + (uint64_t)sampled_x * 4u;
+          uint8_t *destination_pixel = destination_row + (uint64_t)x * 4u;
+          if (source_is_rgba) {
+            destination_pixel[0] = source_pixel[2];
+            destination_pixel[1] = source_pixel[1];
+            destination_pixel[2] = source_pixel[0];
+            destination_pixel[3] = source_pixel[3];
+          } else {
+            memcpy(destination_pixel, source_pixel, 4u);
+          }
+        }
+      }
+
+      MTLTextureDescriptor *description =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                                    MTLPixelFormatBGRA8Unorm
+                                                        width:destination_width
+                                                       height:destination_height
+                                                    mipmapped:NO];
+      description.usage = MTLTextureUsageShaderRead;
+      id<MTLTexture> source_texture =
+          [g_metal_device newTextureWithDescriptor:description];
+      if (!source_texture) {
+        return;
+      }
+      [source_texture
+          replaceRegion:MTLRegionMake2D(0, 0, destination_width,
+                                       destination_height)
+            mipmapLevel:0
+              withBytes:destination
+            bytesPerRow:destination_width * 4u];
+      id<MTLBlitCommandEncoder> encoder =
+          [command_buffer blitCommandEncoder];
+      if (!encoder) {
+        return;
+      }
+      [encoder copyFromTexture:source_texture
+                   sourceSlice:0
+                   sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(destination_width,
+                                           destination_height, 1)
+                     toTexture:drawable.texture
+              destinationSlice:0
+              destinationLevel:0
+             destinationOrigin:MTLOriginMake(0, 0, 0)];
+      [encoder endEncoding];
+      [command_buffer presentDrawable:drawable];
+      [command_buffer commit];
+      [command_buffer waitUntilCompleted];
+      if (command_buffer.status == MTLCommandBufferStatusCompleted) {
+        presented = ++g_guest_frames_presented;
+      }
+    });
+  }
+  return presented;
+}
+
 uint32_t rosette_macho_native_window_pump_events(void) {
   __block uint32_t count = 0;
   @autoreleasepool {
@@ -373,6 +559,7 @@ void rosette_macho_native_window_shutdown(void) {
       g_window = nil;
       g_fullscreen = NO;
       g_diagnostic_frames_presented = 0;
+      g_guest_frames_presented = 0;
     });
   }
 }

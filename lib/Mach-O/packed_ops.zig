@@ -158,6 +158,64 @@ pub fn unpackLowQwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
     return result;
 }
 
+/// Interleaves the low 8 bytes of two 16-byte vectors (PUNPCKLBW).
+pub fn unpackLowBytes(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..8) |lane| {
+        result[lane * 2] = lhs[lane];
+        result[lane * 2 + 1] = rhs[lane];
+    }
+    return result;
+}
+
+/// Interleaves the low 4 words of two 16-byte vectors (PUNPCKLWD).
+pub fn unpackLowWords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        @memcpy(result[lane * 4 ..][0..2], lhs[lane * 2 ..][0..2]);
+        @memcpy(result[lane * 4 + 2 ..][0..2], rhs[lane * 2 ..][0..2]);
+    }
+    return result;
+}
+
+/// Interleaves the high 8 bytes of two 16-byte vectors (PUNPCKHBW).
+pub fn unpackHighBytes(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..8) |lane| {
+        result[lane * 2] = lhs[8 + lane];
+        result[lane * 2 + 1] = rhs[8 + lane];
+    }
+    return result;
+}
+
+/// Interleaves the high 4 words of two 16-byte vectors (PUNPCKHWD).
+pub fn unpackHighWords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    for (0..4) |lane| {
+        @memcpy(result[lane * 4 ..][0..2], lhs[8 + lane * 2 ..][0..2]);
+        @memcpy(result[lane * 4 + 2 ..][0..2], rhs[8 + lane * 2 ..][0..2]);
+    }
+    return result;
+}
+
+/// Interleaves the high 2 dwords of two 16-byte vectors (PUNPCKHDQ).
+pub fn unpackHighDwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    @memcpy(result[0..4], lhs[8..12]);
+    @memcpy(result[4..8], rhs[8..12]);
+    @memcpy(result[8..12], lhs[12..16]);
+    @memcpy(result[12..16], rhs[12..16]);
+    return result;
+}
+
+/// Interleaves the high qwords of two 16-byte vectors (PUNPCKHQDQ).
+pub fn unpackHighQwords(lhs: [16]u8, rhs: [16]u8) [16]u8 {
+    var result: [16]u8 = undefined;
+    @memcpy(result[0..8], lhs[8..16]);
+    @memcpy(result[8..16], rhs[8..16]);
+    return result;
+}
+
 /// Blends 16-bit word lanes from two vectors using an 8-bit control mask.
 /// Each bit selects between lhs (0) and rhs (1) for the corresponding word lane.
 pub fn blendPackedWords(lhs: [16]u8, rhs: [16]u8, control: u8) [16]u8 {
