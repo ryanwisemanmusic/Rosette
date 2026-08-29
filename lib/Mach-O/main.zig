@@ -10,6 +10,8 @@ const ppc_runtime = @import("ppc_runtime");
 const ppc_host_abi = ppc_runtime.host_abi;
 const application_framework = @import("application_framework");
 const application_framework_contract = application_framework.contract;
+const xenia_launch_assist_contract = @import("xenia_launch_assist_contract");
+const xenia_host_gpu_callback_contract = @import("xenia_host_gpu_callback_contract");
 
 // Xenia resolves this optional provider with dlsym while it is hosted by the
 // Mach-O processor. Keeping the wrappers in the executable's root module is
@@ -270,6 +272,78 @@ pub export fn rosette_application_framework_snapshot(
     if (@intFromPtr(handle) == 0 or @intFromPtr(snapshot) == 0) return 0;
     snapshot.* = handle.snapshot();
     return 1;
+}
+
+/// Rosette's Xenia adapter resolves this ABI with dlsym. The request is a
+/// proof-bearing host-startup record; the response can authorize only the
+/// package-defined host operations and never guest execution or GPU output.
+pub export fn rosette_xenia_launch_assist_abi_version() callconv(.c) u32 {
+    return xenia_launch_assist_contract.abi_version;
+}
+
+pub export fn rosette_xenia_launch_assist_schema_version() callconv(.c) u16 {
+    return xenia_launch_assist_contract.schema_version;
+}
+
+pub export fn rosette_xenia_launch_assist_query(
+    request: *const xenia_launch_assist_contract.Request,
+    response: *xenia_launch_assist_contract.Response,
+) callconv(.c) i32 {
+    if (@intFromPtr(request) == 0 or @intFromPtr(response) == 0) return 0;
+    response.* = application_framework.defaultHandle().queryXeniaLaunchAssist(request.*);
+    return 1;
+}
+
+pub export fn rosette_xenia_launch_assist_report(
+    request: *const xenia_launch_assist_contract.Request,
+    response: *const xenia_launch_assist_contract.Response,
+    applied_actions: u32,
+    status_raw: u8,
+) callconv(.c) i32 {
+    if (@intFromPtr(request) == 0 or @intFromPtr(response) == 0) return 0;
+    const status = enumFromRaw(xenia_launch_assist_contract.ApplyStatus, status_raw) orelse return 0;
+    return @intFromBool(application_framework.defaultHandle().reportXeniaLaunchAssist(
+        request.*,
+        response.*,
+        applied_actions,
+        status,
+    ));
+}
+
+/// Xenia resolves this optional provider with dlsym.  The response authorizes
+/// only Xenia's own host callback trampoline; it cannot manufacture a guest
+/// VdSet callback, PM4 packet, ring write, XE_SWAP, or presentation fact.
+pub export fn rosette_xenia_host_gpu_callback_abi_version() callconv(.c) u32 {
+    return xenia_host_gpu_callback_contract.abi_version;
+}
+
+pub export fn rosette_xenia_host_gpu_callback_schema_version() callconv(.c) u16 {
+    return xenia_host_gpu_callback_contract.schema_version;
+}
+
+pub export fn rosette_xenia_host_gpu_callback_query(
+    request: *const xenia_host_gpu_callback_contract.Request,
+    response: *xenia_host_gpu_callback_contract.Response,
+) callconv(.c) i32 {
+    if (@intFromPtr(request) == 0 or @intFromPtr(response) == 0) return 0;
+    response.* = application_framework.defaultHandle().queryXeniaHostGpuCallback(request.*);
+    return 1;
+}
+
+pub export fn rosette_xenia_host_gpu_callback_report(
+    request: *const xenia_host_gpu_callback_contract.Request,
+    response: *const xenia_host_gpu_callback_contract.Response,
+    applied_actions: u32,
+    status_raw: u8,
+) callconv(.c) i32 {
+    if (@intFromPtr(request) == 0 or @intFromPtr(response) == 0) return 0;
+    const status = enumFromRaw(xenia_host_gpu_callback_contract.ApplyStatus, status_raw) orelse return 0;
+    return @intFromBool(application_framework.defaultHandle().reportXeniaHostGpuCallback(
+        request.*,
+        response.*,
+        applied_actions,
+        status,
+    ));
 }
 
 fn abiRecordIsCompatible(size: u16, schema: u16, expected_size: usize) bool {

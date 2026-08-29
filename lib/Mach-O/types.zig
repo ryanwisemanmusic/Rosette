@@ -270,6 +270,10 @@ pub const DecodeCacheEntry = struct {
     /// chance. This scales beyond the old two-way-only MRU rule without a
     /// per-hit age write to every way.
     recently_used: bool = false,
+    /// Saturating count of executions that found this already-filled entry.
+    /// It distinguishes a genuinely reused victim (capacity conflict) from a
+    /// one-pass stream that happened to evict a non-empty cold entry.
+    reuse_count: u16 = 0,
     /// The fill that produced this entry ran the full validation gate chain
     /// and it declined: the RIP is not a special-RIP target (table, stub
     /// helper, libcpp stream, synthetic thunk), the address was executable,
@@ -444,6 +448,10 @@ pub const PerformanceSample = struct {
     decode_cache_stale_rejections: u64 = 0,
     decode_cache_vacant_misses: u64 = 0,
     decode_cache_conflict_misses: u64 = 0,
+    decode_cache_cold_eviction_misses: u64 = 0,
+    decode_cache_victim_hits: u64 = 0,
+    decode_cache_victim_fills: u64 = 0,
+    decode_cache_victim_stale_rejections: u64 = 0,
     code_generation: u64 = 0,
     import_route_cache_hits: u64 = 0,
     import_route_cache_misses: u64 = 0,
@@ -693,6 +701,11 @@ pub const IdleCallback = struct {
     arg1: u64 = 0,
     arg2: u64 = 0,
     extra_arguments: bool = false,
+    /// GTK's idle-source APIs are asynchronous: queueing one does not make
+    /// the caller wait for its return. The scheduler stores this bit on the
+    /// entry so only an explicit framework rendezvous can create a completion
+    /// dependency on the scheduling guest thread.
+    completion_rendezvous: bool = false,
     active: bool = false,
     tag: []const u8 = "",
     scheduled_step: u64 = 0,
@@ -707,11 +720,15 @@ test "only signal handlers request the extra argument registers" {
     // the guest's main loop.
     const idle = IdleCallback{ .function = 0x1000, .data = 0x20 };
     try std.testing.expect(!idle.extra_arguments);
+    try std.testing.expect(!idle.completion_rendezvous);
     try std.testing.expectEqual(@as(u64, 0), idle.arg1);
     try std.testing.expectEqual(@as(u64, 0), idle.arg2);
 
     const handler = IdleCallback{ .function = 0x1000, .data = 0x20, .arg1 = 0, .arg2 = 0x30, .extra_arguments = true };
     try std.testing.expect(handler.extra_arguments);
+
+    const rendezvous = IdleCallback{ .function = 0x1000, .completion_rendezvous = true };
+    try std.testing.expect(rendezvous.completion_rendezvous);
 }
 
 pub const IdleDispatchBlock = enum {

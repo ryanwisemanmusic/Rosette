@@ -80,6 +80,19 @@ pub const DECODE_CACHE_HASH_SHIFT: u6 = 46;
 pub const DECODE_CACHE_SET_SHIFT: u6 = 49;
 pub const DECODE_CACHE_HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Small second-level victim cache for entries displaced from the primary
+/// decode set.  A primary conflict is only harmful when the displaced code is
+/// used again; retaining recent victims lets a returning instruction recover
+/// its already-validated decode without paying another full translation.
+/// Four-way sets keep the miss-side probe bounded while adding only a small
+/// amount of storage beside the 262K-entry primary table.
+pub const DECODE_VICTIM_CACHE_WAYS: usize = 4;
+pub const DECODE_VICTIM_CACHE_SET_COUNT: usize = 1 << 10;
+pub const DECODE_VICTIM_CACHE_ENTRY_COUNT: usize =
+    DECODE_VICTIM_CACHE_WAYS * DECODE_VICTIM_CACHE_SET_COUNT;
+pub const DECODE_VICTIM_CACHE_SET_SHIFT: u6 = 54;
+pub const DECODE_VICTIM_CACHE_HASH_MULTIPLIER: u64 = 0xD6E8_FEB8_6659_FD93;
+
 /// Hash an exact instruction address into the direct-mapped decode cache.
 ///
 /// The old `(address >> 4) & mask` mapping gave every instruction in the same
@@ -95,6 +108,14 @@ pub inline fn decodeCacheIndex(address: u64) usize {
 pub inline fn decodeCacheSetBase(address: u64) usize {
     const set: usize = @intCast((address *% DECODE_CACHE_HASH_MULTIPLIER) >> DECODE_CACHE_SET_SHIFT);
     return set * DECODE_CACHE_WAYS;
+}
+
+pub inline fn decodeVictimCacheSetBase(address: u64) usize {
+    // Fold the high half before multiplying so generated-code addresses and
+    // image addresses do not share the primary table's exact index function.
+    const mixed = (address ^ (address >> 32)) *% DECODE_VICTIM_CACHE_HASH_MULTIPLIER;
+    const set: usize = @intCast(mixed >> DECODE_VICTIM_CACHE_SET_SHIFT);
+    return set * DECODE_VICTIM_CACHE_WAYS;
 }
 
 test "invalidation and lookup enumerate the same slots" {
@@ -145,6 +166,18 @@ test "decode cache hashes neighboring instruction starts independently" {
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
+}
+
+test "victim cache set bases partition the secondary cache" {
+    for ([_]u64{ 0, 1, 0xA000_5AF8, 0x34D8_6000, std.math.maxInt(u64) }) |address| {
+        const base = decodeVictimCacheSetBase(address);
+        try std.testing.expect(base + DECODE_VICTIM_CACHE_WAYS <= DECODE_VICTIM_CACHE_ENTRY_COUNT);
+        try std.testing.expectEqual(@as(usize, 0), base % DECODE_VICTIM_CACHE_WAYS);
+    }
+    try std.testing.expectEqual(
+        DECODE_VICTIM_CACHE_ENTRY_COUNT,
+        DECODE_VICTIM_CACHE_SET_COUNT * DECODE_VICTIM_CACHE_WAYS,
+    );
 }
 pub const IMPORT_ROUTE_CACHE_SIZE: usize = 1024;
 pub const PAGE_READ: u8 = 1 << 0;
