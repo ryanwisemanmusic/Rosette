@@ -34,6 +34,7 @@ pub const UiHandoffTracker = ui_handoff.UiHandoffTracker;
 pub const UiHandoffPhase = ui_handoff.Phase;
 pub const UiHandoffHealth = ui_handoff.Health;
 pub const UiCallbackQuantumAction = ui_handoff.CallbackQuantumAction;
+pub const UiHandoffCompletionMode = ui_handoff.CompletionMode;
 pub const CooperativeWork = cooperative_rotation.Work;
 pub const CooperativeInputs = cooperative_rotation.Inputs;
 pub const chooseCooperativeWork = cooperative_rotation.choose;

@@ -24,6 +24,16 @@ pub const CallbackQuantumAction = enum {
     rendezvous_worker,
 };
 
+/// Describes what a UI callback owes its scheduling thread when it returns.
+/// GTK idle sources are asynchronous event-loop work by default: the caller
+/// queues them and keeps going. A synchronous framework handoff is a
+/// different contract and must be selected explicitly so its caller can be
+/// resumed before another callback crosses the boundary.
+pub const CompletionMode = enum {
+    rendezvous,
+    detached,
+};
+
 pub const SchedulingOwner = struct {
     thread: u64,
     rip: u64,
@@ -51,6 +61,10 @@ pub const UiHandoffTracker = struct {
     diagnostic_count: u64 = 0,
     last_diagnostic_step: u64 = 0,
     worker_rip: u64 = 0,
+    /// `rendezvous` preserves the scheduling-thread completion dependency.
+    /// `detached` records callback completion without making an unrelated
+    /// parked guest thread a prerequisite for dispatching later idle work.
+    completion_mode: CompletionMode = .rendezvous,
     callback_rip: u64 = 0,
     /// Scheduling thread of the most recently abandoned completion, remembered
     /// until that thread is seen running again. A thread that failed to collect
@@ -59,9 +73,34 @@ pub const UiHandoffTracker = struct {
     /// end once per callback for the rest of the run. Survives every reset for
     /// exactly that reason.
     abandoned_thread: u64 = 0,
+    /// Completed callbacks by terminal ownership disposition. `total` is
+    /// incremented exactly once in `completed`; every completed generation is
+    /// then resumed, explicitly abandoned, detached, inherited from an
+    /// already abandoned owner, ownerless, or still pending.
+    completions_total: u64 = 0,
+    completions_resumed: u64 = 0,
     completions_abandoned: u64 = 0,
+    completions_inherited_abandonment: u64 = 0,
+    completions_detached: u64 = 0,
+    completions_ownerless: u64 = 0,
 
     pub fn queued(self: *UiHandoffTracker, source_id: u64, callback: u64, scheduling_thread: u64, scheduling_rip: u64, step: u64) void {
+        self.queuedWithMode(source_id, callback, scheduling_thread, scheduling_rip, step, .rendezvous);
+    }
+
+    /// Queue a callback with an explicit completion contract. Keeping this
+    /// separate from `queued` leaves the scheduler's low-level tests and
+    /// synchronous callers strict by default while allowing the GTK adapter
+    /// to model its documented fire-and-forget API accurately.
+    pub fn queuedWithMode(
+        self: *UiHandoffTracker,
+        source_id: u64,
+        callback: u64,
+        scheduling_thread: u64,
+        scheduling_rip: u64,
+        step: u64,
+        completion_mode: CompletionMode,
+    ) void {
         const next_generation = self.generation +| 1;
         self.* = .{
             .phase = .queued,
@@ -72,8 +111,14 @@ pub const UiHandoffTracker = struct {
             .scheduling_rip = scheduling_rip,
             .queued_step = step,
             .last_progress_step = step,
+            .completion_mode = completion_mode,
             .abandoned_thread = self.abandoned_thread,
+            .completions_total = self.completions_total,
+            .completions_resumed = self.completions_resumed,
             .completions_abandoned = self.completions_abandoned,
+            .completions_inherited_abandonment = self.completions_inherited_abandonment,
+            .completions_detached = self.completions_detached,
+            .completions_ownerless = self.completions_ownerless,
         };
     }
 
@@ -83,8 +128,20 @@ pub const UiHandoffTracker = struct {
     /// the scheduler lose ownership of the running callback and stop donating
     /// quanta to runnable workers.
     pub fn queueIfIdle(self: *UiHandoffTracker, source_id: u64, callback: u64, scheduling_thread: u64, scheduling_rip: u64, step: u64) bool {
+        return self.queueIfIdleWithMode(source_id, callback, scheduling_thread, scheduling_rip, step, .rendezvous);
+    }
+
+    pub fn queueIfIdleWithMode(
+        self: *UiHandoffTracker,
+        source_id: u64,
+        callback: u64,
+        scheduling_thread: u64,
+        scheduling_rip: u64,
+        step: u64,
+        completion_mode: CompletionMode,
+    ) bool {
         if (!self.acceptsNewHandoff()) return false;
-        self.queued(source_id, callback, scheduling_thread, scheduling_rip, step);
+        self.queuedWithMode(source_id, callback, scheduling_thread, scheduling_rip, step, completion_mode);
         return true;
     }
 
@@ -102,8 +159,33 @@ pub const UiHandoffTracker = struct {
         callback_rip: u64,
         step: u64,
     ) void {
+        self.beginDispatchWithMode(
+            source_id,
+            callback,
+            scheduling_thread,
+            scheduling_rip,
+            queued_step,
+            callback_handle,
+            callback_rip,
+            step,
+            .rendezvous,
+        );
+    }
+
+    pub fn beginDispatchWithMode(
+        self: *UiHandoffTracker,
+        source_id: u64,
+        callback: u64,
+        scheduling_thread: u64,
+        scheduling_rip: u64,
+        queued_step: u64,
+        callback_handle: u64,
+        callback_rip: u64,
+        step: u64,
+        completion_mode: CompletionMode,
+    ) void {
         if (self.phase != .queued or self.source_id != source_id or self.callback != callback) {
-            self.queued(source_id, callback, scheduling_thread, scheduling_rip, queued_step);
+            self.queuedWithMode(source_id, callback, scheduling_thread, scheduling_rip, queued_step, completion_mode);
         }
         self.callbackStarted(callback_handle, callback_rip, step);
     }
@@ -181,16 +263,30 @@ pub const UiHandoffTracker = struct {
     pub fn completed(self: *UiHandoffTracker, step: u64) void {
         if (!self.isActive()) return;
         self.phase = .completed;
+        self.completions_total +|= 1;
+        if (self.completion_mode == .detached) {
+            self.completions_detached +|= 1;
+        } else if (self.scheduling_thread == 0) {
+            self.completions_ownerless +|= 1;
+        } else if (self.scheduling_thread == self.abandoned_thread) {
+            self.completions_inherited_abandonment +|= 1;
+        }
         self.completed_step = step;
         self.last_progress_step = step;
         self.worker_handle = 0;
     }
 
     pub fn reset(self: *UiHandoffTracker) void {
+        const dropped_pending = self.phase == .completed and self.hasCompletionDependency();
         self.* = .{
             .generation = self.generation,
             .abandoned_thread = self.abandoned_thread,
+            .completions_total = self.completions_total,
+            .completions_resumed = self.completions_resumed,
             .completions_abandoned = self.completions_abandoned,
+            .completions_inherited_abandonment = self.completions_inherited_abandonment,
+            .completions_detached = self.completions_detached,
+            .completions_ownerless = self.completions_ownerless +| @intFromBool(dropped_pending),
         };
     }
 
@@ -276,6 +372,7 @@ pub const UiHandoffTracker = struct {
     /// frozen across the entire callback and violate its atomic invariants.
     pub fn completionResumeHandle(self: *const UiHandoffTracker) u64 {
         if (self.phase != .completed) return 0;
+        if (self.completion_mode == .detached) return 0;
         if (self.scheduling_thread == self.abandoned_thread) return 0;
         return self.scheduling_thread;
     }
@@ -290,7 +387,12 @@ pub const UiHandoffTracker = struct {
             .generation = self.generation,
             .last_progress_step = step,
             .abandoned_thread = self.abandoned_thread,
+            .completions_total = self.completions_total,
+            .completions_resumed = self.completions_resumed +| 1,
             .completions_abandoned = self.completions_abandoned,
+            .completions_inherited_abandonment = self.completions_inherited_abandonment,
+            .completions_detached = self.completions_detached,
+            .completions_ownerless = self.completions_ownerless,
         };
         return true;
     }
@@ -321,9 +423,32 @@ pub const UiHandoffTracker = struct {
             .generation = self.generation,
             .last_progress_step = current_step,
             .abandoned_thread = abandoned,
+            .completions_total = self.completions_total,
+            .completions_resumed = self.completions_resumed,
             .completions_abandoned = self.completions_abandoned +| 1,
+            .completions_inherited_abandonment = self.completions_inherited_abandonment,
+            .completions_detached = self.completions_detached,
+            .completions_ownerless = self.completions_ownerless,
         };
         return abandoned;
+    }
+
+    pub fn pendingCompletions(self: *const UiHandoffTracker) u64 {
+        const terminal = self.completions_resumed +|
+            self.completions_abandoned +|
+            self.completions_inherited_abandonment +|
+            self.completions_detached +|
+            self.completions_ownerless;
+        return self.completions_total -| terminal;
+    }
+
+    pub fn terminalInvariantHolds(self: *const UiHandoffTracker) bool {
+        return self.completions_total == self.completions_resumed +|
+            self.completions_abandoned +|
+            self.completions_inherited_abandonment +|
+            self.completions_detached +|
+            self.completions_ownerless +|
+            self.pendingCompletions();
     }
 
     pub fn health(self: *const UiHandoffTracker, current_step: u64, stall_steps: u64) Health {
@@ -343,12 +468,13 @@ pub const UiHandoffTracker = struct {
         self.last_diagnostic_step = current_step;
         self.diagnostic_count +|= 1;
         std.debug.print(
-            "scheduler: UI HANDOFF STALL: diagnostic={d} generation={d} health={s} phase={s} source={d} callback=0x{x} callback_handle=0x{x} callback_rip=0x{x} worker=0x{x} worker_rip=0x{x} active=0x{x} active_rip=0x{x} age={d} no_progress={d} queued_by=0x{x} queued_rip=0x{x} suspend/resume/worker_slices={d}/{d}/{d} suspended={d}\n",
+            "scheduler: UI HANDOFF STALL: diagnostic={d} generation={d} health={s} phase={s} handoff={s} source={d} callback=0x{x} callback_handle=0x{x} callback_rip=0x{x} worker=0x{x} worker_rip=0x{x} active=0x{x} active_rip=0x{x} age={d} no_progress={d} queued_by=0x{x} queued_rip=0x{x} suspend/resume/worker_slices={d}/{d}/{d} suspended={d}\n",
             .{
                 self.diagnostic_count,
                 self.generation,
                 @tagName(status),
                 @tagName(self.phase),
+                @tagName(self.completion_mode),
                 self.source_id,
                 self.callback,
                 self.callback_handle,
@@ -411,6 +537,37 @@ test "completed UI handoff returns to its scheduling thread exactly once" {
     try std.testing.expectEqual(@as(u64, 1), tracker.generation);
 }
 
+test "detached UI handoff completes without a scheduling dependency" {
+    var tracker = UiHandoffTracker{};
+    tracker.queuedWithMode(1, 0x1234, 0x7FFF_2020, 0x5678, 10, .detached);
+    tracker.beginDispatchWithMode(
+        1,
+        0x1234,
+        0x7FFF_2020,
+        0x5678,
+        10,
+        0xFFFF_F900_0000_0001,
+        0x1234,
+        20,
+        .detached,
+    );
+    tracker.completed(30);
+
+    try std.testing.expectEqual(CompletionMode.detached, tracker.completion_mode);
+    try std.testing.expectEqual(@as(u64, 0), tracker.completionResumeHandle());
+    try std.testing.expect(!tracker.hasCompletionDependency());
+    try std.testing.expectEqual(Health.completed, tracker.health(1_000_000, 100));
+    try std.testing.expectEqual(@as(u64, 0), tracker.releaseStalledCompletion(1_000_000, 100));
+    try std.testing.expectEqual(@as(u64, 1), tracker.completions_total);
+    try std.testing.expectEqual(@as(u64, 1), tracker.completions_detached);
+    try std.testing.expectEqual(@as(u64, 0), tracker.pendingCompletions());
+    try std.testing.expect(tracker.terminalInvariantHolds());
+
+    // A detached callback cannot pin the next event-loop source behind the
+    // parked thread that happened to enqueue it.
+    try std.testing.expect(tracker.queueIfIdleWithMode(2, 0x4321, 0x7FFF_2030, 0x8765, 40, .detached));
+}
+
 test "a completion dependency its scheduling thread cannot satisfy is released" {
     var tracker = UiHandoffTracker{};
     tracker.queued(1, 0x1234, 0x7FFF_2020, 0x5678, 10);
@@ -465,6 +622,33 @@ test "an abandoned scheduling thread does not re-stall the queue once per callba
     tracker.callbackStarted(0xFFFF_F900_0000_0004, 0x8765, 220);
     tracker.completed(230);
     try std.testing.expectEqual(@as(u64, 0x7FFF_2020), tracker.completionResumeHandle());
+}
+
+test "completion ownership accounts resumed abandoned and inherited terminals" {
+    var tracker = UiHandoffTracker{};
+
+    tracker.queued(1, 0x1000, 0x7FFF_2020, 0x2000, 10);
+    tracker.callbackStarted(0xFFFF_F900_0000_0001, 0x1000, 20);
+    tracker.completed(30);
+    try std.testing.expectEqual(@as(u64, 0x7FFF_2020), tracker.releaseStalledCompletion(130, 100));
+
+    for (2..4) |source| {
+        tracker.queued(source, 0x1000 + source, 0x7FFF_2020, 0x2000, 140 + source);
+        tracker.callbackStarted(0xFFFF_F900_0000_0000 + source, 0x1000, 150 + source);
+        tracker.completed(160 + source);
+    }
+
+    tracker.queued(4, 0x1004, 0x7FFF_2030, 0x2000, 200);
+    tracker.callbackStarted(0xFFFF_F900_0000_0004, 0x1004, 210);
+    tracker.completed(220);
+    try std.testing.expect(tracker.completionResumed(0x7FFF_2030, 230));
+
+    try std.testing.expectEqual(@as(u64, 4), tracker.completions_total);
+    try std.testing.expectEqual(@as(u64, 1), tracker.completions_resumed);
+    try std.testing.expectEqual(@as(u64, 1), tracker.completions_abandoned);
+    try std.testing.expectEqual(@as(u64, 2), tracker.completions_inherited_abandonment);
+    try std.testing.expectEqual(@as(u64, 0), tracker.pendingCompletions());
+    try std.testing.expect(tracker.terminalInvariantHolds());
 }
 
 test "a resumed handoff is never eligible for stalled release" {

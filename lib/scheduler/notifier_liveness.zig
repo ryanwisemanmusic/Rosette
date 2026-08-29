@@ -106,6 +106,13 @@ pub const Object = struct {
     last_notify_step: u64 = 0,
     last_notify_thread: u64 = 0,
     last_notify_pc: u64 = 0,
+    /// The most recently parked waiter's thread handle and PC. The waiter
+    /// bitmask says how many threads are parked; naming the newest one gives
+    /// the report a place to start. Set by `noteWaiterIdentity`, which the
+    /// scheduler calls where it knows the handle (the slot alone cannot be
+    /// resolved to a handle by this module).
+    last_waiter_thread: u64 = 0,
+    last_waiter_pc: u64 = 0,
     first_wait_step: u64 = 0,
     /// Bounded spurious wakes granted by the runtime so a waiter can re-check
     /// its predicate. A count above zero plus a still-parked waiter means the
@@ -179,6 +186,18 @@ pub const Graph = struct {
     pub fn noteWake(self: *Graph, address: u64, slot: usize) void {
         const object = self.find(address) orelse return;
         object.waiter_mask &= ~maskOf(slot);
+    }
+
+    /// Record the identity of a thread parked on this object, so the
+    /// never-notified report can name the waiter instead of only counting
+    /// waiters. The thread handle is scheduler knowledge; the graph only
+    /// stores slots, so the scheduler supplies the handle + PC here.
+    pub fn noteWaiterIdentity(self: *Graph, address: u64, thread: u64, pc: u64) void {
+        const object = self.find(address) orelse return;
+        if (thread != 0) {
+            object.last_waiter_thread = thread;
+            object.last_waiter_pc = pc;
+        }
     }
 
     /// Record who sent a notification. The thread identity is the point: a
@@ -346,6 +365,24 @@ test "an untracked notifier remains real without a fabricated liveness verdict" 
     try std.testing.expectEqual(@as(u32, 0), object.notifierCount());
     try std.testing.expectEqual(@as(u64, 0xffff_f900_0000_0004), object.last_notify_thread);
     try std.testing.expectEqual(Progress.untracked_notifier_stale, classify(object.*, default_stall_steps + 101, default_stall_steps));
+}
+
+// The never-notified report should name the parked thread, not just count it.
+// The graph stores slots; the scheduler supplies the handle + PC separately.
+test "waiter identity is recorded alongside the waiter bitmask" {
+    var graph = Graph{};
+    graph.noteWait(0x2a7cec38, 11, 100);
+    graph.noteWaiterIdentity(0x2a7cec38, 0x7fff2080, 0x82581ad0);
+    const object = graph.find(0x2a7cec38).?;
+    try std.testing.expectEqual(@as(u32, 1), object.waiterCount());
+    try std.testing.expectEqual(@as(u64, 0x7fff2080), object.last_waiter_thread);
+    try std.testing.expectEqual(@as(u64, 0x82581ad0), object.last_waiter_pc);
+}
+
+test "waiter identity is ignored when no waiter was ever recorded" {
+    var graph = Graph{};
+    graph.noteWaiterIdentity(0x9999, 0x7fff2080, 0xdeadbeef);
+    try std.testing.expect(graph.find(0x9999) == null);
 }
 
 // The repair targets never-notified waiters specifically. An object whose
