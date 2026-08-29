@@ -1,0 +1,7 @@
+name = "common-cocoa-graphics-control-contract"
+version = "0.1.0-local"
+kind = "cocoa-graphics-control-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
