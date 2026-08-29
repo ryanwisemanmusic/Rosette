@@ -1,0 +1,7 @@
+name = "common-abi-translation-economics-contract"
+version = "0.1.0-local"
+kind = "translation-cost-classification-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
