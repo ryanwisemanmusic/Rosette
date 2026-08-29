@@ -83,6 +83,42 @@ const Recent = struct {
     step: u64 = 0,
 };
 
+/// What the retained signatures say about how the run ended.
+///
+/// The dump used to be a list. Sixteen signatures and sixteen recent
+/// operations, every one of them printed, with nothing saying whether the run
+/// ended inside a livelock or inside a working producer/consumer pump — and
+/// those look identical in a list of repetition counts. The distinction is not
+/// available to this module on its own; it comes from the wait audit, which
+/// holds the one thing repetition cannot tell you: whether anything else in
+/// the run advanced alongside the pattern.
+pub const Termination = enum(u8) {
+    /// Nothing was retained. The run did not end in a wait pattern at all.
+    quiet,
+    /// Every retained signature is a handshake the audit judged healthy: a
+    /// bounded wait that completed, or a pump that kept its consumer fed.
+    healthy_pumps_only,
+    /// At least one signature recurred while the audit could not account for
+    /// it. This is the one worth reading the recent window for.
+    unaccounted_cycle,
+
+    pub fn label(self: Termination) []const u8 {
+        return switch (self) {
+            .quiet => "quiet",
+            .healthy_pumps_only => "healthy-pumps-only",
+            .unaccounted_cycle => "unaccounted-cycle",
+        };
+    }
+
+    pub fn meaning(self: Termination) []const u8 {
+        return switch (self) {
+            .quiet => "no wait signature was retained; the run did not end inside a synchronization pattern and nothing here bears on why it stopped",
+            .healthy_pumps_only => "every retained signature is a handshake the wait audit accounted for — a bounded wait that completed, or a pump whose consumer kept up. Repetition here is what a working producer/consumer looks like; the reason the run stopped is somewhere else, and the detail is collapsed so it does not read as a finding",
+            .unaccounted_cycle => "a signature recurred that the wait audit could not account for. This is the pattern to read the recent window against: the question is not who failed to signal, but what the woken thread does next and why it comes straight back",
+        };
+    }
+};
+
 pub const Predictor = struct {
     signatures: [SIGNATURE_CAPACITY]Signature = [_]Signature{.{}} ** SIGNATURE_CAPACITY,
     recent: [RECENT_CAPACITY]Recent = [_]Recent{.{}} ** RECENT_CAPACITY,
@@ -143,13 +179,23 @@ pub const Predictor = struct {
     /// Dump every retained wait-cycle signature with readable counts. Called
     /// from terminal diagnostics so a run that ended inside a wait cycle
     /// names the objects it was cycling on instead of reading empty.
-    pub fn dump(self: *Predictor, state: anytype, reason: []const u8) void {
+    ///
+    /// Returns the termination verdict so the caller can decide whether the
+    /// recent window is worth printing.
+    pub fn dump(self: *Predictor, state: anytype, reason: []const u8) Termination {
         var retained: usize = 0;
+        var accounted: usize = 0;
+        var unaccounted: usize = 0;
         for (&self.signatures) |*signature| {
             if (!signature.valid) continue;
             retained += 1;
+            if (self.accountedFor(state, signature)) {
+                accounted += 1;
+                continue;
+            }
+            unaccounted += 1;
             machoCapturePrint(
-                "LIVELOCK PREDICTOR: signature op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d}\n",
+                "LIVELOCK PREDICTOR: signature op={s} object=0x{x} thread=0x{x} pc=0x{x} count={d} first_seen_step={d} last_seen_step={d} emissions={d} accounted=NO\n",
                 .{
                     signature.op.label(),
                     signature.object,
@@ -162,19 +208,50 @@ pub const Predictor = struct {
                 },
             );
         }
+        const termination: Termination = if (retained == 0)
+            .quiet
+        else if (unaccounted == 0)
+            .healthy_pumps_only
+        else
+            .unaccounted_cycle;
+        if (accounted != 0) machoCapturePrint(
+            "LIVELOCK PREDICTOR: {d} signature(s) collapsed: the wait audit accounted for each one as a bounded wait or a fed pump. They are counted, not hidden — a signature stops being collapsed the moment the audit stops accounting for it\n",
+            .{accounted},
+        );
         machoCapturePrint(
-            "LIVELOCK PREDICTOR: dump reason={s} distinct={d} retained={d} observations={d} recent_window={d} emissions={d} suppressed_by_audit={d} step={d}\n",
+            "LIVELOCK PREDICTOR: dump reason={s} termination={s} distinct={d} retained={d} accounted={d} unaccounted={d} observations={d} recent_window={d} emissions={d} suppressed_by_audit={d} step={d}; {s}\n",
             .{
                 reason,
+                termination.label(),
                 self.distinct_signatures,
                 retained,
+                accounted,
+                unaccounted,
                 self.observations,
                 self.recentCount(),
                 self.emissions,
                 self.suppressed,
                 state.executed_steps,
+                termination.meaning(),
             },
         );
+        return termination;
+    }
+
+    /// Whether the wait audit can account for this signature as healthy.
+    ///
+    /// The same judgement `emit` applies while the run is going, applied once
+    /// more at the end so the dump and the live emissions cannot disagree.
+    fn accountedFor(self: *Predictor, state: anytype, signature: *const Signature) bool {
+        _ = self;
+        if (comptime !@hasField(@TypeOf(state.*), "wait_audit")) return false;
+        const audit = &state.wait_audit;
+        for (audit.subjects[0..audit.count]) |subject| {
+            if (subject.object != signature.object) continue;
+            const classification = audit.classify(subject, state.executed_steps);
+            return classification == .expected_pump or classification == .expected_bounded;
+        }
+        return false;
     }
 
     /// The most recent wait operations, oldest first, for correlation.
@@ -489,4 +566,82 @@ test "recent ring wraps and reports the newest operations" {
     // The newest operation (index RECENT_CAPACITY+3) survives the wrap.
     const newest = predictor.recentChronological(RECENT_CAPACITY - 1).?;
     try std.testing.expectEqual(@as(u64, 0x1000 + (RECENT_CAPACITY + 3)), newest.object);
+}
+
+// A dump that reads as a list cannot say whether the run ended inside a
+// livelock or inside a working pump, and those look identical in a list of
+// repetition counts.
+test "an empty predictor terminates quiet" {
+    const TestState = struct { executed_steps: u64 = 0 };
+    var predictor = Predictor{};
+    var state = TestState{};
+    try std.testing.expectEqual(Termination.quiet, predictor.dump(&state, "test"));
+}
+
+test "a retained signature with no audit to account for it is unaccounted" {
+    const TestState = struct { executed_steps: u64 = 0 };
+    var predictor = Predictor{};
+    var state = TestState{};
+    state.executed_steps = 100;
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
+    try std.testing.expectEqual(Termination.unaccounted_cycle, predictor.dump(&state, "test"));
+}
+
+test "signatures the wait audit accounts for terminate as healthy pumps" {
+    const Classification = enum { expected_pump, expected_bounded, insufficient_evidence };
+    const Subject = struct { object: u64 = 0 };
+    const Audit = struct {
+        subjects: [2]Subject = [_]Subject{.{}} ** 2,
+        count: usize = 0,
+        fn classify(self: *const @This(), subject: Subject, step: u64) Classification {
+            _ = self;
+            _ = step;
+            return if (subject.object == 0x827CEC14) .expected_pump else .expected_bounded;
+        }
+    };
+    const TestState = struct {
+        executed_steps: u64 = 0,
+        wait_audit: Audit = .{},
+    };
+    var predictor = Predictor{};
+    var state = TestState{};
+    state.wait_audit.subjects[0] = .{ .object = 0x827CEC14 };
+    state.wait_audit.subjects[1] = .{ .object = 0x827CEC38 };
+    state.wait_audit.count = 2;
+    state.executed_steps = 100;
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
+    predictor.note(&state, .set_event, 0x827CEC38, 0x7fff2080, true);
+    try std.testing.expectEqual(Termination.healthy_pumps_only, predictor.dump(&state, "test"));
+    // Suppression at emission time and accounting at dump time are the same
+    // judgement; a healthy pattern is never reported by one and hidden by the
+    // other.
+    try std.testing.expect(predictor.suppressed >= 2);
+    try std.testing.expectEqual(@as(u64, 0), predictor.emissions);
+}
+
+test "one unaccounted signature among healthy ones still terminates unaccounted" {
+    const Classification = enum { expected_pump, expected_bounded, insufficient_evidence };
+    const Subject = struct { object: u64 = 0 };
+    const Audit = struct {
+        subjects: [1]Subject = [_]Subject{.{}} ** 1,
+        count: usize = 0,
+        fn classify(self: *const @This(), subject: Subject, step: u64) Classification {
+            _ = self;
+            _ = subject;
+            _ = step;
+            return .expected_pump;
+        }
+    };
+    const TestState = struct {
+        executed_steps: u64 = 0,
+        wait_audit: Audit = .{},
+    };
+    var predictor = Predictor{};
+    var state = TestState{};
+    state.wait_audit.subjects[0] = .{ .object = 0x827CEC14 };
+    state.wait_audit.count = 1;
+    state.executed_steps = 100;
+    predictor.note(&state, .wait, 0x827CEC14, 0x7fff2110, true);
+    predictor.note(&state, .wait, 0x14D49FD0, 0x7fff2090, true);
+    try std.testing.expectEqual(Termination.unaccounted_cycle, predictor.dump(&state, "test"));
 }

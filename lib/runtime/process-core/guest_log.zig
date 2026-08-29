@@ -1216,6 +1216,75 @@ fn parseDecimalAfter(message: []const u8, key: []const u8) ?u64 {
     return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
 }
 
+/// The emulator naming the host format it settled on for a guest format.
+///
+/// Read from its own breadcrumb rather than inferred, because the choice is
+/// the emulator's to make and Rosette must record what it actually did rather
+/// than what the substitution ladder would have done. What Rosette contributes
+/// is the other half: whether the host really lacked the preferred format, and
+/// what it does have instead.
+fn observeTextureFormatFallback(self: anytype, message: []const u8) void {
+    const texture = @import("gpu").texture_format_support;
+    // "Format k_2_10_10_10 (signed) is supported via a fallback format (using
+    // the Vulkan format 64 instead of the preferred 65)"
+    if (std.mem.indexOf(u8, message, "is supported via a fallback format") == null) return;
+    const chosen = parseTrailingNumber(message, "using the Vulkan format ") orelse return;
+    const signedness: texture.Signedness =
+        if (std.mem.indexOf(u8, message, "(signed)") != null) .signed else .unsigned;
+    // Longest label first: `k_2_10_10_10` is a prefix of
+    // `k_2_10_10_10_AS_16_16_16_16`, and matching the short one first would
+    // attribute every fallback to the wrong format.
+    const formats = [_]texture.TextureFormat{
+        .k_2_10_10_10_as_16_16_16_16,
+        .k_2_10_10_10,
+        .k_16_16_16_16,
+    };
+    const loader = parseTextureLoader(message);
+    for (formats) |format| {
+        if (std.mem.indexOf(u8, message, format.label()) == null) continue;
+        self.texture_formats.noteEmulatorChoiceWithLoader(
+            format,
+            signedness,
+            chosen,
+            loader,
+            self.executed_steps,
+        );
+        return;
+    }
+}
+
+/// Parse only the loader vocabulary owned by the texture-format contract.
+///
+/// A generic fallback breadcrumb is useful evidence that the emulator chose a
+/// different host format, but it does not prove that the bytes were converted.
+/// Leaving an absent or unfamiliar marker as `unknown` keeps the strict gate
+/// closed until the producer publishes that proof.
+fn parseTextureLoader(message: []const u8) @import("gpu").texture_format_support.LoaderMode {
+    const texture = @import("gpu").texture_format_support;
+    if (std.mem.indexOf(u8, message, "loader=signed-widening") != null)
+        return .signed_widening;
+    if (std.mem.indexOf(u8, message, "loader=signed-float") != null)
+        return .signed_float;
+    if (std.mem.indexOf(u8, message, "loader=native-signed") != null)
+        return .native_signed;
+    if (std.mem.indexOf(u8, message, "loader=native-unsigned") != null)
+        return .native_unsigned;
+    return texture.LoaderMode.unknown;
+}
+
+fn parseTrailingNumber(message: []const u8, prefix: []const u8) ?u32 {
+    const start = std.mem.indexOf(u8, message, prefix) orelse return null;
+    var index = start + prefix.len;
+    var value: u32 = 0;
+    var digits: usize = 0;
+    while (index < message.len and message[index] >= '0' and message[index] <= '9') : (index += 1) {
+        value = std.math.mul(u32, value, 10) catch return null;
+        value = std.math.add(u32, value, message[index] - '0') catch return null;
+        digits += 1;
+    }
+    return if (digits == 0) null else value;
+}
+
 pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
     const State = @TypeOf(self.*);
     if (comptime !@hasField(State, "gpu_bootstrap")) return;
@@ -1226,6 +1295,9 @@ pub fn observeGpuBootstrapGuestLog(self: anytype, message: []const u8) void {
     // consumption.  A generic PM4 line must never close the XE_SWAP stage.
     if (comptime @hasField(State, "gpu_vd_swap_contract")) {
         _ = self.gpu_vd_swap_contract.observeLogLine(message, self.executed_steps);
+    }
+    if (comptime @hasField(State, "texture_formats")) {
+        observeTextureFormatFallback(self, message);
     }
     const steps = [_]struct { marker: []const u8, step: gpu.Step, export_call: bool = false }{
         .{ .marker = "VdInitializeEngines", .step = .initialize_engines, .export_call = true },

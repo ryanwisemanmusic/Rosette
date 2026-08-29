@@ -289,7 +289,16 @@ fn recoverQuiescentGuestThread(self: anytype, reason: []const u8, waiter: u64) b
     }
 
     const completion_thread = self.ui_handoff.completionResumeHandle();
-    const preferred = if (completion_thread != 0) completion_thread else if (self.ui_handoff.isActive()) self.ui_handoff.scheduling_thread else 0;
+    // A detached GTK idle callback has no completion owner. Do not turn the
+    // guest thread that happened to enqueue it into a preferred spurious-wake
+    // target: that thread may be parked on an unrelated application condvar,
+    // exactly as Xenia's EmulatorApp thread is after CallInUIThreadDeferred.
+    const preferred = if (completion_thread != 0)
+        completion_thread
+    else if (self.ui_handoff.isActive() and self.ui_handoff.completion_mode == .rendezvous)
+        self.ui_handoff.scheduling_thread
+    else
+        0;
     if (self.pthreads.wakeOldestCondvarForQuiescence(preferred, self.executed_steps)) |woken| {
         self.cooperative_quiescence_recoveries +|= 1;
         const advanced_now = self.guest_time.advanceForQuiescence();
@@ -582,8 +591,8 @@ pub fn finishActiveGuestThread(self: anytype) void {
             self.idle_completed +|= 1;
             self.ui_handoff.completed(self.executed_steps);
             machoCapturePrint(
-                "macho-processor: GTK idle callback completed: source={d} callback=0x{x} duration_steps={d} completed={d} pending={d}\n",
-                .{ source, callback, duration, self.idle_completed, self.pendingIdleCallbackCount() },
+                "macho-processor: GTK idle callback completed: source={d} callback=0x{x} handoff={s} duration_steps={d} completed={d} pending={d}\n",
+                .{ source, callback, @tagName(self.ui_handoff.completion_mode), duration, self.idle_completed, self.pendingIdleCallbackCount() },
             );
             self.logThreadTable("GTK idle callback completed");
             self.active_guest_thread = 0;
@@ -685,6 +694,25 @@ pub fn scheduleSignalCallback(self: anytype, function: u64, arg0: u64, arg1: u64
 }
 
 pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []const u8) u64 {
+    return scheduleIdleCallbackWithMode(self, function, data, tag, .detached);
+}
+
+/// Queue a GTK idle source using an explicit completion contract. GTK's
+/// `_gdk_threads_add_idle`/`g_idle_add` family is fire-and-forget, so the
+/// ordinary entry point selects `.detached`. A future adapter that has a
+/// genuine synchronous rendezvous may call this with `.rendezvous` after it
+/// has established an explicit guest-side fence.
+pub fn scheduleRendezvousIdleCallback(self: anytype, function: u64, data: u64, tag: []const u8) u64 {
+    return scheduleIdleCallbackWithMode(self, function, data, tag, .rendezvous);
+}
+
+pub fn scheduleIdleCallbackWithMode(
+    self: anytype,
+    function: u64,
+    data: u64,
+    tag: []const u8,
+    handoff_mode: scheduler.UiHandoffCompletionMode,
+) u64 {
     if (function == 0 or !self.isExecutableAddress(function)) {
         machoCapturePrint(
             "macho-processor: GTK idle rejected: callback=0x{x} executable={} tag={s}\n",
@@ -706,13 +734,14 @@ pub fn scheduleIdleCallback(self: anytype, function: u64, data: u64, tag: []cons
             .scheduled_step = self.executed_steps,
             .scheduling_thread = scheduling_owner.thread,
             .scheduling_rip = scheduling_owner.rip,
+            .completion_rendezvous = handoff_mode == .rendezvous,
         };
         self.idle_scheduled +|= 1;
         updateCachedPendingIdle(self, 1);
-        _ = self.ui_handoff.queueIfIdle(source, function, scheduling_owner.thread, scheduling_owner.rip, self.executed_steps);
+        _ = self.ui_handoff.queueIfIdleWithMode(source, function, scheduling_owner.thread, scheduling_owner.rip, self.executed_steps, handoff_mode);
         machoCapturePrint(
-            "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
-            .{ source, function, data, tag, self.executed_steps, scheduling_owner.thread, scheduling_owner.rip, self.cooperative_ui_context != null, self.cached_pending_idle },
+            "macho-processor: GTK idle scheduled: source={d} callback=0x{x} data=0x{x} tag={s} handoff={s} step={d} scheduling_thread=0x{x} scheduling_rip=0x{x} ui_context={} pending={d}\n",
+            .{ source, function, data, tag, @tagName(handoff_mode), self.executed_steps, scheduling_owner.thread, scheduling_owner.rip, self.cooperative_ui_context != null, self.cached_pending_idle },
         );
         self.logThreadTable("GTK idle scheduled");
         return source;
@@ -861,6 +890,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         const scheduled_step = entry.scheduled_step;
         const scheduling_thread = entry.scheduling_thread;
         const scheduling_rip = entry.scheduling_rip;
+        const handoff_mode: scheduler.UiHandoffCompletionMode = if (entry.completion_rendezvous) .rendezvous else .detached;
         entry.* = .{};
         updateCachedPendingIdle(self, -1);
         self.regs = context.regs;
@@ -883,7 +913,7 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
         self.active_idle_callback = function;
         self.active_idle_started_step = self.executed_steps;
         self.idle_started +|= 1;
-        self.ui_handoff.beginDispatch(
+        self.ui_handoff.beginDispatchWithMode(
             source,
             function,
             scheduling_thread,
@@ -892,11 +922,12 @@ pub fn startNextIdleCallback(self: anytype, reason: []const u8, active_already_s
             self.active_guest_thread,
             self.regs.rip,
             self.executed_steps,
+            handoff_mode,
         );
         self.cooperative_thread_switches +|= 1;
         machoCapturePrint(
-            "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
-            .{ source, function, data, tag, reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingIdleCallbackCount() },
+            "macho-processor: GTK idle dispatch start: source={d} callback=0x{x} data=0x{x} tag={s} handoff={s} reason={s} queue_age_steps={d} scheduling_thread=0x{x} scheduling_rip=0x{x} pending={d}\n",
+            .{ source, function, data, tag, @tagName(handoff_mode), reason, self.executed_steps -| scheduled_step, scheduling_thread, scheduling_rip, self.pendingIdleCallbackCount() },
         );
         self.logThreadTable("GTK idle callback started");
         return true;
@@ -1109,16 +1140,17 @@ pub fn restoreMainLoopCaller(self: anytype, reason: []const u8) void {
 pub fn logCooperativeSchedulerSummary(self: anytype) void {
     if (self.cooperative_thread_switches == 0 and self.cooperative_wait_yields == 0) return;
     machoCapturePrint(
-        "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/rotated_without_dispatch/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} ui_handoff_completions_abandoned={d}\n",
-        .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.idle_scheduled, self.idle_started, self.idle_completed, self.idle_removed, self.pendingIdleCallbackCount(), self.idle_wakeups, self.idle_wakes_without_dispatch, self.idle_dispatch_failures, self.idle_starvation_warnings, self.ui_handoff.completions_abandoned },
+        "macho-processor: cooperative scheduler: switches={d} returns={d} wait_yields={d} sleep_yields={d} quantum_yields={d} runnable_rotations={d} resumes(preserved/wait_override)={d}/{d} self_resumes={d} clock(execution_ticks/execution_ns/quiescence_recoveries/quiescence_ticks/quiescence_ns)={d}/{d}/{d}/{d}/{d} runnable_starvation_warnings={d} suspended={d} active=0x{x} gtk_idle(scheduled/started/completed/removed/pending/wakeups/rotated_without_dispatch/dispatch_failures/starvation_warnings)={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} ui_handoff_completions(resumed/abandoned/detached)={d}/{d}/{d}\n",
+        .{ self.cooperative_thread_switches, self.cooperative_thread_returns, self.cooperative_wait_yields, self.cooperative_sleep_yields, self.cooperative_quantum_yields, self.cooperative_rotation_yields, self.cooperative_preserved_register_resumes, self.cooperative_wait_result_resumes, self.cooperative_self_resumes, self.guest_time.execution_advances, self.guest_time.execution_advanced_ns, self.cooperative_quiescence_recoveries, self.guest_time.quiescence_advances, self.guest_time.quiescence_advanced_ns, self.cooperative_starvation_warnings, self.suspended_guest_thread_count, self.active_guest_thread, self.idle_scheduled, self.idle_started, self.idle_completed, self.idle_removed, self.pendingIdleCallbackCount(), self.idle_wakeups, self.idle_wakes_without_dispatch, self.idle_dispatch_failures, self.idle_starvation_warnings, self.ui_handoff.completions_resumed, self.ui_handoff.completions_abandoned, self.ui_handoff.completions_detached },
     );
     machoCapturePrint(
-        "macho-processor: UI COMPLETION OWNERSHIP: total={d} terminal(resumed/abandoned/inherited_abandonment/ownerless)={d}/{d}/{d}/{d} pending={d} invariant={s}; inherited abandonment is an intentional terminal disposition, not a missing scheduling-thread resolution\n",
+        "macho-processor: UI COMPLETION OWNERSHIP: total={d} terminal(resumed/abandoned/inherited_abandonment/detached/ownerless)={d}/{d}/{d}/{d}/{d} pending={d} invariant={s}; detached is the asynchronous GTK disposition, while rendezvous ownership remains strict\n",
         .{
             self.ui_handoff.completions_total,
             self.ui_handoff.completions_resumed,
             self.ui_handoff.completions_abandoned,
             self.ui_handoff.completions_inherited_abandonment,
+            self.ui_handoff.completions_detached,
             self.ui_handoff.completions_ownerless,
             self.ui_handoff.pendingCompletions(),
             if (self.ui_handoff.terminalInvariantHolds()) "YES" else "NO",
@@ -1193,6 +1225,7 @@ pub fn logCooperativeHeartbeat(self: anytype) void {
             .rip = self.regs.rip,
             .generation = self.ui_handoff.generation,
             .phase = self.ui_handoff.phase,
+            .completion_mode = self.ui_handoff.completion_mode,
             .source_id = self.ui_handoff.source_id,
             .callback_handle = self.ui_handoff.callback_handle,
             .callback_rip = self.ui_handoff.callback_rip,
@@ -1280,13 +1313,13 @@ pub fn dumpUiHandoffTrace(self: anytype) void {
         const idx = (start + i) % 5;
         const e = &self.ui_handoff_entries[idx];
         machoCapturePrint(
-            "  [{d}] step={d} rip=0x{x} generation={d} phase={s} source={d} callback=0x{x}/0x{x} worker=0x{x}/0x{x} no_progress={d} suspend/resume/slices={d}/{d}/{d}\n",
+            "  [{d}] step={d} rip=0x{x} generation={d} phase={s} handoff={s} source={d} callback=0x{x}/0x{x} worker=0x{x}/0x{x} no_progress={d} suspend/resume/slices={d}/{d}/{d}\n",
             .{
-                i,                 e.step,            e.rip,
-                e.generation,      @tagName(e.phase), e.source_id,
-                e.callback_handle, e.callback_rip,    e.worker_handle,
-                e.worker_rip,      e.no_progress,     e.suspensions,
-                e.resumes,         e.worker_slices,
+                i,               e.step,            e.rip,
+                e.generation,    @tagName(e.phase), @tagName(e.completion_mode),
+                e.source_id,     e.callback_handle, e.callback_rip,
+                e.worker_handle, e.worker_rip,      e.no_progress,
+                e.suspensions,   e.resumes,         e.worker_slices,
             },
         );
     }

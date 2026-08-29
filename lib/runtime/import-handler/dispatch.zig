@@ -22,6 +22,7 @@ const guest_assertion_recovery = @import("guest_abi").guest_assertion_recovery;
 const cpp_allocation = @import("guest_abi").cpp_allocation;
 const libcpp_thread = @import("guest_abi").libcpp_thread;
 const sdl_runtime = @import("guest_abi").sdl_runtime;
+const native_window_runtime = @import("guest_abi").native_window_runtime;
 const spirv_cross_diagnostics = @import("diagnostics").spirv_cross_diagnostics;
 const x64_backend_diagnostics = @import("diagnostics").x64_backend_diagnostics;
 const symbol_assembly_context = macho_core.symbol_assembly_context;
@@ -77,6 +78,17 @@ fn pthreadExitIsThreadLocal(cooperative_ui_active: bool, active_thread: u64) boo
 /// `regs.rip` is the synthetic import thunk while dispatch is active, which
 /// made every invalid free appear to come from the same 0xfffffc... address.
 /// The saved return address identifies the actual C++ owner/destructor.
+/// Which domain an Objective-C message into Rosette's window came from.
+///
+/// Every one of them arrives through translated x86 executing the emulator's
+/// own host code, so `xenia_host` is the honest attribution; the guest title
+/// never issues an `objc_msgSend` itself. Naming it rather than defaulting to
+/// `unknown` matters because `unknown` is refused for everything, which would
+/// turn the whole surface into a fault the first time it was consulted.
+fn windowActorForObjc() native_window_runtime.Actor {
+    return .xenia_host;
+}
+
 fn importCallerAddress(self: anytype) u64 {
     if (self.regs.rsp == 0 or self.guestMemoryConst(self.regs.rsp, @sizeOf(u64)) == null) {
         return self.regs.rip;
@@ -230,6 +242,7 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if (self.sdl.dispatch(self, name)) |resolution| {
         self.resolving_import_route = .sdl_compat;
         self.import_confidence_override = .modeled;
+        noteSdlGraphicsImport(self, name);
         return sdlResolution(resolution);
     }
     if (self.main_loop_type == .gtk) {
@@ -399,20 +412,60 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
     if ((name_hash == importNameHash("_objc_msgSend") and std.mem.eql(u8, name, "_objc_msgSend"))) {
         const selector_name = self.compat.selectorName(self.regs.rsi);
         const class_name = self.compat.className(self.regs.rdi);
-        if (self.native_window.handleObjcMessage(
+        switch (self.native_window.handleObjcMessage(
             class_name,
             self.regs.rdi,
             selector_name,
             self.regs.rdx,
-        )) |native_result| {
-            if (native_result.value >= 0xFFFF_0000_0000_0000) {
-                self.registerNativeWindowHandles();
-            }
-            machoCapturePrint(
-                "    [objc/native] msgSend receiver=0x{x} class={s} selector={s} argument=0x{x} -> 0x{x} action={s}\n",
-                .{ self.regs.rdi, class_name, selector_name, self.regs.rdx, native_result.value, native_result.action },
-            );
-            return .{ .handled = native_result.value };
+        )) {
+            .handled => |native_result| {
+                // Recorded even when it succeeds. The admission ledger is the
+                // window's account of who touched it, and an account that holds
+                // only the failures cannot say what a healthy run looks like.
+                const outcome = self.admitWindowForwarding(
+                    windowActorForObjc(),
+                    native_result.binding.facility,
+                    native_result.binding.operation,
+                    selector_name,
+                );
+                // The action has already happened by the time this returns, so
+                // an ordering refusal cannot retract it — recording it and then
+                // answering `unsupported` would be a lie about what the window
+                // did. An unaccountable verdict is different: it says the
+                // forwarding should never have been performed at all, and the
+                // fault policy stops the run at it.
+                // Printed before the fault, not after. A fault raises SIGSEGV
+                // and never returns, so a trace line placed below it is a line
+                // the one run that needed it never gets.
+                machoCapturePrint(
+                    "    [objc/native] msgSend receiver=0x{x} class={s} selector={s} argument=0x{x} -> 0x{x} action={s} admission={s}\n",
+                    .{ self.regs.rdi, class_name, selector_name, self.regs.rdx, native_result.value, native_result.action, outcome.decision.verdict.label() },
+                );
+                if (outcome.disposition == .fault) self.faultOnWindowAdmission(outcome);
+                if (native_result.value >= 0xFFFF_0000_0000_0000) {
+                    self.registerNativeWindowHandles();
+                }
+                return .{ .handled = native_result.value };
+            },
+            .unrecognized => |binding| {
+                // Addressed to an identity Rosette's window owns. The generic
+                // Objective-C model must not answer for it: that model has no
+                // idea what this window is, and a plausible reply here is how a
+                // forwarding Rosette never implemented ends up looking handled.
+                const outcome = self.admitWindowForwarding(
+                    windowActorForObjc(),
+                    binding.facility,
+                    binding.operation,
+                    selector_name,
+                );
+                machoCapturePrint(
+                    "    [objc/native] msgSend REFUSED receiver=0x{x} class={s} selector={s} argument=0x{x} verdict={s} disposition={s}; this identity is Rosette's window and nothing else may answer for it. If this selector is one Xenia legitimately sends, substantiate it in native_window_runtime.handleObjcMessage rather than letting the generic model answer for an object it does not own\n",
+                    .{ self.regs.rdi, class_name, selector_name, self.regs.rdx, outcome.decision.verdict.label(), outcome.disposition.label() },
+                );
+                if (outcome.disposition == .fault) self.faultOnWindowAdmission(outcome);
+                if (outcome.disposition != .admit) return .{ .unsupported = 0 };
+            },
+            .foreign => {},
         }
         const result = self.compat.sendMessage(self.regs.rdi, self.regs.rsi);
         if (result.value >= 0xFFFF_0000_0000_0000) self.registerOpaqueHandle(result.value, "Objective-C object identity");
@@ -1610,143 +1663,13 @@ pub fn handleImportSlow(self: anytype, imported: macho_metadata.ImportedSymbol) 
         return .{ .handled = 0 };
     }
 
-    if ((name_hash == importNameHash("_open") and std.mem.eql(u8, name, "_open"))) {
-        const path = self.guestCString(self.regs.rdi, 4096) orelse "";
-        const result = self.fs_forwarder.open(self);
-        self.noteProfileAccountOpen(path, result);
-        return .{ .handled = result };
-    }
-    if ((name_hash == importNameHash("_write") and std.mem.eql(u8, name, "_write"))) {
-        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.write(self))) };
-    }
-    if ((name_hash == importNameHash("_close") and std.mem.eql(u8, name, "_close"))) {
-        return .{ .handled = self.fs_forwarder.close(self) };
-    }
-    if ((name_hash == importNameHash("_fstatat$INODE64") and std.mem.eql(u8, name, "_fstatat$INODE64")) or (name_hash == importNameHash("_fstatat") and std.mem.eql(u8, name, "_fstatat"))) {
-        return .{ .handled = self.fs_forwarder.fstatat(self) };
-    }
-    if ((name_hash == importNameHash("_openat") and std.mem.eql(u8, name, "_openat"))) {
-        const path = self.guestCString(self.regs.rsi, 4096) orelse "";
-        const result = self.fs_forwarder.openat(self);
-        self.noteProfileAccountOpen(path, result);
-        return .{ .handled = result };
-    }
-    if ((name_hash == importNameHash("_fstat$INODE64") and std.mem.eql(u8, name, "_fstat$INODE64")) or (name_hash == importNameHash("_fstat") and std.mem.eql(u8, name, "_fstat"))) {
-        return .{ .handled = self.fs_forwarder.fstat(self) };
-    }
-    if ((name_hash == importNameHash("_ftruncate") and std.mem.eql(u8, name, "_ftruncate")) or (name_hash == importNameHash("_ftruncate64") and std.mem.eql(u8, name, "_ftruncate64"))) {
-        return .{ .handled = self.fs_forwarder.ftruncate(self) };
-    }
-    if ((name_hash == importNameHash("_shm_open") and std.mem.eql(u8, name, "_shm_open"))) {
-        return .{ .handled = self.fs_forwarder.shmOpen(self) };
-    }
-    if ((name_hash == importNameHash("_shm_unlink") and std.mem.eql(u8, name, "_shm_unlink"))) {
-        return .{ .handled = self.fs_forwarder.shmUnlink(self) };
-    }
-    if ((name_hash == importNameHash("_opendir$INODE64") and std.mem.eql(u8, name, "_opendir$INODE64")) or (name_hash == importNameHash("_opendir") and std.mem.eql(u8, name, "_opendir"))) {
-        return .{ .handled = self.fs_forwarder.opendir(self) };
-    }
-    if ((name_hash == importNameHash("_dirfd") and std.mem.eql(u8, name, "_dirfd"))) {
-        return .{ .handled = self.fs_forwarder.dirfd(self) };
-    }
-    if ((name_hash == importNameHash("_closedir") and std.mem.eql(u8, name, "_closedir"))) {
-        return .{ .handled = self.fs_forwarder.closedir(self) };
-    }
-    if ((name_hash == importNameHash("_readdir$INODE64") and std.mem.eql(u8, name, "_readdir$INODE64")) or (name_hash == importNameHash("_readdir") and std.mem.eql(u8, name, "_readdir"))) {
-        return .{ .handled = self.fs_forwarder.readdir(self) };
-    }
-    if ((name_hash == importNameHash("_read") and std.mem.eql(u8, name, "_read"))) {
-        const guest_fd = self.regs.rdi;
-        const requested = self.regs.rdx;
-        const result = self.fs_forwarder.read(self);
-        self.noteProfileAccountRead(guest_fd, requested, result, 0);
-        return .{ .handled = @bitCast(result) };
-    }
-    if ((name_hash == importNameHash("_readv") and std.mem.eql(u8, name, "_readv"))) {
-        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readv(self))) };
-    }
-    if ((name_hash == importNameHash("_writev") and std.mem.eql(u8, name, "_writev"))) {
-        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.writev(self))) };
-    }
-    if ((name_hash == importNameHash("_pread$INODE64") and std.mem.eql(u8, name, "_pread$INODE64")) or (name_hash == importNameHash("_pread") and std.mem.eql(u8, name, "_pread"))) {
-        const guest_fd = self.regs.rdi;
-        const requested = self.regs.rdx;
-        const offset = self.regs.rcx;
-        const result = self.fs_forwarder.pread(self);
-        self.noteProfileAccountRead(guest_fd, requested, result, offset);
-        return .{ .handled = @bitCast(result) };
-    }
-    if ((name_hash == importNameHash("_pwrite$INODE64") and std.mem.eql(u8, name, "_pwrite$INODE64")) or (name_hash == importNameHash("_pwrite") and std.mem.eql(u8, name, "_pwrite"))) {
-        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.pwrite(self))) };
-    }
-    if ((name_hash == importNameHash("_lseek$INODE64") and std.mem.eql(u8, name, "_lseek$INODE64")) or (name_hash == importNameHash("_lseek") and std.mem.eql(u8, name, "_lseek"))) {
-        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.lseek(self))) };
-    }
-    if ((name_hash == importNameHash("_stat$INODE64") and std.mem.eql(u8, name, "_stat$INODE64")) or (name_hash == importNameHash("_stat") and std.mem.eql(u8, name, "_stat"))) {
-        return .{ .handled = self.fs_forwarder.stat(self) };
-    }
-    if ((name_hash == importNameHash("_lstat$INODE64") and std.mem.eql(u8, name, "_lstat$INODE64")) or (name_hash == importNameHash("_lstat") and std.mem.eql(u8, name, "_lstat"))) {
-        return .{ .handled = self.fs_forwarder.lstat(self) };
-    }
-    if ((name_hash == importNameHash("_access") and std.mem.eql(u8, name, "_access")) or (name_hash == importNameHash("_access$INODE64") and std.mem.eql(u8, name, "_access$INODE64"))) {
-        return .{ .handled = self.fs_forwarder.access(self) };
-    }
-    if ((name_hash == importNameHash("_realpath$INODE64") and std.mem.eql(u8, name, "_realpath$INODE64")) or (name_hash == importNameHash("_realpath") and std.mem.eql(u8, name, "_realpath"))) {
-        return .{ .handled = self.fs_forwarder.realpath(self) };
-    }
-    if ((name_hash == importNameHash("_getcwd") and std.mem.eql(u8, name, "_getcwd"))) {
-        return .{ .handled = self.fs_forwarder.getcwd(self) };
-    }
-    if ((name_hash == importNameHash("_chdir") and std.mem.eql(u8, name, "_chdir"))) {
-        return .{ .handled = self.fs_forwarder.chdir(self) };
-    }
-    if ((name_hash == importNameHash("_readlink$INODE64") and std.mem.eql(u8, name, "_readlink$INODE64")) or (name_hash == importNameHash("_readlink") and std.mem.eql(u8, name, "_readlink"))) {
-        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readlink(self))) };
-    }
-    if ((name_hash == importNameHash("_dup") and std.mem.eql(u8, name, "_dup"))) {
-        return .{ .handled = self.fs_forwarder.dup(self) };
-    }
-    if ((name_hash == importNameHash("_dup2") and std.mem.eql(u8, name, "_dup2"))) {
-        return .{ .handled = self.fs_forwarder.dup2(self) };
-    }
-    if ((name_hash == importNameHash("_fcntl") and std.mem.eql(u8, name, "_fcntl"))) {
-        return .{ .handled = self.fs_forwarder.fcntl(self) };
-    }
-    if ((name_hash == importNameHash("_socket") and std.mem.eql(u8, name, "_socket"))) {
-        return .{ .handled = self.fs_forwarder.createSocket(self) };
-    }
-    if ((name_hash == importNameHash("_setsockopt") and std.mem.eql(u8, name, "_setsockopt"))) {
-        return .{ .handled = self.fs_forwarder.setSocketOption(self) };
-    }
-    if ((name_hash == importNameHash("_connect") and std.mem.eql(u8, name, "_connect"))) {
-        return .{ .handled = self.fs_forwarder.connectSocket(self) };
-    }
-    if ((name_hash == importNameHash("_send") and std.mem.eql(u8, name, "_send"))) {
-        return .{ .handled = self.fs_forwarder.sendSocket(self) };
-    }
-    if ((name_hash == importNameHash("_pipe") and std.mem.eql(u8, name, "_pipe"))) {
-        return .{ .handled = self.fs_forwarder.pipe(self) };
-    }
-    if ((name_hash == importNameHash("_mkdir") and std.mem.eql(u8, name, "_mkdir")) or (name_hash == importNameHash("_mkdir$INODE64") and std.mem.eql(u8, name, "_mkdir$INODE64"))) {
-        return .{ .handled = self.fs_forwarder.mkdir(self) };
-    }
-    if ((name_hash == importNameHash("_unlink") and std.mem.eql(u8, name, "_unlink")) or (name_hash == importNameHash("_unlink$INODE64") and std.mem.eql(u8, name, "_unlink$INODE64"))) {
-        return .{ .handled = self.fs_forwarder.unlink(self) };
-    }
-    if ((name_hash == importNameHash("_rename") and std.mem.eql(u8, name, "_rename")) or (name_hash == importNameHash("_rename$INODE64") and std.mem.eql(u8, name, "_rename$INODE64"))) {
-        return .{ .handled = self.fs_forwarder.rename(self) };
-    }
-    if ((name_hash == importNameHash("_symlink") and std.mem.eql(u8, name, "_symlink")) or (name_hash == importNameHash("_symlink$INODE64") and std.mem.eql(u8, name, "_symlink$INODE64"))) {
-        return .{ .handled = self.fs_forwarder.symlink(self) };
-    }
-    if ((name_hash == importNameHash("_mmap") and std.mem.eql(u8, name, "_mmap"))) {
-        return .{ .handled = self.fs_forwarder.mmap(self) };
-    }
-    if ((name_hash == importNameHash("_munmap") and std.mem.eql(u8, name, "_munmap"))) {
-        return .{ .handled = self.fs_forwarder.munmap(self) };
-    }
-    if ((name_hash == importNameHash("_mprotect") and std.mem.eql(u8, name, "_mprotect"))) {
-        return .{ .handled = self.fs_forwarder.mprotect(self) };
+    // S4 (perf audit): the fs_forwarder family gets its own route so a
+    // cached hit jumps straight here instead of re-running the ~120-name
+    // chain. The dispatch must return null for a non-fs name — this call sits
+    // inside handleImportSlow, which still has names after it.
+    if (dispatchFsForwarder(self, name)) |result| {
+        self.resolving_import_route = .fs_forwarder;
+        return result;
     }
     if (std.mem.endsWith(u8, name, "_fopen")) {
         return .{ .handled = self.handleFopen() orelse 0 };
@@ -2080,6 +2003,156 @@ pub fn classicLocale(self: anytype) u64 {
     return object;
 }
 
+/// S4 (perf audit): the filesystem-forwarder family — `_open`, `_read`,
+/// `_write`, `_stat`, `_mmap`, ... — extracted from `handleImportSlow` so the
+/// route cache can replay it directly instead of re-running the ~120-name
+/// compare chain on every hit. Returns null when `name` is not in the family;
+/// the caller (either `handleImportSlow` or `dispatchImportRoute`) falls
+/// through to the rest of the chain. This must stay byte-for-byte equivalent
+/// to the inline block it replaced.
+pub fn dispatchFsForwarder(self: anytype, name: []const u8) ?ImportHandlerResult {
+    const name_hash = importNameHash(name);
+    if ((name_hash == importNameHash("_open") and std.mem.eql(u8, name, "_open"))) {
+        const path = self.guestCString(self.regs.rdi, 4096) orelse "";
+        const result = self.fs_forwarder.open(self);
+        self.noteProfileAccountOpen(path, result);
+        return .{ .handled = result };
+    }
+    if ((name_hash == importNameHash("_write") and std.mem.eql(u8, name, "_write"))) {
+        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.write(self))) };
+    }
+    if ((name_hash == importNameHash("_close") and std.mem.eql(u8, name, "_close"))) {
+        return .{ .handled = self.fs_forwarder.close(self) };
+    }
+    if ((name_hash == importNameHash("_fstatat$INODE64") and std.mem.eql(u8, name, "_fstatat$INODE64")) or (name_hash == importNameHash("_fstatat") and std.mem.eql(u8, name, "_fstatat"))) {
+        return .{ .handled = self.fs_forwarder.fstatat(self) };
+    }
+    if ((name_hash == importNameHash("_openat") and std.mem.eql(u8, name, "_openat"))) {
+        const path = self.guestCString(self.regs.rsi, 4096) orelse "";
+        const result = self.fs_forwarder.openat(self);
+        self.noteProfileAccountOpen(path, result);
+        return .{ .handled = result };
+    }
+    if ((name_hash == importNameHash("_fstat$INODE64") and std.mem.eql(u8, name, "_fstat$INODE64")) or (name_hash == importNameHash("_fstat") and std.mem.eql(u8, name, "_fstat"))) {
+        return .{ .handled = self.fs_forwarder.fstat(self) };
+    }
+    if ((name_hash == importNameHash("_ftruncate") and std.mem.eql(u8, name, "_ftruncate")) or (name_hash == importNameHash("_ftruncate64") and std.mem.eql(u8, name, "_ftruncate64"))) {
+        return .{ .handled = self.fs_forwarder.ftruncate(self) };
+    }
+    if ((name_hash == importNameHash("_shm_open") and std.mem.eql(u8, name, "_shm_open"))) {
+        return .{ .handled = self.fs_forwarder.shmOpen(self) };
+    }
+    if ((name_hash == importNameHash("_shm_unlink") and std.mem.eql(u8, name, "_shm_unlink"))) {
+        return .{ .handled = self.fs_forwarder.shmUnlink(self) };
+    }
+    if ((name_hash == importNameHash("_opendir$INODE64") and std.mem.eql(u8, name, "_opendir$INODE64")) or (name_hash == importNameHash("_opendir") and std.mem.eql(u8, name, "_opendir"))) {
+        return .{ .handled = self.fs_forwarder.opendir(self) };
+    }
+    if ((name_hash == importNameHash("_dirfd") and std.mem.eql(u8, name, "_dirfd"))) {
+        return .{ .handled = self.fs_forwarder.dirfd(self) };
+    }
+    if ((name_hash == importNameHash("_closedir") and std.mem.eql(u8, name, "_closedir"))) {
+        return .{ .handled = self.fs_forwarder.closedir(self) };
+    }
+    if ((name_hash == importNameHash("_readdir$INODE64") and std.mem.eql(u8, name, "_readdir$INODE64")) or (name_hash == importNameHash("_readdir") and std.mem.eql(u8, name, "_readdir"))) {
+        return .{ .handled = self.fs_forwarder.readdir(self) };
+    }
+    if ((name_hash == importNameHash("_read") and std.mem.eql(u8, name, "_read"))) {
+        const guest_fd = self.regs.rdi;
+        const requested = self.regs.rdx;
+        const result = self.fs_forwarder.read(self);
+        self.noteProfileAccountRead(guest_fd, requested, result, 0);
+        return .{ .handled = @bitCast(result) };
+    }
+    if ((name_hash == importNameHash("_readv") and std.mem.eql(u8, name, "_readv"))) {
+        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readv(self))) };
+    }
+    if ((name_hash == importNameHash("_writev") and std.mem.eql(u8, name, "_writev"))) {
+        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.writev(self))) };
+    }
+    if ((name_hash == importNameHash("_pread$INODE64") and std.mem.eql(u8, name, "_pread$INODE64")) or (name_hash == importNameHash("_pread") and std.mem.eql(u8, name, "_pread"))) {
+        const guest_fd = self.regs.rdi;
+        const requested = self.regs.rdx;
+        const offset = self.regs.rcx;
+        const result = self.fs_forwarder.pread(self);
+        self.noteProfileAccountRead(guest_fd, requested, result, offset);
+        return .{ .handled = @bitCast(result) };
+    }
+    if ((name_hash == importNameHash("_pwrite$INODE64") and std.mem.eql(u8, name, "_pwrite$INODE64")) or (name_hash == importNameHash("_pwrite") and std.mem.eql(u8, name, "_pwrite"))) {
+        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.pwrite(self))) };
+    }
+    if ((name_hash == importNameHash("_lseek$INODE64") and std.mem.eql(u8, name, "_lseek$INODE64")) or (name_hash == importNameHash("_lseek") and std.mem.eql(u8, name, "_lseek"))) {
+        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.lseek(self))) };
+    }
+    if ((name_hash == importNameHash("_stat$INODE64") and std.mem.eql(u8, name, "_stat$INODE64")) or (name_hash == importNameHash("_stat") and std.mem.eql(u8, name, "_stat"))) {
+        return .{ .handled = self.fs_forwarder.stat(self) };
+    }
+    if ((name_hash == importNameHash("_lstat$INODE64") and std.mem.eql(u8, name, "_lstat$INODE64")) or (name_hash == importNameHash("_lstat") and std.mem.eql(u8, name, "_lstat"))) {
+        return .{ .handled = self.fs_forwarder.lstat(self) };
+    }
+    if ((name_hash == importNameHash("_access") and std.mem.eql(u8, name, "_access")) or (name_hash == importNameHash("_access$INODE64") and std.mem.eql(u8, name, "_access$INODE64"))) {
+        return .{ .handled = self.fs_forwarder.access(self) };
+    }
+    if ((name_hash == importNameHash("_realpath$INODE64") and std.mem.eql(u8, name, "_realpath$INODE64")) or (name_hash == importNameHash("_realpath") and std.mem.eql(u8, name, "_realpath"))) {
+        return .{ .handled = self.fs_forwarder.realpath(self) };
+    }
+    if ((name_hash == importNameHash("_getcwd") and std.mem.eql(u8, name, "_getcwd"))) {
+        return .{ .handled = self.fs_forwarder.getcwd(self) };
+    }
+    if ((name_hash == importNameHash("_chdir") and std.mem.eql(u8, name, "_chdir"))) {
+        return .{ .handled = self.fs_forwarder.chdir(self) };
+    }
+    if ((name_hash == importNameHash("_readlink$INODE64") and std.mem.eql(u8, name, "_readlink$INODE64")) or (name_hash == importNameHash("_readlink") and std.mem.eql(u8, name, "_readlink"))) {
+        return .{ .handled = @bitCast(@as(i64, self.fs_forwarder.readlink(self))) };
+    }
+    if ((name_hash == importNameHash("_dup") and std.mem.eql(u8, name, "_dup"))) {
+        return .{ .handled = self.fs_forwarder.dup(self) };
+    }
+    if ((name_hash == importNameHash("_dup2") and std.mem.eql(u8, name, "_dup2"))) {
+        return .{ .handled = self.fs_forwarder.dup2(self) };
+    }
+    if ((name_hash == importNameHash("_fcntl") and std.mem.eql(u8, name, "_fcntl"))) {
+        return .{ .handled = self.fs_forwarder.fcntl(self) };
+    }
+    if ((name_hash == importNameHash("_socket") and std.mem.eql(u8, name, "_socket"))) {
+        return .{ .handled = self.fs_forwarder.createSocket(self) };
+    }
+    if ((name_hash == importNameHash("_setsockopt") and std.mem.eql(u8, name, "_setsockopt"))) {
+        return .{ .handled = self.fs_forwarder.setSocketOption(self) };
+    }
+    if ((name_hash == importNameHash("_connect") and std.mem.eql(u8, name, "_connect"))) {
+        return .{ .handled = self.fs_forwarder.connectSocket(self) };
+    }
+    if ((name_hash == importNameHash("_send") and std.mem.eql(u8, name, "_send"))) {
+        return .{ .handled = self.fs_forwarder.sendSocket(self) };
+    }
+    if ((name_hash == importNameHash("_pipe") and std.mem.eql(u8, name, "_pipe"))) {
+        return .{ .handled = self.fs_forwarder.pipe(self) };
+    }
+    if ((name_hash == importNameHash("_mkdir") and std.mem.eql(u8, name, "_mkdir")) or (name_hash == importNameHash("_mkdir$INODE64") and std.mem.eql(u8, name, "_mkdir$INODE64"))) {
+        return .{ .handled = self.fs_forwarder.mkdir(self) };
+    }
+    if ((name_hash == importNameHash("_unlink") and std.mem.eql(u8, name, "_unlink")) or (name_hash == importNameHash("_unlink$INODE64") and std.mem.eql(u8, name, "_unlink$INODE64"))) {
+        return .{ .handled = self.fs_forwarder.unlink(self) };
+    }
+    if ((name_hash == importNameHash("_rename") and std.mem.eql(u8, name, "_rename")) or (name_hash == importNameHash("_rename$INODE64") and std.mem.eql(u8, name, "_rename$INODE64"))) {
+        return .{ .handled = self.fs_forwarder.rename(self) };
+    }
+    if ((name_hash == importNameHash("_symlink") and std.mem.eql(u8, name, "_symlink")) or (name_hash == importNameHash("_symlink$INODE64") and std.mem.eql(u8, name, "_symlink$INODE64"))) {
+        return .{ .handled = self.fs_forwarder.symlink(self) };
+    }
+    if ((name_hash == importNameHash("_mmap") and std.mem.eql(u8, name, "_mmap"))) {
+        return .{ .handled = self.fs_forwarder.mmap(self) };
+    }
+    if ((name_hash == importNameHash("_munmap") and std.mem.eql(u8, name, "_munmap"))) {
+        return .{ .handled = self.fs_forwarder.munmap(self) };
+    }
+    if ((name_hash == importNameHash("_mprotect") and std.mem.eql(u8, name, "_mprotect"))) {
+        return .{ .handled = self.fs_forwarder.mprotect(self) };
+    }
+    return null;
+}
+
 pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_metadata.ImportedSymbol) ?ImportHandlerResult {
     const name = imported.name;
     return switch (route) {
@@ -2125,6 +2198,7 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
         .sdl_compat => blk: {
             const resolution = self.sdl.dispatch(self, name) orelse break :blk null;
             self.import_confidence_override = .modeled;
+            noteSdlGraphicsImport(self, name);
             break :blk sdlResolution(resolution);
         },
         .local_definition => blk: {
@@ -2221,6 +2295,7 @@ pub fn dispatchImportRoute(self: anytype, route: ImportRoute, imported: macho_me
         .chkstk => .{ .handled = self.regs.rax },
         .sysconf => .{ .handled = guestSysconf(@bitCast(@as(u32, @truncate(self.regs.rdi)))) },
         .strtoul => handleImportSlow(self, imported),
+        .fs_forwarder => dispatchFsForwarder(self, name),
     };
 }
 
@@ -2229,6 +2304,11 @@ fn sdlResolution(resolution: sdl_runtime.Resolution) ImportHandlerResult {
         .handled => |value| .{ .handled = value },
         .handled_void => .handled_void,
     };
+}
+
+fn noteSdlGraphicsImport(self: anytype, name: []const u8) void {
+    const State = @typeInfo(@TypeOf(self)).pointer.child;
+    if (@hasDecl(State, "observeSdlGraphicsImport")) self.observeSdlGraphicsImport(name);
 }
 
 /// `pthread_once`: run the initializer exactly once by transferring control to

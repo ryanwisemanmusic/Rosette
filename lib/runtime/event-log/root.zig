@@ -15,6 +15,17 @@ pub const Kind = el.Kind;
 pub const Event = el.Event;
 pub const Logger = el.Logger;
 
+// The asynchronous diagnostic transport. Installed by the process rather than
+// imported here: the ring lives in the diagnostics module, which depends on
+// this one, so a direct import would be a cycle.
+pub const OfferFn = el.OfferFn;
+pub const FlushFn = el.FlushFn;
+pub const ClassifyFn = el.ClassifyFn;
+pub const installAsyncTransport = el.installAsyncTransport;
+pub const clearAsyncTransport = el.clearAsyncTransport;
+pub const asyncTransportInstalled = el.asyncTransportInstalled;
+pub const flushAsyncTransport = el.flushAsyncTransport;
+
 test {
     _ = el;
 }

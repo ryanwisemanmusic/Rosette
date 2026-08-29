@@ -111,6 +111,10 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
         .decode_cache_stale_rejections = self.decode_cache_stale_rejections,
         .decode_cache_vacant_misses = self.decode_cache_vacant_misses,
         .decode_cache_conflict_misses = self.decode_cache_conflict_misses,
+        .decode_cache_cold_eviction_misses = self.decode_cache_cold_eviction_misses,
+        .decode_cache_victim_hits = self.decode_cache_victim_hits,
+        .decode_cache_victim_fills = self.decode_cache_victim_fills,
+        .decode_cache_victim_stale_rejections = self.decode_cache_victim_stale_rejections,
         .code_generation = self.code_generation,
         .import_route_cache_hits = self.import_route_cache_hits,
         .import_route_cache_misses = self.import_route_cache_misses,
@@ -133,6 +137,10 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
     // compulsory/first-touch. A conflict fill evicted live reusable work.
     const decode_vacant = self.decode_cache_vacant_misses -| previous.decode_cache_vacant_misses;
     const decode_conflict = self.decode_cache_conflict_misses -| previous.decode_cache_conflict_misses;
+    const decode_cold = self.decode_cache_cold_eviction_misses -| previous.decode_cache_cold_eviction_misses;
+    const victim_hits = self.decode_cache_victim_hits -| previous.decode_cache_victim_hits;
+    const victim_fills = self.decode_cache_victim_fills -| previous.decode_cache_victim_fills;
+    const victim_stale = self.decode_cache_victim_stale_rejections -| previous.decode_cache_victim_stale_rejections;
     const decode_total = decode_hits + decode_misses;
     const decode_hit_rate = percentage(decode_hits, decode_total);
 
@@ -154,7 +162,8 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
 
     machoCapturePrint(
         "macho-processor: perf heartbeat: step={d} interval(steps/ms)={d}/{d} {d}steps/s" ++
-            " decode(hits/misses/stale)={d}/{d}/{d} hit_rate={d}% miss(vacant/conflict)={d}/{d} code_generation_bumps={d}" ++
+            " decode(hits/misses/stale)={d}/{d}/{d} hit_rate={d}% miss(vacant/conflict/cold)={d}/{d}/{d}" ++
+            " victim(hits/fills/stale)={d}/{d}/{d} code_generation_bumps={d}" ++
             " import(effective/slow/miss/fallback)={d}/{d}/{d}/{d} of {d} cleo_hits={d}\n",
         .{
             self.executed_steps,
@@ -167,6 +176,10 @@ pub fn logPerformanceHeartbeat(self: anytype) void {
             decode_hit_rate,
             decode_vacant,
             decode_conflict,
+            decode_cold,
+            victim_hits,
+            victim_fills,
+            victim_stale,
             generation_delta,
             import_effective,
             import_slow_hits,

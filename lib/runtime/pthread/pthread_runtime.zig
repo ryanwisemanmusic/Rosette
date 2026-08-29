@@ -76,6 +76,10 @@ pub const ThreadSnapshot = struct {
     joined: bool,
     cancelled: bool,
     blocked_since_step: u64,
+    /// Instruction boundary that entered the wait. A parked cooperative
+    /// context has no later instruction samples, so this is its wait-site
+    /// provenance.
+    blocked_rip: u64 = 0,
     blocked_reason: []const u8,
     waiting_condvar: u64,
     waiting_mutex: u64,
@@ -108,6 +112,7 @@ const Thread = struct {
     started: bool = false,
     state: ThreadState = .runnable,
     blocked_since_step: u64 = 0,
+    blocked_rip: u64 = 0,
     blocked_reason: []const u8 = "",
     /// The thread this one is joining, when it is. Recorded because a join
     /// that could not be honoured is a latent use-after-free, and the pair of
@@ -344,7 +349,7 @@ pub const Runtime = struct {
                 if (age > longest_block) longest_block = age;
             }
             machoCapturePrint(
-                "  thread handle=0x{x} id={d} state={s}{s} reason={s} waiting(mutex=0x{x} condvar=0x{x} address=0x{x}) generation={d}/{d} timed={} deadline={d} result={s} blocked_since_step={d} age_steps={d} start_routine=0x{x}\n",
+                "  thread handle=0x{x} id={d} state={s}{s} reason={s} waiting(mutex=0x{x} condvar=0x{x} address=0x{x}) generation={d}/{d} timed={} deadline={d} result={s} blocked_since_step={d} age_steps={d} blocked_rip=0x{x} start_routine=0x{x}\n",
                 .{
                     thread.handle,
                     thread.numeric_id,
@@ -361,6 +366,7 @@ pub const Runtime = struct {
                     @tagName(thread.wait_result),
                     thread.blocked_since_step,
                     if (parked) current_step -| thread.blocked_since_step else 0,
+                    thread.blocked_rip,
                     thread.start_routine,
                 },
             );
@@ -383,6 +389,34 @@ pub const Runtime = struct {
                     "some threads are running and some are parked; correlate the parked resources against the frontier before blaming a wait",
             },
         );
+    }
+
+    /// Threads parked with no reason recorded.
+    ///
+    /// A park Rosette cannot name is a hole in Rosette's model of the wait, not
+    /// a defect in the thread: every conclusion drawn from "this thread is
+    /// blocked" needs to know what it is blocked on, and an empty reason means
+    /// nobody can be asked. Counted separately from the census so the integrity
+    /// gate reads a number rather than parsing a line.
+    pub fn parksWithoutAReason(self: *const Runtime) u64 {
+        var count: u64 = 0;
+        for (&self.threads) |*thread| {
+            if (!thread.active) continue;
+            const parked = switch (thread.state) {
+                .waiting_mutex,
+                .waiting_condvar,
+                .waiting_semaphore,
+                .waiting_event,
+                .waiting_futex_address,
+                .waiting_join,
+                .sleeping_indefinitely,
+                .sleeping_until_deadline,
+                => true,
+                else => false,
+            };
+            if (parked and thread.blocked_reason.len == 0) count += 1;
+        }
+        return count;
     }
 
     /// The object whose waiters are most stuck, for a caller that can resolve
@@ -506,6 +540,7 @@ pub const Runtime = struct {
             .joined = thread.joined,
             .cancelled = thread.cancelled,
             .blocked_since_step = thread.blocked_since_step,
+            .blocked_rip = thread.blocked_rip,
             .blocked_reason = thread.blocked_reason,
             .waiting_condvar = thread.waiting_condvar,
             .waiting_mutex = thread.waiting_mutex,
@@ -660,6 +695,7 @@ pub const Runtime = struct {
             }
             waiting_thread.state = .waiting_condvar;
             waiting_thread.blocked_since_step = schedulerStep(state);
+            waiting_thread.blocked_rip = state.regs.rip;
             waiting_thread.blocked_reason = "pthread_cond_wait";
             waiting_thread.waiting_condvar = cond_addr;
             waiting_thread.waiting_mutex = mutex_addr;
@@ -672,6 +708,11 @@ pub const Runtime = struct {
             waiting_thread.spurious_wake_pending = false;
             if (self.threadSlot(handle)) |slot| {
                 self.waits.noteWait(cond_addr, slot, schedulerStep(state));
+                // S1 (audit): name the parked thread so the never-notified
+                // report can say *who* is waiting, not just how many. The
+                // handle is scheduler knowledge the graph cannot derive from
+                // a slot bitmask.
+                self.waits.noteWaiterIdentity(cond_addr, handle, state.regs.rip);
             }
             self.bumpStateVersion();
         }
@@ -779,6 +820,7 @@ pub const Runtime = struct {
         }
         thread.state = .runnable;
         thread.blocked_reason = "";
+        thread.blocked_rip = 0;
         thread.waiting_condvar = 0;
         thread.waiting_mutex = 0;
         if (completed_condvar != 0) {
@@ -1523,7 +1565,7 @@ test "C++ maximum time point is an indefinite wait, not a finite deadline" {
 test "pthread runtime records deferred guest threads" {
     const TestState = struct {
         memory: [256]u8 = [_]u8{0} ** 256,
-        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
 
         fn guestMemory(self: *@This(), address: u64, length: u64) ?[]u8 {
             if (address + length > self.memory.len) return null;
@@ -1564,7 +1606,7 @@ test "pthread mutex contention tracking" {
     var runtime = Runtime{};
     const mutex_addr: u64 = 0x1000;
     var test_state = struct {
-        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
         fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
             _ = self;
             return null;
@@ -1600,7 +1642,7 @@ test "libc++ recursive mutex models reentrancy and ownership" {
     var state = struct {
         memory: [128]u8 = [_]u8{0} ** 128,
         active_guest_thread: u64 = owner,
-        regs: struct { rdi: u64 = address, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = address, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
         fn guestMemory(self: *@This(), guest_address: u64, count: u64) ?[]u8 {
             const start: usize = @intCast(guest_address);
             const length: usize = @intCast(count);
@@ -1653,7 +1695,7 @@ test "cooperative condition wait releases and reacquires its mutex" {
 
     var state = struct {
         active_guest_thread: u64 = worker,
-        regs: struct { rdi: u64 = 0x4000, rsi: u64 = mutex, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = 0x4000, rsi: u64 = mutex, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
         fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
             _ = self;
             return null;
@@ -1699,7 +1741,7 @@ test "cooperative timed wait returns ETIMEDOUT without a signal" {
 
     var state = struct {
         active_guest_thread: u64 = worker,
-        regs: struct { rdi: u64 = 0x4000, rsi: u64 = mutex, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = 0x4000, rsi: u64 = mutex, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
         fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
             _ = self;
             return null;
@@ -1730,7 +1772,7 @@ test "condition signal targets one waiter and cannot wake a later generation" {
     const State = struct {
         active_guest_thread: u64,
         executed_steps: u64,
-        regs: struct { rdi: u64 = condvar, rsi: u64, rdx: u64 = 0, rcx: u64 = 0 },
+        regs: struct { rdi: u64 = condvar, rsi: u64, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 },
         fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
             _ = self;
             return null;
@@ -1784,7 +1826,7 @@ test "libc++ timed condition wait remains blocked until notify all" {
         memory: [256]u8 = [_]u8{0} ** 256,
         active_guest_thread: u64 = worker,
         monotonic_nanoseconds: u64 = 1_000,
-        regs: struct { rdi: u64 = condvar, rsi: u64 = unique_lock, rdx: u64 = system_clock_epoch_nanoseconds + 6_000, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = condvar, rsi: u64 = unique_lock, rdx: u64 = system_clock_epoch_nanoseconds + 6_000, rcx: u64 = 0, rip: u64 = 0 } = .{},
         fn guestMemory(self: *@This(), address: u64, count: u64) ?[]u8 {
             const start: usize = @intCast(address);
             const length: usize = @intCast(count);
@@ -1840,7 +1882,7 @@ test "scheduler resume overrides RAX only when a condition wait completes" {
 
     var state = struct {
         active_guest_thread: u64 = worker,
-        regs: struct { rdi: u64 = 0x4000, rsi: u64 = mutex, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = 0x4000, rsi: u64 = mutex, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
         fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
             _ = self;
             return null;
@@ -1936,7 +1978,9 @@ test "never-notified condvar waiter gets one bounded spurious wake" {
     runtime.waits.noteWait(0x4000, slot, 10);
 
     // Stalled well past the default stall threshold with zero notifications.
-    try std.testing.expectEqual(waiter, runtime.wakeNeverNotifiedWaiter(500_000_000).?);
+    const repair = runtime.wakeNeverNotifiedWaiter(500_000_000).?;
+    try std.testing.expectEqual(waiter, repair.thread);
+    try std.testing.expectEqual(@as(u64, 0x4000), repair.object);
     try std.testing.expect(runtime.threads[0].spurious_wake_pending);
     try std.testing.expect(runtime.threads[0].last_spurious_condvar == 0x4000);
 
@@ -1979,7 +2023,7 @@ test "pthread_threadid_np assigns stable numeric ids" {
     var state = struct {
         active_guest_thread: u64 = worker,
         mem: [16]u8 = [_]u8{0} ** 16,
-        regs: struct { rdi: u64 = 0, rsi: u64 = 8, rdx: u64 = 0, rcx: u64 = 0 } = .{ .rsi = 8 },
+        regs: struct { rdi: u64 = 0, rsi: u64 = 8, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{ .rsi = 8 },
         fn guestMemory(self: *@This(), address: u64, size: u64) ?[]u8 {
             if (address + size > self.mem.len) return null;
             return self.mem[@intCast(address)..@intCast(address + size)];
@@ -2002,7 +2046,7 @@ test "pthread_threadid_np assigns stable numeric ids" {
 test "POSIX scheduler yield is modeled as a successful scheduling hint" {
     var runtime = Runtime{};
     var test_state = struct {
-        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0 } = .{},
+        regs: struct { rdi: u64 = 0, rsi: u64 = 0, rdx: u64 = 0, rcx: u64 = 0, rip: u64 = 0 } = .{},
         fn guestMemory(self: *@This(), _: u64, _: u64) ?[]u8 {
             _ = self;
             return null;
@@ -2018,4 +2062,34 @@ test "POSIX scheduler yield is modeled as a successful scheduling hint" {
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&test_state, "_sched_yield").?.handled);
     try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&test_state, "_pthread_yield_np").?.handled);
     try std.testing.expectEqual(@as(u64, 2), runtime.scheduler_yields);
+}
+
+test "a parked thread with no reason is counted and a running one is not" {
+    var runtime = Runtime{};
+    runtime.threads[0] = .{ .active = true, .handle = 0x1, .state = .waiting_condvar };
+    runtime.threads[1] = .{ .active = true, .handle = 0x2, .state = .waiting_condvar, .blocked_reason = "pthread_cond_wait" };
+    runtime.threads[2] = .{ .active = true, .handle = 0x3, .state = .running };
+    runtime.threads[3] = .{ .active = false, .handle = 0x4, .state = .waiting_mutex };
+    try std.testing.expectEqual(@as(u64, 1), runtime.parksWithoutAReason());
+}
+
+test "every parked state is covered by the reason check" {
+    // A state added to the parked set in the census but not here would let a
+    // nameless park through unreported, which is exactly the hole this counts.
+    const State = @TypeOf(@as(Runtime, undefined).threads[0].state);
+    const parked_states = [_]State{
+        .waiting_mutex,
+        .waiting_condvar,
+        .waiting_semaphore,
+        .waiting_event,
+        .waiting_futex_address,
+        .waiting_join,
+        .sleeping_indefinitely,
+        .sleeping_until_deadline,
+    };
+    for (parked_states) |state| {
+        var runtime = Runtime{};
+        runtime.threads[0] = .{ .active = true, .handle = 0x1, .state = state };
+        try std.testing.expectEqual(@as(u64, 1), runtime.parksWithoutAReason());
+    }
 }

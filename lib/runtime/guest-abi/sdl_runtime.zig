@@ -17,6 +17,7 @@ const machoCapturePrint = @import("event_log").machoCapturePrint;
 
 pub const compatibility_version = [3]u8{ 2, 0, 12 };
 pub const audio_callback_handle_base: u64 = 0xFFFF_F910_0000_0000;
+pub const window_handle_base: u64 = 0xFFFF_F410_0000_0000;
 
 const max_audio_devices = 8;
 const max_event_watches = 16;
@@ -24,7 +25,25 @@ const audio_spec_size = 32;
 const audio_callback_stack_size: u32 = 256 * 1024;
 const audio_f32_lsb: u16 = 0x8120;
 const sdl_init_audio: u32 = 0x0000_0010;
+const sdl_init_video: u32 = 0x0000_0020;
 const sdl_mix_max_volume: u32 = 128;
+const sdl_window_fullscreen: u32 = 0x0000_0001;
+const sdl_window_shown: u32 = 0x0000_0004;
+const sdl_window_hidden: u32 = 0x0000_0008;
+const sdl_syswm_cocoa: u32 = 4;
+const sdl_syswm_info_size: usize = 72;
+
+pub const GraphicsSnapshot = struct {
+    initialized: bool = false,
+    window_bound: bool = false,
+    window_token: u64 = 0,
+    generation: u64 = 1,
+    native_window_token: u64 = 0,
+    native_view_token: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    flags: u32 = 0,
+};
 
 pub const Resolution = union(enum) {
     handled: u64,
@@ -115,6 +134,19 @@ pub const Runtime = struct {
     event_watch_adds: u64 = 0,
     event_watch_removes: u64 = 0,
     event_pumps: u64 = 0,
+    window_create_attempts: u64 = 0,
+    window_create_successes: u64 = 0,
+    window_create_rejections: u64 = 0,
+    window_destroy_requests: u64 = 0,
+    window_invalid_handles: u64 = 0,
+    window_title_updates: u64 = 0,
+    window_size_updates: u64 = 0,
+    window_show_requests: u64 = 0,
+    window_hide_requests: u64 = 0,
+    window_fullscreen_updates: u64 = 0,
+    window_size_queries: u64 = 0,
+    window_wm_info_queries: u64 = 0,
+    window_native_event_pumps: u64 = 0,
     mapping_updates: u64 = 0,
     log_callback: u64 = 0,
     log_userdata: u64 = 0,
@@ -122,6 +154,15 @@ pub const Runtime = struct {
     last_error: [192]u8 = [_]u8{0} ** 192,
     last_error_length: usize = 0,
     last_error_guest_address: u64 = 0,
+    window_active: bool = false,
+    window_native_bound: bool = false,
+    window_generation: u16 = 1,
+    window_token: u64 = 0,
+    window_native_window_token: u64 = 0,
+    window_native_view_token: u64 = 0,
+    window_width: u32 = 0,
+    window_height: u32 = 0,
+    window_flags: u32 = 0,
     devices: [max_audio_devices]AudioDevice = [_]AudioDevice{.{}} ** max_audio_devices,
     event_watches: [max_event_watches]EventWatch = [_]EventWatch{.{}} ** max_event_watches,
     active_callback_slot: ?usize = null,
@@ -136,16 +177,17 @@ pub const Runtime = struct {
             return .handled_void;
         }
 
+        if (symbolMatches(symbol, "SDL_Init")) {
+            self.calls +|= 1;
+            self.subsystem_initializations +|= 1;
+            self.retainSubsystems(@truncate(state.regs.rdi));
+            return .{ .handled = 0 };
+        }
+
         if (symbolMatches(symbol, "SDL_InitSubSystem")) {
             self.calls +|= 1;
             self.subsystem_initializations +|= 1;
-            const requested: u32 = @truncate(state.regs.rdi);
-            for (0..32) |bit_index| {
-                const bit = @as(u32, 1) << @intCast(bit_index);
-                if (requested & bit == 0) continue;
-                self.subsystem_refs[bit_index] +|= 1;
-                self.initialized_mask |= bit;
-            }
+            self.retainSubsystems(@truncate(state.regs.rdi));
             return .{ .handled = 0 };
         }
 
@@ -155,16 +197,18 @@ pub const Runtime = struct {
             return .{ .handled = if (requested == 0) self.initialized_mask else self.initialized_mask & requested };
         }
 
+        if (symbolMatches(symbol, "SDL_Quit")) {
+            self.calls +|= 1;
+            self.subsystem_quits +|= 1;
+            self.quitAll();
+            return .handled_void;
+        }
+
         if (symbolMatches(symbol, "SDL_QuitSubSystem")) {
             self.calls +|= 1;
             self.subsystem_quits +|= 1;
             const requested: u32 = @truncate(state.regs.rdi);
-            for (0..32) |bit_index| {
-                const bit = @as(u32, 1) << @intCast(bit_index);
-                if (requested & bit == 0 or self.subsystem_refs[bit_index] == 0) continue;
-                self.subsystem_refs[bit_index] -= 1;
-                if (self.subsystem_refs[bit_index] == 0) self.initialized_mask &= ~bit;
-            }
+            self.releaseSubsystems(requested);
             if (requested & sdl_init_audio != 0 and self.initialized_mask & sdl_init_audio == 0) {
                 for (&self.devices, 0..) |*device, slot| {
                     if (!device.active) continue;
@@ -172,7 +216,142 @@ pub const Runtime = struct {
                     self.audio_subsystem_closes +|= 1;
                 }
             }
+            if (requested & sdl_init_video != 0 and self.initialized_mask & sdl_init_video == 0) {
+                self.retireWindow();
+            }
             return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_CreateWindow")) {
+            self.calls +|= 1;
+            return .{ .handled = self.createWindow(state) };
+        }
+
+        if (symbolMatches(symbol, "SDL_DestroyWindow")) {
+            self.calls +|= 1;
+            self.window_destroy_requests +|= 1;
+            if (!self.validWindow(state.regs.rdi)) {
+                self.rejectWindowHandle("SDL_DestroyWindow received a stale or foreign SDL_Window");
+                return .handled_void;
+            }
+            self.retireWindow();
+            return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_SetWindowTitle")) {
+            self.calls +|= 1;
+            if (!self.requireWindow(state.regs.rdi, "SDL_SetWindowTitle received a stale or foreign SDL_Window"))
+                return .handled_void;
+            const title = state.guestCString(state.regs.rsi, 4096) orelse {
+                self.setError("SDL_SetWindowTitle title is unreadable or unterminated");
+                return .handled_void;
+            };
+            if (!setNativeWindowTitle(state, title)) {
+                self.setError("SDL_SetWindowTitle could not update the canonical Cocoa window");
+                return .handled_void;
+            }
+            self.window_title_updates +|= 1;
+            return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_SetWindowSize")) {
+            self.calls +|= 1;
+            if (!self.requireWindow(state.regs.rdi, "SDL_SetWindowSize received a stale or foreign SDL_Window"))
+                return .handled_void;
+            const width: i32 = @bitCast(@as(u32, @truncate(state.regs.rsi)));
+            const height: i32 = @bitCast(@as(u32, @truncate(state.regs.rdx)));
+            if (width <= 0 or height <= 0 or !setNativeWindowSize(state, width, height)) {
+                self.setError("SDL_SetWindowSize dimensions are invalid or Cocoa rejected them");
+                return .handled_void;
+            }
+            self.window_width = @intCast(width);
+            self.window_height = @intCast(height);
+            self.window_size_updates +|= 1;
+            return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_GetWindowSize") or
+            symbolMatches(symbol, "SDL_GetWindowSizeInPixels") or
+            symbolMatches(symbol, "SDL_GL_GetDrawableSize") or
+            symbolMatches(symbol, "SDL_Vulkan_GetDrawableSize"))
+        {
+            self.calls +|= 1;
+            self.window_size_queries +|= 1;
+            if (!self.requireWindow(state.regs.rdi, "SDL window size query received a stale or foreign SDL_Window"))
+                return .handled_void;
+            const width = nativeWindowWidth(state);
+            const height = nativeWindowHeight(state);
+            if (width != 0) self.window_width = width;
+            if (height != 0) self.window_height = height;
+            writeGuestI32(state, state.regs.rsi, @intCast(self.window_width));
+            writeGuestI32(state, state.regs.rdx, @intCast(self.window_height));
+            return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_ShowWindow") or symbolMatches(symbol, "SDL_RaiseWindow")) {
+            self.calls +|= 1;
+            self.window_show_requests +|= 1;
+            if (!self.requireWindow(state.regs.rdi, "SDL_ShowWindow received a stale or foreign SDL_Window"))
+                return .handled_void;
+            if (!showNativeWindow(state)) {
+                self.setError("SDL_ShowWindow could not show the canonical Cocoa window");
+                return .handled_void;
+            }
+            self.window_flags = (self.window_flags | sdl_window_shown) & ~sdl_window_hidden;
+            return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_HideWindow")) {
+            self.calls +|= 1;
+            self.window_hide_requests +|= 1;
+            if (!self.requireWindow(state.regs.rdi, "SDL_HideWindow received a stale or foreign SDL_Window"))
+                return .handled_void;
+            if (!hideNativeWindow(state)) {
+                self.setError("SDL_HideWindow could not hide the canonical Cocoa window");
+                return .handled_void;
+            }
+            self.window_flags = (self.window_flags | sdl_window_hidden) & ~sdl_window_shown;
+            return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_SetWindowFullscreen")) {
+            self.calls +|= 1;
+            self.window_fullscreen_updates +|= 1;
+            if (!self.requireWindow(state.regs.rdi, "SDL_SetWindowFullscreen received a stale or foreign SDL_Window"))
+                return .{ .handled = signedResult(-1) };
+            const requested_flags: u32 = @truncate(state.regs.rsi);
+            const fullscreen = requested_flags & sdl_window_fullscreen != 0;
+            if (!setNativeWindowFullscreen(state, fullscreen)) {
+                self.setError("SDL_SetWindowFullscreen could not update the canonical Cocoa window");
+                return .{ .handled = signedResult(-1) };
+            }
+            self.window_flags = if (fullscreen)
+                self.window_flags | (requested_flags & 0x0000_1001)
+            else
+                self.window_flags & ~@as(u32, 0x0000_1001);
+            return .{ .handled = 0 };
+        }
+
+        if (symbolMatches(symbol, "SDL_GetWindowFlags")) {
+            self.calls +|= 1;
+            if (!self.requireWindow(state.regs.rdi, "SDL_GetWindowFlags received a stale or foreign SDL_Window"))
+                return .{ .handled = 0 };
+            return .{ .handled = self.window_flags };
+        }
+
+        if (symbolMatches(symbol, "SDL_GetWindowID")) {
+            self.calls +|= 1;
+            return .{ .handled = if (self.validWindow(state.regs.rdi)) 1 else 0 };
+        }
+
+        if (symbolMatches(symbol, "SDL_GetWindowFromID")) {
+            self.calls +|= 1;
+            return .{ .handled = if (state.regs.rdi == 1 and self.window_active) self.window_token else 0 };
+        }
+
+        if (symbolMatches(symbol, "SDL_GetWindowWMInfo")) {
+            self.calls +|= 1;
+            return .{ .handled = self.getWindowWmInfo(state) };
         }
 
         if (symbolMatches(symbol, "SDL_OpenAudioDevice")) {
@@ -237,7 +416,20 @@ pub const Runtime = struct {
         if (symbolMatches(symbol, "SDL_PumpEvents")) {
             self.calls +|= 1;
             self.event_pumps +|= 1;
+            pumpNativeWindowEvents(state);
+            self.window_native_event_pumps +|= 1;
             return .handled_void;
+        }
+
+        if (symbolMatches(symbol, "SDL_PollEvent")) {
+            self.calls +|= 1;
+            // Polling SDL also pumps the native queue. Rosette currently has no
+            // SDL_Event encoder, so zero is the truthful result; the Cocoa event
+            // loop still advances and does not deadlock Xenia's UI rendezvous.
+            self.event_pumps +|= 1;
+            pumpNativeWindowEvents(state);
+            self.window_native_event_pumps +|= 1;
+            return .{ .handled = 0 };
         }
 
         if (symbolMatches(symbol, "SDL_NumJoysticks")) {
@@ -303,6 +495,163 @@ pub const Runtime = struct {
         }
 
         return null;
+    }
+
+    pub fn graphicsSnapshot(self: *const Runtime) GraphicsSnapshot {
+        return .{
+            .initialized = self.initialized_mask & sdl_init_video != 0,
+            .window_bound = self.window_active and self.window_native_bound,
+            .window_token = if (self.window_active) self.window_token else 0,
+            .generation = if (self.window_generation == 0) 1 else self.window_generation,
+            .native_window_token = if (self.window_active) self.window_native_window_token else 0,
+            .native_view_token = if (self.window_active) self.window_native_view_token else 0,
+            .width = if (self.window_active) self.window_width else 0,
+            .height = if (self.window_active) self.window_height else 0,
+            .flags = if (self.window_active) self.window_flags else 0,
+        };
+    }
+
+    fn retainSubsystems(self: *Runtime, requested: u32) void {
+        for (0..32) |bit_index| {
+            const bit = @as(u32, 1) << @intCast(bit_index);
+            if (requested & bit == 0) continue;
+            self.subsystem_refs[bit_index] +|= 1;
+            self.initialized_mask |= bit;
+        }
+    }
+
+    fn releaseSubsystems(self: *Runtime, requested: u32) void {
+        for (0..32) |bit_index| {
+            const bit = @as(u32, 1) << @intCast(bit_index);
+            if (requested & bit == 0 or self.subsystem_refs[bit_index] == 0) continue;
+            self.subsystem_refs[bit_index] -= 1;
+            if (self.subsystem_refs[bit_index] == 0) self.initialized_mask &= ~bit;
+        }
+    }
+
+    fn quitAll(self: *Runtime) void {
+        @memset(&self.subsystem_refs, 0);
+        self.initialized_mask = 0;
+        for (&self.devices, 0..) |*device, slot| {
+            if (!device.active) continue;
+            self.closeAudioDevice(device, slot);
+            self.audio_subsystem_closes +|= 1;
+        }
+        self.retireWindow();
+    }
+
+    fn createWindow(self: *Runtime, state: anytype) u64 {
+        self.window_create_attempts +|= 1;
+        if (self.initialized_mask & sdl_init_video == 0)
+            return self.rejectWindowCreate("SDL_CreateWindow requires SDL_INIT_VIDEO ownership");
+        if (self.window_active)
+            return self.rejectWindowCreate("Rosette SDL currently exposes one canonical Cocoa window");
+
+        const title = state.guestCString(state.regs.rdi, 4096) orelse
+            return self.rejectWindowCreate("SDL_CreateWindow title is unreadable or unterminated");
+        const width: i32 = @bitCast(@as(u32, @truncate(state.regs.rcx)));
+        const height: i32 = @bitCast(@as(u32, @truncate(state.regs.r8)));
+        const requested_flags: u32 = @truncate(state.regs.r9);
+        if (width <= 0 or height <= 0)
+            return self.rejectWindowCreate("SDL_CreateWindow dimensions must be positive");
+        if (!setNativeWindowSize(state, width, height) or !setNativeWindowTitle(state, title))
+            return self.rejectWindowCreate("SDL_CreateWindow could not substantiate the canonical Cocoa window");
+
+        const native_window_token = nativeWindowToken(state);
+        const native_view_token = nativeViewToken(state);
+        if (native_window_token == 0 or native_view_token == 0)
+            return self.rejectWindowCreate("SDL_CreateWindow could not bind Cocoa NSWindow and NSView identities");
+
+        const hidden = requested_flags & sdl_window_hidden != 0;
+        if (hidden) {
+            if (!hideNativeWindow(state))
+                return self.rejectWindowCreate("SDL_CreateWindow could not honor SDL_WINDOW_HIDDEN");
+        } else if (!showNativeWindow(state)) {
+            return self.rejectWindowCreate("SDL_CreateWindow could not show the canonical Cocoa window");
+        }
+        if (requested_flags & sdl_window_fullscreen != 0 and
+            !setNativeWindowFullscreen(state, true))
+        {
+            return self.rejectWindowCreate("SDL_CreateWindow could not enter fullscreen");
+        }
+
+        const generation = if (self.window_generation == 0) 1 else self.window_generation;
+        const token = encodeWindowToken(generation);
+        self.window_active = true;
+        self.window_native_bound = true;
+        self.window_generation = generation;
+        self.window_token = token;
+        self.window_native_window_token = native_window_token;
+        self.window_native_view_token = native_view_token;
+        self.window_width = @intCast(width);
+        self.window_height = @intCast(height);
+        self.window_flags = if (hidden)
+            (requested_flags | sdl_window_hidden) & ~sdl_window_shown
+        else
+            (requested_flags | sdl_window_shown) & ~sdl_window_hidden;
+        registerOpaqueHandle(state, token, "SDL_Window borrowing canonical Cocoa NSWindow");
+        self.last_error_length = 0;
+        self.last_error[0] = 0;
+        self.window_create_successes +|= 1;
+        machoCapturePrint(
+            "macho-processor: SDL2 Cocoa window bound: SDL_Window=0x{x} generation={d} Cocoa_NSWindow_token=0x{x} Cocoa_NSView_token=0x{x} drawable={d}x{d} flags=0x{x} authority=borrower Cocoa_owner=AppKit\n",
+            .{ token, generation, native_window_token, native_view_token, self.window_width, self.window_height, self.window_flags },
+        );
+        return token;
+    }
+
+    fn rejectWindowCreate(self: *Runtime, reason: []const u8) u64 {
+        self.window_create_rejections +|= 1;
+        self.setError(reason);
+        return 0;
+    }
+
+    fn rejectWindowHandle(self: *Runtime, reason: []const u8) void {
+        self.window_invalid_handles +|= 1;
+        self.setError(reason);
+    }
+
+    fn requireWindow(self: *Runtime, token: u64, reason: []const u8) bool {
+        if (self.validWindow(token)) return true;
+        self.rejectWindowHandle(reason);
+        return false;
+    }
+
+    fn validWindow(self: *const Runtime, token: u64) bool {
+        return self.window_active and token != 0 and token == self.window_token and
+            token == encodeWindowToken(self.window_generation);
+    }
+
+    fn retireWindow(self: *Runtime) void {
+        if (!self.window_active) return;
+        self.window_active = false;
+        self.window_native_bound = false;
+        self.window_token = 0;
+        self.window_native_window_token = 0;
+        self.window_native_view_token = 0;
+        self.window_width = 0;
+        self.window_height = 0;
+        self.window_flags = 0;
+        self.window_generation +%= 1;
+        if (self.window_generation == 0) self.window_generation = 1;
+    }
+
+    fn getWindowWmInfo(self: *Runtime, state: anytype) u64 {
+        self.window_wm_info_queries +|= 1;
+        if (!self.requireWindow(state.regs.rdi, "SDL_GetWindowWMInfo received a stale or foreign SDL_Window"))
+            return 0;
+        const output = state.guestMemory(state.regs.rsi, sdl_syswm_info_size) orelse {
+            self.setError("SDL_GetWindowWMInfo output structure is unreadable");
+            return 0;
+        };
+        if (output[0] != compatibility_version[0]) {
+            self.setError("SDL_GetWindowWMInfo requires an SDL 2.x SDL_SysWMinfo structure");
+            return 0;
+        }
+        @memset(output[3..], 0);
+        std.mem.writeInt(u32, output[4..8], sdl_syswm_cocoa, .little);
+        std.mem.writeInt(u64, output[8..16], self.window_native_window_token, .little);
+        return 1;
     }
 
     fn openAudioDevice(self: *Runtime, state: anytype) u64 {
@@ -524,17 +873,105 @@ pub const Runtime = struct {
     }
 
     pub fn logSummary(self: *const Runtime) void {
-        if (self.calls == 0 and self.audio_callbacks_dispatched == 0) return;
+        if (self.calls == 0 and self.audio_callbacks_dispatched == 0 and self.window_create_attempts == 0) return;
         var active_devices: usize = 0;
         var active_watches: usize = 0;
         for (self.devices) |device| active_devices += @intFromBool(device.active);
         for (self.event_watches) |watch| active_watches += @intFromBool(watch.active);
+        if (self.window_create_attempts != 0 or self.window_wm_info_queries != 0) {
+            machoCapturePrint(
+                "macho-processor: SDL2 Cocoa adapter: create(attempts/success/reject)={d}/{d}/{d} active={} generation={d} SDL_Window=0x{x} native_tokens(window/view)=0x{x}/0x{x} drawable={d}x{d} flags=0x{x} destroy={d} invalid_handles={d} title={d} size(updates/queries)={d}/{d} show/hide/fullscreen={d}/{d}/{d} wm_info={d} native_event_pumps={d} ownership=SDL_borrower_of_AppKit\n",
+                .{ self.window_create_attempts, self.window_create_successes, self.window_create_rejections, self.window_active, self.window_generation, self.window_token, self.window_native_window_token, self.window_native_view_token, self.window_width, self.window_height, self.window_flags, self.window_destroy_requests, self.window_invalid_handles, self.window_title_updates, self.window_size_updates, self.window_size_queries, self.window_show_requests, self.window_hide_requests, self.window_fullscreen_updates, self.window_wm_info_queries, self.window_native_event_pumps },
+            );
+        }
         machoCapturePrint(
             "macho-processor: SDL2 guest ABI: version={d}.{d}.{d} calls={d} subsystems(init/quit/mask)={d}/{d}/0x{x} audio(open/ok/reject/close/subsystem_close/invalid)={d}/{d}/{d}/{d}/{d}/{d} devices={d} callbacks(dispatch/complete/fail/inflight_handle)={d}/{d}/{d}/0x{x} event_watches(add/remove/active/pumps)={d}/{d}/{d}/{d} hints={d} rejected={d} mappings={d}; backend=clocked_null_sink (guest timing and ownership active, native audible output unavailable)\n",
             .{ compatibility_version[0], compatibility_version[1], compatibility_version[2], self.calls, self.subsystem_initializations, self.subsystem_quits, self.initialized_mask, self.audio_open_attempts, self.audio_open_successes, self.audio_open_rejections, self.audio_close_requests, self.audio_subsystem_closes, self.audio_invalid_handles, active_devices, self.audio_callbacks_dispatched, self.audio_callbacks_completed, self.audio_callback_dispatch_failures, self.audioCallbackHandle(), self.event_watch_adds, self.event_watch_removes, active_watches, self.event_pumps, self.hint_updates, self.hint_rejections, self.mapping_updates },
         );
     }
 };
+
+fn StateType(comptime StatePointer: type) type {
+    return @typeInfo(StatePointer).pointer.child;
+}
+
+fn setNativeWindowTitle(state: anytype, title: []const u8) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "setNativeWindowTitle")) return state.setNativeWindowTitle(title);
+    return true;
+}
+
+fn setNativeWindowSize(state: anytype, width: i32, height: i32) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "setNativeWindowSize")) return state.setNativeWindowSize(width, height);
+    return true;
+}
+
+fn showNativeWindow(state: anytype) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "showNativeWindow")) return state.showNativeWindow();
+    return true;
+}
+
+fn hideNativeWindow(state: anytype) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "hideNativeWindow")) return state.hideNativeWindow();
+    return true;
+}
+
+fn setNativeWindowFullscreen(state: anytype, fullscreen: bool) bool {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "setNativeWindowFullscreen")) return state.setNativeWindowFullscreen(fullscreen);
+    return true;
+}
+
+fn nativeWindowToken(state: anytype) u64 {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "nativeWindowToken")) return state.nativeWindowToken();
+    return 0xFFFF_F400_0000_0021;
+}
+
+fn nativeViewToken(state: anytype) u64 {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "nativeViewToken")) return state.nativeViewToken();
+    return 0xFFFF_F400_0000_0031;
+}
+
+fn nativeWindowWidth(state: anytype) u32 {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "nativeWindowWidth")) return state.nativeWindowWidth();
+    return 0;
+}
+
+fn nativeWindowHeight(state: anytype) u32 {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "nativeWindowHeight")) return state.nativeWindowHeight();
+    return 0;
+}
+
+fn pumpNativeWindowEvents(state: anytype) void {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "pumpNativeWindowEvents")) state.pumpNativeWindowEvents();
+}
+
+fn registerOpaqueHandle(state: anytype, address: u64, owner: []const u8) void {
+    const State = StateType(@TypeOf(state));
+    if (@hasDecl(State, "registerOpaqueHandle")) state.registerOpaqueHandle(address, owner);
+}
+
+fn writeGuestI32(state: anytype, address: u64, value: i32) void {
+    if (address == 0) return;
+    const output = state.guestMemory(address, 4) orelse return;
+    std.mem.writeInt(u32, output[0..4], @bitCast(value), .little);
+}
+
+fn signedResult(value: i32) u64 {
+    return @as(u32, @bitCast(value));
+}
+
+fn encodeWindowToken(generation: u16) u64 {
+    return window_handle_base | @as(u64, generation);
+}
 
 fn encodeDeviceId(slot: usize, generation: u16) u32 {
     return (@as(u32, generation) << 8) | @as(u32, @intCast(slot + 1));
@@ -560,6 +997,7 @@ const TestState = struct {
         rdx: u64 = 0,
         rcx: u64 = 0,
         r8: u64 = 0,
+        r9: u64 = 0,
         rip: u64 = 0,
         rsp: u64 = 0,
     };
@@ -587,6 +1025,17 @@ const TestState = struct {
     synthetic_stack_entry_rsp: u64 = 0,
     synthetic_stack_entry_handle: u64 = 0,
     synthetic_stack_dispatches: u64 = 0,
+    native_window_token: u64 = 0xFFFF_F400_0000_0021,
+    native_view_token: u64 = 0xFFFF_F400_0000_0031,
+    native_width: u32 = 1280,
+    native_height: u32 = 720,
+    native_title_updates: u64 = 0,
+    native_size_updates: u64 = 0,
+    native_show_calls: u64 = 0,
+    native_hide_calls: u64 = 0,
+    native_fullscreen: bool = false,
+    native_event_pumps: u64 = 0,
+    registered_opaque_handle: u64 = 0,
 
     fn saveActiveGuestThread(self: *TestState, reason: []const u8) bool {
         _ = reason;
@@ -641,6 +1090,60 @@ const TestState = struct {
         _ = self;
         return address >= 0x300 and address < 0x800;
     }
+
+    fn setNativeWindowTitle(self: *TestState, title: []const u8) bool {
+        _ = title;
+        self.native_title_updates += 1;
+        return true;
+    }
+
+    fn setNativeWindowSize(self: *TestState, width: i32, height: i32) bool {
+        if (width <= 0 or height <= 0) return false;
+        self.native_width = @intCast(width);
+        self.native_height = @intCast(height);
+        self.native_size_updates += 1;
+        return true;
+    }
+
+    fn showNativeWindow(self: *TestState) bool {
+        self.native_show_calls += 1;
+        return true;
+    }
+
+    fn hideNativeWindow(self: *TestState) bool {
+        self.native_hide_calls += 1;
+        return true;
+    }
+
+    fn setNativeWindowFullscreen(self: *TestState, fullscreen: bool) bool {
+        self.native_fullscreen = fullscreen;
+        return true;
+    }
+
+    fn nativeWindowToken(self: *TestState) u64 {
+        return self.native_window_token;
+    }
+
+    fn nativeViewToken(self: *TestState) u64 {
+        return self.native_view_token;
+    }
+
+    fn nativeWindowWidth(self: *TestState) u32 {
+        return self.native_width;
+    }
+
+    fn nativeWindowHeight(self: *TestState) u32 {
+        return self.native_height;
+    }
+
+    fn pumpNativeWindowEvents(self: *TestState) void {
+        self.native_event_pumps += 1;
+    }
+
+    fn registerOpaqueHandle(self: *TestState, address: u64, owner: []const u8) void {
+        _ = owner;
+        self.registered_opaque_handle = address;
+    }
 };
 
 test "SDL compatibility version satisfies Xenia audio and input" {
@@ -661,6 +1164,91 @@ test "SDL subsystem reference counts do not lose a shared owner" {
     try std.testing.expectEqual(@as(u32, 0x10), runtime.initialized_mask);
     _ = runtime.dispatch(&state, "SDL_QuitSubSystem").?;
     try std.testing.expectEqual(@as(u32, 0), runtime.initialized_mask);
+}
+
+test "SDL window adapter borrows canonical Cocoa identities and exports WM info" {
+    var runtime = Runtime{};
+    var state = TestState{};
+    state.regs.rdi = sdl_init_video;
+    try std.testing.expectEqual(@as(u64, 0), runtime.dispatch(&state, "SDL_Init").?.handled);
+
+    @memcpy(state.memory[16..28], "Xenia Cocoa\x00");
+    state.regs = .{
+        .rdi = 16,
+        .rsi = 0,
+        .rdx = 0,
+        .rcx = 1920,
+        .r8 = 1080,
+        .r9 = 0x0000_2020,
+    };
+    const window = runtime.dispatch(&state, "SDL_CreateWindow").?.handled;
+    try std.testing.expect(window != 0);
+    try std.testing.expectEqual(window, state.registered_opaque_handle);
+    try std.testing.expectEqual(@as(u32, 1920), state.native_width);
+    try std.testing.expectEqual(@as(u32, 1080), state.native_height);
+    try std.testing.expectEqual(@as(u64, 1), state.native_show_calls);
+
+    const snapshot = runtime.graphicsSnapshot();
+    try std.testing.expect(snapshot.initialized);
+    try std.testing.expect(snapshot.window_bound);
+    try std.testing.expectEqual(window, snapshot.window_token);
+    try std.testing.expectEqual(state.native_window_token, snapshot.native_window_token);
+    try std.testing.expectEqual(state.native_view_token, snapshot.native_view_token);
+
+    const wm_info: u64 = 128;
+    state.memory[@intCast(wm_info)] = 2;
+    state.memory[@intCast(wm_info + 1)] = 0;
+    state.memory[@intCast(wm_info + 2)] = 12;
+    state.regs = .{ .rdi = window, .rsi = wm_info };
+    try std.testing.expectEqual(@as(u64, 1), runtime.dispatch(&state, "SDL_GetWindowWMInfo").?.handled);
+    try std.testing.expectEqual(sdl_syswm_cocoa, std.mem.readInt(u32, state.memory[132..136], .little));
+    try std.testing.expectEqual(state.native_window_token, std.mem.readInt(u64, state.memory[136..144], .little));
+
+    state.regs = .{ .rdi = window, .rsi = 224, .rdx = 228 };
+    _ = runtime.dispatch(&state, "SDL_Vulkan_GetDrawableSize").?;
+    try std.testing.expectEqual(@as(u32, 1920), std.mem.readInt(u32, state.memory[224..228], .little));
+    try std.testing.expectEqual(@as(u32, 1080), std.mem.readInt(u32, state.memory[228..232], .little));
+}
+
+test "SDL window generation rejects a destroyed handle after recreation" {
+    var runtime = Runtime{};
+    var state = TestState{};
+    state.regs.rdi = sdl_init_video;
+    _ = runtime.dispatch(&state, "SDL_Init").?;
+    @memcpy(state.memory[16..22], "first\x00");
+    state.regs = .{ .rdi = 16, .rcx = 640, .r8 = 480 };
+    const first = runtime.dispatch(&state, "SDL_CreateWindow").?.handled;
+    try std.testing.expect(first != 0);
+
+    state.regs = .{ .rdi = first };
+    _ = runtime.dispatch(&state, "SDL_DestroyWindow").?;
+    try std.testing.expect(!runtime.graphicsSnapshot().window_bound);
+
+    @memcpy(state.memory[32..39], "second\x00");
+    state.regs = .{ .rdi = 32, .rcx = 800, .r8 = 600 };
+    const second = runtime.dispatch(&state, "SDL_CreateWindow").?.handled;
+    try std.testing.expect(second != 0);
+    try std.testing.expect(first != second);
+
+    state.regs = .{ .rdi = first, .rsi = 1024, .rdx = 768 };
+    _ = runtime.dispatch(&state, "SDL_SetWindowSize").?;
+    try std.testing.expectEqual(@as(u64, 1), runtime.window_invalid_handles);
+    try std.testing.expectEqual(@as(u32, 800), runtime.window_width);
+    try std.testing.expectEqual(@as(u32, 600), runtime.window_height);
+}
+
+test "SDL Quit releases the SDL binding but leaves Cocoa ownership external" {
+    var runtime = Runtime{};
+    var state = TestState{};
+    state.regs.rdi = sdl_init_video;
+    _ = runtime.dispatch(&state, "SDL_Init").?;
+    @memcpy(state.memory[16..22], "owned\x00");
+    state.regs = .{ .rdi = 16, .rcx = 1280, .r8 = 720 };
+    _ = runtime.dispatch(&state, "SDL_CreateWindow").?;
+    _ = runtime.dispatch(&state, "SDL_Quit").?;
+    try std.testing.expectEqual(@as(u32, 0), runtime.initialized_mask);
+    try std.testing.expect(!runtime.window_active);
+    try std.testing.expectEqual(@as(u64, 0xFFFF_F400_0000_0021), state.native_window_token);
 }
 
 test "SDL audio devices copy the obtained spec and reject stale ids" {

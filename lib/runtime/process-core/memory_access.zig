@@ -5788,6 +5788,16 @@ pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
                 entry.* = .{};
             }
         }
+        if (comptime @hasField(@TypeOf(self.*), "decode_victim_cache")) {
+            for (self.decode_victim_cache) |*entry| {
+                if (entry.rip == std.math.maxInt(u64)) continue;
+                const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+                const instruction_end = entry.rip +| instruction_length;
+                if (entry.rip < end and instruction_end > address) {
+                    entry.* = .{};
+                }
+            }
+        }
         return;
     }
     // F4: a code-cache page is written far more often than it is executed
@@ -5824,6 +5834,17 @@ pub fn invalidateDecodeRange(self: anytype, address: u64, count: u64) void {
                     self.translation_economics.notePreciseInvalidation(entry.rip, end -| address);
                 }
                 entry.* = .{};
+            }
+        }
+        if (comptime @hasField(@TypeOf(self.*), "decode_victim_cache")) {
+            const victim_set_base = constants.decodeVictimCacheSetBase(candidate);
+            for (self.decode_victim_cache[victim_set_base..][0..constants.DECODE_VICTIM_CACHE_WAYS]) |*entry| {
+                if (entry.rip == std.math.maxInt(u64)) continue;
+                const instruction_length = @max(@as(u64, entry.decoded.len), 1);
+                const instruction_end = entry.rip +| instruction_length;
+                if (entry.rip < end and instruction_end > address) {
+                    entry.* = .{};
+                }
             }
         }
     }

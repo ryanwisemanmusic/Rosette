@@ -7,6 +7,74 @@ const c = @cImport({
     @cInclude("unistd.h");
 });
 
+/// The asynchronous diagnostic transport, installed by the process when
+/// `ROSETTE_ASYNC_LOG=1` selects it.
+///
+/// Function pointers rather than a direct import: this file lives in a module
+/// the diagnostics module depends on, so importing the ring here would be a
+/// cycle. The indirection also keeps the default path exactly as it was — one
+/// null test — for runs that do not opt in.
+///
+/// Why the transport exists: the synchronous path below puts two syscalls and
+/// a process-wide stderr mutex on a translated guest thread for every line.
+/// That cost lands hardest on whichever subsystem is doing the most work, which
+/// during a graphics investigation is the subsystem under investigation — so
+/// the observer becomes a participant in the scheduling it is trying to
+/// measure, and a livelock or lost wakeup can be created, hidden or moved by
+/// the logging alone.
+pub const OfferFn = *const fn ([]const u8) bool;
+pub const FlushFn = *const fn () void;
+pub const ClassifyFn = *const fn ([]const u8) bool;
+
+var async_offer: ?OfferFn = null;
+var async_flush: ?FlushFn = null;
+/// Returns true when a line must take the synchronous path regardless. A crash
+/// diagnostic queued behind a writer thread that may never run again is a crash
+/// diagnostic that does not exist.
+var async_is_critical: ?ClassifyFn = null;
+
+pub fn installAsyncTransport(offer: OfferFn, flush: FlushFn, is_critical: ClassifyFn) void {
+    async_offer = offer;
+    async_flush = flush;
+    async_is_critical = is_critical;
+}
+
+pub fn clearAsyncTransport() void {
+    if (async_flush) |flush| flush();
+    async_offer = null;
+    async_flush = null;
+    async_is_critical = null;
+}
+
+pub fn asyncTransportInstalled() bool {
+    return async_offer != null;
+}
+
+/// Write everything queued without stopping. Used before a report that must not
+/// appear out of order with the lines it summarises, and from the crash path.
+pub fn flushAsyncTransport() void {
+    if (async_flush) |flush| flush();
+}
+
+/// True when the transport handled this line. The caller must return
+/// immediately on true: falling through to the synchronous path would
+/// reintroduce exactly the stall the ring exists to avoid, and would do it
+/// precisely when the system is busiest.
+fn asyncHandled(text: []const u8) bool {
+    const offer = async_offer orelse return false;
+    const critical = if (async_is_critical) |classify| classify(text) else false;
+    if (critical) {
+        // Order matters more than latency here: everything already queued must
+        // reach the log before the fault that ends the run.
+        if (async_flush) |flush| flush();
+        return false;
+    }
+    // A dropped line is already counted by the ring, so a full ring costs a
+    // counted gap rather than a pause.
+    _ = offer(text);
+    return true;
+}
+
 threadlocal var thread_macho_fd: i32 = -1;
 threadlocal var thread_scheduler_fd: i32 = -1;
 threadlocal var thread_primitive_fd: i32 = -1;
@@ -59,6 +127,10 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
 
     // Scheduler tables have their own complete log. Do not print them to
     // stderr because the route wrapper captures stderr in rosette-runtime.log.
+    // Checked before the transport: these lines belong to a different stream,
+    // and routing them through the shared ring would both reorder them against
+    // that stream and let a scheduler dump evict the diagnostics the ring is
+    // there to protect.
     if (isSchedulerTableLine(text)) {
         if (thread_scheduler_fd >= 0) {
             writeAll(thread_scheduler_fd, text);
@@ -67,6 +139,8 @@ pub fn machoCapturePrint(comptime fmt: []const u8, args: anytype) void {
         }
         return;
     }
+
+    if (asyncHandled(text)) return;
 
     // Always write to stderr first so diagnostics survive a crash
     std.debug.print("{s}", .{text});
@@ -102,6 +176,10 @@ fn writeLineAtomic(fd: i32, text: []const u8) void {
 
 pub fn primitiveCapturePrint(comptime fmt: []const u8, args: anytype) void {
     const text = formatCapture(&capture_buffer, fmt, args);
+
+    // Deliberately not routed through the async transport: this stream has its
+    // own descriptor, and the ring drains to the runtime log. Queuing these
+    // here would move them into the wrong file.
 
     // Always write to stderr first so diagnostics survive a crash
     std.debug.print("{s}", .{text});
