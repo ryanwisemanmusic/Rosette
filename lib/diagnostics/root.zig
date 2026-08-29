@@ -29,6 +29,8 @@ pub const claim_reconciliation = @import("claim_reconciliation.zig");
 pub const interrupt_callback_transaction = @import("interrupt_callback_transaction.zig");
 pub const async_log = @import("async_log.zig");
 pub const translation_economics = @import("translation_economics.zig");
+pub const run_integrity = @import("run_integrity.zig");
+pub const substantiation = @import("substantiation.zig");
 pub const guest_log_channels = @import("guest_log_channels.zig");
 pub const wait_graph = @import("wait_graph.zig");
 pub const deadlock_predictor = @import("deadlock_predictor.zig");
@@ -76,6 +78,8 @@ test {
     _ = claim_reconciliation;
     _ = interrupt_callback_transaction;
     _ = async_log;
+    _ = run_integrity;
+    _ = substantiation;
     _ = translation_economics;
     _ = guest_log_channels;
     _ = wait_graph;

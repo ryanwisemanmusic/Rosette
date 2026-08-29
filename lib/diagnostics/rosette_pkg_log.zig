@@ -47,6 +47,7 @@ const pm4_contract = @import("xenia_pm4_contract");
 const vd_swap_contract = @import("xenia_vd_swap_contract");
 const claim_reconciliation_contract = @import("xenia_claim_reconciliation_contract");
 const interrupt_callback_contract = @import("xenia_interrupt_callback_contract");
+const host_gpu_callback_contract = @import("xenia_host_gpu_callback_contract");
 const graphics_health_contract = @import("xenia_graphics_health_contract");
 const application_controller_contract = @import("xenia_application_controller_contract");
 const application_framework_contract = @import("application_framework_contract");
@@ -88,6 +89,7 @@ const all_contracts = [_]ContractCheck{
     .{ .name = "vd-swap-contract", .checkFn = vd_swap_contract.contractIsWellFormed },
     .{ .name = "claim-reconciliation-contract", .checkFn = claim_reconciliation_contract.contractIsWellFormed },
     .{ .name = "interrupt-callback-contract", .checkFn = interrupt_callback_contract.contractIsWellFormed },
+    .{ .name = "host-gpu-callback-contract", .checkFn = host_gpu_callback_contract.contractIsWellFormed },
     .{ .name = "graphics-health-contract", .checkFn = graphics_health_contract.contractIsWellFormed },
     .{ .name = "application-controller-contract", .checkFn = application_controller_contract.contractIsWellFormed },
     .{ .name = "application-framework-contract", .checkFn = application_framework_contract.contractIsWellFormed },

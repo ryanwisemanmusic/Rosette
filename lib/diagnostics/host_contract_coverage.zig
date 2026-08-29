@@ -267,6 +267,16 @@ pub const Report = struct {
     unsatisfied: u32 = 0,
     untested: u32 = 0,
 
+    /// Aggregate counts are useful for progress, but they let healthy
+    /// supporting capabilities hide an unproven GPU prerequisite. Keep the
+    /// critical counts in the same report so the integrity gate and its log
+    /// consume one snapshot rather than reconstructing a second truth.
+    critical_total: u32 = 0,
+    critical_satisfied: u32 = 0,
+    critical_degraded: u32 = 0,
+    critical_unsatisfied: u32 = 0,
+    critical_untested: u32 = 0,
+
     pub fn percent(self: Report) u32 {
         if (self.possible == 0) return 0;
         return self.earned * 100 / self.possible;
@@ -300,11 +310,25 @@ pub const Ledger = struct {
             const weight = capability.weight().value();
             result.possible += weight * 100;
             result.earned += weight * entry_status.creditPercent();
+            const critical = capability.weight() == .critical;
+            if (critical) result.critical_total += 1;
             switch (entry_status) {
-                .satisfied => result.satisfied += 1,
-                .degraded => result.degraded += 1,
-                .unsatisfied => result.unsatisfied += 1,
-                .untested => result.untested += 1,
+                .satisfied => {
+                    result.satisfied += 1;
+                    if (critical) result.critical_satisfied += 1;
+                },
+                .degraded => {
+                    result.degraded += 1;
+                    if (critical) result.critical_degraded += 1;
+                },
+                .unsatisfied => {
+                    result.unsatisfied += 1;
+                    if (critical) result.critical_unsatisfied += 1;
+                },
+                .untested => {
+                    result.untested += 1;
+                    if (critical) result.critical_untested += 1;
+                },
             }
         }
         return result;
@@ -377,6 +401,7 @@ pub const Ledger = struct {
 test "an unexercised ledger refuses to call its number a measurement" {
     const ledger = Ledger{};
     const result = ledger.report();
+    try std.testing.expectEqual(@as(u32, 11), result.critical_total);
     try std.testing.expectEqual(@as(u32, 0), result.percent());
     try std.testing.expectEqual(@as(u32, capability_count), result.untested);
     try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "not a measurement") != null);
@@ -412,6 +437,22 @@ test "untested and unsatisfied are different amounts of bad news" {
     try std.testing.expectEqual(@as(u32, 0), Status.untested.creditPercent());
     try std.testing.expectEqual(@as(u32, 0), Status.unsatisfied.creditPercent());
     try std.testing.expect(std.mem.indexOf(u8, ledger.verdict(), "shortest list") != null);
+}
+
+test "the report keeps critical capability health separate from convenience coverage" {
+    var ledger = Ledger{};
+    ledger.record(.file_read, .satisfied, "critical capability works");
+    ledger.record(.guest_swap_request, .unsatisfied, "the title never requested a swap");
+    ledger.record(.graphics_command_execution, .degraded, "native submission has no proven guest draw");
+    ledger.record(.frame_presentation, .untested, "no presentation boundary reached");
+    ledger.record(.locale_and_time, .unsatisfied, "convenience capability failed");
+
+    const result = ledger.report();
+    try std.testing.expectEqual(@as(u32, 1), result.critical_satisfied);
+    try std.testing.expectEqual(@as(u32, 1), result.critical_degraded);
+    try std.testing.expectEqual(@as(u32, 1), result.critical_unsatisfied);
+    try std.testing.expectEqual(@as(u32, 8), result.critical_untested);
+    try std.testing.expectEqual(@as(u32, 2), result.unsatisfied);
 }
 
 // "The run is at sixty percent" says nothing actionable; "threading is complete
@@ -474,14 +515,14 @@ test "a fully satisfied ledger admits the model may be incomplete" {
 test "the observed run scores low with presentation as the weakest layer" {
     var ledger = Ledger{};
     inline for (.{
-        Capability.guest_memory_mapping,   Capability.memory_protection,
+        Capability.guest_memory_mapping,      Capability.memory_protection,
         Capability.address_space_translation, Capability.thread_creation,
-        Capability.thread_scheduling,      Capability.sync_primitives,
-        Capability.file_read,              Capability.disc_image,
-        Capability.kernel_variable_surface, Capability.kernel_export_binding,
-        Capability.gpu_engine_init,        Capability.gpu_ring_buffer,
-        Capability.gpu_interrupt_callback, Capability.gpu_command_flow,
-        Capability.window_surface,         Capability.exception_unwinding,
+        Capability.thread_scheduling,         Capability.sync_primitives,
+        Capability.file_read,                 Capability.disc_image,
+        Capability.kernel_variable_surface,   Capability.kernel_export_binding,
+        Capability.gpu_engine_init,           Capability.gpu_ring_buffer,
+        Capability.gpu_interrupt_callback,    Capability.gpu_command_flow,
+        Capability.window_surface,            Capability.exception_unwinding,
         Capability.locale_and_time,
     }) |capability| ledger.record(capability, .satisfied, "observed working");
 
