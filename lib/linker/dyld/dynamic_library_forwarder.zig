@@ -1153,6 +1153,13 @@ pub const GraphicsOwnershipSnapshot = struct {
     rosette_diagnostic_frames: u64 = 0,
     rosette_host_frames: u64 = 0,
     rosette_guest_output_frames: u64 = 0,
+    /// The Vulkan format of the presenter's swapchain images. Frame custody
+    /// needs a format for every frame it holds, including the host clears, and
+    /// this is the one the presenter actually negotiated rather than a
+    /// plausible default.
+    rosette_surface_format: u32 = 0,
+    rosette_extent_width: u32 = 0,
+    rosette_extent_height: u32 = 0,
     xenia_instance: u64 = 0,
     xenia_surface: u64 = 0,
     xenia_device: u64 = 0,
@@ -1286,6 +1293,11 @@ pub const Forwarder = struct {
     guest_frontbuffer_conversions: u64 = 0,
     guest_frontbuffer_conversion_failures: u64 = 0,
     guest_frontbuffer_last_failure: ?rosette_gpu.xenos_texture.Failure = null,
+    /// Whether the front buffer being converted is one Rosette supplied rather
+    /// than one a swap named. Carried through to the published descriptor's
+    /// producer so a frame from a harness surface can never be counted as guest
+    /// output, however well founded the boundary that admitted it was.
+    guest_frontbuffer_harness_supplied: bool = false,
     /// Non-zero once a conversion produced pixels that were not all zero. The
     /// distinction the whole path turns on: a mapped, addressable, entirely
     /// empty front buffer is a GPU that never ran, and presenting it would put
@@ -8162,6 +8174,7 @@ pub const Forwarder = struct {
         height: u32,
         tiled: bool,
         endian: rosette_gpu.xenos_texture.Endian,
+        harness_supplied: bool,
     ) void {
         const surface = rosette_gpu.XenosSurface{
             .width = width,
@@ -8170,12 +8183,18 @@ pub const Forwarder = struct {
             .tiled = tiled,
         };
         if (!surface.presentable()) return;
+        // A surface a source named always displaces one Rosette supplied. The
+        // reverse would let the harness's own fallback hide the console's real
+        // framebuffer the moment a swap finally names it.
+        if (self.guest_frontbuffer_harness_supplied != harness_supplied and
+            self.guest_frontbuffer_source != 0 and harness_supplied) return;
         self.guest_frontbuffer_source = source;
         self.guest_frontbuffer_bytes = surface.requiredBytes();
         self.guest_frontbuffer_width = width;
         self.guest_frontbuffer_height = height;
         self.guest_frontbuffer_tiled = tiled;
         self.guest_frontbuffer_endian = endian;
+        self.guest_frontbuffer_harness_supplied = harness_supplied;
     }
 
     /// Convert the console front buffer into pixels the presenter can copy, and
@@ -8244,7 +8263,10 @@ pub const Forwarder = struct {
             .row_pitch_bytes = @as(u64, surface.width) * 4,
             .orientation = .top_down,
             .fit = .letterbox,
-            .producer = .xenia_host,
+            // A harness surface is Rosette's. Publishing it as `xenia_host`
+            // would put Rosette's own fallback into the counter a reader
+            // consults to find out whether the emulator produced a picture.
+            .producer = if (self.guest_frontbuffer_harness_supplied) .diagnostic else .xenia_host,
             // Set by the swap observation, never by a frame having arrived.
             .guest_swap_observed = false,
         }, self.guest_frontbuffer_source, content.digest);
@@ -8337,6 +8359,32 @@ pub const Forwarder = struct {
             self.cocoa_fallback_failures +|= 1;
             return false;
         };
+        // The window decides whether these pixels may reach it. Every fact the
+        // gate needs about the frame has just been established: the source is
+        // mapped for its whole extent, the descriptor passed the inbox's own
+        // validation, and a swap boundary either was or was not observed.
+        // Presenting first and recording afterwards would make the ledger an
+        // account of what already happened rather than the thing that decided.
+        if (comptime @hasDecl(@TypeOf(state.*), "admitWindowPresentation")) {
+            const outcome = state.admitWindowPresentation(
+                if (descriptor.guest_swap_observed) .guest_title else .xenia_host,
+                if (descriptor.guest_swap_observed) .guest_swap_present else .verified_present,
+                .{
+                    .frame_verified = true,
+                    .frontbuffer_named = true,
+                    .swap_boundary_observed = descriptor.guest_swap_observed,
+                },
+                "cocoa-metal-guest-copy",
+            );
+            if (outcome.disposition == .fault) state.faultOnWindowAdmission(outcome);
+            if (outcome.disposition != .admit) {
+                // Unconsumed: a later checkpoint whose conditions do hold gets
+                // to retry the same descriptor.
+                self.frame_inbox.release(false);
+                self.cocoa_fallback_failures +|= 1;
+                return false;
+            }
+        }
         const presented = state.native_window.presentVerifiedFrame(
             descriptor.serial,
             pixels,
@@ -8385,6 +8433,19 @@ pub const Forwarder = struct {
             ledger.guest_output_frames_presented;
     }
 
+    /// Number of guest Vulkan present requests that actually crossed the
+    /// Rosette forwarding boundary into the host driver.
+    ///
+    /// This is deliberately not `nativePresenterFramesPresented()`. The
+    /// native presenter owns the window-frame ledger, while this counter is
+    /// recorded by the guest Vulkan forwarding path immediately after it
+    /// invokes the real `vkQueuePresentKHR`. A request can therefore be
+    /// observed here before a drawable is completed, and a completed frame
+    /// must never be used as a proxy for the request that caused it.
+    pub fn guestVulkanPresentRequests(self: *const Forwarder) u64 {
+        return self.frame_provenance.native_present_requests;
+    }
+
     pub fn graphicsOwnershipSnapshot(self: *const Forwarder) GraphicsOwnershipSnapshot {
         const presenter = &self.native_presenter;
         const xenia = &self.real_vulkan;
@@ -8401,6 +8462,9 @@ pub const Forwarder = struct {
             .rosette_diagnostic_frames = presenter.ledger.diagnostic_frames_presented,
             .rosette_host_frames = presenter.ledger.host_frames_presented,
             .rosette_guest_output_frames = presenter.ledger.guest_output_frames_presented,
+            .rosette_surface_format = presenter.surface_format.format,
+            .rosette_extent_width = presenter.extent.width,
+            .rosette_extent_height = presenter.extent.height,
             .xenia_instance = if (xenia.instance) |value| @intFromPtr(value) else 0,
             .xenia_surface = xenia.surface,
             .xenia_device = if (xenia.device) |value| @intFromPtr(value) else 0,
@@ -8565,6 +8629,36 @@ pub const Forwarder = struct {
         return self.guest_frontbuffer_nonzero_frames != 0;
     }
 
+    /// Whether the console-framebuffer conversion has ever refused a surface
+    /// for its *format*, as opposed to for its size or its mapping.
+    ///
+    /// The swap gate needs the distinction: a truncated read is an ordering
+    /// problem that a later scan can fix, and an unsupported format is a
+    /// capability Rosette does not have and will not acquire by retrying.
+    /// How many frame generations any producer has published into the inbox.
+    ///
+    /// The output handoff invariant needs a number that is zero only when
+    /// *nothing* has ever produced a frame — not a presented count, which a
+    /// diagnostic clear also advances.
+    /// What this host advertises for a texture format, or null when no
+    /// physical device has been selected yet.
+    ///
+    /// Rosette's presenter owns a real `VkPhysicalDevice`, so the question of
+    /// whether the host has `A2B10G10R10_SNORM_PACK32` is one Rosette answers
+    /// rather than one it reads out of the emulator's log.
+    pub fn presenterFormatFeatures(self: *Forwarder, format: u32) ?u32 {
+        return self.native_presenter.formatFeatures(format);
+    }
+
+    pub fn publishedFrameGenerations(self: *const Forwarder) u64 {
+        return self.frame_inbox.published;
+    }
+
+    pub fn guestFrontBufferFormatRefused(self: *const Forwarder) bool {
+        return self.guest_frontbuffer_conversion_failures != 0 and
+            self.guest_frontbuffer_last_failure == .unsupported_format;
+    }
+
     /// What the console-framebuffer path has done, and where it stopped.
     ///
     /// Printed on its own line rather than folded into the Vulkan lifecycle,
@@ -8593,20 +8687,33 @@ pub const Forwarder = struct {
                 ledger.verdict(),
             },
         );
-        inline for (@typeInfo(tier_consistency.Facet).@"enum".fields) |field| {
-            const facet: tier_consistency.Facet = @enumFromInt(field.value);
-            const served = ledger.tier(facet);
-            if (served != .unknown or ledger.servedBothWays(facet)) machoCapturePrint(
-                "  facet {s: <24} {s}{s}\n",
-                .{
-                    facet.label(),
-                    served.label(),
-                    if (ledger.servedBothWays(facet))
-                        " (SERVED BOTH WAYS — the answer depends on which path the caller took to ask)"
-                    else
-                        "",
-                },
+        // A wholly real stack has no seam, and the seam is the only thing the
+        // per-facet list exists to locate. Nineteen lines saying `real` on
+        // every checkpoint is the success case printing itself out; the header
+        // above already carries `real=19 modelled=0`, which is the whole fact.
+        // The list returns in full the instant one facet is served the other
+        // way, which is exactly when a reader needs to know which one.
+        if (ledger.whollyReal()) {
+            machoCapturePrint(
+                "  facet detail collapsed: all {d} facets served real, no facet served both ways. The per-facet list prints in full the moment any facet is served modelled or both ways\n",
+                .{tier_consistency.facet_count},
             );
+        } else {
+            inline for (@typeInfo(tier_consistency.Facet).@"enum".fields) |field| {
+                const facet: tier_consistency.Facet = @enumFromInt(field.value);
+                const served = ledger.tier(facet);
+                if (served != .unknown or ledger.servedBothWays(facet)) machoCapturePrint(
+                    "  facet {s: <24} {s}{s}\n",
+                    .{
+                        facet.label(),
+                        served.label(),
+                        if (ledger.servedBothWays(facet))
+                            " (SERVED BOTH WAYS — the answer depends on which path the caller took to ask)"
+                        else
+                            "",
+                    },
+                );
+            }
         }
         var splits: [tier_consistency.pairs.len]tier_consistency.Split = undefined;
         for (ledger.splits(&splits)) |split| {
@@ -10045,6 +10152,18 @@ test "Vulkan presenter lifecycle requires UI surface before swapchain" {
     try std.testing.expectEqual(@as(u64, 1), forwarder.vulkan_presenter_bind_attempts);
     try std.testing.expectEqual(@as(u64, 0), forwarder.vulkan_presenter_bind_failures);
     try std.testing.expectEqual(@as(u64, 0), forwarder.vulkan_presenter_off_ui_calls);
+}
+
+test "guest present requests stay separate from completed presenter frames" {
+    var forwarder = Forwarder{};
+    forwarder.frame_provenance.native_present_requests = 1;
+    forwarder.native_presenter.ledger.diagnostic_frames_presented = 2;
+
+    // A host-driver request is the witness for presenter_entry. The two
+    // completed diagnostic frames answer frame_presented and must not be
+    // substituted for that request.
+    try std.testing.expectEqual(@as(u64, 1), forwarder.guestVulkanPresentRequests());
+    try std.testing.expectEqual(@as(u64, 2), forwarder.nativePresenterFramesPresented());
 }
 
 test "Vulkan presenter rejects a Metal layer not owned by the native window bridge" {
