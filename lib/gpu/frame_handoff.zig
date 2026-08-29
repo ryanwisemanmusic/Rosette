@@ -127,6 +127,14 @@ pub const Descriptor = struct {
     guest_pixels: bool = false,
     guest_requested_present: bool = false,
     synthetic_guest_control: bool = false,
+    /// How many presentations this one identity accounts for.
+    ///
+    /// Custody is fed on the checkpoint cadence and the presenter puts frames
+    /// up between checkpoints, so one identity can legitimately stand for
+    /// several presentations of the same picture. Stating the coverage is what
+    /// makes "every frame the window showed is in custody" an exact claim
+    /// instead of one that drifts by a frame per run.
+    presentations_covered: u64 = 1,
 
     pub fn requiredBytes(self: Descriptor) ?u64 {
         const bpp = self.format.bytesPerPixel() orelse return null;
@@ -174,7 +182,8 @@ pub const Descriptor = struct {
             self.producer == other.producer and self.content_digest == other.content_digest and
             self.guest_pixels == other.guest_pixels and
             self.guest_requested_present == other.guest_requested_present and
-            self.synthetic_guest_control == other.synthetic_guest_control;
+            self.synthetic_guest_control == other.synthetic_guest_control and
+            self.presentations_covered == other.presentations_covered;
     }
 };
 
@@ -257,6 +266,10 @@ pub const max_frames: usize = 64;
 
 pub const Summary = struct {
     offered: u64 = 0,
+    /// Presentations accounted for, which is what "every frame the window
+    /// showed is in custody" is measured against — not the number of custody
+    /// records, which can stand for more than one presentation each.
+    presentations_covered: u64 = 0,
     duplicates: u64 = 0,
     rejected: u64 = 0,
     conflicts: u64 = 0,
@@ -281,6 +294,7 @@ pub const Ledger = struct {
     acquired: u64 = 0,
     submitted: u64 = 0,
     presented: u64 = 0,
+    presentations_covered: u64 = 0,
     authentic_guest: u64 = 0,
     guest_pixels_host_cadence: u64 = 0,
     diagnostic: u64 = 0,
@@ -382,6 +396,7 @@ pub const Ledger = struct {
         record.presented_step = step;
         record.frame_class = class;
         self.presented +|= 1;
+        self.presentations_covered +|= @max(record.descriptor.presentations_covered, 1);
         self.last_class = class;
         switch (class) {
             .authentic_guest_present => self.authentic_guest +|= 1,
@@ -421,6 +436,7 @@ pub const Ledger = struct {
     pub fn summary(self: *const Ledger) Summary {
         return .{
             .offered = self.offered,
+            .presentations_covered = self.presentations_covered,
             .duplicates = self.duplicates,
             .rejected = self.rejected,
             .conflicts = self.conflicts,
@@ -617,4 +633,39 @@ test "one identity cannot describe a host clear and a guest buffer" {
     reinterpreted.payload = .guest_memory;
     reinterpreted.source_length = 1280 * 720 * 4;
     try std.testing.expectEqual(OfferResult.conflict, ledger.offer(reinterpreted, 2));
+}
+
+test "one custody record can account for several presentations" {
+    var ledger = Ledger{};
+    var descriptor = diagnosticDescriptor();
+    descriptor.presentations_covered = 3;
+    _ = ledger.offer(descriptor, 1);
+    try std.testing.expect(ledger.validateFrame(descriptor.identity, .rosette_runtime, 2));
+    try std.testing.expect(ledger.acquire(descriptor.identity, .rosette_runtime, 3));
+    try std.testing.expect(ledger.submit(descriptor.identity, .rosette_runtime, 4));
+    _ = ledger.present(descriptor.identity, .rosette_runtime, true, 5);
+    const summary = ledger.summary();
+    try std.testing.expectEqual(@as(u64, 1), summary.presented);
+    try std.testing.expectEqual(@as(u64, 3), summary.presentations_covered);
+}
+
+test "coverage defaults to one and is never zero" {
+    var ledger = Ledger{};
+    var descriptor = diagnosticDescriptor();
+    descriptor.presentations_covered = 0;
+    _ = ledger.offer(descriptor, 1);
+    _ = ledger.validateFrame(descriptor.identity, .rosette_runtime, 2);
+    _ = ledger.acquire(descriptor.identity, .rosette_runtime, 3);
+    _ = ledger.submit(descriptor.identity, .rosette_runtime, 4);
+    _ = ledger.present(descriptor.identity, .rosette_runtime, true, 5);
+    try std.testing.expectEqual(@as(u64, 1), ledger.summary().presentations_covered);
+}
+
+test "one identity cannot silently change how much it covers" {
+    var ledger = Ledger{};
+    const descriptor = diagnosticDescriptor();
+    try std.testing.expectEqual(OfferResult.accepted, ledger.offer(descriptor, 1));
+    var wider = descriptor;
+    wider.presentations_covered = 4;
+    try std.testing.expectEqual(OfferResult.conflict, ledger.offer(wider, 2));
 }

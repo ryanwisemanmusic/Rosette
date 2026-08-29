@@ -947,6 +947,22 @@ pub const Presenter = struct {
         };
     }
 
+    /// What the driver advertises for a format with optimal tiling, or null
+    /// when there is no physical device to ask.
+    ///
+    /// Rosette owns a real `VkPhysicalDevice`, so it can answer "does this host
+    /// have `A2B10G10R10_SNORM_PACK32`" itself instead of taking the emulator's
+    /// word for it. The null is load-bearing: an unasked format and an absent
+    /// one are different facts, and a zero for both would collapse them.
+    pub fn formatFeatures(self: *Presenter, format: u32) ?u32 {
+        if (self.physical_device == null) return null;
+        const entries = &(self.instance_entries orelse return null);
+        var properties = abi.FormatProperties{};
+        entries.get_format_properties(self.physical_device, format, &properties);
+        self.ledger.noteNativeDriverCall();
+        return properties.optimal_tiling_features;
+    }
+
     /// Whether this format can be blitted, asked rather than assumed. A blit
     /// the driver has not advertised is a validation error, and the fallback —
     /// an exact-extent copy — is correct but cannot rescale, so which one is

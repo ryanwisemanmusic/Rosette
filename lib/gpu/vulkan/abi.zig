@@ -207,6 +207,10 @@ pub const ACCESS_TRANSFER_READ_BIT: u32 = 0x0000_0800;
 
 /// Blitting is not universally supported for every format and tiling, and a
 /// blit the driver cannot do is a validation error rather than a soft failure.
+/// `VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT`. The bit that decides whether a
+/// texture format can back a sampled image at all, which is the question the
+/// texture-format substitution ladder asks of every candidate.
+pub const FORMAT_FEATURE_SAMPLED_IMAGE_BIT: u32 = 0x0000_0001;
 pub const FORMAT_FEATURE_BLIT_SRC_BIT: u32 = 0x0000_0400;
 pub const FORMAT_FEATURE_BLIT_DST_BIT: u32 = 0x0000_0800;
 pub const FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT: u32 = 0x0000_1000;

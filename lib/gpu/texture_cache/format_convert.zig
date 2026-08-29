@@ -17,11 +17,20 @@
 
 const std = @import("std");
 const contract = @import("xenia_texture_contract");
+const texture_format_contract = @import("xenia_texture_format_contract");
 
 pub const Error = error{
     UnsupportedConversion,
     BufferTooSmall,
 };
+
+/// Runtime-facing bridge to the package's signed packed-10 conversion. The
+/// package owns the reviewed bit-level semantics; this library owns the
+/// texture-cache-facing entry point so a future Vulkan, Metal, or CPU upload
+/// path cannot invent a second interpretation of the same Xenos word.
+pub fn unpackSigned2101010(word: u32) [4]i16 {
+    return texture_format_contract.unpackSigned2_10_10_10(word);
+}
 
 /// Channel order, independent of byte order.
 pub const ChannelOrder = enum {
@@ -225,4 +234,16 @@ test "a no-op conversion leaves a run untouched" {
     var destination: [2]u32 = undefined;
     try convertRun(&source, &destination, .none, .rgba, .rgba);
     try std.testing.expectEqualSlices(u32, &source, &destination);
+}
+
+test "signed packed 10 conversion delegates to the package contract" {
+    const word = (@as(u32, 0x1FF) << 0) |
+        (@as(u32, 0x200) << 10) |
+        (@as(u32, 0x201) << 20) |
+        (@as(u32, 0x3) << 30);
+    const rgba = unpackSigned2101010(word);
+    try std.testing.expectEqual(@as(i16, 32767), rgba[0]);
+    try std.testing.expectEqual(@as(i16, -32767), rgba[1]);
+    try std.testing.expectEqual(@as(i16, -32767), rgba[2]);
+    try std.testing.expectEqual(@as(i16, -32767), rgba[3]);
 }

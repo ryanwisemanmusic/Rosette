@@ -278,6 +278,19 @@ pub const Ledger = struct {
         return null;
     }
 
+    /// How many distinct swap boundaries have been offered to the gate.
+    ///
+    /// Distinct rather than cumulative: the integrity gate compares this
+    /// against how many boundaries the emulator reached, and those are counts
+    /// of boundaries, not of checkpoints that re-observed them.
+    pub fn touchedBoundaries(self: *const Ledger) u64 {
+        var count: u64 = 0;
+        for (self.swaps) |boundary| {
+            if (boundary.touched()) count += 1;
+        }
+        return count;
+    }
+
     pub fn summary(self: *const Ledger) Summary {
         var result = Summary{
             .observations = self.observations,
@@ -576,4 +589,16 @@ test "the whole swap ladder is admitted end to end when every fact holds" {
     try std.testing.expect(ledger.swapFrontier() == null);
     try std.testing.expectEqual(@as(u64, 0), ledger.faults);
     try std.testing.expectEqual(@as(u64, swap_boundary_count), ledger.swap_admissions);
+}
+
+test "touched boundaries count boundaries, not checkpoints" {
+    var ledger = Ledger{};
+    const evidence = SwapEvidence{ .provenance = .intercepted_execution };
+    var repeat: u64 = 0;
+    while (repeat < 5) : (repeat += 1) {
+        _ = ledger.admitSwap(.vd_swap_entry, evidence, repeat);
+        _ = ledger.admitSwap(.xe_swap_encoded, evidence, repeat);
+    }
+    try std.testing.expectEqual(@as(u64, 2), ledger.touchedBoundaries());
+    try std.testing.expectEqual(@as(u64, 10), ledger.swap_observations);
 }

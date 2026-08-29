@@ -173,6 +173,9 @@ pub const FrameSnapshot = struct {
     content_digest: u64 = 0,
     guest_swap_observed: bool = false,
     consumed: bool = false,
+    /// Presentations this one snapshot stands for. Greater than one when the
+    /// presenter put several frames up between two reconciles.
+    presentations_covered: u64 = 1,
 
     pub fn identity(self: FrameSnapshot, run: u64) frame_handoff.Identity {
         return .{
@@ -199,6 +202,7 @@ pub const FrameSnapshot = struct {
             .content_digest = self.content_digest,
             .guest_pixels = self.origin.carriesGuestPixels(),
             .guest_requested_present = self.guest_swap_observed,
+            .presentations_covered = @max(self.presentations_covered, 1),
         };
     }
 
@@ -673,6 +677,12 @@ pub const Runtime = struct {
             source.rosette_vulkan.swapchain != 0;
         const sink = if (through_vulkan) source.rosette_vulkan.swapchain else source.native.metal_layer;
         if (sink == 0) return null;
+        // Every presentation since the last reconcile, not just the newest one.
+        // Crediting one frame per checkpoint left the window ahead of custody
+        // by however many clears the presenter fitted in between, and a window
+        // that is ahead of custody by even one frame has shown a picture nobody
+        // can attribute.
+        const covered = presented - self.last_diagnostic_custody;
         self.last_diagnostic_custody = presented;
         return .{
             .source_address = sink,
@@ -689,6 +699,7 @@ pub const Runtime = struct {
             // The counter only advances when a present completed, so the frame
             // is consumed by construction.
             .consumed = true,
+            .presentations_covered = covered,
         };
     }
 
@@ -1198,4 +1209,36 @@ test "a window with no drawable facts refuses custody rather than inventing them
     snapshot.native.drawable_width = 0;
     try std.testing.expect(!runtime.reconcile(snapshot).diagnostic_custody);
     try std.testing.expectEqual(@as(u64, 0), runtime.frames.summary().offered);
+}
+
+test "custody accounts for every presentation, not one per checkpoint" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    // Three frames went up between this reconcile and the last.
+    snapshot.rosette_vulkan.diagnostic_frames = 3;
+    _ = runtime.reconcile(snapshot);
+    try std.testing.expectEqual(@as(u64, 1), runtime.frames.summary().presented);
+    try std.testing.expectEqual(@as(u64, 3), runtime.frames.summary().presentations_covered);
+    // Four more before the next one.
+    snapshot.rosette_vulkan.diagnostic_frames = 7;
+    _ = runtime.reconcile(snapshot);
+    try std.testing.expectEqual(@as(u64, 2), runtime.frames.summary().presented);
+    try std.testing.expectEqual(@as(u64, 7), runtime.frames.summary().presentations_covered);
+}
+
+test "coverage never runs behind what the window showed" {
+    var runtime = Runtime{};
+    runtime.configure(.verified_guest_fallback);
+    var snapshot = completeSnapshot();
+    var presented: u64 = 0;
+    var checkpoint: u64 = 0;
+    while (checkpoint < 20) : (checkpoint += 1) {
+        // An irregular cadence, exactly as a real presenter produces.
+        presented += 1 + (checkpoint % 3);
+        snapshot.rosette_vulkan.diagnostic_frames = presented;
+        snapshot.step = checkpoint * 1000;
+        _ = runtime.reconcile(snapshot);
+        try std.testing.expectEqual(presented, runtime.frames.summary().presentations_covered);
+    }
 }
