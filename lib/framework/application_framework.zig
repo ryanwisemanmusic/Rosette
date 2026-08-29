@@ -7,6 +7,10 @@
 
 const std = @import("std");
 const contract = @import("application_framework_contract");
+const xenia_launch_assist_contract = @import("xenia_launch_assist_contract");
+const xenia_launch_assist = @import("xenia_launch_assist.zig");
+const xenia_host_gpu_callback_contract = @import("xenia_host_gpu_callback_contract");
+const xenia_host_gpu_callback = @import("xenia_host_gpu_callback.zig");
 
 pub const schema = contract;
 pub const max_events: usize = 1024;
@@ -68,6 +72,10 @@ pub const Framework = struct {
     requests_denied: u64 = 0,
     next_request_id: u64 = 1,
 
+    /// Events whose master/subowner pair this contract does not permit. Rosette
+    /// is the only master owner of the process; a hosted subsystem
+    /// substantiates its own truth beneath it.
+    ownership_violations: u64 = 0,
     equivalence_checks: u64 = 0,
     equivalence_matches: u64 = 0,
     equivalence_mismatches: u64 = 0,
@@ -76,6 +84,20 @@ pub const Framework = struct {
 
     adapters: [max_adapters]Adapter = [_]Adapter{.{}} ** max_adapters,
     adapter_count: usize = 0,
+
+    /// Xenia may ask Rosette to substantiate a narrowly defined host-side
+    /// startup operation. The policy predicate is package-owned; this audit
+    /// state only records the request and whether the adapter's report was
+    /// coherent with the response.
+    xenia_launch_assist: xenia_launch_assist.Audit = .{},
+
+    /// Host callback installation is a separate policy from observation.
+    /// Xenia's Mach-O process route enables the provider by default so the
+    /// bounded compatibility seam is discoverable; the process boundary can
+    /// still disable it with ROSETTE_XENIA_HOST_GPU_CALLBACK=off. The package
+    /// contract remains the final authority for every mutation.
+    xenia_host_gpu_callback: xenia_host_gpu_callback.Audit = .{},
+    xenia_host_gpu_callback_enabled: bool = false,
 
     /// Configure the framework at a process boundary. Invalid enum values
     /// fail closed instead of being reinterpreted as a newer command.
@@ -95,6 +117,7 @@ pub const Framework = struct {
         self.config.schema = contract.schema_version;
         self.mode = mode;
         self.enabled = mode != .disabled;
+        self.xenia_host_gpu_callback_enabled = false;
         self.capabilities = if (self.enabled) raw.capabilities else 0;
         self.trace_control_flow = raw.trace_control_flow != 0;
         self.trace_memory = raw.trace_memory != 0;
@@ -126,6 +149,16 @@ pub const Framework = struct {
         _ = self.configure(config);
     }
 
+    /// Enable the host GPU callback provider independently of trace capture.
+    /// Keeping this separate from framework activation prevents a generic
+    /// framework enablement from silently granting the capability to a
+    /// non-Xenia process; the Mach-O route supplies the Xenia-only policy.
+    pub fn setXeniaHostGpuCallbackEnabled(self: *Framework, enabled: bool) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.xenia_host_gpu_callback_enabled = enabled and self.enabled;
+    }
+
     pub fn disable(self: *Framework) void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -139,6 +172,7 @@ pub const Framework = struct {
         self.trace_control_flow = false;
         self.trace_memory = false;
         self.trace_graphics = false;
+        self.xenia_host_gpu_callback_enabled = false;
         self.trace_mask.store(0, .release);
         self.config = .{
             .size = @sizeOf(contract.Config),
@@ -216,7 +250,8 @@ pub const Framework = struct {
         self.emitNamedUnlocked(.{
             .kind = @intFromEnum(contract.EventKind.process),
             .truth = @intFromEnum(contract.Truth.observed),
-            .owner = @intFromEnum(contract.Owner.rosette),
+            .owner = @intFromEnum(contract.attribute(contract.Owner.rosette).owner),
+            .subowner = @intFromEnum(contract.attribute(contract.Owner.rosette).subowner),
             .domain = @intFromEnum(contract.Domain.process),
             .value_kind = @intFromEnum(contract.ValueKind.bytes_hash),
             .actual = self.application_id,
@@ -245,7 +280,8 @@ pub const Framework = struct {
             self.emitNamedUnlocked(.{
                 .kind = @intFromEnum(contract.EventKind.state_observation),
                 .truth = @intFromEnum(contract.Truth.observed),
-                .owner = @intFromEnum(contract.Owner.external_adapter),
+                .owner = @intFromEnum(contract.attribute(contract.Owner.external_adapter).owner),
+                .subowner = @intFromEnum(contract.attribute(contract.Owner.external_adapter).subowner),
                 .domain = @intFromEnum(contract.Domain.framework),
                 .value_kind = @intFromEnum(contract.ValueKind.bytes_hash),
                 .actual = capabilities,
@@ -265,6 +301,15 @@ pub const Framework = struct {
     fn emitUnlocked(self: *Framework, event: contract.Event) void {
         if (!self.enabled) return;
         var stored = event;
+        // Checked at the one place every event passes through rather than at
+        // each of the ten that construct one. An event with two master owners
+        // is how two accounts of the same fact drift apart while neither looks
+        // wrong on its own, so it is counted rather than corrected: correcting
+        // it here would hide the caller that produced it.
+        if (!contract.ownershipIsWellFormed(
+            @enumFromInt(stored.owner),
+            @enumFromInt(stored.subowner),
+        )) self.ownership_violations +|= 1;
         stored.size = @sizeOf(contract.Event);
         stored.schema = contract.schema_version;
         self.sequence +|= 1;
@@ -307,7 +352,8 @@ pub const Framework = struct {
         self.emitNamedUnlocked(.{
             .kind = @intFromEnum(contract.EventKind.function_enter),
             .truth = @intFromEnum(contract.Truth.observed),
-            .owner = @intFromEnum(owner),
+            .owner = @intFromEnum(contract.attribute(owner).owner),
+            .subowner = @intFromEnum(contract.attribute(owner).subowner),
             .domain = @intFromEnum(domain),
             .value_kind = @intFromEnum(contract.ValueKind.address),
             .guest_step = guest_step,
@@ -324,7 +370,8 @@ pub const Framework = struct {
         self.emitNamedUnlocked(.{
             .kind = @intFromEnum(contract.EventKind.function_exit),
             .truth = @intFromEnum(contract.Truth.observed),
-            .owner = @intFromEnum(owner),
+            .owner = @intFromEnum(contract.attribute(owner).owner),
+            .subowner = @intFromEnum(contract.attribute(owner).subowner),
             .domain = @intFromEnum(domain),
             .value_kind = @intFromEnum(contract.ValueKind.scalar),
             .guest_step = guest_step,
@@ -341,7 +388,8 @@ pub const Framework = struct {
         self.emitNamedUnlocked(.{
             .kind = @intFromEnum(contract.EventKind.control_transfer),
             .truth = @intFromEnum(contract.Truth.observed),
-            .owner = @intFromEnum(owner),
+            .owner = @intFromEnum(contract.attribute(owner).owner),
+            .subowner = @intFromEnum(contract.attribute(owner).subowner),
             .domain = @intFromEnum(contract.Domain.control_flow),
             .value_kind = @intFromEnum(contract.ValueKind.address),
             .guest_step = guest_step,
@@ -361,7 +409,8 @@ pub const Framework = struct {
         self.emitNamedUnlocked(.{
             .kind = @intFromEnum(contract.EventKind.state_observation),
             .truth = @intFromEnum(contract.Truth.observed),
-            .owner = @intFromEnum(owner),
+            .owner = @intFromEnum(contract.attribute(owner).owner),
+            .subowner = @intFromEnum(contract.attribute(owner).subowner),
             .domain = @intFromEnum(domain),
             .value_kind = @intFromEnum(contract.ValueKind.scalar),
             .guest_step = guest_step,
@@ -388,7 +437,8 @@ pub const Framework = struct {
             self.emitNamedUnlocked(.{
                 .kind = @intFromEnum(contract.EventKind.equivalence),
                 .truth = @intFromEnum(contract.Truth.observed),
-                .owner = @intFromEnum(owner),
+                .owner = @intFromEnum(contract.attribute(owner).owner),
+                .subowner = @intFromEnum(contract.attribute(owner).subowner),
                 .domain = @intFromEnum(domain),
                 .value_kind = @intFromEnum(contract.ValueKind.scalar),
                 .equivalence = @intFromEnum(result),
@@ -410,7 +460,8 @@ pub const Framework = struct {
         self.emitNamedUnlocked(.{
             .kind = @intFromEnum(contract.EventKind.scheduler),
             .truth = @intFromEnum(contract.Truth.observed),
-            .owner = @intFromEnum(contract.Owner.rosette),
+            .owner = @intFromEnum(contract.attribute(contract.Owner.rosette).owner),
+            .subowner = @intFromEnum(contract.attribute(contract.Owner.rosette).subowner),
             .domain = @intFromEnum(contract.Domain.scheduler),
             .value_kind = @intFromEnum(contract.ValueKind.enum_value),
             .guest_step = guest_step,
@@ -418,6 +469,176 @@ pub const Framework = struct {
             .actual = action,
             .auxiliary = blocker,
         }, "application-controller", detail);
+    }
+
+    pub fn queryXeniaLaunchAssist(
+        self: *Framework,
+        assist_request: xenia_launch_assist_contract.Request,
+    ) xenia_launch_assist_contract.Response {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const host_control_enabled = self.enabled and
+            (self.mode == .host_control or self.mode == .experimental_control);
+        const response = self.xenia_launch_assist.query(assist_request, host_control_enabled);
+        if (self.enabled) {
+            const attribution = contract.attribute(.xenia_kernel);
+            self.emitNamedUnlocked(.{
+                .kind = @intFromEnum(contract.EventKind.state_observation),
+                .truth = @intFromEnum(if (response.decision == @intFromEnum(xenia_launch_assist_contract.Decision.allow))
+                    contract.Truth.requested
+                else
+                    contract.Truth.rejected),
+                .owner = @intFromEnum(attribution.owner),
+                .subowner = @intFromEnum(attribution.subowner),
+                .domain = @intFromEnum(contract.Domain.kernel),
+                .value_kind = @intFromEnum(contract.ValueKind.enum_value),
+                .guest_step = assist_request.guest_step,
+                .subject = assist_request.title_id,
+                .expected = response.actions,
+                .actual = response.decision,
+                .mask = response.proof_mask,
+                .auxiliary = response.reason,
+            }, "xenia-launch-assist", "Rosette launch-assist policy query");
+        }
+        return response;
+    }
+
+    pub fn reportXeniaLaunchAssist(
+        self: *Framework,
+        assist_request: xenia_launch_assist_contract.Request,
+        response: xenia_launch_assist_contract.Response,
+        applied_actions: u32,
+        status: xenia_launch_assist_contract.ApplyStatus,
+    ) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const coherent = self.xenia_launch_assist.report(
+            assist_request,
+            response,
+            applied_actions,
+            status,
+        );
+        if (self.enabled) {
+            const attribution = contract.attribute(.xenia_kernel);
+            self.emitNamedUnlocked(.{
+                .kind = @intFromEnum(contract.EventKind.state_observation),
+                .truth = @intFromEnum(if (coherent and status == .applied)
+                    contract.Truth.applied
+                else if (coherent)
+                    contract.Truth.observed
+                else
+                    contract.Truth.rejected),
+                .owner = @intFromEnum(attribution.owner),
+                .subowner = @intFromEnum(attribution.subowner),
+                .domain = @intFromEnum(contract.Domain.kernel),
+                .value_kind = @intFromEnum(contract.ValueKind.enum_value),
+                .guest_step = assist_request.guest_step,
+                .subject = assist_request.title_id,
+                .expected = response.actions,
+                .actual = applied_actions,
+                .mask = response.proof_mask,
+                .auxiliary = @as(u64, @intFromEnum(status)) |
+                    (@as(u64, @intFromBool(coherent)) << 8),
+            }, "xenia-launch-assist", "Xenia launch-assist application report");
+        }
+        return coherent;
+    }
+
+    pub fn queryXeniaHostGpuCallback(
+        self: *Framework,
+        callback_request: xenia_host_gpu_callback_contract.Request,
+    ) xenia_host_gpu_callback_contract.Response {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const host_control_enabled = self.enabled and
+            (self.mode == .host_control or self.mode == .experimental_control);
+        const response = self.xenia_host_gpu_callback.query(
+            callback_request,
+            host_control_enabled,
+            self.xenia_host_gpu_callback_enabled,
+        );
+        if (self.enabled) {
+            const attribution = contract.attribute(.xenia_gpu);
+            self.emitNamedUnlocked(.{
+                .kind = @intFromEnum(contract.EventKind.state_observation),
+                .truth = @intFromEnum(if (response.decision == @intFromEnum(xenia_host_gpu_callback_contract.Decision.allow))
+                    contract.Truth.requested
+                else
+                    contract.Truth.rejected),
+                .owner = @intFromEnum(attribution.owner),
+                .subowner = @intFromEnum(attribution.subowner),
+                .domain = @intFromEnum(contract.Domain.graphics_backend),
+                .value_kind = @intFromEnum(contract.ValueKind.enum_value),
+                .guest_step = callback_request.guest_step,
+                .guest_rip = callback_request.entry_point,
+                .subject = callback_request.title_id,
+                .expected = response.actions,
+                .actual = response.decision,
+                .mask = response.proof_mask,
+                .auxiliary = response.reason,
+            }, "xenia-host-gpu-callback", "Rosette host GPU callback policy query");
+        }
+        return response;
+    }
+
+    pub fn reportXeniaHostGpuCallback(
+        self: *Framework,
+        callback_request: xenia_host_gpu_callback_contract.Request,
+        response: xenia_host_gpu_callback_contract.Response,
+        applied_actions: u32,
+        status: xenia_host_gpu_callback_contract.ApplyStatus,
+    ) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const coherent = self.xenia_host_gpu_callback.report(
+            callback_request,
+            response,
+            applied_actions,
+            status,
+        );
+        if (self.enabled) {
+            const attribution = contract.attribute(.xenia_gpu);
+            self.emitNamedUnlocked(.{
+                .kind = @intFromEnum(contract.EventKind.state_observation),
+                .truth = @intFromEnum(if (coherent and status == .applied)
+                    contract.Truth.applied
+                else if (coherent)
+                    contract.Truth.observed
+                else
+                    contract.Truth.rejected),
+                .owner = @intFromEnum(attribution.owner),
+                .subowner = @intFromEnum(attribution.subowner),
+                .domain = @intFromEnum(contract.Domain.graphics_backend),
+                .value_kind = @intFromEnum(contract.ValueKind.enum_value),
+                .guest_step = callback_request.guest_step,
+                .guest_rip = callback_request.entry_point,
+                .subject = callback_request.title_id,
+                .expected = response.actions,
+                .actual = applied_actions,
+                .mask = response.proof_mask,
+                .auxiliary = @as(u64, @intFromEnum(status)) |
+                    (@as(u64, @intFromBool(coherent)) << 8),
+            }, "xenia-host-gpu-callback", "Xenia host GPU callback application report");
+        }
+        return coherent;
+    }
+
+    pub fn xeniaHostGpuCallbackSnapshot(self: *const Framework) xenia_host_gpu_callback.Snapshot {
+        const mutable = @constCast(self);
+        mutable.lock.lock();
+        defer mutable.lock.unlock();
+        return self.xenia_host_gpu_callback.snapshot();
+    }
+
+    pub fn xeniaHostGpuCallbackEnabled(self: *const Framework) bool {
+        const mutable = @constCast(self);
+        mutable.lock.lock();
+        defer mutable.lock.unlock();
+        return self.xenia_host_gpu_callback_enabled;
     }
 
     pub fn request(self: *Framework, raw: contract.Request) contract.RequestResult {
@@ -500,7 +721,8 @@ pub const Framework = struct {
                 self.emitUnlocked(.{
                     .kind = @intFromEnum(contract.EventKind.command_result),
                     .truth = @intFromEnum(if (status == .applied) contract.Truth.applied else contract.Truth.rejected),
-                    .owner = @intFromEnum(contract.Owner.rosette),
+                    .owner = @intFromEnum(contract.attribute(contract.Owner.rosette).owner),
+                    .subowner = @intFromEnum(contract.attribute(contract.Owner.rosette).subowner),
                     .domain = @intFromEnum(contract.Domain.framework),
                     .value_kind = @intFromEnum(contract.ValueKind.enum_value),
                     .actual = @intFromEnum(status),
@@ -524,6 +746,11 @@ pub const Framework = struct {
             (self.event_cursor + ordinal) % max_events;
         out.* = self.events[index];
         return true;
+    }
+
+    /// Events recorded with an ownership pair the contract does not permit.
+    pub fn ownershipViolations(self: *const Framework) u64 {
+        return self.ownership_violations;
     }
 
     pub fn snapshot(self: *const Framework) contract.Snapshot {
@@ -569,7 +796,8 @@ pub const Framework = struct {
         self.emitUnlocked(.{
             .kind = @intFromEnum(contract.EventKind.command_request),
             .truth = @intFromEnum(if (status_raw == @intFromEnum(contract.RequestStatus.queued)) contract.Truth.requested else contract.Truth.rejected),
-            .owner = @intFromEnum(contract.Owner.external_adapter),
+            .owner = @intFromEnum(contract.attribute(contract.Owner.external_adapter).owner),
+            .subowner = @intFromEnum(contract.attribute(contract.Owner.external_adapter).subowner),
             .domain = @intFromEnum(if (command.isGuestMutation()) contract.Domain.kernel else contract.Domain.framework),
             .value_kind = @intFromEnum(contract.ValueKind.enum_value),
             .guest_step = request_record.guest_step,
@@ -705,4 +933,45 @@ test "bounded event ring reports drops rather than losing the fact" {
     var event: contract.Event = .{};
     try std.testing.expect(framework.readEvent(0, &event));
     try std.testing.expectEqual(@as(u64, 3), event.actual);
+}
+
+test "every event the framework emits carries one master owner" {
+    var framework = Framework{};
+    framework.configureForProcess(true, true, true, true);
+    framework.observeValue(.xenia_gpu, .pm4, 0x10, 0x20, 100, 0x200, "draw", "detail");
+    framework.observeValue(.guest, .vd_swap, 0x11, 0x21, 101, 0x201, "swap", "detail");
+    _ = framework.compareValue(.xenia_presenter, .presenter, 1, 2, 2, 0, 102, 0x202, "present");
+    try std.testing.expectEqual(@as(u64, 0), framework.ownershipViolations());
+
+    var index: usize = 0;
+    var seen: usize = 0;
+    while (index < framework.event_count) : (index += 1) {
+        var event: contract.Event = .{};
+        if (!framework.readEvent(index, &event)) continue;
+        seen += 1;
+        const owner: contract.Owner = @enumFromInt(event.owner);
+        try std.testing.expect(owner.isMaster());
+        try std.testing.expect(contract.ownershipIsWellFormed(owner, @enumFromInt(event.subowner)));
+    }
+    try std.testing.expect(seen != 0);
+}
+
+test "a hosted subsystem appears as the subowner, never as the owner" {
+    var framework = Framework{};
+    framework.configureForProcess(true, true, true, true);
+    framework.observeValue(.xenia_gpu, .pm4, 0x10, 0x20, 100, 0x200, "draw", "detail");
+    var event: contract.Event = .{};
+    try std.testing.expect(framework.readEvent(framework.event_count - 1, &event));
+    try std.testing.expectEqual(@intFromEnum(contract.Owner.rosette), event.owner);
+    try std.testing.expectEqual(@intFromEnum(contract.Owner.xenia_gpu), event.subowner);
+}
+
+test "a malformed pair is counted rather than corrected" {
+    var framework = Framework{};
+    framework.configureForProcess(true, true, true, true);
+    framework.emitUnlocked(.{
+        .owner = @intFromEnum(contract.Owner.xenia_gpu),
+        .subowner = @intFromEnum(contract.Owner.guest),
+    });
+    try std.testing.expectEqual(@as(u64, 1), framework.ownershipViolations());
 }
