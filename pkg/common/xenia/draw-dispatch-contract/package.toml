@@ -1,0 +1,7 @@
+name = "common-xenia-draw-dispatch-contract"
+version = "0.1.0-local"
+kind = "gpu-completion-dispatch-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
