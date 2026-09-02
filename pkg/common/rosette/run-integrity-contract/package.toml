@@ -1,0 +1,7 @@
+name = "common-rosette-run-integrity-contract"
+version = "0.1.0-local"
+kind = "rosette-run-integrity-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
