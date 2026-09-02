@@ -1,0 +1,7 @@
+name = "common-rosette-substantiation-contract"
+version = "0.1.0-local"
+kind = "rosette-substantiation-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
