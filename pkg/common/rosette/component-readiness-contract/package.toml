@@ -1,0 +1,7 @@
+name = "common-rosette-component-readiness-contract"
+version = "0.1.0-local"
+kind = "component-readiness-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
