@@ -1,0 +1,7 @@
+name = "common-rosette-mandatory-order-contract"
+version = "0.1.0-local"
+kind = "cross-subsystem-ordering-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
