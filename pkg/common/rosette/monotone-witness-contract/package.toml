@@ -1,0 +1,7 @@
+name = "common-rosette-monotone-witness-contract"
+version = "0.1.0-local"
+kind = "monotone-witness-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"

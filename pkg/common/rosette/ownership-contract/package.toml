@@ -1,0 +1,7 @@
+name = "common-rosette-ownership-contract"
+version = "0.1.0-local"
+kind = "rosette-ownership-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
