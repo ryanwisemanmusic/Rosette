@@ -1,0 +1,7 @@
+name = "common-xenia-texture-format-contract"
+version = "0.1.0-local"
+kind = "xenia-texture-format-contract"
+role = "build-time"
+architectures = ["any"]
+language = "zig"
+verification = "verify.sh"
