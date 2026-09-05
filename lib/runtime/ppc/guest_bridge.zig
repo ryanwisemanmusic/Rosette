@@ -425,7 +425,23 @@ fn writeRunResult(slot: *Slot, address: u64, result: host_abi.RunResult) bool {
         var zero = [_]u8{0};
         if (!slot.guest_memory.write(slot.guest_memory.context, opcode_guest_address + length, &zero)) return false;
     }
-    return writeGuest(slot, address + @offsetOf(host_abi.RunResult, "unimplemented_opcode"), opcode_guest_address);
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "unimplemented_opcode"), opcode_guest_address)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "transaction_id"), result.transaction_id)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "context_id"), result.context_id)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "guest_start_pc"), result.guest_start_pc)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "guest_return_pc"), result.guest_return_pc)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "x86_start_rip"), result.x86_start_rip)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "x86_return_rip"), result.x86_return_rip)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "state_delta_id"), result.state_delta_id)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "return_value"), result.return_value)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "fault_signal"), result.fault_signal)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "fault_reserved"), result.fault_reserved)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "fault_address"), result.fault_address)) return false;
+    if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "authoritative"), result.authoritative)) return false;
+    for (result.reserved, 0..) |value, index| {
+        if (!writeGuest(slot, address + @offsetOf(host_abi.RunResult, "reserved") + index, value)) return false;
+    }
+    return true;
 }
 
 test "guest-memory callbacks preserve the PPC ABI's little-endian fields" {

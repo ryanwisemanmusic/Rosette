@@ -35,9 +35,9 @@ const State = state_mod.State;
 const Memory = memory_mod.Memory;
 const Context = context_mod.Context;
 
-/// Bumped whenever `GuestState` changes shape. An embedder built against an
-/// older layout is refused rather than read through moved fields.
-pub const abi_version: u32 = 1;
+/// Bumped whenever either public ABI structure changes shape. An embedder built
+/// against an older layout is refused rather than read through moved fields.
+pub const abi_version: u32 = 2;
 
 pub const identity = "Rosette direct PowerPC host (ISA/ppc + lib/runtime/ppc)";
 
@@ -59,6 +59,9 @@ pub const RunStatus = enum(i32) {
     illegal = 3,
     memory_fault = 4,
     refused = 5,
+    timed_out = 6,
+    context_mismatch = 7,
+    effect_unobserved = 8,
 };
 
 /// Mirrors `RosettePpcGuestState`. Field order and types are the contract.
@@ -93,12 +96,29 @@ pub const GuestState = extern struct {
     trap: *const fn (*anyopaque, u32) callconv(.c) void,
 };
 
-/// Mirrors `RosettePpcRunResult`.
+/// Mirrors `RosettePpcRunResult`. The trailing fields make the result a
+/// structured execution boundary rather than a boolean/value pair. The
+/// direct PPC path does not execute Xenia's generated x86, so the x86 RIP
+/// fields are explicitly zero and therefore mean "not available", not
+/// "address zero".
 pub const RunResult = extern struct {
     status: i32,
     address: u32,
     instructions_retired: u64,
     unimplemented_opcode: ?[*:0]const u8,
+    transaction_id: u64,
+    context_id: u64,
+    guest_start_pc: u32,
+    guest_return_pc: u32,
+    x86_start_rip: u64,
+    x86_return_rip: u64,
+    state_delta_id: u64,
+    return_value: u64,
+    fault_signal: i32,
+    fault_reserved: u32,
+    fault_address: u64,
+    authoritative: u8,
+    reserved: [7]u8,
 };
 
 /// A direct-mapped cache of "this target address is ordinary guest code".
@@ -186,6 +206,8 @@ const SpinLock = struct {
 
 var bindings: [max_bindings]Binding = [_]Binding{.{}} ** max_bindings;
 var bindings_lock: SpinLock = .{};
+var next_transaction_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+var next_state_delta_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
 
 fn findBinding(host_context: *anyopaque) ?*Binding {
     for (&bindings) |*binding| {
@@ -358,11 +380,25 @@ pub fn rosette_ppc_execute(
     return_address: u32,
     out_result: *RunResult,
 ) callconv(.c) void {
+    const transaction_id = next_transaction_id.fetchAdd(1, .monotonic);
     out_result.* = .{
         .status = @intFromEnum(RunStatus.refused),
         .address = address,
         .instructions_retired = 0,
         .unimplemented_opcode = null,
+        .transaction_id = transaction_id,
+        .context_id = @intCast(@intFromPtr(host_context)),
+        .guest_start_pc = address,
+        .guest_return_pc = return_address,
+        .x86_start_rip = 0,
+        .x86_return_rip = 0,
+        .state_delta_id = 0,
+        .return_value = 0,
+        .fault_signal = 0,
+        .fault_reserved = 0,
+        .fault_address = 0,
+        .authoritative = 0,
+        .reserved = [_]u8{0} ** 7,
     };
 
     const binding = blk: {
@@ -540,11 +576,28 @@ fn finish(
     op: ?ppc_decode.Op,
 ) void {
     syncToGuest(binding);
+    const state_delta_id = next_state_delta_id.fetchAdd(1, .monotonic);
     out_result.* = .{
         .status = @intFromEnum(status),
         .address = at,
         .instructions_retired = binding.state.instructions_retired -% retired_at_entry,
         .unimplemented_opcode = if (op) |o| opcodeName(o) else null,
+        .transaction_id = out_result.transaction_id,
+        .context_id = @intCast(@intFromPtr(binding.guest.host_context)),
+        .guest_start_pc = out_result.guest_start_pc,
+        .guest_return_pc = out_result.guest_return_pc,
+        .x86_start_rip = 0,
+        .x86_return_rip = 0,
+        .state_delta_id = state_delta_id,
+        .return_value = binding.state.gpr[3],
+        .fault_signal = 0,
+        .fault_reserved = 0,
+        .fault_address = if (status == .memory_fault) at else 0,
+        // A register snapshot is not, by itself, an independently joined
+        // guest-object or memory-effect witness. The embedder must promote the
+        // result only after it observes that delta at its owning boundary.
+        .authoritative = 0,
+        .reserved = [_]u8{0} ** 7,
     };
 }
 
@@ -710,6 +763,16 @@ test "register state syncs in and back out around one request" {
     // The sum is visible to the embedder, not just inside Rosette.
     try testing.expectEqual(@as(u64, 42), emb.gpr[3]);
     try testing.expectEqual(@as(u64, 2), result.instructions_retired);
+    try testing.expect(result.transaction_id != 0);
+    try testing.expectEqual(@as(u64, @intFromPtr(&emb)), result.context_id);
+    try testing.expectEqual(@as(u32, 0), result.guest_start_pc);
+    try testing.expectEqual(@as(u32, 0x100), result.guest_return_pc);
+    try testing.expectEqual(@as(u64, 42), result.return_value);
+    try testing.expect(result.state_delta_id != 0);
+    // A returned register snapshot is not an independently observed kernel or
+    // graphics effect. The embedder must join that delta before promotion.
+    try testing.expectEqual(@as(u8, 0), result.authoritative);
+    try testing.expectEqual(@as(u64, 0), result.x86_start_rip);
     rosette_ppc_release_context(&emb);
 }
 
@@ -852,6 +915,9 @@ test "a guest memory fault is reported with the faulting address" {
     rosette_ppc_execute(&emb, 0, 0x100, &result);
     try testing.expectEqual(@intFromEnum(RunStatus.memory_fault), result.status);
     try testing.expectEqual(@as(u32, 4), result.address);
+    try testing.expectEqual(@as(u64, 4), result.fault_address);
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(result.fault_signal)));
+    try testing.expectEqual(@as(u64, 0), result.return_value);
     rosette_ppc_release_context(&emb);
 }
 
